@@ -8,8 +8,11 @@ isolated single-file exercises.
 kiln          # continue at the first unfinished step
 kiln run      # run this step's spec tests
 kiln check    # run this step's production gates only (lint ladder, docs, mutants, deny…)
-kiln watch    # re-run on save
+kiln hint     # one nudge, and where to read the rest
+kiln reset    # take this step's scaffold back out, keeping your code
+kiln solution # apply the reference solution (recorded, not prevented)
 kiln verify   # full check, CI mode (--json, --slow)
+kiln watch    # re-run on save
 ```
 
 Every step = a short brief (WHY / TASK / DONE WHEN / TRAP / FURTHER) + read-only spec tests + a set of production
@@ -45,30 +48,39 @@ fallback and translation-drift detection, so other languages can be added withou
 
 ## Status
 
-M0 in progress. The plan is committed, and the first implementation chunk is in: the metadata layer,
-the capability lint, the gate framework and the runner's diagnosis commands.
+M0 in progress. The metadata layer, the capability lint, the gates and the runner are in, and T1 steps 1.1–1.3
+are authored end to end (body, spec, scaffold, reference solution, gates), so the step format is proven
+before it is repeated 19 more times.
 
 ```sh
-cargo xtask ci           # the only entry point CI calls: fmt, clippy -D warnings, tests, lint-caps
-cargo run -p kiln --     # continue at the first unfinished step (content for T1 is next)
+cargo xtask ci           # the only entry point CI calls: fmt, clippy -D warnings, tests,
+                         # spec integrity, lint-caps, and `kiln selftest` (the course's anti-rot check)
+cargo run -p kiln --     # continue at the first unfinished step (T1 content for 1.4+ is next)
 cargo run -p kiln -- list
-cargo run -p kiln -- caps --track mailer
-cargo run -p kiln -- lint-caps   # 97 capabilities, 134 slots, 118 planned steps, 22 authored
-cargo run -p kiln -- doctor      # toolchain, container runtime, cargo tools, registry mirror
+cargo run -p kiln -- run mailer/1.1-workspace   # scaffold + spec tests (specs are synced into app/)
+cargo run -p kiln -- check mailer/1.1-workspace # the step's must gates
+cargo run -p kiln -- hint 1.1
+cargo run -p kiln -- selftest                   # scaffold-fails / solution-passes, in a scratch copy
+cargo run -p kiln -- verify --json              # every authored step, with honesty markers
+cargo run -p kiln -- spec restore               # put the course's spec files back
+cargo run -p kiln -- lint-caps                  # 97 capabilities, 134 slots, 118 planned steps, 22 authored
+cargo run -p kiln -- doctor                     # toolchain, container runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```
 
-What works today: the course metadata under `course/` (`course.toml`, `capabilities.toml`, all 22 T1
-steps in `tracks/mailer/track.toml`), the capability rules R0–R6 as `kiln lint-caps`, the `fmt` /
-`clippy@N` / `no-todo` gates with tool probing and Rust-side timeouts, `list` / `caps` / `run` /
-`check` / `doctor` / `i18n status`, and the locale fallback chain. The prototype of the lint is still
-`tools/lint-caps-md.py` (it reads the curriculum document directly):
+What works today: the course metadata under `course/` (`course.toml`, `capabilities.toml`, all 22 T1 steps in
+`tracks/mailer/track.toml`), the capability rules R0–R6 as `kiln lint-caps`, six working gates
+(`spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` / `i18n`), the scaffolds, reference solutions and
+read-only specs of T1 steps 1.1–1.3, `list` / `caps` / `run` / `check` / `hint` / `reset` / `solution` /
+`spec restore` / `spec manifest` / `selftest` / `verify` / `doctor` / `i18n status`, and the locale
+fallback chain. The prototype of the lint is still `tools/lint-caps-md.py` (it reads the curriculum
+document directly):
 
 ```sh
 python3 tools/lint-caps-md.py   # 97 capabilities, 118 steps, 134 (capability, depth) slots, 0 issues
 ```
 
-What is not there yet: step bodies, spec tests, scaffolds and reference solutions for T1, the `watch`
-/ `verify --json` / `selftest` commands, the remaining gates (`spec-integrity`, `docs:public`,
-`exit-code`, `i18n`, `images`, `container-repro`, `links`), and T2–T5 (see [docs/plan.md](docs/plan.md) §11).
+What is not there yet: step bodies, spec tests, scaffolds and reference solutions for T1 1.4–1.22 and
+T2–T5; `kiln watch`; the remaining gates (`docs:public`, `exit-code`, `images`, `container-repro`, `links`,
+and the slow ones); translations. See [docs/plan.md](docs/plan.md) §11.
 
