@@ -1,22 +1,12 @@
 //! `kiln` — the course runner's binary.
 //!
-//! Deliberately thin: argument parsing and the exit code live here, everything else is in the
-//! library so it can be unit tested and reused by `cargo xtask ci`.
+//! Deliberately thin: argument parsing lives in [`kiln::cmd::Cli`], everything else in the
+//! library, so the same code paths can be unit tested and later reused by `cargo xtask ci`.
 
 use clap::Parser;
+use kiln::cmd::{Cli, run};
 use std::process::ExitCode;
 
-/// Command line interface of the course runner.
-#[derive(Debug, Parser)]
-#[command(
-    name = "kiln",
-    version,
-    about = "Run and judge the steps of the rustlings-production course",
-    arg_required_else_help = true
-)]
-struct Cli {}
-
 fn main() -> ExitCode {
-    let _ = Cli::parse();
-    ExitCode::SUCCESS
+    run(&Cli::parse())
 }

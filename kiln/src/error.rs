@@ -41,7 +41,7 @@ pub enum KilnError {
         source: std::io::Error,
     },
 
-    /// A metadata file is not valid TOML for its schema.
+    /// A course file is not valid TOML for its schema.
     #[error("invalid metadata in {path}")]
     Metadata {
         /// Metadata file that failed to parse.
@@ -49,6 +49,16 @@ pub enum KilnError {
         /// Parser error, including line and column.
         #[source]
         source: toml::de::Error,
+    },
+
+    /// Metadata the runner owns could not be encoded.
+    #[error("cannot encode {path}")]
+    Encode {
+        /// File that could not be encoded.
+        path: PathBuf,
+        /// Encoder error.
+        #[source]
+        source: toml::ser::Error,
     },
 
     /// The metadata parsed but contradicts the plan or itself.

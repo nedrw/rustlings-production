@@ -22,10 +22,12 @@
 )]
 
 pub mod caps;
+pub mod cmd;
 pub mod error;
 pub mod gates;
 pub mod i18n;
 pub mod info;
+pub mod state;
 
 #[cfg(test)]
 pub(crate) mod test_support;
