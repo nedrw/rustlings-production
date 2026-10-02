@@ -46,7 +46,35 @@ fn ci() -> Result<(), String> {
         ],
     )?;
     run(&root, "cargo", &["test", "--workspace"])?;
+    lint_caps(&root)?;
+    println!("\nxtask ci: all checks passed");
     Ok(())
+}
+
+/// The course's own linter, called through the library the runner uses.
+///
+/// Deliberately not a nested `cargo run`: `xtask` and `kiln` must agree on what the metadata
+/// rules are, and the only way to guarantee that is to call the same code (plan §10).
+fn lint_caps(root: &Path) -> Result<(), String> {
+    println!("xtask ci: kiln lint-caps (rules R0-R6 over course/)");
+    let report = kiln::caps::lint::lint_root(root).map_err(|error| error.to_string())?;
+    println!(
+        "  {} capabilities · {} slots · {} ledger positions · {} authored steps",
+        report.capabilities, report.slots, report.ledger_positions, report.authored_steps
+    );
+    for notice in &report.skipped {
+        println!("  skipped: {notice}");
+    }
+    for (step, reason) in &report.reteaches {
+        println!("  reteach {step}: {reason}");
+    }
+    if report.is_clean() {
+        return Ok(());
+    }
+    for issue in &report.issues {
+        println!("  {issue}");
+    }
+    Err(format!("{} lint-caps issue(s)", report.issues.len()))
 }
 
 /// Repository root, derived from this crate's location so the task works from anywhere.

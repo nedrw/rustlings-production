@@ -45,12 +45,30 @@ fallback and translation-drift detection, so other languages can be added withou
 
 ## Status
 
-Planning stage — no runner code yet. `tools/lint-caps-md.py` already mechanically checks the capability ledger in
-`docs/curriculum.md` against the step tables (the prototype of `kiln lint-caps`):
+M0 in progress. The plan is committed, and the first implementation chunk is in: the metadata layer,
+the capability lint, the gate framework and the runner's diagnosis commands.
+
+```sh
+cargo xtask ci           # the only entry point CI calls: fmt, clippy -D warnings, tests, lint-caps
+cargo run -p kiln --     # continue at the first unfinished step (content for T1 is next)
+cargo run -p kiln -- list
+cargo run -p kiln -- caps --track mailer
+cargo run -p kiln -- lint-caps   # 97 capabilities, 134 slots, 118 planned steps, 22 authored
+cargo run -p kiln -- doctor      # toolchain, container runtime, cargo tools, registry mirror
+cargo run -p kiln -- i18n status
+```
+
+What works today: the course metadata under `course/` (`course.toml`, `capabilities.toml`, all 22 T1
+steps in `tracks/mailer/track.toml`), the capability rules R0–R6 as `kiln lint-caps`, the `fmt` /
+`clippy@N` / `no-todo` gates with tool probing and Rust-side timeouts, `list` / `caps` / `run` /
+`check` / `doctor` / `i18n status`, and the locale fallback chain. The prototype of the lint is still
+`tools/lint-caps-md.py` (it reads the curriculum document directly):
 
 ```sh
 python3 tools/lint-caps-md.py   # 97 capabilities, 118 steps, 134 (capability, depth) slots, 0 issues
 ```
 
-Next: **M0** — `kiln` skeleton plus all 22 `mailer` steps as real content (see [docs/plan.md](docs/plan.md) §11).
+What is not there yet: step bodies, spec tests, scaffolds and reference solutions for T1, the `watch`
+/ `verify --json` / `selftest` commands, the remaining gates (`spec-integrity`, `docs:public`,
+`exit-code`, `i18n`, `images`, `container-repro`, `links`), and T2–T5 (see [docs/plan.md](docs/plan.md) §11).
 

@@ -1,0 +1,16 @@
+# Only `cargo xtask ci` runs here on purpose (plan §10): the checks live in `xtask`, so local and
+# CI results cannot drift. Adding a check means editing `xtask/src/main.rs`, not this file.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `rust-toolchain.toml` pins the toolchain, so no version is repeated here.
+      - run: rustup show
+      - run: cargo xtask ci
