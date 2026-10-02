@@ -24,4 +24,8 @@
 pub mod caps;
 pub mod error;
 pub mod gates;
+pub mod i18n;
 pub mod info;
+
+#[cfg(test)]
+pub(crate) mod test_support;
