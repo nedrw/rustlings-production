@@ -28,6 +28,8 @@ pub mod gates;
 pub mod i18n;
 pub mod info;
 pub mod process;
+pub mod runtime;
+pub mod scratch;
 pub mod state;
 
 #[cfg(test)]

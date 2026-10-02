@@ -8,7 +8,7 @@
 //! silently behaves differently under `/bin/sh` versus `bash`.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -137,6 +137,32 @@ pub fn run_line(line: &str, dir: &Path, timeout: Duration) -> Result<Ran> {
     run(program, &args, dir, timeout)
 }
 
+/// Find a program on `PATH`, without `which` (which does not exist everywhere) or a shell.
+#[must_use]
+pub fn locate(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Everything the runner prints about a command it started.
 #[must_use]
 pub fn command_line(program: &str, args: &[&str]) -> String {
@@ -212,6 +238,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, KilnError::Spawn { .. }), "{error}");
         assert!(error.to_string().contains("kiln-no-such-tool"), "{error}");
+    }
+
+    #[test]
+    fn a_program_is_located_on_the_path_or_not_at_all() {
+        assert!(locate("cargo").is_some(), "cargo is running this test");
+        assert!(locate("kiln-definitely-not-a-program").is_none());
+        let found = locate("cargo").expect("cargo is on PATH");
+        assert!(found.is_absolute(), "{}", found.display());
     }
 
     #[test]

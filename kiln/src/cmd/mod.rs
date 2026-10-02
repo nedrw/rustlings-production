@@ -26,6 +26,7 @@ use crate::state::State;
 
 pub mod caps;
 pub mod check;
+pub mod doctor;
 pub mod i18n;
 pub mod lint_caps;
 pub mod list;
@@ -100,6 +101,9 @@ pub enum Command {
         #[command(subcommand)]
         command: I18nCommand,
     },
+
+    /// Diagnose the environment: toolchain, container runtime, cargo tools, registry mirror.
+    Doctor,
 }
 
 /// Subcommands of `kiln i18n`.
@@ -131,6 +135,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::I18n { command }) => match command {
             I18nCommand::Status => i18n::status(&session),
         },
+        Some(Command::Doctor) => doctor::run(&session),
         None => list::welcome(&session),
     }
 }
