@@ -26,6 +26,7 @@ use crate::state::State;
 
 pub mod caps;
 pub mod check;
+pub mod i18n;
 pub mod lint_caps;
 pub mod list;
 pub mod run;
@@ -92,6 +93,20 @@ pub enum Command {
         #[arg(value_name = "STEP")]
         step: Option<String>,
     },
+
+    /// Content locales: coverage, structure and translation drift.
+    I18n {
+        /// What to report (only `status` exists so far).
+        #[command(subcommand)]
+        command: I18nCommand,
+    },
+}
+
+/// Subcommands of `kiln i18n`.
+#[derive(Debug, Subcommand)]
+pub enum I18nCommand {
+    /// Coverage, structure problems and drift for the requested locale.
+    Status,
 }
 
 /// Run the CLI and turn its result into a process exit code.
@@ -113,6 +128,9 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::LintCaps) => lint_caps::run(&session),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),
+        Some(Command::I18n { command }) => match command {
+            I18nCommand::Status => i18n::status(&session),
+        },
         None => list::welcome(&session),
     }
 }
