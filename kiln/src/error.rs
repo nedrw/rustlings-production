@@ -1,0 +1,173 @@
+//! Typed failures for the runner.
+//!
+//! Course steps are judged by a process exit code, so the runner needs a small, stable set of
+//! codes — but a code alone is not a diagnosis. Every failure carries the file, command or
+//! tool it came from, and a `source` chain where one exists.
+
+use std::path::PathBuf;
+
+/// The step (or the whole run) passed.
+pub const EXIT_OK: u8 = 0;
+/// The runner judged the step and it did not pass (spec tests or a must gate).
+pub const EXIT_FAILED: u8 = 1;
+/// The runner could not judge: bad metadata, unknown step, missing tool, timeout.
+pub const EXIT_ERROR: u8 = 2;
+/// The requested content is not authored yet — nothing was judged.
+pub const EXIT_NOT_AUTHORED: u8 = 3;
+
+/// Result alias used across the crate.
+pub type Result<T> = std::result::Result<T, KilnError>;
+
+/// Everything that can stop the runner from answering "does this step pass?".
+#[derive(Debug, thiserror::Error)]
+pub enum KilnError {
+    /// A course file could not be read.
+    #[error("cannot read {path}")]
+    Read {
+        /// File that could not be read.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A file could not be written (progress state, restored spec).
+    #[error("cannot write {path}")]
+    Write {
+        /// File that could not be written.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A metadata file is not valid TOML for its schema.
+    #[error("invalid metadata in {path}")]
+    Metadata {
+        /// Metadata file that failed to parse.
+        path: PathBuf,
+        /// Parser error, including line and column.
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// The metadata parsed but contradicts the plan or itself.
+    #[error("{0}")]
+    Invalid(String),
+
+    /// No repository root (a directory containing `course/course.toml`) was found.
+    #[error("no course manifest found in {start} or any parent directory")]
+    NoCourse {
+        /// Directory the search started in.
+        start: PathBuf,
+    },
+
+    /// A step reference matched nothing.
+    #[error("unknown step `{requested}`{suggestion}")]
+    UnknownStep {
+        /// What the user typed.
+        requested: String,
+        /// Closest known step, or an empty string.
+        suggestion: String,
+    },
+
+    /// A track was requested that does not exist.
+    #[error("unknown track `{0}`")]
+    UnknownTrack(String),
+
+    /// A step reference matched more than one step.
+    #[error("ambiguous step `{requested}`: it matches {matches:?}")]
+    AmbiguousStep {
+        /// What the user typed.
+        requested: String,
+        /// Candidate step ids, in track order.
+        matches: Vec<String>,
+    },
+
+    /// A step in `track.toml` does not follow the `<phase>.<index>-<slug>` id convention.
+    #[error("step `{id}` in {track}.toml must look like `1.14-worker`: {reason}")]
+    StepId {
+        /// Offending local step id.
+        id: String,
+        /// Track that declares it.
+        track: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+
+    /// An external tool the course depends on is not installed.
+    #[error("`{tool}` is not available: {hint}")]
+    MissingTool {
+        /// Tool name as the user would type it.
+        tool: String,
+        /// Copy-pasteable install command.
+        hint: String,
+    },
+
+    /// The requested content has not been authored yet.
+    #[error("{what} is not authored yet")]
+    NotAuthored {
+        /// What is missing, phrased for the learner.
+        what: String,
+    },
+
+    /// A command exceeded the runner's timeout (implemented in Rust: there is no `timeout(1)`).
+    #[error("`{command}` timed out after {seconds}s")]
+    Timeout {
+        /// Command line that was killed.
+        command: String,
+        /// Timeout that was applied.
+        seconds: u64,
+    },
+
+    /// A command could not be started at all.
+    #[error("cannot run `{command}` in {dir}")]
+    Spawn {
+        /// Command line that failed to start.
+        command: String,
+        /// Working directory it was started in.
+        dir: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl KilnError {
+    /// Exit code a shell sees for this failure.
+    ///
+    /// `EXIT_NOT_AUTHORED` exists so scripts can tell "you still have work to do" apart from
+    /// "M0 has not written this step yet".
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NotAuthored { .. } => EXIT_NOT_AUTHORED,
+            _ => EXIT_ERROR,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_authored_is_distinguishable_from_a_real_failure() {
+        let missing = KilnError::NotAuthored {
+            what: "step mailer/1.1".into(),
+        };
+        assert_eq!(missing.exit_code(), EXIT_NOT_AUTHORED);
+        assert_ne!(missing.exit_code(), EXIT_FAILED);
+    }
+
+    #[test]
+    fn errors_quote_the_path_that_failed() {
+        let err = KilnError::Read {
+            path: PathBuf::from("course/course.toml"),
+            source: std::io::Error::other("boom"),
+        };
+        assert_eq!(err.to_string(), "cannot read course/course.toml");
+        // The source chain is what makes the message actionable.
+        assert!(std::error::Error::source(&err).is_some());
+    }
+}

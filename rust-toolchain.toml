@@ -1,0 +1,8 @@
+# The pinned toolchain is the single source of truth for the Rust version (plan §9.5):
+# containers only provide a base image, they do not decide the compiler version.
+# Course step `mailer/1.2-toolchain` teaches this file; `kiln doctor` compares it against
+# the installed toolchain.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

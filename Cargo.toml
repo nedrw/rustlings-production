@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["kiln", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0.21"
+toml = "0.9.8"
+
+kiln = { path = "kiln" }
+
+# `kiln` must pass the lint ladder it enforces (plan §6, §10): the production lints are denied
+# workspace-wide, and each crate relaxes them for `cfg(test)` only.
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

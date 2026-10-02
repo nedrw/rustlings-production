@@ -1,0 +1,4 @@
+# `cargo xtask <task>` — the same entry point CI calls, so local and CI checks cannot drift
+# (plan §10: CI only calls `cargo xtask ci`).
+[alias]
+xtask = "run --quiet --package xtask --"
