@@ -182,6 +182,14 @@ images = ["postgres:17-alpine"]          # 需要容器：doctor/images 会先�
 
 Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现在 `kiln/src/gates/`，一个闸门 = 一个函数 + 一行注册表条目，可单测。
 
+落地时的两点澄清（M0 第一段，与上面的示例一致）：
+
+- `id` 在 `track.toml` 里是** track 内**的（`1.14-worker`），因为文件本身已经在某条 track 下；
+  CLI、文档、日志用完全限定 id `mailer/1.14-worker`，由加载器拼出（authoring.md §1 的全局 id）。
+  `kiln run mailer/1.14`、`kiln run 1.14`、`kiln run 1.14-worker` 都接受。
+- `entry` 是**相对 `course/` 的英文源路径**，且必须落在 `docs/steps/<locale>/<track>/` 下；
+  译文路径由 i18n 层只换 locale 那一段得到，所以加一门语言不需要改任何元数据。
+
 ## 5. 题型
 
 | kind | 学员改什么 | 怎么判 | 用在 |
