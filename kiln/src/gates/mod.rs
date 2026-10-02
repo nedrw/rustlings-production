@@ -19,14 +19,24 @@
 //!    that last rule is what keeps namespaced names such as `docs:public` readable.
 //!
 //! This module owns the grammar and the catalogue; running a gate belongs to the modules that
-//! implement one, and probing the tools they need to `tool`.
+//! implement one ([`fmt`], [`clippy`], [`no_todo`] so far), and probing the tools they need to
+//! [`tool`]. `kiln lint-caps` solves the same problem for capability metadata instead of code.
 
-use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::KilnError;
+
+pub mod clippy;
+pub mod fmt;
+pub mod no_todo;
+pub mod registry;
+pub mod runner;
+pub mod tool;
+
+pub use registry::{GateDef, GateOutcome, GateStatus, Outcome, catalogue, lookup};
+pub use runner::{GateContext, GateResult, all_must_passed, run_all};
 
 /// Whether a failing gate blocks the step (plan §6: `must` versus `should`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +95,8 @@ impl GateSpec {
     }
 }
 
-impl fmt::Display for GateSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for GateSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.slow {
             f.write_str("slow:")?;
         }

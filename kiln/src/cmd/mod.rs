@@ -15,17 +15,20 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
 use crate::error::{KilnError, Result};
 use crate::i18n::{Locale, Ui, status};
-use crate::info::Course;
+use crate::info::{Course, Step};
 use crate::state::State;
 
 pub mod caps;
+pub mod check;
 pub mod lint_caps;
 pub mod list;
+pub mod run;
 
 /// Command line interface of the course runner.
 #[derive(Debug, Parser)]
@@ -42,6 +45,12 @@ pub struct Cli {
     /// Course content language (`zh-Hans -> zh -> en` fallback; `KILN_LANG` also works).
     #[arg(long, global = true, env = "KILN_LANG", value_name = "LOCALE")]
     pub lang: Option<String>,
+
+    /// Seconds a command the runner starts may take before it is killed.
+    ///
+    /// The deadline is enforced in Rust: the course must not depend on `timeout(1)`.
+    #[arg(long, global = true, default_value_t = 300, value_name = "SECONDS")]
+    pub timeout: u64,
 
     /// Command to run; a bare `kiln` continues at the first unfinished step.
     #[command(subcommand)]
@@ -69,6 +78,20 @@ pub enum Command {
     ///
     /// Prose rules (R5) report themselves as skipped while step bodies are not authored yet.
     LintCaps,
+
+    /// Run a step's spec tests (the fast path; default: the first unfinished step).
+    Run {
+        /// Step to run: `1.14`, `1.14-worker` or `mailer/1.14-worker`.
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
+
+    /// Run a step's gates only, without its spec tests.
+    Check {
+        /// Step to check (default: the first unfinished step).
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
 }
 
 /// Run the CLI and turn its result into a process exit code.
@@ -83,12 +106,39 @@ pub fn run(cli: &Cli) -> ExitCode {
 }
 
 fn dispatch(cli: &Cli) -> Result<u8> {
-    let session = Session::new(cli)?;
+    let mut session = Session::new(cli)?;
     match &cli.command {
         Some(Command::List { track }) => list::run(&session, track.as_deref()),
         Some(Command::Caps { track }) => caps::run(&session, track.as_deref()),
         Some(Command::LintCaps) => lint_caps::run(&session),
+        Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
+        Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),
         None => list::welcome(&session),
+    }
+}
+
+/// Resolve the step a command should act on.
+///
+/// No reference means "continue where I left off": the first unfinished step of the default
+/// track, which is the behaviour a learner expects from typing `kiln run` (plan §3 D3).
+///
+/// The step is returned by value — it is small, and the commands need to record progress while
+/// the step they are judging is still in view.
+pub(crate) fn resolve_step(session: &Session, reference: Option<&str>) -> Result<Step> {
+    match reference {
+        Some(reference) => session.course().step(reference).cloned(),
+        None => {
+            let track = session.course().default_track()?;
+            list::first_unfinished(track, session.state())
+                .cloned()
+                .ok_or_else(|| {
+                    KilnError::Invalid(format!(
+                        "every step of `{}` is done — name a step explicitly, or start the next \
+                         track",
+                        track.id
+                    ))
+                })
+        }
     }
 }
 
@@ -99,6 +149,7 @@ pub struct Session {
     source: Locale,
     ui: Ui,
     state: State,
+    timeout: Duration,
 }
 
 impl Session {
@@ -122,7 +173,14 @@ impl Session {
             source,
             ui,
             state,
+            timeout: Duration::from_secs(cli.timeout),
         })
+    }
+
+    /// Deadline applied to every command the runner starts.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// The loaded course.
