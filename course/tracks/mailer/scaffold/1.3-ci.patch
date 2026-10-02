@@ -12,14 +12,10 @@ diff --git a/Cargo.toml b/Cargo.toml
 index 7cc9ccd..40dab09 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -27,6 +27,7 @@ workspace = true
- [workspace]
- members = [
+@@ -29,2 +29,3 @@ members = [
      # kiln:scaffold:begin
 +    "xtask",
      # kiln:scaffold:end
- ]
- 
 diff --git a/xtask/Cargo.toml b/xtask/Cargo.toml
 new file mode 100644
 index 0000000..fad0168
