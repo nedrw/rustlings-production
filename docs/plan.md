@@ -184,7 +184,7 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 
 落地时的两点澄清（M0 第一段，与上面的示例一致）：
 
-- `id` 在 `track.toml` 里是** track 内**的（`1.14-worker`），因为文件本身已经在某条 track 下；
+- `id` 在 `track.toml` 里是 **track 内**的（`1.14-worker`），因为文件本身已经在某条 track 下；
   CLI、文档、日志用完全限定 id `mailer/1.14-worker`，由加载器拼出（authoring.md §1 的全局 id）。
   `kiln run mailer/1.14`、`kiln run 1.14`、`kiln run 1.14-worker` 都接受。
 - `entry` 是**相对 `course/` 的英文源路径**，且必须落在 `docs/steps/<locale>/<track>/` 下；
@@ -196,7 +196,11 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 | --- | --- | --- | --- |
 | `milestone` | `app/<track>` 里的真实代码 | 跑 `run.cmd`（只读规格测试）+ 闸门 | 主线 |
 | `drill` | 单个 `.rs` 填空 | 拷进临时 crate 跑 `cargo test`（rustlings 同款） | 机制训练 |
-| `design` | 文档（ADR / runbook / 设计文档） | 结构检查 + 链接检查（`lychee`） | 每条 track 末尾 |
+| `design` | 文档（runbook / ADR / 设计文档）**＋可选的可执行演练** | 文档结构 + `links` +（有 `run` 时）跑 `run.cmd` | 每条 track 末尾 |
+
+`design` 保留 `run` 的理由（M0 第一段的实测反馈）：课程里每条 track 末尾的步骤实际交付两样东西——
+一份人要读的文档（runbook / 演练手册）和一个能重放的演练脚本（断言「无丢单」这类不可观测承诺），
+所以 `design` 的判定是「文档结构 + 链接 + 可选演练」，而不是纯文档。`run` 仅在 `design` 下可选。
 
 `origin` 不是独立题型，而是 milestone/drill 的一个属性：它决定正文模板（`teach` 用 WHY 模板，`deepen`/`transfer` 用 RECALL/DELTA 模板）与提示强度（§3 D4）。
 
@@ -240,6 +244,13 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 
 1. **快闸门优先**：普通步骤 `kiln run` 目标 < 60 秒；慢闸门标 `slow`，只在 `kiln verify --slow` 跑。反馈速度就是 rustlings 的全部魔力。
 2. **panic 政策要讲清楚**：启动期早失败（缺配置、端口占用）允许 panic + 注释；请求路径上不允许。闸门按此实现，而不是一刀切禁止 panic，否则学员学到的是坏习惯。
+
+还有一条关于**闸门作用域**的澄清（M0 第一段的实测反馈）：
+
+- **持久属性**累积：`spec-integrity`、`fmt`、`clippy@N`、`no-todo`、`docs:public`、`exit-code`、`i18n`、`caps` 一旦引入就贯穿后续所有步骤（只加不减）。
+- **步骤作用域属性**只附着在拥有那个产物的步骤上：`images` 只在该步确实需要容器时出现，`container-repro` 只在容器化的那一步，`links` 只在交付文档的步骤。
+- 两者不矛盾的原因：`kiln verify [track]` 会把**每个步骤自己的闸门都跑一遍**，所以 1.21 之后把 Dockerfile 改坏的回归会在全量校验里被 1.21 的 `container-repro` 抓到。
+  也就是说：**回归保护靠 verify 的全量执行，不靠闸门列表无限累积**。
 
 ## 7. 课程体系
 

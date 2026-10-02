@@ -100,6 +100,15 @@ recovery latency against duplicate work, and clock skew decides who wins.
 - `RECALL` 写清**上次那步的 id**与深度（`kiln lint-caps` 会校验指向存在）；
 - `DELTA` 只写「新项目里的坑」，并说明本步**闸门更严、提示更少**。
 
+### 4.4 `kind = "design"` 的正文
+
+文档型步骤（每条 track 末尾）交付两样东西，正文必须分开写：
+
+- **可执行的演练**：`run` 指向一个规格测试（断言「无丢单」这类不可观测承诺）；
+- **人要读的页面**：runbook / 演练手册，受 `links` 与结构检查。
+
+正文里把两者写成一件事（「把 runbook 写成你会重放的演练」），而不是「写一份文档」。
+
 ## 5. scaffold patch 规则
 
 scaffold 会把新模块的骨架与依赖加进学员项目。它必须是**加性**的，否则必然与学员的编辑冲突：
@@ -145,6 +154,8 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 2. 新增闸门必须同时提供**缺失工具时的可执行提示**（`cargo install cargo-mutants` 这类），不允许只抛退出码。
 3. 闸门不得依赖 GNU userland（无 `timeout`、无 GNU-only 参数）；超时在 Rust 侧实现。
 4. 闸门只对**目标类型**生效：库代码严格、测试代码放宽。放宽必须在正文里写明理由，不能藏进 `allow`。
+5. **闸门有两种作用域**（见 plan.md §6）：持久属性（`spec-integrity`/`fmt`/`clippy@N`/`no-todo`/`docs:public`/`exit-code`/`i18n`/`caps`）一旦引入就贯穿后续；
+   步骤作用域属性（`images`/`container-repro`/`links`）只写给拥有那个产物的步骤。回归保护靠 `verify` 跑遍每步自己的闸门，不靠列表无限稀释。
 
 ## 8. i18n
 
