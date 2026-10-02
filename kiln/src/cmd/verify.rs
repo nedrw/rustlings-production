@@ -8,8 +8,10 @@
 //!   step's spec files only into a project that already exists, so running it cannot change what the
 //!   learner has. A step whose project is not there yet is `blocked`, with the command that starts
 //!   it;
-//! * it carries the **honesty markers** from `.kiln/state.toml` — was the reference solution
-//!   applied, was a spec file edited — so a green report can be read for what it is (plan §3 D2).
+//! * it carries the **honesty markers** — was the reference solution applied, was a spec file
+//!   edited — so a green report can be read for what it is (plan §3 D2). The second of those is
+//!   recomputed from the tree, not read from the state file: the marker describes this project, not
+//!   what somebody did to it last week.
 //!
 //! `--json` prints the same thing as one machine-readable document.
 
@@ -27,6 +29,8 @@ struct Verdict {
     id: String,
     number: String,
     title: String,
+    /// Track the step belongs to, so the report can reach the step's metadata again.
+    track: String,
     /// `passed`, `failed`, `blocked` or `not-authored`.
     status: &'static str,
     /// Why, in one line.
@@ -113,6 +117,7 @@ fn judge(session: &Session, track: &Track, step: &Step, run_slow: bool) -> Resul
         id: step.qualified_id(),
         number: step.number().to_owned(),
         title: step.title.clone(),
+        track: step.track.clone(),
         status: "not-authored",
         detail: String::new(),
         spec: None,
@@ -251,12 +256,18 @@ fn report_json(session: &Session, track: Option<&str>, verdicts: &[Verdict]) -> 
 }
 
 fn step_json(session: &Session, verdict: &Verdict) -> Value {
-    let recorded = session.state().steps.get(&verdict.id);
-    let honesty = json!({
-        "solution_applied": recorded.is_some_and(|state| state.solution_applied),
-        "spec_modified": recorded.is_some_and(|state| state.spec_modified),
-        "own_work": !recorded.is_some_and(|state| state.solution_applied),
-    });
+    let step = session
+        .course()
+        .track(&verdict.track)
+        .and_then(|track| track.step(&verdict.number).map(|step| (track, step)));
+    let honesty = match step {
+        Ok((track, step)) => honesty_json(session, track, step, verdict),
+        Err(_) => json!({
+            "solution_applied": false,
+            "spec_modified": false,
+            "own_work": true,
+        }),
+    };
     let spec = match &verdict.spec {
         Some((passed, detail)) => {
             json!({"status": if *passed { "passed" } else { "failed" }, "detail": detail})
@@ -289,5 +300,28 @@ fn step_json(session: &Session, verdict: &Verdict) -> Value {
         "spec": spec,
         "gates": gates,
         "honesty": honesty,
+    })
+}
+
+/// The honesty markers of one step.
+///
+/// `solution_applied` is history — the only way to know it is that `kiln solution` wrote it down.
+/// `spec_modified` is a fact about the tree in front of us, so it is recomputed rather than read: a
+/// learner who edited a spec and then ran `kiln spec restore` is not still marked for it.
+fn honesty_json(session: &Session, track: &Track, step: &Step, verdict: &Verdict) -> Value {
+    let applied = session
+        .state()
+        .steps
+        .get(&verdict.id)
+        .is_some_and(|state| state.solution_applied);
+    let modified = session.project_dir(step).is_ok_and(|dir| {
+        project::missing_content(session.course(), track, step).is_empty()
+            && spec::check_learner(session.course().root(), track, step, &dir)
+                .is_ok_and(|report| !report.is_clean())
+    });
+    json!({
+        "solution_applied": applied,
+        "spec_modified": modified,
+        "own_work": !applied,
     })
 }

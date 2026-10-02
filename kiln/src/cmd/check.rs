@@ -8,6 +8,7 @@ use crate::cmd::Session;
 use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, Result};
 use crate::gates::{Outcome, all_must_passed};
 use crate::project;
+use crate::spec;
 
 /// Run the gates of one step.
 pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
@@ -15,6 +16,7 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     super::run::print_step_header(session, &step)?;
 
     let track = session.course().track(&step.track)?;
+    let project_dir = track.project_dir(session.course().root());
     let missing = project::missing_content(session.course(), track, &step);
     if !missing.is_empty() {
         println!();
@@ -53,6 +55,12 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         .filter(|gate| gate.outcome == Outcome::Pending)
         .count();
 
+    // `check` looks at the spec files too (the `spec-integrity` gate), so the honesty marker is
+    // refreshed here as well: it is a fact about this tree, not a historical note (plan §3 D2).
+    let drift = spec::check_learner(session.course().root(), track, &step, &project_dir)?;
+    session
+        .state_mut()
+        .record_spec_modified(&step.qualified_id(), !drift.is_clean());
     session
         .state_mut()
         .record_gates(&step.qualified_id(), passed);
