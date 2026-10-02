@@ -1,0 +1,57 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 33c7d4a..7cc9ccd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,6 +10,13 @@
+ name = "mailer"
+ version = "0.1.0"
+ edition = "2024"
++# The minimum a user needs to build this. `rust-toolchain.toml` pins what the course uses.
++rust-version = "1.98"
++
++# Inherit the policy below, so the lints are a property of the workspace rather than of whoever
++# remembered to pass `-D` on the command line.
++[lints]
++workspace = true
+ 
+ [dependencies]
+ # kiln:scaffold:begin
+@@ -22,3 +29,15 @@ members = [
+     # kiln:scaffold:begin
+     # kiln:scaffold:end
+ ]
++
++# The lint policy every crate in this workspace inherits. Only lints that hold for *every* target
++# belong here — tests may `unwrap`, and a binary may print. The rungs that need that distinction
++# are passed by `cargo xtask ci` (docs/plan.md §6).
++[workspace.lints.rust]
++missing_docs = "deny"
++unsafe_code = "forbid"
++
++[workspace.lints.clippy]
++dbg_macro = "deny"
++todo = "deny"
++unimplemented = "deny"
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+new file mode 100644
+index 0000000..95c0b08
+--- /dev/null
++++ b/rust-toolchain.toml
+@@ -0,0 +1,6 @@
++# The toolchain is pinned here and nowhere else (docs/plan.md §9.5): a container provides a base
++# image, it does not decide which compiler built the service.
++[toolchain]
++channel = "1.98.1"
++components = ["rustfmt", "clippy"]
++profile = "minimal"
+diff --git a/rustfmt.toml b/rustfmt.toml
+new file mode 100644
+index 0000000..e1e3e8a
+--- /dev/null
++++ b/rustfmt.toml
+@@ -0,0 +1,5 @@
++# Formatting is a gate, so the settings live in the repository instead of in reviewers' heads.
++# Kept deliberately small: every option here is one a step can point at.
++edition = "2024"
++style_edition = "2024"
++max_width = 100

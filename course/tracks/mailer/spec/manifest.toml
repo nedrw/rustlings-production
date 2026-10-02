@@ -7,3 +7,4 @@ format_version = 1
 
 [spec]
 "spec/1.1/layout.rs" = "sha256:9e8b33ba3d7b039322d71009ae72fadf15f179436c14d967bb3774d8b4a1d4a8"
+"spec/1.2/style.rs" = "sha256:3d276df3540b012fada39437517d22505092eafe6b98d1266d71a3831ad412f9"
