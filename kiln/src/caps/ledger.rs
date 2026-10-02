@@ -158,17 +158,6 @@ impl Ledger {
             .map(|(_, _, position)| (position.track.as_str(), position.number.as_str()))
             .collect()
     }
-
-    /// Slots of one track, in step order.
-    #[must_use]
-    pub fn slots_in_track(&self, track: &str) -> Vec<(&CapabilityId, Level, &SlotPosition)> {
-        let mut slots: Vec<_> = self
-            .slots()
-            .filter(|(_, _, position)| position.track == track)
-            .collect();
-        slots.sort_by(|a, b| a.2.number.cmp(&b.2.number).then_with(|| a.0.cmp(b.0)));
-        slots
-    }
 }
 
 #[cfg(test)]

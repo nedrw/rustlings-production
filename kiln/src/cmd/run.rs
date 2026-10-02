@@ -6,7 +6,7 @@
 
 use crate::cmd::Session;
 use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, KilnError, Result};
-use crate::i18n::{StepDoc, fallback_notice, resolve_step_doc};
+use crate::i18n::{fallback_notice, resolve_step_doc};
 use crate::info::Step;
 use crate::process;
 
@@ -81,19 +81,13 @@ pub fn print_step_header(session: &Session, step: &Step) -> Result<()> {
         session.locale(),
         session.source(),
     )?;
-    match &doc {
-        StepDoc::Found { path, .. } => {
-            let relative = path
-                .strip_prefix(session.course().root())
-                .unwrap_or(path.as_path());
-            println!("  body: {}", relative.display());
-        }
-        StepDoc::Missing { path } => {
-            let relative = path
-                .strip_prefix(session.course().root())
-                .unwrap_or(path.as_path());
-            println!("  body: not authored yet ({})", relative.display());
-        }
+    let relative = doc
+        .path()
+        .strip_prefix(session.course().root())
+        .unwrap_or_else(|_| doc.path());
+    match doc.locale() {
+        Some(locale) => println!("  body: {} ({locale})", relative.display()),
+        None => println!("  body: not authored yet ({})", relative.display()),
     }
     if let Some(notice) = fallback_notice(
         &step.qualified_id(),

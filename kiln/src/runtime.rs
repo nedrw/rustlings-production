@@ -105,12 +105,6 @@ impl RuntimeReport {
         self.engines.iter().find(|report| report.engine == engine)
     }
 
-    /// The command a step should use to run a container, e.g. `podman run …`.
-    #[must_use]
-    pub fn run_prefix(&self) -> Option<String> {
-        self.preferred.map(|engine| engine.binary().to_owned())
-    }
-
     /// Whether at least one compose candidate works here.
     #[must_use]
     pub fn compose_works(&self) -> bool {
@@ -262,7 +256,6 @@ mod tests {
         for candidate in &report.compose {
             assert!(!candidate.command().is_empty());
         }
-        assert!(report.run_prefix().is_none() || report.preferred.is_some());
     }
 
     #[test]

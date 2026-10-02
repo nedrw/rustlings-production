@@ -191,6 +191,10 @@ fn cargo_tools() -> Tally {
             warnings += 1;
         }
         println!("  {}", probe.line());
+        if !probe.available {
+            // What the course wants it for, so "install this" has a reason attached.
+            println!("      needed for {}", probe.tool.purpose());
+        }
     }
     (0, warnings)
 }

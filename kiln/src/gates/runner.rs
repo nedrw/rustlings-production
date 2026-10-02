@@ -126,7 +126,10 @@ fn run_one(ctx: &GateContext<'_>, spec: &GateSpec, run_slow: bool) -> GateResult
 
     match definition.status {
         GateStatus::Pending(reason) => {
-            return skip(format!("{reason} (not implemented yet)"));
+            return skip(format!(
+                "{}: {reason} (not implemented yet)",
+                definition.purpose
+            ));
         }
         GateStatus::Ready => {}
     }
