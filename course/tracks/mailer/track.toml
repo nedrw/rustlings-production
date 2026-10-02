@@ -48,10 +48,12 @@ teaches = ["repo/workspace-layout@apply"]
 requires = []
 run = { cmd = "cargo test -p mailer --test spec_layout" }
 spec = ["spec/1.1/layout.rs"]
-scaffold = "scaffold/1.1-workspace.patch"
+# A track's first step starts from the track skeleton; every later scaffold is a patch applied on
+# top of it (authoring.md §5).
+scaffold = "skeleton"
 solution = "solutions/1.1-workspace.patch"
 gates = ["spec-integrity", "caps", "i18n"]
-hint = "`cargo metadata` decides whether the layout is right, so keep logic out of `main.rs` and let the library own everything the specs touch."
+hint = "`cargo check --lib` decides whether the layout is right, so keep every decision out of `main.rs` and let the library own everything the specs touch."
 
 [[step]]
 id = "1.2-toolchain"
@@ -65,7 +67,8 @@ teaches = ["repo/toolchain-pinning@apply"]
 requires = []
 run = { cmd = "cargo test -p mailer --test spec_style" }
 spec = ["spec/1.2/style.rs"]
-scaffold = "scaffold/1.2-toolchain.patch"
+# No scaffold: everything this step adds (the toolchain pin, the style settings, the lint policy) is
+# a decision the learner has to make, so the course writes none of it for them.
 solution = "solutions/1.2-toolchain.patch"
 gates = ["spec-integrity", "caps", "i18n", "fmt", "clippy@1"]
 hint = "`rust-toolchain.toml` is the only place the compiler version lives; style belongs in `rustfmt.toml` and `[workspace.lints]`, not in review comments."

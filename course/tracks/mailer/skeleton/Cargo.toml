@@ -1,0 +1,24 @@
+# The `mailer` service, as it comes out of the box: one crate, one file.
+#
+# T1 step 1 (`mailer/1.1-workspace`) splits this into a library and a thin binary;
+# step 2 pins the toolchain and the lint policy for the workspace.
+#
+# The `kiln:scaffold:begin`/`end` blocks are the regions later scaffolds are allowed to
+# write into (docs/authoring.md §5).
+
+[package]
+name = "mailer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# kiln:scaffold:begin
+# kiln:scaffold:end
+
+# This project is its own workspace, so it never picks up the course's settings
+# (docs/plan.md §3 D6).
+[workspace]
+members = [
+    # kiln:scaffold:begin
+    # kiln:scaffold:end
+]

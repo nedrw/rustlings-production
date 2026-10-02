@@ -1,0 +1,138 @@
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..5f460d2
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,82 @@
++//! `mailer` — a subscription service for a newsletter.
++//!
++//! The library is the service; `src/main.rs` is a shell around it. Every decision lives here,
++//! where a test can reach it without starting a process.
++//!
++//! Nothing in this file prints: [`parse`] answers with a [`Request`], and [`Request::exit_code`]
++//! says how the process ends. Turning that into text on a terminal is the binary's job, and it is
++//! what keeps the library usable from a test, a second binary or a future HTTP front end.
++
++use std::process::ExitCode;
++
++/// What the command line asked for, once it has been parsed.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Request {
++    /// Print [`USAGE`] and exit successfully.
++    Help,
++    /// Print the version and exit successfully.
++    Version,
++    /// Nothing to do yet: the service has no listener.
++    Idle,
++    /// A flag the service does not know.
++    Unknown(String),
++}
++
++impl Request {
++    /// The exit code this request ends in.
++    ///
++    /// The policy lives here rather than in `main.rs` so a test can pin it: an unknown flag is a
++    /// usage error (2), everything else succeeded.
++    #[must_use]
++    pub fn exit_code(&self) -> ExitCode {
++        match self {
++            Request::Unknown(_) => ExitCode::from(2),
++            _ => ExitCode::SUCCESS,
++        }
++    }
++}
++
++/// Usage text, printed by `--help` and after a bad argument.
++pub const USAGE: &str = "\
++usage: mailer [OPTIONS]
++
++OPTIONS:
++    --help       print this help and exit
++    --version    print the version and exit
++";
++
++/// Parse the arguments a process was started with, program name included.
++///
++/// `--help` and `--version` are recognised here; everything else is a usage error until step 4
++/// replaces this with real configuration.
++#[must_use]
++pub fn parse<I, S>(args: I) -> Request
++where
++    I: IntoIterator<Item = S>,
++    S: AsRef<str>,
++{
++    match args.into_iter().nth(1) {
++        None => Request::Idle,
++        Some(flag) => match flag.as_ref() {
++            "--help" => Request::Help,
++            "--version" => Request::Version,
++            other => Request::Unknown(other.to_owned()),
++        },
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Request, parse};
++
++    #[test]
++    fn the_flags_the_service_promises_are_recognised() {
++        assert_eq!(parse(["mailer", "--help"]), Request::Help);
++        assert_eq!(parse(["mailer", "--version"]), Request::Version);
++        assert_eq!(parse(["mailer"]), Request::Idle);
++        assert_eq!(
++            parse(["mailer", "--nope"]),
++            Request::Unknown("--nope".to_owned())
++        );
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 521f2be..9857dfc 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,36 +1,16 @@
+-//! `mailer` — a subscription service for a newsletter.
+-//!
+-//! Everything the service can do today is in this one file. The course's first step is
+-//! about where the code should live, not about what it does.
++//! The `mailer` binary: a shell around the library.
+ 
+ use std::process::ExitCode;
+ 
+-const USAGE: &str = "\
+-usage: mailer [OPTIONS]
+-
+-OPTIONS:
+-    --help       print this help and exit
+-    --version    print the version and exit
+-";
++use mailer::{Request, USAGE};
+ 
+ fn main() -> ExitCode {
+-    let args: Vec<String> = std::env::args().skip(1).collect();
+-    let Some(flag) = args.first() else {
+-        eprintln!("mailer: no listener yet, nothing to do (try --help)");
+-        return ExitCode::SUCCESS;
+-    };
+-    match flag.as_str() {
+-        "--help" => {
+-            println!("{USAGE}");
+-            ExitCode::SUCCESS
+-        }
+-        "--version" => {
+-            println!("mailer {}", env!("CARGO_PKG_VERSION"));
+-            ExitCode::SUCCESS
+-        }
+-        other => {
+-            eprintln!("mailer: unknown argument `{other}`\n{USAGE}");
+-            ExitCode::from(2)
+-        }
++    let request = mailer::parse(std::env::args());
++    match &request {
++        Request::Help => println!("{USAGE}"),
++        Request::Version => println!("mailer {}", env!("CARGO_PKG_VERSION")),
++        Request::Idle => eprintln!("mailer: no listener yet, nothing to do (try --help)"),
++        Request::Unknown(flag) => eprintln!("mailer: unknown argument `{flag}`\n{USAGE}"),
+     }
++    request.exit_code()
+ }
