@@ -1,0 +1,79 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..aebe382
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,16 @@
++# CI calls this project's own entry point and nothing else (step `mailer/1.3-ci`): the checks live
++# in `xtask`, so a local run and a CI run cannot drift.
++name: ci
++
++on:
++  push:
++  pull_request:
++
++jobs:
++  ci:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      # `rust-toolchain.toml` pins the toolchain, so no version is repeated here.
++      - run: rustup show
++      - run: cargo xtask ci
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+index 3395979..5913429 100644
+--- a/xtask/src/main.rs
++++ b/xtask/src/main.rs
+@@ -1,9 +1,23 @@
+ //! `cargo xtask` — this project's own tasks, so CI and a human run exactly the same thing.
+-//!
+-//! The dispatch below is the shape to keep; `ci` is the one that has to be filled in
+-//! (step `mailer/1.3-ci`).
+ 
+-use std::process::ExitCode;
++use std::process::{Command, ExitCode};
++
++/// Every check `cargo xtask ci` runs, in the order that fails fastest.
++///
++/// The list is the contract: CI calls this task and nothing else, so a check that is missing here
++/// is a check nobody runs (docs/plan.md §10).
++const CHECKS: &[&[&str]] = &[
++    &["fmt", "--all", "--check"],
++    &[
++        "clippy",
++        "--workspace",
++        "--all-targets",
++        "--",
++        "-D",
++        "warnings",
++    ],
++    &["test", "--workspace"],
++];
+ 
+ fn main() -> ExitCode {
+     let task = std::env::args().nth(1).unwrap_or_default();
+@@ -20,8 +34,21 @@ fn main() -> ExitCode {
+     }
+ }
+ 
+-/// Run every check CI runs, and fail on the first one that does.
++/// Run every check CI runs, and stop at the first failure.
++///
++/// Progress goes to stderr: stdout stays free for a task that prints something a script reads.
+ fn ci() -> ExitCode {
+-    eprintln!("cargo xtask ci is not implemented yet — see mailer/1.3-ci");
+-    ExitCode::from(1)
++    for check in CHECKS {
++        eprintln!("xtask ci: cargo {}", check.join(" "));
++        let Ok(status) = Command::new("cargo").args(*check).status() else {
++            eprintln!("xtask ci: cargo is not available");
++            return ExitCode::from(2);
++        };
++        if !status.success() {
++            eprintln!("xtask ci: `cargo {}` failed ({status})", check.join(" "));
++            return ExitCode::from(1);
++        }
++    }
++    eprintln!("xtask ci: every check passed");
++    ExitCode::SUCCESS
+ }

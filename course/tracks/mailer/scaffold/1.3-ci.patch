@@ -1,0 +1,73 @@
+diff --git a/.cargo/config.toml b/.cargo/config.toml
+new file mode 100644
+index 0000000..59f24bb
+--- /dev/null
++++ b/.cargo/config.toml
+@@ -0,0 +1,4 @@
++# `cargo xtask <task>` runs the xtask crate. One entry point for every check is what keeps a local
++# run and a CI run in agreement (docs/plan.md §10).
++[alias]
++xtask = "run --quiet --package xtask --"
+diff --git a/Cargo.toml b/Cargo.toml
+index 7cc9ccd..40dab09 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,6 +27,7 @@ workspace = true
+ [workspace]
+ members = [
+     # kiln:scaffold:begin
++    "xtask",
+     # kiln:scaffold:end
+ ]
+ 
+diff --git a/xtask/Cargo.toml b/xtask/Cargo.toml
+new file mode 100644
+index 0000000..fad0168
+--- /dev/null
++++ b/xtask/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "xtask"
++description = "One entry point for every check this project runs"
++version = "0.1.0"
++edition = "2024"
++rust-version = "1.98"
++publish = false
++
++[dependencies]
++
++[lints]
++workspace = true
+diff --git a/xtask/src/main.rs b/xtask/src/main.rs
+new file mode 100644
+index 0000000..3395979
+--- /dev/null
++++ b/xtask/src/main.rs
+@@ -0,0 +1,27 @@
++//! `cargo xtask` — this project's own tasks, so CI and a human run exactly the same thing.
++//!
++//! The dispatch below is the shape to keep; `ci` is the one that has to be filled in
++//! (step `mailer/1.3-ci`).
++
++use std::process::ExitCode;
++
++fn main() -> ExitCode {
++    let task = std::env::args().nth(1).unwrap_or_default();
++    match task.as_str() {
++        "ci" => ci(),
++        "" => {
++            eprintln!("usage: cargo xtask ci");
++            ExitCode::from(2)
++        }
++        other => {
++            eprintln!("unknown task `{other}`: try `cargo xtask ci`");
++            ExitCode::from(2)
++        }
++    }
++}
++
++/// Run every check CI runs, and fail on the first one that does.
++fn ci() -> ExitCode {
++    eprintln!("cargo xtask ci is not implemented yet — see mailer/1.3-ci");
++    ExitCode::from(1)
++}
