@@ -23,7 +23,7 @@ compiles, and the specs tell you what it must do next.
 """
 
 # Shown when the last step of a track is done.
-final = """
+final_message = """
 T1 `mailer` is finished: a service that starts, migrates, mails, retries, drains and ships.
 
 You have the production habits the rest of the course builds on. `kiln list relay` shows what

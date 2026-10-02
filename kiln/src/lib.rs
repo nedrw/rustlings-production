@@ -21,4 +21,7 @@
     )
 )]
 
+pub mod caps;
 pub mod error;
+pub mod gates;
+pub mod info;
