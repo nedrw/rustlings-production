@@ -79,6 +79,7 @@ entry = "docs/steps/en/mailer/1.3-ci.md"
 time_hint = "60m"
 concepts = ["task runner", "CI parity", "fail fast"]
 teaches = ["ci/pipeline@apply"]
+# requires: the task runs fmt/clippy over the workspace members created in 1.1
 requires = ["repo/workspace-layout@apply"]
 run = { cmd = "cargo test -p mailer --test spec_ci" }
 spec = ["spec/1.3/ci.rs"]
@@ -96,6 +97,7 @@ entry = "docs/steps/en/mailer/1.4-config.md"
 time_hint = "90m"
 concepts = ["layered configuration", "override order", "secrets out of the repository"]
 teaches = ["cfg/layered-config@apply", "sec/secrets-management@apply"]
+# requires: startup reads a typed config out of the lib/bin split of 1.1
 requires = ["repo/workspace-layout@apply"]
 run = { cmd = "cargo test -p mailer --test spec_config" }
 spec = ["spec/1.4/config.rs"]
@@ -113,6 +115,7 @@ entry = "docs/steps/en/mailer/1.5-errors.md"
 time_hint = "60m"
 concepts = ["typed errors", "source chain", "status code mapping"]
 teaches = ["err/typed-errors@apply"]
+# requires: startup failures are mapped into the typed errors this enum owns (1.4)
 requires = ["cfg/layered-config@apply"]
 run = { cmd = "cargo test -p mailer --test spec_errors" }
 spec = ["spec/1.5/errors.rs"]
@@ -139,6 +142,7 @@ entry = "docs/steps/en/mailer/1.6-logging.md"
 time_hint = "60m"
 concepts = ["structured logging", "JSON and pretty modes", "request id propagation"]
 teaches = ["obs/structured-logs@apply", "obs/tracing-propagation@aware"]
+# requires: the JSON/pretty mode and log level are config decisions (1.4)
 requires = ["cfg/layered-config@apply"]
 run = { cmd = "cargo test -p mailer --test spec_logging" }
 spec = ["spec/1.6/logging.rs"]
@@ -169,6 +173,7 @@ entry = "docs/steps/en/mailer/1.7-http.md"
 time_hint = "90m"
 concepts = ["routing", "extractors", "graceful 404 and 405"]
 teaches = ["http/service-skeleton@apply"]
+# requires: the listener address comes from config (1.4) and 404/405 answers use the typed errors (1.5)
 requires = ["cfg/layered-config@apply", "err/typed-errors@apply"]
 run = { cmd = "cargo test -p mailer --test spec_http" }
 spec = ["spec/1.7/http.rs"]
@@ -195,6 +200,7 @@ entry = "docs/steps/en/mailer/1.8-test-harness.md"
 time_hint = "90m"
 concepts = ["app factory", "random port", "per-test schema"]
 teaches = ["test/app-factory@apply"]
+# requires: the factory builds the router of 1.7 with per-test configuration (1.4)
 requires = ["http/service-skeleton@apply", "cfg/layered-config@apply"]
 run = { cmd = "cargo test -p mailer --test spec_app_factory" }
 spec = ["spec/1.8/app_factory.rs"]
@@ -221,6 +227,7 @@ entry = "docs/steps/en/mailer/1.9-postgres.md"
 time_hint = "120m"
 concepts = ["migrations", "compile-time checked SQL", "offline metadata"]
 teaches = ["db/migrations@apply"]
+# requires: migrations run before the service serves (1.7), each test gets its own schema (1.8), DATABASE_URL is config (1.4)
 requires = ["cfg/layered-config@apply", "http/service-skeleton@apply", "test/app-factory@apply"]
 run = { cmd = "cargo test -p mailer --test spec_migrations" }
 spec = ["spec/1.9/migrations.rs"]
@@ -249,6 +256,7 @@ entry = "docs/steps/en/mailer/1.10-domain-types.md"
 time_hint = "60m"
 concepts = ["parse don't validate", "newtypes", "round-trip properties"]
 teaches = ["domain/parse-dont-validate@apply"]
+# requires: parser rejections are part of the typed error surface (1.5)
 requires = ["err/typed-errors@apply"]
 run = { cmd = "cargo test -p mailer --test spec_domain_types" }
 spec = ["spec/1.10/domain_types.rs"]
@@ -275,6 +283,7 @@ entry = "docs/steps/en/mailer/1.11-signup.md"
 time_hint = "90m"
 concepts = ["password hashing", "unique constraint", "concurrent signup"]
 teaches = ["db/unique-as-concurrency@apply", "sec/password-hash@apply"]
+# requires: the POST route (1.7), the subscribers table and its unique constraint (1.9), the parsed types (1.10)
 requires = [
     "db/migrations@apply",
     "domain/parse-dont-validate@apply",
@@ -305,6 +314,7 @@ entry = "docs/steps/en/mailer/1.12-token.md"
 time_hint = "90m"
 concepts = ["token lifetime", "single use", "replay"]
 teaches = ["sec/token-lifetime@apply"]
+# requires: tokens are issued during signup (1.11) and stored in a migrated table (1.9)
 requires = ["db/migrations@apply", "sec/password-hash@apply"]
 run = { cmd = "cargo test -p mailer --test spec_confirmation" }
 spec = ["spec/1.12/confirmation.rs"]
@@ -331,6 +341,7 @@ entry = "docs/steps/en/mailer/1.13-email-port.md"
 time_hint = "60m"
 concepts = ["ports and adapters", "fake instead of mock", "failure injection"]
 teaches = ["test/fake-external@apply"]
+# requires: the port returns typed errors (1.5) and carries the confirmation link of 1.12
 requires = ["err/typed-errors@apply", "sec/token-lifetime@apply"]
 run = { cmd = "cargo test -p mailer --test spec_email_port" }
 spec = ["spec/1.13/email_port.rs"]
@@ -361,6 +372,7 @@ entry = "docs/steps/en/mailer/1.14-worker.md"
 time_hint = "120m"
 concepts = ["bounded queue", "drain on shutdown", "retry with jitter"]
 teaches = ["async/backpressure@aware", "async/graceful-shutdown@apply"]
+# requires: shutdown comes from the app skeleton (1.7), queue bounds are config (1.4), delivery goes through the port (1.13)
 requires = [
     "cfg/layered-config@apply",
     "http/service-skeleton@apply",
@@ -391,6 +403,7 @@ entry = "docs/steps/en/mailer/1.15-idempotent-delivery.md"
 time_hint = "90m"
 concepts = ["deduplication key", "delivery state machine", "side effect once"]
 teaches = ["delivery/idempotency@apply"]
+# requires: the deduplication key lives in a migrated table (1.9) and the worker of 1.14 owns the transition
 requires = ["async/graceful-shutdown@apply", "db/migrations@apply"]
 run = { cmd = "cargo test -p mailer --test spec_idempotent_delivery" }
 spec = ["spec/1.15/idempotent_delivery.rs"]
@@ -417,6 +430,7 @@ entry = "docs/steps/en/mailer/1.16-sessions.md"
 time_hint = "90m"
 concepts = ["session cookies", "API keys", "session fixation"]
 teaches = ["sec/authn-session@apply"]
+# requires: the session follows the password check (1.11) and rides on the routes of 1.7
 requires = ["http/service-skeleton@apply", "sec/password-hash@apply"]
 run = { cmd = "cargo test -p mailer --test spec_sessions" }
 spec = ["spec/1.16/sessions.rs"]
@@ -443,6 +457,7 @@ entry = "docs/steps/en/mailer/1.17-newsletter.md"
 time_hint = "90m"
 concepts = ["transactions", "batch insert", "fan-out after commit"]
 teaches = ["db/transactions@apply"]
+# requires: the newsletter rows need migrations (1.9), fan-out is idempotent (1.15) and runs in the worker (1.14)
 requires = [
     "async/graceful-shutdown@apply",
     "db/migrations@apply",
@@ -473,6 +488,7 @@ entry = "docs/steps/en/mailer/1.18-authz-boundary.md"
 time_hint = "60m"
 concepts = ["tenant isolation", "404 over 403", "authorization matrix"]
 teaches = ["sec/authz-tenant-isolation@apply"]
+# requires: the identity comes from the session (1.16) and scoping queries need the subscriber rows (1.9)
 requires = ["db/migrations@apply", "sec/authn-session@apply"]
 run = { cmd = "cargo test -p mailer --test spec_authz" }
 spec = ["spec/1.18/authz.rs"]
@@ -503,6 +519,7 @@ entry = "docs/steps/en/mailer/1.19-test-layering.md"
 time_hint = "120m"
 concepts = ["test layering", "real dependency", "order independence"]
 teaches = ["test/integration-layering@apply"]
+# requires: layered tests build on the factory (1.8) and keep the fake for failure injection (1.13)
 requires = ["test/app-factory@apply", "test/fake-external@apply"]
 run = { cmd = "cargo test -p mailer --test spec_integration" }
 spec = ["spec/1.19/integration.rs"]
@@ -531,6 +548,7 @@ entry = "docs/steps/en/mailer/1.20-metrics.md"
 time_hint = "60m"
 concepts = ["golden signals", "naming conventions", "SLO draft"]
 teaches = ["obs/metrics-slo@aware"]
+# requires: /metrics needs the routes (1.7) and follows the observability baseline of 1.6
 requires = ["http/service-skeleton@apply", "obs/structured-logs@apply"]
 run = { cmd = "cargo test -p mailer --test spec_metrics" }
 spec = ["spec/1.20/metrics.rs"]
@@ -557,6 +575,7 @@ entry = "docs/steps/en/mailer/1.21-container.md"
 time_hint = "120m"
 concepts = ["multi-stage build", "probes", "migrate before traffic"]
 teaches = ["release/container-image@apply"]
+# requires: the image is built by the CI entry point (1.3) and its start-up order depends on typed config (1.4)
 requires = ["ci/pipeline@apply", "cfg/layered-config@apply"]
 run = { cmd = "cargo test -p mailer --test spec_image" }
 spec = ["spec/1.21/image.rs"]
@@ -586,6 +605,7 @@ entry = "docs/steps/en/mailer/1.22-runbook.md"
 time_hint = "120m"
 concepts = ["runbook", "failure drill", "no lost mail"]
 teaches = ["ops/runbook-drill@apply"]
+# requires: the drill runs the container (1.21) and asserts against the metrics baseline (1.20)
 requires = ["obs/metrics-slo@aware", "release/container-image@apply"]
 run = { cmd = "cargo test -p mailer --test spec_runbook_drill" }
 spec = ["spec/1.22/runbook_drill.rs"]
