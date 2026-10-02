@@ -235,16 +235,20 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, ledger_toml, load_course, step_toml, track_toml};
+    use crate::test_support::{TempDir, ledger_toml, load_course, one_track, step_toml};
     use std::path::Path;
 
     /// A course with exactly one step, `mailer/1.1-workspace`.
     fn one_step_course(root: &Path) -> Course {
         load_course(
             root,
-            &track_toml(
+            &one_track(
+                &[step_toml(
+                    "mailer",
+                    "1.1-workspace",
+                    &["repo/workspace-layout@apply"],
+                )],
                 &["repo/workspace-layout@apply"],
-                &[step_toml("1.1-workspace", &["repo/workspace-layout@apply"])],
             ),
             &ledger_toml(&[("repo/workspace-layout", "apply", "mailer/1.1")]),
         )

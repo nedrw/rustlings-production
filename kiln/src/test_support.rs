@@ -62,30 +62,102 @@ welcome = "welcome"
 final_message = "done"
 "#;
 
-/// One `[[step]]` block, valid unless the caller means to break something.
-pub(crate) fn step_toml(id: &str, teaches: &[&str]) -> String {
-    format!(
-        r#"
-[[step]]
-id = "{id}"
-title = "Step {id}"
-kind = "milestone"
-origin = "teach"
-entry = "docs/steps/en/mailer/{id}.md"
-time_hint = "60m"
-teaches = [{}]
-run = {{ cmd = "cargo test -p mailer --test spec" }}
-spec = ["spec/{id}/spec.rs"]
-gates = ["fmt"]
-"#,
-        quoted(teaches)
-    )
+/// One `[[step]]` block, with the defaults of [`Step`].
+pub(crate) fn step_toml(track: &str, id: &str, teaches: &[&str]) -> String {
+    Step::new(track, id, teaches).toml()
 }
 
-/// A `track.toml` whose steps are the given block sources.
-pub(crate) fn track_toml(exit: &[&str], steps: &[String]) -> String {
+/// One `[[step]]` block under construction.
+///
+/// Tests vary one field at a time, so the loop points are methods rather than hand-written TOML
+/// — a fixture that cannot be written is a fixture that quietly stops testing anything.
+pub(crate) struct Step {
+    track: String,
+    id: String,
+    teaches: Vec<String>,
+    origin: String,
+    requires: Vec<String>,
+    gates: Vec<String>,
+    spec: bool,
+    reteach: Option<String>,
+}
+
+impl Step {
+    /// A milestone `teach` step with one spec file and one must gate.
+    pub(crate) fn new(track: &str, id: &str, teaches: &[&str]) -> Self {
+        Self {
+            track: track.to_owned(),
+            id: id.to_owned(),
+            teaches: owned(teaches),
+            origin: "teach".to_owned(),
+            requires: Vec::new(),
+            gates: vec!["fmt".to_owned()],
+            spec: true,
+            reteach: None,
+        }
+    }
+
+    /// Set `origin` (and drop the spec, as a `deepen`/`transfer` step keeps its own evidence).
+    pub(crate) fn origin(mut self, origin: &str) -> Self {
+        self.origin = origin.to_owned();
+        self
+    }
+
+    /// Declare `requires`.
+    pub(crate) fn requires(mut self, requires: &[&str]) -> Self {
+        self.requires = owned(requires);
+        self
+    }
+    /// Replace the gate list.
+    pub(crate) fn gates(mut self, gates: &[&str]) -> Self {
+        self.gates = owned(gates);
+        self
+    }
+
+    /// Include a spec file or not.
+    pub(crate) fn spec(mut self, has_spec: bool) -> Self {
+        self.spec = has_spec;
+        self
+    }
+
+    /// Declare a deliberate re-teach.
+    pub(crate) fn reteach(mut self, reason: &str) -> Self {
+        self.reteach = Some(reason.to_owned());
+        self
+    }
+
+    /// The `[[step]]` block.
+    pub(crate) fn toml(&self) -> String {
+        let mut out = format!(
+            "\n[[step]]\nid = \"{id}\"\ntitle = \"Step {id}\"\nkind = \"milestone\"\n\
+             origin = \"{origin}\"\nentry = \"docs/steps/en/{track}/{id}.md\"\n\
+             time_hint = \"60m\"\nteaches = [{}]\n",
+            quoted_owned(&self.teaches),
+            id = self.id,
+            origin = self.origin,
+            track = self.track,
+        );
+        if !self.requires.is_empty() {
+            out.push_str(&format!("requires = [{}]\n", quoted_owned(&self.requires)));
+        }
+        if !self.gates.is_empty() || self.spec {
+            out.push_str("run = { cmd = \"cargo test\" }\n");
+        }
+        if self.spec {
+            out.push_str(&format!("spec = [\"spec/{}/spec.rs\"]\n", self.id));
+        }
+        out.push_str(&format!("gates = [{}]\n", quoted_owned(&self.gates)));
+        if let Some(reason) = &self.reteach {
+            out.push_str(&format!("reteach = \"{reason}\"\n"));
+        }
+        out
+    }
+}
+
+/// A `track.toml` with the given exit capabilities and step blocks.
+pub(crate) fn track_toml(id: &str, index: u32, exit: &[&str], steps: &[String]) -> String {
     format!(
-        "format_version = 1\nid = \"mailer\"\nindex = 1\ntitle = \"Mailer\"\nproject = \"app/mailer\"\nexit = [{}]\n{}",
+        "format_version = 1\nid = \"{id}\"\nindex = {index}\ntitle = \"{id}\"\nproject = \"app/{id}\"\nexit = [{}]\n{}",
         quoted(exit),
         steps.join("\n")
     )
@@ -110,12 +182,22 @@ pub(crate) fn ledger_toml(slots: &[(&str, &str, &str)]) -> String {
     out
 }
 
-/// Write a one-track course into `root` and load it through the real loader.
-pub(crate) fn load_course(root: &Path, track: &str, ledger: &str) -> Course {
+/// A track fixture: id, position in the path, and the `track.toml` body.
+pub(crate) type TrackFixture = (&'static str, u32, String);
+
+/// Write a course with the given tracks and load it through the real loader.
+pub(crate) fn load_course(root: &Path, tracks: &[TrackFixture], ledger: &str) -> Course {
     write(root, "course/course.toml", MANIFEST_TOML);
     write(root, "course/capabilities.toml", ledger);
-    write(root, "course/tracks/mailer/track.toml", track);
+    for (id, _, body) in tracks {
+        write(root, &format!("course/tracks/{id}/track.toml"), body);
+    }
     Course::load(root).expect("fixture course should load")
+}
+
+/// The loop of a track whose steps are the given blocks: `mailer`, index 1, one exit slot.
+pub(crate) fn one_track(steps: &[String], exit: &[&str]) -> Vec<TrackFixture> {
+    vec![("mailer", 1, track_toml("mailer", 1, exit, steps))]
 }
 
 fn quoted(items: &[&str]) -> String {
@@ -124,4 +206,13 @@ fn quoted(items: &[&str]) -> String {
         .map(|item| format!("\"{item}\""))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Quote a list of already-owned strings.
+fn quoted_owned(items: &[String]) -> String {
+    quoted(&items.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn owned(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
 }

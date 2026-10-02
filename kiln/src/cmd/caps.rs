@@ -118,7 +118,7 @@ fn evidence_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempDir, ledger_toml, load_course, step_toml, track_toml};
+    use crate::test_support::{TempDir, ledger_toml, load_course, one_track, step_toml};
 
     /// A ledger slot must degrade to a readable position when its track or step is not authored
     /// yet: the ledger covers all 118 planned steps, only 22 of which exist as metadata.
@@ -127,9 +127,13 @@ mod tests {
         let temp = TempDir::new("cmd-caps-resolve");
         let course = load_course(
             temp.path(),
-            &track_toml(
+            &one_track(
+                &[step_toml(
+                    "mailer",
+                    "1.1-workspace",
+                    &["repo/workspace-layout@apply"],
+                )],
                 &["repo/workspace-layout@apply"],
-                &[step_toml("1.1-workspace", &["repo/workspace-layout@apply"])],
             ),
             &ledger_toml(&[
                 ("repo/workspace-layout", "apply", "mailer/1.1"),

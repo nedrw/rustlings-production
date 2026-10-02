@@ -142,17 +142,17 @@ fn honesty_marks(session: &Session, step_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::state::State;
-    use crate::test_support::{TempDir, ledger_toml, load_course, step_toml, track_toml};
+    use crate::test_support::{TempDir, ledger_toml, load_course, one_track, step_toml};
 
     fn course(temp: &TempDir) -> crate::info::Course {
         load_course(
             temp.path(),
-            &track_toml(
-                &["repo/toolchain-pinning@apply"],
+            &one_track(
                 &[
-                    step_toml("1.1-workspace", &["repo/workspace-layout@apply"]),
-                    step_toml("1.2-toolchain", &["repo/toolchain-pinning@apply"]),
+                    step_toml("mailer", "1.1-workspace", &["repo/workspace-layout@apply"]),
+                    step_toml("mailer", "1.2-toolchain", &["repo/toolchain-pinning@apply"]),
                 ],
+                &["repo/toolchain-pinning@apply"],
             ),
             &ledger_toml(&[
                 ("repo/workspace-layout", "apply", "mailer/1.1"),

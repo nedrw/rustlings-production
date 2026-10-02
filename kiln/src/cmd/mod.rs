@@ -24,6 +24,7 @@ use crate::info::Course;
 use crate::state::State;
 
 pub mod caps;
+pub mod lint_caps;
 pub mod list;
 
 /// Command line interface of the course runner.
@@ -63,6 +64,11 @@ pub enum Command {
         #[arg(long, value_name = "TRACK")]
         track: Option<String>,
     },
+
+    /// Course self-check: the metadata rules R0-R6 over `capabilities.toml` and `track.toml`.
+    ///
+    /// Prose rules (R5) report themselves as skipped while step bodies are not authored yet.
+    LintCaps,
 }
 
 /// Run the CLI and turn its result into a process exit code.
@@ -81,6 +87,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
     match &cli.command {
         Some(Command::List { track }) => list::run(&session, track.as_deref()),
         Some(Command::Caps { track }) => caps::run(&session, track.as_deref()),
+        Some(Command::LintCaps) => lint_caps::run(&session),
         None => list::welcome(&session),
     }
 }

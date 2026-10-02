@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::KilnError;
 
 pub mod ledger;
+pub mod lint;
 
-pub use ledger::Ledger;
+pub use ledger::{Ledger, SlotPosition};
 
 /// Depth at which a capability is established (curriculum.md §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
