@@ -1,0 +1,605 @@
+# T1 `mailer` — subscription microservice (22 steps), see `docs/curriculum.md` §6.
+#
+# Conventions (all enforced by `kiln lint-caps` unless noted):
+#
+# * `id` is local to the track: `<phase>.<index>-<slug>`; the CLI and the docs use the
+#   fully qualified `<track>/<id>` (authoring.md §1).
+# * `teaches` must match the capability ledger (`course/capabilities.toml`) exactly, slot by
+#   slot — the ledger is the source of truth, this file points at its positions.
+# * `requires` is not tabulated in the curriculum: it lists the slots a step provably builds on,
+#   derived from the step text and kept minimal (each one is taught earlier in this track).
+# * `entry`, `spec`, `scaffold`, `solution` are relative to this track directory; `entry`
+#   additionally carries the `docs/steps/<locale>/` segment the i18n layer rewrites.
+# * `run.cmd` is executed in the learner project (`project` below), never through a shell.
+# * `gates` use the DSL of authoring.md §7 and only ever tighten along the track: the ladder
+#   from plan §6 starts at step 1 and each later step keeps every earlier rung.
+
+format_version = 1
+id = "mailer"
+index = 1
+title = "Mailer — subscription microservice"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/mailer"
+
+# Exit capabilities (curriculum.md §5): whatever else happens, these are established here.
+exit = [
+    "db/migrations@apply",
+    "async/graceful-shutdown@apply",
+    "err/typed-errors@apply",
+    "http/service-skeleton@apply",
+    "obs/metrics-slo@aware",
+    "release/container-image@apply",
+]
+
+# ---------------------------------------------------------------------------------------
+# Phase A — skeleton and toolchain (1.1-1.6): a service that starts, logs, and fails well.
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "1.1-workspace"
+title = "Split the crate into a library and a thin binary"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.1-workspace.md"
+time_hint = "60m"
+concepts = ["lib/bin split", "workspace layout", "thin main"]
+teaches = ["repo/workspace-layout@apply"]
+requires = []
+run = { cmd = "cargo test -p mailer --test spec_layout" }
+spec = ["spec/1.1/layout.rs"]
+scaffold = "scaffold/1.1-workspace.patch"
+solution = "solutions/1.1-workspace.patch"
+gates = ["spec-integrity", "caps", "i18n"]
+hint = "`cargo metadata` decides whether the layout is right, so keep logic out of `main.rs` and let the library own everything the specs touch."
+
+[[step]]
+id = "1.2-toolchain"
+title = "Pin the toolchain, formatting and lint policy"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.2-toolchain.md"
+time_hint = "45m"
+concepts = ["toolchain pinning", "workspace lints", "MSRV policy"]
+teaches = ["repo/toolchain-pinning@apply"]
+requires = []
+run = { cmd = "cargo test -p mailer --test spec_style" }
+spec = ["spec/1.2/style.rs"]
+scaffold = "scaffold/1.2-toolchain.patch"
+solution = "solutions/1.2-toolchain.patch"
+gates = ["spec-integrity", "caps", "i18n", "fmt", "clippy@1"]
+hint = "`rust-toolchain.toml` is the only place the compiler version lives; style belongs in `rustfmt.toml` and `[workspace.lints]`, not in review comments."
+
+[[step]]
+id = "1.3-ci"
+title = "One command for every check, wired into CI"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.3-ci.md"
+time_hint = "60m"
+concepts = ["task runner", "CI parity", "fail fast"]
+teaches = ["ci/pipeline@apply"]
+requires = ["repo/workspace-layout@apply"]
+run = { cmd = "cargo test -p mailer --test spec_ci" }
+spec = ["spec/1.3/ci.rs"]
+scaffold = "scaffold/1.3-ci.patch"
+solution = "solutions/1.3-ci.patch"
+gates = ["spec-integrity", "caps", "i18n", "fmt", "clippy@1"]
+hint = "Make CI call the same entry point you run locally (`cargo xtask ci`); YAML that re-implements the checks is how local-green/CI-red starts."
+
+[[step]]
+id = "1.4-config"
+title = "Typed configuration with a documented override order"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.4-config.md"
+time_hint = "90m"
+concepts = ["layered configuration", "override order", "secrets out of the repository"]
+teaches = ["cfg/layered-config@apply", "sec/secrets-management@apply"]
+requires = ["repo/workspace-layout@apply"]
+run = { cmd = "cargo test -p mailer --test spec_config" }
+spec = ["spec/1.4/config.rs"]
+scaffold = "scaffold/1.4-config.patch"
+solution = "solutions/1.4-config.patch"
+gates = ["spec-integrity", "caps", "i18n", "fmt", "clippy@1", "exit-code"]
+hint = "Pin the order first (defaults < file < environment < flag) and test all four at once; a bad config must exit non-zero before the listener binds."
+
+[[step]]
+id = "1.5-errors"
+title = "Errors as part of the API"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.5-errors.md"
+time_hint = "60m"
+concepts = ["typed errors", "source chain", "status code mapping"]
+teaches = ["err/typed-errors@apply"]
+requires = ["cfg/layered-config@apply"]
+run = { cmd = "cargo test -p mailer --test spec_errors" }
+spec = ["spec/1.5/errors.rs"]
+scaffold = "scaffold/1.5-errors.patch"
+solution = "solutions/1.5-errors.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Model the failures the caller has to react to; `anyhow` is for the boundary that logs and exits, not for the library that returns."
+
+[[step]]
+id = "1.6-logging"
+title = "Structured logs and a request id per request"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.6-logging.md"
+time_hint = "60m"
+concepts = ["structured logging", "JSON and pretty modes", "request id propagation"]
+teaches = ["obs/structured-logs@apply", "obs/tracing-propagation@aware"]
+requires = ["cfg/layered-config@apply"]
+run = { cmd = "cargo test -p mailer --test spec_logging" }
+spec = ["spec/1.6/logging.rs"]
+scaffold = "scaffold/1.6-logging.patch"
+solution = "solutions/1.6-logging.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Log fields, not sentences: assert against a captured JSON writer so a renamed field breaks the test instead of a dashboard."
+
+# ---------------------------------------------------------------------------------------
+# Phase B — service and data (1.7-1.13): HTTP, Postgres, domain types, signup.
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "1.7-http"
+title = "HTTP skeleton: routes, extractors, honest 404 and 405"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.7-http.md"
+time_hint = "90m"
+concepts = ["routing", "extractors", "graceful 404 and 405"]
+teaches = ["http/service-skeleton@apply"]
+requires = ["cfg/layered-config@apply", "err/typed-errors@apply"]
+run = { cmd = "cargo test -p mailer --test spec_http" }
+spec = ["spec/1.7/http.rs"]
+scaffold = "scaffold/1.7-http.patch"
+solution = "solutions/1.7-http.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "405 with an `Allow` header comes from the router, not from a catch-all route; `/healthz` must answer before any dependency is ready."
+
+[[step]]
+id = "1.8-test-harness"
+title = "End-to-end test harness: an app factory on a random port"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.8-test-harness.md"
+time_hint = "90m"
+concepts = ["app factory", "random port", "per-test schema"]
+teaches = ["test/app-factory@apply"]
+requires = ["http/service-skeleton@apply", "cfg/layered-config@apply"]
+run = { cmd = "cargo test -p mailer --test spec_app_factory" }
+spec = ["spec/1.8/app_factory.rs"]
+scaffold = "scaffold/1.8-test-harness.patch"
+solution = "solutions/1.8-test-harness.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "One factory, one random port, one schema per test: no shared mutable state, and no `sleep` to wait for the server to come up."
+
+[[step]]
+id = "1.9-postgres"
+title = "Postgres and migrations: compile-time checked SQL"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.9-postgres.md"
+time_hint = "120m"
+concepts = ["migrations", "compile-time checked SQL", "offline metadata"]
+teaches = ["db/migrations@apply"]
+requires = ["cfg/layered-config@apply", "http/service-skeleton@apply", "test/app-factory@apply"]
+run = { cmd = "cargo test -p mailer --test spec_migrations" }
+spec = ["spec/1.9/migrations.rs"]
+scaffold = "scaffold/1.9-postgres.patch"
+solution = "solutions/1.9-postgres.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+    "images",
+]
+hint = "Migrations run before the service accepts traffic, and `.sqlx` metadata is committed so the crate still builds where no database is running."
+images = ["postgres:17-alpine"]
+
+[[step]]
+id = "1.10-domain-types"
+title = "Domain types: parse, don't validate"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.10-domain-types.md"
+time_hint = "60m"
+concepts = ["parse don't validate", "newtypes", "round-trip properties"]
+teaches = ["domain/parse-dont-validate@apply"]
+requires = ["err/typed-errors@apply"]
+run = { cmd = "cargo test -p mailer --test spec_domain_types" }
+spec = ["spec/1.10/domain_types.rs"]
+scaffold = "scaffold/1.10-domain-types.patch"
+solution = "solutions/1.10-domain-types.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Make the invalid value unrepresentable where it is constructed; the property test round-trips everything the parser accepts and rejects the sample set."
+
+[[step]]
+id = "1.11-signup"
+title = "Signup: password hashing and a unique constraint as a concurrency primitive"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.11-signup.md"
+time_hint = "90m"
+concepts = ["password hashing", "unique constraint", "concurrent signup"]
+teaches = ["db/unique-as-concurrency@apply", "sec/password-hash@apply"]
+requires = [
+    "db/migrations@apply",
+    "domain/parse-dont-validate@apply",
+    "http/service-skeleton@apply",
+]
+run = { cmd = "cargo test -p mailer --test spec_signup" }
+spec = ["spec/1.11/signup.rs"]
+scaffold = "scaffold/1.11-signup.patch"
+solution = "solutions/1.11-signup.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Let the database decide: two concurrent signups must race on the unique constraint, not on a read-then-write in application code."
+
+[[step]]
+id = "1.12-token"
+title = "Confirmation tokens: issue, verify, expire, single use"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.12-token.md"
+time_hint = "90m"
+concepts = ["token lifetime", "single use", "replay"]
+teaches = ["sec/token-lifetime@apply"]
+requires = ["db/migrations@apply", "sec/password-hash@apply"]
+run = { cmd = "cargo test -p mailer --test spec_confirmation" }
+spec = ["spec/1.12/confirmation.rs"]
+scaffold = "scaffold/1.12-token.patch"
+solution = "solutions/1.12-token.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Three failures to design against, not one: expired, replayed, tampered. A token that survives any of them was never a token."
+
+[[step]]
+id = "1.13-email-port"
+title = "Email port and a fake implementation"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.13-email-port.md"
+time_hint = "60m"
+concepts = ["ports and adapters", "fake instead of mock", "failure injection"]
+teaches = ["test/fake-external@apply"]
+requires = ["err/typed-errors@apply", "sec/token-lifetime@apply"]
+run = { cmd = "cargo test -p mailer --test spec_email_port" }
+spec = ["spec/1.13/email_port.rs"]
+scaffold = "scaffold/1.13-email-port.patch"
+solution = "solutions/1.13-email-port.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "The port is a trait and the fake is part of the harness: failure injection is a constructor argument, not a mocking framework."
+
+# ---------------------------------------------------------------------------------------
+# Phase C — background work and boundaries (1.14-1.18).
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "1.14-worker"
+title = "Background delivery worker: bounded queue, drain on shutdown"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.14-worker.md"
+time_hint = "120m"
+concepts = ["bounded queue", "drain on shutdown", "retry with jitter"]
+teaches = ["async/backpressure@aware", "async/graceful-shutdown@apply"]
+requires = [
+    "cfg/layered-config@apply",
+    "http/service-skeleton@apply",
+    "test/fake-external@apply",
+]
+run = { cmd = "cargo test -p mailer --test spec_worker" }
+spec = ["spec/1.14/worker.rs"]
+scaffold = "scaffold/1.14-worker.patch"
+solution = "solutions/1.14-worker.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Stop accepting first, then drain in-flight work, then force-exit on the deadline; the queue is bounded and the overflow policy is a decision you have to make."
+
+[[step]]
+id = "1.15-idempotent-delivery"
+title = "Idempotent delivery: one confirmation email per subscriber"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.15-idempotent-delivery.md"
+time_hint = "90m"
+concepts = ["deduplication key", "delivery state machine", "side effect once"]
+teaches = ["delivery/idempotency@apply"]
+requires = ["async/graceful-shutdown@apply", "db/migrations@apply"]
+run = { cmd = "cargo test -p mailer --test spec_idempotent_delivery" }
+spec = ["spec/1.15/idempotent_delivery.rs"]
+scaffold = "scaffold/1.15-idempotent-delivery.patch"
+solution = "solutions/1.15-idempotent-delivery.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Deduplicate on the key that identifies the side effect, and put the transition in the database: the unique thing is the delivery attempt, not the email body."
+
+[[step]]
+id = "1.16-sessions"
+title = "Sessions and authentication: cookies versus API keys"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.16-sessions.md"
+time_hint = "90m"
+concepts = ["session cookies", "API keys", "session fixation"]
+teaches = ["sec/authn-session@apply"]
+requires = ["http/service-skeleton@apply", "sec/password-hash@apply"]
+run = { cmd = "cargo test -p mailer --test spec_sessions" }
+spec = ["spec/1.16/sessions.rs"]
+scaffold = "scaffold/1.16-sessions.patch"
+solution = "solutions/1.16-sessions.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Session cookies and API keys answer different questions; pick one for the browser flow, fix the session on login, and expire it on logout."
+
+[[step]]
+id = "1.17-newsletter"
+title = "Publish a newsletter: transactional write, background fan-out"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.17-newsletter.md"
+time_hint = "90m"
+concepts = ["transactions", "batch insert", "fan-out after commit"]
+teaches = ["db/transactions@apply"]
+requires = [
+    "async/graceful-shutdown@apply",
+    "db/migrations@apply",
+    "delivery/idempotency@apply",
+]
+run = { cmd = "cargo test -p mailer --test spec_newsletter" }
+spec = ["spec/1.17/newsletter.rs"]
+scaffold = "scaffold/1.17-newsletter.patch"
+solution = "solutions/1.17-newsletter.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Write the newsletter and its per-subscriber rows in one transaction; the fan-out happens after the commit, never inside it, so a partial failure leaves no half-published issue."
+
+[[step]]
+id = "1.18-authz-boundary"
+title = "Authorization boundary: a subscriber only reads their own data"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.18-authz-boundary.md"
+time_hint = "60m"
+concepts = ["tenant isolation", "404 over 403", "authorization matrix"]
+teaches = ["sec/authz-tenant-isolation@apply"]
+requires = ["db/migrations@apply", "sec/authn-session@apply"]
+run = { cmd = "cargo test -p mailer --test spec_authz" }
+spec = ["spec/1.18/authz.rs"]
+scaffold = "scaffold/1.18-authz-boundary.patch"
+solution = "solutions/1.18-authz-boundary.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Scope the query by the authenticated subject instead of filtering after the fetch; a resource the caller does not own is a 404, because 403 leaks that it exists."
+
+# ---------------------------------------------------------------------------------------
+# Phase D — quality and delivery (1.19-1.22).
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "1.19-test-layering"
+title = "Test layering with a real mail server container"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.19-test-layering.md"
+time_hint = "120m"
+concepts = ["test layering", "real dependency", "order independence"]
+teaches = ["test/integration-layering@apply"]
+requires = ["test/app-factory@apply", "test/fake-external@apply"]
+run = { cmd = "cargo test -p mailer --test spec_integration" }
+spec = ["spec/1.19/integration.rs"]
+scaffold = "scaffold/1.19-test-layering.patch"
+solution = "solutions/1.19-test-layering.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+    "images",
+]
+hint = "Keep the fake for failure injection and add the container for the real protocol; the suite has to pass three times in a row in random order."
+images = ["axllent/mailpit:v1.21"]
+
+[[step]]
+id = "1.20-metrics"
+title = "Metrics and an SLO baseline"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.20-metrics.md"
+time_hint = "60m"
+concepts = ["golden signals", "naming conventions", "SLO draft"]
+teaches = ["obs/metrics-slo@aware"]
+requires = ["http/service-skeleton@apply", "obs/structured-logs@apply"]
+run = { cmd = "cargo test -p mailer --test spec_metrics" }
+spec = ["spec/1.20/metrics.rs"]
+scaffold = "scaffold/1.20-metrics.patch"
+solution = "solutions/1.20-metrics.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+]
+hint = "Metric names and labels are an API: fixed vocabulary, bounded cardinality, and a snapshot test that fails when a label drifts."
+
+[[step]]
+id = "1.21-container"
+title = "Containerize and deploy: multi-stage image, probes, migration order"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.21-container.md"
+time_hint = "120m"
+concepts = ["multi-stage build", "probes", "migrate before traffic"]
+teaches = ["release/container-image@apply"]
+requires = ["ci/pipeline@apply", "cfg/layered-config@apply"]
+run = { cmd = "cargo test -p mailer --test spec_image" }
+spec = ["spec/1.21/image.rs"]
+scaffold = "scaffold/1.21-container.patch"
+solution = "solutions/1.21-container.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+    "container-repro",
+]
+hint = "The image must run the same binary you tested, and the start-up contract (probe, migration, then traffic) belongs in the code, not in the deployment docs."
+
+# The one `design` step of this track: the deliverable is a runbook, and the drill script is what
+# proves the runbook works (evidence for `design` per curriculum.md §2.1).
+[[step]]
+id = "1.22-runbook"
+title = "Runbook and the first failure drill"
+kind = "design"
+origin = "teach"
+entry = "docs/steps/en/mailer/1.22-runbook.md"
+time_hint = "120m"
+concepts = ["runbook", "failure drill", "no lost mail"]
+teaches = ["ops/runbook-drill@apply"]
+requires = ["obs/metrics-slo@aware", "release/container-image@apply"]
+run = { cmd = "cargo test -p mailer --test spec_runbook_drill" }
+spec = ["spec/1.22/runbook_drill.rs"]
+scaffold = "scaffold/1.22-runbook.patch"
+solution = "solutions/1.22-runbook.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+    "links",
+]
+hint = "Write the runbook as the drill you will replay: a script asserts recovery (no lost mail, exit code honest), and the page says what a human does when the script fails."

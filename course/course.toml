@@ -1,0 +1,31 @@
+# Course manifest — the file every `kiln` command starts from (plan §4).
+#
+# Metadata only: the runner must be replaceable (xtask, an editor plugin, a web front end)
+# without the course content moving, so nothing here is derived from code.
+
+format_version = 1
+
+# Locale holding the source text of every step. Other locales fall back to it (plan §3 D5).
+default_locale = "en"
+
+# Track a bare `kiln` invocation continues.
+default_track = "mailer"
+
+# Shown before the first step of a track. May name the commands a learner will actually type.
+welcome = """
+Welcome to rustlings-production.
+
+kiln judges one step at a time. `kiln list` shows where you are, `kiln run` runs the current
+step's spec tests, `kiln check` runs its production gates, `kiln hint` nudges when you are stuck.
+
+Every step happens inside a real project under `app/<track>`: you inherit a service that already
+compiles, and the specs tell you what it must do next.
+"""
+
+# Shown when the last step of a track is done.
+final = """
+T1 `mailer` is finished: a service that starts, migrates, mails, retries, drains and ships.
+
+You have the production habits the rest of the course builds on. `kiln list relay` shows what
+T2 asks of you next — the same capabilities under harder failure modes, with fewer hints.
+"""
