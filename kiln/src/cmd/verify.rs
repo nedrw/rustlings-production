@@ -196,18 +196,10 @@ fn summary(ran: &crate::process::Ran) -> String {
     }
     match ran.code {
         Some(0) => "exit code 0".to_owned(),
-        Some(code) => {
-            let first = if ran.stderr.trim().is_empty() {
-                &ran.stdout
-            } else {
-                &ran.stderr
-            };
-            let line = first
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .map_or("no output", str::trim);
-            format!("exit code {code}: {line}")
-        }
+        Some(code) => match ran.first_message() {
+            Some(line) => format!("exit code {code}: {line}"),
+            None => format!("exit code {code}"),
+        },
         None => "killed by a signal".to_owned(),
     }
 }

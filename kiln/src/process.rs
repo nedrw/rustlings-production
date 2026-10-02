@@ -48,6 +48,23 @@ impl Ran {
         self.stderr.lines().find(|line| !line.trim().is_empty())
     }
 
+    /// First line that says something about the outcome.
+    ///
+    /// Cargo narrates as it goes (`Compiling …`, `Finished …`), and those lines are the first thing
+    /// a report would otherwise quote at a learner. Skipping them is what makes an exit-code summary
+    /// useful instead of noise.
+    #[must_use]
+    pub fn first_message(&self) -> Option<&str> {
+        let text = if self.stderr.trim().is_empty() {
+            &self.stdout
+        } else {
+            &self.stderr
+        };
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !is_progress(line))
+    }
+
     /// One-line description used when a command is only a probe.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -172,6 +189,23 @@ pub fn command_line(program: &str, args: &[&str]) -> String {
     format!("{program} {}", args.join(" "))
 }
 
+/// `true` for a line that only reports progress.
+#[must_use]
+fn is_progress(line: &str) -> bool {
+    [
+        "Compiling",
+        "Checking",
+        "Finished",
+        "Running",
+        "Blocking",
+        "Downloading",
+        "Updating",
+        "Documenting",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
 /// Read a stream to the end, keeping at most [`OUTPUT_CAP`] bytes.
 fn drain(mut reader: impl Read) -> String {
     let mut buffer = Vec::new();
@@ -256,5 +290,22 @@ mod tests {
 
         let error = run_line("   ", temp.path(), Duration::from_secs(30)).unwrap_err();
         assert!(error.to_string().contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn progress_lines_are_skipped_when_summarising_output() {
+        let temp = TempDir::new("process-summary");
+        let ran = run(
+            "sh",
+            &[
+                "-c",
+                "printf '   Compiling mailer v0.1.0\\n    Finished dev\\nerror: it broke\\n' >&2; exit 101",
+            ],
+            temp.path(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(ran.first_stderr_line(), Some("   Compiling mailer v0.1.0"));
+        assert_eq!(ran.first_message(), Some("error: it broke"));
     }
 }

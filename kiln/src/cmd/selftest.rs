@@ -304,11 +304,7 @@ fn summary(ran: &Ran) -> String {
 }
 
 fn first_line(ran: &Ran) -> String {
-    let line = complaint(ran)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !is_progress(line))
-        .map_or_else(|| "no output".to_owned(), str::to_owned);
+    let line = ran.first_message().unwrap_or("no output").to_owned();
     if line.chars().count() > 120 {
         let head: String = line.chars().take(117).collect();
         return format!("{head}...");
@@ -323,22 +319,6 @@ fn complaint(ran: &Ran) -> String {
     } else {
         ran.stderr.clone()
     }
-}
-
-/// `true` for cargo's progress lines, which say nothing about what went wrong.
-fn is_progress(line: &str) -> bool {
-    [
-        "Compiling",
-        "Checking",
-        "Finished",
-        "Running",
-        "Blocking",
-        "Downloading",
-        "Updating",
-        "Documenting",
-    ]
-    .iter()
-    .any(|prefix| line.starts_with(prefix))
 }
 
 fn clip(ran: &Ran) -> String {
