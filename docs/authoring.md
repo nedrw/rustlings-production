@@ -10,13 +10,20 @@
 | 步骤 id | `<track>/<phase>.<index>-<slug>` | `mailer/2.15-shutdown-leases` |
 | 正文（英文源） | `docs/steps/en/<track>/<phase>.<index>-<slug>.md` | `docs/steps/en/mailer/1.14-worker.md` |
 | 译文 | `docs/steps/<locale>/<track>/…`（同名文件） | `docs/steps/zh-Hans/mailer/1.14-worker.md` |
-| 规格测试 | `spec/<phase>.<index>/<name>.rs` | `spec/1.14/worker.rs` |
+| 规格测试（真源） | `spec/<phase>.<index>/<name>.rs` | `spec/1.14/worker.rs` |
+| 规格哈希清单（生成物） | `spec/manifest.toml` | 由 `kiln spec manifest` 重写，不手改 |
 | scaffold patch | `scaffold/<phase>.<index>-<slug>.patch` | `scaffold/1.14-worker.patch` |
+| track 骨架 | `skeleton/`（整条 track 一份，第一步用它） | `skeleton/src/main.rs` |
 | 参考解 patch | `solutions/<phase>.<index>-<slug>.patch` | `solutions/1.14-worker.patch` |
 | 能力 id | `<domain>/<name>`，小写连字符 | `async/graceful-shutdown` |
 | probe / drill | `probes/<capability>.rs` / `drills/<slug>.rs` | `probes/async-graceful-shutdown.rs` |
 
 slug 用英文、连字符、动词优先（`rate-limit-by-tenant` 优于 `tenant-limit`）。
+
+规格文件会被同步进学员项目：`spec/<phase>.<index>/<name>.rs` 变成 `tests/spec_<name>.rs`，也就是
+`run.cmd` 的 `--test spec_<name>` 能启动的那个 target。这条映射是一条规则（不是命名建议）：
+`kiln` 在 `spec-integrity` 里对照它，`cargo xtask ci` 也会检查 `track.toml` 里的 `spec` 与 `run.cmd`
+是否对得上。所以**名字必须小写下划线**，且一个步骤至少要有一个 `run.cmd` 指向的目标。
 
 ## 2. 元数据的唯一真源
 
@@ -113,8 +120,10 @@ recovery latency against duplicate work, and clock skew decides who wins.
 
 scaffold 会把新模块的骨架与依赖加进学员项目。它必须是**加性**的，否则必然与学员的编辑冲突：
 
-1. **只允许两种操作**：新增文件；在标记块内插入行。
-2. 标记块长这样（`Cargo.toml`、`lib.rs` 的模块注册、路由注册同理）：
+1. **只允许两种操作**：新增文件；在标记块内插入行。`kiln` 自己执行补丁，并在应用前就拒绝
+   含删除行的 scaffold，所以违反这条的课程文件不会被悄悄应用。
+2. 标记块长这样（`Cargo.toml` 用 `#`，Rust 文件用 `//`；`kiln` 只找行里的
+   `kiln:scaffold:begin` / `kiln:scaffold:end` 记号，不关心注释语法）：
 
 ```toml
 [dependencies]
@@ -123,10 +132,41 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 # kiln:scaffold:end
 ```
 
-3. **绝不允许**修改标记块之外的任何行（包括格式化结果）。
+3. **绝不允许**修改标记块之外的任何行（包括格式化结果）。插入点必须在既有标记块**内部**：
+   scaffold 不能自己新建一个标记块，所以标记块由骨架或更早的创建文件写定 —— 学员因此能一眼看出
+   课程以后会改哪些区域。
 4. scaffold 决定**函数签名**：规格测试只依赖 scaffold 里声明的签名，学员改签名就会编译失败——
-   这是明确反馈，不是玄学。`kiln reset <step>` 恢复签名与骨架，但保留学员的实现文件内容（冲突时保留学员版本并告警）。
+   这是明确反馈，不是玄学。
 5. scaffold patch 必须在**参考解之前**应用：`selftest` 的顺序是 `scaffold → 期望失败 → 应用参考解 → 期望全绿`。
+
+`kiln run <step>` 与 `kiln check <step>` 都会先把这个步骤准备好（同步规格 + 应用 scaffold），两步都是幂等的：
+
+- 文件已经存在且内容一致 → 什么都不做；
+- 文件已经存在但内容不同 → **保留学员的版本**并说明（scaffold 永不覆盖学员代码）；
+- 插入行已经在位 → 视为已应用。
+
+### 5.1 第一步的 scaffold 就是 track 骨架
+
+一条 track 的第一步没有“在什么之上打补丁”，所以它的 `scaffold` 直接写 `"skeleton"`：把
+`course/tracks/<track>/skeleton/` 里缺少的文件复制进 `app/<track>`。骨架同样绝不覆盖已有文件（对比
+track 骨架的规则与 patch 的规则一样）。
+
+这也是 track 决定自身“每个 track 是独立 workspace”（plan §3 D6）的地方：骨架里就有 `[workspace]`，
+而仓库根 `Cargo.toml` 用 `exclude = ["app"]` 把 `app/` 挡在课程 workspace 之外，两边不会互相干扰。
+
+### 5.2 有些步骤没有 scaffold
+
+只改学员自己文件的步骤（例如 `mailer/1.2-toolchain`：工具链钉版、风格设置、lint 策略都是学员要做的决定）
+不声明 scaffold。`kiln` 不会抱怨：没有 scaffold 的步骤只做规格同步。给这种步骤硬塞一个 scaffold，等于把学员
+该做的决定替他做了。
+
+### 5.3 scaffold 与参考解的对称性
+
+- **参考解**是普通 patch：它可以改写、删除、新增，并且在树的形状与它预期不符时**拒绝应用**（不猜）。
+  它作用于 scaffold 之后的那个状态，所以 `selftest` 才能验证“scaffold 必败 / 参考解必全绿”。
+- **`kiln reset <step>`** 把 scaffold 的加值收回去：去掉仍在原位的插入行，删掉没人动过的创建文件；
+  学员编辑过的文件保留并提示。reset 之后 `kiln run <step>` 会把 scaffold 重新放回去。reset 不会删除
+  任何不是 scaffold（或参考解）创建的文件。
 
 ## 6. 规格测试规则
 
@@ -135,6 +175,13 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 3. 一个步骤可以有多个规格文件，但 `run.cmd` 只跑一个测试目标，避免「跑哪几个」变成隐性知识。
 4. 不能用 `sleep` 做同步；用事件/通道/轮询条件（`wait_for`）等待。时间相关用注入时钟。
 5. 测试失败信息要能指向 TRAP：断言消息里写「what to check next」，而不是只写 `assert!(x == y)`。
+6. **优先行为断言，而不是“文件存在”**。能观察的行为：编译器的看法（`cargo check --lib` 告诉你有
+   没有 library target）、程序跑起来的输出与退出码、编译失败本身（拿一个故意的坏文件让被禁的 lint 顶回
+   来）、`cargo xtask ci` 在干净树上绿、在坏树上红。做不到行为断言时（例：黑盒规格无法调用一个
+   可能还不存在的 library），就退回去量一个结构事实，**并在正文里写明为什么**。
+7. 规格文件也会进 fmt/clippy 的 `--all-targets`，所以它自己必须 rustfmt 干净、没有 warning：
+   课程不能要求学员遵守自己都不遵守的 fmt。`rustfmt --edition 2024 --config-path rustfmt.toml --check \
+  course/tracks/*/spec/**/*.rs` 可以本地验证（`kiln spec manifest` 之后记得重生成清单）。
 
 ## 7. 闸门
 
@@ -154,8 +201,20 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 2. 新增闸门必须同时提供**缺失工具时的可执行提示**（`cargo install cargo-mutants` 这类），不允许只抛退出码。
 3. 闸门不得依赖 GNU userland（无 `timeout`、无 GNU-only 参数）；超时在 Rust 侧实现。
 4. 闸门只对**目标类型**生效：库代码严格、测试代码放宽。放宽必须在正文里写明理由，不能藏进 `allow`。
+   具体分工（`clippy@N` 按这个实现，也决定了 workspace lints 表里能写什么）：
+
+   | 目标 | 闸门看什么 |
+   | --- | --- |
+   | `--all-targets` | `-D warnings`、`todo`、`dbg_macro`（测试里的 `todo!()` 一样是未完成工作） |
+   | `--lib` | `print_stdout`、`disallowed_methods`：库不许直接写终端、不许直接读时钟/环境 |
+   | `--lib --bins` | `unwrap_used`/`expect_used`/`indexing_slicing`/`panic`：二进制也是生产代码 |
+
+   所以 `[workspace.lints]` 里**只能**放对所有目标都成立的东西（`todo`/`dbg_macro`/
+   `missing_docs`/`unsafe_code`）；放 `unwrap_used` 或 `print_stdout` 会让第一条测试断言就编译不过。
 5. **闸门有两种作用域**（见 plan.md §6）：持久属性（`spec-integrity`/`fmt`/`clippy@N`/`no-todo`/`docs:public`/`exit-code`/`i18n`/`caps`）一旦引入就贯穿后续；
    步骤作用域属性（`images`/`container-repro`/`links`）只写给拥有那个产物的步骤。回归保护靠 `verify` 跑遍每步自己的闸门，不靠列表无限稀释。
+6. 闸门与 `selftest` 同步演化：`cargo xtask ci` 会跑 `kiln selftest`，所以在 CI 变绿之前，每一步都必须满足「scaffold 上必败 / 参考解上必全绿」。
+   本机新增工具链依赖时（`cargo-mutants` 这类），先让 `kiln doctor` 能报出来，再把闸门写进 `track.toml`。
 
 ## 8. i18n
 
@@ -174,10 +233,12 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 - [ ] TRAP 写的是具体失败现象，不是忠告
 - [ ] `DONE WHEN` 里是可复制的确切命令
 - [ ] 规格测试在 scaffold 上失败、在参考解上全绿
-- [ ] scaffold 是加性的（只新增文件 / 只改标记块）
+- [ ] scaffold 是加性的（只新增文件 / 只改标记块），或本步不需要 scaffold
 - [ ] 快路径 < 60 秒；慢检查标了 `slow`
 - [ ] 每个 `teaches` 都有 must 闸门或规格测试兜底
+- [ ] 规格文件本身 rustfmt 干净（它会被当成学员的 test target 编译）
 - [ ] 英文正文；译文（若有）带 `source_hash` 且未改代码块
+- [ ] `cargo xtask ci` 绿（它含 `spec-integrity`、`lint-caps` 与 `kiln selftest`）
 
 ## 10. 翻译者检查清单
 

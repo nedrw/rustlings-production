@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::{KilnError, Result};
+use crate::info::Origin;
 
 pub mod status;
 pub mod ui;
@@ -311,24 +311,146 @@ fn code_fences(body: &str) -> Vec<String> {
     fences
 }
 
-/// `sha256:<hex>` of a byte slice — the form `source_hash` uses.
+/// The section headings a body has to carry, by template (authoring.md §4).
+///
+/// One source of truth for two checks: `lint-caps` R5 reads the source body, and the `i18n` gate
+/// reads the body the learner's locale resolves to.
 #[must_use]
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("sha256:{hex}")
+pub fn required_sections(origin: Origin) -> &'static [&'static str] {
+    match origin {
+        Origin::Teach => &["WHY", "TASK", "DONE WHEN", "TRAP", "FURTHER"],
+        Origin::Deepen | Origin::Transfer => &["RECALL", "DELTA", "TASK", "DONE WHEN", "TRAP"],
+    }
 }
 
-/// `sha256:<hex>` of a file's contents.
-pub fn hash_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).map_err(|source| KilnError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(hash_bytes(&bytes))
+/// Section names a body actually has, normalised for comparison (`## Task` counts as `TASK`).
+#[must_use]
+pub fn sections(headings: &[String]) -> Vec<String> {
+    headings
+        .iter()
+        .map(|heading| heading.trim_start_matches('#').trim().to_ascii_uppercase())
+        .collect()
+}
+
+/// What one step body looks like in the locale a learner asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyCheck {
+    /// Locale of the body that was found, when one was.
+    pub found: Option<Locale>,
+    /// Path the body was found at (or would live at).
+    pub path: PathBuf,
+    /// `true` when the requested locale had to be given up on.
+    pub fell_back: bool,
+    /// Problems that make the body unusable (authoring.md §8.4).
+    pub problems: Vec<String>,
+    /// Warnings that do not block: a translation made from an older source.
+    pub drift: Vec<String>,
+}
+
+/// Check one step body against its template and, when it is a translation, against its source.
+///
+/// Deliberately per step and per locale: the `i18n` gate judges the body the learner is reading
+/// right now, while `kiln i18n status` reports the whole course.
+pub fn check_body(
+    course_dir: &Path,
+    entry: &str,
+    origin: Origin,
+    requested: &Locale,
+    source: &Locale,
+) -> Result<BodyCheck> {
+    let doc = resolve_step_doc(course_dir, entry, requested, source)?;
+    let mut check = BodyCheck {
+        found: doc.locale().cloned(),
+        path: doc.path().to_path_buf(),
+        fell_back: false,
+        problems: Vec::new(),
+        drift: Vec::new(),
+    };
+    let (path, locale) = match &doc {
+        StepDoc::Found { path, locale, .. } => (path.clone(), locale.clone()),
+        StepDoc::Missing { .. } => {
+            check.problems.push(format!(
+                "no step body in any of `{}` — content not authored yet",
+                requested
+                    .chain(source)
+                    .iter()
+                    .map(Locale::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            return Ok(check);
+        }
+    };
+    check.fell_back = locale != *requested;
+
+    let body = read_step_body(&path)?;
+    let present = sections(&body.headings);
+    let missing: Vec<&str> = required_sections(origin)
+        .iter()
+        .copied()
+        .filter(|section| !present.iter().any(|found| found == section))
+        .collect();
+    if !missing.is_empty() {
+        check.problems.push(format!(
+            "origin = {origin}: the body has no `## {}` section",
+            missing.join("`, `## ")
+        ));
+    }
+    if origin != Origin::Teach && present.iter().any(|section| section == "WHY") {
+        check.problems.push(format!(
+            "origin = {origin} must not re-explain with `## WHY` — deepen/transfer steps use \
+             RECALL/DELTA"
+        ));
+    }
+
+    if &locale == source {
+        return Ok(check);
+    }
+
+    // A translation: front matter, then the two things a translator must not change.
+    match &body.front_matter.locale {
+        Some(declared) if declared == locale.as_str() => {}
+        Some(declared) => check
+            .problems
+            .push(format!("front matter declares locale `{declared}`")),
+        None => check
+            .problems
+            .push("front matter has no `locale`".to_owned()),
+    }
+    if body.front_matter.source_hash.is_none() {
+        check
+            .problems
+            .push("front matter has no `source_hash`".to_owned());
+    }
+    if body.front_matter.translator.is_none() {
+        check
+            .problems
+            .push("front matter has no `translator`".to_owned());
+    }
+
+    let source_path = course_dir.join(entry_for_locale(entry, source)?);
+    let english = read_step_body(&source_path)?;
+    if english.headings != body.headings {
+        check.problems.push(format!(
+            "headings differ from the {source} source ({} versus {})",
+            body.headings.len(),
+            english.headings.len()
+        ));
+    }
+    if english.fences != body.fences {
+        check
+            .problems
+            .push(format!("a code block differs from the {source} source"));
+    }
+    if let Some(declared) = &body.front_matter.source_hash {
+        let actual = crate::hash::file(&source_path)?;
+        if declared != &actual {
+            check.drift.push(format!(
+                "the translation was made from {declared}; the {source} source is now {actual}"
+            ));
+        }
+    }
+    Ok(check)
 }
 
 #[cfg(test)]
@@ -467,17 +589,5 @@ mod tests {
         let path = temp.write("body.md", "+++\nid = \"x\"\n\n# One\n");
         let error = read_step_body(&path).unwrap_err();
         assert!(error.to_string().contains("not closed"), "{error}");
-    }
-
-    #[test]
-    fn hashes_are_sha256_of_the_bytes() {
-        assert_eq!(
-            hash_bytes(b""),
-            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            hash_bytes(b"abc"),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 }

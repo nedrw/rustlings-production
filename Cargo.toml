@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["kiln", "xtask"]
+# Every track is its own cargo workspace under `app/` (plan §3 D6), excluded here so the course's
+# `cargo xtask ci` never tries to build a learner's exercise as part of the course itself.
+exclude = ["app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +15,7 @@ publish = false
 [workspace.dependencies]
 clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.10"
 thiserror = "2.0.21"
 toml = "0.9.8"

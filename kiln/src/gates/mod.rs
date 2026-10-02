@@ -28,11 +28,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::KilnError;
 
+pub mod caps;
 pub mod clippy;
 pub mod fmt;
+pub mod i18n;
 pub mod no_todo;
 pub mod registry;
 pub mod runner;
+pub mod spec_integrity;
 pub mod tool;
 
 pub use registry::{GateDef, GateOutcome, GateStatus, Outcome, catalogue, lookup};

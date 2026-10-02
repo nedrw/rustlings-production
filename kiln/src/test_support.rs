@@ -127,7 +127,15 @@ impl Step {
     }
 
     /// The `[[step]]` block.
+    ///
+    /// The spec path and the test target follow the conventions the real course is held to
+    /// (`spec/<phase>.<index>/<name>.rs` becomes the target `spec_<name>`), so a fixture that
+    /// would not pass `spec::check_step` cannot be written by accident.
     pub(crate) fn toml(&self) -> String {
+        let phase = self
+            .id
+            .split_once('-')
+            .map_or(self.id.as_str(), |(phase, _)| phase);
         let mut out = format!(
             "\n[[step]]\nid = \"{id}\"\ntitle = \"Step {id}\"\nkind = \"milestone\"\n\
              origin = \"{origin}\"\nentry = \"docs/steps/en/{track}/{id}.md\"\n\
@@ -141,10 +149,13 @@ impl Step {
             out.push_str(&format!("requires = [{}]\n", quoted_owned(&self.requires)));
         }
         if !self.gates.is_empty() || self.spec {
-            out.push_str("run = { cmd = \"cargo test\" }\n");
+            out.push_str(&format!(
+                "run = {{ cmd = \"cargo test -p {track} --test spec_spec\" }}\n",
+                track = self.track
+            ));
         }
         if self.spec {
-            out.push_str(&format!("spec = [\"spec/{}/spec.rs\"]\n", self.id));
+            out.push_str(&format!("spec = [\"spec/{phase}/spec.rs\"]\n"));
         }
         out.push_str(&format!("gates = [{}]\n", quoted_owned(&self.gates)));
         if let Some(reason) = &self.reteach {

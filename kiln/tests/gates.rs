@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use kiln::gates::registry::Outcome;
 use kiln::gates::{GateContext, GateResult, GateSpec, run_all};
+use kiln::i18n::Locale;
 use kiln::info::Course;
 
 /// A directory under the system temporary directory, removed when dropped.
@@ -94,16 +95,32 @@ fn course_with(scratch: &Scratch, gates: &[&str], lib_rs: &str) -> Course {
 
 /// Run the named gates against the fixture project.
 fn gates(scratch: &Scratch, gates: &[&str], lib_rs: &str) -> Vec<GateResult> {
+    judge(&course_with(scratch, gates, lib_rs), gates)
+}
+
+/// The same, with a binary in the fixture: the ladder treats `--lib` and `--bins` differently.
+fn gates_and_bin(
+    scratch: &Scratch,
+    gates: &[&str],
+    lib_rs: &str,
+    main_rs: &str,
+) -> Vec<GateResult> {
     let course = course_with(scratch, gates, lib_rs);
+    scratch.write("app/mailer/src/main.rs", main_rs);
+    judge(&course, gates)
+}
+
+fn judge(course: &Course, gates: &[&str]) -> Vec<GateResult> {
     let track = course.default_track().unwrap();
     let step = track.step("1.1").unwrap();
     let specs: Vec<GateSpec> = gates.iter().map(|gate| gate.parse().unwrap()).collect();
     let context = GateContext {
-        course: &course,
+        course,
         track,
         step,
         project_dir: track.project_dir(course.root()),
         timeout: Duration::from_secs(300),
+        locale: &Locale::parse("en").expect("the fixture source locale parses"),
     };
     run_all(&context, &specs, false)
 }
@@ -211,9 +228,55 @@ fn the_clippy_ladder_tightens_from_rung_one_to_rung_two() {
         report(&rung_two)
     );
     assert!(
-        rung_two[0].detail.contains("library code"),
+        rung_two[0].detail.contains("non-test targets"),
         "{}",
         rung_two[0].detail
+    );
+}
+
+#[test]
+fn print_stdout_is_a_library_lint_and_not_a_binary_one() {
+    let scratch = Scratch::new("clippy-print-stdout");
+    // A library that writes to stdout cannot be used from anything that is not a terminal, so rung
+    // 1 refuses it — while the same `println!` in a binary is the binary's whole job.
+    const PRINTING_LIBRARY: &str = r#"
+/// Greets.
+pub fn greet() -> u32 {
+    println!("hello");
+    0
+}
+"#;
+    const QUIET_LIBRARY: &str = r#"
+/// Greets nothing.
+pub fn greet() -> u32 {
+    0
+}
+"#;
+
+    let refused = gates(&scratch, &["clippy@1"], PRINTING_LIBRARY);
+    assert_eq!(
+        outcomes(&refused),
+        [Outcome::Failed],
+        "{}",
+        report(&refused)
+    );
+    assert!(
+        refused[0].detail.contains("print_stdout"),
+        "{}",
+        refused[0].detail
+    );
+
+    let allowed = gates_and_bin(
+        &scratch,
+        &["clippy@1"],
+        QUIET_LIBRARY,
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    );
+    assert_eq!(
+        outcomes(&allowed),
+        [Outcome::Passed],
+        "{}",
+        report(&allowed)
     );
 }
 
@@ -265,6 +328,7 @@ fn a_gate_whose_tool_is_missing_reports_an_install_command() {
         step,
         project_dir: track.project_dir(course.root()),
         timeout: Duration::from_secs(60),
+        locale: &Locale::parse("en").expect("the fixture source locale parses"),
     };
     let results = run_all(&context, &["fmt".parse().unwrap()], false);
     assert_eq!(

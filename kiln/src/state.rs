@@ -179,6 +179,31 @@ impl State {
         state.last_run_unix = Some(now);
     }
 
+    /// Record that the reference solution was applied here (plan §3 D2: recorded, not prevented).
+    pub fn record_solution_applied(&mut self, step_id: &str, applied: bool) {
+        let now = unix_now();
+        let state = self.entry(step_id);
+        state.solution_applied = applied;
+        state.last_run_unix = Some(now);
+    }
+
+    /// Record that a spec file in the project is not the one the course shipped.
+    pub fn record_spec_modified(&mut self, step_id: &str, modified: bool) {
+        let state = self.entry(step_id);
+        state.spec_modified = modified;
+    }
+
+    /// Forget what happened on one step: `kiln reset` starts it over.
+    ///
+    /// Deliberately partial — see [`StepState`] for which half is which. The progress flags are
+    /// what the learner re-earns by redoing the step, so they go; the honesty markers are what keeps
+    /// `kiln verify` truthful, so they stay.
+    pub fn forget_progress(&mut self, step_id: &str) {
+        let state = self.entry(step_id);
+        state.spec_passed = false;
+        state.gates_passed = false;
+    }
+
     /// Number of steps whose spec tests and gates both pass.
     #[must_use]
     pub fn done_count(&self) -> usize {
@@ -261,5 +286,19 @@ mod tests {
                 .contains("newer than this kiln understands"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn honesty_markers_survive_a_reset_but_progress_does_not() {
+        let mut state = State::default();
+        state.record_spec("mailer/1.1-workspace", true);
+        state.record_gates("mailer/1.1-workspace", true);
+        state.record_solution_applied("mailer/1.1-workspace", true);
+        state.record_spec_modified("mailer/1.1-workspace", false);
+
+        state.forget_progress("mailer/1.1-workspace");
+        assert_eq!(state.status("mailer/1.1-workspace"), StepStatus::Pending);
+        assert!(state.steps["mailer/1.1-workspace"].solution_applied);
+        assert_eq!(state.done_count(), 0);
     }
 }

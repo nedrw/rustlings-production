@@ -1,14 +1,23 @@
 //! `kiln run [step]` — judge a step's spec tests.
 //!
 //! The fast path of the whole course (plan §6.1): one command, one answer, under a minute of
-//! wall clock. When a step has no spec or no project yet, this says so and exits 3 — "you still
-//! have work to do" and "this step is not written yet" must not look the same.
+//! wall clock. Getting there takes three steps, in this order:
+//!
+//! 1. the step's content has to exist at all (otherwise: exit 3, "not authored yet");
+//! 2. the spec files are synced and the scaffold applied, both idempotently (authoring.md §5);
+//! 3. the spec files have to *still be* the ones the course shipped — a judgement made against an
+//!    edited spec would be worthless, so the run refuses instead of guessing (plan §3 D2).
+//!
+//! When a step has no spec or no project yet, this says so and exits 3 — "you still have work to
+//! do" and "this step is not written yet" must not look the same.
 
 use crate::cmd::Session;
-use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, KilnError, Result};
+use crate::error::{EXIT_ERROR, EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, KilnError, Result};
 use crate::i18n::{fallback_notice, resolve_step_doc};
 use crate::info::Step;
 use crate::process;
+use crate::project;
+use crate::spec;
 
 /// Run the spec tests of one step.
 pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
@@ -16,8 +25,9 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     print_step_header(session, &step)?;
 
     let track = session.course().track(&step.track)?;
-    let project = track.project_dir(session.course().root());
-    let missing = missing_content(session, &step, &project);
+    let project_label = track.project.clone();
+    let project_dir = track.project_dir(session.course().root());
+    let missing = project::missing_content(session.course(), track, &step);
     if !missing.is_empty() {
         println!();
         for line in &missing {
@@ -38,13 +48,36 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     };
 
     println!();
+    print_preparation(&project::prepare(session.course(), track, &step)?);
+
+    // Refuse to judge against a spec the project's author changed: the result would say something
+    // about that file, not about the step.
+    let drift = spec::check_learner(session.course().root(), track, &step, &project_dir)?;
+    if !drift.is_clean() {
+        println!();
+        for problem in &drift.problems {
+            println!("✗ {problem}");
+        }
+        session
+            .state_mut()
+            .record_spec_modified(&step.qualified_id(), true);
+        session.save_state()?;
+        println!();
+        println!("nothing was judged: a judgement against an edited spec is not a judgement.");
+        return Ok(EXIT_ERROR);
+    }
+    session
+        .state_mut()
+        .record_spec_modified(&step.qualified_id(), false);
+
+    println!();
     println!(
         "> {}  (in {}, deadline {:?})",
         run.cmd,
-        track.project,
+        project_label,
         session.timeout()
     );
-    let ran = process::run_line(&run.cmd, &project, session.timeout())?;
+    let ran = process::run_line(&run.cmd, &project_dir, session.timeout())?;
     print_output(&ran);
 
     let passed = ran.success();
@@ -64,6 +97,19 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     } else {
         println!("✗ {} spec tests failed", step.qualified_id());
         Ok(EXIT_FAILED)
+    }
+}
+
+/// Print what the runner put in place before judging, when it had to put anything there.
+pub fn print_preparation(prepared: &project::Outcome) {
+    if prepared.is_empty() {
+        return;
+    }
+    for line in prepared.lines() {
+        println!("  {line}");
+    }
+    for note in &prepared.notes {
+        println!("  note: {note}");
     }
 }
 
@@ -98,33 +144,6 @@ pub fn print_step_header(session: &Session, step: &Step) -> Result<()> {
         println!("  {notice}");
     }
     Ok(())
-}
-
-/// Everything that stops this step from being judged, phrased for the learner.
-fn missing_content(session: &Session, step: &Step, project: &std::path::Path) -> Vec<String> {
-    let mut missing = Vec::new();
-    if !project.is_dir() {
-        missing.push(format!(
-            "learner project {} does not exist yet",
-            project.display()
-        ));
-    }
-    let track_dir = session
-        .course()
-        .track(&step.track)
-        .map(|track| track.dir(session.course().root()));
-    if let Ok(track_dir) = track_dir {
-        for spec in &step.spec {
-            let path = track_dir.join(spec);
-            if !path.is_file() {
-                missing.push(format!("spec file is missing: {}", path.display()));
-            }
-        }
-        if step.spec.is_empty() {
-            missing.push("the step declares no spec file".to_owned());
-        }
-    }
-    missing
 }
 
 /// Print a command's output without letting it swallow the report.

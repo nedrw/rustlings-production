@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::gates::registry::{GateStatus, Outcome, lookup};
 use crate::gates::{GateSpec, Tier};
+use crate::i18n::Locale;
 use crate::info::{Course, Step, Track};
 
 /// Number of output lines kept when a gate has to quote a failing command.
@@ -27,6 +28,8 @@ pub struct GateContext<'a> {
     pub project_dir: PathBuf,
     /// Deadline for each command the gate starts.
     pub timeout: Duration,
+    /// Locale the learner asked for; gates that judge prose read this one.
+    pub locale: &'a Locale,
 }
 
 impl GateContext<'_> {

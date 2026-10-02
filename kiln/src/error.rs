@@ -105,6 +105,27 @@ pub enum KilnError {
         reason: String,
     },
 
+    /// A scaffold or reference-solution patch does not fit the tree it was applied to.
+    #[error("patch does not apply to {file}: {reason}")]
+    Patch {
+        /// File (relative to the learner project) the patch could not write.
+        file: String,
+        /// What went wrong, phrased so it can be acted on.
+        reason: String,
+    },
+
+    /// The spec files in the learner project are not the ones the course shipped.
+    #[error(
+        "{file} is not the shipped spec, so any result would be meaningless — run \
+         `kiln spec restore {step}`"
+    )]
+    SpecModified {
+        /// Spec file that drifted (relative to the learner project).
+        file: String,
+        /// Step whose spec drifted, as the learner types it.
+        step: String,
+    },
+
     /// An external tool the course depends on is not installed.
     #[error("`{tool}` is not available: {hint}")]
     MissingTool {

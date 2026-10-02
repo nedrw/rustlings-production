@@ -1,7 +1,7 @@
 //! Repository tasks.
 //!
-//! `cargo xtask ci` is the only thing the CI workflow calls, so local and CI checks cannot
-//! drift (plan §10). Adding a check means adding it here, not in YAML.
+//! `cargo xtask ci` is the only thing the CI workflow calls, so local and CI checks cannot drift
+//! (plan §10). Adding a check means adding it here, not in YAML.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -46,9 +46,40 @@ fn ci() -> Result<(), String> {
         ],
     )?;
     run(&root, "cargo", &["test", "--workspace"])?;
+    spec_integrity(&root)?;
     lint_caps(&root)?;
+    // The course's own anti-rot check (plan §10). It is the command a learner can run too, so CI
+    // and a human have one implementation between them, not two.
+    run(
+        &root,
+        "cargo",
+        &["run", "--quiet", "--package", "kiln", "--", "selftest"],
+    )?;
     println!("\nxtask ci: all checks passed");
     Ok(())
+}
+
+/// Both directions of the spec hash check, plus the metadata that names the spec files.
+///
+/// Delegates to the library for the same reason `lint_caps` does: `kiln` and `xtask` must agree on
+/// what "the specs are unchanged" means, and the only way to guarantee that is one implementation.
+fn spec_integrity(root: &Path) -> Result<(), String> {
+    println!("xtask ci: spec integrity (spec/** against spec/manifest.toml)");
+    let audit = kiln::spec::audit(root).map_err(|error| error.to_string())?;
+    println!(
+        "  {} spec file(s) pinned, {} step(s) declare their own",
+        audit.files, audit.steps
+    );
+    if audit.is_clean() {
+        return Ok(());
+    }
+    for problem in &audit.problems {
+        println!("  {problem}");
+    }
+    Err(format!(
+        "{} spec integrity problem(s)",
+        audit.problems.len()
+    ))
 }
 
 /// The course's own linter, called through the library the runner uses.

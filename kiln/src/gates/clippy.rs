@@ -5,14 +5,21 @@
 //! | rung | added over the previous one |
 //! | --- | --- |
 //! | `@0` | plain `cargo clippy` |
-//! | `@1` | `-D warnings`, `todo`, `dbg_macro`, `print_stdout` in library code |
-//! | `@2` | `unwrap_used`, `expect_used`, `indexing_slicing`, `panic` in library code |
-//! | `@3` | `missing_errors_doc`, `disallowed_methods`, a pedantic whitelist |
+//! | `@1` | `-D warnings`, `todo`, `dbg_macro` everywhere; `print_stdout` **in library code** |
+//! | `@2` | `unwrap_used`, `expect_used`, `indexing_slicing`, `panic` in every non-test target |
+//! | `@3` | `missing_errors_doc`, `disallowed_methods` in libraries, a pedantic whitelist |
 //! | `@4` | no new lints: the slow gates (`mutants`, `deny`, `semver`, `bench-budget`) become must |
 //!
-//! Test targets are relaxed on purpose (authoring.md §7.4): the lints marked "library only" run
-//! against `--lib --bins`, because asserting loudly in a test is how tests are written. Which
-//! rung a step uses is metadata, so one rule covers every step instead of per-step `allow`s.
+//! Which targets a rung judges is part of the rung, not an afterthought (authoring.md §7.4):
+//!
+//! * `warnings`, `todo`, `dbg_macro` apply to everything, tests included, because a leftover
+//!   `todo!()` is unfinished work wherever it sits;
+//! * `print_stdout` applies to libraries only — a binary exists to talk to its user, and forbidding
+//!   that would push learners towards `allow`s, which this course does not accept as a design;
+//! * `unwrap_used`, `expect_used`, `indexing_slicing` and `panic` apply to every non-test target
+//!   (`--lib --bins`), because a binary is production code too;
+//! * asserting loudly in a test is how tests are written, so test targets are relaxed, and what a
+//!   relaxed rung would hide is a rung number in `track.toml`, not a per-step `allow`.
 
 use std::fmt;
 
@@ -67,13 +74,25 @@ impl Rung {
         lints
     }
 
-    /// Lints that only have to hold for library and binary code, not for tests.
+    /// Lints that only have to hold for library code: a binary is allowed to talk to its user.
     #[must_use]
-    pub fn production_only(self) -> Vec<&'static str> {
+    pub fn library_only(self) -> Vec<&'static str> {
         let mut lints = Vec::new();
         if self.level >= 1 {
             lints.push("clippy::print_stdout");
         }
+        if self.level >= 3 {
+            // Configured by the project's `clippy.toml` (business code may not read the clock or
+            // the environment directly); without that file the lint simply never fires.
+            lints.push("clippy::disallowed_methods");
+        }
+        lints
+    }
+
+    /// Lints that hold for every non-test target: a binary is production code too.
+    #[must_use]
+    pub fn production_only(self) -> Vec<&'static str> {
+        let mut lints = Vec::new();
         if self.level >= 2 {
             lints.extend([
                 "clippy::unwrap_used",
@@ -81,11 +100,6 @@ impl Rung {
                 "clippy::indexing_slicing",
                 "clippy::panic",
             ]);
-        }
-        if self.level >= 3 {
-            // Configured by the project's `clippy.toml` (business code may not read the clock or
-            // the environment directly); without that file the lint simply never fires.
-            lints.push("clippy::disallowed_methods");
         }
         lints
     }
@@ -119,19 +133,34 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         }
     }
 
+    let library = rung.library_only();
+    if !library.is_empty() {
+        let args = clippy_args(&["--lib"], &library);
+        let ran = process::run("cargo", &args, project, ctx.timeout)?;
+        if !ran.success() {
+            return Ok(GateOutcome::failed(format!(
+                "clippy{rung} failed for library code:\n    {}",
+                clip(&ran.stderr, 12)
+            )));
+        }
+    }
+
     let production = rung.production_only();
     if !production.is_empty() {
         let args = clippy_args(&["--lib", "--bins"], &production);
         let ran = process::run("cargo", &args, project, ctx.timeout)?;
         if !ran.success() {
             return Ok(GateOutcome::failed(format!(
-                "clippy{rung} failed for library code (tests are relaxed):\n    {}",
+                "clippy{rung} failed for non-test targets:\n    {}",
                 clip(&ran.stderr, 12)
             )));
         }
     }
 
     let mut parts = vec![format!("{all_targets:?} lints on all targets").replace('"', "")];
+    if !library.is_empty() {
+        parts.push(format!("{library:?} on `--lib`").replace('"', ""));
+    }
     if !production.is_empty() {
         parts.push(format!("{production:?} on `--lib --bins`").replace('"', ""));
     }
@@ -174,10 +203,17 @@ mod tests {
                     level + 1
                 );
             }
+            for lint in lower.library_only() {
+                assert!(
+                    higher.library_only().contains(&lint),
+                    "{lint} disappears from libraries at clippy@{}",
+                    level + 1
+                );
+            }
             for lint in lower.production_only() {
                 assert!(
                     higher.production_only().contains(&lint),
-                    "{lint} disappears at clippy@{}",
+                    "{lint} disappears from non-test targets at clippy@{}",
                     level + 1
                 );
             }
@@ -187,27 +223,43 @@ mod tests {
     #[test]
     fn rung_zero_is_plain_clippy() {
         assert!(rung("clippy@0").all_targets().is_empty());
+        assert!(rung("clippy@0").library_only().is_empty());
         assert!(rung("clippy@0").production_only().is_empty());
     }
 
     #[test]
     fn the_relaxation_for_test_targets_is_explicit() {
-        // `unwrap` is fine in tests, so it may only be denied where tests are not compiled.
+        // `unwrap` is fine in tests, so it may only be denied where tests are not compiled; and a
+        // binary may print to its user, so `print_stdout` is a library lint.
         let level_two = rung("clippy@2");
         assert!(level_two.production_only().contains(&"clippy::unwrap_used"));
         assert!(!level_two.all_targets().contains(&"clippy::unwrap_used"));
+
+        let level_one = rung("clippy@1");
+        assert!(level_one.library_only().contains(&"clippy::print_stdout"));
+        assert!(
+            !level_one
+                .production_only()
+                .contains(&"clippy::print_stdout")
+        );
+        assert!(!level_one.all_targets().contains(&"clippy::print_stdout"));
     }
 
     #[test]
     fn rung_four_adds_no_lints_but_names_the_slow_gates() {
-        assert_eq!(
-            rung("clippy@4").all_targets(),
-            rung("clippy@3").all_targets()
-        );
-        assert_eq!(
-            rung("clippy@4").production_only(),
-            rung("clippy@3").production_only()
-        );
+        for lints in ["all_targets", "library_only", "production_only"] {
+            let three = match lints {
+                "library_only" => rung("clippy@3").library_only(),
+                "production_only" => rung("clippy@3").production_only(),
+                _ => rung("clippy@3").all_targets(),
+            };
+            let four = match lints {
+                "library_only" => rung("clippy@4").library_only(),
+                "production_only" => rung("clippy@4").production_only(),
+                _ => rung("clippy@4").all_targets(),
+            };
+            assert_eq!(three, four, "@{lints} changed between rung 3 and 4");
+        }
     }
 
     #[test]

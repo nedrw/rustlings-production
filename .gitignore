@@ -1,4 +1,6 @@
 /target
 
-# Learner progress is personal state, not course content (plan §4).
+# Learner progress and the learner's own projects: personal state, not course content (plan §4).
+# `kiln` creates `app/<track>` from the track skeleton the first time a step is run.
 /.kiln
+/app

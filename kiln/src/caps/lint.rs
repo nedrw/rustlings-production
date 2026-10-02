@@ -90,8 +90,33 @@ impl fmt::Display for Rule {
 pub struct Issue {
     /// Rule that was broken.
     pub rule: Rule,
+    /// Step the problem belongs to, when it belongs to one.
+    ///
+    /// Metadata rules that judge the ledger or a whole track rather than a single step leave it
+    /// empty; the `caps` gate uses it to report only what the step being judged is responsible for.
+    pub step: Option<String>,
     /// What is wrong, named so it can be fixed without reading the linter.
     pub message: String,
+}
+
+impl Issue {
+    /// A problem one step is responsible for.
+    fn about(rule: Rule, step: &Step, message: String) -> Self {
+        Self {
+            rule,
+            step: Some(step.qualified_id()),
+            message,
+        }
+    }
+
+    /// A problem with the ledger or a whole track rather than a single step.
+    fn course(rule: Rule, message: String) -> Self {
+        Self {
+            rule,
+            step: None,
+            message,
+        }
+    }
 }
 
 impl fmt::Display for Issue {
@@ -125,6 +150,16 @@ impl Report {
     /// Problems of one rule.
     pub fn issues_for(&self, rule: Rule) -> impl Iterator<Item = &Issue> {
         self.issues.iter().filter(move |issue| issue.rule == rule)
+    }
+
+    /// Problems one step is responsible for, in report order.
+    #[must_use]
+    pub fn issues_for_step(&self, step: &Step) -> Vec<&Issue> {
+        let id = step.qualified_id();
+        self.issues
+            .iter()
+            .filter(|issue| issue.step.as_deref() == Some(id.as_str()))
+            .collect()
     }
 
     /// `true` when nothing is wrong (skipped rules are not problems).
@@ -173,22 +208,24 @@ fn check_ledger_conformance(
     for step in course.steps() {
         for requirement in &step.teaches {
             match course.ledger().slot(&requirement.id, requirement.level) {
-                None => report.issues.push(Issue {
-                    rule: Rule::LedgerConformance,
-                    message: format!(
+                None => report.issues.push(Issue::about(
+                    Rule::LedgerConformance,
+                    step,
+                    format!(
                         "{} teaches {}@{} but the ledger has no slot there",
                         step.qualified_id(),
                         requirement.id,
                         requirement.level
                     ),
-                }),
+                )),
                 Some(position)
                     if (position.track != step.track || position.number != step.number())
                         && step.reteach.is_none() =>
                 {
-                    report.issues.push(Issue {
-                        rule: Rule::LedgerConformance,
-                        message: format!(
+                    report.issues.push(Issue::about(
+                        Rule::LedgerConformance,
+                        step,
+                        format!(
                             "{} teaches {}@{} but the ledger puts it at {}/{}",
                             step.qualified_id(),
                             requirement.id,
@@ -196,7 +233,7 @@ fn check_ledger_conformance(
                             position.track,
                             position.number
                         ),
-                    });
+                    ));
                 }
                 Some(_) => {}
             }
@@ -216,13 +253,13 @@ fn check_ledger_conformance(
             Err(_) => false,
         };
         if !declares_it {
-            report.issues.push(Issue {
-                rule: Rule::LedgerConformance,
-                message: format!(
+            report.issues.push(Issue::course(
+                Rule::LedgerConformance,
+                format!(
                     "the ledger puts {capability}@{level} at {}/{}, but no step there declares it",
                     position.track, position.number
                 ),
-            });
+            ));
         }
     }
 }
@@ -239,16 +276,17 @@ fn check_tracks(course: &Course, report: &mut Report) {
                         Some(reason) => {
                             report.reteaches.push((step.qualified_id(), reason.clone()))
                         }
-                        None => report.issues.push(Issue {
-                            rule: Rule::RepeatTeaching,
-                            message: format!(
+                        None => report.issues.push(Issue::about(
+                            Rule::RepeatTeaching,
+                            step,
+                            format!(
                                 "{} and {} both teach {}@{}",
                                 previous.qualified_id(),
                                 step.qualified_id(),
                                 requirement.id,
                                 requirement.level
                             ),
-                        }),
+                        )),
                     }
                 }
             }
@@ -268,9 +306,10 @@ fn check_path_order(course: &Course, report: &mut Report) {
                 if let Some(reason) = &step.reteach {
                     report.reteaches.push((step.qualified_id(), reason.clone()));
                 } else {
-                    report.issues.push(Issue {
-                        rule: Rule::DepthOrder,
-                        message: format!(
+                    report.issues.push(Issue::about(
+                        Rule::DepthOrder,
+                        step,
+                        format!(
                             "{} teaches {}@{} after {} taught it at {} — a deeper depth or \
                              `reteach = \"why\"` is required",
                             step.qualified_id(),
@@ -279,7 +318,7 @@ fn check_path_order(course: &Course, report: &mut Report) {
                             previous_step.qualified_id(),
                             previous_level
                         ),
-                    });
+                    ));
                 }
             }
             seen.insert(&requirement.id, (requirement.level, step));
@@ -302,15 +341,16 @@ fn check_requires(course: &Course, report: &mut Report) {
                         format!("only taught at {level} by {}", earlier.qualified_id())
                     },
                 );
-                report.issues.push(Issue {
-                    rule: Rule::UnreachableRequires,
-                    message: format!(
+                report.issues.push(Issue::about(
+                    Rule::UnreachableRequires,
+                    step,
+                    format!(
                         "{} requires {}@{}: {where_taught}",
                         step.qualified_id(),
                         requirement.id,
                         requirement.level
                     ),
-                });
+                ));
             }
         }
         for requirement in &step.teaches {
@@ -326,14 +366,15 @@ fn check_evidence(course: &Course, report: &mut Report) {
         if has_evidence {
             continue;
         }
-        report.issues.push(Issue {
-            rule: Rule::UnboundTeaching,
-            message: format!(
+        report.issues.push(Issue::about(
+            Rule::UnboundTeaching,
+            step,
+            format!(
                 "{} teaches {} but declares no must gate and no spec file",
                 step.qualified_id(),
                 join(&step.teaches)
             ),
-        });
+        ));
     }
 }
 
@@ -347,13 +388,13 @@ fn check_exits(course: &Course, report: &mut Report) {
                 })
             });
             if !established {
-                report.issues.push(Issue {
-                    rule: Rule::UncoveredExit,
-                    message: format!(
+                report.issues.push(Issue::course(
+                    Rule::UncoveredExit,
+                    format!(
                         "{} declares {exit} as an exit capability, but no step establishes it",
                         track.id
                     ),
-                });
+                ));
             }
         }
     }
@@ -376,10 +417,9 @@ fn check_prose(course: &Course, report: &mut Report) -> Result<()> {
         let body = match read_step_body(&path) {
             Ok(body) => body,
             Err(error) => {
-                report.issues.push(Issue {
-                    rule: Rule::ProseStructure,
-                    message: format!("{}: {error}", step.qualified_id()),
-                });
+                report
+                    .issues
+                    .push(Issue::about(Rule::ProseStructure, step, format!("{error}")));
                 continue;
             }
         };
@@ -389,31 +429,31 @@ fn check_prose(course: &Course, report: &mut Report) -> Result<()> {
             .map(|heading| heading.trim_start_matches('#').trim().to_ascii_uppercase())
             .collect();
 
-        let wanted: &[&str] = match step.origin {
-            Origin::Teach => &["WHY", "TASK", "DONE WHEN", "TRAP", "FURTHER"],
-            Origin::Deepen | Origin::Transfer => &["RECALL", "DELTA", "TASK", "DONE WHEN", "TRAP"],
-        };
+        // One definition of the templates, shared with the `i18n` gate (authoring.md §4).
+        let wanted: &[&str] = crate::i18n::required_sections(step.origin);
         for section in wanted {
             if !sections.contains(*section) {
-                report.issues.push(Issue {
-                    rule: Rule::ProseStructure,
-                    message: format!(
+                report.issues.push(Issue::about(
+                    Rule::ProseStructure,
+                    step,
+                    format!(
                         "{} (origin = {}) has no `## {section}` section",
                         step.qualified_id(),
                         step.origin
                     ),
-                });
+                ));
             }
         }
         if step.origin != Origin::Teach && sections.contains("WHY") {
-            report.issues.push(Issue {
-                rule: Rule::ProseStructure,
-                message: format!(
+            report.issues.push(Issue::about(
+                Rule::ProseStructure,
+                step,
+                format!(
                     "{} (origin = {}) must not re-explain with `## WHY` — use RECALL/DELTA",
                     step.qualified_id(),
                     step.origin
                 ),
-            });
+            ));
         }
     }
 
@@ -915,7 +955,21 @@ mod tests {
         assert_eq!(report.authored_steps, 22, "T1 metadata only, so far");
         assert!(report.is_clean(), "{:?}", report.issues);
         assert!(report.reteaches.is_empty());
-        assert_eq!(report.skipped.len(), 1);
-        assert!(report.skipped[0].contains("checked 0 of 22 step bodies"));
+        // R5 checks the bodies that exist and reports how many are still missing. Both numbers move
+        // as T1 gets authored, so the notice is checked against the report that produced it.
+        match report.skipped.first() {
+            Some(notice) => {
+                assert!(
+                    report.bodies < 22,
+                    "a skip notice with every body authored?"
+                );
+                assert!(
+                    notice.contains(&format!("checked {} of 22 step bodies", report.bodies)),
+                    "{:?}",
+                    report.skipped
+                );
+            }
+            None => assert_eq!(report.bodies, 22, "no skip notice means every body exists"),
+        }
     }
 }

@@ -6,7 +6,8 @@
 
 use crate::cmd::Session;
 use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, Result};
-use crate::gates::{GateContext, Outcome, all_must_passed, run_all};
+use crate::gates::{Outcome, all_must_passed};
+use crate::project;
 
 /// Run the gates of one step.
 pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
@@ -14,29 +15,22 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     super::run::print_step_header(session, &step)?;
 
     let track = session.course().track(&step.track)?;
-    let project = track.project_dir(session.course().root());
-    if !project.is_dir() {
+    let missing = project::missing_content(session.course(), track, &step);
+    if !missing.is_empty() {
         println!();
-        println!(
-            "  the learner project {} does not exist yet — the step's project content (skeleton \
-             and scaffold) is not authored yet",
-            track.project
-        );
+        for line in &missing {
+            println!("  {line}");
+        }
         println!();
-        println!("nothing to judge: no gate can run without a project.");
+        println!("nothing to judge: no gate can run without the step's content.");
         return Ok(EXIT_NOT_AUTHORED);
     }
 
-    let context = GateContext {
-        course: session.course(),
-        track,
-        step: &step,
-        project_dir: project,
-        timeout: session.timeout(),
-    };
+    println!();
+    super::run::print_preparation(&project::prepare(session.course(), track, &step)?);
 
     println!();
-    let results = run_all(&context, &step.gates, false);
+    let results = session.gates(&step, false)?;
     for result in &results {
         println!("{}", result.line());
     }

@@ -7,8 +7,9 @@
 
 use std::path::PathBuf;
 
-use super::{Locale, entry_for_locale, hash_file, read_step_body, ui};
+use super::{Locale, entry_for_locale, read_step_body, ui};
 use crate::error::{KilnError, Result};
+use crate::hash;
 use crate::info::{Course, Step};
 
 /// Health of one locale.
@@ -211,7 +212,7 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
             }
 
             if let Some(declared) = &body.front_matter.source_hash {
-                let actual = hash_file(&source_path)?;
+                let actual = hash::file(&source_path)?;
                 if declared != &actual {
                     report.drift.push(format!(
                         "{id}: translation was made from {declared}, the {source} source is now {actual}"

@@ -1,8 +1,8 @@
 //! `kiln` — the runner for the *rustlings-production* course.
 //!
-//! The library reads the course metadata under `course/` (manifest, capability ledger, track
-//! files) and reports honestly what a step still needs. `main.rs` is a thin shell around it,
-//! the same shape the course teaches in `mailer/1.1-workspace`.
+//! The library reads the course metadata under `course/` (manifest, capability ledger, track files)
+//! and reports honestly what a step still needs. `main.rs` is a shell around [`cmd::main`], the same
+//! shape the course teaches in `mailer/1.1-workspace`.
 //!
 //! Rules this crate lives by (see `docs/plan.md` §3 D3, §10):
 //!
@@ -25,11 +25,15 @@ pub mod caps;
 pub mod cmd;
 pub mod error;
 pub mod gates;
+pub mod hash;
 pub mod i18n;
 pub mod info;
+pub mod patch;
 pub mod process;
+pub mod project;
 pub mod runtime;
 pub mod scratch;
+pub mod spec;
 pub mod state;
 
 #[cfg(test)]

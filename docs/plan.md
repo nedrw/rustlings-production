@@ -58,7 +58,9 @@ RECALL 指向上次学的那一步，DELTA 只讲「这次有什么不一样」�
 
 ### D2 测试可信度：全靠自觉 vs 哈希+闸门+记录 → **机制约束，不做 DRM**
 
-- 规格测试在只读目录 `spec/`，`track.toml` 记录每个文件哈希；被改动则 `spec-integrity` 失败，`kiln spec restore` 一键恢复。
+- 规格测试在只读目录 `spec/`，哈希记在**生成的** `spec/manifest.toml` 里（落地时的澄清：
+  哈希本来打算写进 `track.toml`，但那是手维护的文件，让工具反复重写它会淹掉真正的改动；改成规格目录旁边
+  一份生成物，`track.toml` 继续只写人写的字段）；被改动则 `spec-integrity` 失败，`kiln spec restore` 一键恢复。
 - `cargo-mutants`（限本步模块）证明规格测试不是空测——比人工写 kill patch 可靠；后者只保留给课程自检。
 - `kiln verify --json` 如实记录 `clean` / `solution-applied` / `spec-modified`。自学场景不阻止应用参考解，但留痕。
 

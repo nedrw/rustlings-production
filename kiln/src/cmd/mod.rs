@@ -13,24 +13,32 @@
 //! Code 3 exists so the difference between "you still have work to do" and "this step has no
 //! content yet" survives in scripts, which is the honest answer while M0 is being written.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use crate::error::{KilnError, Result};
+use crate::error::{EXIT_ERROR, KilnError, Result};
+use crate::gates::{GateContext, GateResult, run_all};
 use crate::i18n::{Locale, Ui, status};
 use crate::info::{Course, Step};
+use crate::process;
 use crate::state::State;
 
 pub mod caps;
 pub mod check;
 pub mod doctor;
+pub mod hint;
 pub mod i18n;
 pub mod lint_caps;
 pub mod list;
+pub mod reset;
 pub mod run;
+pub mod selftest;
+pub mod solution;
+pub mod spec;
+pub mod verify;
 
 /// Command line interface of the course runner.
 #[derive(Debug, Parser)]
@@ -95,6 +103,61 @@ pub enum Command {
         step: Option<String>,
     },
 
+    /// Print a step's hint and where to read more.
+    Hint {
+        /// Step to hint at (default: the first unfinished step).
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
+
+    /// Take a step's scaffold back out, keeping everything you wrote (default: the first
+    /// unfinished step).
+    Reset {
+        /// Step to reset.
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
+
+    /// Apply the reference solution of a step, and record that you did.
+    Solution {
+        /// Step whose solution to apply.
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
+
+    /// Run one step's spec tests and gates against the reference solution, in a throwaway copy of
+    /// the course.
+    ///
+    /// The course's own anti-rot check (plan §10): every step's spec must fail before its solution
+    /// and pass after it. Steps other than the named ones are set up silently as prerequisites.
+    Selftest {
+        /// Steps to assert on (default: every authored step of the default track).
+        #[arg(value_name = "STEP")]
+        steps: Vec<String>,
+    },
+
+    /// Judge every authored step: its spec tests and its gates, plus what the result is worth.
+    Verify {
+        /// Track to verify (default: every authored track).
+        #[arg(value_name = "TRACK")]
+        track: Option<String>,
+
+        /// Machine-readable report on stdout, for scripts and CI.
+        #[arg(long)]
+        json: bool,
+
+        /// Also run the gates marked `slow` (mutants, coverage, soak, …).
+        #[arg(long)]
+        slow: bool,
+    },
+
+    /// The read-only spec files: restore them, or re-pin their hashes.
+    Spec {
+        /// What to do with them.
+        #[command(subcommand)]
+        command: SpecCommand,
+    },
+
     /// Content locales: coverage, structure and translation drift.
     I18n {
         /// What to report (only `status` exists so far).
@@ -104,6 +167,27 @@ pub enum Command {
 
     /// Diagnose the environment: toolchain, container runtime, cargo tools, registry mirror.
     Doctor,
+}
+
+/// Subcommands of `kiln spec`.
+#[derive(Debug, Subcommand)]
+pub enum SpecCommand {
+    /// Write the course copy of a step's spec files back into the project.
+    ///
+    /// This is the command the `spec-integrity` gate points at: it refuses to restore from a
+    /// course copy that no longer matches `spec/manifest.toml`.
+    Restore {
+        /// Step to restore (default: every authored step).
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+    },
+
+    /// Regenerate the hash manifest of the spec files (a course-maintenance command).
+    Manifest {
+        /// Track to re-pin (default: every track).
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
+    },
 }
 
 /// Subcommands of `kiln i18n`.
@@ -124,6 +208,24 @@ pub fn run(cli: &Cli) -> ExitCode {
     }
 }
 
+/// Parse and run one command line, for callers that are not the `kiln` binary.
+///
+/// `cargo xtask ci` uses this to run the course's self-check through exactly the code a learner
+/// runs: CI and a human must not have two implementations of the same check (plan §10).
+pub fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
+    match Cli::try_parse_from(args) {
+        Ok(cli) => run(&cli),
+        Err(error) => {
+            // `--help` and `--version` leave through clap's error channel and are not failures.
+            let _ = error.print();
+            if error.use_stderr() {
+                return ExitCode::from(EXIT_ERROR);
+            }
+            ExitCode::SUCCESS
+        }
+    }
+}
+
 fn dispatch(cli: &Cli) -> Result<u8> {
     let mut session = Session::new(cli)?;
     match &cli.command {
@@ -132,6 +234,14 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::LintCaps) => lint_caps::run(&session),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),
+        Some(Command::Hint { step }) => hint::run(&session, step.as_deref()),
+        Some(Command::Reset { step }) => reset::run(&mut session, step.as_deref()),
+        Some(Command::Solution { step }) => solution::run(&mut session, step.as_deref()),
+        Some(Command::Selftest { steps }) => selftest::run(cli, &session, steps),
+        Some(Command::Verify { track, json, slow }) => {
+            verify::run(&mut session, track.as_deref(), *json, *slow)
+        }
+        Some(Command::Spec { command }) => spec::run(&session, command),
         Some(Command::I18n { command }) => match command {
             I18nCommand::Status => i18n::status(&session),
         },
@@ -182,7 +292,16 @@ impl Session {
             path: PathBuf::from("."),
             source,
         })?;
-        let course = Course::discover(&cwd)?;
+        Self::at(&cwd, cli)
+    }
+
+    /// Load the course rooted at `root` (walking upwards from it), with the locale and progress
+    /// that belong to it.
+    ///
+    /// `kiln selftest` is why this exists: it judges a throwaway copy of the course, and that copy
+    /// must be read with its own metadata, its own project and its own (empty) progress file.
+    pub fn at(root: &Path, cli: &Cli) -> Result<Self> {
+        let course = Course::discover(root)?;
         let source = Locale::parse(&course.manifest().default_locale)?;
         let locale = match &cli.lang {
             Some(requested) => Locale::parse(requested)?,
@@ -268,5 +387,42 @@ impl Session {
             "content locale: {} — {}/{} step bodies, falling back through {chain}",
             self.locale, coverage.0, coverage.1
         )))
+    }
+
+    /// The learner's project directory for a step's track.
+    pub fn project_dir(&self, step: &Step) -> Result<PathBuf> {
+        Ok(self
+            .course
+            .track(&step.track)?
+            .project_dir(self.course.root()))
+    }
+
+    /// Run one step's gates without recording anything.
+    ///
+    /// The single place a [`GateContext`] is built, so `check`, `selftest` and `verify` all judge
+    /// with the same locale, deadline and project directory.
+    pub fn gates(&self, step: &Step, run_slow: bool) -> Result<Vec<GateResult>> {
+        let track = self.course.track(&step.track)?;
+        let context = GateContext {
+            course: &self.course,
+            track,
+            step,
+            project_dir: track.project_dir(self.course.root()),
+            timeout: self.timeout,
+            locale: &self.locale,
+        };
+        Ok(run_all(&context, &step.gates, run_slow))
+    }
+
+    /// Run one step's spec tests (`run.cmd`) in the project, without recording anything.
+    pub fn spec(&self, step: &Step) -> Result<process::Ran> {
+        let run = step.run.as_ref().ok_or_else(|| {
+            KilnError::Invalid(format!(
+                "{} declares no `run.cmd`, so its spec tests cannot be started",
+                step.qualified_id()
+            ))
+        })?;
+        let dir = self.project_dir(step)?;
+        process::run_line(&run.cmd, &dir, self.timeout)
     }
 }

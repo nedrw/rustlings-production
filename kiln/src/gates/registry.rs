@@ -117,17 +117,15 @@ static CATALOGUE: &[GateDef] = &[
         name: "spec-integrity",
         tool: None,
         purpose: "the spec files are the ones the course shipped (plan §3 D2)",
-        run: None,
-        status: GateStatus::Pending("lands with the spec hash manifest, M0 chunk 2"),
+        run: Some(crate::gates::spec_integrity::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "caps",
         tool: None,
         purpose: "the step's capability declarations pass lint-caps",
-        run: None,
-        status: GateStatus::Pending(
-            "the rules exist as `kiln lint-caps`; the per-step wiring lands later in M0",
-        ),
+        run: Some(crate::gates::caps::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "fmt",
@@ -168,8 +166,8 @@ static CATALOGUE: &[GateDef] = &[
         name: "i18n",
         tool: None,
         purpose: "translations keep the structure and hash of their source",
-        run: None,
-        status: GateStatus::Pending("`kiln i18n status` exists; the gate wiring lands later in M0"),
+        run: Some(crate::gates::i18n::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "images",
@@ -328,12 +326,28 @@ mod tests {
     }
 
     #[test]
-    fn the_three_working_gates_are_the_ones_that_probe_a_tool() {
+    fn every_ready_gate_has_an_implementation_and_a_name_a_step_can_use() {
         let ready: Vec<&str> = CATALOGUE
             .iter()
             .filter(|gate| gate.status == GateStatus::Ready)
             .map(|gate| gate.name)
             .collect();
-        assert_eq!(ready, ["fmt", "clippy", "no-todo"]);
+        // The gates a T1 step declares must be runnable, and the ones that need a tool must say
+        // which one: that pairing is what makes `kiln doctor` able to explain a blocked gate.
+        assert_eq!(
+            ready,
+            ["spec-integrity", "caps", "fmt", "clippy", "no-todo", "i18n"],
+            "a gate moved between ready and pending"
+        );
+        for gate in CATALOGUE
+            .iter()
+            .filter(|gate| gate.status == GateStatus::Ready)
+        {
+            assert!(
+                gate.run.is_some(),
+                "{} is ready without a function",
+                gate.name
+            );
+        }
     }
 }
