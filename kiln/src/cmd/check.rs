@@ -6,7 +6,7 @@
 
 use crate::cmd::Session;
 use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, Result};
-use crate::gates::{GateContext, all_must_passed, run_all};
+use crate::gates::{GateContext, Outcome, all_must_passed, run_all};
 
 /// Run the gates of one step.
 pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
@@ -42,6 +42,13 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     }
 
     let passed = all_must_passed(&results);
+    let must_declared = step.must_gates().count();
+    let must_passed = results
+        .iter()
+        .filter(|gate| {
+            gate.spec.tier == crate::gates::Tier::Must && gate.outcome == Outcome::Passed
+        })
+        .count();
     let blocking = results.iter().filter(|gate| gate.breaks_the_step()).count();
     let should = results
         .iter()
@@ -49,7 +56,7 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         .count();
     let pending = results
         .iter()
-        .filter(|gate| gate.outcome == crate::gates::Outcome::Pending)
+        .filter(|gate| gate.outcome == Outcome::Pending)
         .count();
 
     session
@@ -59,9 +66,8 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
 
     println!();
     println!(
-        "{} must/{} should gates · {pending} not implemented yet",
-        step.must_gates().count(),
-        should
+        "{must_passed}/{must_declared} must gates passed · {should} should gate(s) · {pending} not \
+         implemented yet"
     );
     if passed {
         println!("✓ every must gate passed for {}", step.qualified_id());
