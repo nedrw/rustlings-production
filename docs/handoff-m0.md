@@ -121,15 +121,40 @@
 > 警告，配置了却连不上就退出非 0）——这是为了让 1.6/1.7/1.8 的规格在最终树上仍然成立（它们直接启动二进
 > 制、没有数据库），也为 1.22 的断连演练留出「运行中失去数据库」的语义。
 >
-> **规格里必须给自己设截止时间。** 1.9 的「库连不上必须退出」测试用 `Child::try_wait` + 20 秒期限 +
+> **规格里必须给自己设截止时间。** 1.9 的「库连不上必须退出」测试用 `Child::try_wait` + 10 秒期限 +
 > `kill`，不能用 `Command::output()`：在 scaffold 状态下桩实现会照常启动并一直服务，没有期限就会挂住
 > （本次就是因此耗掉了最后一段预算）。
 >
-> ### 还没有动的
+> 2026-10 进度（M0 第四段 · 做到 1.9）：T1 1.9（Postgres + 迁移）已完成并提交——正文、规格、scaffold（`sqlx`
+> 依赖 + `src/db.rs` 接口 + `migrations/0001_subscribers.sql` 占位 + 容器/`psql` 测试装置 `tests/support/postgres.rs`）、
+> 参考解（连接池·迁移·就绪 + `AppError` 两个变体 + `AppState::start` 的启动顺序 + `/readyz` + 工厂同序建状态）。
+> `cargo xtask ci` 全绿，`kiln selftest` 对 **1.1–1.9 共 9 步**满足契约（scaffold 必败 / 参考解必绿 / must 闸门全绿，
+> 1.9 是 9/9，多出来的是新实现的 `images` 闸门）。
 >
-> 1.9 的正文/规格/scaffold/参考解（草稿与验证脚本在上一段的临时目录里，已失效；按上面的事实重做很快）、
-> 1.10–1.22 全部内容（严格按序，每一步都压在前一步的树上）、`images`/`container-repro`/`links` 三个
-> 闸门、`kiln watch`、以及 §4「M0 不做的事」里仍然排除的那些。
+> ### 本段新落地的机制
+>
+> **`images` 闸门与 `kiln images`。** 步骤声明 `images = ["postgres:17-alpine"]`，闸门问引擎本地有没有
+> （`podman image inspect` 级别的探测），没有就给出带镜像前缀的 pull 命令；没引擎算 `blocked`，不算过。
+> `kiln images` 报告全课程声明的镜像，`kiln images pull` 一次拉齐。解析规则调了两条（写进 plan.md §9.3）：
+> 声明的是 Docker Hub 名字（除非自带 registry），走镜像时官方镜像加 `library/`；**本地存在性按「仓库路径」
+> 判断**，所以 `docker.1ms.run/library/postgres:17-alpine` 算 `postgres:17-alpine` 就位，而 `myorg/postgres:17-alpine`
+> 不算。本机 `KILN_REGISTRY_MIRROR` 根本没设、镜像却带着前缀，靠的就是第二条——否则闸门会因为名字不同而误报。
+>
+> **patch 解析器的规则修了。** hunk 里的一行**以它自己的第一个字符为准会被骗**：删掉的 SQL 注释到 patch
+> 里长成 `--- 0001 …`，被当成文件头，于是 1.9 的参考解「hunk 声明 8 行却带 0 行」而拒应用。新规则：hunk 带
+> 多少行由 `@@ -a,b +c,d @@` 的计数决定（和真 diff 一样），行的首字符只是内容。回归测试在 `patch.rs`。
+>
+> **1.9 的一处偏离规划（已改文档）。** 标题原本写「compile-time checked SQL」，但编译期校验的
+> `query!`/`.sqlx` offline 需要编译期能连库或 `.sqlx/`（本机没有 `sqlx-cli`），所以 1.9 用运行时的
+> `sqlx::query(..).fetch_optional(..)` 保证「没有数据库也能编译」，宏与离线元数据跟着 1.11 的第一条真实查询一起上。
+> 步骤标题改为「an empty database, up to date before serving」，curriculum §4.2/§6 已同步。
+>
+> ### 下一步
+>
+> 1.10 起按序写在 1.9 的树上。1.11 需要先 `cargo install sqlx-cli --no-default-features --features postgres,rustls`
+> 生成 `.sqlx/`，作为那一步的 scaffold 内容发布。`container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
+> **`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
+> 另：本机的 `kiln-pg` 容器是上一段手工试验留下的（不影响测试，测试用 `kiln-pg-<pid>-<n>` 并自行清理）。
 
 ## 6. 工作方式约定
 

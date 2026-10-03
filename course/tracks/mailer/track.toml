@@ -223,7 +223,7 @@ hint = "One factory, one random port, one schema per test: no shared mutable sta
 
 [[step]]
 id = "1.9-postgres"
-title = "Postgres and migrations: compile-time checked SQL"
+title = "Postgres and migrations: an empty database, up to date before serving"
 kind = "milestone"
 origin = "teach"
 entry = "docs/steps/en/mailer/1.9-postgres.md"

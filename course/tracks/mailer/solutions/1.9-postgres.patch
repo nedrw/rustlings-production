@@ -1,0 +1,501 @@
+diff --git a/migrations/0001_subscribers.sql b/migrations/0001_subscribers.sql
+index ae9304c..5987f5d 100644
+--- a/migrations/0001_subscribers.sql
++++ b/migrations/0001_subscribers.sql
+@@ -1,8 +1,31 @@
+--- 0001 — the first migration: the `subscribers` table (step `mailer/1.9-postgres`).
++-- 0001 — the `subscribers` table (step `mailer/1.9-postgres`).
+ --
+ -- `sqlx::migrate!` embeds every file in this directory into the binary at compile time and applies
+ -- them in version order: the version is in the file name, `_sqlx_migrations` records what ran, and
+ -- a migration that has run anywhere is never edited — the next one is the way to change a schema.
+ --
+--- The step's TASK lists the table the later steps need. Write it here: this file is what a fresh
+--- database becomes.
++-- The columns are the ones steps 1.10–1.18 build on: who a subscriber is (`email`, unique), where
++-- they are in the confirmation dance (`status`, `confirmation_token`, `confirmation_expires_at`,
++-- `confirmed_at`), and when they arrived (`subscribed_at`).
++
++CREATE TABLE subscribers (
++    id                      BIGSERIAL   PRIMARY KEY,
++    email                   TEXT        NOT NULL UNIQUE,
++    name                    TEXT        NOT NULL,
++    password_hash           TEXT        NOT NULL,
++    status                  TEXT        NOT NULL DEFAULT 'pending',
++    confirmation_token      TEXT        UNIQUE,
++    confirmation_expires_at TIMESTAMPTZ,
++    confirmed_at            TIMESTAMPTZ,
++    subscribed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
++
++    -- The status is a value from a set this code knows, not whatever a caller sends.
++    CONSTRAINT subscribers_status_known
++        CHECK (status IN ('pending', 'active', 'unsubscribed')),
++
++    -- `active` means confirmed. The converse is deliberately *not* asserted: unsubscribing somebody
++    -- who was confirmed must stay possible (step `mailer/1.18-authz-boundary`), so `confirmed_at`
++    -- keeps its value while the status moves on.
++    CONSTRAINT subscribers_active_is_confirmed
++        CHECK (status <> 'active' OR confirmed_at IS NOT NULL)
++);
+diff --git a/src/db.rs b/src/db.rs
+index eb24b47..f7ffde8 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -1,10 +1,16 @@
+ //! The database: one pool, the schema, and the two questions the service asks it
+ //! (step `mailer/1.9-postgres`).
+ //!
+-//! This file is the scaffold: the types and the signatures below are the shape the step needs (and
+-//! the shape its spec talks to), and the bodies are what the step is about. **The scaffold proves
+-//! nothing about a database** — it never opens a connection, applies no migration, and answers
+-//! `ready` without asking — so every test in the spec fails until the step fills these in.
++//! Three decisions are made here, and each of them is one the step argues for:
++//!
++//! * **the pool is opened, not just described**: [`Database::connect`] establishes a connection
++//!   before it returns, so a process that cannot reach its database finds out while it starts
++//!   instead of on the first request that needs it;
++//! * **the migrations are in the binary**: `sqlx::migrate!` embedded `migrations/` at compile time,
++//!   so the schema a build expects and the code a build ships are the same artifact — a container
++//!   image cannot run the wrong pair;
++//! * **readiness is asked, never remembered**: [`Database::ready`] runs a query on every call, which
++//!   is what makes it go red when the database goes away and green again when it comes back.
+ 
+ use std::time::Duration;
+ 
+@@ -36,48 +42,71 @@ pub struct Database {
+ }
+ 
+ impl Database {
+-    /// Connect, and prove it.
++    /// Connect, and prove it: one connection is established before this returns.
+     ///
+     /// # Errors
+     ///
+     /// Reports [`Error::Database`] with the operation `connect` when the URL cannot be parsed or no
+     /// connection can be established within [`ACQUIRE_TIMEOUT`].
+-    ///
+-    /// The scaffold parses the URL and describes the pool; it does not connect, and it does not
+-    /// check that the database is there.
+     pub async fn connect(url: &str) -> Result<Self, Error> {
+         let pool = PgPoolOptions::new()
+             .max_connections(MAX_CONNECTIONS)
+             .acquire_timeout(ACQUIRE_TIMEOUT)
+-            .connect_lazy(url)
++            .connect(url)
++            .await
+             .map_err(|source| Error::Database {
+                 operation: "connect",
+                 source: Box::new(source),
+             })?;
+-        info!(max_connections = MAX_CONNECTIONS, "database configured");
++        info!(
++            max_connections = MAX_CONNECTIONS,
++            "connected to the database"
++        );
+         Ok(Self { pool })
+     }
+ 
+     /// Bring the schema up to date: every migration in `migrations/`, in version order.
+     ///
++    /// sqlx writes `_sqlx_migrations` first and takes an advisory lock, so two processes starting at
++    /// the same time do not run the same migration twice, and a migration that has already run is
++    /// recorded rather than repeated.
++    ///
+     /// # Errors
+     ///
+     /// Reports [`Error::Migration`] when a migration fails, and when the database holds a version
+     /// this build does not know — a schema from the future is not something to serve from.
+-    ///
+-    /// The scaffold applies nothing: an empty database stays empty.
+     pub async fn migrate(&self) -> Result<(), Error> {
++        let migrator = sqlx::migrate!("./migrations");
++        migrator
++            .run(&self.pool)
++            .await
++            .map_err(|source| Error::Migration {
++                source: Box::new(source),
++            })?;
++        info!(migrations = migrator.iter().count(), "schema up to date");
+         Ok(())
+     }
+ 
+     /// Whether the schema this process needs is there and answering.
+     ///
+-    /// # Errors
++    /// The query is deliberately about the *schema*, not just about the connection: a database that
++    /// answers `SELECT 1` but has no `subscribers` table cannot serve a single request of this
++    /// service, and readiness that says "ready" anyway is readiness nobody can use.
++    ///
++    /// `LIMIT 1` keeps it cheap on a large table — the answer is "the query ran", not "how many".
+     ///
+-    /// Reports [`Error::Database`] with the operation `readiness` when the query does not run.
++    /// # Errors
+     ///
+-    /// The scaffold answers yes without asking, which is exactly the difference the step is about.
++    /// Reports [`Error::Database`] with the operation `readiness` when the query does not run; that
++    /// reason belongs in the log the caller keeps, not in the boolean the probe answers with.
+     pub async fn ready(&self) -> Result<(), Error> {
++        sqlx::query("SELECT 1 FROM subscribers LIMIT 1")
++            .fetch_optional(&self.pool)
++            .await
++            .map_err(|source| Error::Database {
++                operation: "readiness",
++                source: Box::new(source),
++            })?;
+         Ok(())
+     }
+ 
+diff --git a/src/error.rs b/src/error.rs
+index 79f46a5..97362e6 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -107,6 +107,22 @@ pub enum Error {
+         #[source]
+         source: std::io::Error,
+     },
++    /// The database could not be reached, or refused what it was asked to do.
++    #[error("the database could not {operation}")]
++    Database {
++        /// What the service was doing when it failed (`connect`, `readiness`).
++        operation: &'static str,
++        /// What the driver reported.
++        #[source]
++        source: Box<sqlx::Error>,
++    },
++    /// The database could not be brought up to the schema this build expects.
++    #[error("the database schema could not be brought up to date")]
++    Migration {
++        /// What the migrator reported.
++        #[source]
++        source: Box<sqlx::migrate::MigrateError>,
++    },
+ }
+ 
+ impl Error {
+@@ -117,7 +133,7 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+-    /// | the configuration could not be read or parsed, logging could not start, or the address could not be bound | `1` | whoever deployed it |
++    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
+     /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
+     /// retry.
+@@ -131,7 +147,9 @@ impl Error {
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+             | Error::Logging { .. }
+-            | Error::Listen { .. } => ExitCode::FAILURE,
++            | Error::Listen { .. }
++            | Error::Database { .. }
++            | Error::Migration { .. } => ExitCode::FAILURE,
+         }
+     }
+ }
+diff --git a/src/http.rs b/src/http.rs
+index 8208106..d8c2b34 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -1,6 +1,6 @@
+-//! The HTTP surface of the service (step `mailer/1.7-http`).
++//! The HTTP surface of the service (steps `mailer/1.7-http` and `mailer/1.9-postgres`).
+ //!
+-//! Three things this file is careful about, and each of them is a decision the step makes:
++//! Four things this file is careful about, and each of them is a decision a step makes:
+ //!
+ //! * **the router is a value**, not a running server: a test can build it and send one request
+ //!   through it without a socket, which is what step `mailer/1.8-test-harness` builds on;
+@@ -9,43 +9,132 @@
+ //!   so it comes from the router and not from a catch-all route that would have to guess;
+ //! * **the address that is logged is the one that was bound**, not the one that was asked for. With
+ //!   port `0` the second and the first are different, and only the operating system knows the
+-//!   second.
++//!   second;
++//! * **liveness and readiness are two questions** (step `mailer/1.9-postgres`): `/healthz` is about
++//!   the process and stays green when a dependency is away, `/readyz` is about everything a request
++//!   needs and goes red. A service that answers "alive" for "ready" is a service an orchestrator
++//!   keeps sending traffic to.
+ 
+ use axum::Router;
++use axum::extract::State;
+ use axum::http::StatusCode;
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::get;
+ use serde::Serialize;
+ use tokio::net::TcpListener;
+-use tracing::{info, instrument};
++use tracing::{info, instrument, warn};
+ 
+ use crate::config::Config;
++use crate::db::Database;
+ use crate::error::Error;
+ use crate::logging::RunId;
+ 
++/// Everything a handler may reach: the configuration this process started with, and the database,
++/// when it has one.
++///
++/// It travels in the router (`Router::with_state`) instead of living in a global, so a test can run
++/// two differently configured apps at once (step `mailer/1.8-test-harness`) and nothing has to be
++/// reset between them.
++#[derive(Debug, Clone)]
++pub struct AppState {
++    config: Config,
++    database: Option<Database>,
++}
++
++impl AppState {
++    /// Build the state one process runs with: connect to the database the configuration names, bring
++    /// its schema up to date, and only then report that there is a state at all.
++    ///
++    /// This *is* the startup order of the course (config → logging → database, migrated → serving),
++    /// in one place, so the binary (`src/main.rs`) and the test harness (`tests/support/mod.rs`)
++    /// cannot drift apart:
++    ///
++    /// * a database that is **configured and unreachable stops the process here**, before a socket
++    ///   exists: a service that accepts traffic it cannot answer is worse than one that never
++    ///   started;
++    /// * a database that is **not configured is a choice, not a mistake**: the service runs, and
++    ///   `/readyz` says it is not ready — which is what the steps before this one are.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::Database`] when the configured database cannot be reached, and
++    /// [`Error::Migration`] when it cannot be brought up to the schema this build expects.
++    #[instrument(name = "startup", skip_all, fields(run.id = %id.as_str()))]
++    pub async fn start(config: Config, id: &RunId) -> Result<Self, Error> {
++        let _ = id;
++        let Some(url) = config.database.url.clone() else {
++            warn!("no database is configured: the service starts, and readiness will say no");
++            return Ok(Self {
++                config,
++                database: None,
++            });
++        };
++
++        let database = Database::connect(&url).await?;
++        database.migrate().await?;
++        Ok(Self {
++            config,
++            database: Some(database),
++        })
++    }
++
++    /// The configuration the process started with.
++    #[must_use]
++    pub fn config(&self) -> &Config {
++        &self.config
++    }
++
++    /// The database this process talks to, when it has one.
++    #[must_use]
++    pub fn database(&self) -> Option<&Database> {
++        self.database.as_ref()
++    }
++}
++
+ /// The router this service answers with.
+ ///
+ /// It is a plain value: the routes, the fallbacks and everything else a request can meet are here,
+-/// and starting a server is a separate decision ([`serve`]). The configuration travels with it, so
+-/// a handler that needs to know how this process was started (step `mailer/1.9-postgres` is the
+-/// first one) does not have to reach for a global.
+-pub fn router(config: &Config) -> Router {
++/// and starting a server is a separate decision ([`serve`]).
++pub fn router(state: AppState) -> Router {
+     Router::new()
+         .route("/healthz", get(healthz))
++        .route("/readyz", get(readyz))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
+-        .with_state(config.clone())
++        .with_state(state)
+ }
+ 
+ /// Liveness: the process is up and answering requests.
+ ///
+-/// Deliberately about the process, not about its dependencies: step `mailer/1.9-postgres` adds a
+-/// readiness answer for those, and a liveness probe that goes red because a database is away is a
+-/// liveness probe that restarts a healthy service.
++/// Deliberately about the process, not about its dependencies: a liveness probe that goes red
++/// because a database is away is a liveness probe that restarts a healthy service.
+ async fn healthz() -> impl IntoResponse {
+     (StatusCode::OK, axum::Json(Body { status: "ok" }))
+ }
+ 
++/// Readiness: this process can answer the requests it promises to.
++///
++/// Asked of the database on *every* request, so the answer follows the dependency instead of
++/// remembering what was true at startup. The body stays a sentence a client can branch on: why the
++/// answer is "not ready" is a fact about this deployment's insides, and it goes to the log.
++async fn readyz(State(state): State<AppState>) -> Response {
++    let Some(database) = state.database() else {
++        return not_ready("no database is configured");
++    };
++    match database.ready().await {
++        Ok(()) => (StatusCode::OK, axum::Json(Body { status: "ready" })).into_response(),
++        Err(error) => {
++            warn!(%error, "the database is not ready");
++            not_ready("the database is not available")
++        }
++    }
++}
++
++/// The answer a readiness probe gets while the service cannot serve.
++fn not_ready(status: &'static str) -> Response {
++    (StatusCode::SERVICE_UNAVAILABLE, axum::Json(Body { status })).into_response()
++}
++
+ /// What the service answers when the path is not one it serves.
+ async fn not_found() -> Response {
+     (
+@@ -85,15 +174,19 @@ struct Body {
+ /// Reports [`Error::Listen`] when the address cannot be bound (a port already in use, a host this
+ /// machine does not have) or when serving stops with an I/O failure; the message names the address,
+ /// which is the first thing a deployment needs to know.
+-pub async fn serve(config: &Config, id: &RunId) -> Result<(), Error> {
+-    let requested = format!("{}:{}", config.listen.host, config.listen.port);
++pub async fn serve(state: AppState, id: &RunId) -> Result<(), Error> {
++    let requested = format!(
++        "{}:{}",
++        state.config().listen.host,
++        state.config().listen.port
++    );
+     let listener = TcpListener::bind(&requested)
+         .await
+         .map_err(|source| Error::Listen {
+             address: requested.clone(),
+             source,
+         })?;
+-    serve_on(listener, config, id)
++    serve_on(listener, state, id)
+         .await
+         .map_err(|error| match error {
+             Error::Listen { source, .. } => Error::Listen {
+@@ -116,7 +209,7 @@ pub async fn serve(config: &Config, id: &RunId) -> Result<(), Error> {
+ /// Reports [`Error::Listen`] when the listener has no address or when serving stops with an I/O
+ /// failure.
+ #[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
+-pub async fn serve_on(listener: TcpListener, config: &Config, id: &RunId) -> Result<(), Error> {
++pub async fn serve_on(listener: TcpListener, state: AppState, id: &RunId) -> Result<(), Error> {
+     let bound = listener.local_addr().map_err(|source| Error::Listen {
+         address: "the bound address".to_owned(),
+         source,
+@@ -124,7 +217,7 @@ pub async fn serve_on(listener: TcpListener, config: &Config, id: &RunId) -> Res
+     // The port in the configuration may be `0` ("whatever is free"), so the only address worth
+     // logging is the one that was actually bound: it is how a caller learns where to send requests.
+     info!(address = %bound, "listening");
+-    axum::serve(listener, router(config))
++    axum::serve(listener, router(state))
+         .await
+         .map_err(|source| Error::Listen {
+             address: bound.to_string(),
+@@ -134,16 +227,22 @@ pub async fn serve_on(listener: TcpListener, config: &Config, id: &RunId) -> Res
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Body, router};
++    use super::{AppState, Body, router};
++    use crate::logging::RunId;
+     use axum::http::StatusCode;
+ 
+-    #[test]
+-    fn the_router_builds_without_a_socket_or_a_runtime() {
+-        // Building the router is a plain function call; `serve` is what needs a runtime (step
+-        // `mailer/1.8-test-harness` relies on this).
++    #[tokio::test]
++    async fn the_router_builds_without_a_socket_or_a_database() {
++        // Building the router is a plain function call; `serve` is what needs a socket (step
++        // `mailer/1.8-test-harness` relies on this, and step 1.9 keeps it true when the state
++        // gained a database).
+         let config = crate::config::Config::load(&crate::config::Flags::default(), &[])
+             .expect("the defaults are valid");
+-        let _ = router(&config);
++        let state = AppState::start(config, &RunId::of_this_process())
++            .await
++            .expect("a configuration without a database is a state");
++        assert!(state.database().is_none());
++        let _ = router(state);
+     }
+ 
+     #[test]
+@@ -153,5 +252,6 @@ mod tests {
+         };
+         assert!(!body.status.is_empty());
+         assert_eq!(StatusCode::NOT_FOUND.as_u16(), 404);
++        assert_eq!(StatusCode::SERVICE_UNAVAILABLE.as_u16(), 503);
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index f1b3e72..fff3cbc 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,11 +14,13 @@
+ use std::path::PathBuf;
+ 
+ pub mod config;
++pub mod db;
+ pub mod error;
+ pub mod http;
+ pub mod logging;
+ 
+ pub use config::{Config, Flags};
++pub use db::Database;
+ pub use error::{Error, SettingSource};
+ pub use logging::RunId;
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 666efe3..717857b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -57,7 +57,12 @@ async fn service() -> Result<ExitCode> {
+             let id = RunId::of_this_process();
+             logging::init(&config.log, &id)?;
+             logging::announce(&config, &id);
+-            mailer::http::serve(&config, &id).await?;
++            // Configuration, then logs, then the database — connected and migrated — and only then
++            // a listener (step `mailer/1.9-postgres`). The order is the step's whole point: a
++            // database this build cannot use has to stop the process before anything can connect to
++            // a half-started service.
++            let state = mailer::http::AppState::start(config, &id).await?;
++            mailer::http::serve(state, &id).await?;
+         }
+         Request::Help | Request::Version => unreachable!("answered above"),
+     }
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index 57171e5..a5f237a 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
+ use std::time::{Duration, Instant};
+ 
+ use mailer::config::Config;
+-use mailer::http;
++use mailer::http::{self, AppState};
+ use mailer::logging::RunId;
+ use tokio::sync::oneshot;
+ 
+@@ -64,10 +64,23 @@ impl TestApp {
+                     .build()
+                     .expect("the test app's runtime starts");
+                 runtime.block_on(async move {
++                    // The factory does what the binary does, in the same order (step
++                    // `mailer/1.9-postgres`): the state is built — the database connected and
++                    // migrated when the configuration names one — and only then is the socket
++                    // handed to the runtime to serve on. A state that cannot be built leaves the
++                    // listener un-armed, so a test sees a refused connection (and this sentence on
++                    // stderr) instead of waiting for an answer that is never coming.
++                    let state = match AppState::start(config, &id).await {
++                        Ok(state) => state,
++                        Err(error) => {
++                            eprintln!("the test app could not start: {error}");
++                            return;
++                        }
++                    };
+                     let listener = tokio::net::TcpListener::from_std(listener)
+                         .expect("the listener is handed to the runtime");
+                     tokio::select! {
+-                        result = http::serve_on(listener, &config, &id) => {
++                        result = http::serve_on(listener, state, &id) => {
+                             if let Err(error) = result {
+                                 eprintln!("the test app stopped: {error}");
+                             }

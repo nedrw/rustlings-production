@@ -221,10 +221,16 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 
 | 能力 | 深度 | 位置 | 新增 | 不再重复 |
 | --- | --- | --- | --- | --- |
-| `db/migrations` | `apply` | T1·1.9 | 前向迁移、`.sqlx` offline 数据、迁移与启动的顺序 | —（首次） |
+| `db/migrations` | `apply` | T1·1.9 | 前向迁移（版本在文件名、`_sqlx_migrations` 记录已应用的版本）、迁移内嵌进二进制（`sqlx::migrate!`）、启动顺序（连库 → 迁移 → 再 listen）、就绪与存活之分 | —（首次） |
 | `db/schema-online-evolution` | `aware` | T2·2.23 | 老代码与新 schema 必须共存多久、发布窗口 | 迁移工具用法（已在 T1） |
 | `db/schema-online-evolution` | `apply` | T3·3.23 | expand → backfill → contract 全流程、回填的批处理与限速 | 迁移工具用法、offline 数据 |
 | `build/reproducibility` | `apply` | T4·4.22 | 迁移与可复现构建、破坏性变更的发布窗口 | 迁移本身 |
+
+> 实现时要记住的一处调整：**编译期校验的 `query!` 与 `.sqlx` offline 元数据不在 1.9**。`migrate!`
+> 不需要数据库就能编译，而 `query!`/`query_scalar!` 宏需要编译期能连库或 `.sqlx/query-<hash>.json`
+> （本机没有 `sqlx-cli`，`cargo sqlx prepare` 要先装）。因此 1.9 的第一条查询用运行时的
+> `sqlx::query(…).fetch_optional(…)`（课程要求「无 DB 环境下可编译」也由它保证），宏与离线元数据跟着
+> 1.11 的第一条真实查询一起上——那一步的 scaffold 发布 `.sqlx/`，正文讲清两者的取舍。
 
 ### 4.3 `sec/authz-tenant-isolation`
 
@@ -289,7 +295,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | --- | --- | --- | --- |
 | 1.7 | HTTP 骨架：axum 路由、extractor、`/healthz`、优雅的 404/405 | `http/service-skeleton@apply` | 路由矩阵测试 |
 | 1.8 | 端到端测试基建：app 工厂、随机端口、每测试独立 schema | `test/app-factory@apply` | 测试可并发跑、无共享状态 |
-| 1.9 | Postgres 与迁移：`sqlx` 编译期校验、`.sqlx` offline、迁移与启动的关系 | `db/migrations@apply` | 空库→最新；无 DB 环境下可编译 |
+| 1.9 | Postgres 与迁移：连接池、`sqlx::migrate!`（迁移内嵌进二进制）、启动顺序、`/readyz` 与 `/healthz` 之分 | `db/migrations@apply` | 空库→最新；无 DB 环境下仍可编译（`migrate!` 不需要库）；库配了却连不上必须退出 1 且不 bind |
 | 1.10 | 领域类型：`Email`/`SubscriberName`/`Password`，解析即校验 | `domain/parse-dont-validate@apply` | 往返 property 测试 + 拒绝样例 |
 | 1.11 | 注册流程：`argon2` 哈希、唯一约束当并发原语 | `sec/password-hash@apply`、`db/unique-as-concurrency@apply` | 并发重复注册只成功一次 |
 | 1.12 | 确认令牌：签发/校验/过期/一次性使用 | `sec/token-lifetime@apply` | 过期、重放、篡改三类测试 |
