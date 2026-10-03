@@ -40,6 +40,7 @@ pub mod selftest;
 pub mod solution;
 pub mod spec;
 pub mod verify;
+pub mod watch;
 
 /// Command line interface of the course runner.
 #[derive(Debug, Parser)]
@@ -76,6 +77,13 @@ pub enum Command {
         /// Track to list (default: all authored tracks).
         #[arg(value_name = "TRACK")]
         track: Option<String>,
+    },
+
+    /// Judge a step, then judge it again whenever the project changes.
+    Watch {
+        /// Step to watch (default: the first step that is not finished).
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
     },
 
     /// Show the capability ledger: every depth, where it is established, and its status.
@@ -248,6 +256,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Caps { track }) => caps::run(&session, track.as_deref()),
         Some(Command::LintCaps) => lint_caps::run(&session),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
+        Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
         Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),
         Some(Command::Hint { step }) => hint::run(&session, step.as_deref()),
         Some(Command::Reset { step }) => reset::run(&mut session, step.as_deref()),
@@ -387,6 +396,15 @@ fn key_of(spec: &crate::gates::GateSpec) -> String {
     format!("{}@{:?}:{}", spec.name, spec.param, spec.slow)
 }
 
+/// Judge one step once — what `kiln run` does, in the shape a loop can call.
+///
+/// `watch` is the only caller that needs this, and it is why the run's work lives here rather than in
+/// its own command file: a watcher and a one-shot run must not disagree about what "judging a step"
+/// means.
+pub(crate) fn run_step_once(session: &mut Session, step: &Step) -> Result<u8> {
+    crate::cmd::run::run(session, Some(step.qualified_id().as_str()))
+}
+
 /// A fingerprint of a project: the *contents* of every file in it, in one number.
 ///
 /// It exists so that a cached gate result is never reused for a different tree — `selftest` applies a
@@ -394,7 +412,7 @@ fn key_of(spec: &crate::gates::GateSpec) -> String {
 /// timestamps, because the other direction matters too: a spec sync that rewrites a file with the
 /// same bytes has not changed the tree, and a fingerprint that said it had would make every step's
 /// gates run again for nothing.
-fn tree_fingerprint(project_dir: &Path) -> String {
+pub(crate) fn tree_fingerprint(project_dir: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     collect_fingerprint(project_dir, project_dir, &mut files);

@@ -291,8 +291,9 @@
 > - **1.22-runbook**（120m，design 步骤，`ops/runbook-drill@apply`）：两条线（演练规格 + 人读的 runbook），
 >   它的 gates 里有 **`links`**，同样是 Pending ✗ **必须先实现**（需要 `lychee` 或一个手写的链接检查器：
 >   只查课程文档里的 URL，离线可跳过）。
-> - **`kiln watch`**（M0 验收里的“reruns on save”）还没做 ✗：轮询项目目录的指纹（`cmd/mod.rs` 里的
->   `tree_fingerprint` 已经是现成的、内容敏感的实现），变了就重跑 `kiln run <step>`。
+> - **`kiln watch` 已做**（`kiln/src/cmd/watch.rs`）：按内容指纹轮询项目（`target/` 不算，同字节重写也不算），
+>   首轮立即跑，之后每变一次重跑一次 `kiln run <step>`；实测“runs: 2 · reruns: 1”。M0 验收里的
+>   “reruns on save”因此已满足。
 >
 > ### 2026-10 进度（M0 第十一段 · 做到 1.18）
 >
