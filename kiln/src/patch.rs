@@ -111,9 +111,11 @@ impl Patch {
     /// Parse a unified diff.
     ///
     /// Git-style headers (`diff --git`, `index`, mode lines) are accepted and ignored, because
-    /// course patches are written by hand and by `git diff` interchangeably. `\ No newline at end
-    /// of file` is rejected: a patch whose meaning depends on a missing final newline is not worth
-    /// supporting for course content.
+    /// course patches are written by hand and by `git diff` interchangeably. Two things are
+    /// rejected rather than interpreted: `\ No newline at end of file` (a patch whose meaning
+    /// depends on a missing final newline is not worth supporting for course content), and
+    /// `rename from`/`copy from` (a rename is a delete plus a create, and applying one as a
+    /// modification would write the content into the file the patch meant to remove it from).
     pub fn parse(text: &str) -> Result<Self> {
         if text.contains('\r') {
             return Err(KilnError::Invalid(
@@ -128,6 +130,16 @@ impl Patch {
                 return Err(KilnError::Invalid(
                     "patch uses `\\ No newline at end of file`, which is not supported".to_owned(),
                 ));
+            }
+            if line.starts_with("rename ") || line.starts_with("copy ") {
+                // `git diff` puts these before the `---`/`+++` pair, so this is where a rename has
+                // to be caught: applying the section as a *modification* would write the content
+                // into the file the patch meant to remove it from, and the new path would stay
+                // missing.
+                return Err(KilnError::Invalid(format!(
+                    "patch renames or copies a file (`{line}`): course patches are generated with \
+                     `git diff --no-renames`, so a rename is written as a delete plus a create"
+                )));
             }
             let Some(old) = line.strip_prefix("--- ") else {
                 continue;
@@ -163,7 +175,6 @@ impl Patch {
                 } else if peeked.starts_with("diff --git")
                     || peeked.starts_with("index ")
                     || peeked.starts_with("similarity ")
-                    || peeked.starts_with("rename ")
                     || peeked.starts_with("new file mode")
                     || peeked.starts_with("deleted file mode")
                     || peeked.starts_with("old mode")
@@ -1106,6 +1117,29 @@ mod tests {
         let patch = Patch::parse(SCAFFOLD).expect("patch should parse");
         let error = plan(temp.path(), &patch, Mode::Solution).unwrap_err();
         assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+
+    #[test]
+    fn a_renaming_patch_is_refused_instead_of_applied_as_a_modification() {
+        // `git diff` writes a rename as `rename from` … `rename to`, and this applier only knows
+        // delete and create: applying the section as a modification would put the content in the
+        // file the patch meant to remove it from (found the hard way, with a `.sqlx` cache file
+        // whose name *is* its hash).
+        let text = "diff --git a/src/old.rs b/src/new.rs\n\
+                    similarity index 62%\n\
+                    rename from src/old.rs\n\
+                    rename to src/new.rs\n\
+                    index e69de29..4b825dc 100644\n\
+                    --- a/src/old.rs\n\
+                    +++ b/src/new.rs\n\
+                    @@ -1 +1 @@\n\
+                    -//! old\n\
+                    +//! new\n";
+        let error = Patch::parse(text).expect_err("a rename must not parse");
+        assert!(
+            error.to_string().contains("--no-renames"),
+            "the error has to name the way to write it instead: {error}"
+        );
     }
 
     #[test]
