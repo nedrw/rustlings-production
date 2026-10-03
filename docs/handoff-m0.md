@@ -251,7 +251,57 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
-> ### 1.14 开工前要确认的两件事（下一段先看这个，再写设计）
+> ### 1.14 设计（含调研结论 · 已定，下一段直接写代码）
+>
+> **调研结论（外部事实，别再花时间查）**
+>
+> - **`mpsc::Sender::send` 在 `select!` 里被取消会丢消息**（tokio 1.53 文档原话：取消 `send` 会丢掉队列里的
+>   位置，要拿 `Permit` 再发才是 cancel-safe）。生产写法因此是 **`reserve()` / `try_reserve()` +
+>   `permit.send(msg)`**：容量先拿到手，消息永不丢——这正好也是「先占坑再干活」的写法。
+> - **队列原语选 tokio 自带的 `mpsc`（有界）**，不引 kanal/flume/crossbeam：第三方在微基准上快 2–10 倍，
+>   但本步负载是每秒几十到几百封、瓶颈在邮件服务器与 argon2，吞吐差异没有意义；而 tokio mpsc 与
+>   `select!`/`axum::serve`/`tokio::time` 共享同一套取消与时钟语义，零新依赖，停机链路不用自己发明。
+> - **停机用 axum 自带的 `Serve::with_graceful_shutdown(fut)`**（停止 accept、等在途请求结束），而不是
+>   自己写 accept 循环。生态里 `tokio_util::CancellationToken` + `TaskTracker` 是通用替代；**本课不引
+>   tokio-util**，用 `watch`/`JoinHandle` 表达同样的两件事（一个信号 + 一组能 join 的任务）。
+> - **重试用 full jitter**：`sleep = random(0, min(cap, base·2^attempt))`（AWS《Exponential Backoff And
+>   Jitter》三种里最简单、界最清楚、可断言的那种；decorrelated jitter 在他们模拟里总耗时略优，放进
+>   FURTHER）。抖动值用已经有了的 `getrandom`，**不要拿时钟当种子**。
+> - **队列不是真相来源**：内存队列在进程被 kill 时丢掉它持有的东西。正文必须写明这条边界——`subscribers`
+>   这张表才是「谁还没确认」的真相，1.15 的幂等键、1.17 的事务、以及将来 T3/T4 的 outbox + 认领才是
+>   「一定送到」；1.14 只教有界内存队列本身。
+>
+> **接口与顺序（决定）**
+>
+> - 新文件 `src/delivery.rs`（scaffold 给形状）：`pub const MAX_ATTEMPTS: u32 = 3`、
+>   `pub const DRAIN_DEADLINE: Duration = 10s`、`pub struct Job`（装 `Message` 就够：重发不需要查库）、
+>   `pub struct Queue`（`mpsc::Sender<Job>` + `Sender::try_reserve` 的包装）、一个纯函数
+>   `pub fn backoff(attempt: u32, base: Duration, cap: Duration) -> Duration`（可单测：上界与单调封顶）。
+> - **请求里的顺序就是课程**：`let permit = queue.try_reserve()?` → 解析/哈希/INSERT → `permit.send(msg)`。
+>   队满 → 新变体 `Error::QueueFull` → **503**（按 1.5 的表：部署方的问题 → 退出码 1），而且它发生在
+>   **写行之前**——客户端重试不会撞上 409 死胡同；`Permit` 还顺手解决了 `send` 的取消安全问题。
+> - **停机链路**：`main.rs` 用 `signal()`（`ctrl_c` + `#[cfg(unix)]` SIGTERM）→ `serve(...)
+>   .with_graceful_shutdown(...)` → 之后 `queue.drain(DRAIN_DEADLINE)`。干净排空退 **0**（课程验收就是这么
+>   写的），超时 `error!` 记下没发出去的条数并退 **1**。
+> - **配置**：新增 `delivery.queue_capacity`（默认 64）与 `delivery.retry_base_ms`（默认 250），按 1.4 的
+>   defaults/file/env/flags/report 机制加（**学员手改 `config.rs`，没有标记块**；这也是第一次让学员自己
+>   加设置，19 的 `public.base_url` 照抄）。`MAX_ATTEMPTS`/`DRAIN_DEADLINE` 先用常量。
+>
+> **规格怎么做（决定，含一个要改旧文件的地方）**
+>
+> - 时间相关的断言放**单测**（`src/delivery.rs` 内，`#[tokio::test(start_paused = true)]` + 假发送器）：
+>   尝试次数 = `MAX_ATTEMPTS`、退避有界、抖动不是常数、超过 `DRAIN_DEADLINE` 时 drain 返回「没排空」。这样
+>   不为测试引入设置，也不睡觉。
+> - **「队满 → 503 且没写行」必须在进程内做**（子进程里没有假发送器）：把 1.13 规格里那个 `App` 夹具**搬到
+>   `tests/support/app.rs`**（scaffold 可以新增文件），1.13 与 1.14 的规格都 `#[path = "support/app.rs"]
+>   mod app;`——代价是 1.13 的规格被改动 ⇒ 要重新 `kiln spec manifest` 并对 1.13 重跑 selftest（允许，
+>   课程内容是自己维护的）。夹具要加一个「挂在第一个 job 上不返回」的发送器（`Hanging`），配合
+>   `MAILER__DELIVERY__QUEUE_CAPACITY=2` 就能用 4 个请求把队填满。
+> - **SIGTERM → 排空 → 退出码 0** 用子进程做（`spec_http.rs` 的套路：起二进制、发信号、等退出码、读 JSON
+>   日志）。
+>
+> ### 1.13 的原始备注（留档）
+>
 >
 > 1.14 是 120m 的异步步（`async/graceful-shutdown@apply` + `async/backpressure@aware`，概念：有界队列、
 > 停机排空、带抖动的重试），需要 `cfg/layered-config@apply` 与 `test/fake-external@apply`（都已具备）。
@@ -265,7 +315,7 @@
 >   这一步的规格（`spec/1.14/worker.rs`）要么用假发送器把队列吃满（把 `Recording` 改造成「每次 send 都
 >   等一个信号」的慢发送器），要么断言 HTTP 答复（429/503）；后者更接近课程的一贯口味。
 >
-> ### 1.13 的设计原文（已按此实现，留档）
+> ### 1.13 的设计原文（已按此实现，留档 · 与上面那条备注同源）
 >
 > 能力 `test/fake-external@apply`；60m → 建议改 **90m**（见下）；requires 已满足（1.5 的错误链、1.12 的
 > 令牌）。**这一步的关键约束是注入缝**：`tests/support/mod.rs`（1.8 的 app 工厂）没有 scaffold 标记块，
