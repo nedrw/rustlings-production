@@ -1,0 +1,11 @@
+# What the build context does not need (step `mailer/1.21-container`).
+#
+# `target/` is the one that matters: it is hundreds of megabytes of the *host's* build output, and
+# sending it to the daemon on every `podman build` is the difference between a build that starts
+# immediately and one that spends a minute copying files nothing will use. The container builds its
+# own release artifacts from source.
+target/
+.git/
+.kiln/
+tests/
+mailer.toml
