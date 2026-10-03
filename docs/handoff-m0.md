@@ -251,6 +251,32 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十三段 · `links` 闸门落地：判树，不判外链）
+>
+> 按计划表里那句 `lychee` 做落地时改了实现方式（**决定+理由写在 plan.md §6 末尾**，authoring.md §4.4 写了对写页面的硬规则）：
+> `links` 是**纯离线闸门**，外链连通性不进闸门、不进 `cargo xtask ci`，只在 `kiln links --external`（要 `curl`）。
+>
+> 落地的东西与证据（全部在本机实测）：
+>
+> 1. `kiln/src/gates/links.rs`：递归扫描项目里的 markdown，判相对目标（逐段精确比对目录项，**不靠文件系统的大小写宽容**）、
+>    `#锚点`/`page.md#锚点` 是否命中标题（GitHub 风格 slug，支持中文标题与重名标题的 `-1` 后缀）、占位符（`TODO`/`TBD`/`FIXME`/`XXX`/`placeholder`、
+>    空目标、空锚点）、绝对路径、越出项目（`../..`）、指向 `target/`；代码块与行内代码不算链接（那是例子）；没有 markdown、
+>    或全树没有任何链接 → 失败（“没写的页面不能被判成过关”）。12 个单元测试。
+> 2. `kiln/src/cmd/links.rs`：`kiln links [PATH] [--external]`。离线那半与闸门**同一个 `scan`**（口径不会不一致）；
+>    `--external` 用 `curl` 逐个抓（15s/条，`-o /dev/null -w %{http_code}`），**只有 404/410 令命令以 1 退出**，
+>    403/429/5xx/超时/解析不到主机只打 `?`，网络不通时退出 2（无法判定）。2 个单元测试。
+> 3. 接线：registry 里 `links` 从 Pending 变 Ready（无外部工具）；`CACHEABLE` 收进 `links`（它的答案确实只是树的属性）；
+>    `kiln/tests/gates.rs` 新增一条走真实 runner 的集成测试（干净页 passed / 半写的页 failed 并点名 `docs/runbook.md:3 TODO` /
+>    没有页面 failed）。
+> 4. 实测（本机，冻结树）：`cargo test -p kiln` → 175 lib + 14 gates 集成 + 1 另一目标全绿；`cargo clippy -p kiln --all-targets -- -D warnings` 与 `cargo fmt --all --check` 均干净；
+>    **课程自己这棵树扫一遍** `kiln links` → 26 页 / 141 链 / 110 外链，**0 findings**（含中文标题锚点、多级目录相对链接——这也是对检查器无假阳性的实测）；
+>    故意做坏的夹具 → 7 条 finding + exit 1；`--external` 试跑（example.com/404/超时）→ `✓ 200` / `✗ 404` / `? timeout`，1 answered · 1 unclear · 1 gone，exit 1。
+>
+> **下一段（写 1.22 的人）接这里的两个约束**：
+> - scaffold 的 runbook 页要用**占位目标**把清单写出来（如 `[dashboard](TODO)`），这样学员 `kiln run` 一上来就看到红；
+> - 参考解的 runbook **所有链接必须留在 `app/mailer` 内**（不能指回课程 `docs/`）：`kiln selftest` 的沙箱里项目是独立副本，
+>   指出去就会在沙箱里红、在本机绿——这正是这条闸门专门避开的那类不一致（外链同理，别写在页面上当目标）。
+
 > ### 2026-10 进度（M0 第十二段 · 做到 1.20）
 >
 > T1 1.19（真实邮件服务器容器，`a141cd8`）、1.20（metrics + SLO 草稿，`29d522f`）已完成。1.19 把 SMTP 适配器
@@ -334,8 +360,8 @@
 >   `images = [...]` 与 1.21 的 `images` 门。注意 spec 的超时是 300s，镜像构建很可能超——建议 spec 只做
 >   “构建一次 + 跑一次 + 探针 + 二进制比对”，并把依赖层缓存写进 Dockerfile。
 > - **1.22-runbook**（120m，design 步骤，`ops/runbook-drill@apply`）：两条线（演练规格 + 人读的 runbook），
->   它的 gates 里有 **`links`**，同样是 Pending ✗ **必须先实现**（需要 `lychee` 或一个手写的链接检查器：
->   只查课程文档里的 URL，离线可跳过）。
+>   它的 gates 里有 **`links`**——**已落地**（见下面 2026-10 的进度：`links` 判树不判外链，外链只在 `kiln links --external`）。
+>   写内容时按 authoring.md §4.4 的硬规则来：页面在项目里、占位目标算不过、相对目标与锚点要对得上。
 > - **`kiln watch` 已做**（`kiln/src/cmd/watch.rs`）：按内容指纹轮询项目（`target/` 不算，同字节重写也不算），
 >   首轮立即跑，之后每变一次重跑一次 `kiln run <step>`；实测“runs: 2 · reruns: 1”。M0 验收里的
 >   “reruns on save”因此已满足。
