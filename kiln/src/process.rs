@@ -189,9 +189,17 @@ pub fn command_line(program: &str, args: &[&str]) -> String {
     format!("{program} {}", args.join(" "))
 }
 
-/// `true` for a line that only reports progress.
+/// `true` for the lines a command prints about *its own* progress rather than about what it found.
+///
+/// Cargo narrates what it is doing before it says anything useful — and on a cold or contended run
+/// it narrates a lot: a dozen `Compiling …` lines, a `Blocking waiting for file lock on package
+/// cache`, an index update. A report that quotes those is a report that says nothing, which is why
+/// both the failure summary and every gate's clipped detail filter them out.
 #[must_use]
-fn is_progress(line: &str) -> bool {
+pub(crate) fn is_progress(line: &str) -> bool {
+    // Cargo indents its narration, and the gate reports keep the indentation: without this the
+    // predicate only ever matched the lines that happened to start in column one.
+    let line = line.trim_start();
     [
         "Compiling",
         "Checking",

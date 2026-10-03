@@ -160,13 +160,27 @@ fn run_one(ctx: &GateContext<'_>, spec: &GateSpec, run_slow: bool) -> GateResult
 /// Explain a failing command in a few lines, without burying the report.
 #[must_use]
 pub fn clip(text: &str, lines: usize) -> String {
-    let kept: Vec<&str> = text
+    let all: Vec<&str> = text
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
-        .take(lines.max(1))
         .collect();
-    let total = text.lines().filter(|line| !line.trim().is_empty()).count();
+    // What the command said about its own work comes first and is worth nothing: on a cold or
+    // contended run a dozen `Compiling …` lines and a `Blocking waiting for file lock` can fill the
+    // whole clip, and the learner then reads a failure report with no failure in it. The
+    // diagnostics are what is left; when there is nothing else, the raw head is still better than an
+    // empty report.
+    let diagnostics: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|line| !crate::process::is_progress(line))
+        .collect();
+    let (kept, total) = if diagnostics.is_empty() {
+        (all.iter().copied(), all.len())
+    } else {
+        (diagnostics.iter().copied(), diagnostics.len())
+    };
+    let kept: Vec<&str> = kept.take(lines.max(1)).collect();
     let mut joined = kept.join("\n    ");
     if total > kept.len() {
         joined.push_str(&format!("\n    … {} more line(s)", total - kept.len()));
@@ -201,6 +215,34 @@ pub fn output_detail(ran: &crate::process::Ran) -> String {
 mod tests {
     use super::*;
     use crate::gates::registry::catalogue;
+
+    #[test]
+    fn a_clipped_detail_quotes_the_diagnostic_and_not_cargos_chatter() {
+        // The shape of a contended cold build: eleven lines about what cargo is doing, then the one
+        // line the learner needs. Before this, `clip(stderr, 12)` kept exactly the chatter.
+        let mut stderr = String::from("    Blocking waiting for file lock on package cache\n");
+        for package in 0..10 {
+            stderr.push_str(&format!("   Compiling a-crate-{package} v1.0.0\n"));
+        }
+        stderr.push_str("error[E0308]: mismatched types\n");
+        let detail = clip(&stderr, 12);
+        assert!(
+            detail.contains("mismatched types"),
+            "the failure has to be in its own report: {detail}"
+        );
+        assert!(
+            !detail.contains("Compiling"),
+            "cargo's narration is not the failure: {detail}"
+        );
+
+        // A command that printed nothing but chatter still gets a report, and the count of what was
+        // left out is about the lines that are actually shown.
+        let chatter = "   Compiling x v1.0.0\n    Finished `dev` profile in 1s\n";
+        assert_eq!(
+            clip(chatter, 1),
+            "   Compiling x v1.0.0\n    … 1 more line(s)"
+        );
+    }
 
     #[test]
     fn clipping_keeps_the_head_and_says_how_much_was_left_out() {
