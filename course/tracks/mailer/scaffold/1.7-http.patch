@@ -1,0 +1,49 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 23f6fc9..4d7d235 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,7 @@ workspace = true
+ [dependencies]
+ # kiln:scaffold:begin
+ anyhow = "1.0.104"
++axum = "0.8.9"
+ serde = { version = "1.0.229", features = ["derive"] }
+ # The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
+ # serialise structures of its own from 1.7 on.
+@@ -28,6 +29,7 @@ serde_json = "1.0.151"
+ thiserror = "2.0.21"
+ toml = "0.9.8"
+ tracing = "0.1.44"
++tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+ tracing-subscriber = { version = "0.3.23", features = ["json", "fmt"] }
+ # kiln:scaffold:end
+ 
+diff --git a/src/http.rs b/src/http.rs
+new file mode 100644
+index 0000000..5890027
+--- /dev/null
++++ b/src/http.rs
+@@ -0,0 +1,23 @@
++//! The HTTP surface of the service (step `mailer/1.7-http`).
++//!
++//! The scaffold declares the two entry points a server needs: a router to answer with, and
++//! something that puts it on a socket. Both are stubs — the routes, the honest 404/405 answers and
++//! the address the service reports are this step's work.
++
++use tokio::net::TcpListener;
++
++use crate::config::Config;
++use crate::error::Error;
++use crate::logging::RunId;
++
++/// Everything the router answers, as one value a test can build without a socket.
++pub fn router() -> axum::Router {
++    axum::Router::new()
++}
++
++/// Bind the configured address and serve until the process stops (step `mailer/1.7-http`).
++///
++/// The scaffold binds nothing and answers no request.
++pub async fn serve(_config: &Config, _id: &RunId) -> Result<(), Error> {
++    Ok(())
++}

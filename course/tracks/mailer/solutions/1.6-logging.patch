@@ -44,7 +44,7 @@ index 5f38167..91ac501 100644
  /// What the command line asked the process to do.
  #[derive(Debug, Clone, PartialEq, Eq)]
 diff --git a/src/logging.rs b/src/logging.rs
-index e6d5ccc..04ac0e8 100644
+index e6d5ccc..58aad9b 100644
 --- a/src/logging.rs
 +++ b/src/logging.rs
 @@ -1,11 +1,22 @@
@@ -137,7 +137,7 @@ index e6d5ccc..04ac0e8 100644
 +        database = database,
 +        "mailer is starting"
 +    );
-+    debug!("no listener yet: this build reads its configuration and stops");
++    debug!("configuration loaded");
 +}
 +
 +/// The configuration's level, as the one the subscriber filters with.

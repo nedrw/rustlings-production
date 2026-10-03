@@ -1,0 +1,227 @@
+diff --git a/src/error.rs b/src/error.rs
+index febeade..79f46a5 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -98,6 +98,15 @@ pub enum Error {
+         #[source]
+         source: Box<dyn std::error::Error + Send + Sync>,
+     },
++    /// The service could not listen on the address it was configured with.
++    #[error("cannot listen on `{address}`")]
++    Listen {
++        /// Address the service was asked to bind.
++        address: String,
++        /// What the socket reported.
++        #[source]
++        source: std::io::Error,
++    },
+ }
+ 
+ impl Error {
+@@ -108,7 +117,7 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+-    /// | the configuration could not be read or parsed | `1` | whoever deployed it |
++    /// | the configuration could not be read or parsed, logging could not start, or the address could not be bound | `1` | whoever deployed it |
+     ///
+     /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
+     /// retry.
+@@ -121,7 +130,8 @@ impl Error {
+             | Error::UnknownSetting { .. } => ExitCode::from(2),
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+-            | Error::Logging { .. } => ExitCode::FAILURE,
++            | Error::Logging { .. }
++            | Error::Listen { .. } => ExitCode::FAILURE,
+         }
+     }
+ }
+diff --git a/src/http.rs b/src/http.rs
+index 5890027..2d8fb87 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -1,23 +1,129 @@
+ //! The HTTP surface of the service (step `mailer/1.7-http`).
+ //!
+-//! The scaffold declares the two entry points a server needs: a router to answer with, and
+-//! something that puts it on a socket. Both are stubs — the routes, the honest 404/405 answers and
+-//! the address the service reports are this step's work.
++//! Three things this file is careful about, and each of them is a decision the step makes:
++//!
++//! * **the router is a value**, not a running server: a test can build it and send one request
++//!   through it without a socket, which is what step `mailer/1.8-test-harness` builds on;
++//! * **an unknown path and a known path with the wrong method answer honestly** — a JSON body that
++//!   says what happened, and for 405 the `Allow` header. That header is the router's own knowledge,
++//!   so it comes from the router and not from a catch-all route that would have to guess;
++//! * **the address that is logged is the one that was bound**, not the one that was asked for. With
++//!   port `0` the second and the first are different, and only the operating system knows the
++//!   second.
+ 
++use axum::Router;
++use axum::http::StatusCode;
++use axum::response::{IntoResponse, Response};
++use axum::routing::get;
++use serde::Serialize;
+ use tokio::net::TcpListener;
++use tracing::{info, instrument};
+ 
+ use crate::config::Config;
+ use crate::error::Error;
+ use crate::logging::RunId;
+ 
+-/// Everything the router answers, as one value a test can build without a socket.
+-pub fn router() -> axum::Router {
+-    axum::Router::new()
++/// The router this service answers with.
++///
++/// It is a plain value: the routes, the fallbacks and everything else a request can meet are here,
++/// and starting a server is a separate decision ([`serve`]).
++pub fn router() -> Router {
++    Router::new()
++        .route("/healthz", get(healthz))
++        .fallback(not_found)
++        .method_not_allowed_fallback(method_not_allowed)
+ }
+ 
+-/// Bind the configured address and serve until the process stops (step `mailer/1.7-http`).
++/// Liveness: the process is up and answering requests.
+ ///
+-/// The scaffold binds nothing and answers no request.
+-pub async fn serve(_config: &Config, _id: &RunId) -> Result<(), Error> {
+-    Ok(())
++/// Deliberately about the process, not about its dependencies: step `mailer/1.9-postgres` adds a
++/// readiness answer for those, and a liveness probe that goes red because a database is away is a
++/// liveness probe that restarts a healthy service.
++async fn healthz() -> impl IntoResponse {
++    (StatusCode::OK, axum::Json(Body { status: "ok" }))
++}
++
++/// What the service answers when the path is not one it serves.
++async fn not_found() -> Response {
++    (
++        StatusCode::NOT_FOUND,
++        axum::Json(Body {
++            status: "no such route",
++        }),
++    )
++        .into_response()
++}
++
++/// What the service answers when the path exists but the method does not.
++///
++/// The `Allow` header is already on the response when this runs — it is what the router knows about
++/// the route — so the handler only has to add the body.
++async fn method_not_allowed() -> Response {
++    (
++        StatusCode::METHOD_NOT_ALLOWED,
++        axum::Json(Body {
++            status: "method not allowed",
++        }),
++    )
++        .into_response()
++}
++
++/// The body of every answer that is not a success.
++#[derive(Debug, Serialize)]
++struct Body {
++    /// One sentence, `not_found`-style: a value a client can branch on, not a paragraph.
++    status: &'static str,
++}
++
++/// Bind the configured address and serve until the process stops.
++///
++/// # Errors
++///
++/// Reports [`Error::Listen`] when the address cannot be bound (a port already in use, a host this
++/// machine does not have) or when serving stops with an I/O failure; the message names the address,
++/// which is the first thing a deployment needs to know.
++#[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
++pub async fn serve(config: &Config, id: &RunId) -> Result<(), Error> {
++    let requested = format!("{}:{}", config.listen.host, config.listen.port);
++    let listener = TcpListener::bind(&requested)
++        .await
++        .map_err(|source| Error::Listen {
++            address: requested.clone(),
++            source,
++        })?;
++    let bound = listener.local_addr().map_err(|source| Error::Listen {
++        address: requested.clone(),
++        source,
++    })?;
++    // The port in the configuration may be `0` ("whatever is free"), so the only address worth
++    // logging is the one that was actually bound: it is how a caller learns where to send requests.
++    info!(address = %bound, "listening");
++    axum::serve(listener, router())
++        .await
++        .map_err(|source| Error::Listen {
++            address: requested,
++            source,
++        })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{Body, router};
++    use axum::http::StatusCode;
++
++    #[test]
++    fn the_router_builds_without_a_socket_or_a_runtime() {
++        // Building the router is a plain function call; `serve` is what needs a runtime (step
++        // `mailer/1.8-test-harness` relies on this).
++        let _ = router();
++    }
++
++    #[test]
++    fn a_body_carries_one_sentence_a_client_can_branch_on() {
++        let body = Body {
++            status: "no such route",
++        };
++        assert!(!body.status.is_empty());
++        assert_eq!(StatusCode::NOT_FOUND.as_u16(), 404);
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 91ac501..f1b3e72 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,6 +15,7 @@ use std::path::PathBuf;
+ 
+ pub mod config;
+ pub mod error;
++pub mod http;
+ pub mod logging;
+ 
+ pub use config::{Config, Flags};
+diff --git a/src/main.rs b/src/main.rs
+index dfed6d4..666efe3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -14,15 +14,16 @@ use anyhow::Result;
+ use mailer::logging::{self, RunId};
+ use mailer::{Config, Error, Request, USAGE};
+ 
+-fn main() -> ExitCode {
+-    match service() {
++#[tokio::main]
++async fn main() -> ExitCode {
++    match service().await {
+         Ok(code) => code,
+         Err(failure) => report(&failure),
+     }
+ }
+ 
+ /// Run one process: the command line, the configuration, and whatever was asked for.
+-fn service() -> Result<ExitCode> {
++async fn service() -> Result<ExitCode> {
+     let cli = mailer::parse(std::env::args())?;
+ 
+     // `--help` and `--version` answer without reading a configuration: a question about the binary
+@@ -56,6 +57,7 @@ fn service() -> Result<ExitCode> {
+             let id = RunId::of_this_process();
+             logging::init(&config.log, &id)?;
+             logging::announce(&config, &id);
++            mailer::http::serve(&config, &id).await?;
+         }
+         Request::Help | Request::Version => unreachable!("answered above"),
+     }

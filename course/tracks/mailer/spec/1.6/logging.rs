@@ -246,9 +246,9 @@ fn the_level_from_the_configuration_decides_what_a_run_pays_for() {
     assert!(
         debug[0]["fields"]["message"]
             .as_str()
-            .unwrap_or_default()
-            .contains("no listener yet"),
-        "the debug line says what this build does not have yet: {}",
+            .is_some_and(|message| !message.is_empty()),
+        "a debug event is an event with a message, and the message belongs to the build that \
+         logged it — the level is what this spec pins: {}",
         loud.said()
     );
     let ids: BTreeSet<String> = events
