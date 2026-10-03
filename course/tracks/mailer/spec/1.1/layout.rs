@@ -18,8 +18,11 @@ use std::process::{Command, Output};
 
 /// Lines of code (not blank, not a comment) `src/main.rs` may keep.
 ///
-/// Generous on purpose: the point is "a shell, not the program", not a formatting opinion.
-const BIN_LINE_BUDGET: usize = 20;
+/// Generous on purpose, and it has to be: the boundary grows with the service — flags,
+/// configuration, logging, turning a failure into an exit code — while the service itself stays in
+/// the library. What this catches is the program moving into `main.rs`, not a formatting opinion
+/// (step 1.6's reference solution lands at 58 of them).
+const BIN_LINE_BUDGET: usize = 100;
 
 fn project() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
