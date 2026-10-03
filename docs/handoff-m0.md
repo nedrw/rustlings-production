@@ -233,7 +233,39 @@
 > `cargo xtask ci` 全绿 3m30s，`kiln selftest` 对 **1.1–1.12 共 12 步**满足契约（1.12：8/8 must），
 > `kiln verify --json mailer` = 12 passed / 0 failed / 10 not authored（exit 3）。
 >
-> ### 1.13 已定的设计（下一段直接写代码，不要再调研）
+> ### 2026-10 进度（M0 第八段 · 做到 1.13）
+>
+> T1 1.13（邮件端口 + 假实现）已完成并提交（`c1bd05d`）：`src/email.rs`（`Message`/`SendError`/
+> 装箱 future 的 `EmailSender`/`Logging`/两个常量）、`tests/support/email.rs`（`Recording` 假实现，
+> `fail_with`/`clear_failure`/`attempted`/`delivered`）、`AppState` 的 `Arc<dyn EmailSender>` 与
+> `start_with_sender`/`sender()`（二进制仍走 `start`，未改一行）、`signup::subscribe(pool, sender,
+> request)` 在插入成功后才发信、发失败只 `warn!` 不改 201；`tests/spec_email_port.rs` 五条。
+> `cargo xtask ci` 全绿 3m45s，`kiln selftest` 对 **1.1–1.13 共 13 步**满足契约（1.13：8/8 must），
+> `kiln verify --json mailer` = 13 passed / 0 failed / 9 not authored。反向验证：把发送挪到插入**之前**，
+> `an_address_that_is_already_subscribed_gets_no_second_email` 报 `left: 2, right: 1`。
+>
+> **落地时与设计的两处不同（下一段照现状写）**：① `confirmation_message` 放在 `src/signup.rs`（不在
+> `src/email.rs`）——端口模块因此不知道「订阅」这个概念，而 1.14 的 worker 要重发时正好需要它；
+> ② 规格里的夹具叫 `App`（不是 `AppHarness`），并且只实现了 `post`（本步所有 HTTP 断言都是 POST /signup）。
+> 另：这一步的 scaffold 没有「故意写错的函数」，它错在**缺缝**——scaffold 上规格是**编译不过**的
+> （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
+> authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
+>
+> ### 1.14 开工前要确认的两件事（下一段先看这个，再写设计）
+>
+> 1.14 是 120m 的异步步（`async/graceful-shutdown@apply` + `async/backpressure@aware`，概念：有界队列、
+> 停机排空、带抖动的重试），需要 `cfg/layered-config@apply` 与 `test/fake-external@apply`（都已具备）。
+> 动手前先把这两处读一遍，因为它们决定 scaffold 能不能只新增文件：
+>
+> - **`src/main.rs` 现在的停机路径**：1.7 起 `serve_on` 用 `tokio::select!` 收一个 oneshot，二进制里
+>   `tokio` 的 `signal` feature 已经开着，但 SIGTERM→排空的完整链路要按现状确认；停机截止时间、队列
+>   上限这类设置要进 `config.rs`（**没有标记块，学员手改**，跟 1.4 的 defaults/file/env/flags/report
+>   机制一起；1.19 之前 `public.base_url` 也该在这时补上）。
+> - **`async/backpressure@aware` 的闸门怎么判**：`gates` 里目前没有能观察「队列满时请求怎么答」的闸门，
+>   这一步的规格（`spec/1.14/worker.rs`）要么用假发送器把队列吃满（把 `Recording` 改造成「每次 send 都
+>   等一个信号」的慢发送器），要么断言 HTTP 答复（429/503）；后者更接近课程的一贯口味。
+>
+> ### 1.13 的设计原文（已按此实现，留档）
 >
 > 能力 `test/fake-external@apply`；60m → 建议改 **90m**（见下）；requires 已满足（1.5 的错误链、1.12 的
 > 令牌）。**这一步的关键约束是注入缝**：`tests/support/mod.rs`（1.8 的 app 工厂）没有 scaffold 标记块，
