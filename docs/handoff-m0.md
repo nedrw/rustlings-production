@@ -251,6 +251,40 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十一段 · 做到 1.18）
+>
+> T1 1.16（会话/认证，`16b5404`）、1.17（newsletter 事务 + fan-out，`a651074`）、1.18（授权边界，
+> `69cf287`）已完成。1.18 是**第一个没有 scaffold 的步骤**（§5.2）：route + 受会话限定范围的查询 + 一个错误
+> 变体，1.16 已经把每种形状都演示过了，`track.toml` 里写明了为什么删掉 `scaffold` 键。到 1.18 为止：
+> `cargo xtask ci` 全绿 7m11s（18/18 步满契约），`kiln verify --json mailer` = 18 passed / 0 failed /
+> 4 not authored。
+>
+> **这一段新落地的机制（后面几步直接用）**：
+>
+> 1. **`tests/support/service.rs`（1.16 的 scaffold 给的）**：一个“真进程 + 能发 header 的客户端”夹具
+>    （`Service::start(env)`、`call/get/get_with/post`、`log_lines`、`stop/wait_for_exit`）。1.13 的进程内夹具
+>    只能发 body，cookie 与 `Authorization` 这类东西它发不了——认证类规格必须用这个。**日志断言要在 env 里
+>    加 `("MAILER__LOG__FORMAT", "json")`**（默认是 pretty，1.7 的规格也是这么做的）。
+> 2. **会话凭据**：`sha2`（新增依赖，scaffold 往标记块里插的）对 token 做 SHA-256——“高熵秘密用快哈希，
+>    可猜的秘密用慢哈希”是这一步的课；cookie 属性固定为 `HttpOnly; SameSite=Lax; Path=/; Max-Age=…`，
+>    **没有 `Secure`**（本机无 TLS），正文 TRAP 第 7 条写明这是决定而非疏漏。
+> 3. **1.17 的表结构**：`issues`（两个 CHECK：非空 subject/body）+ `issue_deliveries`，后者带
+>    `UNIQUE (issue_id, subscriber_id)`（投递身份是“哪一期的哪一份”），claim/mark_sent/release 与 1.15 同形。
+>    事务 + **commit 之后**才 fan-out；audience 是 `INSERT … SELECT … WHERE status = 'active'`（不是 Rust 循环）。
+>    队列满时那些“没排上去”的副本就留在表里——真正的 relay 属于 T3/T4，正文明写了这个缺口。
+> 4. **`Job` 现在是 enum**（`Job::confirmation(subscriber)` / `Job::issue(delivery)`），worker 按种类分派；
+>    两种循环长得像但不抽象化（正文解释了为什么）。任何依赖 `Job` 形状的规格都会因此打破——目前没有。
+>
+> **1.19（真实邮件服务器容器）动手前必须解决的三个限制**（这三条是被前面步骤“记了账”的）：
+>
+> - 二进制一直用 `Logging` 适配器，所以 **1.14 的 drain 截止时间、1.15/1.17 的失败路径在子进程规格里都
+>   无法观测**（1.14 提交信息与 1.15 正文都写了这件事）。1.19 要把适配器**可配置**（SMTP），并且
+>   **在没配置时仍然默认 `Logging`**（1.7 起的子进程规格都隐含依赖这一点，1.14 更是明文断言了
+>   `an email would be sent`）——这样新规格可以指向容器里的邮件服务器，旧规格一字不改。
+> - 镜像：`axllent/mailpit`。Docker Hub 直连在本机拉不动，用 `docker.1ms.run/axllent/mailpit` 缓存；
+>   `images` 门与 `tests/support/` 里的镜像判定按“仓库路径”而不是字符串相等（1.9 定下的规则）。
+> - SMTP 客户端：`lettre`（新增依赖，插在标记块里；不带 TLS 的 feature 组合，mailpit 的 1025 是明文）。
+>
 > ### 2026-10 进度（M0 第十段 · 做到 1.15）
 >
 > T1 1.15（幂等投递）已完成并提交（`32c5489`）：迁移 `0002_confirmation_delivery.sql`（`subscribers` 加
