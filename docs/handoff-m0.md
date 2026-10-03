@@ -251,6 +251,49 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十二段 · 做到 1.20）
+>
+> T1 1.19（真实邮件服务器容器，`a141cd8`）、1.20（metrics + SLO 草稿，`29d522f`）已完成。1.19 把 SMTP 适配器
+> 变成可配置的（`email.smtp_host`/`email.smtp_port`），**没配置时仍然是 `Logging`**（前面所有子进程规格都靠这一
+> 点，1.14 更是明文断言 `an email would be sent`）；`tests/support/mailpit.rs` 是一容器一测试的邮件服务器夹具；
+> 它的第三条规格是**第一次把 1.14 的 drain 截止时间从进程外判下来**（SIGTERM → 10s → 退 1）。1.20 加了
+> `/metrics`（手写 Prometheus 文本格式）、按**匹配到的路由**计数的中间件、以及 `deliveries_total{outcome}` 的
+> 三种结局；规格里有一条 `# HELP` 家族快照（重命名即红）。
+>
+> **这一段的四个环境/工具教训（很重要，别重踩）**：
+>
+> 1. **容器夹具必须带 `-v` 删卷**（`7ed238b`）：postgres 镜像把数据目录声明成 VOLUME，每个测试容器都会留一个匿名
+>    卷，而 `podman rm -f` 不删卷。本 session 累积到 2022 个卷后引擎报 `exceeded num_locks (2048)`，**所有**容器
+>    规格一起崩，症状离原因极远（当时看起来像两个 `perf(kiln)` 提交导致的回归）。两个夹具的 `Drop` 现在都是
+>    `rm -f -v`，注释写明了原因。**如果以后又出现“所有容器测试同时失败”，先看
+>    `podman volume ls | wc -l`，再 `podman volume prune -f`。**
+> 2. **课程 patch 不能追加到骨架 `Cargo.toml` 末尾**（`aa4f6e6` 回退）：那样会让 `1.2` 的 solution 在
+>    `git apply` 下失败（kiln 自己的 applier 容忍，git 不容忍）。骨架的每一行都是后面 patch 的上下文。
+> 3. **共享构建目录是真正的性能开关**（`62436a6`）：`kiln process` 现在接受一个进程级 `CARGO_TARGET_DIR`，
+>    `selftest` 指向 `$XDG_CACHE_HOME/kiln/target`（或 `$HOME/.cache/...`）。单步 selftest 从 1m30s → **25-57s**，
+>    `cargo xtask ci` 从 7m30s（基准）→ **6m46s**，而 `kiln verify` 里每步的同一批门现在只算一次（`perf(kiln)` 的
+>    树指纹缓存）。`verify` 剩下的时间（~2m30s）几乎全是 spec 自己：每个测试各起一个容器（这是刻意的隔离，
+>    也是 1.19 教的 order independence），不要再为了快把它去掉。
+> 4. **两个工作流建议已落地**：长验证交给子 agent（scout，冻结的树 + 只回报结论行/耗时/失败诊断前几行）；
+>    在验证跑着的时候不动文件。这一轮三次验证都是这么做的，上下文省很多。
+>
+> **T1 还剩三步 + 一件框架事（下一段直接接）**：
+>
+> - **1.21-container**（120m，`release/container-image@apply`，spec `spec/image.rs` → `tests/spec_image.rs`，
+>   `run.cmd = cargo test -p mailer --test spec_image`）：多阶段 Dockerfile + 探针 + “先迁移后收流量”；它的 gates
+>   里已经有 **`container-repro`**，而这个门在 `kiln/src/gates/registry.rs` 里仍是
+>   `GateStatus::Pending("arrives with T1 step 21's content")` ✗ **必须先实现这个门**（建议：构建镜像、跑起来、
+>   打 `/healthz`、用同一面 binary 的 `--check-config` 对一下；名字叫“repro”就应该验证“镜像跑的是同一面
+>   binary”）。镜像基础建议用 `docker.1ms.run/library/rust:1.98-slim` + `debian:bookworm-slim`（本机
+>   `docker.m.daocloud.io/library/debian:bookworm-slim` 已经在库里），并把它们加进
+>   `images = [...]` 与 1.21 的 `images` 门。注意 spec 的超时是 300s，镜像构建很可能超——建议 spec 只做
+>   “构建一次 + 跑一次 + 探针 + 二进制比对”，并把依赖层缓存写进 Dockerfile。
+> - **1.22-runbook**（120m，design 步骤，`ops/runbook-drill@apply`）：两条线（演练规格 + 人读的 runbook），
+>   它的 gates 里有 **`links`**，同样是 Pending ✗ **必须先实现**（需要 `lychee` 或一个手写的链接检查器：
+>   只查课程文档里的 URL，离线可跳过）。
+> - **`kiln watch`**（M0 验收里的“reruns on save”）还没做 ✗：轮询项目目录的指纹（`cmd/mod.rs` 里的
+>   `tree_fingerprint` 已经是现成的、内容敏感的实现），变了就重跑 `kiln run <step>`。
+>
 > ### 2026-10 进度（M0 第十一段 · 做到 1.18）
 >
 > T1 1.16（会话/认证，`16b5404`）、1.17（newsletter 事务 + fan-out，`a651074`）、1.18（授权边界，
