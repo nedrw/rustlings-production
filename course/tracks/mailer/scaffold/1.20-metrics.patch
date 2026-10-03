@@ -1,0 +1,188 @@
+diff --git a/src/metrics.rs b/src/metrics.rs
+new file mode 100644
+index 0000000..3e8b167
+--- /dev/null
++++ b/src/metrics.rs
+@@ -0,0 +1,182 @@
++//! What this service counts, and what a metric name promises (step `mailer/1.20-metrics`).
++//!
++//! Logs answer "what happened to this request"; metrics answer "how is this service doing", which is
++//! a different question with a different budget: a metric is a *number somebody will alert on*, and
++//! the cost of getting one wrong is paid at three in the morning rather than in review.
++//!
++//! Three decisions, and each of them is a way to get it wrong:
++//!
++//! * **the names and labels are an API.** A dashboard, an alert and a runbook are all written
++//!   against `http_requests_total{route,status}`; renaming a label breaks them silently, so the
++//!   vocabulary is fixed here, in one file, and a spec refuses to let it drift;
++//! * **cardinality is bounded.** A label whose values come from the request — a path with an id in
++//!   it, an email address, an error message — turns one series into thousands, and a metric store
++//!   into an expensive accident. The route label is the *matched route* (`/subscribers/{id}/deliveries`
++//!   for every subscriber), never the concrete path, and a request that matched nothing is
++//!   `unmatched` rather than its own series;
++//! * **the three endings of a delivery are counted separately** (step
++//!   `mailer/1.15-idempotent-delivery` made them three): `sent`, `failed` (an attempt that will be
++//!   retried) and `given_up`. A single "errors" counter would make a message that was retried and
++//!   then delivered indistinguishable from one nobody will ever receive.
++//!
++//! The exposition is the text format every scraper understands (Prometheus, and a dozen things that
++//! speak it): one sample per line, `name{labels} value`, with `# HELP` and `# TYPE` comments above
++//! each family. A real deployment would reach for a crate that maintains this registry
++//! (`metrics` + `metrics-exporter-prometheus` are the usual pair); writing it out once is how the
++//! shape of the data becomes visible, and the TRAP of this step says what a crate would add.
++//!
++//! # What this scaffold proves
++//!
++//! The registry and its shape are here; the *exposition* is not. [`Metrics::render`] below writes
++//! the `# HELP`/`# TYPE` header of every family and no sample at all, so a scraper learns what this
++//! service intends to measure and nothing about what it is doing. The step is to write the samples
++//! (one line per series, sorted), to put the endpoint in front of them, and to count at the three
++//! places only this service knows about: the middleware for every request, and the delivery worker
++//! for the three endings of a message.
++//!
++//! What is deliberately *not* here: an SLO is a number somebody agrees to, and this file can only
++//! offer the ingredients. The step's prose (and `docs/slo.md` in a deployment) is where the agreement
++//! lives — this is the part of it a machine can check.
++
++use std::collections::BTreeMap;
++use std::fmt::Write as _;
++use std::sync::Mutex;
++use std::time::Duration;
++
++/// The histogram buckets a request duration is counted in, in seconds.
++///
++/// A fixed set, and a small one: buckets are label values (`le="0.05"`), so adding one is a new
++/// series per route, and a histogram with a hundred buckets is a histogram nobody reads. These
++/// reach from "a cache hit" to "something is wrong", which is the range a web service's latency
++/// actually occupies.
++const BUCKETS: [f64; 10] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
++
++/// What the label `route` says for a request that matched no route.
++///
++/// The alternative — using the path that was asked for — is how a scan of `/wp-login.php`,
++/// `/wp-login.php?x=1` and ten thousand other strings becomes ten thousand series.
++const UNMATCHED: &str = "unmatched";
++
++/// How a message ended, as the delivery worker sees it (step `mailer/1.20-metrics`).
++///
++/// The three names are the three endings of step `mailer/1.15-idempotent-delivery`: a message that
++/// was handed over, one attempt that failed and will be retried, and a message the service has given
++/// up on.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DeliveryOutcome {
++    /// The sender took the message.
++    Sent,
++    /// One attempt failed. The worker retries, so this counts attempts rather than messages: it is
++    /// the number that says a mail server is unwell.
++    Failed,
++    /// The attempts ran out and the message is left owed.
++    GivenUp,
++}
++
++impl DeliveryOutcome {
++    /// The label value this outcome is counted under.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            DeliveryOutcome::Sent => "sent",
++            DeliveryOutcome::Failed => "failed",
++            DeliveryOutcome::GivenUp => "given_up",
++        }
++    }
++}
++
++/// One histogram: how many observations fell in each bucket, plus their sum.
++#[derive(Debug, Default, Clone)]
++struct Histogram {
++    /// Counts per bucket, in the order of [`BUCKETS`].
++    buckets: [u64; BUCKETS.len()],
++    /// How many observations there were.
++    count: u64,
++    /// What they added up to, in seconds.
++    sum: f64,
++}
++
++impl Histogram {
++    /// Count one observation.
++    fn observe(&mut self, seconds: f64) {
++        for (index, bound) in BUCKETS.iter().enumerate() {
++            if seconds <= *bound {
++                self.buckets[index] += 1;
++            }
++        }
++        self.count += 1;
++        self.sum += seconds;
++    }
++}
++
++/// Everything this service counts.
++///
++/// One of these lives for the life of the process (inside `AppState` and inside the delivery
++/// worker), which is the point: a counter that starts at zero per request is not a counter. The
++/// interior mutability is a `Mutex` per family rather than one for the whole struct, so a request
++/// being timed does not block a delivery being counted.
++#[derive(Debug, Default)]
++pub struct Metrics {
++    /// Requests answered, by matched route and status code.
++    requests: Mutex<BTreeMap<(String, u16), u64>>,
++    /// Request durations, by matched route.
++    durations: Mutex<BTreeMap<String, Histogram>>,
++    /// Messages finished, by outcome.
++    deliveries: Mutex<BTreeMap<&'static str, u64>>,
++}
++
++impl Metrics {
++    /// A registry with nothing counted yet.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Count one answered request.
++    ///
++    /// `route` is the *matched* route (`None` for a request that matched nothing), and `status` is
++    /// the answer the client got: the pair is what a dashboard groups by, so both are part of the
++    /// key rather than of the value.
++    pub fn record_request(&self, route: Option<&str>, status: u16, elapsed: Duration) {
++        let route = route.unwrap_or(UNMATCHED).to_owned();
++        *self
++            .requests
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .entry((route.clone(), status))
++            .or_insert(0) += 1;
++        self.durations
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .entry(route)
++            .or_default()
++            .observe(elapsed.as_secs_f64());
++    }
++
++    /// Count one message the worker finished with.
++    pub fn record_delivery(&self, outcome: DeliveryOutcome) {
++        *self
++            .deliveries
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .entry(outcome.as_str())
++            .or_insert(0) += 1;
++    }
++
++    /// The exposition: one sample per line, in the text format a scraper reads.
++    ///
++    /// The scaffold writes the *shape* of an exposition — a `# HELP` and a `# TYPE` line per family
++    /// — and no samples: what this process has counted is invisible until the step writes the
++    /// samples, which is the part a scraper actually reads.
++    #[must_use]
++    pub fn render(&self) -> String {
++        let mut out = String::new();
++        out.push_str("# HELP http_requests_total Requests answered, by matched route and status.\n");
++        out.push_str("# TYPE http_requests_total counter\n");
++        out.push_str("# HELP http_request_duration_seconds Request duration, by matched route.\n");
++        out.push_str("# TYPE http_request_duration_seconds histogram\n");
++        out.push_str("# HELP deliveries_total Messages the worker finished with, by outcome.\n");
++        out.push_str("# TYPE deliveries_total counter\n");
++        out
++    }
++}

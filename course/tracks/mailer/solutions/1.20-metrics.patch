@@ -1,0 +1,377 @@
+diff --git a/src/delivery.rs b/src/delivery.rs
+index aa83a37..793fcce 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -43,6 +43,7 @@ use tracing::{error, info, warn};
+ use crate::deliveries;
+ use crate::email::{EmailSender, Message};
+ use crate::error::Error;
++use crate::metrics::{DeliveryOutcome, Metrics};
+ use crate::newsletter;
+ use crate::signup::confirmation_message;
+ 
+@@ -132,11 +133,19 @@ impl Queue {
+     /// and no way for a second one to appear. It also owns the pool: sending is no longer "hand
+     /// this message over", it is "claim what this job names, send it, and record which of the two
+     /// happened" (step `mailer/1.15-idempotent-delivery`), and the record lives in the database.
++    ///
++    /// It owns the counters for the same reason (step `mailer/1.20-metrics`): how a message ended
++    /// — `sent`, `failed`, `given_up` — is something only this task knows, and a metric counted from
++    /// anywhere else would be a guess.
+     #[must_use]
+-    pub fn start(sender: Arc<dyn EmailSender>, pool: PgPool) -> Self {
++    pub fn start(sender: Arc<dyn EmailSender>, pool: PgPool, metrics: Arc<Metrics>) -> Self {
+         let (jobs, mut waiting) = mpsc::channel::<Job>(QUEUE_CAPACITY);
+         let (stop, mut stopping) = watch::channel(false);
+ 
++        // The worker keeps one clone and the queue keeps the other: a delivery's whole story is
++        // recorded by the worker (step `mailer/1.20-metrics`), while the registry itself belongs to
++        // the process.
++        let worker_metrics = Arc::clone(&metrics);
+         let worker = tokio::spawn(async move {
+             let mut delivered = 0_usize;
+             loop {
+@@ -154,7 +163,7 @@ impl Queue {
+                         let Some(job) = job else {
+                             break;
+                         };
+-                        match deliver_job(&pool, sender.as_ref(), &job).await {
++                        match deliver_job(&pool, sender.as_ref(), &worker_metrics, &job).await {
+                             // `true` is a message that went out, and `false` is a job that had
+                             // nothing left to do (step `mailer/1.15-idempotent-delivery`):
+                             // neither of them is a failure.
+@@ -221,10 +230,17 @@ impl Queue {
+ }
+ 
+ /// Run one job: hand it to the kind of delivery it names.
+-async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Result<bool, Error> {
++async fn deliver_job(
++    pool: &PgPool,
++    sender: &dyn EmailSender,
++    metrics: &Metrics,
++    job: &Job,
++) -> Result<bool, Error> {
+     match job {
+-        Job::Confirmation { subscriber } => deliver_confirmation(pool, sender, *subscriber).await,
+-        Job::Issue { delivery } => deliver_copy(pool, sender, *delivery).await,
++        Job::Confirmation { subscriber } => {
++            deliver_confirmation(pool, sender, metrics, *subscriber).await
++        }
++        Job::Issue { delivery } => deliver_copy(pool, sender, metrics, *delivery).await,
+     }
+ }
+ 
+@@ -249,6 +265,7 @@ async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Resu
+ async fn deliver_confirmation(
+     pool: &PgPool,
+     sender: &dyn EmailSender,
++    metrics: &Metrics,
+     subscriber: i64,
+ ) -> Result<bool, Error> {
+     let mut attempt = 1_u32;
+@@ -266,14 +283,17 @@ async fn deliver_confirmation(
+                 // The record is written *after* the send: a `sent_at` set before the mail server took
+                 // the message would be a promise this service cannot keep.
+                 deliveries::mark_sent(pool, subscriber).await?;
++                metrics.record_delivery(DeliveryOutcome::Sent);
+                 return Ok(true);
+             }
+             Err(error) => {
+                 // The message is still owed and nobody is sending it: without this the subscriber
+                 // would be stuck as "someone is on it" forever, and no later job could claim it.
+                 deliveries::release(pool, subscriber).await?;
++                metrics.record_delivery(DeliveryOutcome::Failed);
+                 if attempt >= MAX_ATTEMPTS {
+                     error!(%error, to = %delivery.email, "giving up on an email");
++                    metrics.record_delivery(DeliveryOutcome::GivenUp);
+                     return Ok(false);
+                 }
+                 let wait = backoff(attempt);
+@@ -301,6 +321,7 @@ async fn deliver_confirmation(
+ async fn deliver_copy(
+     pool: &PgPool,
+     sender: &dyn EmailSender,
++    metrics: &Metrics,
+     delivery: i64,
+ ) -> Result<bool, Error> {
+     let mut attempt = 1_u32;
+@@ -320,12 +341,15 @@ async fn deliver_copy(
+         match sender.send(message).await {
+             Ok(()) => {
+                 newsletter::mark_sent(pool, delivery).await?;
++                metrics.record_delivery(DeliveryOutcome::Sent);
+                 return Ok(true);
+             }
+             Err(error) => {
+                 newsletter::release(pool, delivery).await?;
++                metrics.record_delivery(DeliveryOutcome::Failed);
+                 if attempt >= MAX_ATTEMPTS {
+                     error!(%error, to = %copy.email, "giving up on an issue");
++                    metrics.record_delivery(DeliveryOutcome::GivenUp);
+                     return Ok(false);
+                 }
+                 let wait = backoff(attempt);
+@@ -368,6 +392,7 @@ pub fn backoff(attempt: u32) -> Duration {
+ mod tests {
+     use super::{Queue, RETRY_BASE, RETRY_CAP, backoff};
+     use crate::email::{EmailSender, Message, SendError};
++    use crate::metrics::Metrics;
+     use sqlx::PgPool;
+     use std::sync::Arc;
+     use std::time::Duration;
+@@ -431,7 +456,7 @@ mod tests {
+ 
+     #[tokio::test(start_paused = true)]
+     async fn a_full_queue_refuses_instead_of_waiting() {
+-        let queue = Queue::start(Arc::new(Hanging), lazy_pool());
++        let queue = Queue::start(Arc::new(Hanging), lazy_pool(), Arc::new(Metrics::new()));
+         let mut seats = Vec::new();
+         for _ in 0..super::QUEUE_CAPACITY {
+             seats.push(queue.reserve().expect("the queue has room to fill"));
+diff --git a/src/http.rs b/src/http.rs
+index c8b74d3..8e41385 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -39,9 +39,10 @@
+ 
+ use axum::Router;
+ use axum::extract::rejection::{JsonRejection, QueryRejection};
+-use axum::extract::{Json, Path, Query, State};
++use axum::extract::{Json, MatchedPath, Path, Query, State};
+ use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+-use axum::http::{HeaderMap, StatusCode};
++use axum::http::{HeaderMap, Request, StatusCode};
++use axum::middleware::{self, Next};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use serde::{Deserialize, Serialize};
+@@ -50,6 +51,7 @@ use tracing::{error, info, instrument, warn};
+ 
+ use std::future::Future;
+ use std::sync::Arc;
++use std::time::Instant;
+ 
+ use crate::config::Config;
+ use crate::confirmation::{self, Token};
+@@ -59,6 +61,7 @@ use crate::email::{EmailSender, Logging};
+ use crate::error::Error;
+ use crate::logging::RunId;
+ use crate::login::{Credentials, log_in};
++use crate::metrics::Metrics;
+ use crate::newsletter::{self, NewsletterRequest};
+ use crate::session::{self, Token as SessionToken};
+ use crate::signup::{SignupRequest, subscribe};
+@@ -74,6 +77,9 @@ use crate::smtp::Smtp;
+ pub struct AppState {
+     config: Config,
+     database: Option<Database>,
++    /// What this process counts (step `mailer/1.20-metrics`): one registry per process, shared by
++    /// the routes, the delivery worker and the `/metrics` endpoint.
++    metrics: Arc<Metrics>,
+     /// The delivery queue, when there is a database for it to record deliveries in (step
+     /// `mailer/1.15-idempotent-delivery`).
+     delivery: Option<Queue>,
+@@ -134,6 +140,7 @@ impl AppState {
+             return Ok(Self {
+                 config,
+                 database: None,
++                metrics: Arc::new(Metrics::new()),
+                 // No database, no delivery record, no queue: a job
+                 // whose delivery cannot be claimed is work this process must not accept.
+                 delivery: None,
+@@ -144,14 +151,22 @@ impl AppState {
+         database.migrate().await?;
+         // The queue is built with the pool: what it records about a delivery is a write to the
+         // database the subscriber lives in (step `mailer/1.15-idempotent-delivery`).
+-        let delivery = Queue::start(sender, database.pool().clone());
++        let metrics = Arc::new(Metrics::new());
++        let delivery = Queue::start(sender, database.pool().clone(), Arc::clone(&metrics));
+         Ok(Self {
+             config,
+             database: Some(database),
+             delivery: Some(delivery),
++            metrics,
+         })
+     }
+ 
++    /// What this process counts (step `mailer/1.20-metrics`).
++    #[must_use]
++    pub fn metrics(&self) -> &Arc<Metrics> {
++        &self.metrics
++    }
++
+     /// The delivery queue this state was built with (step `mailer/1.14-worker`).
+     ///
+     /// A handler reserves a seat here *before* it does the work a job is about, and hands the job
+@@ -206,9 +221,17 @@ pub fn router(state: AppState) -> Router {
+         .route("/logout", post(logout))
+         .route("/me", get(me))
+         .route("/subscribers/{id}/deliveries", get(deliveries_of))
++        .route("/metrics", get(exposition))
+         .route("/confirm", get(confirm))
+         .route("/newsletter", post(newsletter))
+-        .fallback(not_found)
++        // The unknown path is a *route* with a pattern rather than a bare fallback, and that is what
++        // makes it countable (step `mailer/1.20-metrics`): a router layer is applied to routes, not
++        // to a fallback, so a 404 that nobody routed would be the one answer this service does not
++        // count. The pattern is fixed, so every path a stranger invents lands in one series.
++        .route("/{*rest}", get(not_found))
++        // Last, because a router layer wraps the routes that exist when it is applied: a route
++        // declared after this would be the one answer the service does not count.
++        .layer(middleware::from_fn_with_state(state.clone(), measure))
+         .method_not_allowed_fallback(method_not_allowed)
+         .with_state(state)
+ }
+@@ -313,6 +336,46 @@ async fn signup(
+     }
+ }
+ 
++/// `GET /metrics`: what this process has counted, in the text format a scraper reads
++/// (step `mailer/1.20-metrics`).
++///
++/// Unauthenticated on purpose, and that is a deployment decision rather than an oversight: a scraper
++/// is not a subscriber, and the usual answer is to keep this route somewhere the internet cannot
++/// reach (step `mailer/1.21-container` is where a process gets more than one listener). What is *not*
++/// safe is what the TRAP of this step describes: a metric that carries an address or an id.
++async fn exposition(State(state): State<AppState>) -> Response {
++    (
++        StatusCode::OK,
++        [("content-type", "text/plain; version=0.0.4")],
++        state.metrics().render(),
++    )
++        .into_response()
++}
++
++/// Time every request and count it, by matched route and status (step `mailer/1.20-metrics`).
++///
++/// A middleware rather than a line in each handler, for the reason the whole step exists: a metric
++/// that has to be remembered at nine call sites is a metric that is wrong at three of them. What it
++/// records is the *matched* route — `MatchedPath` is the pattern
++/// (`/subscribers/{id}/deliveries`), not the concrete path — and a request that matched nothing is
++/// one series called `unmatched`, because a path a stranger chose is not a label this service wants.
++async fn measure(
++    State(state): State<AppState>,
++    matched: Option<MatchedPath>,
++    request: Request<axum::body::Body>,
++    next: Next,
++) -> Response {
++    let started = Instant::now();
++    let route = matched.map(|path| path.as_str().to_owned());
++    let response = next.run(request).await;
++    state.metrics().record_request(
++        route.as_deref(),
++        response.status().as_u16(),
++        started.elapsed(),
++    );
++    response
++}
++
+ /// The name of the cookie a session travels in.
+ ///
+ /// One name, in one place: the login that sets it, the logout that clears it, and the lookup that
+diff --git a/src/lib.rs b/src/lib.rs
+index 1b61a03..2206f24 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod error;
+ pub mod http;
+ pub mod logging;
+ pub mod login;
++pub mod metrics;
+ pub mod newsletter;
+ pub mod session;
+ pub mod signup;
+diff --git a/src/metrics.rs b/src/metrics.rs
+index 3e8b167..659c897 100644
+--- a/src/metrics.rs
++++ b/src/metrics.rs
+@@ -25,15 +25,6 @@
+ //! (`metrics` + `metrics-exporter-prometheus` are the usual pair); writing it out once is how the
+ //! shape of the data becomes visible, and the TRAP of this step says what a crate would add.
+ //!
+-//! # What this scaffold proves
+-//!
+-//! The registry and its shape are here; the *exposition* is not. [`Metrics::render`] below writes
+-//! the `# HELP`/`# TYPE` header of every family and no sample at all, so a scraper learns what this
+-//! service intends to measure and nothing about what it is doing. The step is to write the samples
+-//! (one line per series, sorted), to put the endpoint in front of them, and to count at the three
+-//! places only this service knows about: the middleware for every request, and the delivery worker
+-//! for the three endings of a message.
+-//!
+ //! What is deliberately *not* here: an SLO is a number somebody agrees to, and this file can only
+ //! offer the ingredients. The step's prose (and `docs/slo.md` in a deployment) is where the agreement
+ //! lives — this is the part of it a machine can check.
+@@ -165,18 +156,69 @@ impl Metrics {
+ 
+     /// The exposition: one sample per line, in the text format a scraper reads.
+     ///
+-    /// The scaffold writes the *shape* of an exposition — a `# HELP` and a `# TYPE` line per family
+-    /// — and no samples: what this process has counted is invisible until the step writes the
+-    /// samples, which is the part a scraper actually reads.
++    /// Sorted by name and by label, so two scrapes of the same state are the same bytes — which is
++    /// what makes the snapshot in this step's spec a test rather than a coin toss.
+     #[must_use]
+     pub fn render(&self) -> String {
+         let mut out = String::new();
+-        out.push_str("# HELP http_requests_total Requests answered, by matched route and status.\n");
++        out.push_str(
++            "# HELP http_requests_total Requests answered, by matched route and status.\n",
++        );
+         out.push_str("# TYPE http_requests_total counter\n");
++        for ((route, status), count) in self
++            .requests
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .iter()
++        {
++            let _ = writeln!(
++                out,
++                "http_requests_total{{route=\"{route}\",status=\"{status}\"}} {count}"
++            );
++        }
++
+         out.push_str("# HELP http_request_duration_seconds Request duration, by matched route.\n");
+         out.push_str("# TYPE http_request_duration_seconds histogram\n");
++        for (route, histogram) in self
++            .durations
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .iter()
++        {
++            for (index, bound) in BUCKETS.iter().enumerate() {
++                let _ = writeln!(
++                    out,
++                    "http_request_duration_seconds_bucket{{route=\"{route}\",le=\"{bound}\"}} {}",
++                    histogram.buckets[index]
++                );
++            }
++            let _ = writeln!(
++                out,
++                "http_request_duration_seconds_bucket{{route=\"{route}\",le=\"+Inf\"}} {}",
++                histogram.count
++            );
++            let _ = writeln!(
++                out,
++                "http_request_duration_seconds_sum{{route=\"{route}\"}} {}",
++                histogram.sum
++            );
++            let _ = writeln!(
++                out,
++                "http_request_duration_seconds_count{{route=\"{route}\"}} {}",
++                histogram.count
++            );
++        }
++
+         out.push_str("# HELP deliveries_total Messages the worker finished with, by outcome.\n");
+         out.push_str("# TYPE deliveries_total counter\n");
++        for (outcome, count) in self
++            .deliveries
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .iter()
++        {
++            let _ = writeln!(out, "deliveries_total{{outcome=\"{outcome}\"}} {count}");
++        }
+         out
+     }
+ }
