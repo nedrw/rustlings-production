@@ -1,0 +1,65 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 0cadf8f..23f6fc9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,8 +22,13 @@ workspace = true
+ # kiln:scaffold:begin
+ anyhow = "1.0.104"
+ serde = { version = "1.0.229", features = ["derive"] }
++# The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
++# serialise structures of its own from 1.7 on.
++serde_json = "1.0.151"
+ thiserror = "2.0.21"
+ toml = "0.9.8"
++tracing = "0.1.44"
++tracing-subscriber = { version = "0.3.23", features = ["json", "fmt"] }
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings
+diff --git a/src/logging.rs b/src/logging.rs
+new file mode 100644
+index 0000000..e6d5ccc
+--- /dev/null
++++ b/src/logging.rs
+@@ -0,0 +1,41 @@
++//! Structured logging: one line per event, with the fields a log collector indexes
++//! (step `mailer/1.6-logging`).
++//!
++//! The scaffold declares the two entry points and the identifier a line carries. What is missing is
++//! the point of the step: the subscriber (format and level coming from the configuration), and the
++//! announcement with the fields and the span the course's spec looks for.
++
++use crate::config::{Config, Log};
++use crate::error::Error;
++
++/// The identifier that ties every line of one process together.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RunId(String);
++
++impl RunId {
++    /// The id of a run: the process the operating system started.
++    #[must_use]
++    pub fn of_this_process() -> Self {
++        Self(std::process::id().to_string())
++    }
++
++    /// The id as it is written into a log line.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++/// Start logging, in the format and at the level the configuration asks for
++/// (step `mailer/1.6-logging`).
++///
++/// The scaffold installs no subscriber, so nothing is logged yet.
++pub fn init(_log: &Log, _id: &RunId) -> Result<(), Error> {
++    Ok(())
++}
++
++/// Announce what this process is and what it is about to do (step `mailer/1.6-logging`).
++///
++/// The scaffold logs nothing: the events, their fields and the span they run inside are the
++/// step's work.
++pub fn announce(_config: &Config, _id: &RunId) {}

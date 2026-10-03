@@ -138,7 +138,7 @@ hint = "Model the failures the caller has to react to; `anyhow` is for the bound
 
 [[step]]
 id = "1.6-logging"
-title = "Structured logs and a request id per request"
+title = "Structured logs with a correlation id per run"
 kind = "milestone"
 origin = "teach"
 entry = "docs/steps/en/mailer/1.6-logging.md"

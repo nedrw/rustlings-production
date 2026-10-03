@@ -1,0 +1,192 @@
+diff --git a/src/error.rs b/src/error.rs
+index 5ee4acf..febeade 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -91,6 +91,13 @@ pub enum Error {
+         /// What the parser said.
+         source: toml::de::Error,
+     },
++    /// Logging could not be started.
++    #[error("cannot start logging")]
++    Logging {
++        /// What the subscriber reported.
++        #[source]
++        source: Box<dyn std::error::Error + Send + Sync>,
++    },
+ }
+ 
+ impl Error {
+@@ -112,7 +119,9 @@ impl Error {
+             | Error::MissingValue { .. }
+             | Error::InvalidSetting { .. }
+             | Error::UnknownSetting { .. } => ExitCode::from(2),
+-            Error::UnreadableConfig { .. } | Error::InvalidConfig { .. } => ExitCode::FAILURE,
++            Error::UnreadableConfig { .. }
++            | Error::InvalidConfig { .. }
++            | Error::Logging { .. } => ExitCode::FAILURE,
+         }
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 5f38167..91ac501 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,9 +15,11 @@ use std::path::PathBuf;
+ 
+ pub mod config;
+ pub mod error;
++pub mod logging;
+ 
+ pub use config::{Config, Flags};
+ pub use error::{Error, SettingSource};
++pub use logging::RunId;
+ 
+ /// What the command line asked the process to do.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/src/logging.rs b/src/logging.rs
+index e6d5ccc..04ac0e8 100644
+--- a/src/logging.rs
++++ b/src/logging.rs
+@@ -1,11 +1,22 @@
+ //! Structured logging: one line per event, with the fields a log collector indexes
+ //! (step `mailer/1.6-logging`).
+ //!
+-//! The scaffold declares the two entry points and the identifier a line carries. What is missing is
+-//! the point of the step: the subscriber (format and level coming from the configuration), and the
+-//! announcement with the fields and the span the course's spec looks for.
++//! Two decisions are made here, and both are about who reads the lines:
++//!
++//! * **format and level come from the configuration** (step `mailer/1.4-config`), so a terminal
++//!   gets `pretty` and a collector gets `json` without a rebuild, and the level decides what a run
++//!   is willing to pay for;
++//! * **every event of a run happens inside one span** that carries [`RunId`]. A field put on the
++//!   span is on every line below it without any call site repeating it — that is what the
++//!   propagation in the capability name means, and a request id per HTTP request (step
++//!   `mailer/1.7-http`) is the same mechanism one level down.
++
++use std::io::IsTerminal as _;
+ 
+-use crate::config::{Config, Log};
++use tracing::{Level, debug, info, instrument};
++use tracing_subscriber::fmt;
++
++use crate::config::{Config, Level as ConfigLevel, Log, LogFormat};
+ use crate::error::Error;
+ 
+ /// The identifier that ties every line of one process together.
+@@ -14,6 +25,10 @@ pub struct RunId(String);
+ 
+ impl RunId {
+     /// The id of a run: the process the operating system started.
++    ///
++    /// Nothing here is random or time-based: a rollout is a set of processes, and the operating
++    /// system already numbers them. What the id has to survive is the log collector, not a
++    /// collision with another machine's pids.
+     #[must_use]
+     pub fn of_this_process() -> Self {
+         Self(std::process::id().to_string())
+@@ -26,16 +41,55 @@ impl RunId {
+     }
+ }
+ 
+-/// Start logging, in the format and at the level the configuration asks for
+-/// (step `mailer/1.6-logging`).
++/// Start logging, in the format and at the level the configuration asks for.
++///
++/// # Errors
+ ///
+-/// The scaffold installs no subscriber, so nothing is logged yet.
+-pub fn init(_log: &Log, _id: &RunId) -> Result<(), Error> {
+-    Ok(())
++/// Reports [`Error::Logging`] when a subscriber is already installed. That cannot happen in this
++/// binary, and it is not swallowed: a service whose logs go somewhere else than it thinks is a
++/// service nobody can debug.
++pub fn init(log: &Log, _id: &RunId) -> Result<(), Error> {
++    let builder = fmt()
++        .with_max_level(filter(log.level))
++        // Colour is for a person watching a terminal. A line a collector stores has to be the
++        // line: escape sequences around the field names make `host=127.0.0.1` unfindable.
++        .with_ansi(std::io::stdout().is_terminal());
++    let installed = match log.format {
++        LogFormat::Json => builder.json().try_init(),
++        LogFormat::Pretty => builder.try_init(),
++    };
++    installed.map_err(|source| Error::Logging { source })
+ }
+ 
+-/// Announce what this process is and what it is about to do (step `mailer/1.6-logging`).
++/// Announce what this process is and what it is about to do.
+ ///
+-/// The scaffold logs nothing: the events, their fields and the span they run inside are the
+-/// step's work.
+-pub fn announce(_config: &Config, _id: &RunId) {}
++/// The span is the unit of work: it has a name (`run`) and the id every line of this process
++/// carries. `skip_all` keeps the configuration out of the span fields — the fields below are
++/// chosen one by one, because a configuration printed on every line is how secrets leak.
++#[instrument(name = "run", skip_all, fields(run.id = %id.as_str()))]
++pub fn announce(config: &Config, id: &RunId) {
++    let database = if config.database.url.is_some() {
++        "set"
++    } else {
++        "unset"
++    };
++    info!(
++        host = %config.listen.host,
++        port = config.listen.port,
++        log_format = %config.log.format,
++        database = database,
++        "mailer is starting"
++    );
++    debug!("no listener yet: this build reads its configuration and stops");
++}
++
++/// The configuration's level, as the one the subscriber filters with.
++fn filter(level: ConfigLevel) -> Level {
++    match level {
++        ConfigLevel::Error => Level::ERROR,
++        ConfigLevel::Warn => Level::WARN,
++        ConfigLevel::Info => Level::INFO,
++        ConfigLevel::Debug => Level::DEBUG,
++        ConfigLevel::Trace => Level::TRACE,
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index c876cb2..dfed6d4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,5 @@
+ //! The `mailer` binary: a shell around the library, and the one place `anyhow` is allowed
+-//! (step `mailer/1.5-errors`).
++//! (steps `mailer/1.5-errors` and `mailer/1.6-logging`).
+ //!
+ //! The library reports [`mailer::Error`], which is concrete on purpose: a caller matches on it, and
+ //! it says how the process ends. This file has the opposite job — turn a failure into something a
+@@ -11,6 +11,7 @@ use std::process::ExitCode;
+ 
+ use anyhow::Result;
+ 
++use mailer::logging::{self, RunId};
+ use mailer::{Config, Error, Request, USAGE};
+ 
+ fn main() -> ExitCode {
+@@ -43,11 +44,19 @@ fn service() -> Result<ExitCode> {
+ 
+     match cli.request {
+         Request::CheckConfig => {
++            // The report is the answer to a question, not a log line: it goes to stdout as it is,
++            // so it stays scriptable and no subscriber is installed to decorate it.
+             for line in config.report() {
+                 println!("{line}");
+             }
+         }
+-        Request::Idle => eprintln!("mailer: no listener yet, nothing to do (try --help)"),
++        Request::Idle => {
++            // A service starts logging before it does anything else, because the first thing worth
++            // reading is often why it did not get further.
++            let id = RunId::of_this_process();
++            logging::init(&config.log, &id)?;
++            logging::announce(&config, &id);
++        }
+         Request::Help | Request::Version => unreachable!("answered above"),
+     }
+     Ok(ExitCode::SUCCESS)

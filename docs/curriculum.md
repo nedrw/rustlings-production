@@ -281,7 +281,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | 1.3 | 一条命令跑通全部检查（`cargo xtask ci`）+ CI 落地 | `ci/pipeline@apply` | 本地与 CI 同源；故意破坏一次看 CI 变红 |
 | 1.4 | 类型化配置与启动：file/env/flag 覆盖顺序、`--check-config`、密钥不入库 | `cfg/layered-config@apply`、`sec/secrets-management@apply` | 覆盖顺序表测试；坏配置退出码非 0 |
 | 1.5 | 错误处理即 API：`thiserror` 领域错误、`anyhow` 仅在边界、`source` 链、退出码映射（同一套失败分类在 1.7 起映射到 HTTP 状态码） | `err/typed-errors@apply` | 断言错误类型/文案/`source` 链 |
-| 1.6 | 结构化日志与 request id：JSON/pretty 双模式、`#[instrument]` | `obs/structured-logs@apply`、`obs/tracing-propagation@aware` | 捕获 writer 断言字段与 span |
+| 1.6 | 结构化日志与关联 id：JSON/pretty 双模式、`#[instrument]`、span 传播（此时的工作单位是「一次运行」，1.7 起用同一个机制包住每个 HTTP 请求） | `obs/structured-logs@apply`、`obs/tracing-propagation@aware` | 捕获 writer 断言字段与 span |
 
 ### 阶段 B：服务与数据（1.7–1.13）
 
