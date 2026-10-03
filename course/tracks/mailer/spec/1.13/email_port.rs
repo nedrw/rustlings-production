@@ -25,6 +25,7 @@ mod email;
 mod postgres;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use app::App;
 use email::Recording;
@@ -48,6 +49,32 @@ fn signup_body(email: &str) -> String {
     app::signup_body(email)
 }
 
+/// Wait until `check` answers something, or fail loudly with what the test was waiting for.
+///
+/// A spec cannot assert on what the sender was handed the moment a `201` arrives: on this tree the
+/// send happens inside the request, and step `mailer/1.14-worker` is where it moves onto a queue
+/// whose worker runs *after* the answer. Waiting for the condition instead of sleeping a guessed
+/// amount is what keeps one spec honest on both trees (authoring.md §6.4): a service that never
+/// sends fails after the deadline with the right sentence, instead of hanging or passing late.
+fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{what} did not happen within 5s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The messages the fake was handed, once it has been handed at least one.
+fn delivered_so_far(sender: &Recording) -> Vec<mailer::email::Message> {
+    wait_for("the sender to be handed an email", || {
+        let delivered = sender.delivered();
+        (!delivered.is_empty()).then_some(delivered)
+    })
+}
+
 /// The token the service stored for an address: the only thing its confirmation link can carry.
 fn token_of(postgres: &Postgres, address: &str) -> String {
     postgres.query(&format!(
@@ -64,7 +91,7 @@ fn a_signup_hands_one_confirmation_email_to_the_sender() {
     let (status, body) = app.post("/signup", &signup_body(" Ada@Example.COM "));
     assert_eq!(status, 201, "the fixture signup failed: {body}");
 
-    let delivered = sender.delivered();
+    let delivered = delivered_so_far(&sender);
     assert_eq!(
         delivered.len(),
         1,
@@ -107,11 +134,15 @@ fn an_address_that_is_already_subscribed_gets_no_second_email() {
     let (status, body) = app.post("/signup", &signup_body("ada@example.com"));
     assert_eq!(status, 409, "{body}");
 
+    // The second signup sent nothing, and that is a claim about a *non*-event: the only honest way
+    // to assert it is to wait for the first email to have been handed over (so the sender is in use)
+    // and then look at what else it was given.
+    let delivered = delivered_so_far(&sender);
     assert_eq!(
-        sender.delivered().len(),
+        delivered.len(),
         1,
         "the second signup must not email anybody: the address already has a subscriber, and a \
-         second confirmation link is a link that confirms nothing new"
+         second confirmation link is a link that confirms nothing new ({delivered:?})"
     );
 }
 
@@ -128,9 +159,15 @@ fn a_sender_that_refuses_does_not_lose_the_subscriber() {
         "a mail server that is away is not a signup that failed: the subscriber exists, and the \
          message is a delivery problem ({body})"
     );
-    assert_eq!(
-        sender.attempted().len(),
-        1,
+    // It has to try — and on the tree where the send happens on a queue, "try" includes the
+    // retries that queue brings with it (step `mailer/1.14-worker`), so the claim is "at least one
+    // attempt", not "exactly one".
+    let attempted = wait_for("the sender to be handed the email", || {
+        let attempted = sender.attempted();
+        (!attempted.is_empty()).then_some(attempted)
+    });
+    assert!(
+        !attempted.is_empty(),
         "the service has to try: a sender that is never called is a message nobody missed"
     );
     assert_eq!(
@@ -159,14 +196,27 @@ fn a_send_is_attempted_again_after_the_sender_recovers() {
     let (status, body) = app.post("/signup", &signup_body("grace@example.com"));
     assert_eq!(status, 201, "{body}");
 
-    let delivered = sender.delivered();
-    assert_eq!(sender.attempted().len(), 2, "two signups, two attempts");
-    assert_eq!(
-        delivered.len(),
-        1,
-        "one message actually went out, and a failure does not stick to the sender"
+    // Grace's email has to arrive. Ada's may or may not, depending on how far its retries got before
+    // the sender was told to work again, so the assertions are about grace and about the fact that
+    // sending did not stay broken.
+    let delivered = wait_for("grace's confirmation email", || {
+        let delivered = sender.delivered();
+        delivered
+            .iter()
+            .any(|message| message.to.as_str() == "grace@example.com")
+            .then_some(delivered)
+    });
+    assert!(
+        sender.attempted().len() >= 2,
+        "two signups, at least two attempts: {:?}",
+        sender.attempted()
     );
-    assert_eq!(delivered[0].to.as_str(), "grace@example.com");
+    assert!(
+        delivered
+            .iter()
+            .any(|message| message.to.as_str() == "grace@example.com"),
+        "the message that could go out did: {delivered:?}"
+    );
 }
 
 #[tokio::test]
