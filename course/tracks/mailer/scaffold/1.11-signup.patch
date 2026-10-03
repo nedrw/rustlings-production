@@ -1,0 +1,100 @@
+diff --git a/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json b/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json
+new file mode 100644
+index 0000000..6cca886
+--- /dev/null
++++ b/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json
+@@ -0,0 +1,30 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING RETURNING id",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "id"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text",
++        "Text",
++        "Text"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002"
++}
+diff --git a/Cargo.toml b/Cargo.toml
+index 20a18d4..8888752 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,9 @@ workspace = true
+ [dependencies]
+ # kiln:scaffold:begin
+ anyhow = "1.0.104"
++# The password hash of step 1.11: Argon2id with the crate's own defaults, and the PHC string
++# it serialises to.
++argon2 = "0.6.0"
+ axum = "0.8.9"
+ serde = { version = "1.0.229", features = ["derive"] }
+ # The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
+diff --git a/src/signup.rs b/src/signup.rs
+new file mode 100644
+index 0000000..1e43ce9
+--- /dev/null
++++ b/src/signup.rs
+@@ -0,0 +1,44 @@
++//! Signing a subscriber up: parse, hash, insert (step `mailer/1.11-signup`).
++//!
++//! This file is the scaffold: the shape of the request, and the one function the step is *about*.
++//! **It proves nothing about a signup** — `hash` answers the password itself, and the insert is not
++//! written yet — so the spec fails here until the step fills this in.
++//!
++//! What the step completes is the rest of the pipeline the module doc of step
++//! `mailer/1.10-domain-types` describes: parse what arrived into [`Email`], [`SubscriberName`] and
++//! [`Password`], hash the password, and let the database decide whether the address is already
++//! taken.
++
++use serde::Deserialize;
++
++use crate::domain::Password;
++use crate::error::Error;
++
++/// The body of `POST /signup`, as it arrives: three raw strings.
++///
++/// Deliberately raw. Deserialising straight into the domain types would be a door around step
++/// `mailer/1.10-domain-types`'s parsers — a value that never went through `parse` would reach code
++/// that trusts it — so what comes off the wire is text, and the text is parsed where it enters.
++#[derive(Debug, Deserialize)]
++pub struct SignupRequest {
++    /// The address to subscribe, exactly as it was sent.
++    pub email: String,
++    /// The name to greet, exactly as it was sent.
++    pub name: String,
++    /// The password to store a hash of, exactly as it was sent.
++    pub password: String,
++}
++
++/// Hash a password for storage.
++///
++/// # Errors
++///
++/// Reports the hashing failure the step's TASK adds to [`Error`] when the hasher refuses the input
++/// or the system's random number generator fails — neither is something a caller can act on, so
++/// both end as a 500.
++///
++/// The scaffold does not hash: it answers what it was given, which is what a table full of
++/// passwords looks like.
++pub fn hash(password: &Password) -> Result<String, Error> {
++    Ok(password.as_str().to_owned())
++}

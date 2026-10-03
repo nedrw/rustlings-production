@@ -1,0 +1,482 @@
+diff --git a/src/error.rs b/src/error.rs
+index f175c90..2371555 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -119,6 +119,25 @@ pub enum Error {
+         /// What that value would have had to be, phrased for a message.
+         expected: &'static str,
+     },
++    /// The address a caller wants to subscribe already has a subscriber
++    /// (step `mailer/1.11-signup`).
++    ///
++    /// The address **is** part of this failure, unlike [`Error::InvalidInput`]: it came from the
++    /// caller, and the answer ("this one is taken") is not usable without it. The unique constraint
++    /// on `subscribers.email` is what decides this, so it is a race two signups can lose — one of
++    /// them wins, the other is told, and neither gets an error for doing what they were asked to.
++    #[error("`{email}` is already subscribed")]
++    AlreadySubscribed {
++        /// The address that is already taken, as it was stored.
++        email: String,
++    },
++    /// A password could not be hashed (step `mailer/1.11-signup`).
++    #[error("the password could not be hashed")]
++    PasswordHash {
++        /// What the hasher reported.
++        #[source]
++        source: argon2::password_hash::Error,
++    },
+     /// The database could not be reached, or refused what it was asked to do.
+     #[error("the database could not {operation}")]
+     Database {
+@@ -145,11 +164,11 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+-    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, or the database could not be connected or migrated | `1` | whoever deployed it |
++    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
+     /// A value a caller sent that the domain refuses is the caller's problem too — the same code as
+-    /// a unusable flag, and the same shape of answer a 400 will have once there is an HTTP surface
+-    /// (step `mailer/1.11-signup`).
++    /// a unusable flag — and so is an address that already has a subscriber: both are the caller's
++    /// to fix, and both are what the 400 and the 409 of step `mailer/1.11-signup` are made of.
+     ///
+     /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
+     /// retry.
+@@ -160,11 +179,13 @@ impl Error {
+             | Error::MissingValue { .. }
+             | Error::InvalidSetting { .. }
+             | Error::UnknownSetting { .. }
+-            | Error::InvalidInput { .. } => ExitCode::from(2),
++            | Error::InvalidInput { .. }
++            | Error::AlreadySubscribed { .. } => ExitCode::from(2),
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+             | Error::Logging { .. }
+             | Error::Listen { .. }
++            | Error::PasswordHash { .. }
+             | Error::Database { .. }
+             | Error::Migration { .. } => ExitCode::FAILURE,
+         }
+diff --git a/src/http.rs b/src/http.rs
+index d8c2b34..f1b7324 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -14,12 +14,17 @@
+ //!   the process and stays green when a dependency is away, `/readyz` is about everything a request
+ //!   needs and goes red. A service that answers "alive" for "ready" is a service an orchestrator
+ //!   keeps sending traffic to.
++//! * **a failure is a status code and one sentence** (step `mailer/1.11-signup`): [`status_of`] is
++//!   the same table [`Error::exit_code`] writes for a shell — what the caller can fix is a 4xx,
++//!   what only the deployment can fix is a 5xx — and a 5xx never carries the reason: that is a fact
++//!   about this deployment's insides, and it goes to the log.
+ 
+ use axum::Router;
+-use axum::extract::State;
++use axum::extract::rejection::JsonRejection;
++use axum::extract::{Json, State};
+ use axum::http::StatusCode;
+ use axum::response::{IntoResponse, Response};
+-use axum::routing::get;
++use axum::routing::{get, post};
+ use serde::Serialize;
+ use tokio::net::TcpListener;
+ use tracing::{info, instrument, warn};
+@@ -28,6 +33,7 @@ use crate::config::Config;
+ use crate::db::Database;
+ use crate::error::Error;
+ use crate::logging::RunId;
++use crate::signup::{SignupRequest, subscribe};
+ 
+ /// Everything a handler may reach: the configuration this process started with, and the database,
+ /// when it has one.
+@@ -99,6 +105,7 @@ pub fn router(state: AppState) -> Router {
+     Router::new()
+         .route("/healthz", get(healthz))
+         .route("/readyz", get(readyz))
++        .route("/signup", post(signup))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
+         .with_state(state)
+@@ -109,7 +116,7 @@ pub fn router(state: AppState) -> Router {
+ /// Deliberately about the process, not about its dependencies: a liveness probe that goes red
+ /// because a database is away is a liveness probe that restarts a healthy service.
+ async fn healthz() -> impl IntoResponse {
+-    (StatusCode::OK, axum::Json(Body { status: "ok" }))
++    (StatusCode::OK, Json(Body::new("ok")))
+ }
+ 
+ /// Readiness: this process can answer the requests it promises to.
+@@ -122,7 +129,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
+         return not_ready("no database is configured");
+     };
+     match database.ready().await {
+-        Ok(()) => (StatusCode::OK, axum::Json(Body { status: "ready" })).into_response(),
++        Ok(()) => (StatusCode::OK, Json(Body::new("ready"))).into_response(),
+         Err(error) => {
+             warn!(%error, "the database is not ready");
+             not_ready("the database is not available")
+@@ -132,18 +139,12 @@ async fn readyz(State(state): State<AppState>) -> Response {
+ 
+ /// The answer a readiness probe gets while the service cannot serve.
+ fn not_ready(status: &'static str) -> Response {
+-    (StatusCode::SERVICE_UNAVAILABLE, axum::Json(Body { status })).into_response()
++    (StatusCode::SERVICE_UNAVAILABLE, Json(Body::new(status))).into_response()
+ }
+ 
+ /// What the service answers when the path is not one it serves.
+ async fn not_found() -> Response {
+-    (
+-        StatusCode::NOT_FOUND,
+-        axum::Json(Body {
+-            status: "no such route",
+-        }),
+-    )
+-        .into_response()
++    (StatusCode::NOT_FOUND, Json(Body::new("no such route"))).into_response()
+ }
+ 
+ /// What the service answers when the path exists but the method does not.
+@@ -153,18 +154,114 @@ async fn not_found() -> Response {
+ async fn method_not_allowed() -> Response {
+     (
+         StatusCode::METHOD_NOT_ALLOWED,
+-        axum::Json(Body {
+-            status: "method not allowed",
+-        }),
++        Json(Body::new("method not allowed")),
+     )
+         .into_response()
+ }
+ 
++/// `POST /signup`: subscribe one address (step `mailer/1.11-signup`).
++///
++/// The extractor is taken as a `Result` rather than as a `Json` argument, which is what turns a
++/// body the route cannot use into *this* service's answer instead of the extractor's: 400, one
++/// sentence saying what the body had to be, and nothing about what was sent (the `TRAP` of step
++/// `mailer/1.10-domain-types`: a body is a place secrets are typed into, and a message is a place
++/// they end up).
++async fn signup(
++    State(state): State<AppState>,
++    body: Result<Json<SignupRequest>, JsonRejection>,
++) -> Response {
++    let Ok(Json(request)) = body else {
++        return (
++            StatusCode::BAD_REQUEST,
++            Json(Body::new(
++                "the body is not a signup: it has to be a JSON object with `email`, `name` and `password`",
++            )),
++        )
++            .into_response();
++    };
++
++    let Some(database) = state.database() else {
++        // A configuration without a database is a choice (step `mailer/1.9-postgres`), and this is
++        // the request that cannot be answered by it: the service is up, and this route is not
++        // ready — the same 503 `/readyz` is about.
++        warn!("a signup arrived with no database configured");
++        return not_ready("no database is configured");
++    };
++
++    match subscribe(database.pool(), request).await {
++        Ok(email) => (
++            StatusCode::CREATED,
++            Json(SignedUp {
++                status: "pending",
++                email: email.to_string(),
++            }),
++        )
++            .into_response(),
++        Err(error) => answer(error),
++    }
++}
++
++/// The status a failure answers with, in the same two families [`Error::exit_code`] sorts them
++/// into: what the caller can fix is a 4xx, and what only the deployment can fix is a 5xx.
++///
++/// The two tables are one rule written twice, which is the point: a shell and an HTTP caller both
++/// have to be able to tell "you asked for something wrong" from "this service is broken".
++fn status_of(error: &Error) -> StatusCode {
++    match error {
++        Error::InvalidInput { .. } => StatusCode::BAD_REQUEST,
++        Error::AlreadySubscribed { .. } => StatusCode::CONFLICT,
++        _ => StatusCode::INTERNAL_SERVER_ERROR,
++    }
++}
++
++/// Turn a failure into the answer its caller gets.
++///
++/// A 4xx repeats the failure's own sentence: it names a field or an address, never a value the
++/// caller did not send. A 5xx does not: what went wrong is a fact about this deployment (a
++/// database that is away, a password that cannot be hashed), the caller can do nothing with it, and
++/// a service that explains its insides to whoever asks is a service that explains its insides to
++/// whoever asks. The reason goes to the log instead.
++fn answer(error: Error) -> Response {
++    let status = status_of(&error);
++    if status.is_server_error() {
++        warn!(%error, "the request could not be answered");
++        return (
++            status,
++            Json(Body::new("the service cannot answer this request")),
++        )
++            .into_response();
++    }
++    (status, Json(Body::new(error.to_string()))).into_response()
++}
++
++/// The body of a signup that created a subscriber.
++#[derive(Debug, Serialize)]
++struct SignedUp {
++    /// Where the subscriber is in the confirmation dance: `pending` until step `mailer/1.12-token`
++    /// hands out a token, and `active` once it is used (the column default of the migration).
++    status: &'static str,
++    /// The address **as it was stored** — normalised, so a caller can compare it with what it sent
++    /// and see what this service made of it.
++    email: String,
++}
++
+ /// The body of every answer that is not a success.
+ #[derive(Debug, Serialize)]
+ struct Body {
+     /// One sentence, `not_found`-style: a value a client can branch on, not a paragraph.
+-    status: &'static str,
++    ///
++    /// Owned since step `mailer/1.11-signup`: a refusal has to say *what* was refused (a field, an
++    /// address, a body), and a sentence assembled at the boundary is not a `&'static str`.
++    status: String,
++}
++
++impl Body {
++    /// One sentence about what happened.
++    fn new(status: impl Into<String>) -> Self {
++        Self {
++            status: status.into(),
++        }
++    }
+ }
+ 
+ /// Bind the configured address and serve until the process stops.
+@@ -227,7 +324,8 @@ pub async fn serve_on(listener: TcpListener, state: AppState, id: &RunId) -> Res
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{AppState, Body, router};
++    use super::{AppState, Body, router, status_of};
++    use crate::error::Error;
+     use crate::logging::RunId;
+     use axum::http::StatusCode;
+ 
+@@ -247,11 +345,71 @@ mod tests {
+ 
+     #[test]
+     fn a_body_carries_one_sentence_a_client_can_branch_on() {
+-        let body = Body {
+-            status: "no such route",
+-        };
++        let body = Body::new("no such route");
+         assert!(!body.status.is_empty());
+         assert_eq!(StatusCode::NOT_FOUND.as_u16(), 404);
+         assert_eq!(StatusCode::SERVICE_UNAVAILABLE.as_u16(), 503);
+     }
++
++    #[test]
++    fn the_status_table_sorts_failures_the_way_the_exit_codes_do() {
++        // The two families, one rule: the caller's fault is a 4xx and the deployment's is a 5xx —
++        // exactly the split `Error::exit_code` makes between `2` and `1` (step `mailer/1.5-errors`).
++        let caller = [
++            Error::InvalidInput {
++                field: "email",
++                expected: "an address with exactly one `@`",
++            },
++            Error::AlreadySubscribed {
++                email: "ada@example.com".to_owned(),
++            },
++        ];
++        for error in &caller {
++            let status = status_of(error);
++            assert!(status.is_client_error(), "{error} answered {status}");
++        }
++        assert_eq!(
++            status_of(&caller[0]),
++            StatusCode::BAD_REQUEST,
++            "a refused value is the caller's to fix"
++        );
++        assert_eq!(
++            status_of(&caller[1]),
++            StatusCode::CONFLICT,
++            "an address that is taken is a conflict, not a bad request"
++        );
++
++        let deployment = [
++            Error::Listen {
++                address: "127.0.0.1:0".to_owned(),
++                source: std::io::Error::other("in use"),
++            },
++            Error::PasswordHash {
++                source: argon2::password_hash::Error::Crypto,
++            },
++        ];
++        for error in &deployment {
++            assert!(
++                status_of(error).is_server_error(),
++                "{error} must not be blamed on the caller"
++            );
++        }
++
++        // A caller's failure ends the process with `2` and an HTTP caller with a 4xx, and a
++        // deployment's with `1` and a 5xx: two spellings of one decision.
++        for error in &caller {
++            assert_eq!(
++                error.exit_code(),
++                std::process::ExitCode::from(2),
++                "{error}"
++            );
++        }
++        for error in &deployment {
++            assert_eq!(
++                error.exit_code(),
++                std::process::ExitCode::FAILURE,
++                "{error}"
++            );
++        }
++    }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 67329b9..2e917d8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,12 +19,14 @@ pub mod domain;
+ pub mod error;
+ pub mod http;
+ pub mod logging;
++pub mod signup;
+ 
+ pub use config::{Config, Flags};
+ pub use db::Database;
+ pub use domain::{Email, Password, SubscriberName};
+ pub use error::{Error, SettingSource};
+ pub use logging::RunId;
++pub use signup::SignupRequest;
+ 
+ /// What the command line asked the process to do.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/src/signup.rs b/src/signup.rs
+index 1e43ce9..660a11c 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -1,24 +1,33 @@
+ //! Signing a subscriber up: parse, hash, insert (step `mailer/1.11-signup`).
+ //!
+-//! This file is the scaffold: the shape of the request, and the one function the step is *about*.
+-//! **It proves nothing about a signup** — `hash` answers the password itself, and the insert is not
+-//! written yet — so the spec fails here until the step fills this in.
++//! Three decisions live in this file, and they are the step:
+ //!
+-//! What the step completes is the rest of the pipeline the module doc of step
+-//! `mailer/1.10-domain-types` describes: parse what arrived into [`Email`], [`SubscriberName`] and
+-//! [`Password`], hash the password, and let the database decide whether the address is already
+-//! taken.
++//! * **the database decides who is already subscribed** — the insert carries
++//!   `ON CONFLICT (email) DO NOTHING` and asks for the inserted row back, so a signup that loses
++//!   the race gets *no row* instead of an error. Nothing here reads before it writes: a
++//!   `SELECT`-then-`INSERT` has a window between the two halves of it, and two callers arriving in
++//!   that window both win — which is the one thing a unique constraint cannot save you from after
++//!   the fact;
++//! * **a password is hashed, never stored** — [`hash`] is the only place a password becomes
++//!   something a database may hold, and what it holds is a PHC string with a salt of its own. Two
++//!   subscribers who chose the same password get two different hashes, so the table cannot be read
++//!   as a list of who shares one;
++//! * **the parses come first** — `Email`, `SubscriberName` and `Password` are built before anything
++//!   touches the database (step `mailer/1.10-domain-types`), so a request that cannot be stored is
++//!   refused without a row being written for it.
+ 
++use argon2::{Argon2, PasswordHash, PasswordHasher};
+ use serde::Deserialize;
++use sqlx::PgPool;
+ 
+-use crate::domain::Password;
++use crate::domain::{Email, Password, SubscriberName};
+ use crate::error::Error;
+ 
+ /// The body of `POST /signup`, as it arrives: three raw strings.
+ ///
+ /// Deliberately raw. Deserialising straight into the domain types would be a door around step
+ /// `mailer/1.10-domain-types`'s parsers — a value that never went through `parse` would reach code
+-/// that trusts it — so what comes off the wire is text, and the text is parsed where it enters.
++/// that trusts it — so what comes off the wire is text, and the text is parsed in [`subscribe`].
+ #[derive(Debug, Deserialize)]
+ pub struct SignupRequest {
+     /// The address to subscribe, exactly as it was sent.
+@@ -29,16 +38,65 @@ pub struct SignupRequest {
+     pub password: String,
+ }
+ 
+-/// Hash a password for storage.
++/// Subscribe one address, or report that it is taken.
++///
++/// The statement is written out here, and it has to stay **this** text: `sqlx`'s `.sqlx/` metadata
++/// is keyed by a hash of the query a macro is given (step `mailer/1.9-postgres` committed it, so
++/// this crate builds where no database is running), and a different spelling of the same SQL is a
++/// different key. `ON CONFLICT (email) DO NOTHING` is what makes the unique constraint the decider
++/// of a race, and `RETURNING id` is what tells the two callers apart: a row comes back when *this*
++/// call inserted it, and nothing comes back when somebody else already had.
+ ///
+ /// # Errors
+ ///
+-/// Reports the hashing failure the step's TASK adds to [`Error`] when the hasher refuses the input
+-/// or the system's random number generator fails — neither is something a caller can act on, so
+-/// both end as a 500.
++/// Reports [`Error::InvalidInput`] when the email, the name or the password is not a value this
++/// service accepts (the field is named, the value is not), [`Error::PasswordHash`] when the
++/// password cannot be hashed, [`Error::Database`] when the insert does not run, and
++/// [`Error::AlreadySubscribed`] when the address already has a subscriber.
++pub async fn subscribe(pool: &PgPool, request: SignupRequest) -> Result<Email, Error> {
++    let email = Email::parse(&request.email)?;
++    let name = SubscriberName::parse(&request.name)?;
++    let password = Password::parse(&request.password)?;
++    let password_hash = hash(&password)?;
++
++    let inserted: Option<i64> = sqlx::query_scalar!(
++        "INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) \
++         ON CONFLICT (email) DO NOTHING RETURNING id",
++        email.as_str(),
++        name.as_str(),
++        password_hash
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "insert a subscriber",
++        source: Box::new(source),
++    })?;
++
++    match inserted {
++        // The row that came back is this call's own: the address is taken, and taken by this
++        // request. Where the subscriber starts (`pending`) is the column default of the migration.
++        Some(_) => Ok(email),
++        None => Err(Error::AlreadySubscribed {
++            email: email.as_str().to_owned(),
++        }),
++    }
++}
++
++/// Hash a password for storage: Argon2id, with a salt of its own.
++///
++/// The salt is generated per call and travels inside the returned string, so one password stored
++/// twice is two different values — and a stolen table cannot be attacked one column at a time.
++/// Nothing else in the service ever sees the password: verification (step `mailer/1.16-login`)
++/// hashes the *candidate* and compares PHC strings.
++///
++/// # Errors
+ ///
+-/// The scaffold does not hash: it answers what it was given, which is what a table full of
+-/// passwords looks like.
++/// Reports [`Error::PasswordHash`] when the hasher refuses the input or the system's random number
++/// generator fails — neither is something a caller can act on, so both end as a 500.
+ pub fn hash(password: &Password) -> Result<String, Error> {
+-    Ok(password.as_str().to_owned())
++    let hashed: PasswordHash = Argon2::default()
++        .hash_password(password.as_str().as_bytes())
++        .map_err(|source| Error::PasswordHash { source })?;
++    Ok(hashed.to_string())
+ }
