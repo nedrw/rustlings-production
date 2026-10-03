@@ -1,0 +1,568 @@
+diff --git a/.sqlx/query-2ab174889069e7869d68220561b582c1589951cc2691e3a406a681631b2dd802.json b/.sqlx/query-2ab174889069e7869d68220561b582c1589951cc2691e3a406a681631b2dd802.json
+new file mode 100644
+index 0000000..1b2626e
+--- /dev/null
++++ b/.sqlx/query-2ab174889069e7869d68220561b582c1589951cc2691e3a406a681631b2dd802.json
+@@ -0,0 +1,52 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE issue_deliveries SET claimed_at = now(), attempts = attempts + 1 FROM issues, subscribers WHERE issue_deliveries.id = $1 AND issue_deliveries.issue_id = issues.id AND issue_deliveries.subscriber_id = subscribers.id AND issue_deliveries.sent_at IS NULL AND issue_deliveries.claimed_at IS NULL RETURNING subscribers.email, issues.subject, issues.body",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "subject",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "issues",
++            "name": "subject"
++          }
++        }
++      },
++      {
++        "ordinal": 2,
++        "name": "body",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "issues",
++            "name": "body"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false,
++      false,
++      false
++    ]
++  },
++  "hash": "2ab174889069e7869d68220561b582c1589951cc2691e3a406a681631b2dd802"
++}
+diff --git a/.sqlx/query-633f86705ebdc6dc13afc2f96b1d25c00fc6753f83bcab5bde6b91badecb87ac.json b/.sqlx/query-633f86705ebdc6dc13afc2f96b1d25c00fc6753f83bcab5bde6b91badecb87ac.json
+new file mode 100644
+index 0000000..f7e5d0d
+--- /dev/null
++++ b/.sqlx/query-633f86705ebdc6dc13afc2f96b1d25c00fc6753f83bcab5bde6b91badecb87ac.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE issue_deliveries SET sent_at = now(), claimed_at = NULL WHERE id = $1",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "633f86705ebdc6dc13afc2f96b1d25c00fc6753f83bcab5bde6b91badecb87ac"
++}
+diff --git a/.sqlx/query-73e9a28515a0cd59d1f073299684b6e80381a718d942ca16be02d616606b4e63.json b/.sqlx/query-73e9a28515a0cd59d1f073299684b6e80381a718d942ca16be02d616606b4e63.json
+new file mode 100644
+index 0000000..7c29dcd
+--- /dev/null
++++ b/.sqlx/query-73e9a28515a0cd59d1f073299684b6e80381a718d942ca16be02d616606b4e63.json
+@@ -0,0 +1,28 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT id FROM issue_deliveries WHERE issue_id = $1 AND sent_at IS NULL AND claimed_at IS NULL ORDER BY id",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "issue_deliveries",
++            "name": "id"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "73e9a28515a0cd59d1f073299684b6e80381a718d942ca16be02d616606b4e63"
++}
+diff --git a/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json b/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json
+new file mode 100644
+index 0000000..ed93398
+--- /dev/null
++++ b/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO issue_deliveries (issue_id, subscriber_id) SELECT $1, id FROM subscribers",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c"
++}
+diff --git a/.sqlx/query-c14a4259514dfe2166485e13214777db0eaa0dcd906d26de64a846d1b232c8f0.json b/.sqlx/query-c14a4259514dfe2166485e13214777db0eaa0dcd906d26de64a846d1b232c8f0.json
+new file mode 100644
+index 0000000..e841f82
+--- /dev/null
++++ b/.sqlx/query-c14a4259514dfe2166485e13214777db0eaa0dcd906d26de64a846d1b232c8f0.json
+@@ -0,0 +1,30 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO issues (subject, body, published_by) VALUES ($1, $2, $3) RETURNING id",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "issues",
++            "name": "id"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text",
++        "Text",
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "c14a4259514dfe2166485e13214777db0eaa0dcd906d26de64a846d1b232c8f0"
++}
+diff --git a/.sqlx/query-c3a1860ee02e5c03e6c68efc26666c9ec5cc45eaec73f6d4318d97d5008ea47b.json b/.sqlx/query-c3a1860ee02e5c03e6c68efc26666c9ec5cc45eaec73f6d4318d97d5008ea47b.json
+new file mode 100644
+index 0000000..2662001
+--- /dev/null
++++ b/.sqlx/query-c3a1860ee02e5c03e6c68efc26666c9ec5cc45eaec73f6d4318d97d5008ea47b.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE issue_deliveries SET claimed_at = NULL WHERE id = $1",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "c3a1860ee02e5c03e6c68efc26666c9ec5cc45eaec73f6d4318d97d5008ea47b"
++}
+diff --git a/migrations/0004_newsletter.sql b/migrations/0004_newsletter.sql
+new file mode 100644
+index 0000000..8390e34
+--- /dev/null
++++ b/migrations/0004_newsletter.sql
+@@ -0,0 +1,46 @@
++-- 0004 — publishing an issue, and who is owed a copy (step `mailer/1.17-newsletter`).
++--
++-- The newsletter changes the shape of the work: a confirmation is one message per subscriber, while
++-- an issue is one message *per subscriber per issue*. That is what the second table is for — the
++-- delivery of one issue to one subscriber, with the same three states the confirmation uses
++-- (claimed / sent / attempts), and a key that says exactly what the row is:
++--
++--     UNIQUE (issue_id, subscriber_id)
++--
++-- The uniqueness is the idempotency of this step, and it is what makes the fan-out safe to run
++-- twice: the rows are written once per (issue, subscriber) and a second attempt inserts nothing.
++--
++-- Why the two tables are written together: an issue without deliveries is an issue nobody will ever
++-- receive, and deliveries without an issue are rows pointing at nothing. They are one change to the
++-- database, so they are written in one transaction (the step's whole point) — and the queue is filled
++-- *after* that transaction commits, because a full queue is a reason to try again later, not a
++-- reason to throw away a published issue.
++--
++-- The two `CHECK`s are the database's half of a rule the code also enforces (step
++-- `mailer/1.10-domain-types` makes the same argument for the domain types): a subject that is empty
++-- is not a subject, and a body that is empty is not a newsletter. The code's half turns a bad value
++-- into a `400` with a sentence; the database's half is what a second caller — a migration, a script,
++-- a person with `psql` — cannot get around.
++
++CREATE TABLE issues (
++    id           BIGSERIAL   PRIMARY KEY,
++    subject      TEXT        NOT NULL CHECK (length(subject) BETWEEN 1 AND 200),
++    body         TEXT        NOT NULL CHECK (length(body) BETWEEN 1 AND 4000),
++    published_by BIGINT      NOT NULL REFERENCES subscribers(id),
++    published_at TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++CREATE TABLE issue_deliveries (
++    id            BIGSERIAL   PRIMARY KEY,
++    issue_id      BIGINT      NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
++    subscriber_id BIGINT      NOT NULL REFERENCES subscribers(id) ON DELETE CASCADE,
++    claimed_at    TIMESTAMPTZ,
++    sent_at       TIMESTAMPTZ,
++    attempts      INTEGER     NOT NULL DEFAULT 0,
++    UNIQUE (issue_id, subscriber_id)
++);
++
++-- The question the fan-out asks ("which copies of this issue are still owed?") is a question about
++-- the issue, and the question a worker asks ("which copies are still owed at all?") is a question
++-- about what has not been sent.
++CREATE INDEX issue_deliveries_unsent_idx ON issue_deliveries (issue_id) WHERE sent_at IS NULL;
+diff --git a/src/newsletter.rs b/src/newsletter.rs
+new file mode 100644
+index 0000000..6ab6d5b
+--- /dev/null
++++ b/src/newsletter.rs
+@@ -0,0 +1,322 @@
++//! Publishing a newsletter: one write, one fan-out, one transaction (step `mailer/1.17-newsletter`).
++//!
++//! A confirmation email is about one subscriber. An issue is about all of them at once, and that
++//! difference is the whole of this step: the write that publishes an issue is not finished until
++//! *every* subscriber who should receive it has a row saying so, and the sending of those rows is
++//! not part of that write at all.
++//!
++//! Four decisions, and each of them is a way to get it wrong:
++//!
++//! * **the issue and its deliveries are one transaction.** An issue with no delivery rows is an
++//!   issue nobody will ever receive, and rows pointing at an issue that does not exist are worse:
++//!   the database is left in a state that no later step can repair, because nothing knows what was
++//!   meant to happen. `BEGIN`…`COMMIT` around both statements is what makes the pair atomic, and
++//!   `?` inside the transaction is what makes a failure roll it back;
++//! * **the fan-out happens after the commit.** Handing work to the queue inside the transaction
++//!   would make a slow queue a long transaction, and a queue that is full would either block the
++//!   transaction or roll back a published issue. What is queued is work that is *already* recorded,
++//!   so a failure to queue it is a delivery that is later (or, today, not at all — the queue is not
++//!   the record, step `mailer/1.15-idempotent-delivery` said so);
++//! * **the audience is a query, not a loop.** Who receives an issue is the set of subscribers whose
++//!   address was confirmed: `INSERT … SELECT id FROM subscribers WHERE status = 'active'` is one
++//!   statement, and the database is what decides who is in it. A loop in Rust over a list read a
++//!   moment earlier has a window in which somebody confirms — and a loop is also how a fan-out
++//!   becomes a thousand round trips;
++//! * **a delivery is claimed before it is sent**, exactly as a confirmation is (step
++//!   `mailer/1.15-idempotent-delivery`): the unique key makes the row exist once, and the claim makes
++//!   the *send* happen once, however many jobs, retries or workers take part.
++//!
++//! # What this scaffold proves
++//!
++//! The delivery rows, the claim and the fan-out are here; the *write* is not one write. `publish`
++//! below runs its two statements one after the other, with no transaction around them, and its
++//! fan-out hands a copy to **every** subscriber rather than to the ones whose address was confirmed.
++//! Both are visible in the step's spec (`tests/spec_newsletter.rs`): an unconfirmed address gets a
++//! copy, and a publish that fails halfway leaves an issue whose copies were never written. The step
++//! is to make the pair atomic (`BEGIN` … `COMMIT`) and to let the database answer who is owed what.
++//!
++//! What this step does not build is a relay. If a queue is full when the fan-out runs, the rows it
++//! could not hand over are still rows — owed, and recorded — and nothing in this process will pick
++//! them up until a later track's claimer does. Naming that is part of the design: the alternative
++//! (put the queue inside the transaction) is worse in a way that is invisible until production.
++
++use serde::Deserialize;
++use sqlx::PgPool;
++use tracing::warn;
++
++use crate::delivery::{Job, Queue};
++use crate::domain::Email;
++use crate::error::Error;
++
++/// The longest subject an issue may have.
++const SUBJECT_MAX: usize = 200;
++/// The longest body an issue may have.
++const BODY_MAX: usize = 4000;
++
++/// The body of `POST /newsletter`, as it arrives: two raw strings (step `mailer/1.11-signup` made
++/// the same call for the signup body — what comes off the wire is text, and the text is parsed where
++/// it enters).
++#[derive(Debug, Deserialize)]
++pub struct NewsletterRequest {
++    /// What the issue is about.
++    pub subject: String,
++    /// What it says.
++    pub body: String,
++}
++
++/// A subject that passed its parse.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Subject(String);
++
++impl Subject {
++    /// Read a subject out of what a caller sent.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `subject` when the text is empty or longer
++    /// than [`SUBJECT_MAX`] characters.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        let subject = value.trim();
++        if subject.is_empty() || subject.chars().count() > SUBJECT_MAX {
++            return Err(Error::InvalidInput {
++                field: "subject",
++                expected: "a newsletter subject: 1 to 200 characters",
++            });
++        }
++        Ok(Self(subject.to_owned()))
++    }
++
++    /// The subject as it is stored.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++/// A body that passed its parse.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct IssueBody(String);
++
++impl IssueBody {
++    /// Read a body out of what a caller sent.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `body` when the text is empty or longer than
++    /// [`BODY_MAX`] characters.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        let body = value.trim();
++        if body.is_empty() || body.chars().count() > BODY_MAX {
++            return Err(Error::InvalidInput {
++                field: "body",
++                expected: "a newsletter body: 1 to 4000 characters",
++            });
++        }
++        Ok(Self(body.to_owned()))
++    }
++
++    /// The body as it is stored.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++/// What publishing an issue produced: which issue, and how many copies it is owed to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Publication {
++    /// The issue's id.
++    pub issue: i64,
++    /// How many subscribers this issue got a delivery row for.
++    pub deliveries: i64,
++}
++
++/// Publish an issue: record it, then record who it is owed to.
++///
++/// # Errors
++///
++/// Reports [`Error::InvalidInput`] when the subject or the body is not a value this service accepts,
++/// and [`Error::Database`] when either write does not run.
++///
++/// The two statements below are *not* one write: the scaffold inserts the issue, and then inserts a
++/// copy of it for every subscriber there is. A failure in between leaves an issue whose copies were
++/// never written — published, and owed to nobody — and there is no way back, because the issue is
++/// already the record. One transaction around both statements is the step, and the second hole is
++/// the audience: `WHERE status = 'active'` is what makes "who is owed this" a decision the database
++/// makes, rather than "everybody who ever typed an address into the form".
++pub async fn publish(
++    pool: &PgPool,
++    publisher: i64,
++    request: NewsletterRequest,
++) -> Result<Publication, Error> {
++    let subject = Subject::parse(&request.subject)?;
++    let body = IssueBody::parse(&request.body)?;
++
++    let issue = sqlx::query_scalar!(
++        "INSERT INTO issues (subject, body, published_by) VALUES ($1, $2, $3) RETURNING id",
++        subject.as_str(),
++        body.as_str(),
++        publisher
++    )
++    .fetch_one(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "record an issue",
++        source: Box::new(source),
++    })?;
++
++    let deliveries = sqlx::query!(
++        "INSERT INTO issue_deliveries (issue_id, subscriber_id) SELECT $1, id FROM subscribers",
++        issue
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "record the copies an issue is owed to",
++        source: Box::new(source),
++    })?;
++
++    Ok(Publication {
++        issue,
++        deliveries: i64::try_from(deliveries.rows_affected()).unwrap_or(i64::MAX),
++    })
++}
++
++/// Hand as many of an issue's copies to the queue as it will take, and answer how many that was.
++///
++/// This runs *after* the transaction that recorded them (see [`publish`]), and it is deliberately
++/// allowed to fail: the rows exist, the queue is a convenience, and a copy that was not queued is a
++/// copy a relay will find later. What it must not do is pretend: a queue that is full is reported,
++/// not waited on, and not compensated for by un-writing anything.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the delivery rows cannot be read.
++pub async fn fan_out(pool: &PgPool, queue: &Queue, issue: i64) -> Result<usize, Error> {
++    let owed = sqlx::query_scalar!(
++        "SELECT id FROM issue_deliveries \
++          WHERE issue_id = $1 AND sent_at IS NULL AND claimed_at IS NULL \
++          ORDER BY id",
++        issue
++    )
++    .fetch_all(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "read the copies an issue is owed to",
++        source: Box::new(source),
++    })?;
++
++    let total = owed.len();
++    let mut queued = 0_usize;
++    for delivery in owed {
++        match queue.reserve() {
++            Ok(seat) => {
++                seat.send(Job::issue(delivery));
++                queued += 1;
++            }
++            Err(error) => {
++                warn!(
++                    %error,
++                    issue,
++                    remaining = total - queued,
++                    "the delivery queue is full: the copies that did not fit are still recorded, \
++                     and a relay would pick them up"
++                );
++                break;
++            }
++        }
++    }
++    Ok(queued)
++}
++
++/// What a claimed issue delivery needs in order to be sent: where it goes, and what it says.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Copy {
++    /// The address in the row, parsed.
++    pub email: Email,
++    /// What the issue is about.
++    pub subject: String,
++    /// What it says.
++    pub body: String,
++}
++
++/// Claim one copy of one issue, or answer that there is nothing to claim.
++///
++/// The same conditional write as a confirmation (step `mailer/1.15-idempotent-delivery`), on a table
++/// whose key already says which copy it is: `UPDATE … WHERE sent_at IS NULL AND claimed_at IS NULL
++/// RETURNING …` hands the row to one caller, counts the attempt in the same statement, and answers
++/// `None` to every other caller.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the claim does not run, and [`Error::InvalidInput`] when the
++/// address in the row is not one this service would have stored.
++pub async fn claim(pool: &PgPool, delivery: i64) -> Result<Option<Copy>, Error> {
++    let row = sqlx::query!(
++        "UPDATE issue_deliveries \
++            SET claimed_at = now(), attempts = attempts + 1 \
++           FROM issues, subscribers \
++          WHERE issue_deliveries.id = $1 \
++            AND issue_deliveries.issue_id = issues.id \
++            AND issue_deliveries.subscriber_id = subscribers.id \
++            AND issue_deliveries.sent_at IS NULL \
++            AND issue_deliveries.claimed_at IS NULL \
++          RETURNING subscribers.email, issues.subject, issues.body",
++        delivery
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "claim a copy of an issue",
++        source: Box::new(source),
++    })?;
++
++    row.map(|row| {
++        Ok(Copy {
++            email: Email::parse(&row.email)?,
++            subject: row.subject,
++            body: row.body,
++        })
++    })
++    .transpose()
++}
++
++/// Record that a copy went out, and let go of the claim.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the record does not run.
++pub async fn mark_sent(pool: &PgPool, delivery: i64) -> Result<(), Error> {
++    sqlx::query!(
++        "UPDATE issue_deliveries \
++            SET sent_at = now(), claimed_at = NULL \
++          WHERE id = $1",
++        delivery
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "record a delivered copy",
++        source: Box::new(source),
++    })?;
++    Ok(())
++}
++
++/// Give the claim back without recording a delivery.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the release does not run.
++pub async fn release(pool: &PgPool, delivery: i64) -> Result<(), Error> {
++    sqlx::query!(
++        "UPDATE issue_deliveries SET claimed_at = NULL WHERE id = $1",
++        delivery
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "release a copy claim",
++        source: Box::new(source),
++    })?;
++    Ok(())
++}

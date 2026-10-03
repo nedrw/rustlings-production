@@ -1,0 +1,487 @@
+diff --git a/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json b/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json
+deleted file mode 100644
+index ed93398..0000000
+--- a/.sqlx/query-a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c.json
++++ /dev/null
+@@ -1,14 +0,0 @@
+-{
+-  "db_name": "PostgreSQL",
+-  "query": "INSERT INTO issue_deliveries (issue_id, subscriber_id) SELECT $1, id FROM subscribers",
+-  "describe": {
+-    "columns": [],
+-    "parameters": {
+-      "Left": [
+-        "Int8"
+-      ]
+-    },
+-    "nullable": []
+-  },
+-  "hash": "a5e04e2e864f54fb002de8048dbbb84e5e3487403493513d4c76f2f8a0a3ec0c"
+-}
+diff --git a/.sqlx/query-e30f2e534852b8ddbb35fa7e1773a62a88ebbe2f66931529c073edd789e5c51d.json b/.sqlx/query-e30f2e534852b8ddbb35fa7e1773a62a88ebbe2f66931529c073edd789e5c51d.json
+new file mode 100644
+index 0000000..a3df015
+--- /dev/null
++++ b/.sqlx/query-e30f2e534852b8ddbb35fa7e1773a62a88ebbe2f66931529c073edd789e5c51d.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO issue_deliveries (issue_id, subscriber_id) SELECT $1, id FROM subscribers WHERE status = 'active'",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "e30f2e534852b8ddbb35fa7e1773a62a88ebbe2f66931529c073edd789e5c51d"
++}
+diff --git a/src/delivery.rs b/src/delivery.rs
+index 125be20..aa83a37 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -24,7 +24,8 @@
+ //!   orchestrator kills, and being killed is how messages are lost.
+ //!
+ //! Step `mailer/1.15-idempotent-delivery` adds a fifth, and it changes what travels in the
+-//! channel: **a job is an identity, not a message** ([`Job`]). The worker asks the database to
++//! channel: **a job is an identity, not a message** ([`Job`]). Step `mailer/1.17-newsletter` adds a
++//! second kind of identity behind the same queue: a copy of an issue, owed to one subscriber. The worker asks the database to
+ //! claim what a job names and sends what the claim answers with, so a job offered twice — a
+ //! retry, a restarted process, two workers, a duplicate signup — finds nothing to do the second
+ //! time. A message carried in memory would be a second copy of the truth, and there would be no
+@@ -40,8 +41,9 @@ use tokio::task::JoinHandle;
+ use tracing::{error, info, warn};
+ 
+ use crate::deliveries;
+-use crate::email::EmailSender;
++use crate::email::{EmailSender, Message};
+ use crate::error::Error;
++use crate::newsletter;
+ use crate::signup::confirmation_message;
+ 
+ /// How many messages may wait for the worker before a request is refused.
+@@ -69,17 +71,42 @@ const RETRY_CAP: Duration = Duration::from_secs(30);
+ /// How long the worker is given to finish what it already has, once the process is asked to stop.
+ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+ 
+-/// One thing the worker has to do: deliver the confirmation email of one subscriber.
++/// One thing the worker has to do: deliver a message somebody is owed.
+ ///
+ /// The job carries an *identity* rather than a message (step `mailer/1.15-idempotent-delivery`):
+-/// what is owed, and what has already gone out, are facts about the subscriber's row, and the
+-/// message is rebuilt from the row by whoever manages to claim it. A job is therefore a
+-/// question — "does this subscriber still need their confirmation?" — and the claim is the
+-/// answer.
++/// what is owed, and what has already gone out, are facts about a row, and the message is rebuilt
++/// from that row by whoever manages to claim it. A job is therefore a question — "is this still
++/// owed?" — and the claim is the answer.
++///
++/// Step `mailer/1.17-newsletter` adds the second kind: a copy of an issue is owed to one
++/// subscriber, and it is named by the row in `issue_deliveries` that says so. The two kinds share
++/// the queue, the retry policy and the shutdown path, and differ in what they claim and where.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+-pub struct Job {
+-    /// The subscriber whose confirmation is owed.
+-    pub subscriber: i64,
++pub enum Job {
++    /// The confirmation email of one subscriber (step `mailer/1.15-idempotent-delivery`).
++    Confirmation {
++        /// The subscriber whose confirmation is owed.
++        subscriber: i64,
++    },
++    /// One copy of one issue, owed to one subscriber (step `mailer/1.17-newsletter`).
++    Issue {
++        /// The row in `issue_deliveries` that says so.
++        delivery: i64,
++    },
++}
++
++impl Job {
++    /// The confirmation email of one subscriber.
++    #[must_use]
++    pub fn confirmation(subscriber: i64) -> Self {
++        Self::Confirmation { subscriber }
++    }
++
++    /// One copy of one issue, named by its delivery row.
++    #[must_use]
++    pub fn issue(delivery: i64) -> Self {
++        Self::Issue { delivery }
++    }
+ }
+ 
+ /// A queue with one worker behind it.
+@@ -134,7 +161,7 @@ impl Queue {
+                             Ok(true) => delivered += 1,
+                             Ok(false) => {}
+                             Err(error) => {
+-                                error!(%error, subscriber = job.subscriber, "a job could not be run");
++                                error!(%error, ?job, "a job could not be run");
+                             }
+                         }
+                     }
+@@ -193,7 +220,15 @@ impl Queue {
+     }
+ }
+ 
+-/// Run one job: claim, send once, record — and claim again for the next attempt
++/// Run one job: hand it to the kind of delivery it names.
++async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Result<bool, Error> {
++    match job {
++        Job::Confirmation { subscriber } => deliver_confirmation(pool, sender, *subscriber).await,
++        Job::Issue { delivery } => deliver_copy(pool, sender, *delivery).await,
++    }
++}
++
++/// Run one confirmation job: claim, send once, record — and claim again for the next attempt
+ /// (step `mailer/1.15-idempotent-delivery`).
+ ///
+ /// The retry loop goes *through* the database rather than around the sender, and that is the whole
+@@ -211,12 +246,16 @@ impl Queue {
+ /// Reports [`Error::Database`] when the claim, the record or the release does not run, and
+ /// [`Error::InvalidInput`] when a row holds a value that is not the type it was written as. A
+ /// failed *send* is not one of them: it is retried, and then given up on with a line in the log.
+-async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Result<bool, Error> {
++async fn deliver_confirmation(
++    pool: &PgPool,
++    sender: &dyn EmailSender,
++    subscriber: i64,
++) -> Result<bool, Error> {
+     let mut attempt = 1_u32;
+     loop {
+-        let Some(delivery) = deliveries::claim(pool, job.subscriber).await? else {
++        let Some(delivery) = deliveries::claim(pool, subscriber).await? else {
+             info!(
+-                subscriber = job.subscriber,
++                subscriber,
+                 "nothing to claim: the confirmation has been sent, or another worker has it"
+             );
+             return Ok(false);
+@@ -226,13 +265,13 @@ async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Resu
+             Ok(()) => {
+                 // The record is written *after* the send: a `sent_at` set before the mail server took
+                 // the message would be a promise this service cannot keep.
+-                deliveries::mark_sent(pool, job.subscriber).await?;
++                deliveries::mark_sent(pool, subscriber).await?;
+                 return Ok(true);
+             }
+             Err(error) => {
+                 // The message is still owed and nobody is sending it: without this the subscriber
+                 // would be stuck as "someone is on it" forever, and no later job could claim it.
+-                deliveries::release(pool, job.subscriber).await?;
++                deliveries::release(pool, subscriber).await?;
+                 if attempt >= MAX_ATTEMPTS {
+                     error!(%error, to = %delivery.email, "giving up on an email");
+                     return Ok(false);
+@@ -246,6 +285,58 @@ async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Resu
+     }
+ }
+ 
++/// Run one copy job: claim the row, send one issue, record or release (step
++/// `mailer/1.17-newsletter`).
++///
++/// The same policy as a confirmation — one attempt per claim, `backoff` between them,
++/// `MAX_ATTEMPTS` of them, and a release that puts the copy back — over a row that is named by an
++/// id instead of a subscriber. The two loops are written out twice rather than folded into one
++/// generic function: what they share is three lines of policy and one `sleep`, and what they differ
++/// in is the shape of the claim, which a closure over three `await`s would hide rather than
++/// express.
++///
++/// # Errors
++///
++/// The same two kinds as [`deliver_confirmation`].
++async fn deliver_copy(
++    pool: &PgPool,
++    sender: &dyn EmailSender,
++    delivery: i64,
++) -> Result<bool, Error> {
++    let mut attempt = 1_u32;
++    loop {
++        let Some(copy) = newsletter::claim(pool, delivery).await? else {
++            info!(
++                delivery,
++                "nothing to claim: this copy has been sent, or another worker has it"
++            );
++            return Ok(false);
++        };
++        let message = Message {
++            to: copy.email.clone(),
++            subject: copy.subject.clone(),
++            body: copy.body.clone(),
++        };
++        match sender.send(message).await {
++            Ok(()) => {
++                newsletter::mark_sent(pool, delivery).await?;
++                return Ok(true);
++            }
++            Err(error) => {
++                newsletter::release(pool, delivery).await?;
++                if attempt >= MAX_ATTEMPTS {
++                    error!(%error, to = %copy.email, "giving up on an issue");
++                    return Ok(false);
++                }
++                let wait = backoff(attempt);
++                warn!(%error, attempt, ?wait, "the issue could not be sent; trying again");
++                tokio::time::sleep(wait).await;
++                attempt += 1;
++            }
++        }
++    }
++}
++
+ /// The wait before the next attempt: exponential, capped, and jittered.
+ ///
+ /// *Full jitter*, in the shape of the AWS backoff article: a random delay in
+diff --git a/src/http.rs b/src/http.rs
+index 1abdeab..3beea3d 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -46,7 +46,7 @@ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use serde::{Deserialize, Serialize};
+ use tokio::net::TcpListener;
+-use tracing::{info, instrument, warn};
++use tracing::{error, info, instrument, warn};
+ 
+ use std::future::Future;
+ use std::sync::Arc;
+@@ -59,6 +59,7 @@ use crate::email::{EmailSender, Logging};
+ use crate::error::Error;
+ use crate::logging::RunId;
+ use crate::login::{Credentials, log_in};
++use crate::newsletter::{self, NewsletterRequest};
+ use crate::session::{self, Token as SessionToken};
+ use crate::signup::{SignupRequest, subscribe};
+ 
+@@ -182,6 +183,7 @@ pub fn router(state: AppState) -> Router {
+         .route("/logout", post(logout))
+         .route("/me", get(me))
+         .route("/confirm", get(confirm))
++        .route("/newsletter", post(newsletter))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
+         .with_state(state)
+@@ -450,6 +452,70 @@ fn credential(headers: &HeaderMap) -> Result<Option<SessionToken>, Error> {
+     SessionToken::parse(token).map(Some)
+ }
+ 
++/// `POST /newsletter`: publish an issue to every confirmed subscriber
++/// (step `mailer/1.17-newsletter`).
++///
++/// The route is `post` and it is authenticated: publishing is an act by a subscriber, and the
++/// session of step `mailer/1.16-sessions` is what says which one. The answer is `202 Accepted`
++/// rather than `201 Created`, and the difference is the step in one word: the *issue* is created
++/// (and is there when this returns), while the *sending* is work that has been accepted and has not
++/// happened yet.
++///
++/// The order of the two calls below is the whole design: [`newsletter::publish`] is one transaction
++/// — the issue and every copy it is owed to, or nothing — and [`newsletter::fan_out`] runs *after*
++/// it commits. Handing work to the queue inside the transaction would make a full queue into a
++/// rolled-back issue, and a published issue is the one thing this step must not lose.
++async fn newsletter(
++    State(state): State<AppState>,
++    headers: HeaderMap,
++    body: Result<Json<NewsletterRequest>, JsonRejection>,
++) -> Response {
++    let Ok(Json(request)) = body else {
++        return (
++            StatusCode::BAD_REQUEST,
++            Json(Body::new(
++                "the body is not an issue: it has to be a JSON object with `subject` and `body`",
++            )),
++        )
++            .into_response();
++    };
++
++    let (Some(database), Some(delivery)) = (state.database(), state.delivery()) else {
++        warn!("an issue was published with no database configured");
++        return not_ready("no database is configured");
++    };
++    let identity = match identity(database.pool(), &headers).await {
++        Ok(identity) => identity,
++        Err(error) => return answer(error),
++    };
++
++    let publication = match newsletter::publish(database.pool(), identity.subscriber, request).await
++    {
++        Ok(publication) => publication,
++        Err(error) => return answer(error),
++    };
++
++    // A fan-out that could not read the copies it was going to queue is worth a line in the log and
++    // nothing else: the issue is published, the copies are recorded, and what is missing is a
++    // process to hand them over. Reporting a failure to the caller would say the publish failed,
++    // which is the one thing that did not.
++    match newsletter::fan_out(database.pool(), delivery, publication.issue).await {
++        Ok(_queued) => {}
++        Err(error) => {
++            error!(%error, issue = publication.issue, "the fan-out could not read what was owed");
++        }
++    }
++
++    (
++        StatusCode::ACCEPTED,
++        Json(PublicationBody {
++            issue: publication.issue,
++            deliveries: publication.deliveries,
++        }),
++    )
++        .into_response()
++}
++
+ /// `GET /confirm?token=…`: confirm the subscriber a token was issued for
+ /// (step `mailer/1.12-token`).
+ ///
+@@ -547,6 +613,16 @@ fn answer(error: Error) -> Response {
+     (status, Json(Body::new(error.to_string()))).into_response()
+ }
+ 
++/// What publishing an issue answers with: which issue, and how many copies it is owed to
++/// (step `mailer/1.17-newsletter`).
++#[derive(Debug, Serialize)]
++struct PublicationBody {
++    /// The id of the issue that was written.
++    issue: i64,
++    /// How many subscribers this issue got a copy for.
++    deliveries: i64,
++}
++
+ /// The body of an answer that changed a subscriber's state: what it is now, and whose
+ /// (`mailer/1.11-signup` created one, `mailer/1.12-token` confirmed one).
+ #[derive(Debug, Serialize)]
+diff --git a/src/lib.rs b/src/lib.rs
+index a068a70..2550fef 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod error;
+ pub mod http;
+ pub mod logging;
+ pub mod login;
++pub mod newsletter;
+ pub mod session;
+ pub mod signup;
+ 
+diff --git a/src/newsletter.rs b/src/newsletter.rs
+index 6ab6d5b..75407e1 100644
+--- a/src/newsletter.rs
++++ b/src/newsletter.rs
+@@ -26,15 +26,6 @@
+ //!   `mailer/1.15-idempotent-delivery`): the unique key makes the row exist once, and the claim makes
+ //!   the *send* happen once, however many jobs, retries or workers take part.
+ //!
+-//! # What this scaffold proves
+-//!
+-//! The delivery rows, the claim and the fan-out are here; the *write* is not one write. `publish`
+-//! below runs its two statements one after the other, with no transaction around them, and its
+-//! fan-out hands a copy to **every** subscriber rather than to the ones whose address was confirmed.
+-//! Both are visible in the step's spec (`tests/spec_newsletter.rs`): an unconfirmed address gets a
+-//! copy, and a publish that fails halfway leaves an issue whose copies were never written. The step
+-//! is to make the pair atomic (`BEGIN` … `COMMIT`) and to let the database answer who is owed what.
+-//!
+ //! What this step does not build is a relay. If a queue is full when the fan-out runs, the rows it
+ //! could not hand over are still rows — owed, and recorded — and nothing in this process will pick
+ //! them up until a later track's claimer does. Naming that is part of the design: the alternative
+@@ -131,19 +122,18 @@ pub struct Publication {
+     pub deliveries: i64,
+ }
+ 
+-/// Publish an issue: record it, then record who it is owed to.
++/// Publish an issue: record it and everyone it is owed to, in one transaction.
++///
++/// The order inside the transaction is not decoration. The issue is inserted first because the
++/// delivery rows need its id, and the delivery rows come second because they are what makes the
++/// issue a newsletter rather than a draft. Either both are there when this returns, or neither is —
++/// which is what `BEGIN`…`COMMIT` buys and what nothing else in this course has needed until now.
+ ///
+ /// # Errors
+ ///
+ /// Reports [`Error::InvalidInput`] when the subject or the body is not a value this service accepts,
+-/// and [`Error::Database`] when either write does not run.
+-///
+-/// The two statements below are *not* one write: the scaffold inserts the issue, and then inserts a
+-/// copy of it for every subscriber there is. A failure in between leaves an issue whose copies were
+-/// never written — published, and owed to nobody — and there is no way back, because the issue is
+-/// already the record. One transaction around both statements is the step, and the second hole is
+-/// the audience: `WHERE status = 'active'` is what makes "who is owed this" a decision the database
+-/// makes, rather than "everybody who ever typed an address into the form".
++/// and [`Error::Database`] when the transaction does not commit. A failure at any point inside the
++/// transaction rolls back everything the transaction wrote, which is the point.
+ pub async fn publish(
+     pool: &PgPool,
+     publisher: i64,
+@@ -152,30 +142,47 @@ pub async fn publish(
+     let subject = Subject::parse(&request.subject)?;
+     let body = IssueBody::parse(&request.body)?;
+ 
++    let mut transaction = pool.begin().await.map_err(|source| Error::Database {
++        operation: "begin a publish transaction",
++        source: Box::new(source),
++    })?;
++
+     let issue = sqlx::query_scalar!(
+         "INSERT INTO issues (subject, body, published_by) VALUES ($1, $2, $3) RETURNING id",
+         subject.as_str(),
+         body.as_str(),
+         publisher
+     )
+-    .fetch_one(pool)
++    .fetch_one(&mut *transaction)
+     .await
+     .map_err(|source| Error::Database {
+         operation: "record an issue",
+         source: Box::new(source),
+     })?;
+ 
++    // Who is owed a copy is a query, and the database answers it: confirmed subscribers, and nobody
++    // else. A subscriber who is still `pending` has not proven the address is theirs, and one who
++    // left asked not to be written to.
+     let deliveries = sqlx::query!(
+-        "INSERT INTO issue_deliveries (issue_id, subscriber_id) SELECT $1, id FROM subscribers",
++        "INSERT INTO issue_deliveries (issue_id, subscriber_id) \
++         SELECT $1, id FROM subscribers WHERE status = 'active'",
+         issue
+     )
+-    .execute(pool)
++    .execute(&mut *transaction)
+     .await
+     .map_err(|source| Error::Database {
+         operation: "record the copies an issue is owed to",
+         source: Box::new(source),
+     })?;
+ 
++    transaction
++        .commit()
++        .await
++        .map_err(|source| Error::Database {
++            operation: "commit a publish transaction",
++            source: Box::new(source),
++        })?;
++
+     Ok(Publication {
+         issue,
+         deliveries: i64::try_from(deliveries.rows_affected()).unwrap_or(i64::MAX),
+diff --git a/src/signup.rs b/src/signup.rs
+index 00c592f..a74201d 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -125,7 +125,7 @@ pub async fn subscribe(
+             // signup that is lost — the row is written, the address is good, and what a failed
+             // send owes is a line in the log — plus a claim that a later job can take over
+             // (step `mailer/1.15-idempotent-delivery`).
+-            seat.send(Job { subscriber: id });
++            seat.send(Job::confirmation(id));
+             Ok(email)
+         }
+         // The address is taken. If the confirmation is still owed — the row is `pending` and no
+@@ -133,7 +133,7 @@ pub async fn subscribe(
+         // the caller is unchanged: this address already has a subscriber.
+         None => {
+             if let Some(subscriber) = deliveries::outstanding(pool, &email).await? {
+-                seat.send(Job { subscriber });
++                seat.send(Job::confirmation(subscriber));
+             }
+             Err(Error::AlreadySubscribed {
+                 email: email.as_str().to_owned(),
