@@ -581,8 +581,12 @@ concepts = ["multi-stage build", "probes", "migrate before traffic"]
 teaches = ["release/container-image@apply"]
 # requires: the image is built by the CI entry point (1.3) and its start-up order depends on typed config (1.4)
 requires = ["ci/pipeline@apply", "cfg/layered-config@apply"]
-run = { cmd = "cargo test -p mailer --test spec_image" }
+run = { cmd = "cargo test -p mailer --test spec_image", timeout = 1800 }
 spec = ["spec/1.21/image.rs"]
+# The two base images the Dockerfile builds from: the builder is a build-time input, the runtime
+# image is what ships. `kiln images pull` fetches both, and the `images` gate names the command when
+# one is missing — the build itself never reaches a registry for them.
+images = ["rust:1.98-alpine", "alpine:3.20"]
 scaffold = "scaffold/1.21-container.patch"
 solution = "solutions/1.21-container.patch"
 gates = [
@@ -594,6 +598,9 @@ gates = [
     "exit-code",
     "no-todo",
     "docs:public",
+    # The images first: they are build-time inputs, and the gate names the pull command when one is
+    # missing — which is cheaper to read than a build that fails three stages in.
+    "images",
     "container-repro",
 ]
 hint = "The image must run the same binary you tested, and the start-up contract (probe, migration, then traffic) belongs in the code, not in the deployment docs."

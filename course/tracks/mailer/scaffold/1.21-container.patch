@@ -1,0 +1,569 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..293c857
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,11 @@
++# What the build context does not need (step `mailer/1.21-container`).
++#
++# `target/` is the one that matters: it is hundreds of megabytes of the *host's* build output, and
++# sending it to the daemon on every `podman build` is the difference between a build that starts
++# immediately and one that spends a minute copying files nothing will use. The container builds its
++# own release artifacts from source.
++target/
++.git/
++.kiln/
++tests/
++mailer.toml
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..35c86f2
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,21 @@
++# The image this service ships as (step `mailer/1.21-container`).
++#
++# One stage, for now: the toolchain and the sources that built the binary stay in the image, because
++# the build happens *in* the image that runs. Everything the step's spec is about follows from that
++# one decision, and the spec says so one failure at a time.
++#
++# The base image is a build argument rather than a literal: behind a registry mirror the same image
++# lives under another name, and the step's fixture passes the name this engine actually stores
++# (`--build-arg BUILDER=...`). The default is what a machine with Docker Hub access has.
++ARG BUILDER=rust:1.98-alpine
++FROM ${BUILDER}
++
++WORKDIR /src
++COPY . .
++RUN cargo build --release --locked
++
++# The service reads its configuration from the environment (step `mailer/1.4-config`), so an image
++# that ships a binary and nothing else is already a start — what it does not do yet is say where the
++# process should listen, or leave the tools behind.
++EXPOSE 8080
++ENTRYPOINT ["/src/target/release/mailer"]
+diff --git a/tests/support/container.rs b/tests/support/container.rs
+new file mode 100644
+index 0000000..f6b5253
+--- /dev/null
++++ b/tests/support/container.rs
+@@ -0,0 +1,519 @@
++//! A container built from this project, for one test (step `mailer/1.21-container`).
++//!
++//! The other fixtures in this directory run a *service* (`service.rs`), a *database* (`postgres.rs`)
++//! or a *mail server* (`mailpit.rs`). This one runs the thing this step is about: the image the
++//! Dockerfile describes, started the way a deployment starts it and judged from outside.
++//!
++//! Four rules, and the fourth is the one that makes a container test usable on a laptop:
++//!
++//! * **the engine is probed, not assumed** — `podman` first, then `docker` (plan §9.1);
++//! * **every command has a deadline this module enforces** — a build that hangs on a registry has to
++//!   fail as a sentence, not as a test that never ends;
++//! * **the container is removed with its volumes** — the leak that made every container spec fail at
++//!   once, found the hard way in `postgres.rs`;
++//! * **the build gets a cache**: two named volumes for `/src/target` and `/usr/local/cargo`. A Rust
++//!   release build of this workspace is minutes on a small machine, and without a cache every single
++//!   build in every single test pays it again. With one, the first build pays it and the rest are
++//!   seconds — and the cache lives in the engine, not in the throwaway project, so it survives the
++//!   test run that created it.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::io::{Read, Write};
++use std::net::{SocketAddr, TcpStream};
++use std::path::Path;
++use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++/// How long a build is given. The first one on a machine compiles the whole dependency tree; later
++/// ones copy layers and rebuild one crate.
++const BUILD_DEADLINE: Duration = Duration::from_secs(1800);
++/// How long any other engine command may take.
++const COMMAND_DEADLINE: Duration = Duration::from_secs(120);
++/// The base images the step's `Dockerfile` names as its build arguments, written the way a step's
++/// metadata writes them (`images = [...]` in `track.toml`).
++///
++/// The build does not use these strings directly: it uses the names this machine's engine actually
++/// has (see [`local_image`]), because a mirror stores an official image under a name of its own and
++/// `FROM rust:1.98-alpine` cannot find `docker.1ms.run/library/rust:1.98-alpine`. Which is why the
++/// Dockerfile takes both names as build arguments with these values as defaults.
++const BUILDER: &str = "rust:1.98-alpine";
++const RUNTIME: &str = "alpine:3.20";
++/// How long a started container is given to answer.
++const READY_DEADLINE: Duration = Duration::from_secs(30);
++/// How often a wait looks again.
++const RETRY: Duration = Duration::from_millis(100);
++/// How often `run_bounded` looks at its child.
++const POLL: Duration = Duration::from_millis(20);
++/// Where the build cache is mounted inside the image, and the value passed as `CARGO_TARGET_DIR`.
++///
++/// Deliberately *not* the target directory a Dockerfile would use by itself: a mount is not a layer,
++/// so a cache over `/src/target` would leave every image empty of the binary its entry point names —
++/// punishing the naive Dockerfile instead of speeding up the careful one. A Dockerfile that wants
++/// the cache asks for it (`ARG CARGO_TARGET_DIR=...` plus `ENV`), which is also what a CI cache mount
++/// looks like in the wild. A Dockerfile that ignores the argument builds normally.
++const TARGET_MOUNT: &str = "/opt/kiln/target";
++
++/// Where a build keeps its work between runs: the cargo registry it downloads into, and the target
++/// directory it compiles into.
++///
++/// Host directories rather than engine volumes, because that is what `podman build -v` accepts — an
++/// absolute path, not a name. They live under the user's cache directory for the same reason
++/// `kiln`'s own shared target directory does (see `kiln/src/scratch.rs`): the build is a machine's
++/// build, not a project's, and a build cache inside a project would be deleted with it.
++#[must_use]
++pub fn caches() -> (std::path::PathBuf, std::path::PathBuf) {
++    let base = std::env::var_os("XDG_CACHE_HOME")
++        .map(std::path::PathBuf::from)
++        .or_else(|| {
++            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
++        })
++        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
++    (
++        base.join("kiln").join("container-target"),
++        base.join("kiln").join("container-registry"),
++    )
++}
++
++/// The engine this machine answers to (plan §9.1: probed, never assumed).
++#[must_use]
++pub fn engine() -> &'static str {
++    for engine in ["podman", "docker"] {
++        let answered = Command::new(engine)
++            .args(["info", "--format", "{{.Host.Security.Rootless}}"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status()
++            .is_ok_and(|status| status.success());
++        if answered {
++            return engine;
++        }
++    }
++    panic!("neither `podman` nor `docker` answered: a container engine is needed for this spec");
++}
++
++/// The reference to build with for a base image a step declared.
++///
++/// The image has to be *there*: the tests never pull (that would make them need a network and a
++/// working mirror), so a missing base image is a sentence pointing at the command that fetches it.
++///
++/// It also has to be *this machine's*: a store filled through more than one mirror holds the same
++/// repository path more than once — `alpine:3.20` as arm64 from one and as amd64 from another — and
++/// `podman build --pull=never` answers the wrong one with `image not known`, several stages into a
++/// build. So the candidates are the ones for the architecture this engine runs, and a machine that
++/// has only the other one gets the sentence below.
++#[must_use]
++pub fn local_image(engine: &str, declared: &str) -> String {
++    let listed = run_or_panic(engine, &["images", "--format", "{{.Repository}}:{{.Tag}}"]);
++    let candidates: Vec<String> = listed
++        .lines()
++        .map(str::trim)
++        .filter(|name| {
++            !name.is_empty() && *name != "<none>:<none>" && is_declared_image(name, declared)
++        })
++        .map(str::to_owned)
++        .collect();
++    let host = host_architecture(engine);
++    candidates
++        .iter()
++        .find(|name| image_architecture(engine, name).as_deref() == Some(host.as_str()))
++        .or_else(|| candidates.first())
++        .cloned()
++        .unwrap_or_else(|| {
++            panic!(
++                "{declared} is not in the local image store: run `kiln images pull`, or `{engine} \
++                 pull {}` if you are not using kiln",
++                resolved_image(declared)
++            )
++        })
++}
++
++/// The architecture this engine runs images of.
++fn host_architecture(engine: &str) -> String {
++    let ran = run_bounded(
++        engine,
++        &["info", "--format", "{{.Host.Arch}}"],
++        COMMAND_DEADLINE,
++    );
++    let arch = ran.stdout.trim();
++    if ran.status.success() && !arch.is_empty() {
++        return arch.to_owned();
++    }
++    std::env::consts::ARCH.to_owned()
++}
++
++/// The architecture an image was built for, when the engine will say.
++fn image_architecture(engine: &str, name: &str) -> Option<String> {
++    let ran = run_bounded(
++        engine,
++        &["image", "inspect", name, "--format", "{{.Architecture}}"],
++        COMMAND_DEADLINE,
++    );
++    ran.status
++        .success()
++        .then(|| ran.stdout.trim().to_owned())
++        .filter(|arch| !arch.is_empty())
++}
++
++/// Whether a name the engine reports is the image a step declared.
++///
++/// The same rule as `kiln`'s `images` gate (`kiln/src/runtime.rs`) and as `postgres.rs`: the
++/// *repository path* has to be the same, because the engine answers with the name it was pulled
++/// under — `alpine:3.20` is here as `docker.1ms.run/library/alpine:3.20` — while
++/// `someone/alpine:3.20` is a different image that only ends the same way.
++fn is_declared_image(local: &str, declared: &str) -> bool {
++    if local == declared {
++        return true;
++    }
++    let repository = match local.split_once('/') {
++        Some((first, rest))
++            if first == "localhost" || first.contains('.') || first.contains(':') =>
++        {
++            rest
++        }
++        _ => local,
++    };
++    repository == declared
++        || (!declared.contains('/') && repository == format!("library/{declared}"))
++}
++
++/// The reference a pull would use, mirror-aware (`KILN_REGISTRY_MIRROR`).
++fn resolved_image(declared: &str) -> String {
++    match std::env::var("KILN_REGISTRY_MIRROR").ok() {
++        Some(mirror) if !mirror.is_empty() => {
++            if declared.contains('/') {
++                format!("{mirror}/{declared}")
++            } else {
++                format!("{mirror}/library/{declared}")
++            }
++        }
++        _ => declared.to_owned(),
++    }
++}
++
++/// Build `context` into an image called `tag`, and answer how long it took.
++///
++/// A build that fails is a failed test with the builder's own output in the sentence. `--layers` plus
++/// [`CACHE_VOLUMES`] is what makes the second build of the same image cheap.
++#[must_use]
++pub fn build(tag: &str, context: &Path) -> Duration {
++    let engine = engine();
++    let context = context
++        .to_str()
++        .unwrap_or_else(|| panic!("the build context has to be a path: {}", context.display()));
++    let (target, registry) = caches();
++    let target_mount = format!("{}:{TARGET_MOUNT}", target.display());
++    // `/usr/local/cargo/registry` and not `/usr/local/cargo`: the second one is where the image
++    // keeps its *toolchain*, and mounting a cache over it is a build that cannot find `cargo`.
++    let registry_mount = format!("{}:/usr/local/cargo/registry", registry.display());
++    // The registry is shared with the *host's* cargo on purpose: the crates are the same crates, and
++    // downloading them again inside a container is a minute of nothing. The target directory is not
++    // shared with the host's, because that one was built for another platform.
++    // `podman build -v` wants both ends to exist: a mount whose host path is missing is a build that
++    // never starts.
++    let _ = std::fs::create_dir_all(&target);
++    let _ = std::fs::create_dir_all(&registry);
++    // `--pull=never`: this step's images come from `kiln images pull`, and a build that reaches for
++    // Docker Hub instead spends its deadline hanging. A missing base image is the sentence above.
++    let builder = local_image(engine, BUILDER);
++    let runtime = local_image(engine, RUNTIME);
++    let builder_arg = format!("BUILDER={builder}");
++    let runtime_arg = format!("RUNTIME={runtime}");
++    // The Dockerfile decides whether to compile into the cache: the argument is offered, not forced.
++    let target_arg = format!("CARGO_TARGET_DIR={TARGET_MOUNT}");
++    let args: Vec<&str> = vec![
++        "build",
++        "--layers",
++        "--pull=never",
++        "-t",
++        tag,
++        "--build-arg",
++        builder_arg.as_str(),
++        "--build-arg",
++        runtime_arg.as_str(),
++        "--build-arg",
++        target_arg.as_str(),
++        "-v",
++        target_mount.as_str(),
++        "-v",
++        registry_mount.as_str(),
++        context,
++    ];
++
++    let started = Instant::now();
++    let outcome = run_bounded(engine, &args, BUILD_DEADLINE);
++    assert!(
++        outcome.status.success(),
++        "`{engine} build` failed for `{tag}`:\n{}",
++        outcome.said()
++    );
++    started.elapsed()
++}
++
++/// How many containers this process has started: part of every name it hands the engine.
++static NEXT: AtomicU64 = AtomicU64::new(0);
++
++/// One running container, removed when this value is dropped.
++pub struct Container {
++    engine: &'static str,
++    name: String,
++    address: SocketAddr,
++}
++
++impl Container {
++    /// Start `tag` with `env` as its environment, publishing port 8080 on one of this machine's.
++    ///
++    /// No test passes a listening host: where the image listens is the image's own business, and a
++    /// container that only listens on its own loopback is a container nothing can reach — which is
++    /// exactly what the spec is there to notice.
++    #[must_use]
++    pub fn start(tag: &str, env: &[(&str, &str)]) -> Self {
++        let engine = engine();
++        // Tests in one file run in parallel, so a name made of the process id alone would be four
++        // threads asking the engine for the same container at once.
++        let name = format!(
++            "kiln-image-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        );
++        let _ = run_bounded(engine, &["rm", "-f", "-v", &name], COMMAND_DEADLINE);
++
++        let mut args: Vec<String> = vec![
++            "run".to_owned(),
++            "-d".to_owned(),
++            "--name".to_owned(),
++            name.clone(),
++            "-p".to_owned(),
++            "127.0.0.1::8080".to_owned(),
++            "--pull=never".to_owned(),
++        ];
++        for (key, value) in env {
++            args.push("-e".to_owned());
++            args.push(format!("{key}={value}"));
++        }
++        args.push(tag.to_owned());
++        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
++        let outcome = run_bounded(engine, &borrowed, COMMAND_DEADLINE);
++        assert!(
++            outcome.status.success(),
++            "`{engine} run` failed for `{tag}`:\n{}",
++            outcome.said()
++        );
++
++        let published = run_or_panic(engine, &["port", &name, "8080"]);
++        let port = published
++            .trim()
++            .rsplit_once(':')
++            .and_then(|(_, port)| port.trim().parse().ok())
++            .unwrap_or_else(|| panic!("the engine did not publish a port: `{published}`"));
++
++        Self {
++            engine,
++            name,
++            address: SocketAddr::from(([127, 0, 0, 1], port)),
++        }
++    }
++
++    /// One `GET`, as a client sends it: `(status, body)`.
++    #[must_use]
++    pub fn get(&self, path: &str) -> (u16, String) {
++        let (status, _, body) = self.get_with_headers(path);
++        (status, body)
++    }
++
++    /// One `GET`, with the headers it answered.
++    #[must_use]
++    pub fn get_with_headers(&self, path: &str) -> (u16, Vec<(String, String)>, String) {
++        let mut stream = TcpStream::connect(self.address).unwrap_or_else(|error| {
++            panic!(
++                "the container at {} is not accepting connections: {error}",
++                self.address
++            )
++        });
++        stream
++            .set_read_timeout(Some(READY_DEADLINE))
++            .expect("a read deadline can be set");
++        let request = format!(
++            "GET {path} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\n\r\n",
++            self.address
++        );
++        stream
++            .write_all(request.as_bytes())
++            .unwrap_or_else(|error| panic!("the request could not be sent: {error}"));
++        let mut raw = String::new();
++        stream
++            .read_to_string(&mut raw)
++            .unwrap_or_else(|error| panic!("the answer could not be read: {error}"));
++
++        let (head, body) = raw
++            .split_once("\r\n\r\n")
++            .unwrap_or_else(|| panic!("an HTTP answer has a head and a body: `{raw}`"));
++        let status = head
++            .lines()
++            .next()
++            .and_then(|line| line.split_whitespace().nth(1))
++            .and_then(|code| code.parse().ok())
++            .unwrap_or_else(|| panic!("the status line has a code: `{head}`"));
++        let headers = head
++            .lines()
++            .filter_map(|line| line.split_once(':'))
++            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
++            .collect();
++        (status, headers, body.to_owned())
++    }
++
++    /// Wait until the container answers its health endpoint, so no test has to sleep and hope.
++    pub fn wait_until_healthy(&self) {
++        let deadline = Instant::now() + READY_DEADLINE;
++        while Instant::now() < deadline {
++            if self.try_get("/healthz") == Some(200) {
++                return;
++            }
++            std::thread::sleep(RETRY);
++        }
++        panic!(
++            "the container at {} never answered `/healthz` — a container that listens only on its \
++             own loopback is a container nothing can reach. Logs:\n{}",
++            self.address,
++            self.logs()
++        );
++    }
++
++    /// One `GET`, answering `None` while the container is not up yet.
++    fn try_get(&self, path: &str) -> Option<u16> {
++        let mut stream = TcpStream::connect(self.address).ok()?;
++        stream.set_read_timeout(Some(READY_DEADLINE)).ok()?;
++        let request = format!(
++            "GET {path} HTTP/1.1\r\nhost: {}\r\nconnection: close\r\n\r\n",
++            self.address
++        );
++        stream.write_all(request.as_bytes()).ok()?;
++        let mut raw = String::new();
++        stream.read_to_string(&mut raw).ok()?;
++        raw.lines()
++            .next()
++            .and_then(|line| line.split_whitespace().nth(1))
++            .and_then(|code| code.parse().ok())
++    }
++
++    /// Run one command *inside* the container, as a shell, and answer what it said.
++    ///
++    /// This is how a test asks what an image is made of: whether a tool exists, which user the
++    /// process runs as, what the filesystem holds.
++    #[must_use]
++    pub fn exec(&self, command: &str) -> Outcome {
++        let engine = self.engine;
++        run_bounded(
++            engine,
++            &["exec", &self.name, "sh", "-c", command],
++            COMMAND_DEADLINE,
++        )
++    }
++
++    /// Everything the container has printed.
++    #[must_use]
++    pub fn logs(&self) -> String {
++        let engine = self.engine;
++        let outcome = run_bounded(engine, &["logs", &self.name], COMMAND_DEADLINE);
++        outcome.said()
++    }
++
++    /// How big the image is, in bytes, as the engine reports it.
++    #[must_use]
++    pub fn size_of(&self, tag: &str) -> u64 {
++        let engine = self.engine;
++        let listed = run_or_panic(engine, &["image", "inspect", tag, "--format", "{{.Size}}"]);
++        listed
++            .trim()
++            .parse()
++            .unwrap_or_else(|_| panic!("the engine did not report a size for `{tag}`: `{listed}`"))
++    }
++}
++
++impl Drop for Container {
++    fn drop(&mut self) {
++        // `-v` for the reason `tests/support/postgres.rs` learned the hard way: a container removed
++        // without its volumes leaves the engine's lock budget smaller for the next test.
++        let _ = Command::new(self.engine)
++            .args(["rm", "-f", "-v", &self.name])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
++    }
++}
++
++/// What one engine command produced.
++pub struct Outcome {
++    /// Whether it succeeded.
++    pub status: std::process::ExitStatus,
++    /// What it printed.
++    pub stdout: String,
++    /// What it complained about.
++    pub stderr: String,
++}
++
++impl Outcome {
++    /// The output as one string, whichever stream carried it.
++    #[must_use]
++    pub fn said(&self) -> String {
++        format!("{}{}", self.stdout, self.stderr)
++    }
++}
++
++/// Run one engine command, and answer what it printed — or panic with what it said.
++fn run_or_panic(engine: &str, args: &[&str]) -> String {
++    let outcome = run_bounded(engine, args, COMMAND_DEADLINE);
++    assert!(
++        outcome.status.success(),
++        "`{engine} {}` failed: {}",
++        args.join(" "),
++        outcome.said()
++    );
++    outcome.stdout
++}
++
++/// Run one engine command with a deadline this module enforces.
++fn run_bounded(engine: &str, args: &[&str], deadline: Duration) -> Outcome {
++    let mut child = Command::new(engine)
++        .args(args)
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap_or_else(|error| panic!("`{engine}` could not be started: {error}"));
++
++    let until = Instant::now() + deadline;
++    loop {
++        match child.try_wait() {
++            Ok(Some(status)) => {
++                let mut stdout = String::new();
++                let mut stderr = String::new();
++                if let Some(mut pipe) = child.stdout.take() {
++                    let _ = pipe.read_to_string(&mut stdout);
++                }
++                if let Some(mut pipe) = child.stderr.take() {
++                    let _ = pipe.read_to_string(&mut stderr);
++                }
++                return Outcome {
++                    status,
++                    stdout,
++                    stderr,
++                };
++            }
++            Ok(None) => {}
++            Err(error) => panic!(
++                "`{engine} {}` could not be waited for: {error}",
++                args.join(" ")
++            ),
++        }
++        if Instant::now() >= until {
++            let _ = child.kill();
++            let _ = child.wait();
++            panic!(
++                "`{engine} {}` did not finish within {deadline:?}",
++                args.join(" ")
++            );
++        }
++        std::thread::sleep(POLL);
++    }
++}
