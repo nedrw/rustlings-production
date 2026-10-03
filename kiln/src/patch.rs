@@ -330,40 +330,49 @@ fn parse_hunk<'a>(
         _ => return Err(malformed()),
     };
     let old_start = parse_range(&old).ok_or_else(malformed)?.0;
-    let old_count = parse_range(&old).ok_or_else(malformed)?.1;
-    let new_count = parse_range(&new).ok_or_else(malformed)?.1;
-    let _ = new_count;
+    let (old_count, new_count) = (
+        parse_range(&old).ok_or_else(malformed)?.1,
+        parse_range(&new).ok_or_else(malformed)?.1,
+    );
 
+    // How many lines a hunk carries is *in the header*, and that is the only thing consulted here:
+    // a hunk line's first character is part of the file's content, so a removed SQL comment arrives
+    // as `--- …` and an added one as `+++ …` — reading those as file headers is a mistake the
+    // header counts cannot make (they are what a real diff tool counts too).
     let mut hunk_lines = Vec::new();
-    while let Some(line) = lines.peek() {
+    let (mut old_seen, mut new_seen) = (0, 0);
+    while old_seen < old_count || new_seen < new_count {
+        let Some(line) = lines.next() else {
+            break;
+        };
         let kind = match line.chars().next() {
-            Some('+') if !line.starts_with("+++") => Kind::Add,
-            Some('-') if !line.starts_with("---") => Kind::Remove,
-            Some(' ') => Kind::Context,
+            // An empty line is how a stripped-trailing-space context line arrives.
+            None | Some(' ') => Kind::Context,
+            Some('+') => Kind::Add,
+            Some('-') => Kind::Remove,
             Some('\\') => {
                 return Err(KilnError::Invalid(format!(
                     "{path}: `{line}` is not supported"
                 )));
             }
-            // A hunk whose last lines are empty context lines arrives as an empty line.
-            None => Kind::Context,
             Some(_) => break,
         };
-        let line = lines.next().unwrap_or_default();
-        let text = line
-            .strip_prefix([' ', '+', '-'])
-            .unwrap_or(line)
-            .to_owned();
-        hunk_lines.push(Line { kind, text });
+        let line = unescape(line);
+        match kind {
+            Kind::Add => new_seen += 1,
+            Kind::Remove => old_seen += 1,
+            Kind::Context => {
+                old_seen += 1;
+                new_seen += 1;
+            }
+        }
+        hunk_lines.push(Line { kind, text: line });
     }
 
-    let old_seen = hunk_lines
-        .iter()
-        .filter(|line| line.kind != Kind::Add)
-        .count();
-    if old_seen != old_count {
+    if old_seen != old_count || new_seen != new_count {
         return Err(KilnError::Invalid(format!(
-            "{path}: hunk `{header}` declares {old_count} old line(s) but carries {old_seen}"
+            "{path}: hunk `{header}` declares {old_count} old and {new_count} new line(s) but \
+             carries {old_seen} and {new_seen}"
         )));
     }
     Ok(Hunk {
@@ -371,6 +380,13 @@ fn parse_hunk<'a>(
         old_count,
         lines: hunk_lines,
     })
+}
+
+/// One hunk line's text, without the tag that marked it.
+fn unescape(line: &str) -> String {
+    line.strip_prefix([' ', '+', '-'])
+        .unwrap_or(line)
+        .to_owned()
 }
 
 /// Split `-1,3` (or `-1`) into `(start, count)`.
@@ -838,6 +854,35 @@ mod tests {
     fn a_patch_without_a_file_section_is_rejected() {
         let error = Patch::parse("just prose\n").unwrap_err();
         assert!(error.to_string().contains("no file section"), "{error}");
+    }
+
+    #[test]
+    fn content_that_looks_like_a_header_stays_content() {
+        // The line a hunk carries decides nothing: a *removed* SQL comment arrives as `--- 0001 …`
+        // and an added one as `+++ …`, because the `-`/`+` tag is added to the comment's own
+        // dashes. Only the counts in the header say how many lines belong to the hunk, so a patch
+        // that edits a file full of `--` comments has to parse like any other (found by
+        // `mailer/1.9-postgres`'s solution, whose first migration is one big comment).
+        let text = "--- a/migrations/0001.sql\n+++ b/migrations/0001.sql\n@@ -1,3 +1,2 @@\n\
+                    --- 0001 — a comment\n -- a context comment\n-old line\n+new line\n";
+        let patch = Patch::parse(text).expect("a patch of SQL comments should parse");
+        let hunk = patch.sections().first().expect("one section").hunks.first();
+        let hunk = hunk.expect("one hunk");
+        assert_eq!(hunk.old_count, 3);
+        assert_eq!(hunk.lines.len(), 4);
+        assert_eq!(hunk.lines[0].kind, Kind::Remove);
+        assert_eq!(hunk.lines[0].text, "-- 0001 — a comment");
+        assert_eq!(hunk.lines[1].kind, Kind::Context);
+        assert_eq!(hunk.lines[2].kind, Kind::Remove);
+        assert_eq!(hunk.lines[3].kind, Kind::Add);
+    }
+
+    #[test]
+    fn a_hunk_that_does_not_carry_what_its_header_promised_is_rejected() {
+        // The counts are the contract; a truncated hunk is a broken patch, not a short one.
+        let text = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,3 +1,3 @@\n context\n+added\n";
+        let error = Patch::parse(text).unwrap_err();
+        assert!(error.to_string().contains("declares 3 old"), "{error}");
     }
 
     #[test]
