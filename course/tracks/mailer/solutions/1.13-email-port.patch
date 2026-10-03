@@ -1,0 +1,190 @@
+diff --git a/src/http.rs b/src/http.rs
+index 6766949..24577b1 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -18,6 +18,9 @@
+ //!   changes the subscriber's state, and the three ways it can fail (nobody was given that token,
+ //!   the window is closed, it was already used) are three different answers, because a learner — and
+ //!   a person who clicked an old link — needs to be told which one happened;
++//! * **the state carries a port, not an adapter** (step `mailer/1.13-email-port`): what a handler can
++//!   reach is `Arc<dyn EmailSender>`, and building the state with a fake in it is a constructor
++//!   argument — the seam a test needs is one the deployment does not have to know about;
+ //! * **a failure is a status code and one sentence** (step `mailer/1.11-signup`): [`status_of`] is
+ //!   the same table [`Error::exit_code`] writes for a shell — what the caller can fix is a 4xx,
+ //!   what only the deployment can fix is a 5xx — and a 5xx never carries the reason: that is a fact
+@@ -33,9 +36,12 @@ use serde::{Deserialize, Serialize};
+ use tokio::net::TcpListener;
+ use tracing::{info, instrument, warn};
+ 
++use std::sync::Arc;
++
+ use crate::config::Config;
+ use crate::confirmation::{self, Token};
+ use crate::db::Database;
++use crate::email::{EmailSender, Logging};
+ use crate::error::Error;
+ use crate::logging::RunId;
+ use crate::signup::{SignupRequest, subscribe};
+@@ -50,6 +56,7 @@ use crate::signup::{SignupRequest, subscribe};
+ pub struct AppState {
+     config: Config,
+     database: Option<Database>,
++    sender: Arc<dyn EmailSender>,
+ }
+ 
+ impl AppState {
+@@ -70,14 +77,34 @@ impl AppState {
+     ///
+     /// Reports [`Error::Database`] when the configured database cannot be reached, and
+     /// [`Error::Migration`] when it cannot be brought up to the schema this build expects.
+-    #[instrument(name = "startup", skip_all, fields(run.id = %id.as_str()))]
+     pub async fn start(config: Config, id: &RunId) -> Result<Self, Error> {
++        Self::start_with_sender(config, id, Arc::new(Logging)).await
++    }
++
++    /// Build the state with the sender the caller chose (step `mailer/1.13-email-port`).
++    ///
++    /// This is the seam the tests use, and it is public on purpose: the harness that wants a fake
++    /// sender is a crate the library cannot see, so the only honest way to let it in is an argument.
++    /// Nothing about it is test-only — a deployment that grows a second adapter picks it the same way
++    /// — and the binary keeps calling [`AppState::start`], which is this function with [`Logging`].
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::Database`] when the configured database cannot be reached, and
++    /// [`Error::Migration`] when it cannot be brought up to the schema this build expects.
++    #[instrument(name = "startup", skip_all, fields(run.id = %id.as_str()))]
++    pub async fn start_with_sender(
++        config: Config,
++        id: &RunId,
++        sender: Arc<dyn EmailSender>,
++    ) -> Result<Self, Error> {
+         let _ = id;
+         let Some(url) = config.database.url.clone() else {
+             warn!("no database is configured: the service starts, and readiness will say no");
+             return Ok(Self {
+                 config,
+                 database: None,
++                sender,
+             });
+         };
+ 
+@@ -86,9 +113,16 @@ impl AppState {
+         Ok(Self {
+             config,
+             database: Some(database),
++            sender,
+         })
+     }
+ 
++    /// The sender this state was built with.
++    #[must_use]
++    pub fn sender(&self) -> &dyn EmailSender {
++        self.sender.as_ref()
++    }
++
+     /// The configuration the process started with.
+     #[must_use]
+     pub fn config(&self) -> &Config {
+@@ -194,7 +228,7 @@ async fn signup(
+         return not_ready("no database is configured");
+     };
+ 
+-    match subscribe(database.pool(), request).await {
++    match subscribe(database.pool(), state.sender(), request).await {
+         Ok(email) => (
+             StatusCode::CREATED,
+             Json(SubscriberState {
+diff --git a/src/lib.rs b/src/lib.rs
+index bcf286c..06de042 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,6 +17,7 @@ pub mod config;
+ pub mod confirmation;
+ pub mod db;
+ pub mod domain;
++pub mod email;
+ pub mod error;
+ pub mod http;
+ pub mod logging;
+@@ -26,6 +27,7 @@ pub use config::{Config, Flags};
+ pub use confirmation::Token;
+ pub use db::Database;
+ pub use domain::{Email, Password, SubscriberName};
++pub use email::{EmailSender, Message, SendError};
+ pub use error::{Error, SettingSource};
+ pub use logging::RunId;
+ pub use signup::SignupRequest;
+diff --git a/src/signup.rs b/src/signup.rs
+index 3599cd5..7206fbf 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -19,9 +19,11 @@
+ use argon2::{Argon2, PasswordHash, PasswordHasher};
+ use serde::Deserialize;
+ use sqlx::PgPool;
++use tracing::warn;
+ 
+ use crate::confirmation::{CONFIRMATION_WINDOW_SECS, Token};
+ use crate::domain::{Email, Password, SubscriberName};
++use crate::email::{CONFIRMATION_BASE_URL, CONFIRMATION_SUBJECT, EmailSender, Message};
+ use crate::error::Error;
+ 
+ /// The body of `POST /signup`, as it arrives: three raw strings.
+@@ -59,7 +61,11 @@ pub struct SignupRequest {
+ /// password cannot be hashed, [`Error::TokenGeneration`] when a confirmation token cannot be
+ /// issued, [`Error::Database`] when the insert does not run, and [`Error::AlreadySubscribed`] when
+ /// the address already has a subscriber.
+-pub async fn subscribe(pool: &PgPool, request: SignupRequest) -> Result<Email, Error> {
++pub async fn subscribe(
++    pool: &PgPool,
++    sender: &dyn EmailSender,
++    request: SignupRequest,
++) -> Result<Email, Error> {
+     let email = Email::parse(&request.email)?;
+     let name = SubscriberName::parse(&request.name)?;
+     let password = Password::parse(&request.password)?;
+@@ -86,13 +92,42 @@ pub async fn subscribe(pool: &PgPool, request: SignupRequest) -> Result<Email, E
+     match inserted {
+         // The row that came back is this call's own: the address is taken, and taken by this
+         // request. Where the subscriber starts (`pending`) is the column default of the migration.
+-        Some(_) => Ok(email),
++        Some(_) => {
++            // The subscriber exists now, and the email is how they learn that they have to confirm.
++            // A send that fails does **not** fail the signup: the row is written, the address is
++            // good, and the mail server being away is a delivery problem. Undoing a signup because a
++            // mail server is down is throwing away a subscriber this service already has — the
++            // retries for a failed message arrive with the worker of step `mailer/1.14-worker`, and
++            // what a failed send owes *today* is a line in the log, with the reason.
++            let message = confirmation_message(email.clone(), &token);
++            if let Err(error) = sender.send(message).await {
++                warn!(%error, to = %email, "the confirmation email could not be sent");
++            }
++            Ok(email)
++        }
+         None => Err(Error::AlreadySubscribed {
+             email: email.as_str().to_owned(),
+         }),
+     }
+ }
+ 
++/// The message that confirms a subscription: the address, the subject, and the link.
++///
++/// The link carries the token that is *in the row* — the one this signup just stored — because the
++/// only thing `GET /confirm` accepts is a token somebody was issued (step `mailer/1.12-token`). A
++/// confirmation email without it is a `pending` subscriber nobody can ever confirm.
++#[must_use]
++pub fn confirmation_message(to: Email, token: &Token) -> Message {
++    Message {
++        to,
++        subject: CONFIRMATION_SUBJECT.to_owned(),
++        body: format!(
++            "Confirm your subscription by opening {CONFIRMATION_BASE_URL}/confirm?token={}",
++            token.as_str()
++        ),
++    }
++}
++
+ /// Hash a password for storage: Argon2id, with a salt of its own.
+ ///
+ /// The salt is generated per call and travels inside the returned string, so one password stored

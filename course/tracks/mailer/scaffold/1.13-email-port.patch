@@ -1,0 +1,242 @@
+diff --git a/src/email.rs b/src/email.rs
+new file mode 100644
+index 0000000..d1e4ff0
+--- /dev/null
++++ b/src/email.rs
+@@ -0,0 +1,126 @@
++//! Sending email: a port, and the first adapter behind it (step `mailer/1.13-email-port`).
++//!
++//! What this service needs is not "an SMTP client": it is *somewhere a message goes*. Writing that
++//! down as a trait is what makes the difference between a service that can only be tested with a
++//! mail server running and one whose tests hand it a fake and read what it was given.
++//!
++//! Two shapes in this file are decisions rather than taste:
++//!
++//! * **the future is boxed**. The state holds `Arc<dyn EmailSender>` (a handler cannot be generic
++//!   over the state), and a trait's `async fn` is not dispatchable through a trait object, so every
++//!   send pays for one allocation. That is the price of a seam a test can put a fake in, and it is
++//!   paid once per message;
++//! * **the port says nothing about SMTP** — no host, no credentials, no retry. An adapter that needs
++//!   those reads them from its own construction (step `mailer/1.9-postgres` does the same for the
++//!   database), and the caller only learns whether the message was taken.
++//!
++//! The adapter this build runs with is [`Logging`]: T1 has no mail server until step
++//! `mailer/1.19-test-layering`, so a message is a log line today, and the fake the tests use is not
++//! in this file at all — it is part of the test harness, where a fake belongs.
++
++use std::error::Error as StdError;
++use std::fmt;
++use std::future::Future;
++use std::pin::Pin;
++
++use tracing::info;
++
++use crate::domain::Email;
++
++/// The subject every confirmation email carries.
++pub const CONFIRMATION_SUBJECT: &str = "Confirm your subscription";
++
++/// Where the link in that email points.
++///
++/// A constant for now, and deliberately: nothing in this step deploys the service anywhere, so there
++/// is nothing for a setting to be *set* to. A real deployment makes this a configuration setting —
++/// and the TRAP of this step says why that has to happen before the first real mail goes out.
++pub const CONFIRMATION_BASE_URL: &str = "http://localhost:8080";
++
++/// One message this service wants delivered.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Message {
++    /// Who it goes to, as an address that has already been parsed: nothing downstream has to check
++    /// it again (step `mailer/1.10-domain-types`).
++    pub to: Email,
++    /// What the message is about.
++    pub subject: String,
++    /// What it says: plain text, which every mail client can read.
++    pub body: String,
++}
++
++/// Why an adapter could not take a message.
++///
++/// The cause is kept, because "the email could not be sent" is never enough to act on: step
++/// `mailer/1.5-errors`'s rule about sources holds for an adapter's failures too, and the adapter is
++/// the only layer that knows what a mail server actually said.
++pub struct SendError(Box<dyn StdError + Send + Sync>);
++
++impl SendError {
++    /// Wrap what the adapter reported.
++    #[must_use]
++    pub fn new(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
++        Self(source.into())
++    }
++}
++
++impl fmt::Display for SendError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("the email could not be sent")
++    }
++}
++
++impl fmt::Debug for SendError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("SendError").field(&self.0).finish()
++    }
++}
++
++impl StdError for SendError {
++    fn source(&self) -> Option<&(dyn StdError + 'static)> {
++        Some(&*self.0)
++    }
++}
++
++/// The port: everything this service needs from "something that can send email".
++///
++/// `Debug` is a supertrait so that the state holding an `Arc<dyn EmailSender>` can still be printed
++/// in a panic message or a `{:?}` field; `Send + Sync + 'static` are what an `Arc` held across
++/// `await` points and moved between threads needs.
++pub trait EmailSender: Send + Sync + fmt::Debug + 'static {
++    /// Hand one message over.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`SendError`] when the adapter could not take it — a mail server that is away, a
++    /// mailbox that is full. Whether that ends the operation that wanted the message sent is the
++    /// *caller's* decision, and it is the decision this step is about.
++    fn send(
++        &self,
++        message: Message,
++    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>>;
++}
++
++/// The adapter this build runs with: it writes the message to the log.
++///
++/// What it prints is the envelope — the address and the subject — and not the body: the body of a
++/// confirmation email carries the token, and a token in a log line is a token anybody with the logs
++/// can use (step `mailer/1.6-logging`).
++#[derive(Debug, Clone, Copy, Default)]
++pub struct Logging;
++
++impl EmailSender for Logging {
++    fn send(
++        &self,
++        message: Message,
++    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
++        Box::pin(async move {
++            info!(
++                to = %message.to,
++                subject = %message.subject,
++                "an email would be sent"
++            );
++            Ok(())
++        })
++    }
++}
+diff --git a/tests/support/email.rs b/tests/support/email.rs
+new file mode 100644
+index 0000000..3571169
+--- /dev/null
++++ b/tests/support/email.rs
+@@ -0,0 +1,104 @@
++//! A sender that records what it was given (step `mailer/1.13-email-port`).
++//!
++//! This is part of the *harness*, not of the service: a spec pulls it in with
++//! `#[path = "support/email.rs"] mod email;` and gets a sender that keeps every message it was
++//! handed, so a test can ask what the service tried to send. Nothing about it is in `src/`.
++//!
++//! Two decisions worth naming, because they are what "a fake instead of a mock" means:
++//!
++//! * **failure injection is a constructor's business** — [`Recording::fail_with`] makes the next
++//!   sends fail and [`Recording::clear_failure`] lets them through again. A test writes "and the mail
++//!   server is away" without a network, a server, or a mocking framework that has to be told what a
++//!   `send` call looks like;
++//! * **the fake keeps the *envelope*, not a summary of it** — the whole [`Message`], because the
++//!   questions a test asks about an email (`who`, `what subject`, and does the body carry the link
++//!   with the token the row holds) are all questions about the message itself.
++
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Mutex;
++
++use mailer::email::{EmailSender, Message, SendError};
++
++/// A sender that remembers, and can be told to fail.
++#[derive(Debug, Default)]
++pub struct Recording {
++    /// Every message handed over, whether it was delivered or refused.
++    attempted: Mutex<Vec<Message>>,
++    /// The messages that were actually taken.
++    delivered: Mutex<Vec<Message>>,
++    /// The reason every send fails with, while it is set.
++    failure: Mutex<Option<String>>,
++}
++
++impl Recording {
++    /// A sender that has been given nothing and refuses nothing.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Make every send fail from now on, with this reason.
++    pub fn fail_with(&self, reason: &str) {
++        *self
++            .failure
++            .lock()
++            .expect("the fixture lock is not poisoned") = Some(reason.to_owned());
++    }
++
++    /// Let sends through again.
++    pub fn clear_failure(&self) {
++        *self
++            .failure
++            .lock()
++            .expect("the fixture lock is not poisoned") = None;
++    }
++
++    /// Every message this sender was handed, delivered or not.
++    #[must_use]
++    pub fn attempted(&self) -> Vec<Message> {
++        self.attempted
++            .lock()
++            .expect("the fixture lock is not poisoned")
++            .clone()
++    }
++
++    /// The messages this sender took.
++    #[must_use]
++    pub fn delivered(&self) -> Vec<Message> {
++        self.delivered
++            .lock()
++            .expect("the fixture lock is not poisoned")
++            .clone()
++    }
++
++    /// What this sender is about to answer with.
++    fn failing(&self) -> Option<String> {
++        self.failure
++            .lock()
++            .expect("the fixture lock is not poisoned")
++            .clone()
++    }
++}
++
++impl EmailSender for Recording {
++    fn send(
++        &self,
++        message: Message,
++    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
++        Box::pin(async move {
++            self.attempted
++                .lock()
++                .expect("the fixture lock is not poisoned")
++                .push(message.clone());
++            if let Some(reason) = self.failing() {
++                return Err(SendError::new(std::io::Error::other(reason)));
++            }
++            self.delivered
++                .lock()
++                .expect("the fixture lock is not poisoned")
++                .push(message);
++            Ok(())
++        })
++    }
++}
