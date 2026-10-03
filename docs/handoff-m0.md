@@ -82,6 +82,55 @@
 > `main.rs` 行数预算（20）撑不过边界自然变大（1.6 时是 58），已放宽到 100 并写清它的含义。
 > 下一步从 1.7 继续，按同样的顺序：正文 → 规格 → scaffold → 参考解 → 接闸门。
 
+> 2026-10 进度（M0 第三段 · 停在 1.9 门口）：T1 1.7（HTTP 骨架）与 1.8（app 工厂 / 测试基建）已完
+> 成并提交，`cargo xtask ci` 全绿，`kiln selftest` 对 **1.1–1.8 共 8 步**满足契约（scaffold 必败 /
+> 参考解必绿 / must 闸门全绿）。1.9-postgres 已经调研并设计到位，但**尚未提交**，下一段从这里接着做。
+>
+> ### 1.9 已经确定的事（不要再重新调研）
+>
+> **容器可用，走镜像前缀。** 本机 podman 6.1.2 能跑，但 Docker Hub 直连拉取挂住；`docker.1ms.run`
+> 镜像源可用（`docker.m.daocloud.io`、`dockerproxy.net` 也留有缓存）：
+>
+> ```sh
+> podman pull docker.1ms.run/library/postgres:17-alpine     # 294 MB，本地已缓存
+> podman run -d --name kiln-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1::5432 docker.1ms.run/library/postgres:17-alpine
+> ```
+>
+> 课程侧的口径：镜像按 `KILN_REGISTRY_MIRROR` 前缀解析（`kiln doctor` 已实现该报告），步骤声明
+> `images = ["postgres:17-alpine"]`，`images` 闸门（**尚未实现**）要做的就是「本地镜像库里有没有这个
+> 镜像 + 没有就给带前缀的 pull 命令」。
+>
+> **测试用的 Postgres 由规格自己起。** 新增的 `tests/support/postgres.rs`（scaffold 创建、由规格用
+> `#[path = "support/postgres.rs"] mod postgres;` 引入）按 podman→docker 顺序探测，`-p 127.0.0.1::5432`
+> 拿随机宿主端口，`pg_isready` 轮询到就绪，`psql -c` 建每测试独立数据库，`Drop` 时 `rm -f` 容器。
+> 容器是 per-test 的（5 秒级），符合「测试之间不共享任何东西」。
+>
+> **sqlx 的两个事实（实测）。** `sqlx::migrate!("./migrations")` 不需要数据库就能编译；`sqlx::query!`
+> /`query_scalar!` 宏需要「编译期能连到数据库」或 `.sqlx/query-<hash>.json` 缓存（宏找不到缓存时的报错
+> 是「set `DATABASE_URL` … or run `cargo sqlx prepare`」，缓存查找顺序是 `SQLX_OFFLINE_DIR` →
+> crate 的 `.sqlx/` → workspace 的 `.sqlx/`）。本机**没有** `sqlx-cli`，`cargo sqlx prepare` 需要先
+> `cargo install sqlx-cli --no-default-features --features postgres,rustls`（未做，耗时较长）。
+> 因此 1.9 的这一条查询用运行时检查的 `sqlx::query_scalar`，编译期检查的宏留给 1.11 的第一条真实查询，
+> 届时把 `.sqlx/` 作为 scaffold 内容一起发布；这一点要写进 1.9 正文与 curriculum §6 的注记。
+>
+> **1.9 的设计（已定，未落盘）。** `src/db.rs`：`Database { pool }` + `connect`/`migrate`/`ready`/`pool`；
+> `migrations/0001_subscribers.sql` 建 `subscribers`（email 唯一、status、confirmation_token/expires、
+> confirmed_at、subscribed_at，附两条 CHECK，1.10–1.18 直接在此之上加迁移）；启动顺序 = 配置 → 日志 →
+> **连库 + 迁移** → 服务；`http::AppState { config, database: Option<Database> }` + `GET /readyz`（无库
+> 或库不可用 → 503，liveness `/healthz` 仍 200）；**数据库可选但一旦配置就必须可用**（未配置时启动并
+> 警告，配置了却连不上就退出非 0）——这是为了让 1.6/1.7/1.8 的规格在最终树上仍然成立（它们直接启动二进
+> 制、没有数据库），也为 1.22 的断连演练留出「运行中失去数据库」的语义。
+>
+> **规格里必须给自己设截止时间。** 1.9 的「库连不上必须退出」测试用 `Child::try_wait` + 20 秒期限 +
+> `kill`，不能用 `Command::output()`：在 scaffold 状态下桩实现会照常启动并一直服务，没有期限就会挂住
+> （本次就是因此耗掉了最后一段预算）。
+>
+> ### 还没有动的
+>
+> 1.9 的正文/规格/scaffold/参考解（草稿与验证脚本在上一段的临时目录里，已失效；按上面的事实重做很快）、
+> 1.10–1.22 全部内容（严格按序，每一步都压在前一步的树上）、`images`/`container-repro`/`links` 三个
+> 闸门、`kiln watch`、以及 §4「M0 不做的事」里仍然排除的那些。
+
 ## 6. 工作方式约定
 
 - 提交粒度：一个步骤 = 一个提交（正文 + 规格 + scaffold + 参考解 + 接线），提交信息写清 `track/step`；框架改动单独提交。
