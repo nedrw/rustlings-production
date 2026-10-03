@@ -162,10 +162,10 @@ index 0000000..a34e0ef
 +}
 diff --git a/tests/support/mailpit.rs b/tests/support/mailpit.rs
 new file mode 100644
-index 0000000..ee0f6c6
+index 0000000..2cb6430
 --- /dev/null
 +++ b/tests/support/mailpit.rs
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,298 @@
 +//! A real mail server for one test (step `mailer/1.19-test-layering`).
 +//!
 +//! The specs before this one hand the service a *fake* sender (`tests/support/email.rs`) and judge
@@ -342,8 +342,10 @@ index 0000000..ee0f6c6
 +
 +impl Drop for Mailpit {
 +    fn drop(&mut self) {
++        // `-v` for the same reason `tests/support/postgres.rs` uses it: a container that is
++        // removed without its volumes leaves the engine's lock budget smaller for the next test.
 +        let _ = Command::new(self.engine)
-+            .args(["rm", "-f", &self.name])
++            .args(["rm", "-f", "-v", &self.name])
 +            .stdout(Stdio::null())
 +            .stderr(Stdio::null())
 +            .status();

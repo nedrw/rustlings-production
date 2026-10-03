@@ -124,10 +124,10 @@ index 0000000..eb24b47
 +}
 diff --git a/tests/support/postgres.rs b/tests/support/postgres.rs
 new file mode 100644
-index 0000000..2fb011e
+index 0000000..3e7f908
 --- /dev/null
 +++ b/tests/support/postgres.rs
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,435 @@
 +//! A Postgres container for one test (step `mailer/1.9-postgres`).
 +//!
 +//! The specs that need a database pull this file in with
@@ -343,7 +343,11 @@ index 0000000..2fb011e
 +impl Drop for Postgres {
 +    /// Take the container away, whether the test passed, failed or panicked.
 +    fn drop(&mut self) {
-+        let _ = try_run(self.engine, &["rm", "-f", &self.name], COMMAND_DEADLINE);
++        // `-v` matters more than it looks: the image declares its data directory as a volume, so
++        // every container this fixture starts creates an anonymous one, and `rm -f` on its own
++        // leaves it behind. A few thousand specs later the engine runs out of locks and *every*
++        // container test starts failing at once — which is a long way from the line that caused it.
++        let _ = try_run(self.engine, &["rm", "-f", "-v", &self.name], COMMAND_DEADLINE);
 +    }
 +}
 +
