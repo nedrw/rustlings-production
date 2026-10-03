@@ -231,7 +231,7 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 | `deny` | 许可/版本/来源策略 | `cargo-deny` | T2 末 |
 | `unsafe-budget` | 无未注明 unsafe | `deny(unsafe_code)` + `undocumented_unsafe_blocks` | T3 |
 | `semver` | 公开 API 与基线兼容 | `cargo-semver-checks` + 公开面快照 | T3 |
-| `container-repro` | 镜像内跑得起来、体积在预算内 | 运行时抽象层（§9） | T1 步 21 |
+| `container-repro` | 镜像跑的是同一面二进制、且体积在预算内 | `kiln/src/gates/container_repro.rs`（重新构建 + `--check-config` 对照） | T1 步 21 |
 | `links` | 文档链接有效（离线：相对目标 / 锚点 / 占位符） | 内置检查器（`kiln links`） | 每条 track 末 |
 
 `clippy@N` 阶梯（**严格度随进度只升不降**——这是「成长感」的来源，也是课程最强的机制之一）：
@@ -253,6 +253,16 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 - **步骤作用域属性**只附着在拥有那个产物的步骤上：`images` 只在该步确实需要容器时出现，`container-repro` 只在容器化的那一步，`links` 只在交付文档的步骤。
 - 两者不矛盾的原因：`kiln verify [track]` 会把**每个步骤自己的闸门都跑一遍**，所以 1.21 之后把 Dockerfile 改坏的回归会在全量校验里被 1.21 的 `container-repro` 抓到。
   也就是说：**回归保护靠 verify 的全量执行，不靠闸门列表无限累积**。
+
+### `container-repro` 判「镜像里就是这棵树的那面二进制」（定于 1.21，判据别放宽）
+
+它做的是项目内测试做不到的那件事：按 `Dockerfile` **重新构建**镜像，判体积上限（25 MB，与步骤规格同一个数），然后用镜像里的二进制和**宿主二进制**答同一个问题——`--check-config`（1.4），逐行比对。实测：16.5 MB / 25 MB、七行完全相同、热态十二秒。
+
+落地时量出来的三条（后面改这个门时别绕回去）：
+
+1. **基础镜像名要解析，不能假设**：多个镜像源并存时同一个仓库路径会存两份（各一个架构），`podman build --pull=never` 对不属于本机的那个回 `image not known`（构建跑到第三阶段才报）。`runtime::images` 现在优先选**本机架构**的那份——`images` 门因此也报出真正能用于构建的名字。
+2. **构建缓存是「可以要」，不是「强加」**：夹具挂载缓存并通过 `CARGO_TARGET_DIR` 传路径；不认这个参数的 `Dockerfile` 照常构建，认的那个得把二进制 `cp` 出挂载点。把缓存挂在默认 target 目录上（第一版就是这么做的）会让**每个朴素 Dockerfile** 的镜像里一个二进制都没有——惩罚了这一步要教的东西。
+3. **构建比 runner 的默认超时更需要时间**：`run = { cmd, timeout }` 现在是元数据的一部分（取步骤声明与 `kiln --timeout` 的**较大值**，同时作用于该步的规格与闸门）。第一次构建在没构建过的机器上是分钟级，被截止时间砍掉的构建只会报「timed out」，而这一步其实在正常工作。
 
 ### `links` 判树，不判外链（定于 M0 实现 1.22 之前，别改回去）
 

@@ -28,6 +28,7 @@ slug 用英文、连字符、动词优先（`rate-limit-by-tenant` 优于 `tenan
 ## 2. 元数据的唯一真源
 
 - **步骤元数据只在 `track.toml`**（`kind`/`origin`/`teaches`/`requires`/`run`/`spec`/`gates`/`hint`/`time_hint`）。
+- **`run` 可以带 `timeout`**（秒）：`run = { cmd = "cargo test -p mailer --test spec_image", timeout = 1800 }`。它是个**下界**——取步骤声明的与 `kiln --timeout` 的较大值，同时作用于这一步的规格与闸门。只有「命令本身贵得出格」的步骤该写它（目前只有 1.21：镜像里要编译一棵依赖树，第一次构建在没构建过的机器上是分钟级；被默认 300s 砍掉的构建只会报 “timed out”，而这一步其实在正常工作）。
 - **正文 front-matter 只放文档自身的字段**，避免两处真源漂移：
 
 ```toml

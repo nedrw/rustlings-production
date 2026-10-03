@@ -251,6 +251,26 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十四段 · 做到 1.21，`container-repro` 一并落地）
+>
+> T1 1.21（容器化）已完成并提交（`3d125d0` 框架 + `0a7e7da` 内容），**22 步里剩 1.22**。
+> 设计细节写在 plan.md §6 的两个新小节（`container-repro` 与 `links`）里，写页面的硬规则在 authoring.md §4.4。
+>
+> **这一步新落地的机制（后面几步直接用）**：
+>
+> 1. **`container-repro` 门**（`kiln/src/gates/container_repro.rs`）：按 `Dockerfile` 重新构建镜像（`--layers` + 共享缓存，热态十二秒），判 25 MB 体积上限，然后用镜像里的二进制与**宿主二进制**答同一道题 `--check-config`，逐行比对。实测在 1.21 上是 `16.5 MB / 25 MB · 7 行完全相同`。
+> 2. **`run = { cmd, timeout = 1800 }`**（`kiln/src/info.rs`）：步骤自己的截止时间，取与 `kiln --timeout` 的**较大值**，规格与闸门都用它。只有会构建东西的步骤该写。
+> 3. **基础镜像名的解析**（`kiln/src/runtime.rs`）：多个镜像源并存时同一仓库路径存两份（各一架构），`podman build --pull=never` 对非本机那个回 `image not known`（第三阶段才报）；`runtime::images` 现在优先选本机架构的那份，`images` 门因此也报出真正能用于构建的名字（这台机器上：`alpine:3.20` 只有 daocloud 那份是 amd64，1ms 那份才是 arm64）。
+> 4. **构建缓存是「可以要」不是「强加」**：夹具挂 `CARGO_TARGET_DIR` 传路径，不认这个参数的 Dockerfile 照常构建；认的那个要在同一个 `RUN` 里把二进制 `cp` 出挂载点（`COPY --from=builder /src/target/...` 在挂载下会得到空镜像——这就是 CI cache mount 给每个 Rust 项目设的坑，本步让它变成必修）。
+>
+> **实测（本机，冻结树）**：scaffold 规格 150s（116s 构建 + 四条全红，红在「容器只监听 `127.0.0.1:8080`，外面连不上」）；solution 规格 **6.5s 热态 4 passed**；`kiln check mailer/1.21-container` **10/10 must 门、12s**（含 `images` 与 `container-repro`）；`kiln selftest mailer/1.21-container` **169s、1/1 满契约**（scaffold 必败 / solution 通过 / 10 门全绿）。
+>
+> **顺手修的三件事**（都是这一段的实测发现，不要当成噪声）：
+>
+> - **scaffold 内容必须是 rustfmt-clean**：夹具只是 `tests/support/` 里的模块文件，`cargo fmt --all` 只在它能从某个 test target 被 `mod` 到时才看得到它；归档补丁前必须 `rustfmt --edition 2024` 显式格式一遍，否则学员项目的 `fmt` 闸门会红（本段踩过一次）。
+> - **`links --external` 抓到三个真死链**（`200e319` 修）：`std/num/struct.NonZeroU32.html` → `type.`、`sqlx/postgres/struct.PgPoolOptions.html` → `type.`、prometheus 的 `instrumentation/…-…` → `instrumenting/…_…`。三者都是同一主机下兄弟路径 200、只有它 404，是真腐烂。以后再跑一次 `--external` 值得。
+> - **`links` 提交里漏了 rustfmt**（`9450353` 的 `kiln/tests/gates.rs`）：`cargo xtask ci` 从 `cargo fmt --all --check` 开始，所以那一次 ci 在第一个子检查就红了；工作树里下一次 `cargo fmt --all` 已经把它格式化成对的，但**历史里那个提交仍是不干净的**——以后提交前跑一次 `cargo fmt --all && cargo fmt --all --check`。
+
 > ### 2026-10 进度（M0 第十三段 · `links` 闸门落地：判树，不判外链）
 >
 > 按计划表里那句 `lychee` 做落地时改了实现方式（**决定+理由写在 plan.md §6 末尾**，authoring.md §4.4 写了对写页面的硬规则）：
@@ -321,11 +341,11 @@
 > 3. 冷启动复现：`rm -rf app/mailer/target` 后带负载重跑那条路径，而不是只重跑 `verify`。
 > **不要用重跑把它盖过去**——这正是 1.14 段记录过的同类问题（那时也是靠“带负载才出现”才难抓）。
 
-> **T1 还剩三步 + 一件框架事（下一段直接接）**：
+> **T1 只剩 1.22 一步了**（1.21 已于 `0a7e7da` 落地，见本文件顶部的第十四段）：
 >
-> **2026-10 收尾补充：`docs/drafts/1.21-container/` 里有一份*能跑*的版本**（Dockerfile、.dockerignore、夹具、规格 + README）。实测：成品镜像 **16.5 MB**、热缓存构建 **1m24s**、规格 **4 passed / 68s**；README 里写了三个坑（stub 要满足 `missing_docs`——那次 28 分钟失败的真正原因；缓存不能挂到 `/usr/local/cargo`，否则 `cargo: not found`；挂载不进镜像层，所以二进制要在 builder 的 RUN 里 cp 到挂载之外）和完整的落地清单。**下一段直接从那份 README 抄，不要从零再试一遍。**
+> **以下 1.21 的草稿与第一次尝试记录已归档**（草稿仍在 `docs/drafts/1.21-container/`，作参照物：它的 16.5 MB / 热构建数字与落地的版本对得上，但挂载路径、base image 解析、截止时间都已按第十四段改写）：
 >
-> **1.21 的第一次尝试与实测结论（动手前必读，省你一次 28 分钟）**：按“多阶段 Dockerfile + 容器内 `cargo build
+> **1.21 的第一次尝试与实测结论（归档，动手前仍值得一读，省你一次 28 分钟）**：按“多阶段 Dockerfile + 容器内 `cargo build
 > --release`”写了一版（`rust:1.98-slim` builder + `debian:bookworm-slim` runtime，依赖层用 stub 预编译），
 > `podman build` 在这台机器上跑了 **28 分钟**然后在依赖/stub 那层以 exit 101 失败（`cargo build --release
 > --locked`，错误被 buildah 截成一行）。两个基础镜像已在本机（`docker.1ms.run/library/rust:1.98-slim` 828MB、
@@ -333,7 +353,7 @@
 > 冷构建**，`cargo xtask ci` 里 1.21 的 selftest 也会因此变成 30 分钟级别。所以那一版已经从 `app/mailer` 里撤掉
 > 了（`Dockerfile`/`.dockerignore`/`tests/support/container.rs`/`tests/spec_image.rs`），树仍是 1.20 的绿状态。
 >
-> **1.21 的可行设计（下一段按这个来，别再从头试）**：镜像构建走**宿主机已经构建好的 release 二进制**，
+> **1.21 的可行设计（已被落地的版本取代：镜像内编译保留了，构建靠缓存变快；这一段留档）**：镜像构建走**宿主机已经构建好的 release 二进制**，
 > 不要容器内编译：
 >
 > 1. `cargo build --release -p mailer` 在宿主跑一次（缓存后是增量的），spec/Dockerfile 都只 copy
@@ -351,14 +371,9 @@
 >    `127.0.0.1` 换成 `host.containers.internal`（podman machine 下才到得了宿主机发布的端口）。
 
 > - **1.21-container**（120m，`release/container-image@apply`，spec `spec/image.rs` → `tests/spec_image.rs`，
->   `run.cmd = cargo test -p mailer --test spec_image`）：多阶段 Dockerfile + 探针 + “先迁移后收流量”；它的 gates
->   里已经有 **`container-repro`**，而这个门在 `kiln/src/gates/registry.rs` 里仍是
->   `GateStatus::Pending("arrives with T1 step 21's content")` ✗ **必须先实现这个门**（建议：构建镜像、跑起来、
->   打 `/healthz`、用同一面 binary 的 `--check-config` 对一下；名字叫“repro”就应该验证“镜像跑的是同一面
->   binary”）。镜像基础建议用 `docker.1ms.run/library/rust:1.98-slim` + `debian:bookworm-slim`（本机
->   `docker.m.daocloud.io/library/debian:bookworm-slim` 已经在库里），并把它们加进
->   `images = [...]` 与 1.21 的 `images` 门。注意 spec 的超时是 300s，镜像构建很可能超——建议 spec 只做
->   “构建一次 + 跑一次 + 探针 + 二进制比对”，并把依赖层缓存写进 Dockerfile。
+>   `run.cmd = cargo test -p mailer --test spec_image`，**已落地**：见本文件顶部第十四段）：多阶段 Dockerfile + 探针 + “先迁移后收流量”；
+>   下面这段当时的建议已经实现（实现与实测见第十四段；基础镜像最终用 alpine/musl）：原记录是「必须先实现 `container-repro` 门（构建镜像、跑起来、
+>   打 `/healthz`、用同一面 binary 的 `--check-config` 对一下）；基础镜像加进 `images = [...]`；笔记：spec 超时是 300s，镜像构建很可能超》。
 > - **1.22-runbook**（120m，design 步骤，`ops/runbook-drill@apply`）：两条线（演练规格 + 人读的 runbook），
 >   它的 gates 里有 **`links`**——**已落地**（见下面 2026-10 的进度：`links` 判树不判外链，外链只在 `kiln links --external`）。
 >   写内容时按 authoring.md §4.4 的硬规则来：页面在项目里、占位目标算不过、相对目标与锚点要对得上。
