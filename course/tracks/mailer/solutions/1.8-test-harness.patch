@@ -1,0 +1,284 @@
+diff --git a/src/http.rs b/src/http.rs
+index 2d8fb87..8208106 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -26,12 +26,15 @@ use crate::logging::RunId;
+ /// The router this service answers with.
+ ///
+ /// It is a plain value: the routes, the fallbacks and everything else a request can meet are here,
+-/// and starting a server is a separate decision ([`serve`]).
+-pub fn router() -> Router {
++/// and starting a server is a separate decision ([`serve`]). The configuration travels with it, so
++/// a handler that needs to know how this process was started (step `mailer/1.9-postgres` is the
++/// first one) does not have to reach for a global.
++pub fn router(config: &Config) -> Router {
+     Router::new()
+         .route("/healthz", get(healthz))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
++        .with_state(config.clone())
+ }
+ 
+ /// Liveness: the process is up and answering requests.
+@@ -82,7 +85,6 @@ struct Body {
+ /// Reports [`Error::Listen`] when the address cannot be bound (a port already in use, a host this
+ /// machine does not have) or when serving stops with an I/O failure; the message names the address,
+ /// which is the first thing a deployment needs to know.
+-#[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
+ pub async fn serve(config: &Config, id: &RunId) -> Result<(), Error> {
+     let requested = format!("{}:{}", config.listen.host, config.listen.port);
+     let listener = TcpListener::bind(&requested)
+@@ -91,17 +93,41 @@ pub async fn serve(config: &Config, id: &RunId) -> Result<(), Error> {
+             address: requested.clone(),
+             source,
+         })?;
++    serve_on(listener, config, id)
++        .await
++        .map_err(|error| match error {
++            Error::Listen { source, .. } => Error::Listen {
++                address: requested,
++                source,
++            },
++            other => other,
++        })
++}
++
++/// Serve on a listener somebody else bound.
++///
++/// The split exists for the test harness (step `mailer/1.8-test-harness`): a test has to learn the
++/// port before it can send the first request, and the only way to know it is to bind first and ask
++/// the socket. The address that is logged is the one that was bound, never the one that was asked
++/// for.
++///
++/// # Errors
++///
++/// Reports [`Error::Listen`] when the listener has no address or when serving stops with an I/O
++/// failure.
++#[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
++pub async fn serve_on(listener: TcpListener, config: &Config, id: &RunId) -> Result<(), Error> {
+     let bound = listener.local_addr().map_err(|source| Error::Listen {
+-        address: requested.clone(),
++        address: "the bound address".to_owned(),
+         source,
+     })?;
+     // The port in the configuration may be `0` ("whatever is free"), so the only address worth
+     // logging is the one that was actually bound: it is how a caller learns where to send requests.
+     info!(address = %bound, "listening");
+-    axum::serve(listener, router())
++    axum::serve(listener, router(config))
+         .await
+         .map_err(|source| Error::Listen {
+-            address: requested,
++            address: bound.to_string(),
+             source,
+         })
+ }
+@@ -115,7 +141,9 @@ mod tests {
+     fn the_router_builds_without_a_socket_or_a_runtime() {
+         // Building the router is a plain function call; `serve` is what needs a runtime (step
+         // `mailer/1.8-test-harness` relies on this).
+-        let _ = router();
++        let config = crate::config::Config::load(&crate::config::Flags::default(), &[])
++            .expect("the defaults are valid");
++        let _ = router(&config);
+     }
+ 
+     #[test]
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index 065b1d3..57171e5 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -2,46 +2,177 @@
+ //!
+ //! Cargo does not treat a file in `tests/support/` as a test target, so this is plain project
+ //! code: a spec pulls it in with `mod support;` and gets the same harness every other spec uses.
+-//! The scaffold declares the shape and does nothing; the step is what makes it real.
+ //!
+ //! Nothing here may be shared *between* tests: the whole promise of this module is one app, one
+-//! port, one lifetime, per `TestApp`.
++//! port, one lifetime, per `TestApp`. Three decisions follow from that:
++//!
++//! * the app is built out of the same pieces the binary uses — [`mailer::http::serve_on`] on a
++//!   listener this module bound — so a test cannot drift away from what is deployed;
++//! * the port is picked by the operating system, never by the test;
++//! * the runtime lives in a thread of this module's own, so a test can be an ordinary blocking
++//!   `#[test]`: the service is a process-like thing that happens to live in a thread.
+ 
+-use std::net::SocketAddr;
++use std::io::{Read, Write};
++use std::net::{SocketAddr, TcpListener as StdListener, TcpStream};
++use std::thread::JoinHandle;
++use std::time::{Duration, Instant};
+ 
+ use mailer::config::Config;
++use mailer::http;
++use mailer::logging::RunId;
++use tokio::sync::oneshot;
++
++/// How long the harness waits for the service to accept connections.
++const READY_DEADLINE: Duration = Duration::from_secs(20);
++/// How often it tries again.
++const RETRY: Duration = Duration::from_millis(20);
+ 
+ /// A service running for the length of one test.
+ pub struct TestApp {
+     address: SocketAddr,
++    shutdown: Option<oneshot::Sender<()>>,
++    thread: Option<JoinHandle<()>>,
+ }
+ 
+ impl TestApp {
+     /// Start the service on a free port, with the configuration this test asked for.
+     ///
+     /// The port in `config` is ignored on purpose: a test that could choose its port would choose
+-    /// one another test is using. The scaffold starts nothing.
+-    pub fn start(_config: Config) -> Self {
+-        Self {
+-            address: "127.0.0.1:0".parse().expect("a literal address parses"),
+-        }
++    /// one another test is using.
++    ///
++    /// Panics when no port can be bound or the service never answers: inside a test, "the fixture
++    /// could not start" is a test failure with a sentence, not a `Result` every caller unwraps.
++    pub fn start(config: Config) -> Self {
++        // Bind with `std` first: the port has to be known before the runtime exists, and the
++        // listener is handed over to the runtime untouched.
++        let listener = StdListener::bind("127.0.0.1:0")
++            .unwrap_or_else(|error| panic!("no port could be bound for the test app: {error}"));
++        let address = listener
++            .local_addr()
++            .expect("a bound listener has an address");
++        listener
++            .set_nonblocking(true)
++            .expect("the listener can be made non-blocking");
++
++        let (shutdown, stopped) = oneshot::channel();
++        let id = RunId::of_this_process();
++        let thread = std::thread::Builder::new()
++            .name("test-app".to_owned())
++            .spawn(move || {
++                let runtime = tokio::runtime::Builder::new_multi_thread()
++                    .enable_all()
++                    .build()
++                    .expect("the test app's runtime starts");
++                runtime.block_on(async move {
++                    let listener = tokio::net::TcpListener::from_std(listener)
++                        .expect("the listener is handed to the runtime");
++                    tokio::select! {
++                        result = http::serve_on(listener, &config, &id) => {
++                            if let Err(error) = result {
++                                eprintln!("the test app stopped: {error}");
++                            }
++                        }
++                        _ = stopped => {}
++                    }
++                });
++            })
++            .expect("the test app's thread starts");
++
++        let app = Self {
++            address,
++            shutdown: Some(shutdown),
++            thread: Some(thread),
++        };
++        app.wait_until_ready();
++        app
+     }
+ 
+     /// The address this app answers on.
++    #[must_use]
+     pub fn address(&self) -> SocketAddr {
+         self.address
+     }
+ 
+-    /// One `GET`, answered as `(status, body)`. The scaffold sends nothing.
+-    pub fn get(&self, _path: &str) -> (u16, String) {
+-        (0, String::new())
++    /// One `GET`, answered as `(status, body)`.
++    pub fn get(&self, path: &str) -> (u16, String) {
++        self.request("GET", path, "")
++    }
++
++    /// One `POST` with a JSON body, answered as `(status, body)`.
++    pub fn post(&self, path: &str, body: &str) -> (u16, String) {
++        self.request("POST", path, body)
++    }
++
++    /// One request in any method, answered as `(status, body)`.
++    pub fn request(&self, method: &str, path: &str, body: &str) -> (u16, String) {
++        let mut stream = TcpStream::connect(self.address).unwrap_or_else(|error| {
++            panic!(
++                "the test app at {} is not accepting connections: {error}",
++                self.address
++            )
++        });
++        stream
++            .set_read_timeout(Some(READY_DEADLINE))
++            .expect("a read deadline can be set");
++        let request = format!(
++            "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\n\
++             content-length: {}\r\nconnection: close\r\n\r\n{body}",
++            self.address,
++            body.len()
++        );
++        stream
++            .write_all(request.as_bytes())
++            .unwrap_or_else(|error| panic!("the request could not be sent: {error}"));
++        let mut raw = String::new();
++        stream
++            .read_to_string(&mut raw)
++            .unwrap_or_else(|error| panic!("the answer could not be read: {error}"));
++
++        let (head, body) = raw
++            .split_once("\r\n\r\n")
++            .unwrap_or_else(|| panic!("an HTTP answer has a head and a body: `{raw}`"));
++        let status = head
++            .lines()
++            .next()
++            .and_then(|line| line.split_whitespace().nth(1))
++            .and_then(|code| code.parse().ok())
++            .unwrap_or_else(|| panic!("the status line has a code: `{head}`"));
++        (status, body.to_owned())
++    }
++
++    /// Stop the service and wait for its thread.
++    pub fn stop(mut self) {
++        if let Some(shutdown) = self.shutdown.take() {
++            let _ = shutdown.send(());
++        }
++        if let Some(thread) = self.thread.take() {
++            let _ = thread.join();
++        }
+     }
+ 
+-    /// One `POST` with a JSON body, answered as `(status, body)`. The scaffold sends nothing.
+-    pub fn post(&self, _path: &str, _body: &str) -> (u16, String) {
+-        (0, String::new())
++    /// Wait until the service accepts connections, so no test has to sleep and hope.
++    fn wait_until_ready(&self) {
++        let deadline = Instant::now() + READY_DEADLINE;
++        while Instant::now() < deadline {
++            if TcpStream::connect(self.address).is_ok() {
++                return;
++            }
++            std::thread::sleep(RETRY);
++        }
++        panic!(
++            "the test app at {} never started accepting connections",
++            self.address
++        );
+     }
++}
+ 
+-    /// Stop the service. The scaffold has nothing to stop.
+-    pub fn stop(self) {}
++impl Drop for TestApp {
++    fn drop(&mut self) {
++        if let Some(shutdown) = self.shutdown.take() {
++            let _ = shutdown.send(());
++        }
++        if let Some(thread) = self.thread.take() {
++            let _ = thread.join();
++        }
++    }
+ }

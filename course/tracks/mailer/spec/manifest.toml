@@ -13,3 +13,4 @@ format_version = 1
 "spec/1.5/errors.rs" = "sha256:33dfeade8e760e49bbc634776d82b62784c160905a13563a6c8f2e2a9d691196"
 "spec/1.6/logging.rs" = "sha256:9eaae6b6ef86ac40e1c0113aee431a2e39d8ad5755cf2e9ee11cc6c6910b8c93"
 "spec/1.7/http.rs" = "sha256:de9850e35f8c55042e1a3748039fc386b11aaa458659eedbe81fb25a0e50d04c"
+"spec/1.8/app_factory.rs" = "sha256:0ccc9ec0b11622f73cb2594da76265aba1acc7b413ba6379b334330212b7b159"

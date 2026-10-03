@@ -1,0 +1,53 @@
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+new file mode 100644
+index 0000000..065b1d3
+--- /dev/null
++++ b/tests/support/mod.rs
+@@ -0,0 +1,47 @@
++//! The app factory every integration test uses (step `mailer/1.8-test-harness`).
++//!
++//! Cargo does not treat a file in `tests/support/` as a test target, so this is plain project
++//! code: a spec pulls it in with `mod support;` and gets the same harness every other spec uses.
++//! The scaffold declares the shape and does nothing; the step is what makes it real.
++//!
++//! Nothing here may be shared *between* tests: the whole promise of this module is one app, one
++//! port, one lifetime, per `TestApp`.
++
++use std::net::SocketAddr;
++
++use mailer::config::Config;
++
++/// A service running for the length of one test.
++pub struct TestApp {
++    address: SocketAddr,
++}
++
++impl TestApp {
++    /// Start the service on a free port, with the configuration this test asked for.
++    ///
++    /// The port in `config` is ignored on purpose: a test that could choose its port would choose
++    /// one another test is using. The scaffold starts nothing.
++    pub fn start(_config: Config) -> Self {
++        Self {
++            address: "127.0.0.1:0".parse().expect("a literal address parses"),
++        }
++    }
++
++    /// The address this app answers on.
++    pub fn address(&self) -> SocketAddr {
++        self.address
++    }
++
++    /// One `GET`, answered as `(status, body)`. The scaffold sends nothing.
++    pub fn get(&self, _path: &str) -> (u16, String) {
++        (0, String::new())
++    }
++
++    /// One `POST` with a JSON body, answered as `(status, body)`. The scaffold sends nothing.
++    pub fn post(&self, _path: &str, _body: &str) -> (u16, String) {
++        (0, String::new())
++    }
++
++    /// Stop the service. The scaffold has nothing to stop.
++    pub fn stop(self) {}
++}
