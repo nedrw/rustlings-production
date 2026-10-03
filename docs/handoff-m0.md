@@ -295,6 +295,37 @@
 > `print_stdout_is_a_library_lint_and_not_a_binary_one`），再决定是给这些测试加一把进程内的互斥锁，
 > 还是让 CI 对它们用单线程。**不要为了绿而重跑掩盖它。**
 >
+> **1.14 的施工清单（本段已经推演出细节，照这个写，别重新设计）**
+>
+> 1. `src/delivery.rs`（新）：`Job` 直接用 `Message`；`MAX_ATTEMPTS=3`、`RETRY_CAP=30s`、
+>    `DRAIN_DEADLINE=10s`；`pub fn backoff(attempt, base, cap) -> Duration`（full jitter，`getrandom::fill`
+>    取 8 字节转 `u64`/`u64::MAX`，**不要用索引切片**——`--lib --bins` 禁 `indexing_slicing`，也不要
+>    `unwrap/expect/panic`）；`Queue { sender: mpsc::Sender<Message>, worker: Arc<Mutex<Option<JoinHandle<
+>    Result<usize, Error>>>>> , retry_base }`（`Clone` 靠 `Arc`），`Queue::start(sender, capacity,
+>    retry_base)` 里 `tokio::spawn` worker，worker 循环 `rx.recv()` → 逐个 `deliver()`（失败按 `backoff`
+>    重试到 `MAX_ATTEMPTS`，最后 `error!`），返回成功投递条数。
+> 2. **`subscribe` 的签名改成 `(pool: &PgPool, seat: Permit<'_, Message>, request)`**：哨位由 handler 在
+>    **插入之前** `state.delivery().reserve()?` 拿到（队满 → `Error::QueueFull` → 503，且发生在写行之前），
+>    插入成功就 `seat.send(confirmation_message(email.clone(), &token))`（不 await，容量已保证），失败/已订阅
+>    分支直接 drop 哨位（容量自动还回去）。类型本身就强制了「先占坑再干活」。
+> 3. `http.rs`：`serve`/`serve_on` 各加一个带 shutdown future 的孪生函数
+>    (`serve_with_shutdown`/`serve_on_with_shutdown`) 用 `axum::serve(...).with_graceful_shutdown(...)`，
+>    原函数委托它们并传 `std::future::pending()`——**这样 `tests/support/app.rs` 一个字都不用改**。
+> 4. `main.rs`：`shutdown()` = `#[cfg(unix)]` SIGTERM + `ctrl_c`（`signal(...)?` 走 anyhow，bin 里禁
+>    `expect`）；`serve_with_shutdown(state.clone(), &id, async { … }).await?` 之后 `drop(state)` 并
+>    `delivery.drain(DRAIN_DEADLINE)`：干净排空 `info!(delivered)` 退 0，超时 `Error::DrainTimeout` →
+>    `error!` + 退 1（1.5 的表：部署的问题）。
+> 5. `config.rs`：`delivery.queue_capacity`（默认 64）与 `delivery.retry_base_ms`（默认 250），照 1.4 的
+>    defaults/file/env/flags/report/validate 五处各加一行；`Error::QueueFull` 与 `Error::DrainTimeout` 进退出码
+>    表的 `1` 一行。
+> 6. 规格：进程内那条（用 1.13 的 `support/app.rs` 夹具 + 规格自己写的 `Hanging` 发送器，容量设 1）——
+>    **断言写成「至少一次 503」+「行数 == 201 的条数」**（worker 何时取走第一条是竞态，别断确切分布）；
+>    子进程那条（`spec_http.rs` 套路）发 SIGTERM → 退出码 0、日志里有 `email would be sent` 与
+>    `the delivery queue drained`；时间相关的放 `#[tokio::test(start_paused = true)]` 单测（尝试次数、退避
+>    上界、抖动非常量、drain 超时）。
+> 7. **1.13 的规格已经先改好了**（`e0b3545`：`wait_for` 轮询 + 「至少一次尝试」/「grace 收到」这类跨树断言），
+>    所以异步化之后 1.13 的规格在最终树上仍然成立——这一条本来是本步最大的坑，已经拆掉。
+>
 > **规格怎么做（决定，含一个要改旧文件的地方）**
 >
 > - 时间相关的断言放**单测**（`src/delivery.rs` 内，`#[tokio::test(start_paused = true)]` + 假发送器）：
