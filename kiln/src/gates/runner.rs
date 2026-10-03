@@ -226,14 +226,23 @@ mod tests {
 
     #[test]
     fn the_catalogue_declares_which_gates_are_pending_and_why() {
-        // A pending gate must say when it arrives; that is what keeps `kiln check` honest
-        // while M0 is being written.
-        let pending: Vec<&str> = catalogue()
+        // A pending gate must say when it arrives; that is what keeps `kiln check` honest while M0
+        // is being written. The names checked here are the ones T1's own metadata already points at
+        // and whose milestone is still ahead.
+        let pending: Vec<(&str, &str)> = catalogue()
             .iter()
-            .filter(|gate| matches!(gate.status, GateStatus::Pending(_)))
-            .map(|gate| gate.name)
+            .filter_map(|gate| match gate.status {
+                GateStatus::Pending(reason) => Some((gate.name, reason)),
+                GateStatus::Ready => None,
+            })
             .collect();
-        assert!(pending.len() >= 15, "{pending:?}");
-        assert!(pending.contains(&"mutants"));
+        assert!(!pending.is_empty());
+        for name in ["images", "container-repro", "links", "mutants"] {
+            let reason = pending
+                .iter()
+                .find_map(|(pending, reason)| (*pending == name).then_some(*reason))
+                .unwrap_or_else(|| panic!("`{name}` should still be pending"));
+            assert!(!reason.is_empty(), "{name} is pending without a reason");
+        }
     }
 }

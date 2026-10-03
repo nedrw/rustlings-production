@@ -152,15 +152,15 @@ static CATALOGUE: &[GateDef] = &[
         name: "docs:public",
         tool: Some(Tool::CargoClippy),
         purpose: "public items carry documentation and error sections",
-        run: None,
-        status: GateStatus::Pending("arrives with T1 step 5's content"),
+        run: Some(crate::gates::docs_public::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "exit-code",
         tool: None,
         purpose: "failure paths exit non-zero and explain themselves",
-        run: None,
-        status: GateStatus::Pending("arrives with T1 step 4's content"),
+        run: Some(crate::gates::exit_code::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "i18n",
@@ -334,9 +334,21 @@ mod tests {
             .collect();
         // The gates a T1 step declares must be runnable, and the ones that need a tool must say
         // which one: that pairing is what makes `kiln doctor` able to explain a blocked gate.
+        // `exit-code` arrives with T1 step 4's content and `docs:public` with step 5's; the
+        // remaining names a step mentions (`images`, `container-repro`, `links`) still say which
+        // milestone brings them.
         assert_eq!(
             ready,
-            ["spec-integrity", "caps", "fmt", "clippy", "no-todo", "i18n"],
+            [
+                "spec-integrity",
+                "caps",
+                "fmt",
+                "clippy",
+                "no-todo",
+                "docs:public",
+                "exit-code",
+                "i18n",
+            ],
             "a gate moved between ready and pending"
         );
         for gate in CATALOGUE

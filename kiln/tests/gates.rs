@@ -343,3 +343,158 @@ fn a_gate_whose_tool_is_missing_reports_an_install_command() {
         results[0].detail
     );
 }
+
+/// A binary that refuses what it does not understand — the failure path `exit-code` asks for.
+const REFUSING_BIN: &str = r#"
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(flag) = args.first() {
+        eprintln!("usage: fixture [OPTIONS]\n\nunknown argument `{flag}`");
+        std::process::exit(2);
+    }
+}
+"#;
+
+/// A binary that ignores its arguments and exits successfully: the shape the gate exists to reject.
+const IGNORING_BIN: &str = r#"
+fn main() {
+    println!("fixture: nothing to do");
+}
+"#;
+
+#[test]
+fn exit_code_passes_when_a_binary_refuses_an_argument_it_does_not_know() {
+    let scratch = Scratch::new("exit-code-pass");
+    let results = gates_and_bin(&scratch, &["exit-code"], CLEAN, REFUSING_BIN);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Passed],
+        "{}",
+        report(&results)
+    );
+    assert!(
+        results[0].detail.contains("mailer"),
+        "{}",
+        results[0].detail
+    );
+}
+
+#[test]
+fn exit_code_fails_when_a_binary_ignores_an_argument_it_does_not_know() {
+    let scratch = Scratch::new("exit-code-ignore");
+    let results = gates_and_bin(&scratch, &["exit-code"], CLEAN, IGNORING_BIN);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Failed],
+        "{}",
+        report(&results)
+    );
+    assert!(
+        results[0].detail.contains("exited 0"),
+        "{}",
+        results[0].detail
+    );
+}
+
+#[test]
+fn exit_code_is_blocked_when_the_project_ships_no_binary() {
+    let scratch = Scratch::new("exit-code-no-bin");
+    let results = gates(&scratch, &["exit-code"], CLEAN);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Blocked],
+        "{}",
+        report(&results)
+    );
+    assert!(
+        results[0].detail.contains("builds no binary"),
+        "{}",
+        results[0].detail
+    );
+}
+
+/// A library whose public function can fail but never says what it returns on the error path.
+const UNDOCUMENTED_FALLIBLE_LIB: &str = r#"
+//! A fixture crate.
+
+/// Parses a port.
+///
+/// # Panics
+///
+/// Never: this one only fails.
+pub fn parse(input: &str) -> Result<u16, std::num::ParseIntError> {
+    input.parse()
+}
+"#;
+
+/// The same function, documented the way the gate asks for.
+const DOCUMENTED_FALLIBLE_LIB: &str = r#"
+//! A fixture crate.
+
+/// Parses a port.
+///
+/// # Errors
+///
+/// Returns `Err` when `input` is not a number in range.
+pub fn parse(input: &str) -> Result<u16, std::num::ParseIntError> {
+    input.parse()
+}
+"#;
+
+#[test]
+fn docs_public_wants_a_sentence_on_the_error_path() {
+    let scratch = Scratch::new("docs-public");
+    let undocumented = gates(&scratch, &["docs:public"], UNDOCUMENTED_FALLIBLE_LIB);
+    assert_eq!(
+        outcomes(&undocumented),
+        [Outcome::Failed],
+        "{}",
+        report(&undocumented)
+    );
+    assert!(
+        undocumented[0].detail.contains("missing_errors_doc"),
+        "{}",
+        undocumented[0].detail
+    );
+
+    let documented = gates(&scratch, &["docs:public"], DOCUMENTED_FALLIBLE_LIB);
+    assert_eq!(
+        outcomes(&documented),
+        [Outcome::Passed],
+        "{}",
+        report(&documented)
+    );
+}
+
+#[test]
+fn docs_public_does_not_judge_test_code() {
+    let scratch = Scratch::new("docs-public-tests");
+    // A test that returns `Result` for `?` is not an API; demanding `# Errors` there would teach
+    // the wrong reflex (authoring.md §7.4).
+    const TEST_RETURNING_RESULT: &str = r#"
+//! A fixture crate.
+
+/// Identity.
+pub fn id(value: u32) -> u32 {
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::id;
+
+    #[test]
+    fn ids() -> Result<(), std::num::ParseIntError> {
+        assert_eq!(id("1".parse()?), 1);
+        Ok(())
+    }
+}
+"#;
+    let results = gates(&scratch, &["docs:public"], TEST_RETURNING_RESULT);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Passed],
+        "{}",
+        report(&results)
+    );
+}

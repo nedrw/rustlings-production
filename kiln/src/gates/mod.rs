@@ -30,6 +30,8 @@ use crate::error::KilnError;
 
 pub mod caps;
 pub mod clippy;
+pub mod docs_public;
+pub mod exit_code;
 pub mod fmt;
 pub mod i18n;
 pub mod no_todo;
