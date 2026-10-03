@@ -1,0 +1,521 @@
+diff --git a/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json b/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json
+deleted file mode 100644
+index 6cca886..0000000
+--- a/.sqlx/query-b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002.json
++++ /dev/null
+@@ -1,30 +0,0 @@
+-{
+-  "db_name": "PostgreSQL",
+-  "query": "INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING RETURNING id",
+-  "describe": {
+-    "columns": [
+-      {
+-        "ordinal": 0,
+-        "name": "id",
+-        "type_info": "Int8",
+-        "origin": {
+-          "Table": {
+-            "table": "subscribers",
+-            "name": "id"
+-          }
+-        }
+-      }
+-    ],
+-    "parameters": {
+-      "Left": [
+-        "Text",
+-        "Text",
+-        "Text"
+-      ]
+-    },
+-    "nullable": [
+-      false
+-    ]
+-  },
+-  "hash": "b513e123220ce02e3ff730a19b560eca053ea2579c4a5e45e8f8618e3ca15002"
+-}
+diff --git a/src/confirmation.rs b/src/confirmation.rs
+index 56e02e4..edd5d02 100644
+--- a/src/confirmation.rs
++++ b/src/confirmation.rs
+@@ -1,20 +1,30 @@
+ //! Confirmation tokens: issued at signup, good for one confirmation, until they expire
+ //! (step `mailer/1.12-token`).
+ //!
+-//! This file is the scaffold: the token type, the window it is good for, and the two ways a token is
+-//! ever made — issued (random) or parsed (out of a link). **It proves nothing about a token**: the
+-//! scaffold's `issue` answers the same value every time, and the confirmation itself is not written
+-//! yet, so the spec fails here until the step fills these in.
++//! A token is the one thing that turns "somebody typed an address into a form" into "somebody who
++//! can read that address agreed to it". Three failures are designed against here, and each of them
++//! is a way a token stops being one:
+ //!
+-//! A token is the one thing that turns "somebody typed an address into a form" into "somebody who can
+-//! read that address agreed to it", and three failures are designed against: **tampered** (so the
+-//! token is 32 random bytes and is looked up, never checked), **expired** (so the window is stamped
+-//! and compared by the database's clock), and **replayed** (so the statement that confirms a
+-//! subscriber also checks that it may). The step's TRAP section names what each of them looks like
+-//! when it was never designed for.
++//! * **tampered** — a token is 32 bytes from the system's random number generator, so guessing one
++//!   is not a strategy, and it is *looked up* rather than checked: there is nothing to verify
++//!   against, and no signature to forge (signing the token instead would need a secret to keep, and
++//!   would still need the row to make a token single-use);
++//! * **expired** — the expiry is stamped by the database (`now() + …` at the insert) and compared by
++//!   the database (`… > now()` at the update), so the two clocks in this service never have to agree
++//!   about anything;
++//! * **replayed** — the update that confirms a subscriber also *checks* that it may: `status =
++//!   'pending'` is part of the condition, so the same token cannot confirm twice, move
++//!   `confirmed_at` a second time, or un-unsubscribe anybody.
++//!
++//! The third one is why the decision is a single conditional `UPDATE` rather than a read followed by
++//! a write: two requests holding the same token arrive together, exactly one of them changes the
++//! row, and the other one learns that it did not. What the *reason* was (unknown, expired, already
++//! confirmed) is a second question, asked only when the first answer is "no".
+ 
+ use std::fmt;
+ 
++use sqlx::PgPool;
++
+ use crate::error::Error;
+ 
+ /// How many bytes of randomness a token is made of.
+@@ -43,15 +53,13 @@ impl Token {
+     ///
+     /// # Errors
+     ///
+-    /// Reports the failure the step's TASK adds to [`Error`] when the system's random number
+-    /// generator fails. There is no fallback on purpose: a token this service invented would be a
+-    /// token an attacker can invent too, so a request that cannot get randomness does not get a
+-    /// token.
+-    ///
+-    /// The scaffold does not ask the system for anything: it answers the same value for every
+-    /// subscriber, which is the first thing `spec/1.12/confirmation.rs` catches.
++    /// Reports [`Error::TokenGeneration`] when the system's random number generator fails. There is
++    /// no fallback on purpose: a token this service invented would be a token an attacker can
++    /// invent too, so a request that cannot get randomness does not get a token.
+     pub fn issue() -> Result<Self, Error> {
+-        Ok(Self(hex(&[0u8; TOKEN_BYTES])))
++        let mut bytes = [0u8; TOKEN_BYTES];
++        getrandom::fill(&mut bytes).map_err(|source| Error::TokenGeneration { source })?;
++        Ok(Self(hex(&bytes)))
+     }
+ 
+     /// Read a token out of what a caller sent.
+@@ -92,6 +100,62 @@ impl fmt::Debug for Token {
+     }
+ }
+ 
++/// Confirm the subscriber a token was issued for, answering the address it confirmed.
++///
++/// # Errors
++///
++/// Reports [`Error::TokenUnknown`] when no subscriber has that token, [`Error::TokenExpired`] when
++/// the subscriber has it and it is past its expiry, [`Error::AlreadyConfirmed`] when that subscriber
++/// is not waiting for a confirmation any more, and [`Error::Database`] when the statements do not
++/// run.
++///
++/// The address comes back as text rather than as an [`Email`](crate::domain::Email): it came out of
++/// the table, which only ever holds addresses that went through `Email::parse` on their way in, so
++/// there is nothing left to check.
++pub async fn confirm(pool: &PgPool, token: &Token) -> Result<String, Error> {
++    // One statement decides everything: the token has to match, the subscriber has to be waiting,
++    // and the token has to be inside its window. `RETURNING` is how the caller of this statement
++    // learns which of the two it was.
++    let confirmed: Option<String> = sqlx::query_scalar!(
++        "UPDATE subscribers SET status = 'active', confirmed_at = now() WHERE confirmation_token = $1 AND status = 'pending' AND confirmation_expires_at > now() RETURNING email",
++        token.as_str()
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "confirm a subscriber",
++        source: Box::new(source),
++    })?;
++
++    if let Some(email) = confirmed {
++        return Ok(email);
++    }
++
++    // The decision is made; this second question only turns "no" into a sentence. The row it reads
++    // is the same one the update just looked at: the token matched (or the update would have failed
++    // on that condition too), the subscriber is not waiting any more, or the window is closed —
++    // and a subscriber who *is* still waiting can only have been refused by the expiry.
++    let refused = sqlx::query!(
++        "SELECT email, status FROM subscribers WHERE confirmation_token = $1",
++        token.as_str()
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "read a subscriber",
++        source: Box::new(source),
++    })?;
++
++    match refused {
++        None => Err(Error::TokenUnknown),
++        // `active` is the status a replay meets; `unsubscribed` (step `mailer/1.18-authz-boundary`)
++        // is the other way a subscriber stops waiting, and it gets the same sentence until that step
++        // decides whether it deserves its own.
++        Some(row) if row.status != "pending" => Err(Error::AlreadyConfirmed { email: row.email }),
++        Some(_) => Err(Error::TokenExpired),
++    }
++}
++
+ /// The failure a token that is not a token becomes.
+ fn invalid_token() -> Error {
+     Error::InvalidInput {
+@@ -113,3 +177,71 @@ fn hex(bytes: &[u8]) -> String {
+     }
+     out
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{CONFIRMATION_WINDOW_SECS, TOKEN_BYTES, Token, hex};
++
++    #[test]
++    fn a_token_is_the_hex_of_the_bytes_it_was_made_of() {
++        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
++        assert_eq!(hex(&[0u8; 32]).len(), 64);
++    }
++
++    #[test]
++    fn a_token_that_was_issued_parses_back_into_the_same_token() {
++        let token = Token::issue().expect("this machine has a random number generator");
++        assert_eq!(token.as_str().len(), TOKEN_BYTES * 2);
++        assert_eq!(
++            Token::parse(token.as_str()).expect("what was just issued is a token"),
++            token
++        );
++    }
++
++    #[test]
++    fn two_tokens_are_never_the_same_token() {
++        let first = Token::issue().expect("this machine has a random number generator");
++        let second = Token::issue().expect("this machine has a random number generator");
++        assert_ne!(
++            first, second,
++            "a token has to be uncopyable, not merely long"
++        );
++    }
++
++    #[test]
++    fn the_things_a_token_is_not() {
++        let refused = [
++            String::new(),
++            "nope".to_owned(),
++            "a".repeat(TOKEN_BYTES * 2 - 1),
++            "a".repeat(TOKEN_BYTES * 2 + 1),
++            "A".repeat(TOKEN_BYTES * 2),
++            "z".repeat(TOKEN_BYTES * 2),
++        ];
++        for value in refused {
++            assert!(
++                Token::parse(&value).is_err(),
++                "`{value}` is not a token this service issues"
++            );
++        }
++    }
++
++    #[test]
++    fn a_token_has_a_window_and_it_is_a_day() {
++        assert!(
++            (CONFIRMATION_WINDOW_SECS - 86_400.0).abs() < f64::EPSILON,
++            "the confirmation link is good for a day"
++        );
++    }
++
++    #[test]
++    fn debug_prints_a_token_the_way_it_prints_a_password() {
++        let token = Token::issue().expect("this machine has a random number generator");
++        let printed = format!("{token:?}");
++        assert!(
++            !printed.contains(token.as_str()),
++            "`{{:?}}` is how a token reaches a log line: `{printed}`"
++        );
++        assert!(printed.contains("redacted"), "`{printed}`");
++    }
++}
+diff --git a/src/error.rs b/src/error.rs
+index 2371555..955fe18 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -138,6 +138,34 @@ pub enum Error {
+         #[source]
+         source: argon2::password_hash::Error,
+     },
++    /// No subscriber holds the confirmation token a caller sent (step `mailer/1.12-token`).
++    ///
++    /// Deliberately **without** the token: a token is a secret — whoever holds one can confirm that
++    /// address — so it is not part of a failure, and a message is a thing that ends up in a log
++    /// (step `mailer/1.6-logging`, and the same rule [`Error::InvalidInput`] follows for values).
++    #[error("no subscriber has that confirmation token")]
++    TokenUnknown,
++    /// The confirmation token a caller sent is past its expiry (step `mailer/1.12-token`).
++    #[error("that confirmation token has expired")]
++    TokenExpired,
++    /// The subscriber a confirmation token belongs to is not waiting for one
++    /// (step `mailer/1.12-token`).
++    ///
++    /// The address is part of this failure for the same reason it is part of
++    /// [`Error::AlreadySubscribed`]: the caller sent a token, and the answer is only usable if it
++    /// says whose it was.
++    #[error("`{email}` is already confirmed")]
++    AlreadyConfirmed {
++        /// The address that is not waiting for a confirmation, as it was stored.
++        email: String,
++    },
++    /// A confirmation token could not be issued (step `mailer/1.12-token`).
++    #[error("a confirmation token could not be issued")]
++    TokenGeneration {
++        /// What the system's random number generator reported.
++        #[source]
++        source: getrandom::Error,
++    },
+     /// The database could not be reached, or refused what it was asked to do.
+     #[error("the database could not {operation}")]
+     Database {
+@@ -164,11 +192,13 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+-    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, or the database could not be connected or migrated | `1` | whoever deployed it |
++    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, a token could not be issued, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
+     /// A value a caller sent that the domain refuses is the caller's problem too — the same code as
+-    /// a unusable flag — and so is an address that already has a subscriber: both are the caller's
+-    /// to fix, and both are what the 400 and the 409 of step `mailer/1.11-signup` are made of.
++    /// a unusable flag — and so are an address that already has a subscriber and a confirmation
++    /// token that is unknown, expired or spent: all of them are the caller's to fix, and all of them
++    /// are what the 400/404/409/410 of steps `mailer/1.11-signup` and `mailer/1.12-token` are made
++    /// of.
+     ///
+     /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
+     /// retry.
+@@ -180,12 +210,16 @@ impl Error {
+             | Error::InvalidSetting { .. }
+             | Error::UnknownSetting { .. }
+             | Error::InvalidInput { .. }
+-            | Error::AlreadySubscribed { .. } => ExitCode::from(2),
++            | Error::AlreadySubscribed { .. }
++            | Error::TokenUnknown
++            | Error::TokenExpired
++            | Error::AlreadyConfirmed { .. } => ExitCode::from(2),
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+             | Error::Logging { .. }
+             | Error::Listen { .. }
+             | Error::PasswordHash { .. }
++            | Error::TokenGeneration { .. }
+             | Error::Database { .. }
+             | Error::Migration { .. } => ExitCode::FAILURE,
+         }
+diff --git a/src/http.rs b/src/http.rs
+index f1b7324..6766949 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -14,22 +14,27 @@
+ //!   the process and stays green when a dependency is away, `/readyz` is about everything a request
+ //!   needs and goes red. A service that answers "alive" for "ready" is a service an orchestrator
+ //!   keeps sending traffic to.
++//! * **a confirmation link is a GET on a secret** (step `mailer/1.12-token`): `/confirm?token=…`
++//!   changes the subscriber's state, and the three ways it can fail (nobody was given that token,
++//!   the window is closed, it was already used) are three different answers, because a learner — and
++//!   a person who clicked an old link — needs to be told which one happened;
+ //! * **a failure is a status code and one sentence** (step `mailer/1.11-signup`): [`status_of`] is
+ //!   the same table [`Error::exit_code`] writes for a shell — what the caller can fix is a 4xx,
+ //!   what only the deployment can fix is a 5xx — and a 5xx never carries the reason: that is a fact
+ //!   about this deployment's insides, and it goes to the log.
+ 
+ use axum::Router;
+-use axum::extract::rejection::JsonRejection;
+-use axum::extract::{Json, State};
++use axum::extract::rejection::{JsonRejection, QueryRejection};
++use axum::extract::{Json, Query, State};
+ use axum::http::StatusCode;
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+-use serde::Serialize;
++use serde::{Deserialize, Serialize};
+ use tokio::net::TcpListener;
+ use tracing::{info, instrument, warn};
+ 
+ use crate::config::Config;
++use crate::confirmation::{self, Token};
+ use crate::db::Database;
+ use crate::error::Error;
+ use crate::logging::RunId;
+@@ -106,6 +111,7 @@ pub fn router(state: AppState) -> Router {
+         .route("/healthz", get(healthz))
+         .route("/readyz", get(readyz))
+         .route("/signup", post(signup))
++        .route("/confirm", get(confirm))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
+         .with_state(state)
+@@ -191,7 +197,7 @@ async fn signup(
+     match subscribe(database.pool(), request).await {
+         Ok(email) => (
+             StatusCode::CREATED,
+-            Json(SignedUp {
++            Json(SubscriberState {
+                 status: "pending",
+                 email: email.to_string(),
+             }),
+@@ -201,6 +207,57 @@ async fn signup(
+     }
+ }
+ 
++/// `GET /confirm?token=…`: confirm the subscriber a token was issued for
++/// (step `mailer/1.12-token`).
++///
++/// The token arrives as text from a stranger, so it is *parsed* before anything else happens
++/// (step `mailer/1.10-domain-types`) — and a value that is not a token at all is a different answer
++/// from a token that nobody was given: a 400 says "you sent something that is not a link", and the
++/// 404 that follows says "that link is not good any more".
++async fn confirm(
++    State(state): State<AppState>,
++    query: Result<Query<ConfirmQuery>, QueryRejection>,
++) -> Response {
++    let Ok(Query(query)) = query else {
++        return (
++            StatusCode::BAD_REQUEST,
++            Json(Body::new(
++                "the confirmation link has no token: it has to be `/confirm?token=<token>`",
++            )),
++        )
++            .into_response();
++    };
++
++    let token = match Token::parse(&query.token) {
++        Ok(token) => token,
++        Err(error) => return answer(error),
++    };
++
++    let Some(database) = state.database() else {
++        warn!("a confirmation arrived with no database configured");
++        return not_ready("no database is configured");
++    };
++
++    match confirmation::confirm(database.pool(), &token).await {
++        Ok(email) => (
++            StatusCode::OK,
++            Json(SubscriberState {
++                status: "active",
++                email,
++            }),
++        )
++            .into_response(),
++        Err(error) => answer(error),
++    }
++}
++
++/// What `/confirm` reads out of the query string.
++#[derive(Debug, Deserialize)]
++struct ConfirmQuery {
++    /// The token that travelled in the confirmation link.
++    token: String,
++}
++
+ /// The status a failure answers with, in the same two families [`Error::exit_code`] sorts them
+ /// into: what the caller can fix is a 4xx, and what only the deployment can fix is a 5xx.
+ ///
+@@ -209,7 +266,9 @@ async fn signup(
+ fn status_of(error: &Error) -> StatusCode {
+     match error {
+         Error::InvalidInput { .. } => StatusCode::BAD_REQUEST,
+-        Error::AlreadySubscribed { .. } => StatusCode::CONFLICT,
++        Error::TokenUnknown => StatusCode::NOT_FOUND,
++        Error::AlreadySubscribed { .. } | Error::AlreadyConfirmed { .. } => StatusCode::CONFLICT,
++        Error::TokenExpired => StatusCode::GONE,
+         _ => StatusCode::INTERNAL_SERVER_ERROR,
+     }
+ }
+@@ -234,11 +293,12 @@ fn answer(error: Error) -> Response {
+     (status, Json(Body::new(error.to_string()))).into_response()
+ }
+ 
+-/// The body of a signup that created a subscriber.
++/// The body of an answer that changed a subscriber's state: what it is now, and whose
++/// (`mailer/1.11-signup` created one, `mailer/1.12-token` confirmed one).
+ #[derive(Debug, Serialize)]
+-struct SignedUp {
+-    /// Where the subscriber is in the confirmation dance: `pending` until step `mailer/1.12-token`
+-    /// hands out a token, and `active` once it is used (the column default of the migration).
++struct SubscriberState {
++    /// Where the subscriber is: `pending` until the token confirms it, then `active` (the two
++    /// statuses the migration's `CHECK` allows today).
+     status: &'static str,
+     /// The address **as it was stored** — normalised, so a caller can compare it with what it sent
+     /// and see what this service made of it.
+diff --git a/src/lib.rs b/src/lib.rs
+index 2e917d8..bcf286c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,6 +14,7 @@
+ use std::path::PathBuf;
+ 
+ pub mod config;
++pub mod confirmation;
+ pub mod db;
+ pub mod domain;
+ pub mod error;
+@@ -22,6 +23,7 @@ pub mod logging;
+ pub mod signup;
+ 
+ pub use config::{Config, Flags};
++pub use confirmation::Token;
+ pub use db::Database;
+ pub use domain::{Email, Password, SubscriberName};
+ pub use error::{Error, SettingSource};
+diff --git a/src/signup.rs b/src/signup.rs
+index 660a11c..3599cd5 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -20,6 +20,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher};
+ use serde::Deserialize;
+ use sqlx::PgPool;
+ 
++use crate::confirmation::{CONFIRMATION_WINDOW_SECS, Token};
+ use crate::domain::{Email, Password, SubscriberName};
+ use crate::error::Error;
+ 
+@@ -47,24 +48,33 @@ pub struct SignupRequest {
+ /// of a race, and `RETURNING id` is what tells the two callers apart: a row comes back when *this*
+ /// call inserted it, and nothing comes back when somebody else already had.
+ ///
++/// The subscriber is born with the token that will confirm it (step `mailer/1.12-token`), so there
++/// is no moment in which a pending row exists and nobody can confirm it. `now() + …` is the
++/// database's clock, which is the one the confirmation will compare against.
++///
+ /// # Errors
+ ///
+ /// Reports [`Error::InvalidInput`] when the email, the name or the password is not a value this
+ /// service accepts (the field is named, the value is not), [`Error::PasswordHash`] when the
+-/// password cannot be hashed, [`Error::Database`] when the insert does not run, and
+-/// [`Error::AlreadySubscribed`] when the address already has a subscriber.
++/// password cannot be hashed, [`Error::TokenGeneration`] when a confirmation token cannot be
++/// issued, [`Error::Database`] when the insert does not run, and [`Error::AlreadySubscribed`] when
++/// the address already has a subscriber.
+ pub async fn subscribe(pool: &PgPool, request: SignupRequest) -> Result<Email, Error> {
+     let email = Email::parse(&request.email)?;
+     let name = SubscriberName::parse(&request.name)?;
+     let password = Password::parse(&request.password)?;
+     let password_hash = hash(&password)?;
++    // Issued before the insert, stored, and never answered to the caller: whoever can read that
++    // address's mail is who confirms it.
++    let token = Token::issue()?;
+ 
+     let inserted: Option<i64> = sqlx::query_scalar!(
+-        "INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) \
+-         ON CONFLICT (email) DO NOTHING RETURNING id",
++        "INSERT INTO subscribers (email, name, password_hash, confirmation_token, confirmation_expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) ON CONFLICT (email) DO NOTHING RETURNING id",
+         email.as_str(),
+         name.as_str(),
+-        password_hash
++        password_hash,
++        token.as_str(),
++        CONFIRMATION_WINDOW_SECS
+     )
+     .fetch_optional(pool)
+     .await

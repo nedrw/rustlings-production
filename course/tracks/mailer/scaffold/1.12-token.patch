@@ -1,0 +1,253 @@
+diff --git a/.sqlx/query-13175c09bc1b4dbbfbd053b6396037e968d2ab94334c1c5ea66f99591b334232.json b/.sqlx/query-13175c09bc1b4dbbfbd053b6396037e968d2ab94334c1c5ea66f99591b334232.json
+new file mode 100644
+index 0000000..0cd0994
+--- /dev/null
++++ b/.sqlx/query-13175c09bc1b4dbbfbd053b6396037e968d2ab94334c1c5ea66f99591b334232.json
+@@ -0,0 +1,40 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT email, status FROM subscribers WHERE confirmation_token = $1",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "status",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "status"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": [
++      false,
++      false
++    ]
++  },
++  "hash": "13175c09bc1b4dbbfbd053b6396037e968d2ab94334c1c5ea66f99591b334232"
++}
+diff --git a/.sqlx/query-738c2fc8a88ecc46fbcc562afae9606b330427b9bef8698f4dcc4598d6fa78ad.json b/.sqlx/query-738c2fc8a88ecc46fbcc562afae9606b330427b9bef8698f4dcc4598d6fa78ad.json
+new file mode 100644
+index 0000000..471f7c1
+--- /dev/null
++++ b/.sqlx/query-738c2fc8a88ecc46fbcc562afae9606b330427b9bef8698f4dcc4598d6fa78ad.json
+@@ -0,0 +1,28 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE subscribers SET status = 'active', confirmed_at = now() WHERE confirmation_token = $1 AND status = 'pending' AND confirmation_expires_at > now() RETURNING email",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "738c2fc8a88ecc46fbcc562afae9606b330427b9bef8698f4dcc4598d6fa78ad"
++}
+diff --git a/.sqlx/query-ae77a79908dae7d8cce459b075c9fc3da0707224085fd93e42e55daada90b273.json b/.sqlx/query-ae77a79908dae7d8cce459b075c9fc3da0707224085fd93e42e55daada90b273.json
+new file mode 100644
+index 0000000..c9df6b5
+--- /dev/null
++++ b/.sqlx/query-ae77a79908dae7d8cce459b075c9fc3da0707224085fd93e42e55daada90b273.json
+@@ -0,0 +1,32 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO subscribers (email, name, password_hash, confirmation_token, confirmation_expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) ON CONFLICT (email) DO NOTHING RETURNING id",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "id"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text",
++        "Text",
++        "Text",
++        "Text",
++        "Float8"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "ae77a79908dae7d8cce459b075c9fc3da0707224085fd93e42e55daada90b273"
++}
+diff --git a/Cargo.toml b/Cargo.toml
+index 8888752..c48a4ad 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,9 @@ anyhow = "1.0.104"
+ # it serialises to.
+ argon2 = "0.6.0"
+ axum = "0.8.9"
++# The randomness of step 1.12: a confirmation token is 32 bytes from the system, not a value
++# this service can make up by itself.
++getrandom = "0.4"
+ serde = { version = "1.0.229", features = ["derive"] }
+ # The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
+ # serialise structures of its own from 1.7 on.
+diff --git a/src/confirmation.rs b/src/confirmation.rs
+new file mode 100644
+index 0000000..56e02e4
+--- /dev/null
++++ b/src/confirmation.rs
+@@ -0,0 +1,115 @@
++//! Confirmation tokens: issued at signup, good for one confirmation, until they expire
++//! (step `mailer/1.12-token`).
++//!
++//! This file is the scaffold: the token type, the window it is good for, and the two ways a token is
++//! ever made — issued (random) or parsed (out of a link). **It proves nothing about a token**: the
++//! scaffold's `issue` answers the same value every time, and the confirmation itself is not written
++//! yet, so the spec fails here until the step fills these in.
++//!
++//! A token is the one thing that turns "somebody typed an address into a form" into "somebody who can
++//! read that address agreed to it", and three failures are designed against: **tampered** (so the
++//! token is 32 random bytes and is looked up, never checked), **expired** (so the window is stamped
++//! and compared by the database's clock), and **replayed** (so the statement that confirms a
++//! subscriber also checks that it may). The step's TRAP section names what each of them looks like
++//! when it was never designed for.
++
++use std::fmt;
++
++use crate::error::Error;
++
++/// How many bytes of randomness a token is made of.
++///
++/// 256 bits: an attacker who tries a million tokens a second for the age of the universe gets
++/// nowhere near the odds of a coin landing heads a hundred times in a row.
++pub const TOKEN_BYTES: usize = 32;
++
++/// How long a confirmation link is good for, in seconds.
++///
++/// A day: long enough that somebody can find the email tomorrow morning, short enough that a mailbox
++/// left open on a shared machine is not a standing offer.
++pub const CONFIRMATION_WINDOW_SECS: f64 = 24.0 * 60.0 * 60.0;
++
++/// A confirmation token, as it travels in a link.
++///
++/// The field is private and there is no constructor that takes text: a `Token` is either issued
++/// (random bytes) or *parsed* from what arrived in the URL, and nothing else can make one. What
++/// leaves this type is a string; what never leaves it by accident is a `Display` — there is none, so
++/// a token cannot be interpolated into a message or a log line without saying so out loud.
++#[derive(Clone, PartialEq, Eq)]
++pub struct Token(String);
++
++impl Token {
++    /// Issue a token nobody can guess: [`TOKEN_BYTES`] bytes from the system, as lower-case hex.
++    ///
++    /// # Errors
++    ///
++    /// Reports the failure the step's TASK adds to [`Error`] when the system's random number
++    /// generator fails. There is no fallback on purpose: a token this service invented would be a
++    /// token an attacker can invent too, so a request that cannot get randomness does not get a
++    /// token.
++    ///
++    /// The scaffold does not ask the system for anything: it answers the same value for every
++    /// subscriber, which is the first thing `spec/1.12/confirmation.rs` catches.
++    pub fn issue() -> Result<Self, Error> {
++        Ok(Self(hex(&[0u8; TOKEN_BYTES])))
++    }
++
++    /// Read a token out of what a caller sent.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `token` when the text is not what this service
++    /// issues: lower-case hex, [`TOKEN_BYTES`] bytes of it. A well-formed token that belongs to
++    /// nobody is *not* this failure — it is [`Error::TokenUnknown`], and the difference matters,
++    /// because the first is "you sent something that is not a token" (400) and the second is "that
++    /// link is not good" (404).
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        let hex = invalid_token();
++        if value.len() != TOKEN_BYTES * 2 {
++            return Err(hex);
++        }
++        if !value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            return Err(hex);
++        }
++        Ok(Self(value.to_owned()))
++    }
++
++    /// The token as it travels: lower-case hex.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++/// A token is a secret: anybody holding one can confirm that address, so `{:?}` says that there is
++/// one and nothing else (step `mailer/1.10-domain-types` made the same call for a password).
++impl fmt::Debug for Token {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("Token(<redacted>)")
++    }
++}
++
++/// The failure a token that is not a token becomes.
++fn invalid_token() -> Error {
++    Error::InvalidInput {
++        field: "token",
++        expected: "a confirmation token: 64 characters of lower-case hex",
++    }
++}
++
++/// The lower-case hex spelling of some bytes.
++///
++/// Hex rather than the raw bytes or a base64: a confirmation link is text somebody may have to copy
++/// by hand, and every character here survives a URL, an email client's line wrapping and a shell.
++fn hex(bytes: &[u8]) -> String {
++    const DIGITS: &[u8; 16] = b"0123456789abcdef";
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        out.push(DIGITS[usize::from(byte >> 4)] as char);
++        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
++    }
++    out
++}
