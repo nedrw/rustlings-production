@@ -157,10 +157,14 @@
 >
 > ### 下一步
 >
-> 1.11 起按序写在 1.10 的树上；**1.11 的设计已定，见下面一节，直接写代码即可**。前置已就绪：`sqlx-cli 0.9.0`
-> 已装（`cargo sqlx` 在 `~/.cargo/bin`），`argon2 0.6.0` 已拉到本地缓存。`container-repro`（1.21）与 `links`（1.22）
-> 两个闸门仍未实现；**`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
-> 另：本机的 `kiln-pg` 容器是早先手工试验留下的（不影响测试，测试用 `kiln-pg-<pid>-<n>` 并自行清理）。
+> **1.12 起按序写在 1.11 的树上；1.12 的设计已定，见本节末尾，直接写代码即可。** 1.11 已把宏与
+> `.sqlx` offline 元数据带上（见下一条进度），所以 1.12 起每步的第一件事是：把这一步要用的语句写全，
+> 然后用一个跑着的空库 `cargo sqlx prepare`（本机照着 1.11 的做法起 `docker.1ms.run/library/postgres:17-alpine`，
+> 8 秒就绪；`sqlx migrate run` 建表，`DATABASE_URL=… cargo sqlx prepare`），把新生成的 `.sqlx/query-*.json`
+> 作为 scaffold 内容发布，正文里给出语句原文。`container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
+> **`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
+> 别用 `podman images` 的**空输出**判断镜像是否还在：本段开工时它一次返回空、第二次就列全了。
+
 >
 > ### 2026-10 进度（M0 第五段 · 做到 1.10）
 > T1 1.10（领域类型）已完成并提交：`src/domain.rs`（`Email`/`SubscriberName`/`Password` + 五个限额常量，
@@ -175,45 +179,90 @@
 > 好处：spec 本身不引用还得由学员加入的模块，所以它在 scaffold 上**编得过、跑得过、只失败在断言上**；探针能直接
 > `matches!`、能写 property，失败信息就是编译错误或断言行。代价：冷启动一次性多花约 20 秒。
 >
-> ### 1.11 已定的设计（下一段直接写代码，不要再调研）
+> ### 2026-10 进度（M0 第六段 · 做到 1.11）
 >
-> 前置已就绪：`sqlx-cli 0.9.0` 已 `cargo install`（`cargo sqlx` 可用，`~/.cargo/bin`）；`argon2 0.6.0` 从 crates.io 一
-> 秒拉到（缓存已热）。步骤名/能力不变：`1.11-signup`，`db/unique-as-concurrency@apply` + `sec/password-hash@apply`。
+> T1 1.11（注册）已完成并提交（`121caf8`）：`src/signup.rs`（`SignupRequest` 三个原始字符串 +
+> `subscribe(pool, request)` + `hash`）、`Error::AlreadySubscribed { email }`（退出码 2，409）与
+> `Error::PasswordHash { source }`（1，500）、`http.rs` 的 `Error → StatusCode` 表（与 `Error::exit_code`
+> 同一条规则：调用方能修的 4xx、部署的 5xx，且 5xx 从不带原因）、`POST /signup` 的 201/400/409/503。
+> `cargo xtask ci` 全绿 3m06s，`kiln selftest` 对 **1.1–1.11 共 11 步**满足契约（1.11：8/8 must），
+> `kiln verify --json mailer` = 11 passed / 0 failed / 11 not authored（exit 3）。另有一轮**空 `app/` 的
+> 全新走查**：1.1 → 1.11 每步「scaffold 必败 → 参考解全过 → 每个 must 闸门全绿」，1.11 是
+> `0 passed; 6 failed` → `6 passed` → 全绿。
 >
-> **接口。** `POST /signup`，body `{"email": …, "name": …, "password": …}`。成功 **201** + `{"status":"pending","email":"<规整后的地址>"}`（响应里永不出现密码）；
-> body 不是 signup（缺字段/不是 JSON）→ **400**（用 axum 的 `JsonRejection`，handler 收 `Result<Json<SignupRequest>, JsonRejection>`）；
-> 领域拒绝（`Error::InvalidInput`）→ **400**，body 用错误自己的话（它只说字段与期望，不重复值——直接复用 1.10 的约定）；
-> 地址已被订阅（唯一约束）→ **409**。`http.rs` 新增一张 `Error → StatusCode` 映射表，和 1.5 的退出码表同源
-> （2 那边的分类变 4xx，部署问题变 5xx）。
+> **这一段的实测事实（下一段直接用，不要再花时间验证）**
 >
-> 新错误变体：`Error::AlreadySubscribed { email: String }`（退出码 2，409）。body 格式：`Body` 的 `status` 从 `&'static str`
-> 改成 `String`（400/409 要带上具体句子；1.7 的规格只断言它非空，不会碎）。
+> - **`sqlx` 0.9 的 `query!`/`query_scalar!` 只吃字符串字面量**（`expand_query!(source = $query)`，内部
+>   按 `LitStr` 或 `"a" "b"` 拼接解析）。所以 1.11 的设计里那个 `pub const INSERT_SUBSCRIBER` 是行不通的：
+>   语句写进正文（正文给出原文），参考解里用字面量（可以 `\` 换行，`syn` 解出来的值与一行写法逐字相同）。
+> - **`.sqlx` 的键是语句文本的 SHA-256**（`hash_string(&input.sql)`），宏与 `cargo sqlx prepare` 用同一
+>   个函数；`prepare` 的做法是 `cargo check` + `SQLX_OFFLINE_DIR=<cache>` + `SQLX_TMP=<target/sqlx-tmp>`，
+>   由宏把 JSON 写进临时目录再搬到 `.sqlx/`，所以它需要**能连库或已有缓存**且 `cargo check` 成功。缓存
+>   目录按 `SQLX_OFFLINE_DIR` → `<manifest_dir>/.sqlx` → `<workspace_root>/.sqlx` 找；`DATABASE_URL`
+>   未设时自动走离线。`prepare` 会先删掉缓存目录里的旧 `query-*.json`，所以语句改了就自动清理。
+> - **`argon2 0.6` 的 API 与 0.5 不同**：`Argon2::default().hash_password(bytes)` 自带 `getrandom` 取盐
+>   （默认 features = `alloc`+`getrandom`+`password-hash`，不需要 `SaltString`/`OsRng`），返回
+>   `password_hash::phc::PasswordHash`，`to_string()` 就是 PHC 串；`password_hash::Error` 实现了
+>   `core::error::Error`，可以直接当 `#[source]`。
+> - **并发场景的规格写法**（1.11 的第三条测试，1.12 要照抄）：`TestApp` 自动是 `Sync`（字段都是
+>   `SocketAddr`/`oneshot::Sender`/`JoinHandle`），所以 `std::thread::scope` + `std::sync::Barrier::new(N)`
+>   就够了，不需要 `Arc`；N 取 4 比 2 更容易把「先读后写」的实现打出来。
+> - 1.11 的规格**在「先 SELECT 再 INSERT」的实现上会失败**（已实测：`[201, 500, 500, 500]`）。写新步骤的
+>   规格时照此确认一遍：把参考解改成那个阱的形状，看规格是否真的红。
 >
-> **scaffold 内容。** `Cargo.toml` 标记块加 `argon2 = "0.6"`；新文件 `src/signup.rs` 只有三样：
-> `SignupRequest { email: String, name: String, password: String }`（**原始字符串**，解析是学员的事）；一个
-> `pub const INSERT_SUBSCRIBER: &str`（见下）；一个 `hash(password: &Password) -> Result<String, Error>`，
-> scaffold 里直接返回明文（正好是那个阱：“密码存成它自己”）；新目录 `.sqlx/`（由 `cargo sqlx prepare` 生成、作为 scaffold 内容发布）。
+> ### 1.12 已定的设计（下一段直接写代码，不要再调研）
 >
-> **那条被给定的语句**（`.sqlx/` 的缓存按它逐字哈希，所以正文给出、参考解逐字使用；学员重写就按 TRAP 里说的重新 prepare）：
+> 能力不变：`sec/token-lifetime@apply`，hint 是「expired / replayed / tampered 三种失败都要设计」。
+> 1.11 的树上写，1.12 的 scaffold **只新增文件**（`src/confirmation.rs` + `.sqlx/` 新条目 + `Cargo.toml`
+> 标记块里的 `getrandom = "0.3"`），学员改的是 `src/signup.rs`、`src/error.rs`、`src/http.rs`、`src/lib.rs`。
+>
+> **令牌。** `Token`（私有字段）+ `TOKEN_BYTES = 32` + `CONFIRMATION_WINDOW_SECS = 86400.0`：
+> `issue()` 用 `getrandom::fill` 取 32 字节、编成 64 位小写十六进制（不引 `rand`/`hex`，手写 8 行编码，
+> 正文里说明「随机字节 + URL 安全编码」）；scaffold 的 `issue()` **返回 64 个 `0`**（跟 1.11 的 `hash`
+> 返回明文同一个套路，规格的「两次注册两个令牌」是它的闸门），参考解才真的问系统要随机数，并新增
+> `Error::TokenGeneration { source: getrandom::Error }`（退出码 1）。
+>
+> **注册时签发。** 1.11 的 INSERT 扩成（正文给原文、逐字使用）：
 >
 > ```sql
-> INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING RETURNING id
+> INSERT INTO subscribers (email, name, password_hash, confirmation_token, confirmation_expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) ON CONFLICT (email) DO NOTHING RETURNING id
 > ```
 >
-> `ON CONFLICT DO NOTHING` + `RETURNING id` + `fetch_optional` 就是本步的并发原语：约束做判定，应用从不先读后写。
-> 学员写的是：`subscribe(pool, request) -> Result<Email, Error>`（解析→哈希→插入→`None` 变 `AlreadySubscribed`）与路由。
+> `$5` 是 `f64`（`CONFIRMATION_WINDOW_SECS`），过期时刻由**数据库的 `now()`** 算，后面比较也用 `now()`：
+> 应用与库的时钟不需要一致。响应体仍然只有 `{"status":"pending","email":…}`——**令牌绝不进响应**
+> （规格断言 201 的 body 里没有令牌）。
 >
-> **哈希。** `argon2 0.6` 的 `Argon2::default()` + `PasswordHasher`，盐每个订阅者随机（`SaltString::generate(&mut OsRng)`），
-> 存 PHC 字符串（`$argon2id$…`）。1.11 **不提供** verify——校验哈希的调用方是登录（1.16），本步的规格只断言：形状是
-> `$argon2id$`、不等于明文、同一密码两次注册得到不同哈希、响应里没有密码。
+> **确认。** `GET /confirm?token=…`，一次条件 UPDATE 决定一切（正文给原文）：
 >
-> **规格**（`spec/1.11/signup.rs`，用 1.10 的 `TestApp` + 容器装置，不需探针）：① 合法注册 201、行里 email 已规整、
-> status=pending、hash 形状、响应无密码；② 同地址第二次 409 且只一行；③ **两个线程同时**投同一地址：恰好一个 201、
-> 一个 409、一行（这就是能力名）；④ 域名拒绝 400 且 body 指名字段、不重复值、没插入行；⑤ 缺字段/非 JSON 400。
+> ```sql
+> UPDATE subscribers SET status = 'active', confirmed_at = now() WHERE confirmation_token = $1 AND status = 'pending' AND confirmation_expires_at > now() RETURNING email
+> ```
 >
-> **准备 `.sqlx/` 的命令**（我自己跑一次，产物进 scaffold）：容器起一个空库 → `sqlx migrate run --database-url …`
-> → `DATABASE_URL=… cargo sqlx prepare`（在 `app/mailer` 里，带 `.sqlx/` 覆盖写入）→ 把 `.sqlx/*.json` 放进 scaffold。
-> 之后 `cargo test`/`clippy` 在无库环境下必须仍然编译得过（这正是离线元数据的意义，也是本步要讲的东西）。
+> `fetch_optional`：有行 = 这次调用确认成功（200 + `{"status":"active","email":…}`）；没有行才去
+> **诊断**（只为了说清原因，判定已经做完了）：
+>
+> ```sql
+> SELECT email, status = 'active' AS confirmed, confirmation_expires_at <= now() AS expired FROM subscribers WHERE confirmation_token = $1
+> ```
+>
+> 无行 → `Error::TokenUnknown`（404，`no subscriber has that confirmation token`）；`expired` →
+> `Error::TokenExpired`（410）；否则（`active`，或 1.18 之后的 `unsubscribed`）→
+> `Error::AlreadyConfirmed { email }`（409）。三个新变体都进退出码表的 `2` 一行，都**不回显令牌**（令牌也
+> 是秘密）。token 用完**不清空**：清空就分不出「重放」和「伪造」，一次性由 UPDATE 里的 `status = 'pending'`
+> 保证。缺 `token` 参数 → 400（`Result<Query<…>, QueryRejection>`，和 1.11 的 body 同一套路）；无库 → 503。
+> `http.rs` 里的 `SignedUp` 改名成 `SubscriberState`（201 和 200 共用一张体）。
+>
+> **规格**（`spec/1.12/confirmation.rs`，六条，全部从外面看）：① 注册后行里有 64 位十六进制令牌、
+> `confirmed_at IS NULL`、过期时刻在 23–25 小时之后，201 的 body 里没有令牌，两次注册两个不同的令牌；
+> ② 有效令牌 → 200 且行变 `active`、`confirmed_at` 非空；同一个令牌再来一次 → 409，且 `confirmed_at`
+> **没有变**；③ 用 `psql` 把 `confirmation_expires_at` 改成过去 → 410，行仍是 `pending`；
+> ④ 篡改一个字符 / 换一个没发过的令牌 → 404，缺参数 → 400，行不变；⑤ 两个线程拿同一个有效令牌同时
+> 请求（`Barrier` + `thread::scope`）→ 恰好一个 200、一个 409、`confirmed_at` 只被写一次（「先读后写」
+> 的实现在这里露馅）；⑥ 没配库 → 503。
+>
+> **正文的 TRAP 至少覆盖**：`Utc::now()`/应用时钟算过期（跟库的 `now()` 不一致）、令牌进响应或进错误消息、
+> 计数器/时间戳/UUIDv1 这类可猜的「随机」、把「重放」当 500 或当成伪造（404）、先读后写成两次 200、
+> 忘记 `status = 'pending'` 导致重放又能改 `confirmed_at`、清空令牌导致再也说清「已确认」。
 
 ## 6. 工作方式约定
 

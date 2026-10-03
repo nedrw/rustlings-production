@@ -231,6 +231,11 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 > （本机没有 `sqlx-cli`，`cargo sqlx prepare` 要先装）。因此 1.9 的第一条查询用运行时的
 > `sqlx::query(…).fetch_optional(…)`（课程要求「无 DB 环境下可编译」也由它保证），宏与离线元数据跟着
 > 1.11 的第一条真实查询一起上——那一步的 scaffold 发布 `.sqlx/`，正文讲清两者的取舍。
+>
+> 落地结果（1.11，2026-10）：如上面所述，第一条真实查询就是 `query_scalar!`，`.sqlx/` 由一个跑着的空库
+> （`sqlx migrate run` 之后 `DATABASE_URL=… cargo sqlx prepare`）生成、作为 scaffold 内容发布，所以没有
+> 数据库的机器照样编译。一处与上面设想不同：**语句给在正文里，而不是 scaffold 的 `pub const`**——`sqlx`
+> 0.9 的宏按 `LitStr` 解析 `source`，常量表达式进不去（见 `docs/handoff-m0.md` 第六段）。
 
 ### 4.3 `sec/authz-tenant-isolation`
 
