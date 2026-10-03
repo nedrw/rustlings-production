@@ -1,0 +1,884 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index c48a4ad..89b60a6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,7 +39,9 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
+ thiserror = "2.0.21"
+ toml = "0.9.8"
+ tracing = "0.1.44"
+-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal"] }
++# `test-util` is what makes the paused clock available to the unit tests of step 1.14: a retry
++# policy is a thing about time, and a test for it must not wait for real seconds.
++tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "test-util"] }
+ tracing-subscriber = { version = "0.3.23", features = ["json", "fmt"] }
+ # kiln:scaffold:end
+ 
+diff --git a/src/delivery.rs b/src/delivery.rs
+index 0d3d2cc..d667d14 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -14,40 +14,24 @@
+ //! * **capacity is reserved before the work it is for** ([`Queue::reserve`]): the handler takes its
+ //!   seat *before* the insert, so a full queue refuses a signup that has not written anything yet
+ //!   (a refused client can try again; a subscriber that exists with nobody able to confirm it
+-//!   cannot be fixed by trying again). The seat is also the cancel-safe way to send: a `send`
+-//!   cancelled inside a `select!` loses the message, a reserved seat does not;
++//!   cannot be fixed by trying again). The `Permit` that comes back is also the cancel-safe way to
++//!   send: a `send` cancelled inside a `select!` loses the message, a permit does not;
+ //! * **a failed send is retried, with jitter** ([`backoff`]): N workers whose mail server just
+ //!   recovered must not come back in step, which is what makes the delay random *and* increasing;
+ //! * **stopping means stopping taking work, then draining** ([`Queue::drain`]): the worker is told
+ //!   to close the queue to new messages and finish what it already has, and the caller waits for
+ //!   that — at most [`DRAIN_DEADLINE`], because a process that will not stop is a process an
+ //!   orchestrator kills, and being killed is how messages are lost.
+-//!
+-//! # What this scaffold proves
+-//!
+-//! Nothing yet: every one of those four decisions is a hole here, and this file is deliberately the
+-//! shape a first draft reaches for instead of the shape the step asks for.
+-//!
+-//! * there is **no queue** — [`Seat::send`] spawns a task per message, so nothing bounds how many
+-//!   sends are in flight, nothing says when they are all done, and a failure is one log line;
+-//! * [`Queue::reserve`] cannot refuse anything, because there is no bound to refuse against
+-//!   ([`QUEUE_CAPACITY`] is a number this file only claims), so the `503` of a full queue does not
+-//!   exist;
+-//! * [`backoff`] answers the base every time — no doubling, no jitter — and nothing calls it:
+-//!   a message is attempted once;
+-//! * [`Queue::drain`] answers `0` without waiting, because there is nothing to wait *for*: the
+-//!   tasks it spawned are simply dropped when the process stops, in the middle of what they were
+-//!   doing.
+-//!
+-//! The step's spec (`tests/spec_worker.rs`) fails here until all four are replaced by one queue,
+-//! one worker, and one drain.
+ 
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex, PoisonError};
+ use std::time::Duration;
+ 
+-use tracing::warn;
++use tokio::sync::mpsc::{self, Permit};
++use tokio::sync::watch;
++use tokio::task::JoinHandle;
++use tracing::{error, info, warn};
+ 
+-use crate::email::{EmailSender, Message};
++use crate::email::{EmailSender, Message, SendError};
+ use crate::error::Error;
+ 
+ /// How many messages may wait for the worker before a request is refused.
+@@ -62,14 +46,16 @@ use crate::error::Error;
+ pub const QUEUE_CAPACITY: usize = 32;
+ 
+ /// How many times one message is handed to the sender before it is given up on.
+-///
+-/// A message the mail server keeps refusing is a message that may never arrive, and a worker that
+-/// keeps asking is a worker that never gets to the next message.
+ pub const MAX_ATTEMPTS: u32 = 3;
+ 
+ /// The wait before the second attempt: the first delay, before jitter and doubling.
+ const RETRY_BASE: Duration = Duration::from_millis(250);
+ 
++/// The longest wait between two attempts. A cap is what keeps a retry from outliving the process's
++/// own shutdown: the drain has a deadline, and a message sleeping for thirty minutes would sleep
++/// through it.
++const RETRY_CAP: Duration = Duration::from_secs(30);
++
+ /// How long the worker is given to finish what it already has, once the process is asked to stop.
+ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+ 
+@@ -81,64 +67,119 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+ /// one that waits for it.
+ #[derive(Debug, Clone)]
+ pub struct Queue {
+-    /// Where a message goes in this scaffold: straight to the sender, in a task of its own.
+-    sender: Arc<dyn EmailSender>,
++    /// The sending half of the channel: where a reserved seat turns into a queued message.
++    jobs: mpsc::Sender<Message>,
++    /// Set when the process is asked to stop: the worker stops accepting and finishes its buffer.
++    stop: watch::Sender<bool>,
++    /// The worker task, taken once by whoever drains the queue.
++    worker: Arc<Mutex<Option<JoinHandle<usize>>>>,
+ }
+ 
+ impl Queue {
+     /// Start the worker and answer a handle to the queue in front of it.
+     ///
+-    /// There is no worker yet, and nothing to hand it later: the sending half of this scaffold is
+-    /// the seat.
++    /// The worker owns the receiving half for its whole life, so there is nothing to hand it later
++    /// and no way for a second one to appear.
+     #[must_use]
+     pub fn start(sender: Arc<dyn EmailSender>) -> Self {
+-        Self { sender }
++        let (jobs, mut waiting) = mpsc::channel::<Message>(QUEUE_CAPACITY);
++        let (stop, mut stopping) = watch::channel(false);
++
++        let worker = tokio::spawn(async move {
++            let mut delivered = 0_usize;
++            loop {
++                tokio::select! {
++                    // `changed()` fires once per change and then waits for the next one, so the
++                    // close below happens exactly once and the loop keeps draining afterwards.
++                    changed = stopping.changed() => {
++                        if changed.is_err() || *stopping.borrow() {
++                            // Stop taking new work, keep what is already queued: `recv` answers
++                            // `None` once the buffer is empty, which is how this loop ends.
++                            waiting.close();
++                        }
++                    }
++                    message = waiting.recv() => {
++                        let Some(message) = message else {
++                            break;
++                        };
++                        match deliver(sender.as_ref(), &message).await {
++                            Ok(()) => delivered += 1,
++                            Err(error) => {
++                                error!(%error, to = %message.to, "giving up on an email");
++                            }
++                        }
++                    }
++                }
++            }
++            info!(delivered, "the delivery queue drained");
++            delivered
++        });
++
++        Self {
++            jobs,
++            stop,
++            worker: Arc::new(Mutex::new(Some(worker))),
++        }
+     }
+ 
+     /// Reserve room for one message, or refuse the caller that wanted it.
+     ///
++    /// The seat is taken *before* the work the message is about, which is what makes "the queue is
++    /// full" an answer a caller can act on: they are told to come back, and nothing was written for
++    /// them in the meantime.
++    ///
+     /// # Errors
+     ///
+-    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting. The
+-    /// scaffold never reports it: nothing waits here, so there is nothing to refuse.
+-    pub fn reserve(&self) -> Result<Seat<'_>, Error> {
+-        Ok(Seat { sender: &self.sender })
++    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting.
++    pub fn reserve(&self) -> Result<Permit<'_, Message>, Error> {
++        self.jobs.try_reserve().map_err(|_| Error::QueueFull)
+     }
+ 
+     /// Stop taking work, finish what is queued, and answer how many messages were delivered.
+     ///
+     /// # Errors
+     ///
+-    /// Reports [`Error::DrainTimeout`] when the worker is still busy after `deadline`. The scaffold
+-    /// answers `0` without waiting: what it spawned is not tracked, so there is nothing to count.
+-    pub async fn drain(self, _deadline: Duration) -> Result<usize, Error> {
+-        Ok(0)
++    /// Reports [`Error::DrainTimeout`] when the worker is still busy after `deadline`, and
++    /// [`Error::WorkerLost`] when the worker task itself is gone — neither of which is a caller's
++    /// problem, and both of which mean some messages may not have been delivered.
++    pub async fn drain(self, deadline: Duration) -> Result<usize, Error> {
++        // The worker watches this; a failure only means it is already gone, which the join below
++        // reports.
++        let _ = self.stop.send(true);
++        let worker = self
++            .worker
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .take();
++        let Some(worker) = worker else {
++            return Ok(0);
++        };
++        match tokio::time::timeout(deadline, worker).await {
++            Ok(Ok(delivered)) => Ok(delivered),
++            Ok(Err(lost)) => Err(Error::WorkerLost {
++                source: Box::new(lost),
++            }),
++            Err(_elapsed) => Err(Error::DrainTimeout),
++        }
+     }
+ }
+ 
+-/// The seat a caller holds while it does the work its message is about.
+-///
+-/// Taking a seat before the work and sending on it afterwards is the shape the step is about; what
+-/// the scaffold is missing is that a seat means anything — it is free, it is unlimited, and the
+-/// message leaves it immediately.
+-pub struct Seat<'a> {
+-    /// What the message is handed to (step `mailer/1.13-email-port`).
+-    sender: &'a Arc<dyn EmailSender>,
+-}
+-
+-impl Seat<'_> {
+-    /// Hand the message over.
+-    ///
+-    /// It does not fail, and it does not wait: the send happens in a task nobody joins. That is how
+-    /// a process loses the messages it accepted — they are dropped when it stops — and how a
+-    /// failure becomes a log line instead of a retry.
+-    pub fn send(self, message: Message) {
+-        let sender = Arc::clone(self.sender);
+-        tokio::spawn(async move {
+-            if let Err(error) = sender.send(message).await {
+-                warn!(%error, "an email could not be sent");
++/// Hand one message to the sender, retrying the failures that are worth retrying.
++async fn deliver(sender: &dyn EmailSender, message: &Message) -> Result<(), SendError> {
++    let mut attempt = 1_u32;
++    loop {
++        match sender.send(message.clone()).await {
++            Ok(()) => return Ok(()),
++            Err(error) => {
++                if attempt >= MAX_ATTEMPTS {
++                    return Err(error);
++                }
++                let wait = backoff(attempt);
++                warn!(%error, attempt, ?wait, "the email could not be sent; trying again");
++                tokio::time::sleep(wait).await;
++                attempt += 1;
+             }
+-        });
++        }
+     }
+ }
+ 
+@@ -147,16 +188,180 @@ impl Seat<'_> {
+ /// *Full jitter*, in the shape of the AWS backoff article: a random delay in
+ /// `[0, min(cap, base · 2^attempt))`, not a fixed one. The randomisation is the point — a fleet of
+ /// workers retrying one broken mail server must not come back in step, and the failures they are
+-/// retrying are usually the same failure. A cap keeps the wait from outliving the process: the
+-/// drain has a deadline, and a message sleeping for half an hour sleeps through it.
+-///
+-/// The randomness comes from the same place a confirmation token's does (step `mailer/1.12-token`):
+-/// `getrandom`, never the clock, because a test has to be able to say what the delay was. A failed
+-/// generator falls back to the ceiling: a delay that is not random is still a delay, and refusing
+-/// to retry because the system cannot shuffle is worse than retrying too neatly.
++/// retrying are usually the same failure.
+ ///
+-/// The scaffold answers the base every time: no doubling, no jitter, and nothing calls it yet.
++/// The randomness comes from the same place a confirmation token's does. A failed generator falls
++/// back to the ceiling: a delay that is not random is still a delay, and refusing to retry because
++/// the system cannot shuffle is worse than retrying too neatly.
+ #[must_use]
+-pub fn backoff(_attempt: u32) -> Duration {
+-    RETRY_BASE
++pub fn backoff(attempt: u32) -> Duration {
++    let step = RETRY_BASE.saturating_mul(1_u32 << attempt.min(16));
++    let ceiling = step.min(RETRY_CAP);
++    let millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
++    let mut bytes = [0_u8; 8];
++    if getrandom::fill(&mut bytes).is_err() {
++        return ceiling;
++    }
++    let roll = u128::from(u64::from_le_bytes(bytes));
++    // In `u128`, because the interesting values overflow `u64` immediately: `millis * roll` for a
++    // full-width roll is a number that does not fit, and a saturating multiply answers the same
++    // millisecond every time — which is a jitter that is not one (the test below is what found it).
++    let scaled = u128::from(millis).saturating_mul(roll) / u128::from(u64::MAX);
++    Duration::from_millis(u64::try_from(scaled).unwrap_or(u64::MAX))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{DRAIN_DEADLINE, MAX_ATTEMPTS, Queue, RETRY_BASE, RETRY_CAP, backoff};
++    use crate::domain::Email;
++    use crate::email::{EmailSender, Message, SendError};
++    use std::sync::Arc;
++    use std::sync::atomic::{AtomicU32, Ordering};
++    use std::time::Duration;
++
++    fn message() -> Message {
++        Message {
++            to: Email::parse("ada@example.com").expect("the fixture address is valid"),
++            subject: "Confirm your subscription".to_owned(),
++            body: "Confirm your subscription by opening the link.".to_owned(),
++        }
++    }
++
++    /// A sender that fails a fixed number of times and then succeeds.
++    #[derive(Debug)]
++    struct Flaky {
++        failures: u32,
++        attempts: AtomicU32,
++    }
++
++    impl Flaky {
++        fn failing(times: u32) -> Self {
++            Self {
++                failures: times,
++                attempts: AtomicU32::new(0),
++            }
++        }
++
++        fn attempts(&self) -> u32 {
++            self.attempts.load(Ordering::Relaxed)
++        }
++    }
++
++    impl EmailSender for Flaky {
++        fn send(
++            &self,
++            _message: Message,
++        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
++        {
++            Box::pin(async move {
++                let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
++                if attempt <= self.failures {
++                    return Err(SendError::new(std::io::Error::other(
++                        "the mail server is away",
++                    )));
++                }
++                Ok(())
++            })
++        }
++    }
++
++    /// A sender that never answers: the mail server that accepts a connection and says nothing.
++    #[derive(Debug)]
++    struct Hanging;
++
++    impl EmailSender for Hanging {
++        fn send(
++            &self,
++            _message: Message,
++        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
++        {
++            Box::pin(std::future::pending())
++        }
++    }
++
++    #[test]
++    fn the_wait_is_bounded_by_the_cap_and_grows_with_the_attempt() {
++        for attempt in 0..12 {
++            let wait = backoff(attempt);
++            let ceiling = RETRY_BASE
++                .saturating_mul(1_u32 << attempt.min(16))
++                .min(RETRY_CAP);
++            assert!(
++                wait <= ceiling,
++                "attempt {attempt} waited {wait:?}, past its ceiling {ceiling:?}"
++            );
++            assert!(
++                wait < Duration::from_millis(0) || wait <= RETRY_CAP,
++                "a wait has to fit inside the cap"
++            );
++        }
++        assert!(
++            RETRY_BASE.saturating_mul(1_u32 << 12).min(RETRY_CAP) == RETRY_CAP,
++            "the fixture has to reach the cap, or this test proves nothing about it"
++        );
++    }
++
++    #[test]
++    fn the_wait_is_not_the_same_every_time() {
++        let waits: Vec<Duration> = (0..64).map(|_| backoff(2)).collect();
++        let distinct: std::collections::BTreeSet<Duration> = waits.iter().copied().collect();
++        assert!(
++            distinct.len() > 1,
++            "jitter that always answers the same value is not jitter: {waits:?}"
++        );
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_failing_send_is_retried_and_then_given_up_on() {
++        let retried = Flaky::failing(MAX_ATTEMPTS - 1);
++        let queue = Queue::start(Arc::new(retried));
++        let seat = queue.reserve().expect("an empty queue has room");
++        seat.send(message());
++        let delivered = queue.drain(DRAIN_DEADLINE).await.expect("the queue drains");
++        assert_eq!(delivered, 1, "the message arrived after its retries");
++
++        let hopeless = Arc::new(Flaky::failing(u32::MAX));
++        let queue = Queue::start(hopeless.clone());
++        let seat = queue.reserve().expect("an empty queue has room");
++        seat.send(message());
++        let delivered = queue
++            .drain(DRAIN_DEADLINE)
++            .await
++            .expect("a message that cannot be sent must not hold the drain open");
++        assert_eq!(delivered, 0, "nothing was delivered");
++        assert_eq!(
++            hopeless.attempts(),
++            MAX_ATTEMPTS,
++            "a send that keeps failing is attempted exactly {MAX_ATTEMPTS} times, not forever"
++        );
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_full_queue_refuses_instead_of_waiting() {
++        let queue = Queue::start(Arc::new(Hanging));
++        let mut seats = Vec::new();
++        for _ in 0..super::QUEUE_CAPACITY {
++            seats.push(queue.reserve().expect("the queue has room to fill"));
++        }
++        assert!(
++            queue.reserve().is_err(),
++            "a queue that is full has to say so, not wait for room that may never come"
++        );
++        // The seats are dropped here, which returns the capacity: a caller that took a seat and did
++        // not send anything (a signup that lost a race, say) must not cost the queue a slot.
++        drop(seats);
++        assert!(queue.reserve().is_ok(), "a returned seat is room again");
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn draining_gives_up_on_the_deadline_and_leaves_the_worker_behind() {
++        let queue = Queue::start(Arc::new(Hanging));
++        let seat = queue.reserve().expect("an empty queue has room");
++        seat.send(message());
++        let drained = queue.drain(Duration::from_millis(10)).await;
++        assert!(
++            drained.is_err(),
++            "a worker stuck on a message must not drain quietly: {drained:?}"
++        );
++    }
+ }
+diff --git a/src/error.rs b/src/error.rs
+index 955fe18..e113e7a 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -166,6 +166,27 @@ pub enum Error {
+         #[source]
+         source: getrandom::Error,
+     },
++    /// The delivery queue is full (step `mailer/1.14-worker`).
++    ///
++    /// The caller's request was refused *before* it wrote anything: a full queue means this service
++    /// has taken on more work than it has finished, and the honest answer is "come back", not a
++    /// subscriber nobody can confirm.
++    #[error("the service is at capacity: the delivery queue is full")]
++    QueueFull,
++    /// The delivery queue did not finish draining inside its deadline (step `mailer/1.14-worker`).
++    ///
++    /// Some messages may not have been delivered. This is the deployment's problem — the process was
++    /// asked to stop and could not do it in time — which is why the process ends with a failure code
++    /// rather than a clean zero.
++    #[error("the delivery queue did not drain within its deadline")]
++    DrainTimeout,
++    /// The delivery worker is gone (step `mailer/1.14-worker`).
++    #[error("the delivery worker is gone")]
++    WorkerLost {
++        /// What the runtime reported when the worker was waited for.
++        #[source]
++        source: Box<tokio::task::JoinError>,
++    },
+     /// The database could not be reached, or refused what it was asked to do.
+     #[error("the database could not {operation}")]
+     Database {
+@@ -192,7 +213,7 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+-    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, a token could not be issued, or the database could not be connected or migrated | `1` | whoever deployed it |
++    /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, a token could not be issued, the delivery queue is full or did not drain, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
+     /// A value a caller sent that the domain refuses is the caller's problem too — the same code as
+     /// a unusable flag — and so are an address that already has a subscriber and a confirmation
+@@ -220,6 +241,9 @@ impl Error {
+             | Error::Listen { .. }
+             | Error::PasswordHash { .. }
+             | Error::TokenGeneration { .. }
++            | Error::QueueFull
++            | Error::DrainTimeout
++            | Error::WorkerLost { .. }
+             | Error::Database { .. }
+             | Error::Migration { .. } => ExitCode::FAILURE,
+         }
+diff --git a/src/http.rs b/src/http.rs
+index 24577b1..7aa6a7c 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -21,6 +21,12 @@
+ //! * **the state carries a port, not an adapter** (step `mailer/1.13-email-port`): what a handler can
+ //!   reach is `Arc<dyn EmailSender>`, and building the state with a fake in it is a constructor
+ //!   argument — the seam a test needs is one the deployment does not have to know about;
++//! * **the answer does not wait for the mail server** (step `mailer/1.14-worker`): a handler
++//!   reserves a seat in the delivery queue *before* it writes anything and hands the message
++//!   over afterwards, so a queue that is full is a `503` for a signup that wrote no row, and a
++//!   slow mail server is nobody's latency but one worker's. Stopping is the other half of that
++//!   decision: [`serve_with_shutdown`] stops taking requests, and the caller drains what is
++//!   already queued behind them;
+ //! * **a failure is a status code and one sentence** (step `mailer/1.11-signup`): [`status_of`] is
+ //!   the same table [`Error::exit_code`] writes for a shell — what the caller can fix is a 4xx,
+ //!   what only the deployment can fix is a 5xx — and a 5xx never carries the reason: that is a fact
+@@ -36,18 +42,20 @@ use serde::{Deserialize, Serialize};
+ use tokio::net::TcpListener;
+ use tracing::{info, instrument, warn};
+ 
++use std::future::Future;
+ use std::sync::Arc;
+ 
+ use crate::config::Config;
+ use crate::confirmation::{self, Token};
+ use crate::db::Database;
++use crate::delivery::Queue;
+ use crate::email::{EmailSender, Logging};
+ use crate::error::Error;
+ use crate::logging::RunId;
+ use crate::signup::{SignupRequest, subscribe};
+ 
+-/// Everything a handler may reach: the configuration this process started with, and the database,
+-/// when it has one.
++/// Everything a handler may reach: the configuration this process started with, the database when
++/// it has one, and the delivery queue (step `mailer/1.14-worker`).
+ ///
+ /// It travels in the router (`Router::with_state`) instead of living in a global, so a test can run
+ /// two differently configured apps at once (step `mailer/1.8-test-harness`) and nothing has to be
+@@ -56,7 +64,7 @@ use crate::signup::{SignupRequest, subscribe};
+ pub struct AppState {
+     config: Config,
+     database: Option<Database>,
+-    sender: Arc<dyn EmailSender>,
++    delivery: Queue,
+ }
+ 
+ impl AppState {
+@@ -88,6 +96,10 @@ impl AppState {
+     /// Nothing about it is test-only — a deployment that grows a second adapter picks it the same way
+     /// — and the binary keeps calling [`AppState::start`], which is this function with [`Logging`].
+     ///
++    /// The sender is not a field: it goes into the worker behind the delivery queue (step
++    /// `mailer/1.14-worker`), which is the only thing in this process that sends anything, and
++    /// [`AppState::delivery`] is how a handler reaches it.
++    ///
+     /// # Errors
+     ///
+     /// Reports [`Error::Database`] when the configured database cannot be reached, and
+@@ -104,7 +116,7 @@ impl AppState {
+             return Ok(Self {
+                 config,
+                 database: None,
+-                sender,
++                delivery: Queue::start(sender),
+             });
+         };
+ 
+@@ -113,14 +125,18 @@ impl AppState {
+         Ok(Self {
+             config,
+             database: Some(database),
+-            sender,
++            delivery: Queue::start(sender),
+         })
+     }
+ 
+-    /// The sender this state was built with.
++    /// The delivery queue this state was built with (step `mailer/1.14-worker`).
++    ///
++    /// A handler reserves a seat here *before* it does the work a message is about, and hands the
++    /// message over afterwards: that is the whole of this service's contact with the sender, and
++    /// the order is what makes a full queue a refusal that wrote nothing.
+     #[must_use]
+-    pub fn sender(&self) -> &dyn EmailSender {
+-        self.sender.as_ref()
++    pub fn delivery(&self) -> &Queue {
++        &self.delivery
+     }
+ 
+     /// The configuration the process started with.
+@@ -228,7 +244,15 @@ async fn signup(
+         return not_ready("no database is configured");
+     };
+ 
+-    match subscribe(database.pool(), state.sender(), request).await {
++    // The seat is taken **before** the insert (step `mailer/1.14-worker`): a queue with no
++    // room refuses this request while it has written nothing, so a client that retries is
++    // not sent to the `409` of a subscriber nobody could ever confirm.
++    let seat = match state.delivery().reserve() {
++        Ok(seat) => seat,
++        Err(error) => return answer(error),
++    };
++
++    match subscribe(database.pool(), seat, request).await {
+         Ok(email) => (
+             StatusCode::CREATED,
+             Json(SubscriberState {
+@@ -303,6 +327,10 @@ fn status_of(error: &Error) -> StatusCode {
+         Error::TokenUnknown => StatusCode::NOT_FOUND,
+         Error::AlreadySubscribed { .. } | Error::AlreadyConfirmed { .. } => StatusCode::CONFLICT,
+         Error::TokenExpired => StatusCode::GONE,
++        // Capacity is not a fault of the request (step `mailer/1.14-worker`): `503` says
++        // "this service is up and cannot take that work right now", which is what a client
++        // that retries can act on, where a `500` says "something here is broken".
++        Error::QueueFull => StatusCode::SERVICE_UNAVAILABLE,
+         _ => StatusCode::INTERNAL_SERVER_ERROR,
+     }
+ }
+@@ -366,6 +394,24 @@ impl Body {
+ /// machine does not have) or when serving stops with an I/O failure; the message names the address,
+ /// which is the first thing a deployment needs to know.
+ pub async fn serve(state: AppState, id: &RunId) -> Result<(), Error> {
++    serve_with_shutdown(state, id, std::future::pending()).await
++}
++
++/// Bind the configured address and serve until `shutdown` finishes (step `mailer/1.14-worker`).
++///
++/// The future is the difference between a service that runs until somebody kills it and one that can
++/// be asked to stop: what it delivers is the "stop taking requests" half of a shutdown, and a caller
++/// that cares about the work already accepted has something to do when it resolves — the delivery
++/// queue is drained after this returns, never before.
++///
++/// # Errors
++///
++/// Reports [`Error::Listen`] under the same two conditions as [`serve`].
++pub async fn serve_with_shutdown(
++    state: AppState,
++    id: &RunId,
++    shutdown: impl Future<Output = ()> + Send + 'static,
++) -> Result<(), Error> {
+     let requested = format!(
+         "{}:{}",
+         state.config().listen.host,
+@@ -377,7 +423,7 @@ pub async fn serve(state: AppState, id: &RunId) -> Result<(), Error> {
+             address: requested.clone(),
+             source,
+         })?;
+-    serve_on(listener, state, id)
++    serve_on_with_shutdown(listener, state, id, shutdown)
+         .await
+         .map_err(|error| match error {
+             Error::Listen { source, .. } => Error::Listen {
+@@ -395,12 +441,36 @@ pub async fn serve(state: AppState, id: &RunId) -> Result<(), Error> {
+ /// the socket. The address that is logged is the one that was bound, never the one that was asked
+ /// for.
+ ///
++/// There is no shutdown future here, and that is what the harness wants: it stops this future by
++/// dropping it when the test ends. A process that has signals to wait for calls
++/// [`serve_on_with_shutdown`].
++///
+ /// # Errors
+ ///
+ /// Reports [`Error::Listen`] when the listener has no address or when serving stops with an I/O
+ /// failure.
+-#[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
+ pub async fn serve_on(listener: TcpListener, state: AppState, id: &RunId) -> Result<(), Error> {
++    serve_on_with_shutdown(listener, state, id, std::future::pending()).await
++}
++
++/// Serve on a listener somebody else bound, until `shutdown` finishes (step `mailer/1.14-worker`).
++///
++/// "Graceful" is axum's own promise, and it is worth reading as three steps: the listener stops
++/// accepting, the requests that are already in flight are finished, and then this future resolves.
++/// Nothing about the delivery queue is in this function — draining it is the caller's next move, and
++/// the order matters: stop taking work first, then finish the work that was taken.
++///
++/// # Errors
++///
++/// Reports [`Error::Listen`] when the listener has no address or when serving stops with an I/O
++/// failure.
++#[instrument(name = "serve", skip_all, fields(run.id = %id.as_str()))]
++pub async fn serve_on_with_shutdown(
++    listener: TcpListener,
++    state: AppState,
++    id: &RunId,
++    shutdown: impl Future<Output = ()> + Send + 'static,
++) -> Result<(), Error> {
+     let bound = listener.local_addr().map_err(|source| Error::Listen {
+         address: "the bound address".to_owned(),
+         source,
+@@ -409,6 +479,7 @@ pub async fn serve_on(listener: TcpListener, state: AppState, id: &RunId) -> Res
+     // logging is the one that was actually bound: it is how a caller learns where to send requests.
+     info!(address = %bound, "listening");
+     axum::serve(listener, router(state))
++        .with_graceful_shutdown(shutdown)
+         .await
+         .map_err(|source| Error::Listen {
+             address: bound.to_string(),
+@@ -481,6 +552,7 @@ mod tests {
+             Error::PasswordHash {
+                 source: argon2::password_hash::Error::Crypto,
+             },
++            Error::QueueFull,
+         ];
+         for error in &deployment {
+             assert!(
+@@ -488,6 +560,12 @@ mod tests {
+                 "{error} must not be blamed on the caller"
+             );
+         }
++        assert_eq!(
++            status_of(&Error::QueueFull),
++            StatusCode::SERVICE_UNAVAILABLE,
++            "a full queue is not a broken service: `503` is the answer a client that retries \
++             can act on"
++        );
+ 
+         // A caller's failure ends the process with `2` and an HTTP caller with a 4xx, and a
+         // deployment's with `1` and a 5xx: two spellings of one decision.
+diff --git a/src/lib.rs b/src/lib.rs
+index 06de042..2739a63 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -16,6 +16,7 @@ use std::path::PathBuf;
+ pub mod config;
+ pub mod confirmation;
+ pub mod db;
++pub mod delivery;
+ pub mod domain;
+ pub mod email;
+ pub mod error;
+@@ -26,6 +27,7 @@ pub mod signup;
+ pub use config::{Config, Flags};
+ pub use confirmation::Token;
+ pub use db::Database;
++pub use delivery::Queue;
+ pub use domain::{Email, Password, SubscriberName};
+ pub use email::{EmailSender, Message, SendError};
+ pub use error::{Error, SettingSource};
+diff --git a/src/main.rs b/src/main.rs
+index 717857b..c4c7e2a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,8 +11,10 @@ use std::process::ExitCode;
+ 
+ use anyhow::Result;
+ 
++use mailer::delivery::DRAIN_DEADLINE;
+ use mailer::logging::{self, RunId};
+ use mailer::{Config, Error, Request, USAGE};
++use tracing::{error, info};
+ 
+ #[tokio::main]
+ async fn main() -> ExitCode {
+@@ -62,13 +64,62 @@ async fn service() -> Result<ExitCode> {
+             // database this build cannot use has to stop the process before anything can connect to
+             // a half-started service.
+             let state = mailer::http::AppState::start(config, &id).await?;
+-            mailer::http::serve(state, &id).await?;
++            // The queue outlives the listener (step `mailer/1.14-worker`): the handle is taken
++            // before serving starts, because the state is dropped when it stops, and the worker
++            // has to be drained *after* the last request was answered. A process that is asked to
++            // stop and stops is the difference between a deploy that loses the work it accepted
++            // and one that does not.
++            let delivery = state.delivery().clone();
++            mailer::http::serve_with_shutdown(state.clone(), &id, stop()).await?;
++            drop(state);
++            // A clean drain is what `SIGTERM` is supposed to mean, and the worker behind the queue
++            // has already logged what it delivered. A deadline that passes with messages still in
++            // the queue is the other ending: they are not delivered, and a process that exits `0`
++            // into a lost email is a process that lies to its orchestrator — so the exit code says
++            // the deployment has a problem (step `mailer/1.5-errors`).
++            if let Err(failure) = delivery.drain(DRAIN_DEADLINE).await {
++                error!(%failure, "the delivery queue did not drain before its deadline");
++                return Ok(failure.exit_code());
++            }
+         }
+         Request::Help | Request::Version => unreachable!("answered above"),
+     }
+     Ok(ExitCode::SUCCESS)
+ }
+ 
++/// Wait for the signal that means stop: `SIGTERM`, which is what an orchestrator sends, or an
++/// interrupt from whoever is at the terminal (step `mailer/1.14-worker`).
++///
++/// This is a property of a *process*, so it lives in the binary: a test that drives the library
++/// has no signals to wait for, and it stops the same server by dropping the future instead.
++async fn stop() {
++    #[cfg(unix)]
++    {
++        use tokio::signal::unix::{SignalKind, signal};
++        let mut terminate = match signal(SignalKind::terminate()) {
++            Ok(terminate) => terminate,
++            // A signal that cannot be watched is not a reason to refuse to serve: the interrupt
++            // still stops this process, and saying so is more useful than an outage.
++            Err(failure) => {
++                error!(%failure, "SIGTERM cannot be watched: an interrupt is the way to stop");
++                let _ = tokio::signal::ctrl_c().await;
++                return;
++            }
++        };
++        tokio::select! {
++            _ = terminate.recv() => info!("SIGTERM received: stopping, and finishing what is queued"),
++            _ = tokio::signal::ctrl_c() => {
++                info!("interrupt received: stopping, and finishing what is queued")
++            }
++        }
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = tokio::signal::ctrl_c().await;
++        info!("interrupt received: stopping, and finishing what is queued");
++    }
++}
++
+ /// Report a failure: what happened, then the exit code the shell acts on.
+ ///
+ /// The whole cause chain is printed (`{failure:#}`), because "cannot read `mailer.toml`" without
+diff --git a/src/signup.rs b/src/signup.rs
+index 7206fbf..b7b66e1 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -14,16 +14,21 @@
+ //!   as a list of who shares one;
+ //! * **the parses come first** — `Email`, `SubscriberName` and `Password` are built before anything
+ //!   touches the database (step `mailer/1.10-domain-types`), so a request that cannot be stored is
+-//!   refused without a row being written for it.
++//!   refused without a row being written for it;
++//! * **the seat in the queue is taken before the row is written** (step `mailer/1.14-worker`):
++//!   the caller reserves a [`Permit`] and hands it in, so a queue with no room refuses a signup
++//!   that has written nothing — a client that retries arrives at an empty database, where a
++//!   subscriber nobody can confirm would be a dead end. The message is handed over *after* the
++//!   insert wins: a confirmation link for a row that does not exist is a link to nothing.
+ 
+ use argon2::{Argon2, PasswordHash, PasswordHasher};
+ use serde::Deserialize;
+ use sqlx::PgPool;
+-use tracing::warn;
++use tokio::sync::mpsc::Permit;
+ 
+ use crate::confirmation::{CONFIRMATION_WINDOW_SECS, Token};
+ use crate::domain::{Email, Password, SubscriberName};
+-use crate::email::{CONFIRMATION_BASE_URL, CONFIRMATION_SUBJECT, EmailSender, Message};
++use crate::email::{CONFIRMATION_BASE_URL, CONFIRMATION_SUBJECT, Message};
+ use crate::error::Error;
+ 
+ /// The body of `POST /signup`, as it arrives: three raw strings.
+@@ -54,6 +59,13 @@ pub struct SignupRequest {
+ /// is no moment in which a pending row exists and nobody can confirm it. `now() + …` is the
+ /// database's clock, which is the one the confirmation will compare against.
+ ///
++/// The seat in the delivery queue arrives as an argument (step `mailer/1.14-worker`): a signup
++/// does not wait for a mail server any more, and it does not decide what a full queue means
++/// either — whoever reserved the seat did that before this function was reached. The message is
++/// handed over *after* the insert wins, so nothing is queued for a subscriber that does not
++/// exist, and a caller that loses the race leaves the seat empty instead of filling the queue
++/// with a message nobody asked for.
++///
+ /// # Errors
+ ///
+ /// Reports [`Error::InvalidInput`] when the email, the name or the password is not a value this
+@@ -63,7 +75,7 @@ pub struct SignupRequest {
+ /// the address already has a subscriber.
+ pub async fn subscribe(
+     pool: &PgPool,
+-    sender: &dyn EmailSender,
++    seat: Permit<'_, Message>,
+     request: SignupRequest,
+ ) -> Result<Email, Error> {
+     let email = Email::parse(&request.email)?;
+@@ -94,17 +106,17 @@ pub async fn subscribe(
+         // request. Where the subscriber starts (`pending`) is the column default of the migration.
+         Some(_) => {
+             // The subscriber exists now, and the email is how they learn that they have to confirm.
+-            // A send that fails does **not** fail the signup: the row is written, the address is
+-            // good, and the mail server being away is a delivery problem. Undoing a signup because a
+-            // mail server is down is throwing away a subscriber this service already has — the
+-            // retries for a failed message arrive with the worker of step `mailer/1.14-worker`, and
+-            // what a failed send owes *today* is a line in the log, with the reason.
+-            let message = confirmation_message(email.clone(), &token);
+-            if let Err(error) = sender.send(message).await {
+-                warn!(%error, to = %email, "the confirmation email could not be sent");
+-            }
++            // The seat was reserved before the insert, so handing the message over cannot fail and
++            // cannot wait: the worker behind the queue is what will try to send it, and a mail
++            // server that is away is a retry (step `mailer/1.14-worker`) rather than a signup that
++            // is lost — the row is written, the address is good, and what a failed send owes is a
++            // line in the log.
++            seat.send(confirmation_message(email.clone(), &token));
+             Ok(email)
+         }
++        // Losing the race drops the seat instead of sending anything: its room goes back to the
++        // queue, because a refused signup must not cost the service a slot for a message it will
++        // never send.
+         None => Err(Error::AlreadySubscribed {
+             email: email.as_str().to_owned(),
+         }),

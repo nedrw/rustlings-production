@@ -1,0 +1,168 @@
+diff --git a/src/delivery.rs b/src/delivery.rs
+new file mode 100644
+index 0000000..0d3d2cc
+--- /dev/null
++++ b/src/delivery.rs
+@@ -0,0 +1,162 @@
++//! The delivery queue: one bounded queue, one worker, and what happens when either runs out
++//! (step `mailer/1.14-worker`).
++//!
++//! Step `mailer/1.13-email-port` gave the service a place to put a message. This step is about
++//! *when*: sending inside `POST /signup` makes the caller wait for a mail server, and it makes a
++//! mail server that is slow into a service that is slow. So the request hands the message to a
++//! queue and answers, and one worker task does the sending.
++//!
++//! Four decisions, and each of them is a way the queue could have been written wrong:
++//!
++//! * **the queue is bounded** ([`QUEUE_CAPACITY`]). An unbounded queue turns "the mail server is
++//!   away" into "this process ran out of memory", and the failure shows up somewhere else entirely
++//!   — which is why the *request* is what gets refused (a `503`), not the process;
++//! * **capacity is reserved before the work it is for** ([`Queue::reserve`]): the handler takes its
++//!   seat *before* the insert, so a full queue refuses a signup that has not written anything yet
++//!   (a refused client can try again; a subscriber that exists with nobody able to confirm it
++//!   cannot be fixed by trying again). The seat is also the cancel-safe way to send: a `send`
++//!   cancelled inside a `select!` loses the message, a reserved seat does not;
++//! * **a failed send is retried, with jitter** ([`backoff`]): N workers whose mail server just
++//!   recovered must not come back in step, which is what makes the delay random *and* increasing;
++//! * **stopping means stopping taking work, then draining** ([`Queue::drain`]): the worker is told
++//!   to close the queue to new messages and finish what it already has, and the caller waits for
++//!   that — at most [`DRAIN_DEADLINE`], because a process that will not stop is a process an
++//!   orchestrator kills, and being killed is how messages are lost.
++//!
++//! # What this scaffold proves
++//!
++//! Nothing yet: every one of those four decisions is a hole here, and this file is deliberately the
++//! shape a first draft reaches for instead of the shape the step asks for.
++//!
++//! * there is **no queue** — [`Seat::send`] spawns a task per message, so nothing bounds how many
++//!   sends are in flight, nothing says when they are all done, and a failure is one log line;
++//! * [`Queue::reserve`] cannot refuse anything, because there is no bound to refuse against
++//!   ([`QUEUE_CAPACITY`] is a number this file only claims), so the `503` of a full queue does not
++//!   exist;
++//! * [`backoff`] answers the base every time — no doubling, no jitter — and nothing calls it:
++//!   a message is attempted once;
++//! * [`Queue::drain`] answers `0` without waiting, because there is nothing to wait *for*: the
++//!   tasks it spawned are simply dropped when the process stops, in the middle of what they were
++//!   doing.
++//!
++//! The step's spec (`tests/spec_worker.rs`) fails here until all four are replaced by one queue,
++//! one worker, and one drain.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use tracing::warn;
++
++use crate::email::{EmailSender, Message};
++use crate::error::Error;
++
++/// How many messages may wait for the worker before a request is refused.
++///
++/// A bound is the point of a queue in a service: it is a promise about how much work this process
++/// has taken on that it has not finished yet, and it is what turns backpressure into an answer a
++/// caller can act on instead of memory growth nobody is watching.
++///
++/// The number itself is a deployment's business — a later step turns it into a setting — and what
++/// this step fixes is that there *is* one. It is small, because the only way to fill a queue here is
++/// to accept real signups one at a time, and every one of them hashes a password.
++pub const QUEUE_CAPACITY: usize = 32;
++
++/// How many times one message is handed to the sender before it is given up on.
++///
++/// A message the mail server keeps refusing is a message that may never arrive, and a worker that
++/// keeps asking is a worker that never gets to the next message.
++pub const MAX_ATTEMPTS: u32 = 3;
++
++/// The wait before the second attempt: the first delay, before jitter and doubling.
++const RETRY_BASE: Duration = Duration::from_millis(250);
++
++/// How long the worker is given to finish what it already has, once the process is asked to stop.
++pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
++
++/// A queue with one worker behind it.
++///
++/// Cloneable (it is a handle, like the database pool): every clone sends into the same queue and
++/// they all share one worker, so a handler cannot accidentally grow a second one. Cloning does not
++/// give a caller a second `drain` to race with — the first one to take the worker's handle is the
++/// one that waits for it.
++#[derive(Debug, Clone)]
++pub struct Queue {
++    /// Where a message goes in this scaffold: straight to the sender, in a task of its own.
++    sender: Arc<dyn EmailSender>,
++}
++
++impl Queue {
++    /// Start the worker and answer a handle to the queue in front of it.
++    ///
++    /// There is no worker yet, and nothing to hand it later: the sending half of this scaffold is
++    /// the seat.
++    #[must_use]
++    pub fn start(sender: Arc<dyn EmailSender>) -> Self {
++        Self { sender }
++    }
++
++    /// Reserve room for one message, or refuse the caller that wanted it.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting. The
++    /// scaffold never reports it: nothing waits here, so there is nothing to refuse.
++    pub fn reserve(&self) -> Result<Seat<'_>, Error> {
++        Ok(Seat { sender: &self.sender })
++    }
++
++    /// Stop taking work, finish what is queued, and answer how many messages were delivered.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::DrainTimeout`] when the worker is still busy after `deadline`. The scaffold
++    /// answers `0` without waiting: what it spawned is not tracked, so there is nothing to count.
++    pub async fn drain(self, _deadline: Duration) -> Result<usize, Error> {
++        Ok(0)
++    }
++}
++
++/// The seat a caller holds while it does the work its message is about.
++///
++/// Taking a seat before the work and sending on it afterwards is the shape the step is about; what
++/// the scaffold is missing is that a seat means anything — it is free, it is unlimited, and the
++/// message leaves it immediately.
++pub struct Seat<'a> {
++    /// What the message is handed to (step `mailer/1.13-email-port`).
++    sender: &'a Arc<dyn EmailSender>,
++}
++
++impl Seat<'_> {
++    /// Hand the message over.
++    ///
++    /// It does not fail, and it does not wait: the send happens in a task nobody joins. That is how
++    /// a process loses the messages it accepted — they are dropped when it stops — and how a
++    /// failure becomes a log line instead of a retry.
++    pub fn send(self, message: Message) {
++        let sender = Arc::clone(self.sender);
++        tokio::spawn(async move {
++            if let Err(error) = sender.send(message).await {
++                warn!(%error, "an email could not be sent");
++            }
++        });
++    }
++}
++
++/// The wait before the next attempt: exponential, capped, and jittered.
++///
++/// *Full jitter*, in the shape of the AWS backoff article: a random delay in
++/// `[0, min(cap, base · 2^attempt))`, not a fixed one. The randomisation is the point — a fleet of
++/// workers retrying one broken mail server must not come back in step, and the failures they are
++/// retrying are usually the same failure. A cap keeps the wait from outliving the process: the
++/// drain has a deadline, and a message sleeping for half an hour sleeps through it.
++///
++/// The randomness comes from the same place a confirmation token's does (step `mailer/1.12-token`):
++/// `getrandom`, never the clock, because a test has to be able to say what the delay was. A failed
++/// generator falls back to the ceiling: a delay that is not random is still a delay, and refusing
++/// to retry because the system cannot shuffle is worse than retrying too neatly.
++///
++/// The scaffold answers the base every time: no doubling, no jitter, and nothing calls it yet.
++#[must_use]
++pub fn backoff(_attempt: u32) -> Duration {
++    RETRY_BASE
++}
