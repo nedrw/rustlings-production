@@ -495,7 +495,8 @@ teaches = ["sec/authz-tenant-isolation@apply"]
 requires = ["db/migrations@apply", "sec/authn-session@apply"]
 run = { cmd = "cargo test -p mailer --test spec_authz" }
 spec = ["spec/1.18/authz.rs"]
-scaffold = "scaffold/1.18-authz-boundary.patch"
+# No scaffold: the step is a route, a scoped query and an error variant, and step 1.16 already
+# showed every shape involved. The spec is the contract (authoring.md §5.2).
 solution = "solutions/1.18-authz-boundary.patch"
 gates = [
     "spec-integrity",

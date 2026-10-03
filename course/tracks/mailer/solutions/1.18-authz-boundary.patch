@@ -1,0 +1,252 @@
+diff --git a/.sqlx/query-529fb5d51021decd9cd56ee5c7af25a350fc0b87a6add0044db11174cd7a1b2a.json b/.sqlx/query-529fb5d51021decd9cd56ee5c7af25a350fc0b87a6add0044db11174cd7a1b2a.json
+new file mode 100644
+index 0000000..9e79fa5
+--- /dev/null
++++ b/.sqlx/query-529fb5d51021decd9cd56ee5c7af25a350fc0b87a6add0044db11174cd7a1b2a.json
+@@ -0,0 +1,59 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT issue_deliveries.issue_id, issues.subject, issue_deliveries.sent_at::text, issue_deliveries.attempts FROM issue_deliveries JOIN issues ON issues.id = issue_deliveries.issue_id WHERE issue_deliveries.subscriber_id = $1 ORDER BY issues.id DESC",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "issue_id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "issue_deliveries",
++            "name": "issue_id"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "subject",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "issues",
++            "name": "subject"
++          }
++        }
++      },
++      {
++        "ordinal": 2,
++        "name": "sent_at",
++        "type_info": "Text",
++        "origin": "Expression"
++      },
++      {
++        "ordinal": 3,
++        "name": "attempts",
++        "type_info": "Int4",
++        "origin": {
++          "Table": {
++            "table": "issue_deliveries",
++            "name": "attempts"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false,
++      false,
++      null,
++      false
++    ]
++  },
++  "hash": "529fb5d51021decd9cd56ee5c7af25a350fc0b87a6add0044db11174cd7a1b2a"
++}
+diff --git a/src/error.rs b/src/error.rs
+index a4d4d32..57aee43 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -166,6 +166,17 @@ pub enum Error {
+         #[source]
+         source: getrandom::Error,
+     },
++    /// A caller asked for something that is not theirs, or that does not exist (step
++    /// `mailer/1.18-authz-boundary`).
++    ///
++    /// One variant for both, and that is the whole point: a resource somebody else owns has to be
++    /// indistinguishable from one that was never there, or the difference tells a stranger which ids
++    /// are worth guessing. It is the caller's problem (the exit code is `2`, the status a `404`).
++    #[error("no such {what}")]
++    NotFound {
++        /// What the caller asked for, phrased for the message.
++        what: &'static str,
++    },
+     /// A caller tried to log in and is not who they said they were (step `mailer/1.16-sessions`).
+     ///
+     /// One variant for both halves of that answer — no such address, and a password that does not
+@@ -258,6 +269,7 @@ impl Error {
+             | Error::TokenUnknown
+             | Error::TokenExpired
+             | Error::AlreadyConfirmed { .. }
++            | Error::NotFound { .. }
+             | Error::InvalidCredentials
+             | Error::NotAuthenticated
+             | Error::NotConfirmed => ExitCode::from(2),
+diff --git a/src/http.rs b/src/http.rs
+index 3beea3d..220bcd0 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -39,7 +39,7 @@
+ 
+ use axum::Router;
+ use axum::extract::rejection::{JsonRejection, QueryRejection};
+-use axum::extract::{Json, Query, State};
++use axum::extract::{Json, Path, Query, State};
+ use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+ use axum::http::{HeaderMap, StatusCode};
+ use axum::response::{IntoResponse, Response};
+@@ -182,6 +182,7 @@ pub fn router(state: AppState) -> Router {
+         .route("/login", post(login))
+         .route("/logout", post(logout))
+         .route("/me", get(me))
++        .route("/subscribers/{id}/deliveries", get(deliveries_of))
+         .route("/confirm", get(confirm))
+         .route("/newsletter", post(newsletter))
+         .fallback(not_found)
+@@ -295,6 +296,46 @@ async fn signup(
+ /// reads it all have to agree, and a constant is how they do.
+ const SESSION_COOKIE: &str = "session";
+ 
++/// `GET /subscribers/{id}/deliveries`: the messages one subscriber was owed
++/// (step `mailer/1.18-authz-boundary`).
++///
++/// The id is in the path, and the first thing this handler does is compare it with the identity the
++/// session carries. That comparison is not the authorization, it is the *answer*: a caller asking for
++/// somebody else's id gets the same `404` as a caller asking for an id that was never created, so the
++/// boundary does not double as a way to find out which ids exist.
++///
++/// The query behind it is scoped by the subscriber as well (see [`newsletter::history`]), and that is
++/// deliberate belt-and-braces: the check above is a fact about this handler, while the `WHERE` is a
++/// fact about the statement — and a later route that forgets to compare has still not written the
++/// leak into SQL.
++async fn deliveries_of(
++    State(state): State<AppState>,
++    Path(id): Path<i64>,
++    headers: HeaderMap,
++) -> Response {
++    let Some(database) = state.database() else {
++        warn!("a delivery history was asked for with no database configured");
++        return not_ready("no database is configured");
++    };
++    let identity = match identity(database.pool(), &headers).await {
++        Ok(identity) => identity,
++        Err(error) => return answer(error),
++    };
++    if identity.subscriber != id {
++        warn!(
++            asked = id,
++            subscriber = identity.subscriber,
++            "a subscriber asked for somebody else's deliveries"
++        );
++        return answer(Error::NotFound { what: "subscriber" });
++    }
++
++    match newsletter::history(database.pool(), identity.subscriber).await {
++        Ok(history) => (StatusCode::OK, Json(history)).into_response(),
++        Err(error) => answer(error),
++    }
++}
++
+ /// `POST /login`: credentials in, a session out (step `mailer/1.16-sessions`).
+ ///
+ /// The answer carries the token twice — in the body it is not, and in a `Set-Cookie` header it is —
+@@ -583,6 +624,9 @@ fn status_of(error: &Error) -> StatusCode {
+         // `mailer/1.16-sessions`). Credentials that do not match are the same `401` for the same
+         // reason, and an unconfirmed subscriber is a `403`: the password was right, the account is
+         // not usable yet.
++        // An id that belongs to somebody else is an id this caller cannot see (step
++        // `mailer/1.18-authz-boundary`): `404`, because a `403` would say that it exists.
++        Error::NotFound { .. } => StatusCode::NOT_FOUND,
+         Error::NotAuthenticated | Error::InvalidCredentials => StatusCode::UNAUTHORIZED,
+         Error::NotConfirmed => StatusCode::FORBIDDEN,
+         // Capacity is not a fault of the request (step `mailer/1.14-worker`): `503` says
+diff --git a/src/newsletter.rs b/src/newsletter.rs
+index 75407e1..f147222 100644
+--- a/src/newsletter.rs
++++ b/src/newsletter.rs
+@@ -31,7 +31,7 @@
+ //! them up until a later track's claimer does. Naming that is part of the design: the alternative
+ //! (put the queue inside the transaction) is worse in a way that is invisible until production.
+ 
+-use serde::Deserialize;
++use serde::{Deserialize, Serialize};
+ use sqlx::PgPool;
+ use tracing::warn;
+ 
+@@ -236,6 +236,65 @@ pub async fn fan_out(pool: &PgPool, queue: &Queue, issue: i64) -> Result<usize,
+     Ok(queued)
+ }
+ 
++/// One copy of one issue, as the subscriber it belongs to sees it (step `mailer/1.18-authz-boundary`).
++///
++/// This is a *read* of somebody's own data, and it is deliberately shaped as one: the query is scoped
++/// by the subscriber it is asked for, so there is no list of other people's rows to filter afterwards
++/// — and no way to forget to filter it.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
++pub struct DeliveryRecord {
++    /// The issue this copy is of.
++    pub issue: i64,
++    /// What the issue is about.
++    pub subject: String,
++    /// When the message was handed to the sender, if it has been.
++    pub sent_at: Option<String>,
++    /// How many times it was attempted.
++    pub attempts: i32,
++}
++
++/// The copies of the issues one subscriber was owed, newest first.
++///
++/// The one parameter is the subscriber, and it comes from the *session* (step `mailer/1.16-sessions`),
++/// never from the request: a handler that passes an id it was given in a path has handed the
++/// authorization decision to whoever asked.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the rows cannot be read.
++pub async fn history(pool: &PgPool, subscriber: i64) -> Result<Vec<DeliveryRecord>, Error> {
++    // `sent_at::text` rather than a timestamp: this service reads and writes clocks in SQL
++    // (`now()`), and the type a timestamp would come back as is a dependency on a time crate that
++    // nothing else here needs. What a client wants is a string anyway.
++    let rows = sqlx::query!(
++        "SELECT issue_deliveries.issue_id, \
++                issues.subject, \
++                issue_deliveries.sent_at::text, \
++                issue_deliveries.attempts \
++           FROM issue_deliveries \
++           JOIN issues ON issues.id = issue_deliveries.issue_id \
++          WHERE issue_deliveries.subscriber_id = $1 \
++          ORDER BY issues.id DESC",
++        subscriber
++    )
++    .fetch_all(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "read a subscriber's delivery history",
++        source: Box::new(source),
++    })?;
++
++    Ok(rows
++        .into_iter()
++        .map(|row| DeliveryRecord {
++            issue: row.issue_id,
++            subject: row.subject,
++            sent_at: row.sent_at,
++            attempts: row.attempts,
++        })
++        .collect())
++}
++
+ /// What a claimed issue delivery needs in order to be sent: where it goes, and what it says.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Copy {
