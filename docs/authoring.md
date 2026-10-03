@@ -182,6 +182,12 @@ track 骨架的规则与 patch 的规则一样）。
 7. 规格文件也会进 fmt/clippy 的 `--all-targets`，所以它自己必须 rustfmt 干净、没有 warning：
    课程不能要求学员遵守自己都不遵守的 fmt。`rustfmt --edition 2024 --config-path rustfmt.toml --check \
   course/tracks/*/spec/**/*.rs` 可以本地验证（`kiln spec manifest` 之后记得重生成清单）。
+8. **一条规格要在它会被拿去判的每一棵树上都成立**，不只是它自己那一步的树：`selftest` 用本步的树
+   （scaffold 后 / 参考解后），而 `verify` 与「学员做到后面再回头跑早期步骤」用的是**最终树**。所以规格
+   不能依赖“此刻服务还没有 HTTP 层”这类事实。反例（已修）：1.6 的规格用 `Command::output()` 等日志进程
+   自己退出——1.7 加了监听后它永远不退出，`verify` 与项目自己的 `cargo xtask ci`（`spec_ci` 会启动它）
+   都挂死。写法：给它一个空闲端口（`--listen-port`）、读到「启动结束」的标点（进程结束 / 说出 `listening`
+   / 那个端口开始应答）就停手，再断言行内容；退出码只在确实有退出时才断。
 
 ## 7. 闸门
 
