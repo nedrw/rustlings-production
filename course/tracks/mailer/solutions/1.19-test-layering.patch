@@ -1,0 +1,177 @@
+diff --git a/src/config.rs b/src/config.rs
+index d0a6d4e..2f2a77c 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -46,6 +46,8 @@ pub struct Config {
+     pub log: Log,
+     /// Where it keeps its data.
+     pub database: Database,
++    /// Where it sends email from (step `mailer/1.19-test-layering`).
++    pub email: EmailSettings,
+ }
+ 
+ impl Config {
+@@ -82,8 +84,15 @@ impl Config {
+         } else {
+             UNSET
+         };
++        let smtp_host = self.email.smtp_host.as_deref().unwrap_or(UNSET);
++        let smtp_port = self
++            .email
++            .smtp_port
++            .map_or_else(|| UNSET.to_owned(), |port| port.to_string());
+         vec![
+             format!("database.url = {url}"),
++            format!("email.smtp_host = {smtp_host}"),
++            format!("email.smtp_port = {smtp_port}"),
+             format!("listen.host = {}", self.listen.host),
+             format!("listen.port = {}", self.listen.port),
+             format!("log.format = {}", self.log.format),
+@@ -128,6 +137,14 @@ impl Config {
+         {
+             self.database.url = Some(url.clone());
+         }
++        if let Some(email) = &file.email {
++            if let Some(host) = &email.smtp_host {
++                self.email.smtp_host = Some(host.clone());
++            }
++            if let Some(port) = email.smtp_port {
++                self.email.smtp_port = Some(port);
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -154,6 +171,14 @@ impl Config {
+                     self.log.format = Self::setting("log.format", value.parse(), origin)?;
+                 }
+                 "database.url" => self.database.url = Some(value.clone()),
++                // An email host is what turns the logging adapter into SMTP (step
++                // `mailer/1.19-test-layering`): the empty string is not "no host" but a host nobody
++                // can reach, and saying so is the caller's job rather than this function's.
++                "email.smtp_host" => self.email.smtp_host = Some(value.clone()),
++                "email.smtp_port" => {
++                    self.email.smtp_port =
++                        Some(Self::setting("email.smtp_port", port(value), origin)?);
++                }
+                 _ => return Err(Error::UnknownSetting { name: name.clone() }),
+             }
+         }
+@@ -219,6 +244,22 @@ impl Default for Log {
+     }
+ }
+ 
++/// Where the service sends email from (step `mailer/1.19-test-layering`).
++///
++/// Named `EmailSettings` rather than `Email` because `mailer::domain::Email` is a *parsed address*,
++/// and two types with one name in one library is a review comment waiting to happen.
++///
++/// No SMTP host is the default, and it is not a mistake: the adapter then writes messages to the log
++/// (step `mailer/1.13-email-port`), which is what lets every step before this one run without a mail
++/// server. A host is what turns that into SMTP.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct EmailSettings {
++    /// Host of the SMTP server a message is handed to.
++    pub smtp_host: Option<String>,
++    /// Port that server listens on. `None` means the port a mail server is expected on.
++    pub smtp_port: Option<u16>,
++}
++
+ /// Where the service keeps its data.
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ pub struct Database {
+@@ -360,6 +401,8 @@ struct FileConfig {
+     log: Option<FileLog>,
+     /// `[database]` section.
+     database: Option<FileDatabase>,
++    /// `[email]` section.
++    email: Option<FileEmail>,
+ }
+ 
+ /// The `[listen]` section of a configuration file.
+@@ -390,6 +433,16 @@ struct FileDatabase {
+     url: Option<String>,
+ }
+ 
++/// The `[email]` section of a configuration file (step `mailer/1.19-test-layering`).
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileEmail {
++    /// Host of the SMTP server a message is handed to.
++    smtp_host: Option<String>,
++    /// Port that server listens on.
++    smtp_port: Option<u16>,
++}
++
+ /// Read a port out of a string some source handed over.
+ ///
+ /// `u16` already refuses everything outside the range; the message is what turns that into a
+diff --git a/src/http.rs b/src/http.rs
+index 220bcd0..c8b74d3 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -62,6 +62,7 @@ use crate::login::{Credentials, log_in};
+ use crate::newsletter::{self, NewsletterRequest};
+ use crate::session::{self, Token as SessionToken};
+ use crate::signup::{SignupRequest, subscribe};
++use crate::smtp::Smtp;
+ 
+ /// Everything a handler may reach: the configuration this process started with, the database when
+ /// it has one, and the delivery queue (step `mailer/1.14-worker`).
+@@ -97,7 +98,8 @@ impl AppState {
+     /// Reports [`Error::Database`] when the configured database cannot be reached, and
+     /// [`Error::Migration`] when it cannot be brought up to the schema this build expects.
+     pub async fn start(config: Config, id: &RunId) -> Result<Self, Error> {
+-        Self::start_with_sender(config, id, Arc::new(Logging)).await
++        let sender = adapter(&config);
++        Self::start_with_sender(config, id, sender).await
+     }
+ 
+     /// Build the state with the sender the caller chose (step `mailer/1.13-email-port`).
+@@ -122,6 +124,11 @@ impl AppState {
+         sender: Arc<dyn EmailSender>,
+     ) -> Result<Self, Error> {
+         let _ = id;
++        // Which adapter this process sends through is the first thing worth knowing when mail does
++        // not arrive (step `mailer/1.19-test-layering`), and it is logged *here* rather than where
++        // the adapter is chosen so that the line belongs to the run like every other line of
++        // starting up: the span above is what carries the id, and an event outside it carries none.
++        info!(sender = ?sender, "this process sends its email through the adapter above");
+         let Some(url) = config.database.url.clone() else {
+             warn!("no database is configured: the service starts, and readiness will say no");
+             return Ok(Self {
+@@ -170,6 +177,22 @@ impl AppState {
+     }
+ }
+ 
++/// The adapter this configuration asks for (step `mailer/1.19-test-layering`).
++///
++/// The choice is made in exactly one place, and every handler is written against the port — which is
++/// what step `mailer/1.13-email-port` bought: adding a real transport cost this function and nothing
++/// else. No host configured means the logging adapter, on purpose: it is what every earlier step's
++/// tests run against, and a service that refused to start without a mail server could not be tested
++/// on a laptop.
++fn adapter(config: &Config) -> Arc<dyn EmailSender> {
++    match &config.email.smtp_host {
++        // 25 is the port a mail server is expected to listen on; a test container is where the
++        // default is wrong, and that is exactly why the port is a setting.
++        Some(host) => Arc::new(Smtp::new(host, config.email.smtp_port.unwrap_or(25))),
++        None => Arc::new(Logging),
++    }
++}
++
+ /// The router this service answers with.
+ ///
+ /// It is a plain value: the routes, the fallbacks and everything else a request can meet are here,
+diff --git a/src/lib.rs b/src/lib.rs
+index 2550fef..1b61a03 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,7 @@ pub mod login;
+ pub mod newsletter;
+ pub mod session;
+ pub mod signup;
++pub mod smtp;
+ 
+ pub use config::{Config, Flags};
+ pub use confirmation::Token;

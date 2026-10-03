@@ -1,0 +1,464 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a0960d0..c9bd575 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,10 @@ getrandom = "0.4"
+ # The session digest of step 1.16: a fast hash for a value nobody can guess, where step 1.11
+ # uses a slow one for a value everybody can.
+ sha2 = "0.10"
++# The SMTP client of step 1.19: the first adapter that talks to something real. Plain SMTP with
++# no TLS (the test container speaks it on a loopback port), which is why the default features
++# — and the TLS stacks they drag in — are off.
++lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
+ serde = { version = "1.0.229", features = ["derive"] }
+ # The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
+ # serialise structures of its own from 1.7 on.
+diff --git a/src/smtp.rs b/src/smtp.rs
+new file mode 100644
+index 0000000..a34e0ef
+--- /dev/null
++++ b/src/smtp.rs
+@@ -0,0 +1,141 @@
++//! Sending email to a mail server: the adapter that talks to something real (step
++//! `mailer/1.19-test-layering`).
++//!
++//! Step `mailer/1.13-email-port` wrote the port down and gave it one adapter that writes a log line;
++//! every step since could then be tested without a mail server, and the tests said what they meant
++//! because they could hand the service any sender they liked. This step adds the other half of that
++//! trade: the adapter T1 actually ships with, and a container running a real SMTP server for the
++//! tests that should not take the fake's word for it.
++//!
++//! Three decisions, and each of them is a way to get it wrong:
++//!
++//! * **plain SMTP, and on purpose.** The transport is built with `builder_dangerous`, which is the
++//!   crate's way of saying *there is no TLS on this connection*. That is correct for a loopback test
++//!   server and wrong for anything else, and the name is there so that nobody says it by accident:
++//!   step `mailer/1.21-container` is where a deployment's TLS story starts;
++//! * **a deadline per conversation.** A mail server that accepts a connection and then says nothing is
++//!   exactly the thing that holds a worker open — and with it the drain (step
++//!   `mailer/1.14-worker`) — until an orchestrator loses patience. [`SMTP_TIMEOUT`] turns that into a
++//!   failed attempt, which the delivery state machine already knows how to handle;
++//! * **the sender is a value nobody owns.** `no-reply@mailer.invalid`: `mailer.invalid` is one of the
++//!   domains RFC 2606 reserves for exactly this, so the address cannot be a working mailbox and
++//!   cannot be somebody else's. A real deployment makes it a setting next to the host and the port —
++//!   and this constant is the honest placeholder until it does.
++//!
++//! The port is the port: this file knows nothing about subscribers, confirmations or newsletters. It
++//! takes a [`Message`] and either hands it to a mail server or says why it could not.
++
++use std::future::Future;
++use std::pin::Pin;
++use std::time::Duration;
++
++use lettre::Message as Envelope;
++use lettre::message::Mailbox;
++use lettre::transport::smtp::AsyncSmtpTransport;
++use lettre::{Address, AsyncTransport, Tokio1Executor};
++use tracing::info;
++
++use crate::domain::Email;
++use crate::email::{EmailSender, Message, SendError};
++
++/// Who confirmation and newsletter emails come from.
++///
++/// The domain is reserved for documentation (RFC 2606), so it is an address that cannot deliver and
++/// belongs to nobody. Both halves are here rather than a single string: `lettre` wants an address
++/// split into a local part and a domain, and building it from one is where the interesting parse
++/// errors live.
++const SENDER: (&str, &str) = ("no-reply", "mailer.invalid");
++
++/// How long one SMTP conversation may take before it is a failure.
++///
++/// Long enough for a real mail server to answer over a slow link, short enough that a server which
++/// never answers is a retry (step `mailer/1.15-idempotent-delivery`) rather than a stuck worker.
++const SMTP_TIMEOUT: Duration = Duration::from_secs(5);
++
++/// The adapter that talks to an SMTP server.
++///
++/// It holds a connection pool: `lettre`'s transport hands out pooled connections, which is why one
++/// of these lives for the life of the process (inside the delivery queue's worker, step
++/// `mailer/1.14-worker`) rather than being built per message.
++pub struct Smtp {
++    /// The pooled client this adapter sends through.
++    transport: AsyncSmtpTransport<Tokio1Executor>,
++}
++
++impl Smtp {
++    /// Talk to the SMTP server at `host:port`, in the clear.
++    ///
++    /// `builder_dangerous` is the crate's name for "no TLS", and it is spelled out in the module doc
++    /// above: a loopback test server is the case this is right for, and a deployment is not.
++    #[must_use]
++    pub fn new(host: &str, port: u16) -> Self {
++        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
++            .port(port)
++            .timeout(Some(SMTP_TIMEOUT))
++            .build();
++        Self { transport }
++    }
++}
++
++/// A transport is a pool of connections: what `{:?}` can say without leaking one.
++impl std::fmt::Debug for Smtp {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("Smtp { transport: <pool> }")
++    }
++}
++
++impl EmailSender for Smtp {
++    fn send(
++        &self,
++        message: Message,
++    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
++        Box::pin(async move {
++            let envelope = envelope_of(&message)?;
++            // The same envelope the logging adapter prints (step `mailer/1.13-email-port`): the
++            // address and the subject, never the body, because the body of a confirmation carries
++            // the token.
++            info!(
++                to = %message.to,
++                subject = %message.subject,
++                "an email is being sent"
++            );
++            self.transport
++                .send(envelope)
++                .await
++                .map(|_answer| ())
++                .map_err(SendError::new)
++        })
++    }
++}
++
++/// Turn one of this service's messages into an SMTP envelope.
++///
++/// The errors here are all "this service built a message a mail server cannot carry": the address it
++/// parsed is one `lettre` refuses, or a header holds something a header cannot. They are
++/// [`SendError`]s because that is what the port promises, and a failed send is a retry rather than a
++/// crash.
++fn envelope_of(message: &Message) -> Result<Envelope, SendError> {
++    let from = Mailbox::new(Some("Mailer".to_owned()), address_of(SENDER.0, SENDER.1)?);
++    let to = Mailbox::new(None, address_of_email(&message.to)?);
++    Envelope::builder()
++        .from(from)
++        .to(to)
++        .subject(message.subject.clone())
++        .body(message.body.clone())
++        .map_err(SendError::new)
++}
++
++/// The `lettre` address of one subscriber address.
++fn address_of_email(address: &Email) -> Result<Address, SendError> {
++    let (user, domain) = address.as_str().split_once('@').ok_or_else(|| {
++        SendError::new(std::io::Error::other(
++            "the address has no domain, which this service should not have stored",
++        ))
++    })?;
++    address_of(user, domain)
++}
++
++/// The `lettre` address of a local part and a domain.
++fn address_of(user: &str, domain: &str) -> Result<Address, SendError> {
++    Address::new(user, domain).map_err(SendError::new)
++}
+diff --git a/tests/support/mailpit.rs b/tests/support/mailpit.rs
+new file mode 100644
+index 0000000..ee0f6c6
+--- /dev/null
++++ b/tests/support/mailpit.rs
+@@ -0,0 +1,296 @@
++//! A real mail server for one test (step `mailer/1.19-test-layering`).
++//!
++//! The specs before this one hand the service a *fake* sender (`tests/support/email.rs`) and judge
++//! what it was given. That is the right shape for "one message per subscriber" and the wrong shape
++//! for "the email a person would receive": a fake cannot be wrong about SMTP, and the parts that
++//! break in production — the protocol, the headers, the body encoding — are exactly the parts it does
++//! not implement.
++//!
++//! So this file runs [`mailpit`](https://mailpit.axllent.org): a mail server in a container that
++//! accepts SMTP on one port and answers questions about what it received on another. A spec pulls it
++//! in with `#[path = "support/mailpit.rs"] mod mailpit;`, points the service at [`Mailpit::smtp`],
++//! and can then read the message that arrived — headers, subject, body — as a mail client would.
++//!
++//! Three course rules decide how this is written, and they are the same ones
++//! `tests/support/postgres.rs` follows:
++//!
++//! * **the engine is probed, not assumed** — `podman` first, then `docker` (plan §9.1);
++//! * **the image is looked up, not guessed** — the engine stores what it was pulled under, so
++//!   `axllent/mailpit:v1.21` also counts as present when it is cached as
++//!   `docker.1ms.run/axllent/mailpit:v1.21`;
++//! * **every command has a deadline this module enforces itself** — there is no `timeout(1)` here,
++//!   and the readiness wait is a condition with a deadline rather than a sleep.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::io::{Read, Write};
++use std::net::{Shutdown, TcpStream};
++use std::process::{Child, Command, Stdio};
++use std::time::{Duration, Instant};
++
++use serde_json::Value;
++
++/// The image the tests run, written the way a step's metadata writes it.
++const IMAGE: &str = "axllent/mailpit:v1.21";
++/// The port the container listens on for SMTP.
++const SMTP_PORT: u16 = 1025;
++/// The port the container answers questions on.
++const HTTP_PORT: u16 = 8025;
++/// How long the container is given to answer the first question.
++const READY_DEADLINE: Duration = Duration::from_secs(30);
++/// How long any one engine command may take.
++const COMMAND_DEADLINE: Duration = Duration::from_secs(30);
++/// How often a wait looks again.
++const RETRY: Duration = Duration::from_millis(50);
++/// How often `run_bounded` looks at its child.
++const POLL: Duration = Duration::from_millis(20);
++
++/// One mailpit container, for the length of one test.
++pub struct Mailpit {
++    engine: &'static str,
++    name: String,
++    smtp_port: u16,
++    http_port: u16,
++}
++
++impl Mailpit {
++    /// Start a container that accepts mail on a port nobody else has, and wait until it answers.
++    ///
++    /// Panics when no engine answers, when the image is not in the local store, or when the server
++    /// never comes up. Inside a test, a fixture that cannot start is a failure with a sentence — and
++    /// the sentence names the command that fixes it, which is `kiln images pull` in the common case.
++    pub fn start() -> Self {
++        let engine = engine();
++        let image = local_image(engine);
++        let name = format!("kiln-mailpit-{}", std::process::id());
++        run_or_panic(
++            engine,
++            &[
++                "run",
++                "-d",
++                "--name",
++                &name,
++                // Both ports are whatever is free on the host, so two tests never meet on one.
++                "-p",
++                "127.0.0.1::1025",
++                "-p",
++                "127.0.0.1::8025",
++                "--pull=never",
++                &image,
++            ],
++        );
++
++        let smtp_port = published_port(engine, &name, SMTP_PORT);
++        let http_port = published_port(engine, &name, HTTP_PORT);
++        let mut mailpit = Self {
++            engine,
++            name,
++            smtp_port,
++            http_port,
++        };
++        mailpit.wait_until_ready();
++        mailpit
++    }
++
++    /// Where the SMTP server listens, as the settings of a service under test want it.
++    #[must_use]
++    pub fn smtp(&self) -> (String, u16) {
++        ("127.0.0.1".to_owned(), self.smtp_port)
++    }
++
++    /// The messages this server has received, newest first, as the API describes them.
++    #[must_use]
++    pub fn messages(&self) -> Vec<Value> {
++        let answer = self.get("/api/v1/messages");
++        let parsed: Value =
++            serde_json::from_str(&answer).unwrap_or_else(|error| panic!("{error}: {answer}"));
++        parsed["messages"]
++            .as_array()
++            .cloned()
++            .unwrap_or_else(|| panic!("mailpit answers with a list of messages: {answer}"))
++    }
++
++    /// How many messages have arrived.
++    #[must_use]
++    pub fn count(&self) -> usize {
++        self.messages().len()
++    }
++
++    /// The text body of one message, as a mail client would show it.
++    #[must_use]
++    pub fn text_of(&self, id: &str) -> String {
++        let answer = self.get(&format!("/api/v1/message/{id}"));
++        let parsed: Value =
++            serde_json::from_str(&answer).unwrap_or_else(|error| panic!("{error}: {answer}"));
++        parsed["Text"]
++            .as_str()
++            .unwrap_or_else(|| panic!("a message has a text body: {answer}"))
++            .to_owned()
++    }
++
++    /// Wait until the server answers questions, so no test has to sleep and hope.
++    fn wait_until_ready(&mut self) {
++        let deadline = Instant::now() + READY_DEADLINE;
++        while Instant::now() < deadline {
++            if let Some(answer) = self.try_get("/api/v1/messages")
++                && answer.contains("\"total\"")
++            {
++                return;
++            }
++            std::thread::sleep(RETRY);
++        }
++        panic!(
++            "the mailpit container never answered on port {} — is `{IMAGE}` pulled? \
++             (`kiln images pull` pulls what the course declares)",
++            self.http_port
++        );
++    }
++
++    /// One question, asked over the container's HTTP port, panicking if it cannot be answered.
++    fn get(&self, path: &str) -> String {
++        self.try_get(path).unwrap_or_else(|| {
++            panic!(
++                "the mailpit container did not answer `{path}` on port {}",
++                self.http_port
++            )
++        })
++    }
++
++    /// One question, asked over the container's HTTP port.
++    ///
++    /// `HTTP/1.0` is deliberate: the answer then ends at the end of the connection, so the body is
++    /// what was read and nothing has to know about chunked encoding.
++    fn try_get(&self, path: &str) -> Option<String> {
++        let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).ok()?;
++        stream.set_read_timeout(Some(READY_DEADLINE)).ok()?;
++        let request = format!("GET {path} HTTP/1.0\r\nhost: 127.0.0.1\r\n\r\n");
++        stream.write_all(request.as_bytes()).ok()?;
++        let mut raw = String::new();
++        stream.read_to_string(&mut raw).ok()?;
++        let _ = stream.shutdown(Shutdown::Both);
++        raw.split_once("\r\n\r\n").map(|(_, body)| body.to_owned())
++    }
++}
++
++impl Drop for Mailpit {
++    fn drop(&mut self) {
++        let _ = Command::new(self.engine)
++            .args(["rm", "-f", &self.name])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status();
++    }
++}
++
++/// Which engine this machine answers to (plan §9.1: probed, never assumed).
++fn engine() -> &'static str {
++    for engine in ["podman", "docker"] {
++        let answered = Command::new(engine)
++            .args(["info", "--format", "{{.Host.Security.Rootless}}"])
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .status()
++            .is_ok_and(|status| status.success());
++        if answered {
++            return engine;
++        }
++    }
++    panic!("neither `podman` nor `docker` answered: a container engine is needed for this spec");
++}
++
++/// The image as it is stored locally, which is not always how it was asked for.
++///
++/// A registry mirror stores images under its own prefix (`docker.1ms.run/library/postgres:17-alpine`
++/// for `postgres:17-alpine`), so the rule is the one the `images` gate uses: compare the repository
++/// *path* at the end, not the string.
++fn local_image(engine: &'static str) -> String {
++    let listed = run_or_panic(engine, &["images", "--format", "{{.Repository}}:{{.Tag}}"]);
++    for line in listed.lines() {
++        let line = line.trim();
++        if line.ends_with(IMAGE) {
++            return line.to_owned();
++        }
++    }
++    panic!(
++        "`{IMAGE}` is not in the local store: run `kiln images pull` (or `{engine} pull {IMAGE}`) \
++         once and try again"
++    );
++}
++
++/// The host port an engine published for a container port.
++fn published_port(engine: &'static str, name: &str, port: u16) -> u16 {
++    let listed = run_or_panic(engine, &["port", name, &port.to_string()]);
++    listed
++        .trim()
++        .rsplit_once(':')
++        .and_then(|(_, port)| port.trim().parse().ok())
++        .unwrap_or_else(|| panic!("the engine did not publish port {port} of {name}: `{listed}`"))
++}
++
++/// Run one engine command, and answer what it printed — or panic with what it said.
++fn run_or_panic(engine: &str, args: &[&str]) -> String {
++    let outcome = run_bounded(engine, args);
++    if !outcome.status.success() {
++        panic!(
++            "`{engine} {}` exited {:?}: {}{}",
++            args.join(" "),
++            outcome.status.code(),
++            outcome.stdout,
++            outcome.stderr
++        );
++    }
++    outcome.stdout
++}
++
++/// What one engine command produced.
++struct Outcome {
++    status: std::process::ExitStatus,
++    stdout: String,
++    stderr: String,
++}
++
++/// Run one engine command with a deadline this module enforces, because several engine commands can
++/// wait on a registry, a lock or a container that never starts.
++fn run_bounded(engine: &str, args: &[&str]) -> Outcome {
++    let mut child: Child = Command::new(engine)
++        .args(args)
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap_or_else(|error| panic!("`{engine}` could not be started: {error}"));
++
++    let deadline = Instant::now() + COMMAND_DEADLINE;
++    loop {
++        match child.try_wait() {
++            Ok(Some(status)) => {
++                let mut stdout = String::new();
++                let mut stderr = String::new();
++                if let Some(mut pipe) = child.stdout.take() {
++                    let _ = pipe.read_to_string(&mut stdout);
++                }
++                if let Some(mut pipe) = child.stderr.take() {
++                    let _ = pipe.read_to_string(&mut stderr);
++                }
++                return Outcome {
++                    status,
++                    stdout,
++                    stderr,
++                };
++            }
++            Ok(None) => {}
++            Err(error) => panic!(
++                "`{engine} {}` could not be waited for: {error}",
++                args.join(" ")
++            ),
++        }
++        if Instant::now() >= deadline {
++            let _ = child.kill();
++            let _ = child.wait();
++            panic!(
++                "`{engine} {}` did not finish within {COMMAND_DEADLINE:?}",
++                args.join(" ")
++            );
++        }
++        std::thread::sleep(POLL);
++    }
++}
