@@ -1,0 +1,478 @@
+diff --git a/src/config.rs b/src/config.rs
+index a7e4429..2838107 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -5,7 +5,7 @@
+ //! stubs it fills in.
+ 
+ use std::fmt;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+ 
+ use serde::Deserialize;
+@@ -19,6 +19,12 @@ pub const DEFAULT_FILE: &str = "mailer.toml";
+ /// What a port setting has to look like, in a message about one.
+ pub const PORT_EXPECTED: &str = "a port number between 0 and 65535";
+ 
++/// What `--check-config` prints in place of a secret that is set.
++pub const REDACTED: &str = "<redacted>";
++
++/// What `--check-config` prints for a setting that no source set at all.
++pub const UNSET: &str = "<unset>";
++
+ /// The command line, as far as the configuration is concerned: the last layer of the override
+ /// order, and the only one a person types on purpose.
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+@@ -44,19 +50,133 @@ impl Config {
+     /// Assemble the effective configuration out of its sources, in the documented order
+     /// (step `mailer/1.4-config`).
+     ///
+-    /// The scaffold returns the defaults, so the step's spec fails until the file, the environment
+-    /// and the flags are layered on top of them.
+-    pub fn load(_flags: &Flags, _env: &[(String, String)]) -> Result<Self, ConfigError> {
+-        Ok(Self::default())
++    /// Defaults first, then the file, then the environment, then the flags: every setting ends up
++    /// with the value of the last source that mentioned it, and a setting nobody recognises is an
++    /// error rather than a default.
++    pub fn load(flags: &Flags, env: &[(String, String)]) -> Result<Self, ConfigError> {
++        let mut config = Self::default();
++        config.apply_file(flags.config.as_deref())?;
++        config.apply_env(env)?;
++        config.apply_flags(flags);
++        Ok(config)
+     }
+ 
+-    /// One `key = value` line per setting, secrets redacted — what `--check-config` prints
+-    /// (step `mailer/1.4-config`).
++    /// One `key = value` line per setting, secrets redacted — what `--check-config` prints.
+     ///
+-    /// The scaffold prints nothing at all.
++    /// The list is sorted by setting name so two runs can be compared line by line, and the
++    /// database URL is reduced to [`REDACTED`]: a configuration report is what people paste into
++    /// issues, and a password that reaches an issue is a password that has to be rotated.
+     #[must_use]
+     pub fn report(&self) -> Vec<String> {
+-        Vec::new()
++        let url = if self.database.url.is_some() {
++            REDACTED
++        } else {
++            UNSET
++        };
++        vec![
++            format!("database.url = {url}"),
++            format!("listen.host = {}", self.listen.host),
++            format!("listen.port = {}", self.listen.port),
++            format!("log.format = {}", self.log.format),
++            format!("log.level = {}", self.log.level),
++        ]
++    }
++
++    /// The file layer: `mailer.toml`, or the file `--config` named.
++    fn apply_file(&mut self, explicit: Option<&Path>) -> Result<(), ConfigError> {
++        let path = explicit.map_or_else(|| PathBuf::from(DEFAULT_FILE), Path::to_path_buf);
++        let text = match std::fs::read_to_string(&path) {
++            Ok(text) => text,
++            // A default file that is not there is the normal case: the built-in defaults are a
++            // valid configuration. A file somebody named has to exist — starting with different
++            // settings than the ones asked for is how a deployment goes missing.
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => {
++                return Ok(());
++            }
++            Err(error) => {
++                return Err(ConfigError::File {
++                    path,
++                    message: error.to_string(),
++                });
++            }
++        };
++        let file: FileConfig = toml::from_str(&text).map_err(|error| ConfigError::Content {
++            path,
++            message: error.to_string(),
++        })?;
++
++        if let Some(listen) = &file.listen {
++            if let Some(host) = &listen.host {
++                self.listen.host.clone_from(host);
++            }
++            if let Some(port) = listen.port {
++                self.listen.port = port;
++            }
++        }
++        if let Some(log) = &file.log {
++            if let Some(level) = log.level {
++                self.log.level = level;
++            }
++            if let Some(format) = log.format {
++                self.log.format = format;
++            }
++        }
++        if let Some(database) = &file.database
++            && let Some(url) = &database.url
++        {
++            self.database.url = Some(url.clone());
++        }
++        Ok(())
++    }
++
++    /// The environment layer: `MAILER__<SECTION>__<SETTING>`, where `__` separates the parts.
++    ///
++    /// A variable with the service's own prefix that does not name a setting is refused: it is the
++    /// shape a typo takes, and the service that ignores it starts with settings nobody chose.
++    fn apply_env(&mut self, env: &[(String, String)]) -> Result<(), ConfigError> {
++        for (name, value) in env {
++            let Some(setting) = name.strip_prefix(ENV_PREFIX) else {
++                continue;
++            };
++            let key = setting.to_ascii_lowercase().replace("__", ".");
++            let source = Source::Environment(name.clone());
++            match key.as_str() {
++                "listen.host" => self.listen.host.clone_from(value),
++                "listen.port" => {
++                    self.listen.port = Self::setting("listen.port", port(value), source)?;
++                }
++                "log.level" => {
++                    self.log.level = Self::setting("log.level", value.parse(), source)?;
++                }
++                "log.format" => {
++                    self.log.format = Self::setting("log.format", value.parse(), source)?;
++                }
++                "database.url" => self.database.url = Some(value.clone()),
++                _ => return Err(ConfigError::UnknownEnvironment { name: name.clone() }),
++            }
++        }
++        Ok(())
++    }
++
++    /// The flag layer, applied last: it is the source a person types on purpose.
++    fn apply_flags(&mut self, flags: &Flags) {
++        if let Some(port) = flags.listen_port {
++            self.listen.port = port;
++        }
++    }
++
++    /// Attach the setting's name to a value some source refused, so the message says which setting
++    /// and where it came from.
++    fn setting<T>(
++        key: &str,
++        parsed: Result<T, BadValue>,
++        source: Source,
++    ) -> Result<T, ConfigError> {
++        parsed.map_err(|problem| ConfigError::Value {
++            key: key.to_owned(),
++            problem,
++            source,
++        })
+     }
+ }
+ 
+@@ -226,6 +346,57 @@ impl fmt::Display for LogFormat {
+     }
+ }
+ 
++/// `mailer.toml` as it is written: every setting optional, so a file may mention one of them, and
++/// unknown ones refused — a misspelled key is a setting the service does not have.
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileConfig {
++    /// `[listen]` section.
++    listen: Option<FileListen>,
++    /// `[log]` section.
++    log: Option<FileLog>,
++    /// `[database]` section.
++    database: Option<FileDatabase>,
++}
++
++/// The `[listen]` section of a configuration file.
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileListen {
++    /// Interface to bind.
++    host: Option<String>,
++    /// Port to bind.
++    port: Option<u16>,
++}
++
++/// The `[log]` section of a configuration file.
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileLog {
++    /// Most verbose level that is printed.
++    level: Option<Level>,
++    /// How a line is rendered.
++    format: Option<LogFormat>,
++}
++
++/// The `[database]` section of a configuration file.
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileDatabase {
++    /// Connection string of the database.
++    url: Option<String>,
++}
++
++/// Read a port out of a string some source handed over.
++///
++/// `u16` already refuses everything outside the range; the message is what turns that into a
++/// sentence about the setting.
++fn port(value: &str) -> Result<u16, BadValue> {
++    value
++        .parse()
++        .map_err(|_| BadValue::new(value, PORT_EXPECTED))
++}
++
+ /// A value that is none of the names a setting accepts, before anyone knows which setting it came
+ /// from: the source adds that when it applies the value.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/src/lib.rs b/src/lib.rs
+index 5f460d2..9afbd04 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,37 +3,37 @@
+ //! The library is the service; `src/main.rs` is a shell around it. Every decision lives here,
+ //! where a test can reach it without starting a process.
+ //!
+-//! Nothing in this file prints: [`parse`] answers with a [`Request`], and [`Request::exit_code`]
+-//! says how the process ends. Turning that into text on a terminal is the binary's job, and it is
+-//! what keeps the library usable from a test, a second binary or a future HTTP front end.
++//! Nothing in this file prints: [`parse`] answers with a [`Cli`] and [`Config::load`] answers with
++//! the configuration the process will use. Turning either of them into text on a terminal is the
++//! binary's job, and it is what keeps the library usable from a test, a second binary or an HTTP
++//! front end.
+ 
+-use std::process::ExitCode;
++use std::path::PathBuf;
+ 
+-/// What the command line asked for, once it has been parsed.
++pub mod config;
++
++pub use config::{Config, ConfigError, Flags};
++
++/// What the command line asked the process to do.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Request {
+     /// Print [`USAGE`] and exit successfully.
+     Help,
+     /// Print the version and exit successfully.
+     Version,
++    /// Print the effective configuration ([`Config::report`]) and exit successfully.
++    CheckConfig,
+     /// Nothing to do yet: the service has no listener.
+     Idle,
+-    /// A flag the service does not know.
+-    Unknown(String),
+ }
+ 
+-impl Request {
+-    /// The exit code this request ends in.
+-    ///
+-    /// The policy lives here rather than in `main.rs` so a test can pin it: an unknown flag is a
+-    /// usage error (2), everything else succeeded.
+-    #[must_use]
+-    pub fn exit_code(&self) -> ExitCode {
+-        match self {
+-            Request::Unknown(_) => ExitCode::from(2),
+-            _ => ExitCode::SUCCESS,
+-        }
+-    }
++/// One run's command line: what to do, plus the flags that override the configuration.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Cli {
++    /// What the process was asked to do.
++    pub request: Request,
++    /// Flag layer of the configuration (see [`config`]).
++    pub flags: Flags,
+ }
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+@@ -41,42 +41,105 @@ pub const USAGE: &str = "\
+ usage: mailer [OPTIONS]
+ 
+ OPTIONS:
+-    --help       print this help and exit
+-    --version    print the version and exit
++    --help                 print this help and exit
++    --version              print the version and exit
++    --check-config         print the effective configuration and exit
++    --config <path>        read the configuration from <path> (default: mailer.toml)
++    --listen-port <port>   listen on <port>, whatever the other sources say
+ ";
+ 
+ /// Parse the arguments a process was started with, program name included.
+ ///
+-/// `--help` and `--version` are recognised here; everything else is a usage error until step 4
+-/// replaces this with real configuration.
+-#[must_use]
+-pub fn parse<I, S>(args: I) -> Request
++/// An argument this build does not know is refused rather than ignored: it means the run was meant
++/// for a different build, and starting anyway would hide that.
++pub fn parse<I, S>(args: I) -> Result<Cli, ConfigError>
+ where
+     I: IntoIterator<Item = S>,
+     S: AsRef<str>,
+ {
+-    match args.into_iter().nth(1) {
+-        None => Request::Idle,
+-        Some(flag) => match flag.as_ref() {
+-            "--help" => Request::Help,
+-            "--version" => Request::Version,
+-            other => Request::Unknown(other.to_owned()),
+-        },
++    let mut flags = Flags::default();
++    let mut request = Request::Idle;
++    let mut args = args.into_iter().skip(1);
++
++    while let Some(argument) = args.next() {
++        match argument.as_ref() {
++            "--help" => request = Request::Help,
++            "--version" => request = Request::Version,
++            "--check-config" => request = Request::CheckConfig,
++            "--config" => {
++                let path = args.next().ok_or_else(|| ConfigError::Usage {
++                    message: "`--config` needs the path of a file".to_owned(),
++                })?;
++                flags.config = Some(PathBuf::from(path.as_ref()));
++            }
++            "--listen-port" => {
++                let value = args.next().ok_or_else(|| ConfigError::Usage {
++                    message: "`--listen-port` needs a port number".to_owned(),
++                })?;
++                flags.listen_port =
++                    Some(value.as_ref().parse().map_err(|_| ConfigError::Value {
++                        key: "listen.port".to_owned(),
++                        problem: config::BadValue::new(value.as_ref(), config::PORT_EXPECTED),
++                        source: config::Source::Flag("--listen-port"),
++                    })?);
++            }
++            other => {
++                return Err(ConfigError::Usage {
++                    message: format!("unknown argument `{other}`"),
++                });
++            }
++        }
+     }
++
++    Ok(Cli { request, flags })
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Request, parse};
++    use super::{Cli, ConfigError, Flags, Request, parse};
++
++    fn parsed(args: &[&str]) -> Cli {
++        parse(args).expect("the fixture arguments are valid")
++    }
+ 
+     #[test]
+     fn the_flags_the_service_promises_are_recognised() {
+-        assert_eq!(parse(["mailer", "--help"]), Request::Help);
+-        assert_eq!(parse(["mailer", "--version"]), Request::Version);
+-        assert_eq!(parse(["mailer"]), Request::Idle);
++        assert_eq!(parsed(&["mailer", "--help"]).request, Request::Help);
++        assert_eq!(parsed(&["mailer", "--version"]).request, Request::Version);
+         assert_eq!(
+-            parse(["mailer", "--nope"]),
+-            Request::Unknown("--nope".to_owned())
++            parsed(&["mailer", "--check-config"]).request,
++            Request::CheckConfig
+         );
++        assert_eq!(parsed(&["mailer"]).request, Request::Idle);
++        assert_eq!(parsed(&["mailer"]).flags, Flags::default());
++    }
++
++    #[test]
++    fn the_flags_that_override_the_configuration_are_kept() {
++        let cli = parsed(&["mailer", "--config", "other.toml", "--listen-port", "9222"]);
++        assert_eq!(cli.flags.config, Some("other.toml".into()));
++        assert_eq!(cli.flags.listen_port, Some(9222));
++    }
++
++    #[test]
++    fn arguments_this_build_does_not_know_are_refused_by_name() {
++        let error = parse(["mailer", "--nope"]).expect_err("an unknown flag must be refused");
++        assert!(error.to_string().contains("--nope"), "{error}");
++
++        let error = parse(["mailer", "--config"]).expect_err("a missing path must be refused");
++        assert!(error.to_string().contains("--config"), "{error}");
++
++        let error = parse(["mailer", "--listen-port"]).expect_err("a missing port must be refused");
++        assert!(error.to_string().contains("--listen-port"), "{error}");
++    }
++
++    #[test]
++    fn a_flag_with_a_bad_value_names_the_setting_it_would_have_changed() {
++        let error = parse(["mailer", "--listen-port", "70000"])
++            .expect_err("a port above the range must be refused");
++        let message = error.to_string();
++        assert!(message.contains("listen.port"), "{message}");
++        assert!(message.contains("70000"), "{message}");
++        assert!(matches!(error, ConfigError::Value { .. }), "{error}");
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 9857dfc..0dc6bb6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,15 +2,54 @@
+ 
+ use std::process::ExitCode;
+ 
+-use mailer::{Request, USAGE};
++use mailer::{Config, ConfigError, Request, USAGE};
+ 
+ fn main() -> ExitCode {
+-    let request = mailer::parse(std::env::args());
+-    match &request {
+-        Request::Help => println!("{USAGE}"),
+-        Request::Version => println!("mailer {}", env!("CARGO_PKG_VERSION")),
++    let cli = match mailer::parse(std::env::args()) {
++        Ok(cli) => cli,
++        Err(error) => return refuse(&error),
++    };
++
++    // `--help` and `--version` answer without reading a configuration: a question about the binary
++    // should not depend on the state of a service.
++    match cli.request {
++        Request::Help => {
++            println!("{USAGE}");
++            return ExitCode::SUCCESS;
++        }
++        Request::Version => {
++            println!("mailer {}", env!("CARGO_PKG_VERSION"));
++            return ExitCode::SUCCESS;
++        }
++        _ => {}
++    }
++
++    let env: Vec<(String, String)> = std::env::vars().collect();
++    let config = match Config::load(&cli.flags, &env) {
++        Ok(config) => config,
++        Err(error) => return refuse(&error),
++    };
++
++    match cli.request {
++        Request::CheckConfig => {
++            for line in config.report() {
++                println!("{line}");
++            }
++        }
+         Request::Idle => eprintln!("mailer: no listener yet, nothing to do (try --help)"),
+-        Request::Unknown(flag) => eprintln!("mailer: unknown argument `{flag}`\n{USAGE}"),
++        Request::Help | Request::Version => unreachable!("handled above"),
++    }
++    ExitCode::SUCCESS
++}
++
++/// Report a configuration the service refuses to start with.
++///
++/// The message goes to stderr and the process exits non-zero before anything else happens: a service
++/// that starts with settings it did not understand is worse than one that does not start.
++fn refuse(error: &ConfigError) -> ExitCode {
++    eprintln!("mailer: {error}");
++    if let ConfigError::Usage { .. } = error {
++        eprintln!("{USAGE}");
+     }
+-    request.exit_code()
++    ExitCode::from(2)
+ }

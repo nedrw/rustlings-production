@@ -1,0 +1,360 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 40dab09..904d2ba 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,6 +20,8 @@ workspace = true
+ 
+ [dependencies]
+ # kiln:scaffold:begin
++serde = { version = "1.0.229", features = ["derive"] }
++toml = "0.9.8"
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings
+diff --git a/src/config.rs b/src/config.rs
+new file mode 100644
+index 0000000..a7e4429
+--- /dev/null
++++ b/src/config.rs
+@@ -0,0 +1,341 @@
++//! Typed configuration, and the order its sources are layered in.
++//!
++//! Step `mailer/1.4-config` writes the layering itself: the types below are the scaffold, so the
++//! step's spec has settings to look at, and [`Config::load`] and [`Config::report`] are the two
++//! stubs it fills in.
++
++use std::fmt;
++use std::path::PathBuf;
++use std::str::FromStr;
++
++use serde::Deserialize;
++
++/// Prefix of every environment variable the service reads.
++pub const ENV_PREFIX: &str = "MAILER__";
++
++/// File read when `--config` does not name another one.
++pub const DEFAULT_FILE: &str = "mailer.toml";
++
++/// What a port setting has to look like, in a message about one.
++pub const PORT_EXPECTED: &str = "a port number between 0 and 65535";
++
++/// The command line, as far as the configuration is concerned: the last layer of the override
++/// order, and the only one a person types on purpose.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Flags {
++    /// File to read instead of [`DEFAULT_FILE`].
++    pub config: Option<PathBuf>,
++    /// Port to listen on, whatever the other sources say.
++    pub listen_port: Option<u16>,
++}
++
++/// The effective configuration of one process.
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct Config {
++    /// Where the service listens.
++    pub listen: Listen,
++    /// How it logs.
++    pub log: Log,
++    /// Where it keeps its data.
++    pub database: Database,
++}
++
++impl Config {
++    /// Assemble the effective configuration out of its sources, in the documented order
++    /// (step `mailer/1.4-config`).
++    ///
++    /// The scaffold returns the defaults, so the step's spec fails until the file, the environment
++    /// and the flags are layered on top of them.
++    pub fn load(_flags: &Flags, _env: &[(String, String)]) -> Result<Self, ConfigError> {
++        Ok(Self::default())
++    }
++
++    /// One `key = value` line per setting, secrets redacted — what `--check-config` prints
++    /// (step `mailer/1.4-config`).
++    ///
++    /// The scaffold prints nothing at all.
++    #[must_use]
++    pub fn report(&self) -> Vec<String> {
++        Vec::new()
++    }
++}
++
++/// Where the service listens.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Listen {
++    /// Interface to bind.
++    pub host: String,
++    /// Port to bind.
++    pub port: u16,
++}
++
++impl Default for Listen {
++    fn default() -> Self {
++        Self {
++            host: "127.0.0.1".to_owned(),
++            port: 8080,
++        }
++    }
++}
++
++/// How the service logs.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Log {
++    /// Most verbose level that is printed.
++    pub level: Level,
++    /// How a line is rendered.
++    pub format: LogFormat,
++}
++
++impl Default for Log {
++    fn default() -> Self {
++        Self {
++            level: Level::Info,
++            format: LogFormat::Pretty,
++        }
++    }
++}
++
++/// Where the service keeps its data.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Database {
++    /// Connection string of the database.
++    ///
++    /// A secret: it has no default, and nothing prints it.
++    pub url: Option<String>,
++}
++
++/// Log levels the service knows, from the quietest to the loudest.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
++#[serde(try_from = "String")]
++pub enum Level {
++    /// Only failures.
++    Error,
++    /// Failures and warnings.
++    Warn,
++    /// The default: what a healthy service tells you about itself.
++    Info,
++    /// What the code does while it works.
++    Debug,
++    /// Everything, including the framework's own noise.
++    Trace,
++}
++
++impl Level {
++    /// Every level this build knows, quietest first.
++    pub const ALL: &'static [Level] = &[
++        Level::Error,
++        Level::Warn,
++        Level::Info,
++        Level::Debug,
++        Level::Trace,
++    ];
++
++    /// Name as a configuration writes it.
++    #[must_use]
++    pub fn name(self) -> &'static str {
++        match self {
++            Level::Error => "error",
++            Level::Warn => "warn",
++            Level::Info => "info",
++            Level::Debug => "debug",
++            Level::Trace => "trace",
++        }
++    }
++
++    /// What a message about a bad level says the accepted values are.
++    pub const EXPECTED: &'static str = "one of `error`, `warn`, `info`, `debug`, `trace`";
++}
++
++impl FromStr for Level {
++    type Err = BadValue;
++
++    fn from_str(text: &str) -> Result<Self, Self::Err> {
++        Self::ALL
++            .iter()
++            .copied()
++            .find(|level| level.name() == text)
++            .ok_or_else(|| BadValue::new(text, Self::EXPECTED))
++    }
++}
++
++impl TryFrom<String> for Level {
++    type Error = BadValue;
++
++    fn try_from(text: String) -> Result<Self, BadValue> {
++        text.parse()
++    }
++}
++
++impl fmt::Display for Level {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.name())
++    }
++}
++
++/// How a log line is rendered.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
++#[serde(try_from = "String")]
++pub enum LogFormat {
++    /// A human reads it: the default while the service runs on a terminal.
++    Pretty,
++    /// One JSON object per line: what a log collector wants.
++    Json,
++}
++
++impl LogFormat {
++    /// Every format this build knows.
++    pub const ALL: &'static [LogFormat] = &[LogFormat::Pretty, LogFormat::Json];
++
++    /// Name as a configuration writes it.
++    #[must_use]
++    pub fn name(self) -> &'static str {
++        match self {
++            LogFormat::Pretty => "pretty",
++            LogFormat::Json => "json",
++        }
++    }
++
++    /// What a message about a bad format says the accepted values are.
++    pub const EXPECTED: &'static str = "one of `pretty`, `json`";
++}
++
++impl FromStr for LogFormat {
++    type Err = BadValue;
++
++    fn from_str(text: &str) -> Result<Self, Self::Err> {
++        Self::ALL
++            .iter()
++            .copied()
++            .find(|format| format.name() == text)
++            .ok_or_else(|| BadValue::new(text, Self::EXPECTED))
++    }
++}
++
++impl TryFrom<String> for LogFormat {
++    type Error = BadValue;
++
++    fn try_from(text: String) -> Result<Self, BadValue> {
++        text.parse()
++    }
++}
++
++impl fmt::Display for LogFormat {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.name())
++    }
++}
++
++/// A value that is none of the names a setting accepts, before anyone knows which setting it came
++/// from: the source adds that when it applies the value.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct BadValue {
++    /// The value as it was written.
++    pub value: String,
++    /// What the setting accepts, phrased for a message.
++    pub expected: &'static str,
++}
++
++impl BadValue {
++    /// Describe one refused value, given what the setting would have accepted.
++    #[must_use]
++    pub fn new(value: &str, expected: &'static str) -> Self {
++        Self {
++            value: value.to_owned(),
++            expected,
++        }
++    }
++}
++
++impl fmt::Display for BadValue {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "`{}` is not {}", self.value, self.expected)
++    }
++}
++
++/// Which source a value came from, so a complaint can point at it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Source {
++    /// The configuration file.
++    File(PathBuf),
++    /// An environment variable, by name.
++    Environment(String),
++    /// A command-line flag, by name.
++    Flag(&'static str),
++}
++
++impl fmt::Display for Source {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Source::File(path) => write!(f, "{}", path.display()),
++            Source::Environment(name) => f.write_str(name),
++            Source::Flag(flag) => f.write_str(flag),
++        }
++    }
++}
++
++/// Everything that stops the service from being configured.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ConfigError {
++    /// The configuration file could not be read.
++    File {
++        /// File that could not be read.
++        path: PathBuf,
++        /// What reading it reported, as text (the step that types errors owns the chain).
++        message: String,
++    },
++    /// The configuration file is not valid TOML, or holds a setting the service does not know.
++    Content {
++        /// File that was read.
++        path: PathBuf,
++        /// What the parser said.
++        message: String,
++    },
++    /// The environment holds a variable the service does not know.
++    UnknownEnvironment {
++        /// Variable that was not recognised.
++        name: String,
++    },
++    /// A setting has a value the service cannot use.
++    Value {
++        /// Setting as the configuration writes it (`listen.port`).
++        key: String,
++        /// The value, and what would have been accepted.
++        problem: BadValue,
++        /// Where the value came from.
++        source: Source,
++    },
++    /// The command line itself does not make sense.
++    Usage {
++        /// What is wrong with it.
++        message: String,
++    },
++}
++
++impl fmt::Display for ConfigError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            ConfigError::File { path, message } => {
++                write!(f, "cannot read `{}`: {message}", path.display())
++            }
++            ConfigError::Content { path, message } => {
++                write!(f, "cannot use `{}`: {message}", path.display())
++            }
++            ConfigError::UnknownEnvironment { name } => write!(
++                f,
++                "`{name}` is not a setting this service knows — a typo in a variable name would \
++                 otherwise start the service with the wrong settings"
++            ),
++            ConfigError::Value {
++                key,
++                problem,
++                source,
++            } => write!(
++                f,
++                "`{key}` is `{}`, which is not {} (from {source})",
++                problem.value, problem.expected
++            ),
++            ConfigError::Usage { message } => f.write_str(message),
++        }
++    }
++}
