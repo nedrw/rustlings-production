@@ -157,11 +157,11 @@
 >
 > ### 下一步
 >
-> **1.12 起按序写在 1.11 的树上；1.12 的设计已定，见本节末尾，直接写代码即可。** 1.11 已把宏与
-> `.sqlx` offline 元数据带上（见下一条进度），所以 1.12 起每步的第一件事是：把这一步要用的语句写全，
-> 然后用一个跑着的空库 `cargo sqlx prepare`（本机照着 1.11 的做法起 `docker.1ms.run/library/postgres:17-alpine`，
-> 8 秒就绪；`sqlx migrate run` 建表，`DATABASE_URL=… cargo sqlx prepare`），把新生成的 `.sqlx/query-*.json`
-> 作为 scaffold 内容发布，正文里给出语句原文。`container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
+> **1.13 起按序写在 1.12 的树上；1.13 的设计已定，见本节末尾，直接写代码即可。** 从 1.11 起，一个
+> 用到 SQL 的步骤开工顺序是：把这一步要用的语句写全 → 用一个跑着的空库
+> `cargo sqlx prepare`（起 `docker.1ms.run/library/postgres:17-alpine`，8 秒就绪；`sqlx migrate run` 建表，
+> `DATABASE_URL=… cargo sqlx prepare`）→ 把新生成的 `.sqlx/query-*.json` 作为 scaffold 内容发布，正文里给出
+> 语句原文。1.13 不新增语句（它没有数据库工作）。`container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
 > **`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
 > 别用 `podman images` 的**空输出**判断镜像是否还在：本段开工时它一次返回空、第二次就列全了。
 
@@ -190,79 +190,102 @@
 > 全新走查**：1.1 → 1.11 每步「scaffold 必败 → 参考解全过 → 每个 must 闸门全绿」，1.11 是
 > `0 passed; 6 failed` → `6 passed` → 全绿。
 >
-> **这一段的实测事实（下一段直接用，不要再花时间验证）**
+> **这一段实测的事实（不要再花时间验证）**
 >
-> - **`sqlx` 0.9 的 `query!`/`query_scalar!` 只吃字符串字面量**（`expand_query!(source = $query)`，内部
->   按 `LitStr` 或 `"a" "b"` 拼接解析）。所以 1.11 的设计里那个 `pub const INSERT_SUBSCRIBER` 是行不通的：
->   语句写进正文（正文给出原文），参考解里用字面量（可以 `\` 换行，`syn` 解出来的值与一行写法逐字相同）。
+> - **`sqlx` 0.9 的 `query!`/`query_scalar!` 只吃字符串字面量**（`expand_query!(source = $query)` 内部
+>   按 `LitStr` 或 `"a" "b"` 拼接解析）。所以设计里那个「scaffold 给 `pub const INSERT_SUBSCRIBER`」是行不
+>   通的：语句写在**正文**里，参考解用字面量（可以 `\` 换行，`syn` 解出来的值与一行写法逐字相同）。
 > - **`.sqlx` 的键是语句文本的 SHA-256**（`hash_string(&input.sql)`），宏与 `cargo sqlx prepare` 用同一
 >   个函数；`prepare` 的做法是 `cargo check` + `SQLX_OFFLINE_DIR=<cache>` + `SQLX_TMP=<target/sqlx-tmp>`，
 >   由宏把 JSON 写进临时目录再搬到 `.sqlx/`，所以它需要**能连库或已有缓存**且 `cargo check` 成功。缓存
 >   目录按 `SQLX_OFFLINE_DIR` → `<manifest_dir>/.sqlx` → `<workspace_root>/.sqlx` 找；`DATABASE_URL`
->   未设时自动走离线。`prepare` 会先删掉缓存目录里的旧 `query-*.json`，所以语句改了就自动清理。
+>   未设时自动走离线；`prepare` 会先删掉缓存目录里的旧 `query-*.json`（所以语句改了会自动清理）。
 > - **`argon2 0.6` 的 API 与 0.5 不同**：`Argon2::default().hash_password(bytes)` 自带 `getrandom` 取盐
 >   （默认 features = `alloc`+`getrandom`+`password-hash`，不需要 `SaltString`/`OsRng`），返回
 >   `password_hash::phc::PasswordHash`，`to_string()` 就是 PHC 串；`password_hash::Error` 实现了
->   `core::error::Error`，可以直接当 `#[source]`。
-> - **并发场景的规格写法**（1.11 的第三条测试，1.12 要照抄）：`TestApp` 自动是 `Sync`（字段都是
->   `SocketAddr`/`oneshot::Sender`/`JoinHandle`），所以 `std::thread::scope` + `std::sync::Barrier::new(N)`
->   就够了，不需要 `Arc`；N 取 4 比 2 更容易把「先读后写」的实现打出来。
-> - 1.11 的规格**在「先 SELECT 再 INSERT」的实现上会失败**（已实测：`[201, 500, 500, 500]`）。写新步骤的
->   规格时照此确认一遍：把参考解改成那个阱的形状，看规格是否真的红。
+>   `core::error::Error`，可以直接当 `#[source]`。`getrandom 0.4` 的函数是 `getrandom::fill(&mut [u8])`，
+>   `getrandom::Error` 同样实现了 `core::error::Error`，加 `getrandom = "0.4"` 不会引入新下载。
+> - **并发场景的规格写法**（1.11/1.12 都用）：`TestApp` 自动是 `Sync`，所以
+>   `std::thread::scope` + `std::sync::Barrier::new(N)` 就够了，不需要 `Arc`；N 取 4 比 2 更容易把
+>   「先读后写」的实现打出来。
+> - **反向验证是这一步的常规动作**：把参考解改成那个阱的形状，看规格真的红（1.11：`[201, 500, 500, 500]`；
+>   1.12：`[200, 200]`）。
+> - 本机 `podman images` 有一次返回空、下一次才列全；镜像没了就
+>   `podman pull docker.1ms.run/library/postgres:17-alpine`（8 秒）。
 >
-> ### 1.12 已定的设计（下一段直接写代码，不要再调研）
+> ### 2026-10 进度（M0 第七段 · 做到 1.12）
 >
-> 能力不变：`sec/token-lifetime@apply`，hint 是「expired / replayed / tampered 三种失败都要设计」。
-> 1.11 的树上写，1.12 的 scaffold **只新增文件**（`src/confirmation.rs` + `.sqlx/` 新条目 + `Cargo.toml`
-> 标记块里的 `getrandom = "0.3"`），学员改的是 `src/signup.rs`、`src/error.rs`、`src/http.rs`、`src/lib.rs`。
+> 能力 `sec/token-lifetime@apply`；hint 是「expired / replayed / tampered 三种失败都要设计」。
+> 落地结果：`src/confirmation.rs`（`Token`、`TOKEN_BYTES=32`、`CONFIRMATION_WINDOW_SECS=86400.0`、
+> `parse`/`issue`/`as_str`/手写 `Debug(<redacted>)`、零依赖的 `hex`），`GET /confirm?token=…`，
+> 过期由库的 `now()` 写与比，一次性由 UPDATE 条件里的 `status = 'pending'` 保证，令牌不清空（清空就分不出
+> 重放和伪造），三个新的 4xx 变体 + `TokenGeneration`（500/退出 1），
+> `SignedUp` 改名 `SubscriberState`。scaffold 只新增文件（`src/confirmation.rs` 里 `issue` 返回 64 个 0、
+> `.sqlx/` 三条新语句的元数据、`Cargo.toml` 的 `getrandom`），`time_hint` 仍是 90m，闸门列表未变。
+> 1.12 的参考解**删掉了 1.11 那条 INSERT 的 `.sqlx` 条目**（语句改了，`cargo sqlx prepare` 也会删），
+> 这是解法可以删文件、scaffold 不能的第一次使用，正文里写明了。
 >
-> **令牌。** `Token`（私有字段）+ `TOKEN_BYTES = 32` + `CONFIRMATION_WINDOW_SECS = 86400.0`：
-> `issue()` 用 `getrandom::fill` 取 32 字节、编成 64 位小写十六进制（不引 `rand`/`hex`，手写 8 行编码，
-> 正文里说明「随机字节 + URL 安全编码」）；scaffold 的 `issue()` **返回 64 个 `0`**（跟 1.11 的 `hash`
-> 返回明文同一个套路，规格的「两次注册两个令牌」是它的闸门），参考解才真的问系统要随机数，并新增
-> `Error::TokenGeneration { source: getrandom::Error }`（退出码 1）。
+> **1.12 实测的规格口味（下一步照抄）**：`signed_up()` 用 `psql` 直接读 `confirmation_token`（服务永远不
+> 把它给调用方，规格要当数据库的读者）；过期用一条 `UPDATE … SET confirmation_expires_at = now() -
+> interval '1 minute'` 造出来，不睡觉；重放除了断 409，还断言 `confirmed_at` **没有被第二次请求挪动**。
+> 反向验证同样做了：把 `confirm` 改成「先读后写」，`two_confirmations_at_once_confirm_once` 报
+> `[200, 200]`；把 `issue` 留成 scaffold 的常量，第二次注册 500（`confirmation_token UNIQUE`）。
+> `cargo xtask ci` 全绿 3m30s，`kiln selftest` 对 **1.1–1.12 共 12 步**满足契约（1.12：8/8 must），
+> `kiln verify --json mailer` = 12 passed / 0 failed / 10 not authored（exit 3）。
 >
-> **注册时签发。** 1.11 的 INSERT 扩成（正文给原文、逐字使用）：
+> ### 1.13 已定的设计（下一段直接写代码，不要再调研）
 >
-> ```sql
-> INSERT INTO subscribers (email, name, password_hash, confirmation_token, confirmation_expires_at) VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) ON CONFLICT (email) DO NOTHING RETURNING id
-> ```
+> 能力 `test/fake-external@apply`；60m → 建议改 **90m**（见下）；requires 已满足（1.5 的错误链、1.12 的
+> 令牌）。**这一步的关键约束是注入缝**：`tests/support/mod.rs`（1.8 的 app 工厂）没有 scaffold 标记块，
+> 新 scaffold 只能新增文件，所以 1.13 的规格**自己写一个能注入发送器的 app 夹具**，不碰 `TestApp`。
 >
-> `$5` 是 `f64`（`CONFIRMATION_WINDOW_SECS`），过期时刻由**数据库的 `now()`** 算，后面比较也用 `now()`：
-> 应用与库的时钟不需要一致。响应体仍然只有 `{"status":"pending","email":…}`——**令牌绝不进响应**
-> （规格断言 201 的 body 里没有令牌）。
+> **端口**：新文件 `src/email.rs`（scaffold 内容，`Cargo.toml` 不需新增依赖）：
+> `pub struct Message { pub to: Email, pub subject: String, pub body: String }`（收件人用 1.10 的领域类型，
+> 不是 `String`）；`pub struct SendError(Box<dyn Error + Send + Sync>)`（1.5 的规矩：保留 cause，实现
+> `Display`/`Error`）；`pub trait EmailSender: Send + Sync + 'static`，方法签名
+> `fn send(&self, message: Message) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>>`
+> ——**必须装箱**，因为 `AppState` 要拿 `Arc<dyn EmailSender>`，而 AFIT 在 1.98 还不能 dyn 分发；正文里
+> 写明这一次分配是 `dyn` 的代价。第一个适配器 `pub struct Logging`（`send` 记一条
+> `info!(to = %message.to, subject = %message.subject, "an email would be sent")` 并返回 Ok）：1.13 没有
+> SMTP，真实的适配器是 1.19 的 mailpit。链接由 `pub fn confirmation_message(to: Email, token: &Token) ->
+> Message` 造，基址是 `pub const CONFIRMATION_BASE_URL`（**本步先不做成配置项**：`config.rs` 没有标记块，
+> 加设置要学员手改 1.4 那套 defaults/file/env/flags/report 机制，把它留给真正需要它的 1.19/1.21；正文
+> TRAP 里说明这一点）。规格只断言 body 里有 `/confirm?token=<行里的令牌>`，不钉基址。
 >
-> **确认。** `GET /confirm?token=…`，一次条件 UPDATE 决定一切（正文给原文）：
+> **注入缝**：`AppState` 增加 `sender: Arc<dyn EmailSender>` 与
+> `pub async fn start_with_sender(config, id, sender: Arc<dyn EmailSender>) -> Result<Self, Error>`
+> （`start` 内部用 `Logging`），二进制继续用 `start`。这条缝是**公开的**，因为测试装置在库看不见的地方，
+> 正文里写明理由（「注入是构造参数，不是 mock 框架」）。
 >
-> ```sql
-> UPDATE subscribers SET status = 'active', confirmed_at = now() WHERE confirmation_token = $1 AND status = 'pending' AND confirmation_expires_at > now() RETURNING email
-> ```
+> **用法**：1.11 的 `subscribe` 在插入成功、拿到 token 之后发一封信（`confirmation_message(email, &token)`）
+> ——`subscribe` 需要拿到 token，所以它的返回值要从 `Email` 变成 `(Email, Token)`？**不要**：让
+> `subscribe` 自己发（`pool` 之外再收 `&dyn EmailSender` 或 `&Arc<dyn EmailSender>`），返回值不变。
+> **发送失败不改变答复**：行已经写好、订阅者已经在，信是投递问题不是注册问题 → 仍然 201，`warn!` 记一条
+> （1.14 的 worker 与 1.15 的幂等重投是它的续集；这也是 1.14「把发送挪出请求路径」的引子）。已被订阅的地址
+> **不发信**（409 之前不能发）。`Logging` 的失败注入不需要：假的 `Recording` 才需要。
 >
-> `fetch_optional`：有行 = 这次调用确认成功（200 + `{"status":"active","email":…}`）；没有行才去
-> **诊断**（只为了说清原因，判定已经做完了）：
+> **假实现**：scaffold 新增 `tests/support/email.rs`：
+> `pub struct Recording { sent: Mutex<Vec<Message>>, failure: Mutex<Option<String>> }`，
+> `new()`、`fail_with(&str)`（之后每次 send 都返回 `Err(SendError::…)`）、`clear_failure()`、
+> `sent() -> Vec<Message>`；`impl EmailSender for Recording` 先查失败再记录。规格用
+> `#[path = "support/email.rs"] mod email;` 引入（1.9 的 postgres.rs 同一套路），夹具是规格里的
+> `AppHarness`：`AppState::start_with_sender` + `std::net::TcpListener::bind("127.0.0.1:0")` +
+> 自己的线程跑 `http::serve_on`，请求用 spec_http 那种裸 TCP 写法（不要复制 TestApp 的整份代码，
+> 只要 get/post 两个方法）。
 >
-> ```sql
-> SELECT email, status = 'active' AS confirmed, confirmation_expires_at <= now() AS expired FROM subscribers WHERE confirmation_token = $1
-> ```
+> **规格**（`spec/1.13/email_port.rs`，五条）：① 注册成功 → 假发送器**恰好**收到一封信、收件人是规整后的
+> 地址、body 里有 `/confirm?token=<行里的令牌>`（表里的令牌与信里的令牌必须一致）；② 同一地址第二次
+> → 409 且**没有第二封信**；③ `fail_with` 之后注册 → 仍然 201、行仍然是 `pending`、信没发出去（订阅者不
+> 因为邮件服务器挂了而消失）；④ 恢复（`clear_failure`）后注册第三个地址 → 又是一封信（失败不粘住）；
+> ⑤ 端口本身的一致性：`Logging` 与 `Recording` 都是 `EmailSender`，对「可投递的消息」都返回 Ok
+> ——这可以用 `let senders: Vec<Box<dyn EmailSender>> = vec![Box::new(Logging), Box::new(Recording::new())]`
+> 在一个测试里跑同一段断言表达出来（`test/fake-external` 的「假实现要与真实现同契约」）。
 >
-> 无行 → `Error::TokenUnknown`（404，`no subscriber has that confirmation token`）；`expired` →
-> `Error::TokenExpired`（410）；否则（`active`，或 1.18 之后的 `unsubscribed`）→
-> `Error::AlreadyConfirmed { email }`（409）。三个新变体都进退出码表的 `2` 一行，都**不回显令牌**（令牌也
-> 是秘密）。token 用完**不清空**：清空就分不出「重放」和「伪造」，一次性由 UPDATE 里的 `status = 'pending'`
-> 保证。缺 `token` 参数 → 400（`Result<Query<…>, QueryRejection>`，和 1.11 的 body 同一套路）；无库 → 503。
-> `http.rs` 里的 `SignedUp` 改名成 `SubscriberState`（201 和 200 共用一张体）。
->
-> **规格**（`spec/1.12/confirmation.rs`，六条，全部从外面看）：① 注册后行里有 64 位十六进制令牌、
-> `confirmed_at IS NULL`、过期时刻在 23–25 小时之后，201 的 body 里没有令牌，两次注册两个不同的令牌；
-> ② 有效令牌 → 200 且行变 `active`、`confirmed_at` 非空；同一个令牌再来一次 → 409，且 `confirmed_at`
-> **没有变**；③ 用 `psql` 把 `confirmation_expires_at` 改成过去 → 410，行仍是 `pending`；
-> ④ 篡改一个字符 / 换一个没发过的令牌 → 404，缺参数 → 400，行不变；⑤ 两个线程拿同一个有效令牌同时
-> 请求（`Barrier` + `thread::scope`）→ 恰好一个 200、一个 409、`confirmed_at` 只被写一次（「先读后写」
-> 的实现在这里露馅）；⑥ 没配库 → 503。
->
-> **正文的 TRAP 至少覆盖**：`Utc::now()`/应用时钟算过期（跟库的 `now()` 不一致）、令牌进响应或进错误消息、
-> 计数器/时间戳/UUIDv1 这类可猜的「随机」、把「重放」当 500 或当成伪造（404）、先读后写成两次 200、
-> 忘记 `status = 'pending'` 导致重放又能改 `confirmed_at`、清空令牌导致再也说清「已确认」。
+> **正文 TRAP 至少覆盖**：`send` 失败把注册变成 500（订阅者已存在，这是投递问题）；给已被订阅的地址也发
+> 信（钓鱼/骚扰面）；把链接基址写死在正文示例里而正文又说它该是配置项（要么是常量要么是设置，不能是
+> 两者）；`AppState` 里存具体类型而不是 `Arc<dyn _>`（测试没法注入）；用 `async fn` 直接写 trait 方法
+> （dyn 分发编不过）；假实现只存在于测试文件里却断言真实现的行为（假货会漂移）。正文 DONE WHEN 里要
+> 能复制的 `kiln run/check` 两条命令，并加上 `cargo test --lib`。
 
 ## 6. 工作方式约定
 
