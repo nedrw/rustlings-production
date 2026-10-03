@@ -6,13 +6,32 @@
 //! printed: `json` mode is parsed field by field, `pretty` mode is checked for the same facts in a
 //! form a human reads, and both are checked for the one thing that must never appear in a log
 //! line — a secret.
+//!
+//! **What a run says is the subject; how it ends is not.** The same file is judged against trees
+//! where the service logs and exits (this step) and against trees where it logs and then serves
+//! until somebody stops it (every step from `mailer/1.7-http` on), so [`capture`] reads until the
+//! start is over — the process ended, or it is listening — and then stops it. Asserting an exit
+//! code here would be a claim about the tree, not about the logs.
 
 use std::collections::BTreeSet;
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+/// How long one run gets to finish saying what it has to say.
+const RUN_DEADLINE: Duration = Duration::from_secs(15);
+/// How often [`capture`] looks at the lines it collected.
+const POLL: Duration = Duration::from_millis(20);
+/// The word a start ends with: once the service has a listener, it has nothing left to say about
+/// starting, and a later tree will keep saying nothing for hours.
+const LISTENING: &str = "listening";
 
 /// A directory the test writes its fixtures into, removed when the test ends.
 struct Dir(PathBuf);
@@ -47,15 +66,26 @@ impl Drop for Dir {
 struct Run {
     stdout: String,
     stderr: String,
+    /// Exit code, when the process ended on its own; `None` when this spec stopped a service that
+    /// was still serving (a later tree does exactly that).
     code: Option<i32>,
     /// The process id the operating system gave it — the id a log line has to carry.
     pid: u32,
+    /// The port this run was told to listen on, which is the port its start line reports.
+    port: u16,
 }
 
 impl Run {
     /// Everything the process said, whichever stream it said it on.
     fn said(&self) -> String {
         format!("{}{}", self.stdout, self.stderr)
+    }
+
+    /// `true` when the service did not start: it exited non-zero, or it panicked.
+    ///
+    /// A run this spec *stopped* is not a failure — that is a service which was still serving.
+    fn failed(&self) -> bool {
+        self.code.is_some_and(|code| code != 0) || self.said().contains("panicked at")
     }
 
     /// The lines of `json` mode, parsed: a collector has to be able to do exactly this.
@@ -92,11 +122,14 @@ impl Run {
     }
 }
 
-/// Start the service in `dir` with an empty environment plus what the test passes.
-fn start(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Child, u32) {
+/// Start the service in `dir`, with an empty environment plus what the test passes, on a port
+/// nobody else is using.
+fn start(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Child, u32, u16) {
+    let port = free_port();
     let mut command = Command::new(env!("CARGO_BIN_EXE_mailer"));
     command
         .args(args)
+        .args(["--listen-port", &port.to_string()])
         .current_dir(dir)
         .env_clear()
         .stdout(Stdio::piped())
@@ -108,21 +141,86 @@ fn start(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Child, u32) {
         .spawn()
         .unwrap_or_else(|error| panic!("the mailer binary could not be started: {error}"));
     let pid = child.id();
-    (child, pid)
+    (child, pid, port)
+}
+
+/// A port nothing is listening on, asked of the operating system.
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port can be found");
+    listener
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port()
+}
+
+/// Run the service and collect everything it said while it was starting.
+///
+/// The run ends the first time one of these is true: the process ended, it said it is listening, it
+/// is listening anyway (the port answers — a service told to log only errors says nothing at all),
+/// or [`RUN_DEADLINE`] passed. Whichever it was, the process is stopped and its output is read to
+/// the end of the pipe, so the lines judged below are all the lines of that start.
+fn capture(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let (mut child, pid, port) = start(dir, args, env);
+    let stdout = child
+        .stdout
+        .take()
+        .expect("the service was started with a pipe");
+    let (sender, lines) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + RUN_DEADLINE;
+    let mut collected: Vec<String> = Vec::new();
+    loop {
+        match lines.recv_timeout(POLL) {
+            Ok(line) => {
+                let end_of_start = line.contains(LISTENING);
+                collected.push(line);
+                if end_of_start {
+                    break;
+                }
+            }
+            // Nothing new for a moment: the process may be gone, or it may be up and quiet.
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline || TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+            }
+            // The pipe closed: the process ended on its own.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("the mailer process has to finish: {error}"));
+    // The reader ends with the pipe, which is what makes the collected lines complete rather than
+    // "whatever had arrived by then".
+    let _ = reader.join();
+    let mut stdout = collected.join("\n");
+    while let Ok(line) = lines.try_recv() {
+        stdout.push('\n');
+        stdout.push_str(&line);
+    }
+
+    Run {
+        stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        code: output.status.code(),
+        pid,
+        port,
+    }
 }
 
 /// Run the service and collect everything it said.
 fn run(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
-    let (child, pid) = start(dir, args, env);
-    let output = child
-        .wait_with_output()
-        .unwrap_or_else(|error| panic!("the mailer process has to finish: {error}"));
-    Run {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        code: output.status.code(),
-        pid,
-    }
+    capture(dir, args, env)
 }
 
 /// The `json` mode of the service, with the level the caller asks for.
@@ -132,14 +230,7 @@ fn json_run(dir: &Path, level: &str, extra: &[(&str, &str)]) -> Run {
         ("MAILER__LOG__LEVEL", level),
     ];
     env.extend_from_slice(extra);
-    let run = run(dir, &[], &env);
-    assert_eq!(
-        run.code,
-        Some(0),
-        "the service has to exit successfully here: {}",
-        run.said()
-    );
-    run
+    run(dir, &[], &env)
 }
 
 /// One field of an event, or a panic naming what the event actually had.
@@ -153,6 +244,7 @@ fn field<'a>(event: &'a Value, name: &str) -> &'a Value {
 fn json_mode_is_one_object_per_line_with_the_fields_a_collector_indexes() {
     let dir = Dir::new("json");
     let run = json_run(dir.path(), "info", &[]);
+    assert!(!run.failed(), "the service has to start: {}", run.said());
     let events = run.events();
     let event = events
         .first()
@@ -166,7 +258,11 @@ fn json_mode_is_one_object_per_line_with_the_fields_a_collector_indexes() {
         "{event} — the settings that decided how this process runs belong in the line that says \
          it started"
     );
-    assert_eq!(field(event, "port"), 8080, "{event}");
+    assert_eq!(
+        field(event, "port"),
+        run.port,
+        "{event} — the port the run was configured with belongs in the line that says it started"
+    );
     assert_eq!(field(event, "log_format"), "json", "{event}");
     assert_eq!(
         field(event, "database"),
@@ -188,7 +284,7 @@ fn json_mode_is_one_object_per_line_with_the_fields_a_collector_indexes() {
 fn pretty_mode_is_for_a_human_and_carries_the_same_fields() {
     let dir = Dir::new("pretty");
     let run = run(dir.path(), &[], &[("MAILER__LOG__FORMAT", "pretty")]);
-    assert_eq!(run.code, Some(0), "{}", run.said());
+    assert!(!run.failed(), "the service has to start: {}", run.said());
 
     let line = run
         .stdout
@@ -199,7 +295,8 @@ fn pretty_mode_is_for_a_human_and_carries_the_same_fields() {
         !line.trim_start().starts_with('{'),
         "`pretty` mode is the format a person reads, not JSON: `{line}`"
     );
-    for fragment in ["mailer is starting", "host=127.0.0.1", "port=8080"] {
+    let port = format!("port={}", run.port);
+    for fragment in ["mailer is starting", "host=127.0.0.1", port.as_str()] {
         assert!(
             line.contains(fragment),
             "`pretty` mode has to show the same facts as `json` mode; {fragment:?} is missing \
