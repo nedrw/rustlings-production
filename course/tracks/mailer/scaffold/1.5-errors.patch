@@ -1,0 +1,88 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 904d2ba..0cadf8f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,7 +20,9 @@ workspace = true
+ 
+ [dependencies]
+ # kiln:scaffold:begin
++anyhow = "1.0.104"
+ serde = { version = "1.0.229", features = ["derive"] }
++thiserror = "2.0.21"
+ toml = "0.9.8"
+ # kiln:scaffold:end
+ 
+diff --git a/src/error.rs b/src/error.rs
+new file mode 100644
+index 0000000..0defa25
+--- /dev/null
++++ b/src/error.rs
+@@ -0,0 +1,68 @@
++//! The failures this service can report, and what each one means at the boundary
++//! (step `mailer/1.5-errors`).
++//!
++//! The scaffold declares the shape: one enum, a variant for every way the service can fail, and
++//! the source a value came from when a setting is what broke. The step makes it an API — every
++//! variant gets a message for a human, a cause for the caller to walk, and an exit code the shell
++//! can act on — and then the rest of the service is rewritten to report one of these instead of
++//! a sentence built where the failure happened.
++
++use std::path::PathBuf;
++
++/// Which source a setting's value came from, so a complaint can point at it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SettingSource {
++    /// The configuration file.
++    File(PathBuf),
++    /// An environment variable, by name.
++    Environment(String),
++    /// A command-line flag, by name.
++    Flag(&'static str),
++}
++
++/// What went wrong.
++#[derive(Debug)]
++pub enum Error {
++    /// The command line asked for something this build does not have.
++    UnknownArgument {
++        /// The argument, as it was typed.
++        argument: String,
++    },
++    /// A flag was given without the value it needs.
++    MissingValue {
++        /// The flag that needs one.
++        flag: &'static str,
++        /// What it needs, phrased for a message about it.
++        expected: &'static str,
++    },
++    /// A setting has a value the service cannot use.
++    InvalidSetting {
++        /// Setting as a configuration writes it (`listen.port`).
++        key: String,
++        /// The value as it was written.
++        value: String,
++        /// What the setting would have accepted.
++        expected: &'static str,
++        /// Where the value came from.
++        source: SettingSource,
++    },
++    /// The environment holds a variable the service does not know.
++    UnknownSetting {
++        /// Variable that was not recognised.
++        name: String,
++    },
++    /// The configuration file could not be read.
++    UnreadableConfig {
++        /// File that could not be read.
++        path: PathBuf,
++        /// What reading it reported.
++        source: std::io::Error,
++    },
++    /// The configuration file could not be parsed.
++    InvalidConfig {
++        /// File that was read.
++        path: PathBuf,
++        /// What the parser said.
++        source: toml::de::Error,
++    },
++}

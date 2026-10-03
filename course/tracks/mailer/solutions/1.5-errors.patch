@@ -1,0 +1,575 @@
+diff --git a/src/config.rs b/src/config.rs
+index 2838107..d0a6d4e 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -10,6 +10,8 @@ use std::str::FromStr;
+ 
+ use serde::Deserialize;
+ 
++use crate::error::{BadValue, Error, SettingSource};
++
+ /// Prefix of every environment variable the service reads.
+ pub const ENV_PREFIX: &str = "MAILER__";
+ 
+@@ -53,7 +55,14 @@ impl Config {
+     /// Defaults first, then the file, then the environment, then the flags: every setting ends up
+     /// with the value of the last source that mentioned it, and a setting nobody recognises is an
+     /// error rather than a default.
+-    pub fn load(flags: &Flags, env: &[(String, String)]) -> Result<Self, ConfigError> {
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::UnreadableConfig`] or [`Error::InvalidConfig`] when the file cannot be
++    /// read or refused by the parser, [`Error::UnknownSetting`] when the environment holds a
++    /// variable this service does not know, and [`Error::InvalidSetting`] when a source supplies
++    /// a value the setting cannot use.
++    pub fn load(flags: &Flags, env: &[(String, String)]) -> Result<Self, Error> {
+         let mut config = Self::default();
+         config.apply_file(flags.config.as_deref())?;
+         config.apply_env(env)?;
+@@ -83,7 +92,7 @@ impl Config {
+     }
+ 
+     /// The file layer: `mailer.toml`, or the file `--config` named.
+-    fn apply_file(&mut self, explicit: Option<&Path>) -> Result<(), ConfigError> {
++    fn apply_file(&mut self, explicit: Option<&Path>) -> Result<(), Error> {
+         let path = explicit.map_or_else(|| PathBuf::from(DEFAULT_FILE), Path::to_path_buf);
+         let text = match std::fs::read_to_string(&path) {
+             Ok(text) => text,
+@@ -93,17 +102,10 @@ impl Config {
+             Err(error) if error.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => {
+                 return Ok(());
+             }
+-            Err(error) => {
+-                return Err(ConfigError::File {
+-                    path,
+-                    message: error.to_string(),
+-                });
+-            }
++            Err(source) => return Err(Error::UnreadableConfig { path, source }),
+         };
+-        let file: FileConfig = toml::from_str(&text).map_err(|error| ConfigError::Content {
+-            path,
+-            message: error.to_string(),
+-        })?;
++        let file: FileConfig =
++            toml::from_str(&text).map_err(|source| Error::InvalidConfig { path, source })?;
+ 
+         if let Some(listen) = &file.listen {
+             if let Some(host) = &listen.host {
+@@ -133,26 +135,26 @@ impl Config {
+     ///
+     /// A variable with the service's own prefix that does not name a setting is refused: it is the
+     /// shape a typo takes, and the service that ignores it starts with settings nobody chose.
+-    fn apply_env(&mut self, env: &[(String, String)]) -> Result<(), ConfigError> {
++    fn apply_env(&mut self, env: &[(String, String)]) -> Result<(), Error> {
+         for (name, value) in env {
+             let Some(setting) = name.strip_prefix(ENV_PREFIX) else {
+                 continue;
+             };
+             let key = setting.to_ascii_lowercase().replace("__", ".");
+-            let source = Source::Environment(name.clone());
++            let origin = SettingSource::Environment(name.clone());
+             match key.as_str() {
+                 "listen.host" => self.listen.host.clone_from(value),
+                 "listen.port" => {
+-                    self.listen.port = Self::setting("listen.port", port(value), source)?;
++                    self.listen.port = Self::setting("listen.port", port(value), origin)?;
+                 }
+                 "log.level" => {
+-                    self.log.level = Self::setting("log.level", value.parse(), source)?;
++                    self.log.level = Self::setting("log.level", value.parse(), origin)?;
+                 }
+                 "log.format" => {
+-                    self.log.format = Self::setting("log.format", value.parse(), source)?;
++                    self.log.format = Self::setting("log.format", value.parse(), origin)?;
+                 }
+                 "database.url" => self.database.url = Some(value.clone()),
+-                _ => return Err(ConfigError::UnknownEnvironment { name: name.clone() }),
++                _ => return Err(Error::UnknownSetting { name: name.clone() }),
+             }
+         }
+         Ok(())
+@@ -170,12 +172,13 @@ impl Config {
+     fn setting<T>(
+         key: &str,
+         parsed: Result<T, BadValue>,
+-        source: Source,
+-    ) -> Result<T, ConfigError> {
+-        parsed.map_err(|problem| ConfigError::Value {
++        origin: SettingSource,
++    ) -> Result<T, Error> {
++        parsed.map_err(|problem| Error::InvalidSetting {
+             key: key.to_owned(),
+-            problem,
+-            source,
++            value: problem.value,
++            expected: problem.expected,
++            origin,
+         })
+     }
+ }
+@@ -396,117 +399,3 @@ fn port(value: &str) -> Result<u16, BadValue> {
+         .parse()
+         .map_err(|_| BadValue::new(value, PORT_EXPECTED))
+ }
+-
+-/// A value that is none of the names a setting accepts, before anyone knows which setting it came
+-/// from: the source adds that when it applies the value.
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub struct BadValue {
+-    /// The value as it was written.
+-    pub value: String,
+-    /// What the setting accepts, phrased for a message.
+-    pub expected: &'static str,
+-}
+-
+-impl BadValue {
+-    /// Describe one refused value, given what the setting would have accepted.
+-    #[must_use]
+-    pub fn new(value: &str, expected: &'static str) -> Self {
+-        Self {
+-            value: value.to_owned(),
+-            expected,
+-        }
+-    }
+-}
+-
+-impl fmt::Display for BadValue {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "`{}` is not {}", self.value, self.expected)
+-    }
+-}
+-
+-/// Which source a value came from, so a complaint can point at it.
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub enum Source {
+-    /// The configuration file.
+-    File(PathBuf),
+-    /// An environment variable, by name.
+-    Environment(String),
+-    /// A command-line flag, by name.
+-    Flag(&'static str),
+-}
+-
+-impl fmt::Display for Source {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        match self {
+-            Source::File(path) => write!(f, "{}", path.display()),
+-            Source::Environment(name) => f.write_str(name),
+-            Source::Flag(flag) => f.write_str(flag),
+-        }
+-    }
+-}
+-
+-/// Everything that stops the service from being configured.
+-#[derive(Debug, Clone, PartialEq, Eq)]
+-pub enum ConfigError {
+-    /// The configuration file could not be read.
+-    File {
+-        /// File that could not be read.
+-        path: PathBuf,
+-        /// What reading it reported, as text (the step that types errors owns the chain).
+-        message: String,
+-    },
+-    /// The configuration file is not valid TOML, or holds a setting the service does not know.
+-    Content {
+-        /// File that was read.
+-        path: PathBuf,
+-        /// What the parser said.
+-        message: String,
+-    },
+-    /// The environment holds a variable the service does not know.
+-    UnknownEnvironment {
+-        /// Variable that was not recognised.
+-        name: String,
+-    },
+-    /// A setting has a value the service cannot use.
+-    Value {
+-        /// Setting as the configuration writes it (`listen.port`).
+-        key: String,
+-        /// The value, and what would have been accepted.
+-        problem: BadValue,
+-        /// Where the value came from.
+-        source: Source,
+-    },
+-    /// The command line itself does not make sense.
+-    Usage {
+-        /// What is wrong with it.
+-        message: String,
+-    },
+-}
+-
+-impl fmt::Display for ConfigError {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        match self {
+-            ConfigError::File { path, message } => {
+-                write!(f, "cannot read `{}`: {message}", path.display())
+-            }
+-            ConfigError::Content { path, message } => {
+-                write!(f, "cannot use `{}`: {message}", path.display())
+-            }
+-            ConfigError::UnknownEnvironment { name } => write!(
+-                f,
+-                "`{name}` is not a setting this service knows — a typo in a variable name would \
+-                 otherwise start the service with the wrong settings"
+-            ),
+-            ConfigError::Value {
+-                key,
+-                problem,
+-                source,
+-            } => write!(
+-                f,
+-                "`{key}` is `{}`, which is not {} (from {source})",
+-                problem.value, problem.expected
+-            ),
+-            ConfigError::Usage { message } => f.write_str(message),
+-        }
+-    }
+-}
+diff --git a/src/error.rs b/src/error.rs
+index 0defa25..5ee4acf 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -1,13 +1,20 @@
+ //! The failures this service can report, and what each one means at the boundary
+ //! (step `mailer/1.5-errors`).
+ //!
+-//! The scaffold declares the shape: one enum, a variant for every way the service can fail, and
+-//! the source a value came from when a setting is what broke. The step makes it an API — every
+-//! variant gets a message for a human, a cause for the caller to walk, and an exit code the shell
+-//! can act on — and then the rest of the service is rewritten to report one of these instead of
+-//! a sentence built where the failure happened.
++//! Every failure is a variant of [`Error`], so a caller matches on what happened instead of
++//! reading a sentence. Two more things make this an API rather than a `String`:
++//!
++//! * each variant keeps its **cause** — the [`std::io::Error`] that stopped a read, the
++//!   [`toml::de::Error`] that refused a file — so `source()` walks a chain instead of the message
++//!   flattening it into prose;
++//! * each variant knows how the process ends because of it ([`Error::exit_code`]), because a shell
++//!   is a caller too.
+ 
++use std::fmt;
+ use std::path::PathBuf;
++use std::process::ExitCode;
++
++use thiserror::Error;
+ 
+ /// Which source a setting's value came from, so a complaint can point at it.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -20,15 +27,27 @@ pub enum SettingSource {
+     Flag(&'static str),
+ }
+ 
++impl fmt::Display for SettingSource {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            SettingSource::File(path) => write!(f, "{}", path.display()),
++            SettingSource::Environment(name) => f.write_str(name),
++            SettingSource::Flag(flag) => f.write_str(flag),
++        }
++    }
++}
++
+ /// What went wrong.
+-#[derive(Debug)]
++#[derive(Debug, Error)]
+ pub enum Error {
+     /// The command line asked for something this build does not have.
++    #[error("unknown argument `{argument}`")]
+     UnknownArgument {
+         /// The argument, as it was typed.
+         argument: String,
+     },
+     /// A flag was given without the value it needs.
++    #[error("`{flag}` needs {expected}")]
+     MissingValue {
+         /// The flag that needs one.
+         flag: &'static str,
+@@ -36,6 +55,7 @@ pub enum Error {
+         expected: &'static str,
+     },
+     /// A setting has a value the service cannot use.
++    #[error("`{key}` is `{value}`, which is not {expected} (from {origin})")]
+     InvalidSetting {
+         /// Setting as a configuration writes it (`listen.port`).
+         key: String,
+@@ -44,14 +64,19 @@ pub enum Error {
+         /// What the setting would have accepted.
+         expected: &'static str,
+         /// Where the value came from.
+-        source: SettingSource,
++        origin: SettingSource,
+     },
+     /// The environment holds a variable the service does not know.
++    #[error(
++        "`{name}` is not a setting this service knows — a typo in a variable name would \
++         otherwise start the service with the wrong settings"
++    )]
+     UnknownSetting {
+         /// Variable that was not recognised.
+         name: String,
+     },
+     /// The configuration file could not be read.
++    #[error("cannot read `{path}`")]
+     UnreadableConfig {
+         /// File that could not be read.
+         path: PathBuf,
+@@ -59,6 +84,7 @@ pub enum Error {
+         source: std::io::Error,
+     },
+     /// The configuration file could not be parsed.
++    #[error("cannot use `{path}`")]
+     InvalidConfig {
+         /// File that was read.
+         path: PathBuf,
+@@ -66,3 +92,49 @@ pub enum Error {
+         source: toml::de::Error,
+     },
+ }
++
++impl Error {
++    /// The exit code this failure ends the process with.
++    ///
++    /// The table is the contract a script sees:
++    ///
++    /// | failure | code | who has to act |
++    /// | --- | --- | --- |
++    /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
++    /// | the configuration could not be read or parsed | `1` | whoever deployed it |
++    ///
++    /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
++    /// retry.
++    #[must_use]
++    pub fn exit_code(&self) -> ExitCode {
++        match self {
++            Error::UnknownArgument { .. }
++            | Error::MissingValue { .. }
++            | Error::InvalidSetting { .. }
++            | Error::UnknownSetting { .. } => ExitCode::from(2),
++            Error::UnreadableConfig { .. } | Error::InvalidConfig { .. } => ExitCode::FAILURE,
++        }
++    }
++}
++
++/// A value that is none of the names a setting accepts, before anyone knows which setting it came
++/// from: the source adds that when it applies the value.
++#[derive(Debug, Error)]
++#[error("`{value}` is not {expected}")]
++pub struct BadValue {
++    /// The value as it was written.
++    pub value: String,
++    /// What the setting accepts, phrased for a message.
++    pub expected: &'static str,
++}
++
++impl BadValue {
++    /// Describe one refused value, given what the setting would have accepted.
++    #[must_use]
++    pub fn new(value: &str, expected: &'static str) -> Self {
++        Self {
++            value: value.to_owned(),
++            expected,
++        }
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 9afbd04..5f38167 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,12 +7,17 @@
+ //! the configuration the process will use. Turning either of them into text on a terminal is the
+ //! binary's job, and it is what keeps the library usable from a test, a second binary or an HTTP
+ //! front end.
++//!
++//! What can go wrong is [`Error`], which is why the failure type lives in [`error`] rather than in
++//! the sentence that reports it (step `mailer/1.5-errors`).
+ 
+ use std::path::PathBuf;
+ 
+ pub mod config;
++pub mod error;
+ 
+-pub use config::{Config, ConfigError, Flags};
++pub use config::{Config, Flags};
++pub use error::{Error, SettingSource};
+ 
+ /// What the command line asked the process to do.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -52,7 +57,13 @@ OPTIONS:
+ ///
+ /// An argument this build does not know is refused rather than ignored: it means the run was meant
+ /// for a different build, and starting anyway would hide that.
+-pub fn parse<I, S>(args: I) -> Result<Cli, ConfigError>
++///
++/// # Errors
++///
++/// Reports [`Error::UnknownArgument`] for an argument this build does not have, [`Error::MissingValue`]
++/// when a flag was given without its value, and [`Error::InvalidSetting`] when the value cannot be
++/// used.
++pub fn parse<I, S>(args: I) -> Result<Cli, Error>
+ where
+     I: IntoIterator<Item = S>,
+     S: AsRef<str>,
+@@ -67,25 +78,28 @@ where
+             "--version" => request = Request::Version,
+             "--check-config" => request = Request::CheckConfig,
+             "--config" => {
+-                let path = args.next().ok_or_else(|| ConfigError::Usage {
+-                    message: "`--config` needs the path of a file".to_owned(),
++                let path = args.next().ok_or(Error::MissingValue {
++                    flag: "--config",
++                    expected: "the path of a file",
+                 })?;
+                 flags.config = Some(PathBuf::from(path.as_ref()));
+             }
+             "--listen-port" => {
+-                let value = args.next().ok_or_else(|| ConfigError::Usage {
+-                    message: "`--listen-port` needs a port number".to_owned(),
++                let value = args.next().ok_or(Error::MissingValue {
++                    flag: "--listen-port",
++                    expected: "a port number",
+                 })?;
+                 flags.listen_port =
+-                    Some(value.as_ref().parse().map_err(|_| ConfigError::Value {
++                    Some(value.as_ref().parse().map_err(|_| Error::InvalidSetting {
+                         key: "listen.port".to_owned(),
+-                        problem: config::BadValue::new(value.as_ref(), config::PORT_EXPECTED),
+-                        source: config::Source::Flag("--listen-port"),
++                        value: value.as_ref().to_owned(),
++                        expected: config::PORT_EXPECTED,
++                        origin: SettingSource::Flag("--listen-port"),
+                     })?);
+             }
+             other => {
+-                return Err(ConfigError::Usage {
+-                    message: format!("unknown argument `{other}`"),
++                return Err(Error::UnknownArgument {
++                    argument: other.to_owned(),
+                 });
+             }
+         }
+@@ -96,7 +110,7 @@ where
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Cli, ConfigError, Flags, Request, parse};
++    use super::{Cli, Error, Flags, Request, parse};
+ 
+     fn parsed(args: &[&str]) -> Cli {
+         parse(args).expect("the fixture arguments are valid")
+@@ -140,6 +154,6 @@ mod tests {
+         let message = error.to_string();
+         assert!(message.contains("listen.port"), "{message}");
+         assert!(message.contains("70000"), "{message}");
+-        assert!(matches!(error, ConfigError::Value { .. }), "{error}");
++        assert!(matches!(error, Error::InvalidSetting { .. }), "{error}");
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 0dc6bb6..c876cb2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,34 +1,45 @@
+-//! The `mailer` binary: a shell around the library.
++//! The `mailer` binary: a shell around the library, and the one place `anyhow` is allowed
++//! (step `mailer/1.5-errors`).
++//!
++//! The library reports [`mailer::Error`], which is concrete on purpose: a caller matches on it, and
++//! it says how the process ends. This file has the opposite job — turn a failure into something a
++//! person can act on, then return the code the shell sees — so an opaque box of failures is exactly
++//! what it wants: `anyhow` lets `?` walk out of any step below without inventing a second error
++//! enum that nothing can match on.
+ 
+ use std::process::ExitCode;
+ 
+-use mailer::{Config, ConfigError, Request, USAGE};
++use anyhow::Result;
++
++use mailer::{Config, Error, Request, USAGE};
+ 
+ fn main() -> ExitCode {
+-    let cli = match mailer::parse(std::env::args()) {
+-        Ok(cli) => cli,
+-        Err(error) => return refuse(&error),
+-    };
++    match service() {
++        Ok(code) => code,
++        Err(failure) => report(&failure),
++    }
++}
++
++/// Run one process: the command line, the configuration, and whatever was asked for.
++fn service() -> Result<ExitCode> {
++    let cli = mailer::parse(std::env::args())?;
+ 
+     // `--help` and `--version` answer without reading a configuration: a question about the binary
+     // should not depend on the state of a service.
+     match cli.request {
+         Request::Help => {
+             println!("{USAGE}");
+-            return ExitCode::SUCCESS;
++            return Ok(ExitCode::SUCCESS);
+         }
+         Request::Version => {
+             println!("mailer {}", env!("CARGO_PKG_VERSION"));
+-            return ExitCode::SUCCESS;
++            return Ok(ExitCode::SUCCESS);
+         }
+         _ => {}
+     }
+ 
+     let env: Vec<(String, String)> = std::env::vars().collect();
+-    let config = match Config::load(&cli.flags, &env) {
+-        Ok(config) => config,
+-        Err(error) => return refuse(&error),
+-    };
++    let config = Config::load(&cli.flags, &env)?;
+ 
+     match cli.request {
+         Request::CheckConfig => {
+@@ -37,19 +48,34 @@ fn main() -> ExitCode {
+             }
+         }
+         Request::Idle => eprintln!("mailer: no listener yet, nothing to do (try --help)"),
+-        Request::Help | Request::Version => unreachable!("handled above"),
++        Request::Help | Request::Version => unreachable!("answered above"),
+     }
+-    ExitCode::SUCCESS
++    Ok(ExitCode::SUCCESS)
+ }
+ 
+-/// Report a configuration the service refuses to start with.
++/// Report a failure: what happened, then the exit code the shell acts on.
+ ///
+-/// The message goes to stderr and the process exits non-zero before anything else happens: a service
+-/// that starts with settings it did not understand is worse than one that does not start.
+-fn refuse(error: &ConfigError) -> ExitCode {
+-    eprintln!("mailer: {error}");
+-    if let ConfigError::Usage { .. } = error {
+-        eprintln!("{USAGE}");
++/// The whole cause chain is printed (`{failure:#}`), because "cannot read `mailer.toml`" without
++/// "No such file or directory" leaves the reader to guess which half is wrong.
++fn report(failure: &anyhow::Error) -> ExitCode {
++    eprintln!("mailer: {failure:#}");
++    match failure.downcast_ref::<Error>() {
++        Some(error) => {
++            if is_about_the_arguments(error) {
++                eprintln!("{USAGE}");
++            }
++            error.exit_code()
++        }
++        // A failure of this file's own has no code of its own; the generic one says "something
++        // broke", and the message above says what.
++        None => ExitCode::FAILURE,
+     }
+-    ExitCode::from(2)
++}
++
++/// `true` for the failures the usage text answers: the arguments themselves were wrong.
++fn is_about_the_arguments(error: &Error) -> bool {
++    matches!(
++        error,
++        Error::UnknownArgument { .. } | Error::MissingValue { .. }
++    )
+ }
