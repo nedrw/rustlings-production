@@ -603,3 +603,51 @@ fn the_images_gate_judges_what_the_engine_has_and_names_the_pull_it_does_not() {
         "{detail}"
     );
 }
+
+/// The `links` gate as the runner sees it: offline, over the project's own pages (plan §6).
+#[test]
+fn the_links_gate_judges_the_pages_of_the_project() {
+    // A page whose targets resolve. The external URL is listed rather than fetched — this gate may
+    // not touch the network, which is what makes the result the same on every machine.
+    let scratch = Scratch::new("links-clean");
+    scratch.write(
+        "app/mailer/docs/runbook.md",
+        "# Runbook\n\n## Steps\n\nRead [the code](../src/lib.rs) and \
+         <https://example.com/docs>.\n\nBack to [the steps](#steps).\n",
+    );
+    let course = course_with(&scratch, &["links"], CLEAN);
+    let results = judge(&course, &["links"]);
+    assert_eq!(outcomes(&results), [Outcome::Passed], "{}", report(&results));
+    assert!(
+        results[0].detail.contains("not fetched"),
+        "{}",
+        results[0].detail
+    );
+
+    // What a half-written runbook looks like: a placeholder where a target should be, and a file
+    // that was renamed. Both are what a learner sees before they finish the step.
+    let scratch = Scratch::new("links-half-written");
+    scratch.write(
+        "app/mailer/docs/runbook.md",
+        "# Runbook\n\nSee [the dashboard](TODO) and [the drill](tests/drill.rs).\n",
+    );
+    let course = course_with(&scratch, &["links"], CLEAN);
+    let results = judge(&course, &["links"]);
+    assert_eq!(outcomes(&results), [Outcome::Failed], "{}", report(&results));
+    assert!(
+        results[0].detail.contains("docs/runbook.md:3") && results[0].detail.contains("TODO"),
+        "{}",
+        results[0].detail
+    );
+
+    // A design step whose page was never written cannot pass a gate about its links.
+    let scratch = Scratch::new("links-no-page");
+    let course = course_with(&scratch, &["links"], CLEAN);
+    let results = judge(&course, &["links"]);
+    assert_eq!(outcomes(&results), [Outcome::Failed], "{}", report(&results));
+    assert!(
+        results[0].detail.contains("no markdown"),
+        "{}",
+        results[0].detail
+    );
+}

@@ -32,6 +32,7 @@ pub mod doctor;
 pub mod hint;
 pub mod i18n;
 pub mod images;
+pub mod links;
 pub mod lint_caps;
 pub mod list;
 pub mod reset;
@@ -181,6 +182,21 @@ pub enum Command {
         action: Option<ImageAction>,
     },
 
+    /// Check the links in a tree of markdown (default: this repository).
+    ///
+    /// The offline half is the `links` gate, so a learner sees exactly what the gate sees; a
+    /// maintainer can point it at the whole repository. `--external` adds the one thing no gate may
+    /// do — fetch a URL — which is why it is a flag here rather than a gate (plan §6).
+    Links {
+        /// Directory to scan (default: the repository root).
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Also fetch every external target with `curl` (needs the network; never a gate).
+        #[arg(long)]
+        external: bool,
+    },
+
     /// Diagnose the environment: toolchain, container runtime, cargo tools, registry mirror.
     Doctor,
 }
@@ -272,6 +288,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Images { action }) => {
             images::run(&session, *action == Some(ImageAction::Pull))
         }
+        Some(Command::Links { path, external }) => links::run(&session, path.as_deref(), *external),
         Some(Command::Doctor) => doctor::run(&session),
         None => list::welcome(&session),
     }
@@ -330,7 +347,11 @@ pub struct Session {
 /// * **the detail line is per step** — `images` names the images *this* step declared, and two steps
 ///   of one track declare different ones;
 /// * **the gate is slow or not implemented** — `mutants`, `bench` and friends are run on purpose,
-///   and `container-repro`/`links` say what they need before they can answer anything.
+///   and `container-repro` says what it needs before it can answer anything.
+///
+/// `links` earns its place by being offline by construction (plan §6): it reads the tree, so one
+/// answer is good for every step on that tree. The half that would not be — fetching URLs — is not a
+/// gate at all, which is what makes this line safe to write.
 const CACHEABLE: &[&str] = &[
     "spec-integrity",
     "fmt",
@@ -338,6 +359,7 @@ const CACHEABLE: &[&str] = &[
     "exit-code",
     "no-todo",
     "docs:public",
+    "links",
 ];
 
 /// Gate results already produced in this run, by gate and by the tree they were produced on.

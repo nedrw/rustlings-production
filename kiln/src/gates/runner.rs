@@ -279,9 +279,10 @@ mod tests {
             })
             .collect();
         assert!(!pending.is_empty());
-        // `images` left this list when T1 step 9's content brought it (it is ready now), so the
-        // names here are the ones no content has reached yet.
-        for name in ["container-repro", "links", "mutants"] {
+        // `images` left this list when T1 step 9's content brought it, and `links` left it when the
+        // course decided link checking must stay offline (plan §6); what is left is the names no
+        // content has reached yet.
+        for name in ["container-repro", "mutants"] {
             let reason = pending
                 .iter()
                 .find_map(|(pending, reason)| (*pending == name).then_some(*reason))

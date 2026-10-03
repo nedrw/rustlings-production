@@ -188,9 +188,12 @@ static CATALOGUE: &[GateDef] = &[
     GateDef {
         name: "links",
         tool: None,
-        purpose: "documentation links resolve",
-        run: None,
-        status: GateStatus::Pending("needs `lychee`; arrives with T1 step 22's content"),
+        purpose: "documentation links resolve, without asking the network",
+        // Offline by decision (plan §6): whether a URL still answers is somebody else's uptime. The
+        // network half is `kiln links --external`, a command no gate can call, so a step's verdict
+        // never depends on it.
+        run: Some(crate::gates::links::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "timeout",
@@ -336,9 +339,9 @@ mod tests {
             .collect();
         // The gates a T1 step declares must be runnable, and the ones that need a tool must say
         // which one: that pairing is what makes `kiln doctor` able to explain a blocked gate.
-        // `exit-code` arrives with T1 step 4's content, `docs:public` with step 5's and `images`
-        // with step 9's; the remaining names a step mentions (`container-repro`, `links`) still say
-        // which milestone brings them.
+        // `exit-code` arrives with T1 step 4's content, `docs:public` with step 5's, `images` with
+        // step 9's and `links` with step 22's; the remaining name a step mentions
+        // (`container-repro`) still says which milestone brings it.
         assert_eq!(
             ready,
             [
@@ -351,6 +354,7 @@ mod tests {
                 "exit-code",
                 "i18n",
                 "images",
+                "links",
             ],
             "a gate moved between ready and pending"
         );
