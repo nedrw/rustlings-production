@@ -22,10 +22,3 @@ members = [
     # kiln:scaffold:begin
     # kiln:scaffold:end
 ]
-
-# Argon2 is the one dependency a *test* waits for: a debug build of it hashes one password in a few
-# hundred milliseconds, and every spec that signs a subscriber up pays that (step `mailer/1.11-signup`
-# is the one that put it there). Optimising dependencies — the code you do not step through — is the
-# standard trade; `cargo build` is what pays for it, once.
-[profile.dev.package."*"]
-opt-level = 2
