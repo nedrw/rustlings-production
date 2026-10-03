@@ -200,6 +200,12 @@ fn is_progress(line: &str) -> bool {
         "Blocking",
         "Downloading",
         "Updating",
+        // Cargo narrates its dependency resolution before it builds anything. It is the first
+        // line of a cold run, so a report that quotes it says "Locking 17 packages" where the
+        // learner needs to read the failure.
+        "Locking",
+        "Adding",
+        "Removing",
         "Documenting",
     ]
     .iter()
@@ -299,7 +305,8 @@ mod tests {
             "sh",
             &[
                 "-c",
-                "printf '   Compiling mailer v0.1.0\\n    Finished dev\\nerror: it broke\\n' >&2; exit 101",
+                "printf '   Compiling mailer v0.1.0\\n    Finished dev\\nerror: it broke\\n' \
+                 >&2; exit 101",
             ],
             temp.path(),
             Duration::from_secs(30),
@@ -307,5 +314,27 @@ mod tests {
         .unwrap();
         assert_eq!(ran.first_stderr_line(), Some("   Compiling mailer v0.1.0"));
         assert_eq!(ran.first_message(), Some("error: it broke"));
+    }
+
+    #[test]
+    fn dependency_resolution_is_progress_too() {
+        // The first line of a cold `cargo test` in a project with dependencies: quoting it as the
+        // reason a step failed tells a course author nothing.
+        let temp = TempDir::new("process-locking");
+        let ran = run(
+            "sh",
+            &[
+                "-c",
+                "printf '    Locking 17 packages to latest Rust 1.98 compatible versions\\n\
+                 error: test failed, to rerun pass `-p mailer --test spec_config`\\n' >&2; exit 101",
+            ],
+            temp.path(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(
+            ran.first_message(),
+            Some("error: test failed, to rerun pass `-p mailer --test spec_config`")
+        );
     }
 }
