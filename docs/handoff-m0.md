@@ -277,6 +277,20 @@
 > 4. **两个工作流建议已落地**：长验证交给子 agent（scout，冻结的树 + 只回报结论行/耗时/失败诊断前几行）；
 >    在验证跑着的时候不动文件。这一轮三次验证都是这么做的，上下文省很多。
 >
+> **一处未复现的红（留档，别当成已修）**：`2d0f004` 上的 `kiln verify --json mailer` 报 `mailer/1.3-ci` 失败
+> （它的 `spec_ci` 测试会在 `app/mailer` 里重跑项目自己的 `cargo xtask ci`）。**同一棵树、同一条命令手工跑是绿的**：
+> `cd app/mailer && KILN_CI_NESTED=1 cargo xtask ci` → “xtask ci: every check passed”；
+> `cargo test -q -p mailer --test spec_ci` → 2 passed in 70s。同一次 `cargo xtask ci`（selftest 的沙箱副本）里 1.3
+> 也是绿的（scaffold 失败 / solution 通过 / 5/5 门）✓。所以红只出现在 `verify` 那条路径上，且当时刚跑完 6 分钟的
+> `ci`（机器有负载）。`verify` 全程只用了 2m29s，说明 `spec_ci` 是**很快**失败的（不是超时），但报错行被 kiln 截成
+> 一行（`exit code 101: error: test failed …`），看不到内部是哪一步。
+>
+> **下一段要做的第一件事**：在空载的机器上连跑三遍 `kiln verify --json mailer`，看 1.3 是否稳定失败；若稳定，
+> 就把 `spec_ci` 的 `run.cmd` 单独跑一遍并保留完整输出（`kiln run mailer/1.3-ci` 或直接那条 cargo 命令，不要截断）。
+> 怀疑方向：内部 `cargo test --workspace` 会在同一台机器上并发拉起全部容器型 spec（1.9/1.11–1.20），而它跑在外层
+> kiln 已经用过的 `app/mailer` target 目录上；负载、锁与容器资源的组合是这一类“换个时间就绿”的常见来源。
+> **不要用重跑把它盖过去**——这正是 1.14 段记录过的同类问题（那时也是靠“带负载才出现”才难抓）。
+
 > **T1 还剩三步 + 一件框架事（下一段直接接）**：
 >
 > - **1.21-container**（120m，`release/container-image@apply`，spec `spec/image.rs` → `tests/spec_image.rs`，
