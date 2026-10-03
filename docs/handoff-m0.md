@@ -251,6 +251,41 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十段 · 做到 1.15）
+>
+> T1 1.15（幂等投递）已完成并提交（`32c5489`）：迁移 `0002_confirmation_delivery.sql`（`subscribers` 加
+> `confirmation_claimed_at`/`confirmation_sent_at`/`confirmation_attempts`）、新模块 `src/deliveries.rs`
+> （claim/mark_sent/release/outstanding 四个状态机函数）、`Job` 改成携带订阅者 id（不再携带 `Message`）、
+> worker 的重试改成“过一次数据库”（claim → 发一次 → 记账或释放）、`AppState` 的 `Option<Queue>`（没数据库
+> 就没有投递记录，也就没有队列）、重复注册会重新“报一次”仍欠的投递（答案仍是 409）、`main.rs` 排空可选队列。
+> 规格四条：一次注册一封邮件且行里有记录；同地址再注册（两种写法）仍只有一封；持续失败时 attempts 到
+> `MAX_ATTEMPTS`、释放占用、之后再注册能送出且只送一次；八个并发注册 → 一个 201、七个 409、一封邮件。
+> `cargo xtask ci` 全绿 5m42s（15/15 步满契约），`kiln verify --json mailer` = 15 passed / 0 failed /
+> 7 not authored。
+>
+> **这一步定下/发现的四件事**：
+>
+> 1. **`.sqlx` 离线元数据的做法（后续改 SQL 的步骤照抄）**：起一个 Postgres 容器 →
+>    `DATABASE_URL=postgres://postgres:postgres@127.0.0.1:<port>/postgres cargo sqlx migrate run --source migrations`
+>    → `cargo sqlx prepare --workspace`（在 `app/mailer` 里跑）。Docker Hub 拉不动，用
+>    `docker.1ms.run/library/postgres:17-alpine`。**scaffold 自带它自己那几个查询的 `.sqlx` 文件**（否则学员
+>    declare 模块后离线编译不过），solution 用新的哈希文件替换旧的（旧的要删）。
+> 2. **课程 patch 不能有 rename 段**：`git diff` 把 `.sqlx` 改名写成 `rename from/to`，而 `kiln` 的 applier
+>    只会删/增/改，会把它当“修改旧路径”应用——症状是三步以外的“run `cargo sqlx prepare`”。已修（`5f3fe9d`）：
+>    applier 现在直接报错并告诉你用 `git diff --no-renames`。**以后生成 patch 一律加 `--no-renames`**。
+> 3. **1.9 的规格改成可扩展的**（同一提交）：它原来断言“迁移恰好一条、列恰好九个”，任何后续步骤都不可能
+>    满足。现在断言 1.9 承诺的那些列**存在**（子集），以及第二次启动不改变已应用迁移的集合。1.17 再加迁移
+>    （0003）时不会再碰它。
+> 4. **`confirmation_attempts` 的口径**：第一版把“claim 次数”当 attempts，而 worker 在**一次** claim 里重试
+>    发送 → 列里读完是 1（规格当场报“10s 内没能给出放弃的证据”）。现在是“一次 claim 一次尝试”，重试循环穿过
+>    数据库；这样计数才是“这条消息被真正递给邮件服务器的次数”，重启后不会归零、多个 job 也会累加。
+>
+> **留给后面的两处已知缺口**：① 进程在 claim 与 send 之间死掉，会留下一个永远“被占用”的订阅者——需要
+> reaper（`claimed_at < now() - interval …`）或 outbox，属于 T3/T4；正文第 9 条 TRAP 已写明。② 目前只有一种
+> 消息，所以状态用 `subscribers` 的列表达；**1.17 的 newsletter 是第二种消息**（“某个订阅者的某一期”才是投递
+> 身份），那时该上 `deliveries` 表 + `UNIQUE (subscriber_id, kind)`——迁移文件里的注释已经把这层关系写下了。
+> 另：1.18 的授权要用 1.16 的会话；1.19 必须保留“未配置邮件服务器时用 `Logging`”（见第九段第 3 条）。
+>
 > ### 2026-10 进度（M0 第九段 · 做到 1.14）
 >
 > T1 1.14（后台投递队列）已完成并提交（`4acf2f1`）：`src/delivery.rs`（有界 `tokio::sync::mpsc` +
