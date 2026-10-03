@@ -25,6 +25,19 @@
 - `kiln watch` 存盘重跑；`kiln verify --json` 输出可机读的进度与诚实度标记；
 - T1 的容器步骤（1.9 Postgres、1.19 mailpit）在本机 podman 下跑通。
 
+### 验收实测（2026-10，冻结在 `c08f33a`，三个命令全绿）
+
+| 验收项 | 实测 | 证据 |
+| --- | --- | --- |
+| 全部内容 + 契约 | `cargo xtask ci` **486s**，最后一行 `22/22 step(s) hold the contract` | fmt / clippy `-D warnings` / workspace 179+15+1 测试 / spec-integrity 22 pinned / `lint-caps` 97 caps·134 slots·118 positions·22 authored |
+| 逐步规格 | `kiln verify --json mailer` **205s**：`passed 22 · failed 0 · not_authored 0 · blocked 0` | 两个容器/文档步（1.21 10/10 门、1.22 9/9 门）也在里面 |
+| 链接（离线 + 外链） | `kiln links` 29 页 167 链 0 findings；`kiln links --external` **115s**：`112 answered · 7 unclear · 0 gone` | 那 7 个 `?` 都是本机当时连不上的主机（docs/hub.docker.com、en.wikipedia、research.google、web.dev、sre.google），不是 404 |
+| 无译文 locale | `kiln --lang ja list` exit 0，打印 `content locale: ja — 0/22 step bodies, falling back through ja -> en` | 回退链在报告里可见，不静默 |
+| 容器步 | 1.9 / 1.19 / 1.21 在本机 podman 下跑通（1.21 另有 `container-repro` 门：16.5 MB / 25 MB、7 行 `--check-config` 与宿主逐行相同） | `kiln selftest` 里每步都在跑 |
+
+两条不算“人工干预”的准备动作，写在验收清单旁边以免被当成缺口：三个容器步先跑 `kiln images pull`（`images` 门与每个夹具都会直说）；
+`KILN_REGISTRY_MIRROR` 在 Docker Hub 不可达的机器上要设（`kiln doctor` 会提醒）。
+
 ## 2. 构建顺序（先出内容，再补框架）
 
 1. 仓库骨架：`kiln/`（clap 子命令 + manifest 解析 + state）、`course/course.toml`、`course/tracks/mailer/track.toml`（先放 3 个步骤）、`xtask/`。
