@@ -20,6 +20,7 @@ use kiln::gates::registry::Outcome;
 use kiln::gates::{GateContext, GateResult, GateSpec, run_all};
 use kiln::i18n::Locale;
 use kiln::info::Course;
+use kiln::runtime;
 
 /// A directory under the system temporary directory, removed when dropped.
 struct Scratch {
@@ -60,11 +61,28 @@ impl Drop for Scratch {
 /// `lib_rs` is written with leading blank lines removed: the fixtures are raw strings indented for
 /// readability, and `cargo fmt --check` would otherwise fail on the blank line alone.
 fn course_with(scratch: &Scratch, gates: &[&str], lib_rs: &str) -> Course {
+    course_with_images(scratch, gates, lib_rs, &[])
+}
+
+/// The same, with the step declaring container images (plan §9.3).
+fn course_with_images(scratch: &Scratch, gates: &[&str], lib_rs: &str, images: &[&str]) -> Course {
     let gate_list = gates
         .iter()
         .map(|gate| format!("\"{gate}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let image_list = if images.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "images = [{}]\n",
+            images
+                .iter()
+                .map(|image| format!("\"{image}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     scratch.write(
         "course/course.toml",
         "format_version = 1\ndefault_locale = \"en\"\ndefault_track = \"mailer\"\n\
@@ -82,7 +100,7 @@ fn course_with(scratch: &Scratch, gates: &[&str], lib_rs: &str) -> Course {
              [[step]]\nid = \"1.1-workspace\"\ntitle = \"Layout\"\nkind = \"milestone\"\n\
              origin = \"teach\"\nentry = \"docs/steps/en/mailer/1.1-workspace.md\"\n\
              time_hint = \"60m\"\nteaches = [\"repo/workspace-layout@apply\"]\n\
-             spec = [\"spec/1.1/layout.rs\"]\ngates = [{gate_list}]\n"
+             spec = [\"spec/1.1/layout.rs\"]\ngates = [{gate_list}]\n{image_list}"
         ),
     );
     scratch.write(
@@ -539,5 +557,49 @@ mod tests {
         [Outcome::Passed],
         "{}",
         report(&results)
+    );
+}
+
+#[test]
+fn the_images_gate_judges_what_the_engine_has_and_names_the_pull_it_does_not() {
+    // An engine is not part of every environment, and a missing one is not a failing test: the same
+    // rule as the gates themselves (plan §10 — report what cannot be judged).
+    let Some(engine) = runtime::first_engine(Duration::from_secs(30)) else {
+        eprintln!("no container engine answered: skipping the live `images` check");
+        return;
+    };
+    let local = runtime::local_images(engine, Duration::from_secs(30))
+        .expect("the engine answers `images`");
+    let Some(present) = local.first() else {
+        eprintln!("the local image store is empty: skipping the live `images` check");
+        return;
+    };
+
+    // An image the engine has — under whatever name this machine pulled it — is a pass.
+    let scratch = Scratch::new("images-present");
+    let course = course_with_images(&scratch, &["images"], CLEAN, &[present.as_str()]);
+    let results = judge(&course, &["images"]);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Passed],
+        "{}",
+        report(&results)
+    );
+
+    // One it does not have is a failure whose detail is the command that fixes it.
+    let scratch = Scratch::new("images-missing");
+    let course = course_with_images(&scratch, &["images"], CLEAN, &["kiln-no-such-image:0"]);
+    let results = judge(&course, &["images"]);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Failed],
+        "{}",
+        report(&results)
+    );
+    let detail = &results[0].detail;
+    assert!(detail.contains("kiln-no-such-image:0"), "{detail}");
+    assert!(
+        detail.contains(&format!("{} pull", engine.name())),
+        "{detail}"
     );
 }

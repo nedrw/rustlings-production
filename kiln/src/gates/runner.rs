@@ -237,7 +237,9 @@ mod tests {
             })
             .collect();
         assert!(!pending.is_empty());
-        for name in ["images", "container-repro", "links", "mutants"] {
+        // `images` left this list when T1 step 9's content brought it (it is ready now), so the
+        // names here are the ones no content has reached yet.
+        for name in ["container-repro", "links", "mutants"] {
             let reason = pending
                 .iter()
                 .find_map(|(pending, reason)| (*pending == name).then_some(*reason))

@@ -31,6 +31,7 @@ pub mod check;
 pub mod doctor;
 pub mod hint;
 pub mod i18n;
+pub mod images;
 pub mod lint_caps;
 pub mod list;
 pub mod reset;
@@ -165,8 +166,22 @@ pub enum Command {
         command: I18nCommand,
     },
 
+    /// Container images the authored steps declare (plan §9.3).
+    Images {
+        /// `pull` fetches what is missing; nothing just reports.
+        #[arg(value_name = "ACTION")]
+        action: Option<ImageAction>,
+    },
+
     /// Diagnose the environment: toolchain, container runtime, cargo tools, registry mirror.
     Doctor,
+}
+
+/// What `kiln images` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImageAction {
+    /// Fetch the images that are not in the local store.
+    Pull,
 }
 
 /// Subcommands of `kiln spec`.
@@ -245,6 +260,9 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::I18n { command }) => match command {
             I18nCommand::Status => i18n::status(&session),
         },
+        Some(Command::Images { action }) => {
+            images::run(&session, *action == Some(ImageAction::Pull))
+        }
         Some(Command::Doctor) => doctor::run(&session),
         None => list::welcome(&session),
     }

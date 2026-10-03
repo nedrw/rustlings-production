@@ -34,6 +34,7 @@ pub mod docs_public;
 pub mod exit_code;
 pub mod fmt;
 pub mod i18n;
+pub mod images;
 pub mod no_todo;
 pub mod registry;
 pub mod runner;

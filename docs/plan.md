@@ -291,7 +291,9 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 
 1. **容器运行时必须抽象**：`kiln` 提供一个 `ContainerRuntime` 探测层（podman / docker / lima 兼容 socket），优先 `podman`，回退 `docker`；步骤需要容器时通过它执行，不直接用 `docker` 字面量。
 2. **不硬依赖 `docker compose`**：同时支持 `podman compose` / `podman-compose` / `docker compose` / 直接 `run`，由 `doctor` 报出哪条路可用（本机只有直接 `run` 可用）。
-3. **镜像预拉**：步骤声明 `images = [...]`，`kiln images pull` 一次性预拉并在 `doctor` 里报告；支持镜像前缀映射（本机在用 `docker.1ms.run` / `docker.m.daocloud.io`）通过 `KILN_REGISTRY_MIRROR` 覆盖。
+3. **镜像预拉**：步骤声明 `images = [...]`，`kiln images` 报告本地有没有、`kiln images pull` 一次性预拉并在 `doctor` 里报告；支持镜像前缀映射（本机在用 `docker.1ms.run` / `docker.m.daocloud.io`）通过 `KILN_REGISTRY_MIRROR` 覆盖。两条解析规则（实现在 `kiln/src/runtime.rs`，学员侧的测试装置照抄同一套规则）：
+   - 声明的名字是 Docker Hub 名字（`postgres:17-alpine`），除非它自己点了 registry（`ghcr.io/…`、`localhost:5000/…`）；走镜像时官方镜像要加 `library/`，即 `docker.1ms.run/library/postgres:17-alpine`。
+   - **本地存在性按仓库路径判断**：引擎里存的是当初拉下来时的名字，所以声明 `postgres:17-alpine` 在 `docker.1ms.run/library/postgres:17-alpine` 下也算就位；`myorg/postgres:17-alpine` 不算（那是另一个镜像）。本机 `KILN_REGISTRY_MIRROR` 没设、镜像名带前缀，靠的就是这条。
 4. **闸门不得依赖 GNU userland**：不用 `timeout`、不用 GNU-only 参数；超时由 Rust 侧实现。
 5. **容器里的 Rust 版本不靠镜像**：课程钉 `rust-toolchain.toml`，容器只当底座（`rust:1.88` ≠ 本机 1.98 正是这个坑）。
 6. crates.io 可用但镜像拉取不稳定 → 文档里给可选的 `cargo` 源镜像/`vendor` 方案，由 `doctor` 检测后提示。
