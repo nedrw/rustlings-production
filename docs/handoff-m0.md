@@ -287,6 +287,14 @@
 >   defaults/file/env/flags/report 机制加（**学员手改 `config.rs`，没有标记块**；这也是第一次让学员自己
 >   加设置，19 的 `public.base_url` 照抄）。`MAX_ATTEMPTS`/`DRAIN_DEADLINE` 先用常量。
 >
+> **已知问题（两次观测，未修）**：`cargo xtask ci` 里的 `cargo test --workspace` 偶尔在
+> `-p kiln --test gates` 上红一次（慢/负载高时），单独重跑那条测试 14/14 全绿、整套 ci 重跑也绿。两次都
+> 只在机器同时跑着学员项目的编译/容器时出现，怀疑是几条 gate 测试各自起 `cargo`（编译临时工程）互相
+> 抢锁/抢 CPU 造成；测超时值本身不紧（300s/60s，`kiln/tests/gates.rs`），所以不是单纯调大超时能修。
+> 修之前先要能复现：把 `cargo test -p kiln --test gates` 连跑 10 遍看红的是哪条（最可能是
+> `print_stdout_is_a_library_lint_and_not_a_binary_one`），再决定是给这些测试加一把进程内的互斥锁，
+> 还是让 CI 对它们用单线程。**不要为了绿而重跑掩盖它。**
+>
 > **规格怎么做（决定，含一个要改旧文件的地方）**
 >
 > - 时间相关的断言放**单测**（`src/delivery.rs` 内，`#[tokio::test(start_paused = true)]` + 假发送器）：

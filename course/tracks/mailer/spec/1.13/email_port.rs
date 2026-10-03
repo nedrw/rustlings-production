@@ -12,177 +12,40 @@
 //! * the port itself is judged once, over *every* adapter, because a fake that does not behave like
 //!   the thing it replaces is a fake that will lie to a test one day.
 //!
-//! The harness lives in this file on purpose: the factory of step `mailer/1.8-test-harness` builds
-//! its state with `AppState::start`, and this step's seam is the other constructor. Nothing here
-//! sleeps, and every wait is a connection that either succeeds or has a deadline.
+//! The harness this step needs is `tests/support/app.rs`: the factory of step
+//! `mailer/1.8-test-harness` builds its state with `AppState::start`, and this step's seam is the
+//! other constructor, so the fixture that takes a sender lives next to it. Nothing here sleeps, and
+//! every wait is a connection that either succeeds or has a deadline.
 
+#[path = "support/app.rs"]
+mod app;
 #[path = "support/email.rs"]
 mod email;
 #[path = "support/postgres.rs"]
 mod postgres;
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener as StdListener, TcpStream};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
+use app::App;
 use email::Recording;
-use mailer::config::{Config, Flags};
+use mailer::config::Config;
 use mailer::domain::Email;
 use mailer::email::{EmailSender, Logging, Message};
-use mailer::http::{self, AppState};
-use mailer::logging::RunId;
 use postgres::Postgres;
-use serde_json::json;
-use tokio::sync::oneshot;
-
-/// How long the harness waits for the service to accept connections.
-const READY_DEADLINE: Duration = Duration::from_secs(20);
-/// How often it tries again.
-const RETRY: Duration = Duration::from_millis(20);
-
-/// A service built with the sender a test chose.
-///
-/// The same shape as `TestApp` (step `mailer/1.8-test-harness`): the state is built first, the port
-/// is the operating system's choice, and the runtime lives in a thread of its own so a test can be an
-/// ordinary `#[test]`. The one difference is the argument this step is about.
-struct App {
-    address: SocketAddr,
-    shutdown: Option<oneshot::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl App {
-    /// Start the service on a free port, with this configuration and this sender.
-    fn start(config: Config, sender: Arc<dyn EmailSender>) -> Self {
-        let listener = StdListener::bind("127.0.0.1:0")
-            .unwrap_or_else(|error| panic!("no port could be bound for the test app: {error}"));
-        let address = listener
-            .local_addr()
-            .expect("a bound listener has an address");
-        listener
-            .set_nonblocking(true)
-            .expect("the listener can be made non-blocking");
-
-        let (shutdown, stopped) = oneshot::channel();
-        let id = RunId::of_this_process();
-        let thread = std::thread::Builder::new()
-            .name("test-app".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("the test app's runtime starts");
-                runtime.block_on(async move {
-                    let state = match AppState::start_with_sender(config, &id, sender).await {
-                        Ok(state) => state,
-                        Err(error) => {
-                            eprintln!("the test app could not start: {error}");
-                            return;
-                        }
-                    };
-                    let listener = tokio::net::TcpListener::from_std(listener)
-                        .expect("the listener is handed to the runtime");
-                    tokio::select! {
-                        result = http::serve_on(listener, state, &id) => {
-                            if let Err(error) = result {
-                                eprintln!("the test app stopped: {error}");
-                            }
-                        }
-                        _ = stopped => {}
-                    }
-                });
-            })
-            .expect("the test app's thread starts");
-
-        let app = Self {
-            address,
-            shutdown: Some(shutdown),
-            thread: Some(thread),
-        };
-        app.wait_until_ready();
-        app
-    }
-
-    /// One `POST` with a JSON body, answered as `(status, body)`.
-    fn post(&self, path: &str, body: &str) -> (u16, String) {
-        let mut stream = TcpStream::connect(self.address).unwrap_or_else(|error| {
-            panic!(
-                "the test app at {} is not accepting connections: {error}",
-                self.address
-            )
-        });
-        stream
-            .set_read_timeout(Some(READY_DEADLINE))
-            .expect("a read deadline can be set");
-        let request = format!(
-            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            self.address,
-            body.len()
-        );
-        stream
-            .write_all(request.as_bytes())
-            .unwrap_or_else(|error| panic!("the request could not be sent: {error}"));
-        let mut raw = String::new();
-        stream
-            .read_to_string(&mut raw)
-            .unwrap_or_else(|error| panic!("the answer could not be read: {error}"));
-
-        let (head, body) = raw
-            .split_once("\r\n\r\n")
-            .unwrap_or_else(|| panic!("an HTTP answer has a head and a body: `{raw}`"));
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("the status line has a code: `{head}`"));
-        (status, body.to_owned())
-    }
-
-    /// Wait until the service accepts connections, so no test has to sleep and hope.
-    fn wait_until_ready(&self) {
-        let deadline = Instant::now() + READY_DEADLINE;
-        while Instant::now() < deadline {
-            if TcpStream::connect(self.address).is_ok() {
-                return;
-            }
-            std::thread::sleep(RETRY);
-        }
-        panic!(
-            "the test app at {} never started accepting connections",
-            self.address
-        );
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 
 /// The configuration a test starts the service with: the defaults, plus what the test adds.
 fn config(env: &[(String, String)]) -> Config {
-    Config::load(&Flags::default(), env).expect("the fixture configuration is valid")
+    app::config(env)
 }
 
 /// The setting a service reads its database from (step `mailer/1.4-config`).
 fn database_setting(url: &str) -> (String, String) {
-    ("MAILER__DATABASE__URL".to_owned(), url.to_owned())
+    app::database_setting(url)
 }
 
 /// One signup body, as a caller writes it.
 fn signup_body(email: &str) -> String {
-    json!({ "email": email, "name": "Ada Lovelace", "password": "correct horse battery staple" })
-        .to_string()
+    app::signup_body(email)
 }
 
 /// The token the service stored for an address: the only thing its confirmation link can carry.
