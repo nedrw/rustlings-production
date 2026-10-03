@@ -251,7 +251,36 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
-> ### 1.14 设计（含调研结论 · 已定，下一段直接写代码）
+> ### 2026-10 进度（M0 第九段 · 做到 1.14）
+>
+> T1 1.14（后台投递队列）已完成并提交（`4acf2f1`）：`src/delivery.rs`（有界 `tokio::sync::mpsc` +
+> one worker、`try_reserve`/`Permit` 当「座位」、`watch` 停机信号、`tokio::time::timeout` 包裹的
+> `drain`、full jitter 用 `getrandom`、五条 `start_paused` 单测）；`AppState` 持有队列（`sender()`
+> 删掉——发送端现在只住在 worker 里）、handler 在 INSERT **之前**拿座位、`serve_with_shutdown` /
+> `serve_on_with_shutdown`（`axum::serve(...).with_graceful_shutdown`）、`main.rs` 等 SIGTERM/ctrl_c
+> → 排空 → 退 0/1、`QueueFull` 在状态表里是 503、`tokio` 加 `test-util`。规格三条：答案不等发送
+> （挂死的 sender 下仍 201，且队满 503 且**没写行**）、失败一次的发送由重试送到、SIGTERM 排空 + 日志
+> + 退出码 0。`cargo xtask ci` 全绿 4m06s（14/14 步满足契约），`kiln verify --json mailer` = 14
+> passed / 0 failed / 8 not authored，`spec_worker` 4 条 11.7s。反向验证：`drop(seat)` →「34 个注册全被
+> 接受、一个都没被拒」；`MAX_ATTEMPTS=1` →「10s 内 ada 的邮件没到」。
+>
+> **这一步定下的、后面几步要照做的三件事**：
+>
+> 1. **队列容量是常量 `QUEUE_CAPACITY = 32`**（原本设计里想放 `config.rs`，本段缩范围改成常量）。
+>    32 而不是 64：规格靠「一个接一个的注册」把队填满，而每个注册都要在 debug 下算一次 argon2
+>    （约 230ms），64 会让这一步自己的 spec 跑 18s。把它变成设置属于 1.19/1.21 的部署工作。
+> 2. **规格不能依赖 `Queue` 自己的 API**：1.15 的幂等投递几乎一定要让 job 带上订阅者身份（重发、
+>    去重、状态机），`Queue::start/reserve/drain` 的形状会变。所以这一步的规格只从 HTTP 与日志看
+>    行为（`QUEUE_CAPACITY`/`MAX_ATTEMPTS` 两个常量除外）——`verify` 会在 1.22 的树上重跑它。
+> 3. **1.19 必须保留「没配置邮件服务器时用 `Logging` 适配器」这个默认**：1.14 的子进程规格断言
+>    SIGTERM 前有 `an email would be sent`，而 1.7 起所有「二进制直接跑起来」的规格也隐含这一点。
+>
+> **一处「没抓到」的记录（写进提交信息了）**：把 `main.rs` 里显式 `drain` 删掉，SIGTERM 规格**仍然
+> 通过**——丢掉队列会关掉 channel，tokio 的 runtime drop 又会让 worker 把手上那条做完。也就是说
+> **drain 的截止时间在「适配器永不阻塞」的二进制里无法观测**，所以正文把它归给单测（TRAP 第 7 条明说）。
+> 若要真正判它，得让 1.19 的适配器可注入或可配置成慢速——那时可以把这条规格补强。
+>
+> ### 1.14 设计（已按此实现，留档）
 >
 > **调研结论（外部事实，别再花时间查）**
 >
@@ -331,17 +360,11 @@
 > 7. **1.13 的规格已经先改好了**（`e0b3545`：`wait_for` 轮询 + 「至少一次尝试」/「grace 收到」这类跨树断言），
 >    所以异步化之后 1.13 的规格在最终树上仍然成立——这一条本来是本步最大的坑，已经拆掉。
 >
-> **进度（M0 第九段起 · 1.14 已经写了一部分，在 `app/mailer` 里**）**：`src/delivery.rs` 已按上面的清单写完
-> 并通过单测（`cargo test -p mailer --lib` 18 passed，其中 5 条是本步的：退避上界与抖动非常量、失败重试
-> 恰好 `MAX_ATTEMPTS` 次、队满拒而不等、drain 超时）——**并且单测当场抓到一个真 bug**：原先的抖动用
-> `millis.saturating_mul(roll) / u64::MAX`，`u64` 乘法直接饱和，答案恒为 1ms（「抖动」其实不是抖动）；现在
-> 走 `u128`。`Cargo.toml` 给 `tokio` 加了 `test-util`（暂停时钟，authoring §6.4 要的「注入时钟」）。
-> `Error::QueueFull`/`DrainTimeout`/`WorkerLost` 也已写进 `src/error.rs`（退出码 1 那一行）。
-> `docs/drafts/1.14-delivery.rs` 是这份文件的副本（`app/` 不跨 worktree 复制，所以留一份在 git 里）。
-> **还需做的**：`subscribe(pool, seat: Permit<'_, Message>, request)`、`AppState` 持有 `Queue`、
-> `serve_with_shutdown`/`serve_on_with_shutdown`、`main.rs` 的 SIGTERM→排空→退出码、规格（进程内 503 +
-> 子进程 SIGTERM）、patches/正文/接线。容量与重试基数是**常量**（原本想在 `config.rs` 加设置，本段改为常量以
-> 缩小范围；把它们变成设置属于 1.19/1.21 的部署工作）。
+> **落地情况（M0 第九段已实现，上面三条「后面几步要照做」在 §5 的进度小节里）**：`src/delivery.rs` 与
+> 单测、`Error::QueueFull`/`DrainTimeout`/`WorkerLost`、`subscribe(pool, seat, request)`、`AppState` 的
+> 队列与 `serve_*_with_shutdown`、`main.rs` 的信号与排空、`spec/1.14/worker.rs` 三条，都已落地；
+> 与下面的施工清单的两处差异：容量与重试基数**是常量**（不是在 `config.rs` 加设置），且规格的进程内
+> 部分用「一个挂死的 sender」而不是「容量设 1 的设置」。
 >
 > **规格怎么做（决定，含一个要改旧文件的地方）**
 >
