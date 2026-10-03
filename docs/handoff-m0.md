@@ -157,16 +157,12 @@
 >
 > ### 下一步
 >
-> 1.11 起按序写在 1.10 的树上。1.11 需要先 `cargo install sqlx-cli --no-default-features --features postgres,rustls`
-> 生成 `.sqlx/`，作为那一步的 scaffold 内容发布；为了让缓存命中，**查询本身也要是 scaffold 内容**
-> （离线元数据按查询哈希索引，学员写不一样的 SQL 就找不到缓存，编译期会报「set `DATABASE_URL` … or run
-> `cargo sqlx prepare`」）。`argon2` 需要联网拉一次（crates.io 可达，本机缓存里没有）。
-> `container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
-> **`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
+> 1.11 起按序写在 1.10 的树上；**1.11 的设计已定，见下面一节，直接写代码即可**。前置已就绪：`sqlx-cli 0.9.0`
+> 已装（`cargo sqlx` 在 `~/.cargo/bin`），`argon2 0.6.0` 已拉到本地缓存。`container-repro`（1.21）与 `links`（1.22）
+> 两个闸门仍未实现；**`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
 > 另：本机的 `kiln-pg` 容器是早先手工试验留下的（不影响测试，测试用 `kiln-pg-<pid>-<n>` 并自行清理）。
 >
 > ### 2026-10 进度（M0 第五段 · 做到 1.10）
->
 > T1 1.10（领域类型）已完成并提交：`src/domain.rs`（`Email`/`SubscriberName`/`Password` + 五个限额常量，
 > scaffold 里的三个 `parse` 什么都不查、`Password` 带着 derive 出来的 `Debug`，参考解把它们变成解析器 + 手写的
 > 遮蔽 `Debug`）、`Error::InvalidInput { field, expected }`（**不带值**——值可能是密码），`pub mod domain;`。
@@ -178,6 +174,46 @@
 > 在一个临时目录里编译并运行（同 1.5 的做法；`CARGO_TARGET_DIR` 指向项目下的独立目录，第二次起几秒）。
 > 好处：spec 本身不引用还得由学员加入的模块，所以它在 scaffold 上**编得过、跑得过、只失败在断言上**；探针能直接
 > `matches!`、能写 property，失败信息就是编译错误或断言行。代价：冷启动一次性多花约 20 秒。
+>
+> ### 1.11 已定的设计（下一段直接写代码，不要再调研）
+>
+> 前置已就绪：`sqlx-cli 0.9.0` 已 `cargo install`（`cargo sqlx` 可用，`~/.cargo/bin`）；`argon2 0.6.0` 从 crates.io 一
+> 秒拉到（缓存已热）。步骤名/能力不变：`1.11-signup`，`db/unique-as-concurrency@apply` + `sec/password-hash@apply`。
+>
+> **接口。** `POST /signup`，body `{"email": …, "name": …, "password": …}`。成功 **201** + `{"status":"pending","email":"<规整后的地址>"}`（响应里永不出现密码）；
+> body 不是 signup（缺字段/不是 JSON）→ **400**（用 axum 的 `JsonRejection`，handler 收 `Result<Json<SignupRequest>, JsonRejection>`）；
+> 领域拒绝（`Error::InvalidInput`）→ **400**，body 用错误自己的话（它只说字段与期望，不重复值——直接复用 1.10 的约定）；
+> 地址已被订阅（唯一约束）→ **409**。`http.rs` 新增一张 `Error → StatusCode` 映射表，和 1.5 的退出码表同源
+> （2 那边的分类变 4xx，部署问题变 5xx）。
+>
+> 新错误变体：`Error::AlreadySubscribed { email: String }`（退出码 2，409）。body 格式：`Body` 的 `status` 从 `&'static str`
+> 改成 `String`（400/409 要带上具体句子；1.7 的规格只断言它非空，不会碎）。
+>
+> **scaffold 内容。** `Cargo.toml` 标记块加 `argon2 = "0.6"`；新文件 `src/signup.rs` 只有三样：
+> `SignupRequest { email: String, name: String, password: String }`（**原始字符串**，解析是学员的事）；一个
+> `pub const INSERT_SUBSCRIBER: &str`（见下）；一个 `hash(password: &Password) -> Result<String, Error>`，
+> scaffold 里直接返回明文（正好是那个阱：“密码存成它自己”）；新目录 `.sqlx/`（由 `cargo sqlx prepare` 生成、作为 scaffold 内容发布）。
+>
+> **那条被给定的语句**（`.sqlx/` 的缓存按它逐字哈希，所以正文给出、参考解逐字使用；学员重写就按 TRAP 里说的重新 prepare）：
+>
+> ```sql
+> INSERT INTO subscribers (email, name, password_hash) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING RETURNING id
+> ```
+>
+> `ON CONFLICT DO NOTHING` + `RETURNING id` + `fetch_optional` 就是本步的并发原语：约束做判定，应用从不先读后写。
+> 学员写的是：`subscribe(pool, request) -> Result<Email, Error>`（解析→哈希→插入→`None` 变 `AlreadySubscribed`）与路由。
+>
+> **哈希。** `argon2 0.6` 的 `Argon2::default()` + `PasswordHasher`，盐每个订阅者随机（`SaltString::generate(&mut OsRng)`），
+> 存 PHC 字符串（`$argon2id$…`）。1.11 **不提供** verify——校验哈希的调用方是登录（1.16），本步的规格只断言：形状是
+> `$argon2id$`、不等于明文、同一密码两次注册得到不同哈希、响应里没有密码。
+>
+> **规格**（`spec/1.11/signup.rs`，用 1.10 的 `TestApp` + 容器装置，不需探针）：① 合法注册 201、行里 email 已规整、
+> status=pending、hash 形状、响应无密码；② 同地址第二次 409 且只一行；③ **两个线程同时**投同一地址：恰好一个 201、
+> 一个 409、一行（这就是能力名）；④ 域名拒绝 400 且 body 指名字段、不重复值、没插入行；⑤ 缺字段/非 JSON 400。
+>
+> **准备 `.sqlx/` 的命令**（我自己跑一次，产物进 scaffold）：容器起一个空库 → `sqlx migrate run --database-url …`
+> → `DATABASE_URL=… cargo sqlx prepare`（在 `app/mailer` 里，带 `.sqlx/` 覆盖写入）→ 把 `.sqlx/*.json` 放进 scaffold。
+> 之后 `cargo test`/`clippy` 在无库环境下必须仍然编译得过（这正是离线元数据的意义，也是本步要讲的东西）。
 
 ## 6. 工作方式约定
 
