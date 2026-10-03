@@ -8,6 +8,10 @@
 
 让一个新克隆的人能一条命令地从零走到 T1 结束：
 
+**状态（2026-10，第十五段）：T1 的 22 步全部写完。** 本文件顶部第十四、十五段记了 1.21/1.22 落地时的实测与坑；
+下面这份验收清单逐条对齐的结论写在那一节里（“新克隆一条命令”这条是用 `kiln selftest` + `kiln verify` 逼近的，
+三个容器步仍需先 `kiln images pull`，这不是“人工干预”，是 `images` 门/夹具会直说的准备动作）。
+
 1. `kiln` 骨架：`list` / `run` / `check` / `watch` / `hint` / `reset` / `verify --json` / `doctor` / `images` / `spec restore` / `i18n status` / `caps`。
 2. 12 个闸门：`spec-integrity`、`fmt`、`clippy@N`、`no-todo`、`docs:public`、`exit-code`、`i18n`、`images`、`container-repro`、`links`、`caps`、`timeout`。
 3. **T1 `mailer` 全部 22 步真实内容**（正文 + 规格测试 + scaffold + 参考解 + 闸门接线）。
@@ -251,6 +255,27 @@
 > （`AppState::start_with_sender` 不存在），`kiln selftest` 把编译错误计为「scaffold 失败」，这符合
 > authoring §6.2；正文的 TASK 因此把那条签名写清楚了。
 >
+> ### 2026-10 进度（M0 第十五段 · 1.22 落地，**T1 22/22 步全部写完**）
+>
+> 1.22（runbook + 首次故障演练）已提交（`0c62815`）。T1 的正文/规格/scaffold/参考解/闸门接线全部就位，12 个闸门里只剩 `timeout`（刻意留在 “由 runner 自己实现，不是逐步门” 的状态）。
+>
+> **这一步的形状（design 步骤的模板，T2–T5 的 design 步可以照抄）**：交付两样彼此验证的东西——
+> 可执行的演练（`tests/support/drill.rs` 的 `replay(Recovery)`）和要人读的页面（`docs/runbook.md`）。
+> 演练用 1.13 的 `Recording::fail_with` 把邮件服务器“拿走”，先用**数据库里的次数**等到第一次投递真的失败（前提为真才谈得上恢复），
+> 再决定服务器回不回来，最后从**服务自己的记录**算 `delivered` / `given_up`。规格跑两个世界：
+> 回来则一无丢失，不回来则必须报出丢失——**一个不会红的演练就是装饰**。页面那半由 `links` 门查（离线结构）。
+> scaffold 的两个洞正对应这两半：演练“报告它希望发生的事”、页面用 `TODO` 目标——所以 scaffold 上 2/3 个测试红，而且红得各有原因。
+>
+> **实测**：scaffold 1 passed / 2 failed；solution 3 passed / 3.1s；`kiln check` 9/9 门 / 9s（`links` 数出页上 9 个目标）；`kiln selftest mailer/1.22-runbook` **29s、1/1 满契约**。
+>
+> **这一步又摸出两个坑**：
+>
+> 1. **夹具的 `#![allow(dead_code)]` 不是摆设**：`tests/support/email.rs`（1.13）比后面四个夹具早，没有那一行；
+>    任何通过自己的 drill 引入它的规格都会因为「有些方法没用」而 clippy 红。现在它有了（改动落在 1.13 的 scaffold 补丁里，
+>    已用“从补丁重建整棵树”（`/tmp/b23`）与本步 selftest 验证一致）。
+> 2. **runbook 里用反引号写路径等于没写**：`links` 门因此判“一页没有一个链接”——它判得对，凌晨三点的人要的是能点的东西。
+>    参考解的页面现在链到 `src/delivery.rs`、`src/deliveries.rs`、`src/newsletter.rs`、`src/metrics.rs`、`src/logging.rs`、`src/http.rs` 与演练文件本身。
+
 > ### 2026-10 进度（M0 第十四段 · 做到 1.21，`container-repro` 一并落地）
 >
 > T1 1.21（容器化）已完成并提交（`3d125d0` 框架 + `0a7e7da` 内容），**22 步里剩 1.22**。
