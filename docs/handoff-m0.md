@@ -285,10 +285,14 @@
 > `ci`（机器有负载）。`verify` 全程只用了 2m29s，说明 `spec_ci` 是**很快**失败的（不是超时），但报错行被 kiln 截成
 > 一行（`exit code 101: error: test failed …`），看不到内部是哪一步。
 >
-> **下一段要做的第一件事**：在空载的机器上连跑三遍 `kiln verify --json mailer`，看 1.3 是否稳定失败；若稳定，
-> 就把 `spec_ci` 的 `run.cmd` 单独跑一遍并保留完整输出（`kiln run mailer/1.3-ci` 或直接那条 cargo 命令，不要截断）。
-> 怀疑方向：内部 `cargo test --workspace` 会在同一台机器上并发拉起全部容器型 spec（1.9/1.11–1.20），而它跑在外层
-> kiln 已经用过的 `app/mailer` target 目录上；负载、锁与容器资源的组合是这一类“换个时间就绿”的常见来源。
+> **已经量过了**：`4810e6a` 上连空跑三遍 `kiln verify --json mailer` → 三次都是 **passed 20 / failed 0 /
+> not-authored 2**（exit 3 = 内容未写完），1.3 三次全绿，五个门全 passed。所以它不是确定性的失败。
+> **但这不等于排除负载**：这三遍跑在已经被预热过的 `app/mailer/target` 上，内部那次 `cargo xtask ci` 每次都是
+> 增量构建；原来出问题时的条件（冷构建 + 刚跑完 6 分钟 ci 的机器）没有被复现。结论：**最可能是负载/冷构建相关，
+> 不是 app 状态相关、也不是确定性失败** —— 下一次再遇到就按这条走：
+> 1. 保留 `kiln verify --json mailer` 的完整 JSON（对 1.3 的 `gates` 数组和失败行，别只看控制台那一行）；
+> 2. 顺手看一眼 `podman volume ls | wc -l`（容器类 spec 的并发量是内部 `cargo test --workspace` 的产物）；
+> 3. 冷启动复现：`rm -rf app/mailer/target` 后带负载重跑那条路径，而不是只重跑 `verify`。
 > **不要用重跑把它盖过去**——这正是 1.14 段记录过的同类问题（那时也是靠“带负载才出现”才难抓）。
 
 > **T1 还剩三步 + 一件框架事（下一段直接接）**：
