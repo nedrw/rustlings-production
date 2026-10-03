@@ -70,14 +70,13 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         .state_mut()
         .record_spec_modified(&step.qualified_id(), false);
 
+    let deadline = step.deadline(session.timeout());
     println!();
     println!(
         "> {}  (in {}, deadline {:?})",
-        run.cmd,
-        project_label,
-        session.timeout()
+        run.cmd, project_label, deadline
     );
-    let ran = process::run_line(&run.cmd, &project_dir, session.timeout())?;
+    let ran = process::run_line(&run.cmd, &project_dir, deadline)?;
     print_output(&ran);
 
     let passed = ran.success();

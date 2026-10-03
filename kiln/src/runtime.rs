@@ -311,17 +311,63 @@ pub fn images(
     timeout: Duration,
 ) -> Result<Vec<ImageReport>, KilnError> {
     let local = local_images(engine, timeout)?;
+    // Which local copy is the one a *build* would use: a store filled through more than one mirror
+    // holds the same repository path more than once — once per architecture — and the engine
+    // refuses the copy that is not this machine's. Naming the wrong one here would send a learner
+    // to a pull that changes nothing.
+    let host = host_architecture(engine, timeout);
     Ok(declared
         .iter()
-        .map(|declared| ImageReport {
-            declared: declared.clone(),
-            resolved: resolve(declared),
-            local: local
+        .map(|declared| {
+            let matching: Vec<&String> = local
                 .iter()
-                .find(|name| is_declared_image(name, declared))
-                .cloned(),
+                .filter(|name| is_declared_image(name, declared))
+                .collect();
+            let chosen = matching
+                .iter()
+                .find(|name| {
+                    image_architecture(engine, name, timeout).as_deref() == Some(host.as_str())
+                })
+                .or_else(|| matching.first());
+            ImageReport {
+                declared: declared.clone(),
+                resolved: resolve(declared),
+                local: chosen.map(|name| (*name).clone()),
+            }
         })
         .collect())
+}
+
+/// The architecture this engine runs images of, as it reports it.
+///
+/// Falls back to the architecture this binary was compiled for, which is the same machine in every
+/// case that matters here.
+fn host_architecture(engine: Engine, timeout: Duration) -> String {
+    process::run(
+        engine.binary(),
+        &["info", "--format", "{{.Host.Arch}}"],
+        &std::env::temp_dir(),
+        timeout,
+    )
+    .ok()
+    .filter(|ran| ran.success())
+    .map(|ran| ran.stdout.trim().to_owned())
+    .filter(|arch| !arch.is_empty())
+    .unwrap_or_else(|| std::env::consts::ARCH.to_owned())
+}
+
+/// The architecture an image was built for, when the engine will say.
+fn image_architecture(engine: Engine, name: &str, timeout: Duration) -> Option<String> {
+    let ran = process::run(
+        engine.binary(),
+        &["image", "inspect", name, "--format", "{{.Architecture}}"],
+        &std::env::temp_dir(),
+        timeout,
+    )
+    .ok()?;
+    ran.success()
+        .then(|| ran.stdout.trim().to_owned())
+        .filter(|arch| !arch.is_empty())
 }
 
 /// Candidate compose commands, in the order the plan lists them (plan §9.2).

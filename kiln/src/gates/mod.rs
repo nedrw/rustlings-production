@@ -30,6 +30,7 @@ use crate::error::KilnError;
 
 pub mod caps;
 pub mod clippy;
+pub mod container_repro;
 pub mod docs_public;
 pub mod exit_code;
 pub mod fmt;

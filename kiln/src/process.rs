@@ -99,6 +99,22 @@ pub fn share_cargo_target_dir(dir: PathBuf) {
 
 /// Run `program` with `args` in `dir`, killing it when `timeout` elapses.
 pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<Ran> {
+    run_with_env(program, args, dir, timeout, &[])
+}
+
+/// The same, with environment variables set for the child.
+///
+/// The environment is part of what a command *is* for the few callers that compare two runs of the
+/// same program (`container-repro` asks a binary inside an image and a binary on this host the same
+/// question, and the image's own settings are what make the two answers comparable). Everything else
+/// gets the runner's own environment, which is what [`run`] passes on.
+pub fn run_with_env(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    timeout: Duration,
+    env: &[(String, String)],
+) -> Result<Ran> {
     let rendered = command_line(program, args);
     let started = Instant::now();
     let spawn_error = |source| KilnError::Spawn {
@@ -111,6 +127,7 @@ pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Resul
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

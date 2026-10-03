@@ -182,8 +182,10 @@ static CATALOGUE: &[GateDef] = &[
         name: "container-repro",
         tool: None,
         purpose: "the image runs the same binary and fits its budget",
-        run: None,
-        status: GateStatus::Pending("arrives with T1 step 21's content"),
+        // The engine is probed by the gate itself (it is not a cargo tool), so `tool` stays empty
+        // and a missing engine is reported as `blocked` rather than as a missing tool.
+        run: Some(crate::gates::container_repro::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "links",
@@ -340,8 +342,8 @@ mod tests {
         // The gates a T1 step declares must be runnable, and the ones that need a tool must say
         // which one: that pairing is what makes `kiln doctor` able to explain a blocked gate.
         // `exit-code` arrives with T1 step 4's content, `docs:public` with step 5's, `images` with
-        // step 9's and `links` with step 22's; the remaining name a step mentions
-        // (`container-repro`) still says which milestone brings it.
+        // step 9's, `links` with step 22's and `container-repro` with step 21's; nothing a step
+        // mentions is pending any more.
         assert_eq!(
             ready,
             [
@@ -354,6 +356,7 @@ mod tests {
                 "exit-code",
                 "i18n",
                 "images",
+                "container-repro",
                 "links",
             ],
             "a gate moved between ready and pending"

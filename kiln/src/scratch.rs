@@ -52,6 +52,21 @@ pub fn shared_target_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Where a container build keeps what it downloads and compiles, one cache per machine.
+///
+/// `name` is the fixture's own convention — `container-target` for what a build compiles,
+/// `container-registry` for the crates it downloads — because a step's fixture and the gate that
+/// judges the same tree have to share one cache: otherwise every build pays again for the one
+/// before it. Engines mount these as host directories, not as named volumes (`podman build -v`
+/// takes a path), which is why they live where a person can find them.
+#[must_use]
+pub fn container_cache(name: &str) -> Option<PathBuf> {
+    let base = cache_base(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
+    let dir = base.join("kiln").join(name);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 /// Where a cache belongs, from the two variables that say so (tested without touching the
 /// environment, which a test cannot do and should not try to).
 fn cache_base(

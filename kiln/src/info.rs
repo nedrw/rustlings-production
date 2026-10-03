@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -112,6 +113,15 @@ pub struct RunCmd {
     /// Split on whitespace and executed without a shell: the course must not depend on GNU
     /// userland, so quoting and pipelines are deliberately impossible here.
     pub cmd: String,
+    /// Seconds this step's commands may take, when the runner's default is not enough.
+    ///
+    /// A floor rather than a cap: `kiln --timeout` still raises it, and it applies to the step's
+    /// gates as well as to its spec run. The step that needs it is the one whose command builds
+    /// something — a container image with a dependency tree inside it is minutes on a machine that
+    /// has never built one, and a deadline that kills the build reports "timed out" about a step
+    /// that was working.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 /// One step, as declared in `track.toml`.
@@ -201,6 +211,22 @@ impl Step {
         self.gates
             .iter()
             .filter(|gate| gate.tier == crate::gates::Tier::Must && !gate.slow)
+    }
+
+    /// How long this step's commands — its spec run and its gates — may take.
+    ///
+    /// The larger of what the step declares and what the runner was given: a declaration is about
+    /// the artifact (building an image is minutes on a machine that has never built one), and
+    /// `kiln --timeout` stays the way to raise it further. A step that declares nothing uses the
+    /// runner's deadline exactly, which is every step but the one that builds a container image.
+    #[must_use]
+    pub fn deadline(&self, runner: Duration) -> Duration {
+        let declared = self
+            .run
+            .as_ref()
+            .and_then(|run| run.timeout)
+            .map(Duration::from_secs);
+        declared.map_or(runner, |declared| declared.max(runner))
     }
 }
 

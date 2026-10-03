@@ -779,6 +779,7 @@ mod tests {
         let (temp, track, mut step, _) = fixture("spec-step-run");
         step.run = Some(crate::info::RunCmd {
             cmd: "cargo test -p mailer --test spec_layout".to_owned(),
+            timeout: None,
         });
         let problems = check_step(&track.dir(temp.path()), &step).unwrap();
         assert_eq!(problems.len(), 1, "{problems:?}");
@@ -823,6 +824,7 @@ mod tests {
         let (temp, track, mut step, _) = fixture("spec-step-target");
         step.run = Some(crate::info::RunCmd {
             cmd: "cargo test -p mailer --test spec_elsewhere".to_owned(),
+            timeout: None,
         });
         let problems = check_step(&track.dir(temp.path()), &step).unwrap();
         assert_eq!(problems.len(), 1, "{problems:?}");

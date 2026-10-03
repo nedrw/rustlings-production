@@ -347,7 +347,8 @@ pub struct Session {
 /// * **the detail line is per step** — `images` names the images *this* step declared, and two steps
 ///   of one track declare different ones;
 /// * **the gate is slow or not implemented** — `mutants`, `bench` and friends are run on purpose,
-///   and `container-repro` says what it needs before it can answer anything.
+///   and `container-repro` builds an image, which is minutes on a machine that has never built one
+///   before.
 ///
 /// `links` earns its place by being offline by construction (plan §6): it reads the tree, so one
 /// answer is good for every step on that tree. The half that would not be — fetching URLs — is not a
@@ -608,7 +609,9 @@ impl Session {
             track,
             step,
             project_dir,
-            timeout: self.timeout,
+            // A step's gates judge the step's artifact, so they get the same deadline its own spec
+            // run gets: `container-repro` builds the image the step is about.
+            timeout: step.deadline(self.timeout),
             locale: &self.locale,
         };
         // What has already been answered on this tree, and what still has to run.
@@ -656,7 +659,7 @@ impl Session {
             ))
         })?;
         let dir = self.project_dir(step)?;
-        process::run_line(&run.cmd, &dir, self.timeout)
+        process::run_line(&run.cmd, &dir, step.deadline(self.timeout))
     }
 }
 

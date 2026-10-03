@@ -617,7 +617,12 @@ fn the_links_gate_judges_the_pages_of_the_project() {
     );
     let course = course_with(&scratch, &["links"], CLEAN);
     let results = judge(&course, &["links"]);
-    assert_eq!(outcomes(&results), [Outcome::Passed], "{}", report(&results));
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Passed],
+        "{}",
+        report(&results)
+    );
     assert!(
         results[0].detail.contains("not fetched"),
         "{}",
@@ -633,7 +638,12 @@ fn the_links_gate_judges_the_pages_of_the_project() {
     );
     let course = course_with(&scratch, &["links"], CLEAN);
     let results = judge(&course, &["links"]);
-    assert_eq!(outcomes(&results), [Outcome::Failed], "{}", report(&results));
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Failed],
+        "{}",
+        report(&results)
+    );
     assert!(
         results[0].detail.contains("docs/runbook.md:3") && results[0].detail.contains("TODO"),
         "{}",
@@ -644,7 +654,12 @@ fn the_links_gate_judges_the_pages_of_the_project() {
     let scratch = Scratch::new("links-no-page");
     let course = course_with(&scratch, &["links"], CLEAN);
     let results = judge(&course, &["links"]);
-    assert_eq!(outcomes(&results), [Outcome::Failed], "{}", report(&results));
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Failed],
+        "{}",
+        report(&results)
+    );
     assert!(
         results[0].detail.contains("no markdown"),
         "{}",
