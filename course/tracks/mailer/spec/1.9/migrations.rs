@@ -81,10 +81,16 @@ fn an_empty_database_reaches_the_current_schema_before_the_service_serves() {
         "0",
         "migrating an empty database must not invent rows"
     );
+    assert_ne!(
+        postgres.query("SELECT count(*) FROM _sqlx_migrations"),
+        "0",
+        "a start against an empty database has to run the migrations and record them"
+    );
     assert_eq!(
-        postgres.query("SELECT version::text || ':' || success::text FROM _sqlx_migrations"),
-        "1:true",
-        "the migration that ran has to be recorded as applied, or the next start runs it again"
+        postgres.query("SELECT count(*) FROM _sqlx_migrations WHERE NOT success"),
+        "0",
+        "every migration that ran has to be recorded as successful, or the next start runs it \
+         again"
     );
     app.stop();
 }
@@ -99,12 +105,16 @@ fn the_schema_is_the_one_the_later_steps_build_on() {
         "the fixture database is not ready"
     );
 
-    // The columns, by name: steps 1.10-1.18 read and write exactly these, and a rename here is a
-    // rename in four later steps.
+    // The columns, by name: steps 1.10-1.18 read and write these, and a rename here is a rename
+    // in four later steps. The check is a *subset* on purpose — a step that needs a column of its
+    // own adds it in a migration of its own (step `mailer/1.15-idempotent-delivery` adds three) —
+    // so what it protects is the words, not the whole table.
     assert_eq!(
         postgres.query(
             "SELECT string_agg(column_name, ', ' ORDER BY column_name) FROM information_schema.\
-             columns WHERE table_name = 'subscribers'"
+             columns WHERE table_name = 'subscribers' AND column_name IN (\
+                 'id', 'email', 'name', 'password_hash', 'status', 'confirmation_token', \
+                 'confirmation_expires_at', 'confirmed_at', 'subscribed_at')"
         ),
         "confirmation_expires_at, confirmation_token, confirmed_at, email, id, name, \
          password_hash, status, subscribed_at",
@@ -189,6 +199,8 @@ fn a_second_start_against_the_same_database_changes_nothing() {
 
     let first = TestApp::start(config(std::slice::from_ref(&setting)));
     assert_eq!(first.get("/readyz").0, 200, "the first start is not ready");
+    let applied = postgres
+        .query("SELECT string_agg(version::text, ', ' ORDER BY version) FROM _sqlx_migrations");
     first.stop();
 
     // Starting twice happens on every deploy and every restart: the second start has a schema that
@@ -199,9 +211,11 @@ fn a_second_start_against_the_same_database_changes_nothing() {
     second.stop();
 
     assert_eq!(
-        postgres.query("SELECT count(*) FROM _sqlx_migrations"),
-        "1",
-        "a migration is applied once, not once per start"
+        postgres
+            .query("SELECT string_agg(version::text, ', ' ORDER BY version) FROM _sqlx_migrations"),
+        applied,
+        "the set of migrations a database has seen is what a second start leaves alone: a \
+         migration is applied once, not once per start"
     );
 }
 

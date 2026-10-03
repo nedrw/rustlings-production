@@ -1,0 +1,325 @@
+diff --git a/.sqlx/query-47aca8deb0c2955c77b448b1b7a57e44ad65a76078777b7eb3a7943a28faa99f.json b/.sqlx/query-47aca8deb0c2955c77b448b1b7a57e44ad65a76078777b7eb3a7943a28faa99f.json
+new file mode 100644
+index 0000000..533750c
+--- /dev/null
++++ b/.sqlx/query-47aca8deb0c2955c77b448b1b7a57e44ad65a76078777b7eb3a7943a28faa99f.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE subscribers SET confirmation_sent_at = now(), confirmation_claimed_at = NULL WHERE id = $1",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "47aca8deb0c2955c77b448b1b7a57e44ad65a76078777b7eb3a7943a28faa99f"
++}
+diff --git a/.sqlx/query-ba90caf7a1a12264e4a1ee3b1be75720ce3a772a563d52915b9e34b5b2124143.json b/.sqlx/query-ba90caf7a1a12264e4a1ee3b1be75720ce3a772a563d52915b9e34b5b2124143.json
+new file mode 100644
+index 0000000..caf4e26
+--- /dev/null
++++ b/.sqlx/query-ba90caf7a1a12264e4a1ee3b1be75720ce3a772a563d52915b9e34b5b2124143.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE subscribers SET confirmation_claimed_at = NULL WHERE id = $1",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "ba90caf7a1a12264e4a1ee3b1be75720ce3a772a563d52915b9e34b5b2124143"
++}
+diff --git a/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json b/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json
+new file mode 100644
+index 0000000..e8cad7c
+--- /dev/null
++++ b/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json
+@@ -0,0 +1,40 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT email, confirmation_token AS \"confirmation_token!\" FROM subscribers WHERE id = $1 AND status = 'pending' AND confirmation_sent_at IS NULL AND confirmation_token IS NOT NULL",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "confirmation_token!",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "confirmation_token"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false,
++      true
++    ]
++  },
++  "hash": "d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c"
++}
+diff --git a/.sqlx/query-dd3e8e45268f4cfc282ef4844177180f0696abb628697a64ef08567365344316.json b/.sqlx/query-dd3e8e45268f4cfc282ef4844177180f0696abb628697a64ef08567365344316.json
+new file mode 100644
+index 0000000..5a0c774
+--- /dev/null
++++ b/.sqlx/query-dd3e8e45268f4cfc282ef4844177180f0696abb628697a64ef08567365344316.json
+@@ -0,0 +1,28 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT id FROM subscribers WHERE email = $1 AND status = 'pending' AND confirmation_sent_at IS NULL",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "id"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": [
++      false
++    ]
++  },
++  "hash": "dd3e8e45268f4cfc282ef4844177180f0696abb628697a64ef08567365344316"
++}
+diff --git a/migrations/0002_confirmation_delivery.sql b/migrations/0002_confirmation_delivery.sql
+new file mode 100644
+index 0000000..19dc6e2
+--- /dev/null
++++ b/migrations/0002_confirmation_delivery.sql
+@@ -0,0 +1,28 @@
++-- 0002 — the confirmation delivery state machine (step `mailer/1.15-idempotent-delivery`).
++--
++-- A confirmation email is a side effect, and what has to happen exactly once per subscriber is the
++-- *delivery* of it. `confirmation_sent_at` is that fact: while it is null, something is still owed
++-- to this subscriber, and a worker may claim it.
++--
++-- The three columns are the states of one transition:
++--
++-- * `confirmation_claimed_at` — a worker is sending this right now. It is what makes a claim
++--   *exclusive*: `UPDATE … WHERE confirmation_claimed_at IS NULL` hands its `RETURNING` row to
++--   exactly one caller, which is the same trick step `mailer/1.11-signup` plays with a unique
++--   constraint, one table over;
++-- * `confirmation_sent_at` — the message was handed to the sender. It is written *after* the send,
++--   and it is what makes every later job for the same subscriber do nothing;
++-- * `confirmation_attempts` — how many times a worker claimed it. A row that ran out of attempts is
++--   a message this service gave up on, and counting is what makes "gave up" visible instead of
++--   silent.
++--
++-- Why columns rather than a `deliveries` table: there is one kind of message today, so "the
++-- confirmation email of subscriber X" is one fact about X. A second kind of message — the
++-- newsletter issue of step `mailer/1.17-newsletter` — is where `deliveries` with
++-- `UNIQUE (subscriber_id, kind)` earns its place; the identity of a delivery is what must not
++-- collide, and a table is how more than one identity is spelled.
++
++ALTER TABLE subscribers
++    ADD COLUMN confirmation_claimed_at TIMESTAMPTZ,
++    ADD COLUMN confirmation_sent_at    TIMESTAMPTZ,
++    ADD COLUMN confirmation_attempts   INTEGER NOT NULL DEFAULT 0;
+diff --git a/src/deliveries.rs b/src/deliveries.rs
+new file mode 100644
+index 0000000..eeb8eaa
+--- /dev/null
++++ b/src/deliveries.rs
+@@ -0,0 +1,165 @@
++//! The confirmation delivery state machine: claim, send, record (step
++//! `mailer/1.15-idempotent-delivery`).
++//!
++//! Step `mailer/1.14-worker` moved the send off the request path. This step is about what happens
++//! when the same message is *offered* twice: the request that queued it may lose its answer, the
++//! process may be restarted, two workers may hold a job for one subscriber, and the worker itself
++//! retries. A mail server can only do what it is told, so "one email per subscriber" is not a
++//! property of the sender — it is a property of this file, and it is decided in the database.
++//!
++//! Three decisions, and each of them is a way to get it wrong:
++//!
++//! * **the key is the intent, not the message.** What must not happen twice is *telling this
++//!   subscriber about their confirmation*, so that is what the state records. Hashing the message
++//!   instead would make a rotated token a different message — and the same intent — which is
++//!   exactly how a deduplication key ends up deduplicating nothing;
++//! * **the claim is a conditional write, and its answer is the truth.** [`claim`] does not read and
++//!   then decide (step `mailer/1.11-signup` already taught why: there is a window between the two
++//!   halves of a read-then-write, and two callers arriving in it both win). The `UPDATE` carries
++//!   its conditions and hands its `RETURNING` row to one caller: the one that won;
++//! * **the record is written after the send, and given back if it fails.** `sent_at` is set only
++//!   once the message was *taken*; a send that failed releases the claim, so the message can be
++//!   delivered by a later claim instead of being stuck as "someone is on it" forever.
++//!
++//! # What this scaffold proves
++//!
++//! Nothing yet, and the hole is the middle decision: [`claim`] below **reads** the row and answers
++//! whatever it finds. Two callers asking at the same time both get the message, the worker sends it
++//! twice, and `confirmation_attempts` stays at zero — the count that is supposed to make "we gave
++//! up on this message" a fact about the row. The step's spec
++//! (`tests/spec_idempotent_delivery.rs`) fails here until the read becomes a write that only one
++//! caller can win, and until the caller that loses believes it.
++//!
++//! What this file does not do even when it is finished is make delivery *durable*: a worker that
++//! dies between the claim and the send leaves a subscriber claimed and unsent, and a reaper
++//! (`WHERE confirmation_claimed_at < now() - interval '…'`) or an outbox is where that gets fixed.
++//! Neither is this step's work.
++
++use sqlx::PgPool;
++
++use crate::confirmation::Token;
++use crate::domain::Email;
++use crate::error::Error;
++
++/// What a claimed delivery needs in order to be sent: where it goes, and the token that makes the
++/// link work.
++///
++/// Both are parsed values (step `mailer/1.10-domain-types`), built from the row the claim came
++/// back with — the service never invents a message it cannot check.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Delivery {
++    /// The address in the row, as an address.
++    pub email: Email,
++    /// The confirmation token that is *in the row*: the only thing `GET /confirm` accepts
++    /// (step `mailer/1.12-token`).
++    pub token: Token,
++}
++
++/// Claim the confirmation email of one subscriber, or answer that there is nothing to claim.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the question cannot be asked, and [`Error::InvalidInput`] when a
++/// value the row holds cannot be parsed as the domain type it was written as.
++///
++/// The scaffold reads: `pending`, not yet told, token present — and answers `Some` for every caller
++/// that asks. Making it an `UPDATE … WHERE confirmation_claimed_at IS NULL RETURNING …` (and
++/// counting the attempt in the same statement) is what turns "may I?" into "I did", which is the
++/// whole of this step's idempotency.
++pub async fn claim(pool: &PgPool, subscriber: i64) -> Result<Option<Delivery>, Error> {
++    let row = sqlx::query!(
++        "SELECT email, confirmation_token AS \"confirmation_token!\" FROM subscribers \
++          WHERE id = $1 \
++            AND status = 'pending' \
++            AND confirmation_sent_at IS NULL \
++            AND confirmation_token IS NOT NULL",
++        subscriber
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "claim a confirmation email",
++        source: Box::new(source),
++    })?;
++
++    row.map(|row| {
++        Ok(Delivery {
++            email: Email::parse(&row.email)?,
++            token: Token::parse(&row.confirmation_token)?,
++        })
++    })
++    .transpose()
++}
++
++/// Record that the message went out, and let go of the claim.
++///
++/// This is the write every later job for this subscriber runs into: with `confirmation_sent_at` set,
++/// [`claim`] answers `None` without sending anything.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the record does not run.
++pub async fn mark_sent(pool: &PgPool, subscriber: i64) -> Result<(), Error> {
++    sqlx::query!(
++        "UPDATE subscribers \
++            SET confirmation_sent_at = now(), confirmation_claimed_at = NULL \
++          WHERE id = $1",
++        subscriber
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "record a delivered confirmation email",
++        source: Box::new(source),
++    })?;
++    Ok(())
++}
++
++/// Give the claim back without recording a delivery.
++///
++/// A send that failed leaves the message owed and nobody sending it: releasing the claim is what
++/// makes it claimable again, by the retry of this worker or by a later job.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the release does not run.
++pub async fn release(pool: &PgPool, subscriber: i64) -> Result<(), Error> {
++    sqlx::query!(
++        "UPDATE subscribers SET confirmation_claimed_at = NULL WHERE id = $1",
++        subscriber
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "release a confirmation claim",
++        source: Box::new(source),
++    })?;
++    Ok(())
++}
++
++/// The subscriber this address belongs to, when the service still owes them a confirmation.
++///
++/// A second signup for an address that is taken is a `409` (step `mailer/1.11-signup`), and it is
++/// also the only way a client can say "try that delivery again": this is the question behind that
++/// answer, and `None` — the address is unknown, already confirmed, or already told — is what makes
++/// the second signup leave the queue alone.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the question cannot be asked.
++pub async fn outstanding(pool: &PgPool, email: &Email) -> Result<Option<i64>, Error> {
++    let row = sqlx::query!(
++        "SELECT id FROM subscribers \
++          WHERE email = $1 \
++            AND status = 'pending' \
++            AND confirmation_sent_at IS NULL",
++        email.as_str()
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "look up an outstanding confirmation",
++        source: Box::new(source),
++    })?;
++    Ok(row.map(|row| row.id))
++}

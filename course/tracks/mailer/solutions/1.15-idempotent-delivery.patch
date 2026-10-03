@@ -1,0 +1,691 @@
+diff --git a/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json b/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json
+deleted file mode 100644
+index e8cad7c..0000000
+--- a/.sqlx/query-d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c.json
++++ /dev/null
+@@ -1,40 +0,0 @@
+-{
+-  "db_name": "PostgreSQL",
+-  "query": "SELECT email, confirmation_token AS \"confirmation_token!\" FROM subscribers WHERE id = $1 AND status = 'pending' AND confirmation_sent_at IS NULL AND confirmation_token IS NOT NULL",
+-  "describe": {
+-    "columns": [
+-      {
+-        "ordinal": 0,
+-        "name": "email",
+-        "type_info": "Text",
+-        "origin": {
+-          "Table": {
+-            "table": "subscribers",
+-            "name": "email"
+-          }
+-        }
+-      },
+-      {
+-        "ordinal": 1,
+-        "name": "confirmation_token!",
+-        "type_info": "Text",
+-        "origin": {
+-          "Table": {
+-            "table": "subscribers",
+-            "name": "confirmation_token"
+-          }
+-        }
+-      }
+-    ],
+-    "parameters": {
+-      "Left": [
+-        "Int8"
+-      ]
+-    },
+-    "nullable": [
+-      false,
+-      true
+-    ]
+-  },
+-  "hash": "d7de972fa4489a64d815dfd32f3a7f06d1d3a1ff39604627964f89f17ed4588c"
+-}
+diff --git a/.sqlx/query-f8b1b06b3a469722c53da33405e198fe028316ddca2fffacd124d1b55d8edaf3.json b/.sqlx/query-f8b1b06b3a469722c53da33405e198fe028316ddca2fffacd124d1b55d8edaf3.json
+new file mode 100644
+index 0000000..33c2e43
+--- /dev/null
++++ b/.sqlx/query-f8b1b06b3a469722c53da33405e198fe028316ddca2fffacd124d1b55d8edaf3.json
+@@ -0,0 +1,40 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE subscribers SET confirmation_claimed_at = now(), confirmation_attempts = confirmation_attempts + 1 WHERE id = $1 AND status = 'pending' AND confirmation_sent_at IS NULL AND confirmation_claimed_at IS NULL AND confirmation_token IS NOT NULL RETURNING email, confirmation_token AS \"confirmation_token!\"",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "confirmation_token!",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "confirmation_token"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Int8"
++      ]
++    },
++    "nullable": [
++      false,
++      true
++    ]
++  },
++  "hash": "f8b1b06b3a469722c53da33405e198fe028316ddca2fffacd124d1b55d8edaf3"
++}
+diff --git a/src/deliveries.rs b/src/deliveries.rs
+index eeb8eaa..16b960b 100644
+--- a/src/deliveries.rs
++++ b/src/deliveries.rs
+@@ -21,19 +21,10 @@
+ //!   once the message was *taken*; a send that failed releases the claim, so the message can be
+ //!   delivered by a later claim instead of being stuck as "someone is on it" forever.
+ //!
+-//! # What this scaffold proves
+-//!
+-//! Nothing yet, and the hole is the middle decision: [`claim`] below **reads** the row and answers
+-//! whatever it finds. Two callers asking at the same time both get the message, the worker sends it
+-//! twice, and `confirmation_attempts` stays at zero — the count that is supposed to make "we gave
+-//! up on this message" a fact about the row. The step's spec
+-//! (`tests/spec_idempotent_delivery.rs`) fails here until the read becomes a write that only one
+-//! caller can win, and until the caller that loses believes it.
+-//!
+-//! What this file does not do even when it is finished is make delivery *durable*: a worker that
+-//! dies between the claim and the send leaves a subscriber claimed and unsent, and a reaper
+-//! (`WHERE confirmation_claimed_at < now() - interval '…'`) or an outbox is where that gets fixed.
+-//! Neither is this step's work.
++//! What this file does not do is what makes delivery *durable*: it re-reads the row for
++//! [`Delivery`], but a worker that dies between the claim and the send leaves a subscriber claimed
++//! and unsent — a reaper (`WHERE confirmation_claimed_at < now() - interval '…'`) or an outbox is
++//! where that gets fixed, and neither is this step's work.
+ 
+ use sqlx::PgPool;
+ 
+@@ -57,22 +48,34 @@ pub struct Delivery {
+ 
+ /// Claim the confirmation email of one subscriber, or answer that there is nothing to claim.
+ ///
++/// The statement is the whole of the idempotency: it flips `confirmation_claimed_at` from null to
++/// now for a subscriber who is `pending`, whose confirmation has not been sent, and whose row is not
++/// already claimed, and it hands back the address and token to send. One caller gets that row; every
++/// other caller — a second worker, a later job for the same subscriber, the same worker after a
++/// retry — gets `None`, which is not an error: it means somebody else is sending it, or it is
++/// already gone.
++///
++/// `confirmation_attempts` is incremented by the same statement, so a claim *is* an attempt: the
++/// worker sends once per claim (step `mailer/1.14-worker`'s retry loop now goes through
++/// [`claim`], not around the sender), and the column is the number of times this message was really
++/// offered to a mail server — a count that survives a restart and adds up across every job for the
++/// subscriber.
++///
+ /// # Errors
+ ///
+-/// Reports [`Error::Database`] when the question cannot be asked, and [`Error::InvalidInput`] when a
++/// Reports [`Error::Database`] when the claim does not run, and [`Error::InvalidInput`] when a
+ /// value the row holds cannot be parsed as the domain type it was written as.
+-///
+-/// The scaffold reads: `pending`, not yet told, token present — and answers `Some` for every caller
+-/// that asks. Making it an `UPDATE … WHERE confirmation_claimed_at IS NULL RETURNING …` (and
+-/// counting the attempt in the same statement) is what turns "may I?" into "I did", which is the
+-/// whole of this step's idempotency.
+ pub async fn claim(pool: &PgPool, subscriber: i64) -> Result<Option<Delivery>, Error> {
+     let row = sqlx::query!(
+-        "SELECT email, confirmation_token AS \"confirmation_token!\" FROM subscribers \
++        "UPDATE subscribers \
++            SET confirmation_claimed_at = now(), \
++                confirmation_attempts = confirmation_attempts + 1 \
+           WHERE id = $1 \
+             AND status = 'pending' \
+             AND confirmation_sent_at IS NULL \
+-            AND confirmation_token IS NOT NULL",
++            AND confirmation_claimed_at IS NULL \
++            AND confirmation_token IS NOT NULL \
++          RETURNING email, confirmation_token AS \"confirmation_token!\"",
+         subscriber
+     )
+     .fetch_optional(pool)
+diff --git a/src/delivery.rs b/src/delivery.rs
+index d667d14..125be20 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -22,17 +22,27 @@
+ //!   to close the queue to new messages and finish what it already has, and the caller waits for
+ //!   that — at most [`DRAIN_DEADLINE`], because a process that will not stop is a process an
+ //!   orchestrator kills, and being killed is how messages are lost.
++//!
++//! Step `mailer/1.15-idempotent-delivery` adds a fifth, and it changes what travels in the
++//! channel: **a job is an identity, not a message** ([`Job`]). The worker asks the database to
++//! claim what a job names and sends what the claim answers with, so a job offered twice — a
++//! retry, a restarted process, two workers, a duplicate signup — finds nothing to do the second
++//! time. A message carried in memory would be a second copy of the truth, and there would be no
++//! way to ask whether it had already gone out.
+ 
+ use std::sync::{Arc, Mutex, PoisonError};
+ use std::time::Duration;
+ 
++use sqlx::PgPool;
+ use tokio::sync::mpsc::{self, Permit};
+ use tokio::sync::watch;
+ use tokio::task::JoinHandle;
+ use tracing::{error, info, warn};
+ 
+-use crate::email::{EmailSender, Message, SendError};
++use crate::deliveries;
++use crate::email::EmailSender;
+ use crate::error::Error;
++use crate::signup::confirmation_message;
+ 
+ /// How many messages may wait for the worker before a request is refused.
+ ///
+@@ -59,6 +69,19 @@ const RETRY_CAP: Duration = Duration::from_secs(30);
+ /// How long the worker is given to finish what it already has, once the process is asked to stop.
+ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+ 
++/// One thing the worker has to do: deliver the confirmation email of one subscriber.
++///
++/// The job carries an *identity* rather than a message (step `mailer/1.15-idempotent-delivery`):
++/// what is owed, and what has already gone out, are facts about the subscriber's row, and the
++/// message is rebuilt from the row by whoever manages to claim it. A job is therefore a
++/// question — "does this subscriber still need their confirmation?" — and the claim is the
++/// answer.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Job {
++    /// The subscriber whose confirmation is owed.
++    pub subscriber: i64,
++}
++
+ /// A queue with one worker behind it.
+ ///
+ /// Cloneable (it is a handle, like the database pool): every clone sends into the same queue and
+@@ -67,8 +90,8 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+ /// one that waits for it.
+ #[derive(Debug, Clone)]
+ pub struct Queue {
+-    /// The sending half of the channel: where a reserved seat turns into a queued message.
+-    jobs: mpsc::Sender<Message>,
++    /// The sending half of the channel: where a reserved seat turns into a queued job.
++    jobs: mpsc::Sender<Job>,
+     /// Set when the process is asked to stop: the worker stops accepting and finishes its buffer.
+     stop: watch::Sender<bool>,
+     /// The worker task, taken once by whoever drains the queue.
+@@ -79,10 +102,12 @@ impl Queue {
+     /// Start the worker and answer a handle to the queue in front of it.
+     ///
+     /// The worker owns the receiving half for its whole life, so there is nothing to hand it later
+-    /// and no way for a second one to appear.
++    /// and no way for a second one to appear. It also owns the pool: sending is no longer "hand
++    /// this message over", it is "claim what this job names, send it, and record which of the two
++    /// happened" (step `mailer/1.15-idempotent-delivery`), and the record lives in the database.
+     #[must_use]
+-    pub fn start(sender: Arc<dyn EmailSender>) -> Self {
+-        let (jobs, mut waiting) = mpsc::channel::<Message>(QUEUE_CAPACITY);
++    pub fn start(sender: Arc<dyn EmailSender>, pool: PgPool) -> Self {
++        let (jobs, mut waiting) = mpsc::channel::<Job>(QUEUE_CAPACITY);
+         let (stop, mut stopping) = watch::channel(false);
+ 
+         let worker = tokio::spawn(async move {
+@@ -98,14 +123,18 @@ impl Queue {
+                             waiting.close();
+                         }
+                     }
+-                    message = waiting.recv() => {
+-                        let Some(message) = message else {
++                    job = waiting.recv() => {
++                        let Some(job) = job else {
+                             break;
+                         };
+-                        match deliver(sender.as_ref(), &message).await {
+-                            Ok(()) => delivered += 1,
++                        match deliver_job(&pool, sender.as_ref(), &job).await {
++                            // `true` is a message that went out, and `false` is a job that had
++                            // nothing left to do (step `mailer/1.15-idempotent-delivery`):
++                            // neither of them is a failure.
++                            Ok(true) => delivered += 1,
++                            Ok(false) => {}
+                             Err(error) => {
+-                                error!(%error, to = %message.to, "giving up on an email");
++                                error!(%error, subscriber = job.subscriber, "a job could not be run");
+                             }
+                         }
+                     }
+@@ -122,16 +151,16 @@ impl Queue {
+         }
+     }
+ 
+-    /// Reserve room for one message, or refuse the caller that wanted it.
++    /// Reserve room for one job, or refuse the caller that wanted it.
+     ///
+-    /// The seat is taken *before* the work the message is about, which is what makes "the queue is
++    /// The seat is taken *before* the work the job is about, which is what makes "the queue is
+     /// full" an answer a caller can act on: they are told to come back, and nothing was written for
+     /// them in the meantime.
+     ///
+     /// # Errors
+     ///
+-    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting.
+-    pub fn reserve(&self) -> Result<Permit<'_, Message>, Error> {
++    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] jobs are already waiting.
++    pub fn reserve(&self) -> Result<Permit<'_, Job>, Error> {
+         self.jobs.try_reserve().map_err(|_| Error::QueueFull)
+     }
+ 
+@@ -164,15 +193,49 @@ impl Queue {
+     }
+ }
+ 
+-/// Hand one message to the sender, retrying the failures that are worth retrying.
+-async fn deliver(sender: &dyn EmailSender, message: &Message) -> Result<(), SendError> {
++/// Run one job: claim, send once, record — and claim again for the next attempt
++/// (step `mailer/1.15-idempotent-delivery`).
++///
++/// The retry loop goes *through* the database rather than around the sender, and that is the whole
++/// shape of this step: every attempt is a claim, so `confirmation_attempts` is a count of the times
++/// the message was really offered to a mail server — a fact that survives a restart and adds up
++/// across every job for that subscriber. A claimed-and-released row is a message with nobody sending
++/// it, which is what makes the next claim (this worker's or a later job's) able to pick it up.
++///
++/// `Ok(false)` is the idempotency of this step and it is not a failure: the claim found nothing to
++/// do, because the confirmation has already gone out or because another worker is sending it right
++/// now.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the claim, the record or the release does not run, and
++/// [`Error::InvalidInput`] when a row holds a value that is not the type it was written as. A
++/// failed *send* is not one of them: it is retried, and then given up on with a line in the log.
++async fn deliver_job(pool: &PgPool, sender: &dyn EmailSender, job: &Job) -> Result<bool, Error> {
+     let mut attempt = 1_u32;
+     loop {
+-        match sender.send(message.clone()).await {
+-            Ok(()) => return Ok(()),
++        let Some(delivery) = deliveries::claim(pool, job.subscriber).await? else {
++            info!(
++                subscriber = job.subscriber,
++                "nothing to claim: the confirmation has been sent, or another worker has it"
++            );
++            return Ok(false);
++        };
++        let message = confirmation_message(delivery.email.clone(), &delivery.token);
++        match sender.send(message).await {
++            Ok(()) => {
++                // The record is written *after* the send: a `sent_at` set before the mail server took
++                // the message would be a promise this service cannot keep.
++                deliveries::mark_sent(pool, job.subscriber).await?;
++                return Ok(true);
++            }
+             Err(error) => {
++                // The message is still owed and nobody is sending it: without this the subscriber
++                // would be stuck as "someone is on it" forever, and no later job could claim it.
++                deliveries::release(pool, job.subscriber).await?;
+                 if attempt >= MAX_ATTEMPTS {
+-                    return Err(error);
++                    error!(%error, to = %delivery.email, "giving up on an email");
++                    return Ok(false);
+                 }
+                 let wait = backoff(attempt);
+                 warn!(%error, attempt, ?wait, "the email could not be sent; trying again");
+@@ -212,57 +275,21 @@ pub fn backoff(attempt: u32) -> Duration {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{DRAIN_DEADLINE, MAX_ATTEMPTS, Queue, RETRY_BASE, RETRY_CAP, backoff};
+-    use crate::domain::Email;
++    use super::{Queue, RETRY_BASE, RETRY_CAP, backoff};
+     use crate::email::{EmailSender, Message, SendError};
++    use sqlx::PgPool;
+     use std::sync::Arc;
+-    use std::sync::atomic::{AtomicU32, Ordering};
+     use std::time::Duration;
+ 
+-    fn message() -> Message {
+-        Message {
+-            to: Email::parse("ada@example.com").expect("the fixture address is valid"),
+-            subject: "Confirm your subscription".to_owned(),
+-            body: "Confirm your subscription by opening the link.".to_owned(),
+-        }
+-    }
+-
+-    /// A sender that fails a fixed number of times and then succeeds.
+-    #[derive(Debug)]
+-    struct Flaky {
+-        failures: u32,
+-        attempts: AtomicU32,
+-    }
+-
+-    impl Flaky {
+-        fn failing(times: u32) -> Self {
+-            Self {
+-                failures: times,
+-                attempts: AtomicU32::new(0),
+-            }
+-        }
+-
+-        fn attempts(&self) -> u32 {
+-            self.attempts.load(Ordering::Relaxed)
+-        }
+-    }
+-
+-    impl EmailSender for Flaky {
+-        fn send(
+-            &self,
+-            _message: Message,
+-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
+-        {
+-            Box::pin(async move {
+-                let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+-                if attempt <= self.failures {
+-                    return Err(SendError::new(std::io::Error::other(
+-                        "the mail server is away",
+-                    )));
+-                }
+-                Ok(())
+-            })
+-        }
++    /// A pool that connects on first use — and is never used by these tests.
++    ///
++    /// The worker needs a database since step `mailer/1.15-idempotent-delivery`, but the test below
++    /// exercises the queue's *memory*: its bound and its seats. A lazy pool is what lets a test build
++    /// one of those without a database, and a test that accidentally runs a statement still fails
++    /// loudly rather than silently passing.
++    fn lazy_pool() -> PgPool {
++        PgPool::connect_lazy("postgres://mailer@127.0.0.1:5432/mailer")
++            .expect("the fixture connection string is well formed")
+     }
+ 
+     /// A sender that never answers: the mail server that accepts a connection and says nothing.
+@@ -311,34 +338,9 @@ mod tests {
+         );
+     }
+ 
+-    #[tokio::test(start_paused = true)]
+-    async fn a_failing_send_is_retried_and_then_given_up_on() {
+-        let retried = Flaky::failing(MAX_ATTEMPTS - 1);
+-        let queue = Queue::start(Arc::new(retried));
+-        let seat = queue.reserve().expect("an empty queue has room");
+-        seat.send(message());
+-        let delivered = queue.drain(DRAIN_DEADLINE).await.expect("the queue drains");
+-        assert_eq!(delivered, 1, "the message arrived after its retries");
+-
+-        let hopeless = Arc::new(Flaky::failing(u32::MAX));
+-        let queue = Queue::start(hopeless.clone());
+-        let seat = queue.reserve().expect("an empty queue has room");
+-        seat.send(message());
+-        let delivered = queue
+-            .drain(DRAIN_DEADLINE)
+-            .await
+-            .expect("a message that cannot be sent must not hold the drain open");
+-        assert_eq!(delivered, 0, "nothing was delivered");
+-        assert_eq!(
+-            hopeless.attempts(),
+-            MAX_ATTEMPTS,
+-            "a send that keeps failing is attempted exactly {MAX_ATTEMPTS} times, not forever"
+-        );
+-    }
+-
+     #[tokio::test(start_paused = true)]
+     async fn a_full_queue_refuses_instead_of_waiting() {
+-        let queue = Queue::start(Arc::new(Hanging));
++        let queue = Queue::start(Arc::new(Hanging), lazy_pool());
+         let mut seats = Vec::new();
+         for _ in 0..super::QUEUE_CAPACITY {
+             seats.push(queue.reserve().expect("the queue has room to fill"));
+@@ -352,16 +354,4 @@ mod tests {
+         drop(seats);
+         assert!(queue.reserve().is_ok(), "a returned seat is room again");
+     }
+-
+-    #[tokio::test(start_paused = true)]
+-    async fn draining_gives_up_on_the_deadline_and_leaves_the_worker_behind() {
+-        let queue = Queue::start(Arc::new(Hanging));
+-        let seat = queue.reserve().expect("an empty queue has room");
+-        seat.send(message());
+-        let drained = queue.drain(Duration::from_millis(10)).await;
+-        assert!(
+-            drained.is_err(),
+-            "a worker stuck on a message must not drain quietly: {drained:?}"
+-        );
+-    }
+ }
+diff --git a/src/http.rs b/src/http.rs
+index 7aa6a7c..ef7fa20 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -64,7 +64,9 @@ use crate::signup::{SignupRequest, subscribe};
+ pub struct AppState {
+     config: Config,
+     database: Option<Database>,
+-    delivery: Queue,
++    /// The delivery queue, when there is a database for it to record deliveries in (step
++    /// `mailer/1.15-idempotent-delivery`).
++    delivery: Option<Queue>,
+ }
+ 
+ impl AppState {
+@@ -116,27 +118,34 @@ impl AppState {
+             return Ok(Self {
+                 config,
+                 database: None,
+-                delivery: Queue::start(sender),
++                // No database, no delivery record, no queue: a job
++                // whose delivery cannot be claimed is work this process must not accept.
++                delivery: None,
+             });
+         };
+ 
+         let database = Database::connect(&url).await?;
+         database.migrate().await?;
++        // The queue is built with the pool: what it records about a delivery is a write to the
++        // database the subscriber lives in (step `mailer/1.15-idempotent-delivery`).
++        let delivery = Queue::start(sender, database.pool().clone());
+         Ok(Self {
+             config,
+             database: Some(database),
+-            delivery: Queue::start(sender),
++            delivery: Some(delivery),
+         })
+     }
+ 
+     /// The delivery queue this state was built with (step `mailer/1.14-worker`).
+     ///
+-    /// A handler reserves a seat here *before* it does the work a message is about, and hands the
+-    /// message over afterwards: that is the whole of this service's contact with the sender, and
+-    /// the order is what makes a full queue a refusal that wrote nothing.
++    /// A handler reserves a seat here *before* it does the work a job is about, and hands the job
++    /// over afterwards: that is the whole of this service's contact with the sender, and the order
++    /// is what makes a full queue a refusal that wrote nothing. There is no queue without a
++    /// database since step `mailer/1.15-idempotent-delivery` — the delivery record lives in one,
++    /// and a queue that cannot record what it did would be a queue that sends twice.
+     #[must_use]
+-    pub fn delivery(&self) -> &Queue {
+-        &self.delivery
++    pub fn delivery(&self) -> Option<&Queue> {
++        self.delivery.as_ref()
+     }
+ 
+     /// The configuration the process started with.
+@@ -236,10 +245,12 @@ async fn signup(
+             .into_response();
+     };
+ 
+-    let Some(database) = state.database() else {
+-        // A configuration without a database is a choice (step `mailer/1.9-postgres`), and this is
+-        // the request that cannot be answered by it: the service is up, and this route is not
+-        // ready — the same 503 `/readyz` is about.
++    // A configuration without a database is a choice (step `mailer/1.9-postgres`), and this is
++    // the request that cannot be answered by it: the service is up, and this route is not
++    // ready — the same 503 `/readyz` is about. Since step `mailer/1.15-idempotent-delivery` the
++    // delivery queue is part of the same answer: a signup needs somewhere to write the
++    // subscriber *and* somewhere to record the delivery.
++    let (Some(database), Some(delivery)) = (state.database(), state.delivery()) else {
+         warn!("a signup arrived with no database configured");
+         return not_ready("no database is configured");
+     };
+@@ -247,7 +258,7 @@ async fn signup(
+     // The seat is taken **before** the insert (step `mailer/1.14-worker`): a queue with no
+     // room refuses this request while it has written nothing, so a client that retries is
+     // not sent to the `409` of a subscriber nobody could ever confirm.
+-    let seat = match state.delivery().reserve() {
++    let seat = match delivery.reserve() {
+         Ok(seat) => seat,
+         Err(error) => return answer(error),
+     };
+diff --git a/src/lib.rs b/src/lib.rs
+index 2739a63..77ed04f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -16,6 +16,7 @@ use std::path::PathBuf;
+ pub mod config;
+ pub mod confirmation;
+ pub mod db;
++pub mod deliveries;
+ pub mod delivery;
+ pub mod domain;
+ pub mod email;
+@@ -27,7 +28,7 @@ pub mod signup;
+ pub use config::{Config, Flags};
+ pub use confirmation::Token;
+ pub use db::Database;
+-pub use delivery::Queue;
++pub use delivery::{Job, Queue};
+ pub use domain::{Email, Password, SubscriberName};
+ pub use email::{EmailSender, Message, SendError};
+ pub use error::{Error, SettingSource};
+diff --git a/src/main.rs b/src/main.rs
+index c4c7e2a..854601c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -69,7 +69,7 @@ async fn service() -> Result<ExitCode> {
+             // has to be drained *after* the last request was answered. A process that is asked to
+             // stop and stops is the difference between a deploy that loses the work it accepted
+             // and one that does not.
+-            let delivery = state.delivery().clone();
++            let delivery = state.delivery().cloned();
+             mailer::http::serve_with_shutdown(state.clone(), &id, stop()).await?;
+             drop(state);
+             // A clean drain is what `SIGTERM` is supposed to mean, and the worker behind the queue
+@@ -77,7 +77,9 @@ async fn service() -> Result<ExitCode> {
+             // the queue is the other ending: they are not delivered, and a process that exits `0`
+             // into a lost email is a process that lies to its orchestrator — so the exit code says
+             // the deployment has a problem (step `mailer/1.5-errors`).
+-            if let Err(failure) = delivery.drain(DRAIN_DEADLINE).await {
++            if let Some(delivery) = delivery
++                && let Err(failure) = delivery.drain(DRAIN_DEADLINE).await
++            {
+                 error!(%failure, "the delivery queue did not drain before its deadline");
+                 return Ok(failure.exit_code());
+             }
+diff --git a/src/signup.rs b/src/signup.rs
+index b7b66e1..00c592f 100644
+--- a/src/signup.rs
++++ b/src/signup.rs
+@@ -19,7 +19,12 @@
+ //!   the caller reserves a [`Permit`] and hands it in, so a queue with no room refuses a signup
+ //!   that has written nothing — a client that retries arrives at an empty database, where a
+ //!   subscriber nobody can confirm would be a dead end. The message is handed over *after* the
+-//!   insert wins: a confirmation link for a row that does not exist is a link to nothing.
++//!   insert wins: a confirmation link for a row that does not exist is a link to nothing;
++//! * **a second signup asks for a delivery, it does not cause one** (step
++//!   `mailer/1.15-idempotent-delivery`): the address is taken, so the answer is still a `409`
++//!   — and if the confirmation is still owed, the seat is used to ask the worker to try
++//!   again. Whether that produces an email is not decided here: a delivery happens once, and
++//!   the database is where that once is counted.
+ 
+ use argon2::{Argon2, PasswordHash, PasswordHasher};
+ use serde::Deserialize;
+@@ -27,6 +32,8 @@ use sqlx::PgPool;
+ use tokio::sync::mpsc::Permit;
+ 
+ use crate::confirmation::{CONFIRMATION_WINDOW_SECS, Token};
++use crate::deliveries;
++use crate::delivery::Job;
+ use crate::domain::{Email, Password, SubscriberName};
+ use crate::email::{CONFIRMATION_BASE_URL, CONFIRMATION_SUBJECT, Message};
+ use crate::error::Error;
+@@ -61,10 +68,16 @@ pub struct SignupRequest {
+ ///
+ /// The seat in the delivery queue arrives as an argument (step `mailer/1.14-worker`): a signup
+ /// does not wait for a mail server any more, and it does not decide what a full queue means
+-/// either — whoever reserved the seat did that before this function was reached. The message is
++/// either — whoever reserved the seat did that before this function was reached. The job is
+ /// handed over *after* the insert wins, so nothing is queued for a subscriber that does not
+-/// exist, and a caller that loses the race leaves the seat empty instead of filling the queue
+-/// with a message nobody asked for.
++/// exist — and it is an identity rather than a message (step `mailer/1.15-idempotent-delivery`),
++/// so what a worker ends up sending is decided by the row, not by whoever queued it.
++///
++/// The seat is also used by the arm that *loses* the race: a signup for an address that already
++/// has a pending subscriber is a second request for the confirmation they are still owed, and
++/// the worker is asked to try again. Nothing about that can produce a second email — the
++/// delivery is claimed in the database — but leaving it out would mean a subscriber whose
++/// confirmation failed has no way back in.
+ ///
+ /// # Errors
+ ///
+@@ -75,7 +88,7 @@ pub struct SignupRequest {
+ /// the address already has a subscriber.
+ pub async fn subscribe(
+     pool: &PgPool,
+-    seat: Permit<'_, Message>,
++    seat: Permit<'_, Job>,
+     request: SignupRequest,
+ ) -> Result<Email, Error> {
+     let email = Email::parse(&request.email)?;
+@@ -104,22 +117,28 @@ pub async fn subscribe(
+     match inserted {
+         // The row that came back is this call's own: the address is taken, and taken by this
+         // request. Where the subscriber starts (`pending`) is the column default of the migration.
+-        Some(_) => {
++        Some(id) => {
+             // The subscriber exists now, and the email is how they learn that they have to confirm.
+-            // The seat was reserved before the insert, so handing the message over cannot fail and
+-            // cannot wait: the worker behind the queue is what will try to send it, and a mail
+-            // server that is away is a retry (step `mailer/1.14-worker`) rather than a signup that
+-            // is lost — the row is written, the address is good, and what a failed send owes is a
+-            // line in the log.
+-            seat.send(confirmation_message(email.clone(), &token));
++            // The seat was reserved before the insert, so handing the job over cannot fail and
++            // cannot wait: the worker behind the queue is what will claim it and try to send it,
++            // and a mail server that is away is a retry (step `mailer/1.14-worker`) rather than a
++            // signup that is lost — the row is written, the address is good, and what a failed
++            // send owes is a line in the log — plus a claim that a later job can take over
++            // (step `mailer/1.15-idempotent-delivery`).
++            seat.send(Job { subscriber: id });
+             Ok(email)
+         }
+-        // Losing the race drops the seat instead of sending anything: its room goes back to the
+-        // queue, because a refused signup must not cost the service a slot for a message it will
+-        // never send.
+-        None => Err(Error::AlreadySubscribed {
+-            email: email.as_str().to_owned(),
+-        }),
++        // The address is taken. If the confirmation is still owed — the row is `pending` and no
++        // delivery was ever recorded — the seat asks the worker to try again, and the answer to
++        // the caller is unchanged: this address already has a subscriber.
++        None => {
++            if let Some(subscriber) = deliveries::outstanding(pool, &email).await? {
++                seat.send(Job { subscriber });
++            }
++            Err(Error::AlreadySubscribed {
++                email: email.as_str().to_owned(),
++            })
++        }
+     }
+ }
+ 
