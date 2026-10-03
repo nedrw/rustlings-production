@@ -677,6 +677,14 @@ fn apply_hunks(path: &str, content: &str, file: &FileDiff, mode: Mode) -> Result
         let old = hunk.old_side();
         let new = hunk.new_side();
         let expected = hunk.old_start.saturating_sub(1);
+        // A scaffold's lines stay where they were put while the file around them grows: later steps
+        // insert their own dependencies into the same marked block, and the lines this hunk was
+        // written against are no longer its neighbours. Idempotence has to be a property of the
+        // additions, not of their neighbourhood, so a scaffold whose added lines are all present
+        // (inside a marked block) has nothing left to do.
+        if mode == Mode::Scaffold && additions_are_present(&lines, hunk) {
+            continue;
+        }
         let found = match find(&lines, &old, cursor.max(expected)) {
             Some(position) => Some((position, false)),
             None => find(&lines, &new, cursor.min(expected)).map(|position| (position, true)),
@@ -760,6 +768,22 @@ fn check_marker_block(path: &str, lines: &[String], hunk: &Hunk, position: usize
         }
     }
     Ok(())
+}
+
+/// `true` when every line this hunk adds is already in the file, inside a marked block.
+///
+/// This is what makes a scaffold idempotent across steps: the same `[dependencies]` block collects
+/// insertions from several steps, so the context a hunk was written against can be gone while the
+/// lines it adds are still exactly where it put them.
+fn additions_are_present(lines: &[String], hunk: &Hunk) -> bool {
+    hunk.lines
+        .iter()
+        .filter(|line| line.kind == Kind::Add)
+        .all(|line| {
+            lines.iter().enumerate().any(|(index, existing)| {
+                existing == &line.text && inside_marker_block(lines, index)
+            })
+        })
 }
 
 /// `true` when `position` sits between a begin marker and its end marker.
@@ -901,6 +925,37 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("Cargo.toml")).unwrap(),
             after_first
+        );
+    }
+
+    #[test]
+    fn a_scaffold_stays_applied_when_a_later_step_grows_the_same_block() {
+        // The shape every `[dependencies]` block in a track has: step 4 inserts two lines, step 6
+        // inserts three more into the same block. Re-running step 4 has to be a no-op, not a second
+        // copy of its lines — the context it was written against is gone, the lines are not.
+        let temp = tree("patch-grown-block", &[("Cargo.toml", WITH_MARKERS)]);
+        let first = Patch::parse(SCAFFOLD).expect("patch should parse");
+        plan(temp.path(), &first, Mode::Scaffold)
+            .expect("first plan")
+            .apply(temp.path())
+            .expect("first apply");
+
+        let grown = std::fs::read_to_string(temp.path().join("Cargo.toml"))
+            .unwrap()
+            .replace(
+                "# kiln:scaffold:end",
+                "another = \"1\"\n# kiln:scaffold:end",
+            );
+        std::fs::write(temp.path().join("Cargo.toml"), grown).unwrap();
+
+        let again = plan(temp.path(), &first, Mode::Scaffold).expect("second plan");
+        assert!(again.is_empty(), "{again:?}");
+        again.apply(temp.path()).expect("second apply");
+        let after = std::fs::read_to_string(temp.path().join("Cargo.toml")).unwrap();
+        assert_eq!(
+            after.matches("todo = \"deny\"").count(),
+            1,
+            "the line must not be inserted twice: {after}"
         );
     }
 
