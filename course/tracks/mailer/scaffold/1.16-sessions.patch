@@ -1,0 +1,738 @@
+diff --git a/.sqlx/query-09983de76c83cf2dab446032c5aff203d0645a2020f78634c34932e1cae9c150.json b/.sqlx/query-09983de76c83cf2dab446032c5aff203d0645a2020f78634c34932e1cae9c150.json
+new file mode 100644
+index 0000000..253c335
+--- /dev/null
++++ b/.sqlx/query-09983de76c83cf2dab446032c5aff203d0645a2020f78634c34932e1cae9c150.json
+@@ -0,0 +1,40 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT sessions.subscriber_id, subscribers.email FROM sessions JOIN subscribers ON subscribers.id = sessions.subscriber_id WHERE sessions.token_hash = $1 AND sessions.revoked_at IS NULL AND sessions.expires_at > now() AND subscribers.status = 'active'",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "subscriber_id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "sessions",
++            "name": "subscriber_id"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "email",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "email"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": [
++      false,
++      false
++    ]
++  },
++  "hash": "09983de76c83cf2dab446032c5aff203d0645a2020f78634c34932e1cae9c150"
++}
+diff --git a/.sqlx/query-84757142fe7e433123b7fc1823ecd0b830addec26e0cda268418c629af27d351.json b/.sqlx/query-84757142fe7e433123b7fc1823ecd0b830addec26e0cda268418c629af27d351.json
+new file mode 100644
+index 0000000..bce0205
+--- /dev/null
++++ b/.sqlx/query-84757142fe7e433123b7fc1823ecd0b830addec26e0cda268418c629af27d351.json
+@@ -0,0 +1,52 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "SELECT id, password_hash, status FROM subscribers WHERE email = $1",
++  "describe": {
++    "columns": [
++      {
++        "ordinal": 0,
++        "name": "id",
++        "type_info": "Int8",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "id"
++          }
++        }
++      },
++      {
++        "ordinal": 1,
++        "name": "password_hash",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "password_hash"
++          }
++        }
++      },
++      {
++        "ordinal": 2,
++        "name": "status",
++        "type_info": "Text",
++        "origin": {
++          "Table": {
++            "table": "subscribers",
++            "name": "status"
++          }
++        }
++      }
++    ],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": [
++      false,
++      false,
++      false
++    ]
++  },
++  "hash": "84757142fe7e433123b7fc1823ecd0b830addec26e0cda268418c629af27d351"
++}
+diff --git a/.sqlx/query-a25d903aab5877fb6d7cd2cc7abb716f3480f28dc0dfece66152cabb65d9e86a.json b/.sqlx/query-a25d903aab5877fb6d7cd2cc7abb716f3480f28dc0dfece66152cabb65d9e86a.json
+new file mode 100644
+index 0000000..0393212
+--- /dev/null
++++ b/.sqlx/query-a25d903aab5877fb6d7cd2cc7abb716f3480f28dc0dfece66152cabb65d9e86a.json
+@@ -0,0 +1,16 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "INSERT INTO sessions (subscriber_id, token_hash, expires_at) VALUES ($1, $2, now() + make_interval(secs => $3))",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Int8",
++        "Text",
++        "Float8"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "a25d903aab5877fb6d7cd2cc7abb716f3480f28dc0dfece66152cabb65d9e86a"
++}
+diff --git a/.sqlx/query-bd7734ce47a17f177f9dde9c52cf8bb691d11356dfde263c1a2b3cfdabd89745.json b/.sqlx/query-bd7734ce47a17f177f9dde9c52cf8bb691d11356dfde263c1a2b3cfdabd89745.json
+new file mode 100644
+index 0000000..0f4603f
+--- /dev/null
++++ b/.sqlx/query-bd7734ce47a17f177f9dde9c52cf8bb691d11356dfde263c1a2b3cfdabd89745.json
+@@ -0,0 +1,14 @@
++{
++  "db_name": "PostgreSQL",
++  "query": "UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
++  "describe": {
++    "columns": [],
++    "parameters": {
++      "Left": [
++        "Text"
++      ]
++    },
++    "nullable": []
++  },
++  "hash": "bd7734ce47a17f177f9dde9c52cf8bb691d11356dfde263c1a2b3cfdabd89745"
++}
+diff --git a/Cargo.toml b/Cargo.toml
+index 89b60a6..a0960d0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,9 @@ axum = "0.8.9"
+ # The randomness of step 1.12: a confirmation token is 32 bytes from the system, not a value
+ # this service can make up by itself.
+ getrandom = "0.4"
++# The session digest of step 1.16: a fast hash for a value nobody can guess, where step 1.11
++# uses a slow one for a value everybody can.
++sha2 = "0.10"
+ serde = { version = "1.0.229", features = ["derive"] }
+ # The spec of `mailer/1.6-logging` reads the service's own JSON lines; this service will
+ # serialise structures of its own from 1.7 on.
+diff --git a/migrations/0003_sessions.sql b/migrations/0003_sessions.sql
+new file mode 100644
+index 0000000..4e1dbc1
+--- /dev/null
++++ b/migrations/0003_sessions.sql
+@@ -0,0 +1,33 @@
++-- 0003 — sessions: how a caller proves who they are (step `mailer/1.16-sessions`).
++--
++-- A session is a bearer credential: whoever holds the token *is* the subscriber it was issued to.
++-- Three consequences are designed into this table rather than left to the routes:
++--
++-- * `token_hash` holds the SHA-256 of the token, never the token. A session token is a random value
++--   with 256 bits of entropy, so it does not need a slow hash (step `mailer/1.11-signup` hashes
++--   passwords with Argon2 for exactly the opposite reason: a password is guessable and a token is
++--   not). What both cases share is that the *stored* value must not be the value that opens the
++--   door — a database dump is not a set of live sessions;
++-- * `token_hash` is `UNIQUE`, which is what makes the lookup of a token a lookup and not a search,
++--   and what makes the database the thing that decides when two sessions collide (they do not);
++-- * `expires_at` and `revoked_at` are the two ways a session ends. Their absence is the default —
++--   `revoked_at IS NULL AND expires_at > now()` is what every authenticated query carries, and it is
++--   the same shape as the confirmation window of step `mailer/1.12-token`: the database's clock
++--   decides, one statement decides, and a token that was revoked is gone without anything having to
++--   be deleted.
++--
++-- `ON DELETE CASCADE` says what a session is worth without its subscriber: nothing. Removing a
++-- subscriber removes their sessions rather than leaving credentials that authenticate nobody.
++
++CREATE TABLE sessions (
++    id            BIGSERIAL   PRIMARY KEY,
++    subscriber_id BIGINT      NOT NULL REFERENCES subscribers(id) ON DELETE CASCADE,
++    token_hash    TEXT        NOT NULL UNIQUE,
++    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
++    expires_at    TIMESTAMPTZ NOT NULL,
++    revoked_at    TIMESTAMPTZ
++);
++
++-- Finding a subscriber's sessions (and revoking all of them at once) is a question about the
++-- subscriber, not about the token.
++CREATE INDEX sessions_subscriber_id_idx ON sessions (subscriber_id);
+diff --git a/src/session.rs b/src/session.rs
+new file mode 100644
+index 0000000..43a912f
+--- /dev/null
++++ b/src/session.rs
+@@ -0,0 +1,250 @@
++//! Sessions: a bearer credential with a life cycle in the database (step `mailer/1.16-sessions`).
++//!
++//! Signing up proved an address was reachable. Logging in answers a different question — *who is
++//! this?* — and it has to be answered on every request that is about somebody's own data. The
++//! answer this step builds is a session: a random value the service hands out once, remembers the
++//! hash of, and can end.
++//!
++//! Four decisions, and each of them is a way to get it wrong:
++//!
++//! * **the token is random and unambiguous** ([`SESSION_BYTES`] bytes from the system, spelled in
++//!   hex). Not a counter, not a signed blob of the subscriber's address: the token is an opaque
++//!   name for one row, and anything a client can *derive* or *guess* is a client that can be
++//!   somebody else;
++//! * **what is stored is the hash** ([`Token::digest`]) — SHA-256 here, Argon2 for passwords, and
++//!   the difference is entropy: a token nobody can guess does not need a slow hash, a password
++//!   everybody can guess does. Storing the token itself would make a database dump a set of live
++//!   sessions;
++//! * **a session expires and can be revoked**, and both are checked by the statement that reads it
++//!   (`expires_at > now() AND revoked_at IS NULL`), for the reason step `mailer/1.12-token` puts the
++//!   confirmation window in the query: one clock, one decision, no window between reading and
++//!   acting;
++//! * **a login always opens a *new* session.** Nothing a caller sends is ever adopted as a session
++//!   — that is session fixation, and the cheap version of it is a service that takes the cookie it
++//!   was given and blesses it on login. The token is issued here and nowhere else.
++//!
++//! # What this scaffold proves
++//!
++//! The table, the digest and the life cycle are here; the token is not. [`Token::issue`] below
++//! answers the *same* value every time, which is session fixation in its purest form: whoever saw
++//! one token holds every session this service will ever open, including the next login. The step's
++//! spec (`tests/spec_sessions.rs`) fails on `assert_ne!(first, second)` until the value becomes
++//! [`SESSION_BYTES`] bytes from the system — and it cannot be caught by reading the routes, which is
++//! why the spec logs in twice.
++
++use sqlx::PgPool;
++
++use crate::domain::Email;
++use crate::error::Error;
++
++/// How many bytes of randomness a session token is made of.
++///
++/// The same 256 bits as a confirmation token (step `mailer/1.12-token`) and for the same reason: an
++/// attacker who tries a million tokens a second for the age of the universe gets nowhere near it.
++pub const SESSION_BYTES: usize = 32;
++
++/// How long a session is good for, in seconds.
++///
++/// Thirty days, because a session is a convenience: long enough that a person is not asked for a
++/// password every morning, short enough that an abandoned browser is not a standing offer. A
++/// deployment that cares more can shorten it without anything else changing — the window is read
++/// from the row, not from this constant.
++pub const SESSION_LIFETIME_SECS: f64 = 30.0 * 24.0 * 60.0 * 60.0;
++
++/// A session token, as it travels: the value in a cookie, or after `Bearer `.
++///
++/// The field is private and there is no constructor that takes text: a token is either *issued*
++/// (random bytes) or *parsed* from what arrived in a header, and nothing else can make one. There is
++/// no `Display` either, so the value cannot be interpolated into a log line or an error message
++/// without somebody saying so out loud (step `mailer/1.10-domain-types` made the same call for a
++/// password, and step `mailer/1.12-token` for a confirmation token).
++#[derive(Clone, PartialEq, Eq)]
++pub struct Token(String);
++
++impl Token {
++    /// Issue a token nobody can guess: [`SESSION_BYTES`] bytes from the system, as lower-case hex.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::TokenGeneration`] when the system's random number generator fails. There is
++    /// no fallback on purpose: a token this service invented would be a token an attacker can
++    /// invent too.
++    ///
++    /// The scaffold does not ask the system for anything: it answers zero bytes every time, which is
++    /// the one value in this file that is not a secret. Fixing this is the step — and the `# Errors`
++    /// above is part of the fix, because asking the system for randomness is the thing that can
++    /// fail.
++    pub fn issue() -> Result<Self, Error> {
++        Ok(Self(hex(&[0_u8; SESSION_BYTES])))
++    }
++
++    /// Read a token out of what a caller sent.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `session` when the text is not what this
++    /// service issues: lower-case hex, [`SESSION_BYTES`] bytes of it. It is a 400 rather than a 401
++    /// because the difference matters: "that is not a token" is a client bug, and "that token is not
++    /// good any more" is a session that ended.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        if value.len() != SESSION_BYTES * 2 {
++            return Err(invalid_session());
++        }
++        if !value
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            return Err(invalid_session());
++        }
++        Ok(Self(value.to_owned()))
++    }
++
++    /// The token as it travels: lower-case hex.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++
++    /// What the database stores for this token: the hex of its SHA-256.
++    ///
++    /// The hash is what makes a leaked table harmless: the value in the row cannot be presented as a
++    /// credential, and the token itself exists only in the client's hands and in this process's
++    /// memory for the length of one request.
++    #[must_use]
++    pub fn digest(&self) -> String {
++        use sha2::{Digest, Sha256};
++        hex(&Sha256::digest(self.0.as_bytes()))
++    }
++}
++
++/// A session is a secret: anybody holding one is the subscriber it was issued to, so `{:?}` says
++/// that there is one and nothing else.
++impl std::fmt::Debug for Token {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("Token(<redacted>)")
++    }
++}
++
++/// Who a session belongs to: what an authenticated request is allowed to know.
++///
++/// It is deliberately small. A handler that needs more looks it up by [`Identity::subscriber`], and
++/// what it looks up is scoped by that id — which is the rule step `mailer/1.18-authz-boundary`
++/// depends on.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Identity {
++    /// The subscriber this session was issued to.
++    pub subscriber: i64,
++    /// The address in the row, parsed.
++    pub email: Email,
++}
++
++/// Open a session for one subscriber and hand back the token that names it.
++///
++/// The token is returned, its hash is stored, and nothing else about it is kept: the same call for
++/// the same subscriber produces a different token every time, which is what a login is supposed to
++/// do.
++///
++/// # Errors
++///
++/// Reports [`Error::TokenGeneration`] when a token cannot be issued, and [`Error::Database`] when
++/// the session cannot be written.
++pub async fn open(pool: &PgPool, subscriber: i64) -> Result<Token, Error> {
++    let token = Token::issue()?;
++    sqlx::query!(
++        "INSERT INTO sessions (subscriber_id, token_hash, expires_at) \
++         VALUES ($1, $2, now() + make_interval(secs => $3))",
++        subscriber,
++        token.digest(),
++        SESSION_LIFETIME_SECS
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "open a session",
++        source: Box::new(source),
++    })?;
++    Ok(token)
++}
++
++/// Who a token belongs to, if it is still good.
++///
++/// One statement, and the conditions are in it: not revoked, not expired, and belonging to a
++/// subscriber who confirmed their address. `None` is the answer to every way a session can fail —
++/// unknown, revoked, expired, unconfirmed — because telling a caller *which* of them it was is
++/// telling an attacker which of them to work on next.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the session cannot be read, and [`Error::InvalidInput`] when the
++/// address in the row is not one this service would have stored.
++pub async fn authenticate(pool: &PgPool, token: &Token) -> Result<Option<Identity>, Error> {
++    let row = sqlx::query!(
++        "SELECT sessions.subscriber_id, subscribers.email \
++           FROM sessions \
++           JOIN subscribers ON subscribers.id = sessions.subscriber_id \
++          WHERE sessions.token_hash = $1 \
++            AND sessions.revoked_at IS NULL \
++            AND sessions.expires_at > now() \
++            AND subscribers.status = 'active'",
++        token.digest()
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "read a session",
++        source: Box::new(source),
++    })?;
++    row.map(|row| {
++        Ok(Identity {
++            subscriber: row.subscriber_id,
++            email: Email::parse(&row.email)?,
++        })
++    })
++    .transpose()
++}
++
++/// End a session. Answers whether there was one to end.
++///
++/// The row stays: a revoked session is a fact worth keeping (it is how "this device was signed out"
++/// can be explained later), and `revoked_at IS NULL` in every authenticated query is what makes it
++/// stop working.
++///
++/// # Errors
++///
++/// Reports [`Error::Database`] when the revocation cannot be written.
++pub async fn revoke(pool: &PgPool, token: &Token) -> Result<bool, Error> {
++    let outcome = sqlx::query!(
++        "UPDATE sessions SET revoked_at = now() \
++          WHERE token_hash = $1 AND revoked_at IS NULL",
++        token.digest()
++    )
++    .execute(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "revoke a session",
++        source: Box::new(source),
++    })?;
++    Ok(outcome.rows_affected() > 0)
++}
++
++/// The failure a value that is not a session token becomes.
++fn invalid_session() -> Error {
++    Error::InvalidInput {
++        field: "session",
++        expected: "a session token: 64 characters of lower-case hex",
++    }
++}
++
++/// The lower-case hex spelling of some bytes.
++///
++/// The same spelling a confirmation token uses, and for the same reason: an opaque value a person
++/// may have to copy by hand survives a URL, a shell and a cookie header as long as it is hex.
++fn hex(bytes: &[u8]) -> String {
++    const DIGITS: &[u8; 16] = b"0123456789abcdef";
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        out.push(DIGITS[usize::from(byte >> 4)] as char);
++        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
++    }
++    out
++}
+diff --git a/tests/support/service.rs b/tests/support/service.rs
+new file mode 100644
+index 0000000..98a483e
+--- /dev/null
++++ b/tests/support/service.rs
+@@ -0,0 +1,277 @@
++//! A service under test: a process, its log, and a client that can speak to it (step
++//! `mailer/1.16-sessions`).
++//!
++//! The fixtures before this one drive the service *in process* (`tests/support/app.rs` builds a
++//! state and a router and runs them in a thread). That is the right shape for a route whose only
++//! input is a body. It is the wrong shape for authentication, where the input is a *cookie* or an
++//! `Authorization` header and the output is a `Set-Cookie` — a client that cannot send or read
++//! headers cannot test any of it, and a process that speaks HTTP is what a browser and a program
++//! both talk to.
++//!
++//! So this file is the other fixture: [`Service`] starts the real binary on a port of the
++//! operating system's choosing, keeps its stdout for the test to read, and hands out a [`Response`]
++//! with the status line, the headers and the body of whatever was sent. Nothing here sleeps to
++//! synchronise: the service is *waited for*, and every wait has a deadline.
++//!
++//! What it deliberately does not do is know anything about the course: no route names, no cookie
++//! parsing, no JSON helpers. A test that wants one of those writes it, so that what a test asserts
++//! stays visible in the test.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::io::{BufRead, BufReader, Read, Write};
++use std::net::{SocketAddr, TcpListener, TcpStream};
++use std::process::{Child, Command, Stdio};
++use std::sync::mpsc::{self, Receiver};
++use std::thread;
++use std::time::{Duration, Instant};
++
++/// How long the service is given to accept connections, and any one request to answer.
++const DEADLINE: Duration = Duration::from_secs(20);
++/// How long a process is given to exit after it was asked to stop.
++const EXIT_DEADLINE: Duration = Duration::from_secs(15);
++/// How often a waiting test looks again.
++const RETRY: Duration = Duration::from_millis(20);
++
++/// The service under test: a process, the lines it prints, and where it listens.
++pub struct Service {
++    child: Child,
++    lines: Receiver<String>,
++    address: SocketAddr,
++}
++
++impl Service {
++    /// Start the service with `env` as its whole environment, on a port this process picks.
++    ///
++    /// `env_clear` is deliberate: a test that depends on a setting the machine happens to have set
++    /// is a test that passes here and fails there. What the service needs, the test spells out.
++    pub fn start(env: &[(&str, &str)]) -> Self {
++        let port = free_port();
++        let mut command = Command::new(env!("CARGO_BIN_EXE_mailer"));
++        command
++            .args(["--listen-port", &port.to_string()])
++            .env_clear()
++            .stdout(Stdio::piped());
++        for (name, value) in env {
++            command.env(name, value);
++        }
++        let mut child = command
++            .spawn()
++            .unwrap_or_else(|error| panic!("the mailer binary could not be started: {error}"));
++
++        let stdout = child
++            .stdout
++            .take()
++            .expect("the service was started with a pipe");
++        let (sender, lines) = mpsc::channel();
++        thread::spawn(move || {
++            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
++                if sender.send(line).is_err() {
++                    break;
++                }
++            }
++        });
++
++        let service = Self {
++            child,
++            lines,
++            address: SocketAddr::from(([127, 0, 0, 1], port)),
++        };
++        service.wait_until_ready();
++        service
++    }
++
++    /// Where the service listens.
++    #[must_use]
++    pub fn address(&self) -> SocketAddr {
++        self.address
++    }
++
++    /// Wait until the service accepts connections, so no test has to sleep and hope.
++    fn wait_until_ready(&self) {
++        let deadline = Instant::now() + DEADLINE;
++        while Instant::now() < deadline {
++            if TcpStream::connect(self.address).is_ok() {
++                return;
++            }
++            thread::sleep(RETRY);
++        }
++        panic!(
++            "the service at {} never started accepting connections: {:?}",
++            self.address,
++            self.log_lines()
++        );
++    }
++
++    /// One request, as a client sends it: a method, a path, headers, and an optional body.
++    ///
++    /// `connection: close` means one request per connection, which is all this harness needs and
++    /// makes the end of the body the end of the read.
++    pub fn call(
++        &self,
++        method: &str,
++        path: &str,
++        headers: &[(&str, &str)],
++        body: Option<&str>,
++    ) -> Response {
++        let mut stream = TcpStream::connect(self.address).unwrap_or_else(|error| {
++            panic!(
++                "the service at {} is not accepting connections: {error}",
++                self.address
++            )
++        });
++        stream
++            .set_read_timeout(Some(DEADLINE))
++            .expect("a read deadline can be set");
++
++        let body = body.unwrap_or("");
++        let mut request = format!(
++            "{method} {path} HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
++            self.address,
++            body.len()
++        );
++        for (name, value) in headers {
++            request.push_str(&format!("{name}: {value}\r\n"));
++        }
++        request.push_str("\r\n");
++        request.push_str(body);
++
++        stream
++            .write_all(request.as_bytes())
++            .unwrap_or_else(|error| panic!("the request could not be sent: {error}"));
++        let mut raw = String::new();
++        stream
++            .read_to_string(&mut raw)
++            .unwrap_or_else(|error| panic!("the answer could not be read: {error}"));
++        Response::parse(&raw)
++    }
++
++    /// One `GET`, with no headers.
++    pub fn get(&self, path: &str) -> Response {
++        self.call("GET", path, &[], None)
++    }
++
++    /// One `GET` with headers: a session is carried in a header, not in a path.
++    pub fn get_with(&self, path: &str, headers: &[(&str, &str)]) -> Response {
++        self.call("GET", path, headers, None)
++    }
++
++    /// One `POST` with a JSON body, and whatever headers the test needs with it.
++    pub fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
++        let mut all = vec![("content-type", "application/json")];
++        all.extend_from_slice(headers);
++        self.call("POST", path, &all, Some(body))
++    }
++
++    /// The lines the service has printed so far.
++    pub fn log_lines(&self) -> Vec<String> {
++        let mut lines = Vec::new();
++        while let Ok(line) = self.lines.recv_timeout(RETRY) {
++            lines.push(line);
++        }
++        lines
++    }
++
++    /// Ask the process to stop the way an orchestrator does: `SIGTERM`.
++    ///
++    /// `std::process::Child` can only send `SIGKILL`, which is the one signal that makes a graceful
++    /// shutdown unobservable, so this harness starts a named tool: `kill` is in every POSIX
++    /// environment and `-TERM` is the signal a deployment sends. A Windows process has no `SIGTERM`
++    /// to answer, which is why this half of the harness is `#[cfg(unix)]`.
++    #[cfg(unix)]
++    pub fn stop(&self) {
++        let pid = self.child.id().to_string();
++        let status = Command::new("kill")
++            .args(["-TERM", &pid])
++            .status()
++            .unwrap_or_else(|error| panic!("`kill -TERM {pid}` could not be run: {error}"));
++        assert!(status.success(), "`kill -TERM {pid}` answered {status}");
++    }
++
++    /// Wait for the process to exit and answer the code a shell would see (`-1`: killed by a signal).
++    pub fn wait_for_exit(&mut self) -> i32 {
++        let deadline = Instant::now() + EXIT_DEADLINE;
++        loop {
++            match self.child.try_wait() {
++                Ok(Some(status)) => return status.code().unwrap_or(-1),
++                Ok(None) => {}
++                Err(error) => panic!("the service could not be waited for: {error}"),
++            }
++            assert!(
++                Instant::now() < deadline,
++                "the service did not exit within {EXIT_DEADLINE:?} of `SIGTERM`: {:?}",
++                self.log_lines()
++            );
++            thread::sleep(RETRY);
++        }
++    }
++}
++
++impl Drop for Service {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++/// What a client gets back: the status, the headers, and the body.
++pub struct Response {
++    /// The status code of the answer.
++    pub status: u16,
++    /// Every header, in the order it arrived, lower-cased names.
++    pub headers: Vec<(String, String)>,
++    /// The body, as text.
++    pub body: String,
++}
++
++impl Response {
++    /// Split an HTTP answer into its three parts.
++    fn parse(raw: &str) -> Self {
++        let (head, body) = raw
++            .split_once("\r\n\r\n")
++            .unwrap_or_else(|| panic!("an HTTP answer has a head and a body: `{raw}`"));
++        let mut lines = head.lines();
++        let status = lines
++            .next()
++            .and_then(|line| line.split_whitespace().nth(1))
++            .and_then(|code| code.parse().ok())
++            .unwrap_or_else(|| panic!("the status line has a code: `{head}`"));
++        let headers = lines
++            .filter_map(|line| line.split_once(':'))
++            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
++            .collect();
++        Self {
++            status,
++            headers,
++            body: body.to_owned(),
++        }
++    }
++
++    /// The first value of a header, case-insensitively (the protocol is).
++    #[must_use]
++    pub fn header(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(key, _)| key.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++
++    /// Every value of a header, in order: `Set-Cookie` is allowed to appear more than once.
++    #[must_use]
++    pub fn headers(&self, name: &str) -> Vec<&str> {
++        self.headers
++            .iter()
++            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++            .collect()
++    }
++}
++
++/// A port nothing is listening on right now, asked of the operating system.
++fn free_port() -> u16 {
++    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port can be found");
++    listener
++        .local_addr()
++        .expect("a bound listener has an address")
++        .port()
++}

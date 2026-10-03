@@ -1,0 +1,427 @@
+diff --git a/src/error.rs b/src/error.rs
+index e113e7a..a4d4d32 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -166,6 +166,28 @@ pub enum Error {
+         #[source]
+         source: getrandom::Error,
+     },
++    /// A caller tried to log in and is not who they said they were (step `mailer/1.16-sessions`).
++    ///
++    /// One variant for both halves of that answer — no such address, and a password that does not
++    /// match — because which of the two it was is a fact about this service's subscribers. It is the
++    /// caller's to fix (the exit code is `2`, the status a `401`).
++    #[error("the email and password do not match a subscriber")]
++    InvalidCredentials,
++    /// A request that needs a session brought none, or brought one that is not good any more
++    /// (step `mailer/1.16-sessions`).
++    ///
++    /// Unknown, revoked, expired, and belonging to an unconfirmed subscriber all end here, and all
++    /// of them end the same way on purpose: telling a caller *which* of them it was tells an
++    /// attacker which one to work on next.
++    #[error("this request needs a session, and the one it carried is not usable")]
++    NotAuthenticated,
++    /// The subscriber exists, the password was right, and the address was never confirmed
++    /// (step `mailer/1.16-sessions`).
++    ///
++    /// A `403` rather than a `401`: the credentials were not wrong, this account cannot be used
++    /// until somebody proves they can read that address.
++    #[error("this subscriber has not confirmed their address yet")]
++    NotConfirmed,
+     /// The delivery queue is full (step `mailer/1.14-worker`).
+     ///
+     /// The caller's request was refused *before* it wrote anything: a full queue means this service
+@@ -213,6 +235,7 @@ impl Error {
+     /// | failure | code | who has to act |
+     /// | --- | --- | --- |
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
++    /// | the caller sent no usable session, or credentials that do not match the identity they claim, or a password that belongs to an address nobody confirmed | `2` | the caller |
+     /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, the password could not be hashed, a token could not be issued, the delivery queue is full or did not drain, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
+     /// A value a caller sent that the domain refuses is the caller's problem too — the same code as
+@@ -234,7 +257,10 @@ impl Error {
+             | Error::AlreadySubscribed { .. }
+             | Error::TokenUnknown
+             | Error::TokenExpired
+-            | Error::AlreadyConfirmed { .. } => ExitCode::from(2),
++            | Error::AlreadyConfirmed { .. }
++            | Error::InvalidCredentials
++            | Error::NotAuthenticated
++            | Error::NotConfirmed => ExitCode::from(2),
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+             | Error::Logging { .. }
+diff --git a/src/http.rs b/src/http.rs
+index ef7fa20..1abdeab 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -21,6 +21,11 @@
+ //! * **the state carries a port, not an adapter** (step `mailer/1.13-email-port`): what a handler can
+ //!   reach is `Arc<dyn EmailSender>`, and building the state with a fake in it is a constructor
+ //!   argument — the seam a test needs is one the deployment does not have to know about;
++//! * **a session is a bearer credential, and this file is where it is carried** (step
++//!   `mailer/1.16-sessions`): `POST /login` hands one out as a cookie, `POST /logout` ends it, and
++//!   everything that is about somebody's own data reads it from either the `session` cookie or an
++//!   `Authorization: Bearer …` header. The token itself is never invented here, and a token that
++//!   arrived is never adopted as an identity — it is looked up, and the row decides;
+ //! * **the answer does not wait for the mail server** (step `mailer/1.14-worker`): a handler
+ //!   reserves a seat in the delivery queue *before* it writes anything and hands the message
+ //!   over afterwards, so a queue that is full is a `503` for a signup that wrote no row, and a
+@@ -35,7 +40,8 @@
+ use axum::Router;
+ use axum::extract::rejection::{JsonRejection, QueryRejection};
+ use axum::extract::{Json, Query, State};
+-use axum::http::StatusCode;
++use axum::http::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
++use axum::http::{HeaderMap, StatusCode};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use serde::{Deserialize, Serialize};
+@@ -52,6 +58,8 @@ use crate::delivery::Queue;
+ use crate::email::{EmailSender, Logging};
+ use crate::error::Error;
+ use crate::logging::RunId;
++use crate::login::{Credentials, log_in};
++use crate::session::{self, Token as SessionToken};
+ use crate::signup::{SignupRequest, subscribe};
+ 
+ /// Everything a handler may reach: the configuration this process started with, the database when
+@@ -170,6 +178,9 @@ pub fn router(state: AppState) -> Router {
+         .route("/healthz", get(healthz))
+         .route("/readyz", get(readyz))
+         .route("/signup", post(signup))
++        .route("/login", post(login))
++        .route("/logout", post(logout))
++        .route("/me", get(me))
+         .route("/confirm", get(confirm))
+         .fallback(not_found)
+         .method_not_allowed_fallback(method_not_allowed)
+@@ -276,6 +287,169 @@ async fn signup(
+     }
+ }
+ 
++/// The name of the cookie a session travels in.
++///
++/// One name, in one place: the login that sets it, the logout that clears it, and the lookup that
++/// reads it all have to agree, and a constant is how they do.
++const SESSION_COOKIE: &str = "session";
++
++/// `POST /login`: credentials in, a session out (step `mailer/1.16-sessions`).
++///
++/// The answer carries the token twice — in the body it is not, and in a `Set-Cookie` header it is —
++/// and the attributes of that cookie are decisions rather than decorations:
++///
++/// * `HttpOnly` keeps it away from scripts, so a cross-site scripting bug cannot read it;
++/// * `SameSite=Lax` keeps it away from cross-site requests, so another site cannot make a browser
++///   carry it (a form POST is exactly what the confirmation link is not: a GET);
++/// * `Path=/` and `Max-Age` are the scope and the lifetime. The lifetime is *stated* even though the
++///   row has one too, because the two ends should agree about when the session ends.
++///
++/// `Secure` is deliberately absent: this build has no TLS (step `mailer/1.21-container` puts it
++/// behind something that does), and a `Secure` cookie that never arrives is a login that does not
++/// work. The TRAP of this step says what has to change before that is true.
++async fn login(
++    State(state): State<AppState>,
++    body: Result<Json<Credentials>, JsonRejection>,
++) -> Response {
++    let Ok(Json(credentials)) = body else {
++        return (
++            StatusCode::BAD_REQUEST,
++            Json(Body::new(
++                "the body is not a login: it has to be a JSON object with `email` and `password`",
++            )),
++        )
++            .into_response();
++    };
++
++    let Some(database) = state.database() else {
++        warn!("a login arrived with no database configured");
++        return not_ready("no database is configured");
++    };
++
++    match log_in(database.pool(), credentials).await {
++        Ok((token, email)) => {
++            let cookie = format!(
++                "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
++                token.as_str(),
++                session::SESSION_LIFETIME_SECS as u64
++            );
++            (
++                StatusCode::OK,
++                [(SET_COOKIE, cookie)],
++                Json(SubscriberState {
++                    status: "active",
++                    email: email.to_string(),
++                }),
++            )
++                .into_response()
++        }
++        Err(error) => answer(error),
++    }
++}
++
++/// `POST /logout`: end the session the request carried (step `mailer/1.16-sessions`).
++///
++/// The answer is a `204` with a cookie that has already expired, so a browser that is signed out
++/// also stops *sending* the token — a logout that only revokes the row leaves the value in the
++/// client's hands, which is a session that is one bug away from working again.
++async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
++    let token = match credential(&headers) {
++        Ok(Some(token)) => token,
++        Ok(None) => return answer(Error::NotAuthenticated),
++        Err(error) => return answer(error),
++    };
++
++    let Some(database) = state.database() else {
++        warn!("a logout arrived with no database configured");
++        return not_ready("no database is configured");
++    };
++
++    match session::revoke(database.pool(), &token).await {
++        // A token that named nothing is a `401` rather than a `204`: the caller asked to end a
++        // session this service does not have, and saying so is more useful than pretending.
++        Ok(false) => answer(Error::NotAuthenticated),
++        Ok(true) => (
++            StatusCode::NO_CONTENT,
++            [(
++                SET_COOKIE,
++                format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
++            )],
++        )
++            .into_response(),
++        Err(error) => answer(error),
++    }
++}
++
++/// `GET /me`: who this session belongs to (step `mailer/1.16-sessions`).
++///
++/// The first route in the course that is *about somebody*, and it is where the whole idea of a
++/// session is observable from outside: with a token, an address; without one, a `401`. What it
++/// returns is deliberately small — whoever needs more asks the database by id, which is the rule
++/// step `mailer/1.18-authz-boundary` turns into a habit.
++async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
++    let Some(database) = state.database() else {
++        warn!("an authenticated request arrived with no database configured");
++        return not_ready("no database is configured");
++    };
++    let identity = match identity(database.pool(), &headers).await {
++        Ok(identity) => identity,
++        Err(error) => return answer(error),
++    };
++    (
++        StatusCode::OK,
++        Json(SubscriberState {
++            status: "active",
++            email: identity.email.to_string(),
++        }),
++    )
++        .into_response()
++}
++
++/// The identity a request carries, or [`Error::NotAuthenticated`] (step `mailer/1.16-sessions`).
++///
++/// Both transports end in the same lookup: the token is parsed out of wherever it arrived, and the
++/// database decides whether it is still good. Nothing about the *request* says who the caller is —
++/// which is the difference between a session and a header a client made up.
++async fn identity(pool: &sqlx::PgPool, headers: &HeaderMap) -> Result<session::Identity, Error> {
++    let token = credential(headers)?.ok_or(Error::NotAuthenticated)?;
++    session::authenticate(pool, &token)
++        .await?
++        .ok_or(Error::NotAuthenticated)
++}
++
++/// The session token a request carries, from either of the two places one may arrive.
++///
++/// * `Authorization: Bearer <token>` is what a program sends: one header, no browser semantics, and
++///   the same token a browser would have had in a cookie;
++/// * `Cookie: session=<token>` is what a browser sends, and it is a *header with a grammar* — read
++///   as a list of `name=value` pairs, not as a string that happens to contain the token.
++///
++/// # Errors
++///
++/// Reports [`Error::InvalidInput`] when a credential is there but is not a session token: a 400, not
++/// a 401, because the caller has a bug rather than a session that ended.
++fn credential(headers: &HeaderMap) -> Result<Option<SessionToken>, Error> {
++    if let Some(value) = headers.get(AUTHORIZATION) {
++        let value = value.to_str().map_err(|_| Error::NotAuthenticated)?;
++        let token = value
++            .strip_prefix("Bearer ")
++            .ok_or(Error::NotAuthenticated)?;
++        return SessionToken::parse(token.trim()).map(Some);
++    }
++    let Some(value) = headers.get(COOKIE) else {
++        return Ok(None);
++    };
++    let cookies = value.to_str().map_err(|_| Error::NotAuthenticated)?;
++    let token = cookies.split(';').find_map(|pair| {
++        let (name, value) = pair.split_once('=')?;
++        (name.trim() == SESSION_COOKIE).then_some(value.trim())
++    });
++    let Some(token) = token else {
++        return Ok(None);
++    };
++    SessionToken::parse(token).map(Some)
++}
++
+ /// `GET /confirm?token=…`: confirm the subscriber a token was issued for
+ /// (step `mailer/1.12-token`).
+ ///
+@@ -338,6 +512,13 @@ fn status_of(error: &Error) -> StatusCode {
+         Error::TokenUnknown => StatusCode::NOT_FOUND,
+         Error::AlreadySubscribed { .. } | Error::AlreadyConfirmed { .. } => StatusCode::CONFLICT,
+         Error::TokenExpired => StatusCode::GONE,
++        // A session that is missing, revoked or expired is one answer: the caller is not
++        // authenticated, and which of the three it was is not theirs to learn (step
++        // `mailer/1.16-sessions`). Credentials that do not match are the same `401` for the same
++        // reason, and an unconfirmed subscriber is a `403`: the password was right, the account is
++        // not usable yet.
++        Error::NotAuthenticated | Error::InvalidCredentials => StatusCode::UNAUTHORIZED,
++        Error::NotConfirmed => StatusCode::FORBIDDEN,
+         // Capacity is not a fault of the request (step `mailer/1.14-worker`): `503` says
+         // "this service is up and cannot take that work right now", which is what a client
+         // that retries can act on, where a `500` says "something here is broken".
+diff --git a/src/lib.rs b/src/lib.rs
+index 77ed04f..a068a70 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,6 +23,8 @@ pub mod email;
+ pub mod error;
+ pub mod http;
+ pub mod logging;
++pub mod login;
++pub mod session;
+ pub mod signup;
+ 
+ pub use config::{Config, Flags};
+diff --git a/src/login.rs b/src/login.rs
+new file mode 100644
+index 0000000..12aabea
+--- /dev/null
++++ b/src/login.rs
+@@ -0,0 +1,89 @@
++//! Logging in: credentials in, a session out (step `mailer/1.16-sessions`).
++//!
++//! Signing up and logging in are two different questions, and this file exists so that they do not
++//! get mixed up. `POST /signup` asks "is this address free, and can the person at it be reached?";
++//! `POST /login` asks "is this the person who subscribed?" and the answer is a session — a value the
++//! service issues, remembers the hash of, and can end (step `mailer/1.16-sessions`).
++//!
++//! Three things this file is careful about:
++//!
++//! * **the password is verified, never compared.** What the table holds is a PHC string with a salt
++//!   of its own (step `mailer/1.11-signup`), so the check is Argon2 verifying a candidate against
++//!   it — the same algorithm and the same work, whoever says what. A string comparison would be both
++//!   wrong (the salt) and cheap enough to be worth attacking;
++//! * **an unconfirmed subscriber cannot log in.** The address was never proven, so there is nobody
++//!   to authenticate yet, and letting them in would make confirmation a decoration;
++//! * **a login opens a *new* session**. Nothing a caller brought is adopted — the token comes from
++//!   [`session::open`], and the cookie (or `Authorization` header) the client used is only ever read
++//!   from, never trusted as an identity.
++
++use argon2::{Argon2, PasswordHash, PasswordVerifier};
++use serde::Deserialize;
++use sqlx::PgPool;
++
++use crate::domain::{Email, Password};
++use crate::error::Error;
++use crate::session::{self, Token};
++
++/// The body of `POST /login`: the two things a caller knows about themselves.
++///
++/// Raw strings, for the same reason the signup body is (step `mailer/1.11-signup`): what arrives is
++/// text, and the text is parsed where it enters.
++#[derive(Debug, Deserialize)]
++pub struct Credentials {
++    /// The address the subscriber signed up with, as it was sent.
++    pub email: String,
++    /// The password, as it was sent.
++    pub password: String,
++}
++
++/// Verify credentials and open a session for the subscriber they belong to.
++///
++/// The answer is the token (which becomes the `Set-Cookie` of the response) and the address the
++/// session belongs to (which becomes its body). Everything else about the subscriber is looked up
++/// later, by id, when a handler needs it.
++///
++/// # Errors
++///
++/// Reports [`Error::InvalidInput`] when the email or the password is not a value this service
++/// accepts (the field is named, the value is not), [`Error::InvalidCredentials`] when the address
++/// has no subscriber or the password does not match one, [`Error::NotConfirmed`] when it matches a
++/// subscriber who never confirmed their address, [`Error::PasswordHash`] when the stored hash cannot
++/// be read at all (a row this service wrote and cannot use — a deployment problem, not a caller's),
++/// and [`Error::Database`] when the session cannot be written.
++pub async fn log_in(pool: &PgPool, credentials: Credentials) -> Result<(Token, Email), Error> {
++    let email = Email::parse(&credentials.email)?;
++    let password = Password::parse(&credentials.password)?;
++
++    let row = sqlx::query!(
++        "SELECT id, password_hash, status FROM subscribers WHERE email = $1",
++        email.as_str()
++    )
++    .fetch_optional(pool)
++    .await
++    .map_err(|source| Error::Database {
++        operation: "find a subscriber to log in",
++        source: Box::new(source),
++    })?;
++
++    // One answer for "no such address" and "the password is wrong": which of the two it was is a
++    // fact about this service's subscribers, and a caller who is neither does not need it.
++    let Some(row) = row else {
++        return Err(Error::InvalidCredentials);
++    };
++    let stored = PasswordHash::new(&row.password_hash).map_err(|source| Error::PasswordHash {
++        source: source.into(),
++    })?;
++    if Argon2::default()
++        .verify_password(password.as_str().as_bytes(), &stored)
++        .is_err()
++    {
++        return Err(Error::InvalidCredentials);
++    }
++    if row.status != "active" {
++        return Err(Error::NotConfirmed);
++    }
++
++    let token = session::open(pool, row.id).await?;
++    Ok((token, email))
++}
+diff --git a/src/session.rs b/src/session.rs
+index 43a912f..1e85308 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -22,15 +22,6 @@
+ //! * **a login always opens a *new* session.** Nothing a caller sends is ever adopted as a session
+ //!   — that is session fixation, and the cheap version of it is a service that takes the cookie it
+ //!   was given and blesses it on login. The token is issued here and nowhere else.
+-//!
+-//! # What this scaffold proves
+-//!
+-//! The table, the digest and the life cycle are here; the token is not. [`Token::issue`] below
+-//! answers the *same* value every time, which is session fixation in its purest form: whoever saw
+-//! one token holds every session this service will ever open, including the next login. The step's
+-//! spec (`tests/spec_sessions.rs`) fails on `assert_ne!(first, second)` until the value becomes
+-//! [`SESSION_BYTES`] bytes from the system — and it cannot be caught by reading the routes, which is
+-//! why the spec logs in twice.
+ 
+ use sqlx::PgPool;
+ 
+@@ -69,13 +60,10 @@ impl Token {
+     /// Reports [`Error::TokenGeneration`] when the system's random number generator fails. There is
+     /// no fallback on purpose: a token this service invented would be a token an attacker can
+     /// invent too.
+-    ///
+-    /// The scaffold does not ask the system for anything: it answers zero bytes every time, which is
+-    /// the one value in this file that is not a secret. Fixing this is the step — and the `# Errors`
+-    /// above is part of the fix, because asking the system for randomness is the thing that can
+-    /// fail.
+     pub fn issue() -> Result<Self, Error> {
+-        Ok(Self(hex(&[0_u8; SESSION_BYTES])))
++        let mut bytes = [0_u8; SESSION_BYTES];
++        getrandom::fill(&mut bytes).map_err(|source| Error::TokenGeneration { source })?;
++        Ok(Self(hex(&bytes)))
+     }
+ 
+     /// Read a token out of what a caller sent.
