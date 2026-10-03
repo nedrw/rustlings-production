@@ -311,7 +311,7 @@ new file mode 100644
 index 0000000..3571169
 --- /dev/null
 +++ b/tests/support/email.rs
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,108 @@
 +//! A sender that records what it was given (step `mailer/1.13-email-port`).
 +//!
 +//! This is part of the *harness*, not of the service: a spec pulls it in with
@@ -327,6 +327,10 @@ index 0000000..3571169
 +//! * **the fake keeps the *envelope*, not a summary of it** — the whole [`Message`], because the
 +//!   questions a test asks about an email (`who`, `what subject`, and does the body carry the link
 +//!   with the token the row holds) are all questions about the message itself.
++
++// A spec reaches this module through the drill it declares, and uses the part of the harness that
++// drill needs: the same rule the four other support files follow.
++#![allow(dead_code)]
 +
 +use std::future::Future;
 +use std::pin::Pin;

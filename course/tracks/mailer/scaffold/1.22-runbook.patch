@@ -1,0 +1,150 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+new file mode 100644
+index 0000000..af61f62
+--- /dev/null
++++ b/docs/runbook.md
+@@ -0,0 +1,38 @@
++# Runbook: the mail server is away
++
++The page a responder reads when subscribers are not receiving email. Everything in it should be
++something a person can *do* or *look at*, and the drill at the bottom is what makes it evidence
++rather than prose.
++
++This is the skeleton: the sections are the ones an incident needs, and every link is a placeholder
++until the step's last task is done — `kiln check mailer/1.22-runbook` runs the `links` gate over this
++file, and it fails while the targets are `TODO`.
++
++## Symptoms
++
++What does a responder see first, from the outside? (metrics, logs, what a subscriber reports)
++
++## Signals
++
++| what to look at | where |
++| --- | --- |
++| [the metric that means mail is being given up on](TODO) | `GET /metrics` |
++| [the endpoint that says this process is alive](TODO) | |
++| [the line in the log that says a message was abandoned](TODO) | |
++
++## Steps
++
++1. [what confirms the suspicion before anything is restarted](TODO)
++2. [what to check on the mail server's side](TODO)
++3. [what to do when it is back](TODO)
++4. [what to do about the messages that were already given up on](TODO)
++
++## Verification
++
++- [the command that replays the drill](TODO)
++- [the number that has to be back where it was](TODO)
++
++## Escalation
++
++- [what to do when the mail server is not coming back today](TODO)
++- [who or what to involve, and with what information](TODO)
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+new file mode 100644
+index 0000000..042d876
+--- /dev/null
++++ b/tests/support/drill.rs
+@@ -0,0 +1,100 @@
++//! The outage drill (step `mailer/1.22-runbook`) — the shape of one, and not a drill yet.
++//!
++//! What is here is what a first version usually looks like: the service is started with a mail
++//! server that refuses every message, a subscriber signs up, the drill waits a moment, and then it
++//! reports that the message arrived. Nothing in it asks the service anything — `Report` below is an
++//! answer this file *decided on* rather than one it measured, and `Recovery` is accepted and
++//! ignored.
++//!
++//! That is the shape the spec's second test goes after: a drill that reports success whatever the
++//! mail server does cannot be the evidence a runbook rests on. Turning this into a drill means
++//! making the outage and the recovery real, and taking the numbers from the service's own records —
++//! which is what the runbook you are writing is supposed to describe.
++//!
++//! The parts it does not use are still here to be read: `sender.attempted()` is what the mail server
++//! was asked to send, `sender.delivered()` is what it took, and `Recovery::Never` is the world this
++//! version cannot tell apart from the other one.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++#[path = "app.rs"]
++mod app;
++#[path = "email.rs"]
++mod email;
++#[path = "postgres.rs"]
++mod postgres;
++
++use email::Recording;
++use postgres::Postgres;
++
++/// How long this version gives the queue before it reports what it hopes happened.
++const SETTLE: Duration = Duration::from_millis(500);
++/// The address this drill signs up.
++const DRILL_EMAIL: &str = "drill@example.com";
++
++/// Whether the mail server comes back before the service gives up.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Recovery {
++    /// The outage ends: the server answers again, inside the retry budget.
++    ComesBack,
++    /// The outage outlasts the retry budget: the service stops trying.
++    Never,
++}
++
++/// What one replay found.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Report {
++    /// Messages the service accepted while the mail server was away.
++    pub accepted: usize,
++    /// Messages the mail server took.
++    pub delivered: usize,
++    /// Messages the service stopped trying to deliver.
++    pub given_up: usize,
++}
++
++impl Report {
++    /// `true` when the promise the runbook makes held: nothing the service accepted was lost.
++    #[must_use]
++    pub fn nothing_was_lost(&self) -> bool {
++        self.accepted > 0 && self.delivered == self.accepted && self.given_up == 0
++    }
++}
++
++/// Replay the drill: take the mail server away, accept a subscriber, and answer what happened.
++///
++/// Nothing about this version depends on `recovery`, and that is the hole: both replays answer the
++/// same thing.
++#[must_use]
++pub fn replay(recovery: Recovery) -> Report {
++    let postgres = Postgres::start();
++    let sender = Arc::new(Recording::new());
++    sender.fail_with("the mail server is away");
++    let config = app::config(&[app::database_setting(&postgres.url())]);
++    let service = app::App::start(config, sender.clone());
++
++    let (status, body) = service.post("/signup", &app::signup_body(DRILL_EMAIL));
++    let accepted = usize::from((200..300).contains(&status));
++    assert!(
++        accepted == 1,
++        "the service refused a signup during the outage ({status}): {body}"
++    );
++
++    // What a drill measures, looked at and then ignored: this version reports what it expects the
++    // queue to have done rather than what the records say it did.
++    let offered = sender.attempted().len();
++    let taken = sender.delivered().len();
++    let _ = (offered, taken);
++
++    if recovery == Recovery::ComesBack {
++        // The recovery is here — and so is the hole: the report below is the same in both worlds.
++        sender.clear_failure();
++    }
++    std::thread::sleep(SETTLE);
++
++    Report {
++        accepted,
++        delivered: accepted,
++        given_up: 0,
++    }
++}

@@ -1,0 +1,268 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+index af61f62..d4b22b5 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -1,38 +1,69 @@
+-# Runbook: the mail server is away
++# Runbook: no mail is lost while the mail server is away
+ 
+-The page a responder reads when subscribers are not receiving email. Everything in it should be
+-something a person can *do* or *look at*, and the drill at the bottom is what makes it evidence
+-rather than prose.
++This service promises a subscriber one thing it cannot do by itself: the email it accepts at
++`POST /signup` will be handed to a mail server. When that server is away, the promise is kept by
++[the queue that retries](../src/delivery.rs), and the failure mode this page exists for is the one
++where the queue runs out of attempts and a subscriber never hears from us.
+ 
+-This is the skeleton: the sections are the ones an incident needs, and every link is a placeholder
+-until the step's last task is done — `kiln check mailer/1.22-runbook` runs the `links` gate over this
+-file, and it fails while the targets are `TODO`.
++Everything here is replayable. If you have ten minutes and a laptop, replay it before you need it:
++`cargo test --test spec_runbook_drill`.
+ 
+ ## Symptoms
+ 
+-What does a responder see first, from the outside? (metrics, logs, what a subscriber reports)
++Any of these, in the order they are usually noticed:
++
++- subscribers say the confirmation link never arrived, often in a burst from one mail domain;
++- `deliveries_total{outcome="given_up"}` is not zero — this is the one that means *a subscriber will
++  never hear from us*, and the alert should be on it rather than on any error rate;
++- the mail server's own logs show connections being refused or rejected for our account;
++- `POST /signup` still answers 200: the service accepts work it cannot complete, which is deliberate
++  — refusing signups during a mail outage would lose the subscriber instead of the email.
+ 
+ ## Signals
+ 
+ | what to look at | where |
+ | --- | --- |
+-| [the metric that means mail is being given up on](TODO) | `GET /metrics` |
+-| [the endpoint that says this process is alive](TODO) | |
+-| [the line in the log that says a message was abandoned](TODO) | |
++| mail that will never be sent | `deliveries_total{outcome="given_up"}` on `GET /metrics` ([how it is written](../src/metrics.rs)) |
++| attempts that failed and will be retried | `deliveries_total{outcome="failed"}` — a number that *moving* is normal, one that only climbs is not |
++| requests, by route and status | `http_requests_total{route,status}` — `POST /signup` staying at 200 is the service keeping its side |
++| liveness, readiness | `GET /healthz` (this process), `GET /readyz` (database current — a mail outage does **not** make readiness red) |
++| what the service itself said | [the JSON log](../src/logging.rs) (step `mailer/1.6-logging`): `giving up on an email` and `the email could not be sent; trying again` are the two lines this runbook is written around |
+ 
+ ## Steps
+ 
+-1. [what confirms the suspicion before anything is restarted](TODO)
+-2. [what to check on the mail server's side](TODO)
+-3. [what to do when it is back](TODO)
+-4. [what to do about the messages that were already given up on](TODO)
++1. **Confirm it is the mail server and not the queue.** Restarting this service does not help: a
++   claimed message is [released for the next attempt](../src/deliveries.rs)
++   (`mailer/1.15-idempotent-delivery`), and the queue is in the database, not in the process.
++2. **Check the sender's side**: is the mail server up, is the account still allowed to send, is the
++   port reachable from here (`MAILER__EMAIL__SMTP_HOST`, `MAILER__EMAIL__SMTP_PORT`)?
++3. **When it is back, do nothing to the service** — the worker retries on its own; watch
++   `deliveries_total{outcome="failed"}` stop climbing.
++4. **For the messages that were given up on, re-queue them** rather than apologising: the row is the
++   unit of work, and a subscriber whose confirmation was given up is still `confirmed_at IS NULL`.
++   [The newsletter path](../src/newsletter.rs) has its own copy of the queue
++   (`mailer/1.17-newsletter`).
++5. **Write down what you saw** — the drill below is only worth its runtime if the next responder
++   reads what this one learned.
+ 
+ ## Verification
+ 
+-- [the command that replays the drill](TODO)
+-- [the number that has to be back where it was](TODO)
++- `cargo test --test spec_runbook_drill` — [the drill](../tests/support/drill.rs) in
++  `tests/support/` — replays the outage twice: the server comes back (nothing is lost) and the server
++  never comes back (the drill reports the loss). Both have to hold; the second one is what makes the
++  first one evidence.
++- `deliveries_total{outcome="given_up"}` back at zero, and `POST /signup` still at 200 for a fresh
++  address.
++- a fresh signup's message arrives at the mail server within the retry budget — the queue, not the
++  request path, is what was broken.
+ 
+ ## Escalation
+ 
+-- [what to do when the mail server is not coming back today](TODO)
+-- [who or what to involve, and with what information](TODO)
++- **the mail server is not coming back today**: the queue is bounded
++  ([`MAX_ATTEMPTS`](../src/delivery.rs) is three attempts), so mail *will* be given up on; the honest
++  move is to stop accepting signups (a deployment decision, and `GET /readyz` is the lever an
++  orchestrator has) and to say so.
++- **the database is the thing that is away**: this page does not apply; start with `GET /readyz`
++  ([why it exists](../src/http.rs)) and the migration order of `mailer/1.9-postgres`.
++- **given-up mail keeps climbing after the server is back**: a queue that is retrying into a server
++  which is up is a bug on our side, not an outage — [the worker](../src/delivery.rs) and the
++  `MAILER__EMAIL__…` settings are where to look, and the drill is what to reproduce it with.
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+index 042d876..065e4b1 100644
+--- a/tests/support/drill.rs
++++ b/tests/support/drill.rs
+@@ -1,22 +1,26 @@
+-//! The outage drill (step `mailer/1.22-runbook`) — the shape of one, and not a drill yet.
++//! The outage drill (step `mailer/1.22-runbook`), replayed by `spec_runbook_drill`.
+ //!
+-//! What is here is what a first version usually looks like: the service is started with a mail
+-//! server that refuses every message, a subscriber signs up, the drill waits a moment, and then it
+-//! reports that the message arrived. Nothing in it asks the service anything — `Report` below is an
+-//! answer this file *decided on* rather than one it measured, and `Recovery` is accepted and
+-//! ignored.
++//! A runbook is a page somebody reads at three in the morning; this is the half such a page cannot
++//! carry: the *replay*. It takes the mail server away, keeps accepting subscribers, and then answers
++//! what happened to the messages they were promised — from the service's own records, not from what
++//! the drill hoped.
+ //!
+-//! That is the shape the spec's second test goes after: a drill that reports success whatever the
+-//! mail server does cannot be the evidence a runbook rests on. Turning this into a drill means
+-//! making the outage and the recovery real, and taking the numbers from the service's own records —
+-//! which is what the runbook you are writing is supposed to describe.
++//! Four decisions worth naming, because they are what makes this a drill rather than a test:
+ //!
+-//! The parts it does not use are still here to be read: `sender.attempted()` is what the mail server
+-//! was asked to send, `sender.delivered()` is what it took, and `Recovery::Never` is the world this
+-//! version cannot tell apart from the other one.
++//! * **the outage is injected, and it is real**: `Recording::fail_with` (step
++//!   `mailer/1.13-email-port`) *is* the mail server being away, so an incident replays on a laptop in
++//!   seconds. What a real SMTP server would add is the protocol, not the queue — and the queue is
++//!   what the promise is about (`mailer/1.15-idempotent-delivery`);
++//! * **the drill waits for the first failed attempt**, because a recovery that beats the outage
++//!   proves nothing: the premise has to be true before the recovery means anything;
++//! * **the numbers come from the service**: `delivered` is what the mail server took, `given_up` is
++//!   what the service stopped trying to send. The runbook's promise is the difference between them;
++//! * **the drill can fail**: `Recovery::Never` is the same replay with the server never coming back,
++//!   which is the case where the promise *is* broken. The spec runs both, because a drill that
++//!   cannot report a loss is decoration.
+ 
+ use std::sync::Arc;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ #[path = "app.rs"]
+ mod app;
+@@ -28,8 +32,16 @@ mod postgres;
+ use email::Recording;
+ use postgres::Postgres;
+ 
+-/// How long this version gives the queue before it reports what it hopes happened.
+-const SETTLE: Duration = Duration::from_millis(500);
++/// How long the drill waits for the queue to reach an ending.
++///
++/// One message's retry budget is three attempts inside a few hundred milliseconds (the backoff of
++/// step `mailer/1.15-idempotent-delivery`); the rest is the room a loaded machine and a container
++/// database need. A drill that has to be fast still has to be patient with the machine it runs on.
++const DRILL_DEADLINE: Duration = Duration::from_secs(30);
++/// How often it looks again.
++const RETRY: Duration = Duration::from_millis(20);
++/// The attempts the service allows before it gives up on a confirmation.
++const MAX_ATTEMPTS: i64 = 3;
+ /// The address this drill signs up.
+ const DRILL_EMAIL: &str = "drill@example.com";
+ 
+@@ -62,17 +74,18 @@ impl Report {
+ }
+ 
+ /// Replay the drill: take the mail server away, accept a subscriber, and answer what happened.
+-///
+-/// Nothing about this version depends on `recovery`, and that is the hole: both replays answer the
+-/// same thing.
+ #[must_use]
+ pub fn replay(recovery: Recovery) -> Report {
+     let postgres = Postgres::start();
+     let sender = Arc::new(Recording::new());
++    // The outage. Every send fails until the drill says otherwise, and nothing about the service
++    // knows it is a drill: the queue, the claims and the retry budget are the real ones.
+     sender.fail_with("the mail server is away");
+     let config = app::config(&[app::database_setting(&postgres.url())]);
+     let service = app::App::start(config, sender.clone());
+ 
++    // The moment the runbook is about: a subscriber arrives while the mail server is away. The
++    // service takes the request and now owes an email it cannot send yet.
+     let (status, body) = service.post("/signup", &app::signup_body(DRILL_EMAIL));
+     let accepted = usize::from((200..300).contains(&status));
+     assert!(
+@@ -80,21 +93,79 @@ pub fn replay(recovery: Recovery) -> Report {
+         "the service refused a signup during the outage ({status}): {body}"
+     );
+ 
+-    // What a drill measures, looked at and then ignored: this version reports what it expects the
+-    // queue to have done rather than what the records say it did.
+-    let offered = sender.attempted().len();
+-    let taken = sender.delivered().len();
+-    let _ = (offered, taken);
++    // The premise, checked rather than assumed: the message has been offered to the mail server, and
++    // the mail server did not take it.
++    wait(&postgres, "the first attempt to be recorded", || {
++        attempts(&postgres) >= 1
++    });
++    assert!(
++        sender.delivered().is_empty(),
++        "a message was delivered while the mail server was away"
++    );
+ 
+     if recovery == Recovery::ComesBack {
+-        // The recovery is here — and so is the hole: the report below is the same in both worlds.
+         sender.clear_failure();
+     }
+-    std::thread::sleep(SETTLE);
++
++    // From here the queue is on its own: it retries with backoff, or it spends the attempts it is
++    // allowed. Either way the drill waits for that ending instead of guessing at it.
++    wait(&postgres, "the queue to reach an ending", || {
++        sender.delivered().len() == accepted || given_up(&postgres) == accepted
++    });
+ 
+     Report {
+         accepted,
+-        delivered: accepted,
+-        given_up: 0,
++        delivered: sender.delivered().len(),
++        given_up: given_up(&postgres),
++    }
++}
++
++/// Look again until the condition holds, and fail loudly when the deadline passes.
++///
++/// A drill waits for a *fact* — the queue has moved — and never for a number of seconds: a sleep is
++/// either too short on a loaded machine or wasted time on an idle one, and neither is a statement
++/// about the queue.
++fn wait(postgres: &Postgres, what: &str, condition: impl Fn() -> bool) {
++    let until = Instant::now() + DRILL_DEADLINE;
++    while Instant::now() < until {
++        if condition() {
++            return;
++        }
++        std::thread::sleep(RETRY);
+     }
++    panic!(
++        "the drill waited {DRILL_DEADLINE:?} for {what}, and it did not happen (the service is in \
++         {}, and this drill signed up {DRILL_EMAIL})",
++        postgres.query("SELECT count(*) FROM subscribers")
++    );
++}
++
++/// How many times the service has offered this message to a mail server.
++fn attempts(postgres: &Postgres) -> i64 {
++    number(
++        postgres,
++        &format!(
++            "SELECT COALESCE(max(confirmation_attempts), 0) FROM subscribers WHERE email = \
++             '{DRILL_EMAIL}'"
++        ),
++    )
++}
++
++/// Messages the service stopped trying to send: nothing sent, and the attempts it allows are spent.
++fn given_up(postgres: &Postgres) -> usize {
++    number(
++        postgres,
++        &format!(
++            "SELECT count(*) FROM subscribers WHERE confirmation_sent_at IS NULL AND \
++             confirmation_attempts >= {MAX_ATTEMPTS}"
++        ),
++    ) as usize
++}
++
++/// One integer out of one query.
++fn number(postgres: &Postgres, sql: &str) -> i64 {
++    let answered = postgres.query(sql);
++    answered.parse().unwrap_or_else(|_| {
++        panic!("`{sql}` was expected to answer one number, and it answered `{answered}`")
++    })
+ }
