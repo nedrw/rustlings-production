@@ -297,6 +297,8 @@
 
 > **T1 还剩三步 + 一件框架事（下一段直接接）**：
 >
+> **2026-10 收尾补充：`docs/drafts/1.21-container/` 里有一份*能跑*的版本**（Dockerfile、.dockerignore、夹具、规格 + README）。实测：成品镜像 **16.5 MB**、热缓存构建 **1m24s**、规格 **4 passed / 68s**；README 里写了三个坑（stub 要满足 `missing_docs`——那次 28 分钟失败的真正原因；缓存不能挂到 `/usr/local/cargo`，否则 `cargo: not found`；挂载不进镜像层，所以二进制要在 builder 的 RUN 里 cp 到挂载之外）和完整的落地清单。**下一段直接从那份 README 抄，不要从零再试一遍。**
+>
 > **1.21 的第一次尝试与实测结论（动手前必读，省你一次 28 分钟）**：按“多阶段 Dockerfile + 容器内 `cargo build
 > --release`”写了一版（`rust:1.98-slim` builder + `debian:bookworm-slim` runtime，依赖层用 stub 预编译），
 > `podman build` 在这台机器上跑了 **28 分钟**然后在依赖/stub 那层以 exit 101 失败（`cargo build --release
