@@ -297,6 +297,31 @@
 
 > **T1 还剩三步 + 一件框架事（下一段直接接）**：
 >
+> **1.21 的第一次尝试与实测结论（动手前必读，省你一次 28 分钟）**：按“多阶段 Dockerfile + 容器内 `cargo build
+> --release`”写了一版（`rust:1.98-slim` builder + `debian:bookworm-slim` runtime，依赖层用 stub 预编译），
+> `podman build` 在这台机器上跑了 **28 分钟**然后在依赖/stub 那层以 exit 101 失败（`cargo build --release
+> --locked`，错误被 buildah 截成一行）。两个基础镜像已在本机（`docker.1ms.run/library/rust:1.98-slim` 828MB、
+> `docker.1ms.run/library/debian:bookworm-slim` 100MB），但那 28 分钟说明：**课程 spec 的 300s 上限装不下一次
+> 冷构建**，`cargo xtask ci` 里 1.21 的 selftest 也会因此变成 30 分钟级别。所以那一版已经从 `app/mailer` 里撤掉
+> 了（`Dockerfile`/`.dockerignore`/`tests/support/container.rs`/`tests/spec_image.rs`），树仍是 1.20 的绿状态。
+>
+> **1.21 的可行设计（下一段按这个来，别再从头试）**：镜像构建走**宿主机已经构建好的 release 二进制**，
+> 不要容器内编译：
+>
+> 1. `cargo build --release -p mailer` 在宿主跑一次（缓存后是增量的），spec/Dockerfile 都只 copy
+>    `target/release/mailer` 进 runtime 层。这恰好让 teaches 里的“the image runs the same binary you
+>    tested”变成**字面为真**（镜里就是同一面二进制）——正好也是 `container-repro` 门要判的东西。
+> 2. “multi-stage”这层意思改用**两阶段但零编译**表达：一个 `FROM debian:bookworm-slim AS builder` 只做
+>    `useradd`/准备目录，runtime 再 `COPY --from=builder`——或者干脆在正文里诚实地把 multi-stage 说成
+>    “CI 里由 CI 构建、本地由宿主机构建”的两种模式，并把容器内容器编译列为 FURTHER（带上面那 28 分钟的实测）。
+> 3. 镜像内编译若要保留，就必须把 `podman build` 挪出 spec（比如 `kiln images pull` 那样的准备命令），
+>    并让学习者用 `kiln --timeout 1800 run mailer/1.21-container`；`container-repro` 门也要接受这个超时。
+> 4. 已经写好的规格设计可以直接用（撤掉前是完整的，四个断言都在正文/handoff 里）：容器里 `/healthz` 200、
+>    `/readyz` 503 且说明缺数据库、未知路径的 404 体与宿主同形；`command -v cargo/rustc/cc` 全非零、`/src`
+>    不存在（“不是编译环境”）；`id -u` ≠ 0；给了数据库时 `/readyz` 转 200 且 `subscribers` 表在——容器得用
+>    `MAILER__LISTEN__HOST=0.0.0.0`（默认 `127.0.0.1` 在容器里等于没有发布端口），数据库地址要把
+>    `127.0.0.1` 换成 `host.containers.internal`（podman machine 下才到得了宿主机发布的端口）。
+
 > - **1.21-container**（120m，`release/container-image@apply`，spec `spec/image.rs` → `tests/spec_image.rs`，
 >   `run.cmd = cargo test -p mailer --test spec_image`）：多阶段 Dockerfile + 探针 + “先迁移后收流量”；它的 gates
 >   里已经有 **`container-repro`**，而这个门在 `kiln/src/gates/registry.rs` 里仍是
