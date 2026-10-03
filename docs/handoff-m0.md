@@ -157,10 +157,27 @@
 >
 > ### 下一步
 >
-> 1.10 起按序写在 1.9 的树上。1.11 需要先 `cargo install sqlx-cli --no-default-features --features postgres,rustls`
-> 生成 `.sqlx/`，作为那一步的 scaffold 内容发布。`container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
+> 1.11 起按序写在 1.10 的树上。1.11 需要先 `cargo install sqlx-cli --no-default-features --features postgres,rustls`
+> 生成 `.sqlx/`，作为那一步的 scaffold 内容发布；为了让缓存命中，**查询本身也要是 scaffold 内容**
+> （离线元数据按查询哈希索引，学员写不一样的 SQL 就找不到缓存，编译期会报「set `DATABASE_URL` … or run
+> `cargo sqlx prepare`」）。`argon2` 需要联网拉一次（crates.io 可达，本机缓存里没有）。
+> `container-repro`（1.21）与 `links`（1.22）两个闸门仍未实现；
 > **`kiln watch`（M0 §1/§2.6 的目标）还没写**，现在是这条 track 之外剩下的唯一框架缺口。
-> 另：本机的 `kiln-pg` 容器是上一段手工试验留下的（不影响测试，测试用 `kiln-pg-<pid>-<n>` 并自行清理）。
+> 另：本机的 `kiln-pg` 容器是早先手工试验留下的（不影响测试，测试用 `kiln-pg-<pid>-<n>` 并自行清理）。
+>
+> ### 2026-10 进度（M0 第五段 · 做到 1.10）
+>
+> T1 1.10（领域类型）已完成并提交：`src/domain.rs`（`Email`/`SubscriberName`/`Password` + 五个限额常量，
+> scaffold 里的三个 `parse` 什么都不查、`Password` 带着 derive 出来的 `Debug`，参考解把它们变成解析器 + 手写的
+> 遮蔽 `Debug`）、`Error::InvalidInput { field, expected }`（**不带值**——值可能是密码），`pub mod domain;`。
+> `cargo xtask ci` 全绿，`kiln selftest` 对 **1.1–1.10 共 10 步**满足契约（1.10：8/8 must），
+> `kiln verify --json mailer` = 10 passed / 0 failed / 12 not authored（exit 3）。
+>
+> **这一段的写法约定（下一段照抄）**：一个步骤如果需要库 API 而 scaffold 又不该改 `lib.rs`，就用
+> **探针 crate**：spec 自己写一个 `Cargo.toml`（`mailer = { path = <项目> }`）、`src/lib.rs` 和 `tests/*.rs`，
+> 在一个临时目录里编译并运行（同 1.5 的做法；`CARGO_TARGET_DIR` 指向项目下的独立目录，第二次起几秒）。
+> 好处：spec 本身不引用还得由学员加入的模块，所以它在 scaffold 上**编得过、跑得过、只失败在断言上**；探针能直接
+> `matches!`、能写 property，失败信息就是编译错误或断言行。代价：冷启动一次性多花约 20 秒。
 
 ## 6. 工作方式约定
 

@@ -1,0 +1,230 @@
+diff --git a/src/domain.rs b/src/domain.rs
+index 8de38ae..815cbd7 100644
+--- a/src/domain.rs
++++ b/src/domain.rs
+@@ -1,15 +1,22 @@
+ //! The values this service works with, and the only way to make them
+ //! (step `mailer/1.10-domain-types`).
+ //!
+-//! This file is the scaffold: the types, the limits and the signatures below are the shape the step
+-//! needs — and the shape its spec talks to — while the bodies are what the step is about. **Nothing
+-//! below checks anything**: every `parse` keeps what it was given, and `Password` carries the
+-//! derived `Debug`. The step turns these into parsers, and its spec is what says when that is done.
+-//!
+ //! "Parse, don't validate", in one sentence: a value that has been checked is a *different type*
+ //! from the text it came from, and the only way to get one is to parse it. Nothing here has a public
+ //! constructor, so `Email` in a function signature is a promise the compiler keeps: no caller has to
+ //! re-check, and no reviewer has to look for the `validate_email(..)` call somebody forgot to make.
++//!
++//! Three decisions are visible in the code below, and each of them is one this step argues for:
++//!
++//! * **normalisation is part of parsing**: an address is trimmed and lower-cased before it is
++//!   stored, because `subscribers.email` is `UNIQUE` (step `mailer/1.9-postgres`) and compares
++//!   bytes — `Ada@Example.com` and `ada@example.com` have to be one subscriber, not two. What a
++//!   parser produces is *canonical*: parsing it again changes nothing.
++//! * **a password is not normalised at all**: spaces are part of a secret, and a value that quietly
++//!   changes is a value that fails somebody's login. The type keeps exactly what was typed.
++//! * **a refused value is not repeated**: the failure names the field and what it expected, never
++//!   the text that was sent — it may be a password, and a log line outlives the mistake (step
++//!   `mailer/1.6-logging`).
+ 
+ use std::fmt;
+ 
+@@ -45,10 +52,41 @@ impl Email {
+     /// service accepts: no `@` or more than one, an empty side, a local part that is too long or
+     /// shaped differently, a domain whose labels are empty or hold something other than letters,
+     /// digits and `-`, or an address over [`MAX_EMAIL_LENGTH`].
+-    ///
+-    /// The scaffold accepts everything.
+     pub fn parse(value: &str) -> Result<Self, Error> {
+-        Ok(Self(value.to_owned()))
++        let only_one_at = invalid("email", "an address with exactly one `@`");
++        let value = value.trim().to_ascii_lowercase();
++        if value.len() > MAX_EMAIL_LENGTH {
++            return Err(invalid("email", "an address of at most 254 bytes"));
++        }
++        let Some((local, domain)) = value.split_once('@') else {
++            return Err(only_one_at);
++        };
++        if domain.contains('@') {
++            return Err(only_one_at);
++        }
++        if local.is_empty() || local.len() > MAX_EMAIL_LOCAL_LENGTH {
++            return Err(invalid("email", "a local part of 1 to 64 characters"));
++        }
++        if !is_local_part(local) {
++            return Err(invalid(
++                "email",
++                "a local part of letters, digits, `.`, `_`, `+` or `-`, with no dot at either end",
++            ));
++        }
++        if domain.is_empty()
++            || !domain.contains('.')
++            || domain.starts_with('.')
++            || domain.ends_with('.')
++        {
++            return Err(invalid("email", "a domain of labels separated by dots"));
++        }
++        if domain.split('.').any(|label| !is_label(label)) {
++            return Err(invalid(
++                "email",
++                "a domain of letters, digits and `-`, with no `-` at either end of a label",
++            ));
++        }
++        Ok(Self(value))
+     }
+ 
+     /// The address as this service stores it: lower case, no surrounding space.
+@@ -75,10 +113,23 @@ impl SubscriberName {
+     ///
+     /// Reports [`Error::InvalidInput`] with the field `name` when the value is empty (or only
+     /// space), holds control characters, or is longer than [`MAX_NAME_LENGTH`] characters.
+-    ///
+-    /// The scaffold accepts everything.
+     pub fn parse(value: &str) -> Result<Self, Error> {
+-        Ok(Self(value.to_owned()))
++        let trimmed = value.trim();
++        if trimmed.chars().any(char::is_control) {
++            return Err(invalid("name", "a name without control characters"));
++        }
++        // Runs of spaces are one space: what a person typed is the name, not the layout of the form
++        // it was typed into.
++        let collapsed = trimmed
++            .split(' ')
++            .filter(|part| !part.is_empty())
++            .collect::<Vec<_>>()
++            .join(" ");
++        let length = collapsed.chars().count();
++        if length == 0 || length > MAX_NAME_LENGTH {
++            return Err(invalid("name", "a name of 1 to 100 characters"));
++        }
++        Ok(Self(collapsed))
+     }
+ 
+     /// The name as it is stored: trimmed, one line, single spaces.
+@@ -95,7 +146,7 @@ impl fmt::Display for SubscriberName {
+ }
+ 
+ /// A password, kept exactly as it was typed.
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq)]
+ pub struct Password(String);
+ 
+ impl Password {
+@@ -106,9 +157,14 @@ impl Password {
+     /// Reports [`Error::InvalidInput`] with the field `password` when the value is shorter than
+     /// [`MIN_PASSWORD_LENGTH`] or longer than [`MAX_PASSWORD_LENGTH`] characters, or holds control
+     /// characters.
+-    ///
+-    /// The scaffold accepts everything.
+     pub fn parse(value: &str) -> Result<Self, Error> {
++        let length = value.chars().count();
++        if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&length) {
++            return Err(invalid("password", "a password of 12 to 128 characters"));
++        }
++        if value.chars().any(char::is_control) {
++            return Err(invalid("password", "a password without control characters"));
++        }
+         Ok(Self(value.to_owned()))
+     }
+ 
+@@ -118,3 +174,36 @@ impl Password {
+         &self.0
+     }
+ }
++
++/// A password must not reach a log line through `{:?}`, so this is written by hand instead of
++/// derived (step `mailer/1.6-logging` is where log lines became a place secrets do not go).
++///
++/// It says that there is a secret, and nothing else about it: not the characters, and not how many
++/// there are — a length is a fact about the secret too.
++impl fmt::Debug for Password {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("Password(<redacted>)")
++    }
++}
++
++/// The failure a refused value becomes, with the field that was wrong.
++fn invalid(field: &'static str, expected: &'static str) -> Error {
++    Error::InvalidInput { field, expected }
++}
++
++/// `true` when the part before the `@` is shaped the way this service accepts.
++fn is_local_part(local: &str) -> bool {
++    const ALLOWED: &str = "abcdefghijklmnopqrstuvwxyz0123456789._+-";
++    !local.starts_with('.')
++        && !local.ends_with('.')
++        && !local.contains("..")
++        && local.chars().all(|c| ALLOWED.contains(c))
++}
++
++/// `true` when one label of a domain is a run of letters, digits and `-`.
++fn is_label(label: &str) -> bool {
++    !label.is_empty()
++        && !label.starts_with('-')
++        && !label.ends_with('-')
++        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
++}
+diff --git a/src/error.rs b/src/error.rs
+index 97362e6..f175c90 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -107,6 +107,18 @@ pub enum Error {
+         #[source]
+         source: std::io::Error,
+     },
++    /// A value a caller sent is not one this service accepts (step `mailer/1.10-domain-types`).
++    ///
++    /// The text that was sent is deliberately **not** part of this failure: it may be a password,
++    /// and a message is a thing that ends up in a log (step `mailer/1.6-logging`). The field and
++    /// what it expected are what a caller needs; the value is what they already have.
++    #[error("the {field} is not {expected}")]
++    InvalidInput {
++        /// Which value was refused, as the code names it (`email`, `name`, `password`).
++        field: &'static str,
++        /// What that value would have had to be, phrased for a message.
++        expected: &'static str,
++    },
+     /// The database could not be reached, or refused what it was asked to do.
+     #[error("the database could not {operation}")]
+     Database {
+@@ -135,6 +147,10 @@ impl Error {
+     /// | the caller asked for something this service does not have — an unknown argument, a missing value, a value a setting cannot use, an unknown setting | `2` | whoever started the process |
+     /// | the configuration could not be read or parsed, logging could not start, the address could not be bound, or the database could not be connected or migrated | `1` | whoever deployed it |
+     ///
++    /// A value a caller sent that the domain refuses is the caller's problem too — the same code as
++    /// a unusable flag, and the same shape of answer a 400 will have once there is an HTTP surface
++    /// (step `mailer/1.11-signup`).
++    ///
+     /// Two codes are enough to tell those two apart, and a script that sees `2` knows not to
+     /// retry.
+     #[must_use]
+@@ -143,7 +159,8 @@ impl Error {
+             Error::UnknownArgument { .. }
+             | Error::MissingValue { .. }
+             | Error::InvalidSetting { .. }
+-            | Error::UnknownSetting { .. } => ExitCode::from(2),
++            | Error::UnknownSetting { .. }
++            | Error::InvalidInput { .. } => ExitCode::from(2),
+             Error::UnreadableConfig { .. }
+             | Error::InvalidConfig { .. }
+             | Error::Logging { .. }
+diff --git a/src/lib.rs b/src/lib.rs
+index fff3cbc..67329b9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,12 +15,14 @@ use std::path::PathBuf;
+ 
+ pub mod config;
+ pub mod db;
++pub mod domain;
+ pub mod error;
+ pub mod http;
+ pub mod logging;
+ 
+ pub use config::{Config, Flags};
+ pub use db::Database;
++pub use domain::{Email, Password, SubscriberName};
+ pub use error::{Error, SettingSource};
+ pub use logging::RunId;
+ 

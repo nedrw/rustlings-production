@@ -1,0 +1,126 @@
+diff --git a/src/domain.rs b/src/domain.rs
+new file mode 100644
+index 0000000..8de38ae
+--- /dev/null
++++ b/src/domain.rs
+@@ -0,0 +1,120 @@
++//! The values this service works with, and the only way to make them
++//! (step `mailer/1.10-domain-types`).
++//!
++//! This file is the scaffold: the types, the limits and the signatures below are the shape the step
++//! needs — and the shape its spec talks to — while the bodies are what the step is about. **Nothing
++//! below checks anything**: every `parse` keeps what it was given, and `Password` carries the
++//! derived `Debug`. The step turns these into parsers, and its spec is what says when that is done.
++//!
++//! "Parse, don't validate", in one sentence: a value that has been checked is a *different type*
++//! from the text it came from, and the only way to get one is to parse it. Nothing here has a public
++//! constructor, so `Email` in a function signature is a promise the compiler keeps: no caller has to
++//! re-check, and no reviewer has to look for the `validate_email(..)` call somebody forgot to make.
++
++use std::fmt;
++
++use crate::error::Error;
++
++/// Longest address this service accepts, in bytes — what the addressing rules allow end to end.
++pub const MAX_EMAIL_LENGTH: usize = 254;
++/// Longest local part (`before@`) this service accepts, in bytes.
++pub const MAX_EMAIL_LOCAL_LENGTH: usize = 64;
++/// Longest subscriber name this service accepts, in characters.
++pub const MAX_NAME_LENGTH: usize = 100;
++/// Shortest password this service accepts, in characters.
++///
++/// Twelve, because length is what actually costs an attacker — with a hash function and a salt per
++/// subscriber, character classes add little and lock people out (NIST SP 800-63B agrees).
++pub const MIN_PASSWORD_LENGTH: usize = 12;
++/// Longest password this service is willing to hash, in characters.
++///
++/// A cap keeps one request from turning into a gigabyte of hashing; it is far above any phrase a
++/// person types.
++pub const MAX_PASSWORD_LENGTH: usize = 128;
++
++/// An email address that has been checked, and normalised on the way in.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Email(String);
++
++impl Email {
++    /// Check a value and answer the address it is, in the form this service stores.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `email` when the value is not an address this
++    /// service accepts: no `@` or more than one, an empty side, a local part that is too long or
++    /// shaped differently, a domain whose labels are empty or hold something other than letters,
++    /// digits and `-`, or an address over [`MAX_EMAIL_LENGTH`].
++    ///
++    /// The scaffold accepts everything.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        Ok(Self(value.to_owned()))
++    }
++
++    /// The address as this service stores it: lower case, no surrounding space.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for Email {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++/// A subscriber's name, checked and collapsed into one line.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SubscriberName(String);
++
++impl SubscriberName {
++    /// Check a value and answer the name it is.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `name` when the value is empty (or only
++    /// space), holds control characters, or is longer than [`MAX_NAME_LENGTH`] characters.
++    ///
++    /// The scaffold accepts everything.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        Ok(Self(value.to_owned()))
++    }
++
++    /// The name as it is stored: trimmed, one line, single spaces.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for SubscriberName {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++/// A password, kept exactly as it was typed.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Password(String);
++
++impl Password {
++    /// Check a value and answer the password it is.
++    ///
++    /// # Errors
++    ///
++    /// Reports [`Error::InvalidInput`] with the field `password` when the value is shorter than
++    /// [`MIN_PASSWORD_LENGTH`] or longer than [`MAX_PASSWORD_LENGTH`] characters, or holds control
++    /// characters.
++    ///
++    /// The scaffold accepts everything.
++    pub fn parse(value: &str) -> Result<Self, Error> {
++        Ok(Self(value.to_owned()))
++    }
++
++    /// The password as it was typed — the one place a secret leaves this type.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
