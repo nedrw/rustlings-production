@@ -331,6 +331,18 @@
 > 7. **1.13 的规格已经先改好了**（`e0b3545`：`wait_for` 轮询 + 「至少一次尝试」/「grace 收到」这类跨树断言），
 >    所以异步化之后 1.13 的规格在最终树上仍然成立——这一条本来是本步最大的坑，已经拆掉。
 >
+> **进度（M0 第九段起 · 1.14 已经写了一部分，在 `app/mailer` 里**）**：`src/delivery.rs` 已按上面的清单写完
+> 并通过单测（`cargo test -p mailer --lib` 18 passed，其中 5 条是本步的：退避上界与抖动非常量、失败重试
+> 恰好 `MAX_ATTEMPTS` 次、队满拒而不等、drain 超时）——**并且单测当场抓到一个真 bug**：原先的抖动用
+> `millis.saturating_mul(roll) / u64::MAX`，`u64` 乘法直接饱和，答案恒为 1ms（「抖动」其实不是抖动）；现在
+> 走 `u128`。`Cargo.toml` 给 `tokio` 加了 `test-util`（暂停时钟，authoring §6.4 要的「注入时钟」）。
+> `Error::QueueFull`/`DrainTimeout`/`WorkerLost` 也已写进 `src/error.rs`（退出码 1 那一行）。
+> `docs/drafts/1.14-delivery.rs` 是这份文件的副本（`app/` 不跨 worktree 复制，所以留一份在 git 里）。
+> **还需做的**：`subscribe(pool, seat: Permit<'_, Message>, request)`、`AppState` 持有 `Queue`、
+> `serve_with_shutdown`/`serve_on_with_shutdown`、`main.rs` 的 SIGTERM→排空→退出码、规格（进程内 503 +
+> 子进程 SIGTERM）、patches/正文/接线。容量与重试基数是**常量**（原本想在 `config.rs` 加设置，本段改为常量以
+> 缩小范围；把它们变成设置属于 1.19/1.21 的部署工作）。
+>
 > **规格怎么做（决定，含一个要改旧文件的地方）**
 >
 > - 时间相关的断言放**单测**（`src/delivery.rs` 内，`#[tokio::test(start_paused = true)]` + 假发送器）：
