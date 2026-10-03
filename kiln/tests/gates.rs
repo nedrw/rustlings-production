@@ -397,6 +397,49 @@ fn exit_code_fails_when_a_binary_ignores_an_argument_it_does_not_know() {
 }
 
 #[test]
+fn exit_code_probes_every_binary_the_project_builds() {
+    let scratch = Scratch::new("exit-code-two-bins");
+    // Two binaries: one that refuses what it does not understand, and one that ignores it. A gate
+    // that stops at the first match would report a green step while half the project accepts
+    // anything.
+    let course = course_with(&scratch, &["exit-code"], CLEAN);
+    scratch.write("app/mailer/src/main.rs", REFUSING_BIN.trim_start());
+    scratch.write("app/mailer/src/bin/second.rs", IGNORING_BIN.trim_start());
+    let results = judge(&course, &["exit-code"]);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Failed],
+        "{}",
+        report(&results)
+    );
+    assert!(
+        results[0].detail.contains("second"),
+        "the gate has to keep probing after the first binary behaved: {}",
+        results[0].detail
+    );
+}
+
+#[test]
+fn exit_code_passes_only_when_every_binary_names_what_it_refuses() {
+    let scratch = Scratch::new("exit-code-two-good-bins");
+    let course = course_with(&scratch, &["exit-code"], CLEAN);
+    scratch.write("app/mailer/src/main.rs", REFUSING_BIN.trim_start());
+    scratch.write("app/mailer/src/bin/second.rs", REFUSING_BIN.trim_start());
+    let results = judge(&course, &["exit-code"]);
+    assert_eq!(
+        outcomes(&results),
+        [Outcome::Passed],
+        "{}",
+        report(&results)
+    );
+    assert!(
+        results[0].detail.contains("mailer") && results[0].detail.contains("second"),
+        "the report has to name every binary it probed: {}",
+        results[0].detail
+    );
+}
+
+#[test]
 fn exit_code_is_blocked_when_the_project_ships_no_binary() {
     let scratch = Scratch::new("exit-code-no-bin");
     let results = gates(&scratch, &["exit-code"], CLEAN);

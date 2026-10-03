@@ -171,43 +171,42 @@ fn probe(
     };
 
     let ran = process::run(&executable.to_string_lossy(), &[PROBE], project, timeout)?;
-    Ok(Some(judge(&bin.target, &ran)))
+    Ok(judge(&bin.target, &ran))
 }
 
-/// Grade one probe run.
-fn judge(target: &str, ran: &Ran) -> GateOutcome {
+/// Grade one probe run: `None` when the binary behaved, and the complaint for the learner when it
+/// did not.
+fn judge(target: &str, ran: &Ran) -> Option<GateOutcome> {
     let output = format!("{}{}", ran.stdout, ran.stderr);
     if ran.timed_out {
-        return GateOutcome::failed(format!(
+        return Some(GateOutcome::failed(format!(
             "`{target} {PROBE}` was still running after {:?}: an argument the program does not \
              understand must end in a usage error before anything else starts",
             ran.elapsed
-        ));
+        )));
     }
     if ran.success() {
-        return GateOutcome::failed(format!(
+        return Some(GateOutcome::failed(format!(
             "`{target} {PROBE}` exited 0: a program that accepts an argument it does not \
              understand starts with the wrong settings and says nothing"
-        ));
+        )));
     }
     if let Some(line) = output.lines().find(|line| line.contains(PANIC)) {
-        return GateOutcome::failed(format!(
+        return Some(GateOutcome::failed(format!(
             "`{target} {PROBE}` panicked instead of reporting: {} — a panic is a stack trace, not \
              an error message",
             line.trim()
-        ));
+        )));
     }
     if !output.contains(PROBE) {
-        return GateOutcome::failed(format!(
+        return Some(GateOutcome::failed(format!(
             "`{target} {PROBE}` failed with exit code {:?} but never says which argument it \
              refused:\n    {}",
             ran.code,
             clip(&output, 6)
-        ));
+        )));
     }
-    GateOutcome::passed(format!(
-        "{target} exits non-zero and names the refused argument"
-    ))
+    None
 }
 
 /// List the project's binaries and target directory, via `cargo metadata`.
@@ -320,7 +319,8 @@ mod tests {
 
     #[test]
     fn a_binary_that_ignores_the_probe_fails_with_the_reason() {
-        let outcome = judge("mailer", &ran(Some(0), "nothing to do\n", ""));
+        let outcome = judge("mailer", &ran(Some(0), "nothing to do\n", ""))
+            .expect("an exit code of 0 is a failure");
         assert_eq!(outcome.outcome, crate::gates::Outcome::Failed);
         assert!(outcome.detail.contains("exited 0"), "{}", outcome.detail);
     }
@@ -334,14 +334,16 @@ mod tests {
                 "",
                 "thread 'main' panicked at src/main.rs:4:5:\ncalled `Option::unwrap()`",
             ),
-        );
+        )
+        .expect("a panic is a failure");
         assert_eq!(outcome.outcome, crate::gates::Outcome::Failed);
         assert!(outcome.detail.contains("panicked"), "{}", outcome.detail);
     }
 
     #[test]
     fn an_exit_code_without_a_message_is_not_a_readable_failure() {
-        let outcome = judge("mailer", &ran(Some(2), "", ""));
+        let outcome = judge("mailer", &ran(Some(2), "", ""))
+            .expect("a bare exit code is not a readable failure");
         assert_eq!(outcome.outcome, crate::gates::Outcome::Failed);
         assert!(
             outcome.detail.contains("never says which argument"),
@@ -360,7 +362,6 @@ mod tests {
                 "usage: mailer [OPTIONS]\n\nunknown argument `--kiln-exit-code-probe`",
             ),
         );
-        assert_eq!(outcome.outcome, crate::gates::Outcome::Passed);
-        assert!(outcome.detail.contains("mailer"), "{}", outcome.detail);
+        assert!(outcome.is_none(), "this binary behaved: {outcome:?}");
     }
 }
