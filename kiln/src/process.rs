@@ -10,6 +10,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -78,24 +79,46 @@ impl Ran {
     }
 }
 
+/// A cargo build directory every command this process starts should share, once somebody asks for
+/// one.
+///
+/// `kiln selftest` runs one project nineteen times in a throwaway copy, and without this each of
+/// those runs would compile the same dependencies from scratch — minutes per step, spent on crates
+/// that did not change. One directory (see [`crate::scratch::shared_target_dir`]) lets cargo keep
+/// what it built between runs, which is the difference between a check that takes minutes and one
+/// that takes tens of minutes.
+static CARGO_TARGET_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Share one cargo build directory across every command this process starts.
+///
+/// Never the project's own: what asks for this is a *sandboxed* run, whose project is a copy that is
+/// deleted when the command ends.
+pub fn share_cargo_target_dir(dir: PathBuf) {
+    let _ = CARGO_TARGET_DIR.set(dir);
+}
+
 /// Run `program` with `args` in `dir`, killing it when `timeout` elapses.
 pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<Ran> {
-    let command = command_line(program, args);
+    let rendered = command_line(program, args);
     let started = Instant::now();
     let spawn_error = |source| KilnError::Spawn {
-        command: command.clone(),
+        command: rendered.clone(),
         dir: dir.to_path_buf(),
         source,
     };
+    let shared_target_dir = CARGO_TARGET_DIR.get().filter(|_| program == "cargo");
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(spawn_error)?;
+        .stderr(Stdio::piped());
+    if let Some(target_dir) = shared_target_dir {
+        command.env("CARGO_TARGET_DIR", target_dir);
+    }
+    let mut child = command.spawn().map_err(spawn_error)?;
 
     // Draining the pipes from threads keeps a chatty child from blocking on a full pipe while the
     // main thread waits for it to exit.
@@ -130,7 +153,7 @@ pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Resul
     let stdout = collect(stdout);
     let stderr = if timed_out {
         let collected = collect(stderr);
-        format!("{collected}\n{command} was killed after {timeout:?}")
+        format!("{collected}\n{rendered} was killed after {timeout:?}")
     } else {
         collect(stderr)
     };

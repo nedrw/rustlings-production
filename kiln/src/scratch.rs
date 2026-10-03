@@ -38,9 +38,66 @@ impl Drop for Scratch {
     }
 }
 
+/// The build directory a *sandboxed* run shares between its commands.
+///
+/// Not the project's (that is a throwaway copy) and not the sandbox (deleted when the command ends):
+/// the point is to keep what cargo built for the next run. So it is the user's cache directory, one
+/// per machine — and a run that cannot work out where that is simply does without, because a missing
+/// optimisation must never break a check.
+#[must_use]
+pub fn shared_target_dir() -> Option<PathBuf> {
+    let base = cache_base(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
+    let dir = base.join("kiln").join("target");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Where a cache belongs, from the two variables that say so (tested without touching the
+/// environment, which a test cannot do and should not try to).
+fn cache_base(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg));
+    }
+    let home = home?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".cache"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cache_directory_comes_from_the_variable_that_says_so() {
+        use std::ffi::OsString;
+        assert_eq!(
+            cache_base(Some(OsString::from("/tmp/cache")), None),
+            Some(PathBuf::from("/tmp/cache")),
+            "XDG_CACHE_HOME wins when it is set"
+        );
+        assert_eq!(
+            cache_base(None, Some(OsString::from("/home/learner"))),
+            Some(PathBuf::from("/home/learner/.cache")),
+            "and `$HOME/.cache` is the fallback"
+        );
+        assert_eq!(
+            cache_base(Some(OsString::new()), Some(OsString::from("/home/learner"))),
+            Some(PathBuf::from("/home/learner/.cache")),
+            "an empty variable names nothing"
+        );
+        assert_eq!(
+            cache_base(None, None),
+            None,
+            "no home, no cache: a run without one still runs"
+        );
+    }
 
     #[test]
     fn a_scratch_directory_is_created_and_cleaned_up() {

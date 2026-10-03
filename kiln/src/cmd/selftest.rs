@@ -70,6 +70,12 @@ pub fn run(cli: &Cli, session: &Session, requested: &[String]) -> Result<u8> {
             )));
         }
     };
+    // One build directory for every command this run starts, so the dependencies of the project are
+    // compiled once per machine rather than once per step: nineteen throwaway copies of one project
+    // would otherwise pay for the same crates nineteen times.
+    if let Some(target_dir) = crate::scratch::shared_target_dir() {
+        crate::process::share_cargo_target_dir(target_dir);
+    }
     project::copy_tree(&session.course().dir(), &scratch.path().join(COURSE_DIR))?;
     // The repository's own toolchain and style settings reach `app/<track>` through the directory
     // it lives in, so the sandbox needs them too; otherwise the sandbox would compile with whatever
