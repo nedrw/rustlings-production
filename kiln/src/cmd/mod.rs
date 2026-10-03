@@ -301,6 +301,138 @@ pub struct Session {
     ui: Ui,
     state: State,
     timeout: Duration,
+    /// Gate results already produced in this run, keyed by the tree they were produced on.
+    ///
+    /// `verify` judges **one tree** with nineteen steps' gate lists, and most of those are the same
+    /// gate on the same tree (`fmt`, `clippy`, `docs:public`, …): the answer cannot differ, and asking
+    /// nineteen times is most of what that command spends. `selftest` mutates its sandbox between
+    /// steps, which is why the key is the *tree* rather than just the gate — a different tree is a
+    /// different question. [`CACHEABLE`] holds the list of gates this may apply to and why the
+    /// others are left out.
+    cache: GateCache,
+}
+
+/// The gates whose answer is a property of the *tree*, and which a run may therefore answer once.
+///
+/// Everything else is left out on purpose, and for one of three reasons:
+///
+/// * **the step is part of the question** — `caps` and `i18n` judge that step's metadata and prose,
+///   which live in the course rather than in the project the fingerprint describes;
+/// * **the detail line is per step** — `images` names the images *this* step declared, and two steps
+///   of one track declare different ones;
+/// * **the gate is slow or not implemented** — `mutants`, `bench` and friends are run on purpose,
+///   and `container-repro`/`links` say what they need before they can answer anything.
+const CACHEABLE: &[&str] = &[
+    "spec-integrity",
+    "fmt",
+    "clippy",
+    "exit-code",
+    "no-todo",
+    "docs:public",
+];
+
+/// Gate results already produced in this run, by gate and by the tree they were produced on.
+#[derive(Debug, Default)]
+struct GateCache {
+    /// Key: the gate as written, plus [`tree_fingerprint`] of the project.
+    results: std::cell::RefCell<std::collections::HashMap<(String, String), GateResult>>,
+    /// How many questions were answered from the cache, for tests and for the curious.
+    hits: std::cell::Cell<usize>,
+}
+
+impl GateCache {
+    /// `true` when this gate's answer is a property of the tree alone.
+    fn covers(&self, spec: &crate::gates::GateSpec) -> bool {
+        CACHEABLE.contains(&spec.name.as_str())
+    }
+
+    /// A result this run has already produced for this gate on this tree.
+    fn get(&self, spec: &crate::gates::GateSpec, fingerprint: Option<&str>) -> Option<GateResult> {
+        let fingerprint = fingerprint?;
+        if !self.covers(spec) {
+            return None;
+        }
+        let hit = self
+            .results
+            .borrow()
+            .get(&(key_of(spec), fingerprint.to_owned()))
+            .cloned();
+        if hit.is_some() {
+            self.hits.set(self.hits.get() + 1);
+        }
+        hit
+    }
+
+    /// Remember what this gate answered on this tree.
+    fn put(&self, spec: &crate::gates::GateSpec, fingerprint: &str, result: &GateResult) {
+        if !self.covers(spec) {
+            return;
+        }
+        self.results
+            .borrow_mut()
+            .insert((key_of(spec), fingerprint.to_owned()), result.clone());
+    }
+
+    /// How many questions were answered without running a gate.
+    #[cfg(test)]
+    fn hits(&self) -> usize {
+        self.hits.get()
+    }
+}
+
+/// How one gate is named in the cache: the gate as the step wrote it, which is what decides the
+/// command that runs and the parameter it is given. The tier is not part of it (whether a *failing*
+/// gate blocks a step is decided after it has run, not by running it differently).
+fn key_of(spec: &crate::gates::GateSpec) -> String {
+    format!("{}@{:?}:{}", spec.name, spec.param, spec.slow)
+}
+
+/// A fingerprint of a project: the *contents* of every file in it, in one number.
+///
+/// It exists so that a cached gate result is never reused for a different tree — `selftest` applies a
+/// scaffold, a solution or a reset between steps, and all three change files. Contents rather than
+/// timestamps, because the other direction matters too: a spec sync that rewrites a file with the
+/// same bytes has not changed the tree, and a fingerprint that said it had would make every step's
+/// gates run again for nothing.
+fn tree_fingerprint(project_dir: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    collect_fingerprint(project_dir, project_dir, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, bytes) in files {
+        path.hash(&mut hasher);
+        bytes.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Walk one directory, skipping the two trees that are not the project: build output and the VCS.
+fn collect_fingerprint(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name == "target" || name == ".git" {
+                continue;
+            }
+            collect_fingerprint(root, &path, files);
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        files.push((relative, bytes));
+    }
 }
 
 impl Session {
@@ -334,6 +466,7 @@ impl Session {
             ui,
             state,
             timeout: Duration::from_secs(cli.timeout),
+            cache: GateCache::default(),
         })
     }
 
@@ -421,15 +554,57 @@ impl Session {
     /// with the same locale, deadline and project directory.
     pub fn gates(&self, step: &Step, run_slow: bool) -> Result<Vec<GateResult>> {
         let track = self.course.track(&step.track)?;
+        let project_dir = track.project_dir(self.course.root());
+        // One fingerprint per call, and only when the step has something cacheable to run: reading
+        // the tree is cheap, and reading it for a step whose gates are all step-scoped would be work
+        // nobody uses.
+        let fingerprint = step
+            .gates
+            .iter()
+            .any(|spec| self.cache.covers(spec))
+            .then(|| tree_fingerprint(&project_dir));
         let context = GateContext {
             course: &self.course,
             track,
             step,
-            project_dir: track.project_dir(self.course.root()),
+            project_dir,
             timeout: self.timeout,
             locale: &self.locale,
         };
-        Ok(run_all(&context, &step.gates, run_slow))
+        // What has already been answered on this tree, and what still has to run.
+        let cached: Vec<Option<GateResult>> = step
+            .gates
+            .iter()
+            .map(|spec| self.cache.get(spec, fingerprint.as_deref()))
+            .collect();
+        let to_run: Vec<crate::gates::GateSpec> = step
+            .gates
+            .iter()
+            .zip(&cached)
+            .filter(|(_, cached)| cached.is_none())
+            .map(|(spec, _)| spec.clone())
+            .collect();
+        let mut fresh = run_all(&context, &to_run, run_slow).into_iter();
+        let mut results: Vec<GateResult> = Vec::with_capacity(step.gates.len());
+        for (spec, cached) in step.gates.iter().zip(cached) {
+            let result = match cached {
+                Some(result) => result,
+                None => {
+                    let result = fresh.next().ok_or_else(|| {
+                        KilnError::Invalid(format!(
+                            "the gate runner answered fewer gates than it was given for {}",
+                            step.qualified_id()
+                        ))
+                    })?;
+                    if let Some(fingerprint) = &fingerprint {
+                        self.cache.put(spec, fingerprint, &result);
+                    }
+                    result
+                }
+            };
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Run one step's spec tests (`run.cmd`) in the project, without recording anything.
@@ -442,5 +617,102 @@ impl Session {
         })?;
         let dir = self.project_dir(step)?;
         process::run_line(&run.cmd, &dir, self.timeout)
+    }
+}
+
+#[cfg(test)]
+mod gate_cache_tests {
+    use super::{GateCache, key_of, tree_fingerprint};
+    use crate::gates::{GateSpec, Tier};
+
+    /// A gate as a step would declare it.
+    fn gate(name: &str, param: Option<&str>) -> GateSpec {
+        GateSpec {
+            name: name.to_owned(),
+            param: param.map(str::to_owned),
+            tier: Tier::Must,
+            slow: false,
+        }
+    }
+
+    /// A result worth caching.
+    fn result(detail: &str) -> crate::gates::GateResult {
+        crate::gates::GateResult {
+            spec: gate("fmt", None),
+            outcome: crate::gates::Outcome::Passed,
+            detail: detail.to_owned(),
+            elapsed: std::time::Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn a_tree_that_does_not_change_keeps_its_fingerprint() {
+        let dir = std::env::temp_dir().join(format!("kiln-fingerprint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("a scratch directory");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\n").expect("write");
+        std::fs::write(dir.join("src/lib.rs"), "//! x\n").expect("write");
+
+        let first = tree_fingerprint(&dir);
+        assert_eq!(first, tree_fingerprint(&dir), "reading twice is one answer");
+        assert_eq!(
+            first.len(),
+            16,
+            "a fingerprint is one short hex number: {first}"
+        );
+
+        // A rewrite with the same bytes is the *same* tree (a spec sync does exactly that), and a
+        // different byte is a different one.
+        std::fs::write(dir.join("src/lib.rs"), "//! x\n").expect("write");
+        assert_eq!(first, tree_fingerprint(&dir), "same bytes, same tree");
+        std::fs::write(dir.join("src/lib.rs"), "//! y\n").expect("write");
+        assert_ne!(
+            first,
+            tree_fingerprint(&dir),
+            "a tree that changed is a different question"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gate_is_asked_once_per_tree_and_not_for_a_step_scoped_one() {
+        let cache = GateCache::default();
+        let fmt = gate("fmt", None);
+        let caps = gate("caps", None);
+        let tree = "fingerprint";
+
+        assert!(
+            cache.get(&fmt, Some(tree)).is_none(),
+            "nothing is cached yet"
+        );
+        cache.put(&fmt, tree, &result("`cargo fmt --check` is clean"));
+        assert_eq!(
+            cache
+                .get(&fmt, Some(tree))
+                .expect("the second look hits")
+                .detail,
+            "`cargo fmt --check` is clean"
+        );
+        assert_eq!(cache.hits(), 1);
+
+        // A different tree is a different question, and a step-scoped gate is never cached: `caps`
+        // judges the step's own metadata, which no project fingerprint describes.
+        assert!(cache.get(&fmt, Some("other")).is_none());
+        cache.put(&caps, tree, &result("no rule R0-R6 issue"));
+        assert!(
+            cache.get(&caps, Some(tree)).is_none(),
+            "caps is never cached"
+        );
+
+        // The parameter is part of the question: `clippy@2` and `clippy@3` are different gates.
+        let rung_two = gate("clippy", Some("2"));
+        let rung_three = gate("clippy", Some("3"));
+        cache.put(&rung_two, tree, &result("rung 2"));
+        assert!(
+            cache.get(&rung_three, Some(tree)).is_none(),
+            "rungs do not share"
+        );
+        assert_eq!(key_of(&rung_two), key_of(&gate("clippy", Some("2"))));
+        assert_ne!(key_of(&rung_two), key_of(&rung_three));
     }
 }
