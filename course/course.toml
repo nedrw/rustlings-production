@@ -26,6 +26,7 @@ compiles, and the specs tell you what it must do next.
 final_message = """
 T1 `mailer` is finished: a service that starts, migrates, mails, retries, drains and ships.
 
-You have the production habits the rest of the course builds on. T2 `relay` is planned but not
-authored yet — `kiln caps` shows the capabilities waiting there, and what T1 established for good.
+You have the production habits the rest of the course builds on. T2 `relay` continues in a project
+of its own: `kiln list relay` shows where it stands, `kiln plan relay` what is left, and
+`kiln review --due` what is worth re-checking before you start.
 """

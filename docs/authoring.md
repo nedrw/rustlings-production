@@ -16,7 +16,9 @@
 | track 骨架 | `skeleton/`（整条 track 一份，第一步用它） | `skeleton/src/main.rs` |
 | 参考解 patch | `solutions/<phase>.<index>-<slug>.patch` | `solutions/1.14-worker.patch` |
 | 能力 id | `<domain>/<name>`，小写连字符 | `async/graceful-shutdown` |
-| probe / drill | `probes/<capability>.rs` / `drills/<slug>.rs` | `probes/async-graceful-shutdown.rs` |
+| probe 题 | `probes/<domain>-<name>.<level>.rs`（头部写 `probe = "<能力>@<深度>"`） | `probes/delivery-idempotency.apply.rs` |
+| probe 参考答案 | `probes/solutions/<同名>.rs` | `probes/solutions/delivery-idempotency.apply.rs` |
+| drill | `drills/<slug>.rs` | `drills/async-select-cancellation.rs` |
 
 slug 用英文、连字符、动词优先（`rate-limit-by-tenant` 优于 `tenant-limit`）。
 
@@ -254,6 +256,10 @@ track 骨架的规则与 patch 的规则一样）。
 - [ ] 规格文件本身 rustfmt 干净（它会被当成学员的 test target 编译）
 - [ ] 英文正文；译文（若有）带 `source_hash` 且未改代码块
 - [ ] `cargo xtask ci` 绿（它含 `spec-integrity`、`lint-caps` 与 `kiln selftest`）
+- [ ] `deepen`/`transfer` 步：`RECALL` 点名了更早的步骤（`track/<phase>.<index>`）、点了深度，
+      且那一步真的建立过本步的 `requires` 或要深化的槽位（`lint-caps` R5 会查）
+- [ ] `apply` 及以上的槽位：有对应的 probe（`course/probes/`），且 `kiln probe --check` 通过——
+      没有 probe 的槽位要在正文或 handoff 里写明理由（例如需要真实数据库的网络型能力）
 
 ## 10. 翻译者检查清单
 

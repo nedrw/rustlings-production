@@ -13,6 +13,10 @@ kiln reset    # take this step's scaffold back out, keeping your code
 kiln solution # apply the reference solution (recorded, not prevented)
 kiln verify   # full check, CI mode (--json, --slow)
 kiln watch    # judge again whenever the project's contents change
+kiln plan     # the path ahead; --fast marks the steps a passed probe has already proven
+kiln skip     # skip such a step (recorded as `»`, never counted as done)
+kiln probe    # re-check one capability with a 3–10 minute exercise
+kiln review   # what you have proven per capability, and what is going stale (--due)
 ```
 
 Every step = a short brief (WHY / TASK / DONE WHEN / TRAP / FURTHER) + read-only spec tests + a set of
@@ -28,8 +32,8 @@ with stricter gates and fewer hints.
 
 | track | project | difficulty | steps |
 | --- | --- | --- | --- |
-| T1 | `mailer` — subscription microservice (inspired by *Zero To Production in Rust*) | intro → mid | 22 |
-| T2 | `relay` — webhook delivery service | mid | 24 |
+| T1 | `mailer` — subscription microservice (inspired by *Zero To Production in Rust*) **delivered** | intro → mid | 22 |
+| T2 | `relay` — webhook delivery service **in progress (M1)** | mid | 24 |
 | T3 | `jobq` — job queue engine (library + worker + CLI) | mid-high | 26 |
 | T4 | `lakelet` — telemetry ingest and query | high | 24 |
 | T5 | `meskv` — distributed KV / scheduler (optional) | highest | 22 |
@@ -88,23 +92,28 @@ cargo run -p kiln -- run mailer/1.22-runbook    # scaffold + spec tests (specs a
 cargo run -p kiln -- check mailer/1.22-runbook  # the step's must gates
 cargo run -p kiln -- hint 1.1
 cargo run -p kiln -- selftest                   # scaffold-fails / solution-passes, in a scratch copy
+cargo run -p kiln -- selftest --track relay 2.1 # the same check for another track, one step at a time
 cargo run -p kiln -- verify --json              # every authored step, with honesty markers
+cargo run -p kiln -- plan --fast                # what a passed probe would let you skip, and why
+cargo run -p kiln -- probe                      # the review exercises; `probe --check` validates them
+cargo run -p kiln -- review --due               # capabilities whose last proof is over 45 days old
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
 cargo run -p kiln -- links                      # every relative link in the repository, offline
 cargo run -p kiln -- spec restore               # put the course's spec files back
-cargo run -p kiln -- lint-caps                  # 97 capabilities, 134 slots, 118 planned, 22 authored
+cargo run -p kiln -- lint-caps                  # 97 capabilities, 134 slots, 118 planned, see below
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```
 
-Also in: the course metadata under `course/` (`course.toml`, `capabilities.toml`, all 22 T1 steps in
-`tracks/mailer/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; eleven implemented
+Also in: the course metadata under `course/` (`course.toml`, `capabilities.toml`, the step tables in
+`tracks/<track>/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; eleven implemented
 gates — `spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` / `docs:public` / `exit-code` /
 `i18n` / `images` / `container-repro` / `links` — plus `timeout`, which is the runner's own deadline
 rather than a per-step gate (plan.md §6), and `conformance`, which the catalogue holds for T3;
 `list` / `caps` / `run` / `check` / `hint` / `reset` /
 `solution` / `spec restore` / `spec manifest` / `selftest` / `verify` / `watch` / `doctor` / `images` /
-`links` / `i18n status`; and the locale fallback chain. `tools/lint-caps-md.py` is the prototype the
+`links` / `i18n status` / `plan` / `skip` / `probe` / `review`; and the locale fallback chain.
+`tools/lint-caps-md.py` is the prototype the
 Rust lint was ported from; it still cross-checks the ledger against the curriculum's own tables,
 which is why it is kept:
 
@@ -112,8 +121,8 @@ which is why it is kept:
 python3 tools/lint-caps-md.py   # 97 capabilities, 118 steps, 134 (capability, depth) slots, 0 issues
 ```
 
-What is not in yet: T2–T5 content; the slow-path gates (`mutants`, `coverage`, `bench`, `loom`,
-`soak`, `sim`); capability dedup at runtime (`kiln plan --fast`, `kiln probe`, `review --due`, spaced
-repetition); translations (the fallback chain and the drift detector are ready, no locale has
-translated bodies); the `new-track` generator; a documentation site. See
+What is not in yet: T3–T5 content; the rest of T2 (`relay` is being authored step by step, see
+[docs/handoff-m1.md](docs/handoff-m1.md)); the slow-path gates (`mutants`, `coverage`, `bench`,
+`loom`, `soak`, `sim`); translations (the fallback chain and the drift detector are ready, no locale
+has translated bodies); the `new-track` generator; a documentation site. See
 [docs/plan.md](docs/plan.md) §11.
