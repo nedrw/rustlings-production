@@ -33,6 +33,8 @@
 //! and the port's methods are the only place the column names appear: no other file in the crate
 //! knows that jobs live in a table.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -42,7 +44,7 @@ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId
 use crate::engine::error::Error;
 use crate::engine::events::{EventKind, JobEvent};
 use crate::engine::sealed::Sealed;
-use crate::engine::store::{BoxFuture, Store};
+use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
 
 // Why the statements below are written out rather than assembled, and why they look the way they
 // do: `sqlx` 0.9 takes a `&'static str` and nothing else (`SqlSafeStr`), so a query built with
@@ -61,6 +63,8 @@ use crate::engine::store::{BoxFuture, Store};
 pub struct PostgresStore {
     /// The pool every statement in this file runs on.
     pool: PgPool,
+    /// How long a claim by this store is good for.
+    lease: Duration,
 }
 
 impl PostgresStore {
@@ -76,29 +80,41 @@ impl PostgresStore {
         // pool of workers rather than to the store. `connect` waits for a real connection, so a URL
         // that cannot be reached is refused here instead of at the first claim.
         let pool = PgPoolOptions::new().connect(url).await.map_err(refused)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            lease: DEFAULT_LEASE,
+        })
     }
 
-    /// Bring the schema up to date.
+    /// The same store, leasing claims for `lease`.
     ///
-    /// Runs on every start of the daemon, against a database that is usually already current, so
-    /// "the second run changes nothing" is part of what this method owes rather than a detail of
-    /// how it is written (step `mailer/1.9-postgres` made the same promise for one service).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Store`] when a migration fails.
-    pub async fn migrate(&self) -> Result<(), Error> {
-        sqlx::migrate!("./migrations")
-            .run(&self.pool)
-            .await
-            .map_err(|error| refused(sqlx::Error::Migrate(Box::new(error))))
+    /// The lease is the deployment's number (`jobq/3.7-leases-and-recovery`): the daemon passes
+    /// `worker.lease_seconds`, a test passes millimetres, and the row is stamped with whichever one
+    /// the store it was claimed from was built with.
+    #[must_use]
+    pub fn with_lease(mut self, lease: Duration) -> Self {
+        self.lease = lease;
+        self
     }
+
 }
 
 impl Sealed for PostgresStore {}
 
 impl Store for PostgresStore {
+    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            // `jobq/3.7-leases-and-recovery` is where the daemon starts calling this on every start,
+            // so the promise the store fixture of `jobq/3.5-store-port-conformance` has been relying
+            // on — "the second run changes nothing" — is now a promise the port makes rather than one
+            // that fixture happens to keep.
+            sqlx::migrate!("./migrations")
+                .run(&self.pool)
+                .await
+                .map_err(|error| refused(sqlx::Error::Migrate(Box::new(error))))
+        })
+    }
+
     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
         Box::pin(async move {
             if request.max_attempts == 0 {
@@ -119,7 +135,7 @@ impl Store for PostgresStore {
                      (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
                  values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
                  returning id, queue, payload::text as payload, state, priority, run_at, \
-                           attempts, max_attempts, last_error",
+                           attempts, max_attempts, last_error, lease_owner, lease_expires_at",
             )
             .bind(id.as_uuid())
             .bind(request.queue.as_str())
@@ -149,11 +165,6 @@ impl Store for PostgresStore {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
         Box::pin(async move {
-            // Nothing records who holds a job yet (step `jobq/3.7-leases-and-recovery` adds the
-            // lease), so the worker is not written down here either — the two backends have to
-            // answer the same questions, and an answer the in-memory store cannot give is not one
-            // the port may rely on. The name is still the interface.
-            let _ = worker;
             let now = Utc::now();
             // One statement, and the shape of it is the whole promise: the rows are chosen with
             // `for update skip locked` *inside* the update that stamps them, so a second claim
@@ -167,9 +178,14 @@ impl Store for PostgresStore {
             // longest due, then identity): `returning` says which rows changed, not in which
             // order, and an order that comes out of the database by accident is an order that
             // changes the day an index does.
+            // The claim stamps the lease in the same statement that stamps the attempt, and that
+            // is the point of this step: a row that is running without an owner is a row nobody can
+            // recover, and a row whose owner is written in a second statement is a row that is
+            // unowned for as long as the second statement takes.
             let rows: Vec<JobRow> = sqlx::query_as(
                 "with taken as ( \
-                     update jobs set state = 'running', attempts = jobs.attempts + 1 \
+                     update jobs set state = 'running', attempts = jobs.attempts + 1, \
+                                     lease_owner = $4, lease_expires_at = $5 \
                      where id in ( \
                          select id from jobs \
                          where queue = $1 and state = 'queued' and run_at <= $2 \
@@ -178,10 +194,10 @@ impl Store for PostgresStore {
                          for update skip locked \
                      ) \
                      returning id, queue, payload::text as payload, state, priority, run_at, \
-                               attempts, max_attempts, last_error \
+                               attempts, max_attempts, last_error, lease_owner, lease_expires_at \
                  ) \
                  select id, queue, payload::text as payload, state, priority, run_at, attempts, \
-                        max_attempts, last_error \
+                        max_attempts, last_error, lease_owner, lease_expires_at \
                  from taken order by priority desc, run_at asc, id asc",
             )
             .bind(queue.as_str())
@@ -190,6 +206,12 @@ impl Store for PostgresStore {
             // queue no process could hold: saturating keeps that impossible case out of the port's
             // error surface instead of adding a refusal nobody can reach.
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(worker.as_str())
+            // The lease's end is computed from the *engine's* clock and bound in, for the reason the
+            // claim's `run_at` comparison is: a database clock is a second authority on time, and two
+            // authorities disagree eventually (step `jobq/3.8-clock-injection` is where the engine's
+            // becomes injectable, and it must be the only one either backend reads).
+            .bind(now + self.lease)
             .fetch_all(&self.pool)
             .await
             .map_err(refused)?;
@@ -203,10 +225,7 @@ impl Store for PostgresStore {
         id: &'a JobId,
     ) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
-            let _ = worker;
-            // The worker is not asked for a second time here either: the guard is the row's own
-            // state, which is the only thing that can decide this once two workers disagree.
-            self.settle(id, Change::Completed).await.map(|_| ())
+            self.settle(worker, id, Change::Completed).await.map(|_| ())
         })
     }
 
@@ -217,8 +236,7 @@ impl Store for PostgresStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<JobState, Error>> {
         Box::pin(async move {
-            let _ = worker;
-            self.settle(id, Change::Failed { reason }).await
+            self.settle(worker, id, Change::Failed { reason }).await
         })
     }
 
@@ -226,7 +244,7 @@ impl Store for PostgresStore {
         Box::pin(async move {
             let row: Option<JobRow> = sqlx::query_as(
                 "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
-                        max_attempts, last_error \
+                        max_attempts, last_error, lease_owner, lease_expires_at \
                  from jobs where id = $1",
             )
             .bind(id.as_uuid())
@@ -250,6 +268,58 @@ impl Store for PostgresStore {
         })
     }
 
+    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            // One statement, so there is nothing to retry and nothing to isolate: either this worker
+            // still holds the row (and the instant moves) or it does not (and nothing happens).
+            let renewed = sqlx::query(
+                "update jobs set lease_expires_at = $2 \
+                 where lease_owner = $1 and state = 'running'",
+            )
+            .bind(worker.as_str())
+            // The engine's clock again, bound in: a renewal measured against the database's clock
+            // would be a second authority on how long a lease is.
+            .bind(Utc::now() + self.lease)
+            .execute(&self.pool)
+            .await
+            .map_err(refused)?;
+            Ok(u32::try_from(renewed.rows_affected()).unwrap_or(u32::MAX))
+        })
+    }
+
+    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            // One statement, and the reason it can be one: everything here is a decision the
+            // *database* can make from the rows it is already holding. The rows this worker holds
+            // are locked, the budget decides where each one goes, and the lines that say so are
+            // inserted in the same statement — so a worker that is handing back forty jobs either
+            // hands back forty or hands back none, and no reader ever sees the half of it.
+            let written = sqlx::query(GIVE_BACK)
+                .bind(worker.as_str())
+                .bind(HANDED_BACK)
+                .bind(EventKind::Reclaimed.as_str())
+                .bind(Utc::now())
+                .execute(&self.pool)
+                .await
+                .map_err(refused)?;
+            Ok(u32::try_from(written.rows_affected()).unwrap_or(u32::MAX))
+        })
+    }
+
+    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            let written = sqlx::query(RECLAIM)
+                .bind(Utc::now())
+                .bind(RECLAIM_BATCH)
+                .bind(ABANDONED)
+                .bind(EventKind::Reclaimed.as_str())
+                .execute(&self.pool)
+                .await
+                .map_err(refused)?;
+            Ok(u32::try_from(written.rows_affected()).unwrap_or(u32::MAX))
+        })
+    }
+
     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
         Box::pin(async move {
             // The order is the port's promise, so it is written here rather than left to whatever
@@ -268,6 +338,71 @@ impl Store for PostgresStore {
     }
 }
 
+/// How many rows one run of the reclaimer may take back.
+///
+/// A bound rather than "everything that is expired": the rows a single worker can be holding when it
+/// dies are bounded by the batch it claimed, so a run that finds more than this is a run looking at
+/// a fleet that stopped — and the next turn, a moment later, is the right place to find that out
+/// rather than one transaction that locks a table's worth of rows while it writes them back.
+const RECLAIM_BATCH: i64 = 128;
+
+/// Put back everything this worker still holds, and write the line that says so.
+///
+/// Two `with` clauses and an insert: `held` takes the rows this worker holds (and nothing else — the
+/// filter is the whole safety property, see `Store::release`), `put_back` moves each one to the state
+/// its own budget leaves it in, and the insert writes one `reclaimed` line per row. One statement,
+/// so there is no window in which a row has moved and its line has not.
+///
+/// `gen_random_uuid()` mints the line's identity in the database rather than in the engine, which is
+/// the one place this file differs from `JobEvent::new` on purpose: the rows are being written by
+/// SQL, and asking Rust for forty of them would mean forty round trips through a statement that
+/// already has everything it needs.
+const GIVE_BACK: &str = "with held as ( \
+        select id, attempts, max_attempts from jobs \
+        where state = 'running' and lease_owner = $1 \
+        for update \
+    ), put_back as ( \
+        update jobs set \
+            state = case when held.attempts < held.max_attempts then 'queued' else 'failed' end, \
+            last_error = $2, \
+            lease_owner = null, \
+            lease_expires_at = null \
+        from held \
+        where jobs.id = held.id \
+        returning jobs.id as id, jobs.attempts as attempt \
+    ) \
+    insert into job_events (id, job_id, kind, attempt, detail, at) \
+    select gen_random_uuid(), id, $3, attempt, $2, $4 from put_back \
+    on conflict (job_id, kind, attempt) do nothing";
+
+/// Put back everything whose lease has run out, and write the line that says so.
+///
+/// The same statement as `GIVE_BACK` with the other predicate: `state = 'running' and
+/// lease_expires_at <= $1`, ordered by the instant and bounded by [`RECLAIM_BATCH`]. `for update skip
+/// locked` is what keeps a reclaimer from *waiting* for a worker that is right in the middle of
+/// settling one of these rows: a row somebody is writing is not abandoned, and a worker that stops
+/// on a lock that is about to be released would be a worker that stops exactly when a crash is being
+/// cleaned up.
+const RECLAIM: &str = "with expired as ( \
+        select id, attempts, max_attempts from jobs \
+        where state = 'running' and lease_expires_at <= $1 \
+        order by lease_expires_at asc, id asc \
+        limit $2 \
+        for update skip locked \
+    ), put_back as ( \
+        update jobs set \
+            state = case when expired.attempts < expired.max_attempts then 'queued' else 'failed' end, \
+            last_error = $3, \
+            lease_owner = null, \
+            lease_expires_at = null \
+        from expired \
+        where jobs.id = expired.id \
+        returning jobs.id as id, jobs.attempts as attempt \
+    ) \
+    insert into job_events (id, job_id, kind, attempt, detail, at) \
+    select gen_random_uuid(), id, $4, attempt, $3, $1 from put_back \
+    on conflict (job_id, kind, attempt) do nothing";
+
 /// The statement a settle's transaction starts with.
 ///
 /// One line, and the step's whole isolation argument. At `repeatable read` a transaction's reads
@@ -283,15 +418,23 @@ impl Store for PostgresStore {
 const SETTLE: &str = "begin isolation level repeatable read";
 
 /// The statement that records a success.
-const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null \
-                       where id = $1 and state = 'running' \
+///
+/// `and lease_owner = $2` is the guard `jobq/3.7-leases-and-recovery` adds to the one that was
+/// already there, and it closes the window a lease opens: a worker that was killed, whose row was
+/// reclaimed and claimed by somebody else, would otherwise settle *that* attempt — it holds the
+/// same job id, and "running" is still true. What it does not hold is the lease, and the row is the
+/// only place that can tell the two workers apart.
+const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null, \
+                               lease_owner = null, lease_expires_at = null \
+                       where id = $1 and state = 'running' and lease_owner = $2 \
                        returning state, attempts";
 
 /// The statement that records a failure: the row's own budget decides where the job goes, in the
-/// same statement that writes the reason down.
-const FAIL: &str = "update jobs set last_error = $2, \
-                           state = case when attempts < max_attempts then 'queued' else 'failed' end \
-                    where id = $1 and state = 'running' \
+/// same statement that writes the reason down — and the same lease guard.
+const FAIL: &str = "update jobs set last_error = $3, \
+                           state = case when attempts < max_attempts then 'queued' else 'failed' end, \
+                           lease_owner = null, lease_expires_at = null \
+                    where id = $1 and state = 'running' and lease_owner = $2 \
                     returning state, attempts";
 
 /// What a settle does to the row it touches.
@@ -318,11 +461,15 @@ impl Change<'_> {
     async fn apply(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
+        worker: &WorkerId,
         id: &JobId,
     ) -> Result<Option<(String, i64)>, Error> {
         let row = match self {
-            Change::Completed => sqlx::query_as(COMPLETE).bind(id.as_uuid()),
-            Change::Failed { reason } => sqlx::query_as(FAIL).bind(id.as_uuid()).bind(*reason),
+            Change::Completed => sqlx::query_as(COMPLETE).bind(id.as_uuid()).bind(worker.as_str()),
+            Change::Failed { reason } => sqlx::query_as(FAIL)
+                .bind(id.as_uuid())
+                .bind(worker.as_str())
+                .bind(*reason),
         }
         .fetch_optional(&mut **transaction)
         .await
@@ -373,23 +520,34 @@ impl PostgresStore {
     /// [`Error::NotFound`] when there is no such row, [`Error::Invalid`] when the row is not
     /// running, [`Error::Conflict`] when a concurrent writer made the database refuse the
     /// transaction, [`Error::Store`] for anything else the backend refused.
-    async fn settle(&self, id: &JobId, change: Change<'_>) -> Result<JobState, Error> {
+    async fn settle(
+        &self,
+        worker: &WorkerId,
+        id: &JobId,
+        change: Change<'_>,
+    ) -> Result<JobState, Error> {
         let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
-        let Some((state, attempts)) = change.apply(&mut transaction, id).await? else {
-            // Nothing moved, and there are two different reasons for that — which is why the
+        let Some((state, attempts)) = change.apply(&mut transaction, worker, id).await? else {
+            // Nothing moved, and there are three different reasons for that — which is why the
             // refusal is a second question, asked through the transaction that just wrote, rather
-            // than a message invented here.
-            let unreadable = format!(
-                "job {id} is {}, not running: {}",
-                state_of(&mut transaction, id)
-                    .await?
-                    .as_deref()
-                    .unwrap_or("gone"),
-                change.refusal()
-            );
-            let refusal = match state_of(&mut transaction, id).await? {
-                Some(_) => Error::Invalid { detail: unreadable },
+            // than a message invented here. The third one is the step: the row is running, and it
+            // is somebody else's.
+            let refusal = match state_and_holder(&mut transaction, id).await? {
                 None => Error::NotFound { id: *id },
+                Some((state, Some(owner))) if owner != worker.as_str() => Error::Invalid {
+                    detail: format!(
+                        "job {id} is {state} and held by {owner}, not by {worker}: {}. A claim that \
+                         was reclaimed belongs to whoever holds it now, and a worker that comes back \
+                         to settle it would be settling somebody else's attempt",
+                        change.refusal()
+                    ),
+                },
+                Some((state, _)) => Error::Invalid {
+                    detail: format!(
+                        "job {id} is {state}, not running: {}",
+                        change.refusal()
+                    ),
+                },
             };
             // Nothing was written (the update matched no row), so there is nothing to undo; the
             // rollback is what says so out loud, and it releases the snapshot and the locks the
@@ -443,19 +601,24 @@ async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool,
     Ok(written.rows_affected() > 0)
 }
 
-/// What the `state` column says about one job, or `None` when there is no such row.
+/// What the `state` column says about one job, and who holds it, or `None` when there is no row.
 ///
-/// Asked only after a write that changed nothing, to tell "this job is gone" from "this job is not
-/// running" — the two refusals the port separates and the two a caller acts on differently. It is
-/// asked *through the transaction that just wrote*, so the answer belongs to the same snapshot as
-/// the refusal it explains.
-async fn state_of(connection: &mut PgConnection, id: &JobId) -> Result<Option<String>, Error> {
-    let row: Option<(String,)> = sqlx::query_as("select state from jobs where id = $1")
-        .bind(id.as_uuid())
-        .fetch_optional(connection)
-        .await
-        .map_err(refused)?;
-    Ok(row.map(|(state,)| state))
+/// Asked only after a write that changed nothing, to tell the three refusals apart: this job is
+/// gone, this job is not running, and this job is running but it is not this worker's. It is asked
+/// *through the transaction that just wrote*, so the answer belongs to the same snapshot as the
+/// refusal it explains — and the third of those is what the lease guard needs to explain itself
+/// (`jobq/3.7-leases-and-recovery`).
+async fn state_and_holder(
+    connection: &mut PgConnection,
+    id: &JobId,
+) -> Result<Option<(String, Option<String>)>, Error> {
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("select state, lease_owner from jobs where id = $1")
+            .bind(id.as_uuid())
+            .fetch_optional(connection)
+            .await
+            .map_err(refused)?;
+    Ok(row)
 }
 
 /// One row of `jobs`, in the shape the driver decodes it.
@@ -485,6 +648,10 @@ struct JobRow {
     max_attempts: i64,
     /// Why the last attempt failed, when one did.
     last_error: Option<String>,
+    /// Who holds it, as a name, when somebody does.
+    lease_owner: Option<String>,
+    /// When the claim runs out, when somebody holds it.
+    lease_expires_at: Option<DateTime<Utc>>,
 }
 
 impl JobRow {
@@ -504,6 +671,11 @@ impl JobRow {
             attempts: count(self.attempts, "attempts")?,
             max_attempts: count(self.max_attempts, "max_attempts")?,
             last_error: self.last_error,
+            // The owner travels as the string the column holds and is parsed on the way in, so that
+            // a row the engine wrote and cannot read back is reported here rather than becoming a
+            // job whose lease belongs to a name nobody can use.
+            lease_owner: self.lease_owner.map(WorkerId::new),
+            lease_expires_at: self.lease_expires_at,
         })
     }
 }

@@ -204,7 +204,9 @@ impl fmt::Display for JobState {
 ///
 /// `#[non_exhaustive]` writes that promise into the type (step `jobq/3.2-public-api-baseline`):
 /// private fields already make the constructor the door, and this says out loud that the row is
-/// going to grow rather than that it happens to look finished today.
+/// going to grow rather than that it happens to look finished today. It has grown once so far: the
+/// two lease fields of step `jobq/3.7-leases-and-recovery` arrived without any caller of `Job`
+/// having to be rebuilt, which is the promise being kept rather than described.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -226,6 +228,10 @@ pub struct Job {
     pub(crate) max_attempts: u32,
     /// Why the last attempt failed, when one did.
     pub(crate) last_error: Option<String>,
+    /// Who holds it, when somebody does.
+    pub(crate) lease_owner: Option<WorkerId>,
+    /// When the claim runs out, when somebody holds it.
+    pub(crate) lease_expires_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -281,6 +287,26 @@ impl Job {
     #[must_use]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Who holds this job, when somebody does.
+    ///
+    /// `jobq/3.7-leases-and-recovery` is where this stops being `None` for a running job: a claim
+    /// stamps the worker that made it, `Store::renew` moves the instant next to it, and a *settle*
+    /// refuses a write from a worker the row no longer names — which is what stops a worker that
+    /// was already declared dead from settling the attempt its successor is running right now.
+    #[must_use]
+    pub fn lease_owner(&self) -> Option<&WorkerId> {
+        self.lease_owner.as_ref()
+    }
+
+    /// When the claim on this job runs out, when somebody holds it.
+    ///
+    /// After this instant the row is presumed abandoned and `Store::reclaim_expired` puts it back
+    /// in its queue: the owner is a hint, and this is the deadline that decides.
+    #[must_use]
+    pub fn lease_expires_at(&self) -> Option<DateTime<Utc>> {
+        self.lease_expires_at
     }
 
     /// `true` when another attempt is allowed after this one fails.

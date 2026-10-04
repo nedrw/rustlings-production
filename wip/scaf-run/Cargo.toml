@@ -1,0 +1,54 @@
+# The `jobq` engine, as it comes out of the box: the library, the two binaries around it, a test
+# harness that already works, and the dependencies the first steps need.
+#
+# T3 step 1 (`jobq/3.1-engine-boundary`) fills the modules in. Later scaffolds add dependencies,
+# members and lints *inside the marked blocks* — that rule is what keeps your own edits safe
+# (docs/authoring.md §5).
+
+[package]
+name = "jobq"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# kiln:scaffold:begin
+chrono = { version = "0.4.42", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, optional = true, features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "chrono"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "fmt", "env-filter"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+# kiln:scaffold:end
+
+# The crate assembles two ways, and this table is the whole of it (step `jobq/3.4-feature-assembly`):
+# the in-memory engine is the floor every combination has, and `postgres` adds the durable backend on
+# top of it. Features are additive — enabling one never disables another — which is why nothing here
+# is spelled "without", and why the matrix of combinations is checked rather than the flags.
+#
+# `postgres` is a list rather than a bare name because `jobq/3.5-store-port-conformance` adds the
+# durable backend's dependency wiring to it, and a scaffold may only insert lines into a marked block
+# (docs/authoring.md §5): the block belongs here from the step that writes the table.
+[features]
+# kiln:scaffold:begin
+default = ["postgres"]
+postgres = [
+    "dep:sqlx",
+]
+# kiln:scaffold:end
+
+# The crate's own lint policy. `jobq/3.24-unsafe-budget` is the step that argues for
+# `unsafe_code = "deny"`, and the block below is where it lands.
+[lints.rust]
+# kiln:scaffold:begin
+# kiln:scaffold:end
+
+# This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+[workspace]
+members = [
+    # kiln:scaffold:begin
+    # kiln:scaffold:end
+]

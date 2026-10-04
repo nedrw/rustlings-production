@@ -11,9 +11,15 @@
 //! guard is alive, so a settle that is refused writes neither, and a settle that answers writes
 //! both. The *idempotence* of an append is the same kind of translation: a unique index under a
 //! table, and here the key of a map.
+//!
+//! `jobq/3.7-leases-and-recovery` adds the third: the lease. The in-memory store stamps one, renews
+//! one, releases one and reclaims an expired one, and every one of those is the same decision the
+//! durable backend makes in SQL — including the guard that matters most, which is that a settle only
+//! counts from the worker the row still names.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
@@ -21,7 +27,7 @@ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId
 use crate::engine::error::Error;
 use crate::engine::events::{EventKind, JobEvent};
 use crate::engine::sealed::Sealed;
-use crate::engine::store::{BoxFuture, Store};
+use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
 
 /// What this store knows, under one lock.
 ///
@@ -68,6 +74,16 @@ impl Ledger {
         });
         trail
     }
+
+    /// Whether this row is this worker's to settle.
+    ///
+    /// The check the durable backend writes as `and lease_owner = $2` in its `where` clause, in the
+    /// shape a map can ask it: the row has to be running *and* still name this worker, because a
+    /// worker whose lease was reclaimed and handed to somebody else is a worker whose attempt is
+    /// over — whatever it thinks.
+    fn holds(job: &Job, worker: &WorkerId) -> bool {
+        job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker)
+    }
 }
 
 /// Jobs in a map, protected by a mutex. One process, no durability, honest about both.
@@ -76,10 +92,21 @@ impl Ledger {
 /// `jobq/3.2-public-api-baseline`): the conformance suite of step `jobq/3.5-store-port-conformance`
 /// is written against it and against the durable one, which is the whole reason an outside
 /// implementation is not welcome.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryStore {
     /// The rows and the trail behind one lock.
     ledger: Mutex<Ledger>,
+    /// How long a claim by this store is good for.
+    lease: Duration,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            ledger: Mutex::default(),
+            lease: DEFAULT_LEASE,
+        }
+    }
 }
 
 impl MemoryStore {
@@ -87,6 +114,18 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same store, leasing claims for `lease`.
+    ///
+    /// The lease is a *setting* rather than a constant because the right value is the deployment's:
+    /// it has to be longer than the slowest attempt the operator is willing to wait for and shorter
+    /// than the recovery they are willing to accept, and a test that has to watch a lease run out
+    /// needs it in millimetres (`jobq/3.7-leases-and-recovery`).
+    #[must_use]
+    pub fn with_lease(mut self, lease: Duration) -> Self {
+        self.lease = lease;
+        self
     }
 
     /// The store's contents, taken without a panic path: a poisoned mutex means some other thread
@@ -150,6 +189,9 @@ impl Store for MemoryStore {
                 attempts: 0,
                 max_attempts: request.max_attempts,
                 last_error: None,
+                // Nobody holds a job that has just been written: the lease arrives with the claim.
+                lease_owner: None,
+                lease_expires_at: None,
             };
             self.ledger().jobs.insert(job.id, job.clone());
             Ok(job)
@@ -163,15 +205,10 @@ impl Store for MemoryStore {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
         Box::pin(async move {
-            // Nothing records who holds a job yet, so the worker is not written down here either —
-            // the two backends have to answer the same questions, and an answer only this one can
-            // give is not one the port may rely on (step `jobq/3.7-leases-and-recovery` gives both
-            // of them the lease). The name is still the interface.
-            let _ = worker;
             let now = Utc::now();
-            // One lock, one decision: choosing the due jobs and stamping them happen in the same
-            // critical section, so a second claim on this store cannot read the same row as free
-            // while this one is on its way to marking it running.
+            // One lock, one decision: choosing the due jobs, stamping them running and leasing them
+            // happen in the same critical section, so a second claim on this store cannot read the
+            // same row as free while this one is on its way to marking it running.
             let mut ledger = self.ledger();
             let due = Self::due(&ledger.jobs, queue, now);
             let mut claimed = Vec::new();
@@ -181,6 +218,10 @@ impl Store for MemoryStore {
                     // An attempt starts when a worker takes the job, not when it finishes: a
                     // worker that dies holding a job must still have spent one.
                     job.attempts += 1;
+                    // And so does the lease: from here until somebody renews it, this row is this
+                    // worker's, and the row is the only place that says so.
+                    job.lease_owner = Some(worker.clone());
+                    job.lease_expires_at = Some(now + self.lease);
                     claimed.push(job.clone());
                 }
             }
@@ -194,23 +235,20 @@ impl Store for MemoryStore {
         id: &'a JobId,
     ) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
-            let _ = worker;
             let mut ledger = self.ledger();
             let Some(job) = ledger.jobs.get_mut(id) else {
                 return Err(Error::NotFound { id: *id });
             };
-            if job.state != JobState::Running {
+            if !Ledger::holds(job, worker) {
                 return Err(Error::Invalid {
-                    detail: format!(
-                        "job {id} is {}, not running: only the worker that claimed it can complete \
-                         it",
-                        job.state
-                    ),
+                    detail: refused(job, worker, "only the worker that claimed it can complete it"),
                 });
             }
             let attempt = job.attempts;
             job.state = JobState::Succeeded;
             job.last_error = None;
+            job.lease_owner = None;
+            job.lease_expires_at = None;
             // The line goes in while the same guard is held: this store has no transaction to commit
             // or roll back, so the lock *is* the transaction, and a refusal above returns before
             // either write happens.
@@ -232,17 +270,16 @@ impl Store for MemoryStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<JobState, Error>> {
         Box::pin(async move {
-            let _ = worker;
             let mut ledger = self.ledger();
             let Some(job) = ledger.jobs.get_mut(id) else {
                 return Err(Error::NotFound { id: *id });
             };
-            if job.state != JobState::Running {
+            if !Ledger::holds(job, worker) {
                 return Err(Error::Invalid {
-                    detail: format!(
-                        "job {id} is {}, not running: a failure is only recorded against an \
-                         attempt somebody actually started",
-                        job.state
+                    detail: refused(
+                        job,
+                        worker,
+                        "a failure is only recorded against an attempt somebody actually started",
                     ),
                 });
             }
@@ -254,6 +291,8 @@ impl Store for MemoryStore {
                 JobState::Failed
             };
             let state = job.state;
+            job.lease_owner = None;
+            job.lease_expires_at = None;
             // The attempt the line names is the one the claim started, read off the row the same
             // guard is holding: a trail built from a second read could name an attempt that had
             // already moved on (step `jobq/3.6-transaction-isolation`).
@@ -278,5 +317,112 @@ impl Store for MemoryStore {
 
     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
         Box::pin(async move { Ok(self.ledger().events_of(id)) })
+    }
+
+    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
+        // A store with no schema has nothing to prepare, and saying so is the whole answer: a
+        // caller that has to know which backend it is holding does not have a port.
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            let until = Utc::now() + self.lease;
+            let mut ledger = self.ledger();
+            let mut renewed = 0;
+            for job in ledger.jobs.values_mut() {
+                // The filter is the safety property: a worker renews what it holds, not what
+                // it remembers holding.
+                if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
+                    job.lease_expires_at = Some(until);
+                    renewed += 1;
+                }
+            }
+            Ok(renewed)
+        })
+    }
+
+    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            let now = Utc::now();
+            let mut ledger = self.ledger();
+            let mut handed_back = Vec::new();
+            for (id, job) in ledger.jobs.iter_mut() {
+                if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
+                    handed_back.push((*id, put_back(job, HANDED_BACK)));
+                }
+            }
+            for (id, attempt) in &handed_back {
+                ledger.record(&JobEvent::new(
+                    *id,
+                    EventKind::Reclaimed,
+                    *attempt,
+                    Some(HANDED_BACK.to_owned()),
+                    now,
+                ));
+            }
+            Ok(u32::try_from(handed_back.len()).unwrap_or(u32::MAX))
+        })
+    }
+
+    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
+        Box::pin(async move {
+            let now = Utc::now();
+            let mut ledger = self.ledger();
+            let mut expired = Vec::new();
+            for (id, job) in ledger.jobs.iter_mut() {
+                // The instant decides, not the owner: the worker that took this row may still be
+                // alive and merely stuck, and it is the lease — the promise it failed to keep —
+                // that says the row belongs to somebody else now.
+                if job.state == JobState::Running && job.lease_expires_at.is_some_and(|at| at <= now) {
+                    expired.push((*id, put_back(job, ABANDONED)));
+                }
+            }
+            for (id, attempt) in &expired {
+                ledger.record(&JobEvent::new(
+                    *id,
+                    EventKind::Reclaimed,
+                    *attempt,
+                    Some(ABANDONED.to_owned()),
+                    now,
+                ));
+            }
+            Ok(u32::try_from(expired.len()).unwrap_or(u32::MAX))
+        })
+    }
+}
+
+/// Put one row back in its queue, and answer which attempt the line it gets will name.
+///
+/// The two rules the whole recovery story rests on are in this function, and the durable backend
+/// writes them as one `case` expression:
+///
+/// * the attempt that was abandoned stays counted — it was started, whether or not anybody watched
+///   it end, and a count that forgave it would let one payload that kills its worker be retried for
+///   ever;
+/// * the job goes back to `queued` while the budget has a try left and to `failed` when it does
+///   not, which is what makes a poison payload die: nobody has to *fail* it for the queue to stop
+///   handing it out.
+fn put_back(job: &mut Job, reason: &str) -> u32 {
+    job.state = if job.attempts < job.max_attempts {
+        JobState::Queued
+    } else {
+        JobState::Failed
+    };
+    job.last_error = Some(reason.to_owned());
+    job.lease_owner = None;
+    job.lease_expires_at = None;
+    job.attempts
+}
+
+/// Why one worker may not settle this row, in the two cases that look alike and are not.
+fn refused(job: &Job, worker: &WorkerId, why: &str) -> String {
+    match &job.lease_owner {
+        Some(owner) if owner != worker => format!(
+            "{} is held by {owner}, not by {worker}: {why}, and a claim that was reclaimed belongs \
+             to whoever holds it now",
+            job.id
+        ),
+        _ => format!("{} is {}, not running: {why}", job.id, job.state),
     }
 }

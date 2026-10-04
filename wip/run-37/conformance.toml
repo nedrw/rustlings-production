@@ -1,0 +1,5 @@
+# One suite, many implementations: `kiln` re-runs this step's spec once per backend, with
+# `KILN_BACKEND` naming the store the fixture builds. A backend listed here without a fixture to
+# build it is a green gate that proves nothing, so the list and `tests/support/store.rs` have to
+# agree (step `jobq/3.5-store-port-conformance`).
+backends = ["memory", "postgres"]

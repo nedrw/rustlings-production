@@ -82,10 +82,9 @@ impl Backend {
     ///
     /// [`Error::Store`] when the backend refused to apply its schema.
     pub async fn migrate(&self) -> Result<(), Error> {
-        match self {
-            Backend::Memory(_) => Ok(()),
-            Backend::Postgres { store, .. } => store.migrate().await,
-        }
+        // One call, because `jobq/3.7-leases-and-recovery` put the step on the port: a backend with
+        // no schema answers `Ok(())`, which is the answer this match used to spell out by hand.
+        self.store().migrate().await
     }
 }
 

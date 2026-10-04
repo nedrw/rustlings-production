@@ -106,6 +106,19 @@ pub struct WorkerSettings {
     pub poll_interval_ms: u64,
     /// How long the drain may take after a stop signal before the process ends anyway.
     pub shutdown_seconds: u64,
+    /// How long a claim by this process is good for.
+    ///
+    /// `jobq/3.7-leases-and-recovery`'s number, and it is a trade rather than a default: longer than
+    /// the slowest attempt the operator is willing to wait for (or the row's own lease runs out
+    /// underneath the worker holding it, and two workers run one job) and shorter than the recovery
+    /// they are willing to accept (because that is how long a `kill -9` makes work invisible).
+    pub lease_seconds: u64,
+    /// The program to run for each job, as a program and its arguments.
+    ///
+    /// `None` means the daemon records the jobs it takes rather than running anything: a queue with
+    /// no application handler is still a queue, and failing every job because a setting is missing
+    /// would spend the queue's attempt budgets on a misconfiguration.
+    pub handler: Option<String>,
 }
 
 /// The effective settings: every layer already applied.
@@ -193,6 +206,12 @@ struct FileWorker {
     /// How long the drain may take after a stop signal.
     #[serde(default)]
     shutdown_seconds: Option<u64>,
+    /// How long a claim is good for.
+    #[serde(default)]
+    lease_seconds: Option<u64>,
+    /// The program to run for each job.
+    #[serde(default)]
+    handler: Option<String>,
 }
 
 /// `[log]` in a file.
@@ -220,6 +239,8 @@ impl Default for Config {
                 batch: 8,
                 poll_interval_ms: 250,
                 shutdown_seconds: 10,
+                lease_seconds: 60,
+                handler: None,
             },
             log: LogSettings {
                 level: "info".to_owned(),
@@ -293,6 +314,12 @@ impl Config {
         if let Some(seconds) = file.worker.shutdown_seconds {
             self.worker.shutdown_seconds = seconds;
         }
+        if let Some(seconds) = file.worker.lease_seconds {
+            self.worker.lease_seconds = seconds;
+        }
+        if let Some(handler) = file.worker.handler {
+            self.worker.handler = Some(handler);
+        }
         if let Some(level) = file.log.level {
             self.log.level = level;
         }
@@ -332,6 +359,12 @@ impl Config {
                 }
                 (Some("WORKER"), Some("SHUTDOWN_SECONDS"), None) => {
                     self.worker.shutdown_seconds = parse_number(name, value)?;
+                }
+                (Some("WORKER"), Some("LEASE_SECONDS"), None) => {
+                    self.worker.lease_seconds = parse_number(name, value)?;
+                }
+                (Some("WORKER"), Some("HANDLER"), None) => {
+                    self.worker.handler = Some(value.clone());
                 }
                 (Some("LOG"), Some("LEVEL"), None) => self.log.level = value.clone(),
                 (Some("LOG"), Some("FORMAT"), None) => {
@@ -375,6 +408,26 @@ impl Config {
                 detail: "worker.shutdown_seconds must be at least 1".to_owned(),
             });
         }
+        if self.worker.lease_seconds == 0 {
+            return Err(Error::Invalid {
+                detail: "worker.lease_seconds must be at least 1: a lease of zero is a claim that \
+                         has already run out, and every row this worker takes would be reclaimed \
+                         from under it"
+                    .to_owned(),
+            });
+        }
+        if self
+            .worker
+            .handler
+            .as_deref()
+            .is_some_and(|handler| handler.trim().is_empty())
+        {
+            return Err(Error::Invalid {
+                detail: "worker.handler cannot be empty: name the program to run for each job, or \
+                         leave the setting out and let the daemon record the jobs it takes"
+                    .to_owned(),
+            });
+        }
         if self.log.level.trim().is_empty() {
             return Err(Error::Invalid {
                 detail: "log.level cannot be empty".to_owned(),
@@ -401,6 +454,11 @@ impl Config {
             format!("worker.batch = {}", self.worker.batch),
             format!("worker.poll_interval_ms = {}", self.worker.poll_interval_ms),
             format!("worker.shutdown_seconds = {}", self.worker.shutdown_seconds),
+            format!("worker.lease_seconds = {}", self.worker.lease_seconds),
+            format!(
+                "worker.handler = {}",
+                self.worker.handler.as_deref().unwrap_or("none")
+            ),
             format!("log.level = {}", self.log.level),
             format!("log.format = {}", self.log.format.as_str()),
         ]
