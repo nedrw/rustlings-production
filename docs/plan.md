@@ -203,6 +203,7 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 `design` 保留 `run` 的理由（M0 第一段的实测反馈）：课程里每条 track 末尾的步骤实际交付两样东西——
 一份人要读的文档（runbook / 演练手册）和一个能重放的演练脚本（断言「无丢单」这类不可观测承诺），
 所以 `design` 的判定是「文档结构 + 链接 + 可选演练」，而不是纯文档。`run` 仅在 `design` 下可选。
+T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、页面各一份，见 [t1-mailer.md](t1-mailer.md) §5）。
 
 `origin` 不是独立题型，而是 milestone/drill 的一个属性：它决定正文模板（`teach` 用 WHY 模板，`deepen`/`transfer` 用 RECALL/DELTA 模板）与提示强度（§3 D4）。
 
@@ -281,7 +282,7 @@ Gates 用极小字符串 DSL：`name` / `name@参数` / `name:参数`；实现�
 
 | track | 项目 | 难度 | 步数 | 主要新能力 |
 | --- | --- | --- | --- | --- |
-| T1 | `mailer` 邮件订阅微服务（题材参考《Zero To Production in Rust》） | 入门→中 | 22 | 服务骨架、类型化错误、迁移、后台 worker、可观测基线、容器发布 |
+| T1 | `mailer` 邮件订阅微服务（题材参考《Zero To Production in Rust》）**已交付** | 入门→中 | 22 | 服务骨架、类型化错误、迁移、后台 worker、可观测基线、容器发布 |
 | T2 | `relay` Webhook 投递服务 | 中 | 24 | 至少一次投递、顺序与幂等、DLQ、HMAC 签名、SSRF 防护、限流、多租户 |
 | T3 | `jobq` 通用任务队列（库 + 服务 + CLI） | 中高 | 26 | 库设计、事务与 `SKIP LOCKED` 深化、cron、变异/覆盖率/基准闸门、在线 schema 演进 |
 | T4 | `lakelet` 遥测摄取与查询 | 高 | 24 | WAL 与崩溃恢复、列式存储与压缩、查询引擎、批处理与写放大、性能剖析与 soak |
