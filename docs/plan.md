@@ -112,7 +112,7 @@ rustlings 的 runner 假设「把一个 `.rs` 拷进临时 crate 跑 `cargo test
   6. 每条 track 声明的 `exit` 能力必须被本 track 覆盖。
 - **三种正文姿态**：`origin = teach`（首次，模板 WHY/TASK/DONE WHEN/TRAP/FURTHER）、`deepen`（同能力升深度）、`transfer`（同能力同深度换项目）——后两者用 RECALL/DELTA 模板，不重讲。
 - 使用体验：学员走到 `deepen`/`transfer` 步时，runner 打印 RECALL 卡片——「`async/graceful-shutdown@apply` 你在 `mailer/1.14` 学过（约 62 天前）。本次 DELTA：在途任务持有数据库租约，drop 的代价从「丢一次投递」变成「30 秒内不可见」。」——并且闸门更严、提示更少。
-- 想跳过：`kiln plan --fast` 允许对已证明能力跳过「讲解 + 实现」（`kiln probe <cap>` 出具证据），但**不能跳过更深深度的步骤**（那些是新东西）。
+- 想跳过：`kiln plan --fast` 允许对已证明能力跳过「讲解 + 实现」（`kiln probe <cap>` 出具证据），但**不能跳过更深深度的步骤**（那些是新东西）。**跳过资格不看年龄**：跳过是可选的，一次通过的 probe 多久之后仍然解锁那一步；45 天窗口只属于 `kiln review --due`（复习提示），不是资格上限。
 
 结论：**讲解去重是强制的；实现在新项目里必须重做，但考的只是迁移能力**——这正是「复杂项目不重复」与「真的会长本事」的平衡点。
 

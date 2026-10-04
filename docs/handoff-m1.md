@@ -50,7 +50,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 
 - `kiln plan [track]` 列出路径；`--fast` 给每一步判 `keep` / `skip`；
 - **跳过规则只有一条**：这一步 `teaches` 的**每一个**槽位都有**通过的 probe** 作为证据
-  （步骤自己的完成记录不算——那证明的是「跟着脚手架做过一遍」）。更深的深度永远不能跳；
+  （步骤自己的完成记录不算——那证明的是「跟着脚手架做过一遍」）。更深的深度永远不能跳；**资格不看
+  年龄**（跳过是可选的：一次通过的 probe 多少天之后仍然解锁那一步，45 天窗口只属于 `review --due`，
+  见 plan.md §3 D4）。
 - `kiln skip <step>` 执行一次跳过：应用 scaffold 与参考解（**记录 `solution_applied`**，项目才不会
   编译不过），`state.skipped = true`；`kiln list` 显示 `»`，**不计入完成数**，
   `kiln reset <step>` 把它放回待办。`--all` 跳过整条 track 上所有够格的点，`--force` 无证据也跳
