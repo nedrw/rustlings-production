@@ -1,0 +1,403 @@
+diff --git a/migrations/0004_events_cursor_index.sql b/migrations/0004_events_cursor_index.sql
+new file mode 100644
+index 0000000..5ad3d2a
+--- /dev/null
++++ b/migrations/0004_events_cursor_index.sql
+@@ -0,0 +1,5 @@
++-- A page reads one tenant's events in `(received_at, id)` order, newest first. The index is in that
++-- same order, so a page is a range scan that starts at the cursor and stops after `limit + 1` rows;
++-- without it the database sorts the tenant's whole table for every page, and the cost of a page
++-- grows with the tenant rather than with the page.
++create index events_tenant_received_idx on events (tenant_id, received_at desc, id desc);
+diff --git a/src/http.rs b/src/http.rs
+index bc0497e..cfc4230 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -12,7 +12,7 @@ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use std::time::Instant;
+ 
+-use axum::extract::{Extension, Request, State};
++use axum::extract::{Extension, Query, Request, State};
+ use axum::http::{HeaderMap, HeaderValue, StatusCode};
+ use axum::middleware::{self, Next};
+ use axum::response::{IntoResponse, Response};
+@@ -30,6 +30,7 @@ use crate::error::Error;
+ use crate::events;
+ use crate::logging::{self, RunId};
+ use crate::openapi;
++use crate::pagination;
+ 
+ /// Everything a handler may need, built once per process.
+ #[derive(Debug, Clone)]
+@@ -100,7 +101,7 @@ pub fn router(state: AppState) -> Router {
+     // id and the log line, so a refused request is still visible.
+     let tenant = Router::new()
+         .route("/endpoints", post(create_endpoint).get(list_endpoints))
+-        .route("/events", post(create_event))
++        .route("/events", post(create_event).get(list_events))
+         .layer(middleware::from_fn_with_state(
+             state.clone(),
+             require_principal,
+@@ -456,6 +457,53 @@ async fn create_event(
+     }
+ }
+ 
++/// One page, as the API hands it to a caller.
++#[derive(Debug, serde::Serialize)]
++struct PageBody<'a> {
++    /// The events in this page, newest first.
++    events: Vec<EventBody<'a>>,
++    /// Where the next page starts, or `null` when this page is the end of the stream.
++    next: Option<String>,
++}
++
++/// The parameters `GET /events` accepts.
++///
++/// Every one of them is text: what makes a size usable and a cursor real is decided by
++/// [`pagination::page`], in one place, next to the query that needs them.
++#[derive(Debug, Deserialize)]
++struct ListEvents {
++    /// `limit=`: how many rows this page may hold.
++    limit: Option<String>,
++    /// `cursor=`: the position this page continues from.
++    cursor: Option<String>,
++    /// `kind=`: only events of this kind.
++    kind: Option<String>,
++}
++
++/// One page of the calling tenant's events, newest first.
++///
++/// A page is bounded and it says where it stopped: `next` is the cursor that continues it, and
++/// `null` means the caller has read everything that existed when this page was answered.
++async fn list_events(
++    State(state): State<AppState>,
++    Extension(principal): Extension<Principal>,
++    Query(params): Query<ListEvents>,
++) -> Response {
++    let query = pagination::Query {
++        limit: params.limit,
++        cursor: params.cursor,
++        kind: params.kind,
++    };
++    match pagination::page(state.db().pool(), principal.tenant_id, &query).await {
++        Err(error) => error.into_response(),
++        Ok(page) => {
++            let events = page.events.iter().map(EventBody::of).collect();
++            let next = page.next.as_ref().map(|cursor| cursor.as_str().to_owned());
++            (StatusCode::OK, Json(PageBody { events, next })).into_response()
++        }
++    }
++}
++
+ /// The `Idempotency-Key` header, when it carries something usable.
+ ///
+ /// Header names are case-insensitive and so is this lookup; the value is trimmed, because `Key: `
+diff --git a/src/lib.rs b/src/lib.rs
+index ca13f9d..cf5bc34 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,6 +17,7 @@ pub mod events;
+ pub mod http;
+ pub mod logging;
+ pub mod openapi;
++pub mod pagination;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+ pub const USAGE: &str = "\
+diff --git a/src/openapi.rs b/src/openapi.rs
+index b9d9ee1..2f8fc33 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -92,6 +92,49 @@ pub fn document() -> Value {
+                 },
+             },
+             "/events": {
++                "get": {
++                    "summary": "One page of the calling tenant's events, newest first.",
++                    "description": "A page is bounded and stable: it holds at most `limit` rows, \
++                                    it is ordered by the instant the event was accepted and then by \
++                                    its identity, and `next` is the position that continues it — \
++                                    `null` when the caller has read everything there was.",
++                    "parameters": [
++                        {
++                            "name": "limit",
++                            "in": "query",
++                            "required": false,
++                            "description": "How many rows this page may hold (default 25, most 100).",
++                            "schema": { "type": "integer", "minimum": 1, "maximum": 100 },
++                        },
++                        {
++                            "name": "cursor",
++                            "in": "query",
++                            "required": false,
++                            "description": "The `next` of the previous page: an opaque position, \
++                                            not an offset.",
++                            "schema": { "type": "string" },
++                        },
++                        {
++                            "name": "kind",
++                            "in": "query",
++                            "required": false,
++                            "description": "Only events of this kind.",
++                            "schema": { "type": "string" },
++                        },
++                    ],
++                    "responses": {
++                        "200": answer(
++                            "Page",
++                            "One page of events, and the cursor that continues it.",
++                        ),
++                        "400": answer(
++                            "Error",
++                            "The `limit` is outside 1..=100, or the `cursor` is not one this \
++                             service issued.",
++                        ),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                    },
++                },
+                 "post": {
+                     "summary": "Accept one event for the calling tenant.",
+                     "parameters": [{
+@@ -175,6 +218,23 @@ pub fn document() -> Value {
+                         },
+                     },
+                 },
++                "Event": event_schema(false),
++                "Page": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["events", "next"],
++                    "properties": {
++                        "events": {
++                            "type": "array",
++                            "items": { "$ref": "#/components/schemas/Event" },
++                        },
++                        "next": {
++                            "type": ["string", "null"],
++                            "description": "The cursor that continues this page, or `null` when \
++                                            the stream ends here.",
++                        },
++                    },
++                },
+                 "CreateEvent": {
+                     "type": "object",
+                     "additionalProperties": false,
+diff --git a/src/pagination.rs b/src/pagination.rs
+index 0480f94..65afe5c 100644
+--- a/src/pagination.rs
++++ b/src/pagination.rs
+@@ -1,27 +1,25 @@
+ //! Pages: where a caller is in a stream that keeps growing, and how it asks for what is next.
+ //!
+-//! Step `relay/2.4-cursor-pagination` implements it. A caller cannot ask for "all of a tenant's
+-//! events": the table grows while it reads, the answer would be unbounded, and the second request
+-//! would be a different question than the first — a result set that shifts under a reader is how a
+-//! batch job skips a row it never knew was there.
++//! A caller cannot ask for "all of a tenant's events": the table grows while it reads, the answer
++//! would be unbounded, and the second request would be a different question than the first — a
++//! result set that shifts under a reader is how a batch job skips a row it never knew was there.
+ //!
+ //! So a caller asks for a *page*, and the service answers with the rows plus a **cursor**: an opaque
+-//! position in the stream that the next request carries back. Three things make that work, and each
+-//! is a way to get it wrong:
++//! position in the stream that the next request carries back. Three things make that work:
+ //!
+ //! * the position is a **pair** — when the last row was accepted *and* which row it was. An instant
+-//!   on its own is not a position: several events share one, and "after that instant" steps over
+-//!   every row that has it;
++//!   on its own is not a position: several events share one (a batch arrives in one transaction, two
++//!   machines write in the same microsecond), and "after that instant" steps over every row that has
++//!   it;
+ //! * the order and the comparison are the **same order**. A cursor only means something relative to
+-//!   an `ORDER BY`, and the two have to be written down together — the same goes for the index that
+-//!   lets the database walk in that order instead of sorting;
++//!   an `ORDER BY`, which is why `migrations/0004_events_cursor_index.sql` puts an index in exactly
++//!   that order: the page is then a range scan, not a sort of the tenant's table;
+ //! * a page is **one** statement. Asking for one row more than the page holds is what answers "is
+-//!   there more?" without a second query and without guessing.
++//!   there more?" — a second query would ask the same question about a table that has moved on.
+ //!
+ //! The two constants below are the contract rather than a choice: [`DEFAULT_LIMIT`] is what a caller
+ //! that asks for no size gets, and [`MAX_LIMIT`] is the largest page this service serves. A caller
+-//! asking for more is told so — silently shrinking the page would be an answer to a question nobody
+-//! asked.
++//! asking for more is told so — silently shrinking the page would answer a question nobody asked.
+ 
+ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+@@ -29,22 +27,20 @@ use uuid::Uuid;
+ 
+ use crate::domain::TenantId;
+ use crate::error::Error;
+-use crate::events::Event;
++use crate::events::{self, Event};
+ 
+ /// How many rows a page holds when the caller does not ask for a size.
+ pub const DEFAULT_LIMIT: i64 = 25;
+ /// The most rows one page may hold.
+ pub const MAX_LIMIT: i64 = 100;
++/// Characters in a cursor: 16 for the instant, 32 for the identity, both hex and both fixed width.
++const CURSOR_LENGTH: usize = 48;
+ 
+ /// A position in the event stream: the last event a caller has already seen.
+ ///
+-/// Opaque to the caller and exact to this service. How the position is written down is this step's
+-/// decision, and the two properties that are not negotiable are:
+-///
+-/// * it **round-trips**: what an event is turned into is read back as the position of that event,
+-///   exactly — an instant that loses its microseconds puts the cursor in the wrong place;
+-/// * it is **validated on the way in**: it arrives from a stranger, so anything that is not a
+-///   position this service wrote is a `400` rather than a query.
++/// Opaque to the caller and exact to this service. A cursor that exists has been checked — by
++/// [`Cursor::after`], which wrote it, or by [`Cursor::parse`], which refused to build one from
++/// anything else — so the text is kept as it was validated and decoded where it is used.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Cursor(String);
+ 
+@@ -52,8 +48,7 @@ impl Cursor {
+     /// The cursor that continues after `event`.
+     #[must_use]
+     pub fn after(event: &Event) -> Self {
+-        let _ = event;
+-        todo!("step relay/2.4-cursor-pagination")
++        Self(encode(event.received_at, event.id))
+     }
+ 
+     /// Read a cursor a caller sent back.
+@@ -62,8 +57,8 @@ impl Cursor {
+     ///
+     /// Returns [`Error::BadRequest`] when the text is not a cursor this service issued.
+     pub fn parse(text: &str) -> Result<Self, Error> {
+-        let _ = text;
+-        todo!("step relay/2.4-cursor-pagination")
++        decode(text)?;
++        Ok(Self(text.to_owned()))
+     }
+ 
+     /// The text form, as the API hands it out and takes it back.
+@@ -71,6 +66,16 @@ impl Cursor {
+     pub fn as_str(&self) -> &str {
+         &self.0
+     }
++
++    /// The position this cursor points at: the instant of the row, and the row.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::BadRequest`] if the text is not a cursor this service issued, which cannot
++    /// happen for a value built by [`Cursor::after`] or [`Cursor::parse`].
++    pub(crate) fn position(&self) -> Result<(DateTime<Utc>, Uuid), Error> {
++        decode(&self.0)
++    }
+ }
+ 
+ /// One page request, exactly as `GET /events` received it.
+@@ -105,6 +110,105 @@ pub struct Page {
+ /// `1..=MAX_LIMIT`, or a cursor this service did not issue), and [`Error::Database`] when the read
+ /// fails.
+ pub async fn page(pool: &PgPool, tenant: TenantId, query: &Query) -> Result<Page, Error> {
+-    let _ = (pool, tenant, query);
+-    todo!("step relay/2.4-cursor-pagination")
++    let limit = page_size(query)?;
++    let position = match query.cursor.as_deref() {
++        Some(text) => Some(Cursor::parse(text)?.position()?),
++        None => None,
++    };
++    let kind = query
++        .kind
++        .as_deref()
++        .map(str::trim)
++        .filter(|kind| !kind.is_empty());
++
++    // One statement, and one row more than the page holds. The nullable parameters keep the four
++    // combinations (with and without a cursor, with and without a filter) in one plan, and the row
++    // comparison `(received_at, id) < (…)` is the same order the index is in — and the same order
++    // the position is a pair for.
++    let rows: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
++        "select id, kind, payload::text, received_at from events \
++         where tenant_id = $1 \
++           and ($2::text is null or kind = $2) \
++           and ($3::timestamptz is null or (received_at, id) < ($3, $4)) \
++         order by received_at desc, id desc \
++         limit $5",
++    )
++    .bind(tenant.as_uuid())
++    .bind(kind)
++    .bind(position.map(|(at, _)| at))
++    .bind(position.map(|(_, id)| id))
++    .bind(limit + 1)
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    let mut events = Vec::with_capacity(rows.len());
++    for (id, kind, payload, received_at) in rows {
++        events.push(Event {
++            id,
++            tenant_id: tenant,
++            kind,
++            payload: events::decode_payload(&payload)?,
++            received_at,
++        });
++    }
++
++    // `limit` is inside `1..=MAX_LIMIT` by the time it is used here, so the conversion cannot lose
++    // anything; it is written as a conversion rather than a cast so that stays true if the range
++    // ever changes.
++    let page_size = usize::try_from(limit).unwrap_or(usize::MAX);
++    let next = if events.len() > page_size {
++        // The extra row was only ever the answer to "is there more?": the page is the rows the
++        // caller asked for, and the cursor points at the last of *those*, not at the extra one.
++        events.truncate(page_size);
++        events.last().map(Cursor::after)
++    } else {
++        None
++    };
++    Ok(Page { events, next })
++}
++
++/// The size of the page a request asks for.
++fn page_size(query: &Query) -> Result<i64, Error> {
++    let Some(text) = query.limit.as_deref() else {
++        return Ok(DEFAULT_LIMIT);
++    };
++    let text = text.trim();
++    let invalid = || {
++        Error::BadRequest(format!(
++            "`limit={text}` is not a page size: ask for 1 to {MAX_LIMIT} rows"
++        ))
++    };
++    let limit: i64 = text.parse().map_err(|_| invalid())?;
++    if !(1..=MAX_LIMIT).contains(&limit) {
++        return Err(invalid());
++    }
++    Ok(limit)
++}
++
++/// One position, written as a cursor: the instant in microseconds and then the identity, both hex
++/// and both fixed width.
++///
++/// Hex rather than base64, and that is a decision worth the two sentences: a cursor is written and
++/// read by this service alone, so what matters is that a bad one is *refused* — and a character
++/// class (`[0-9a-f]`, 48 of them) refuses more than a decoder that accepts a near-miss. It also
++/// needs no dependency and no padding rules. The instant comes first so that a cursor sorts in the
++/// same order as the rows it points at, which is what makes it readable in a log line.
++fn encode(at: DateTime<Utc>, id: Uuid) -> String {
++    format!("{:016x}{:032x}", at.timestamp_micros() as u64, id.as_u128())
++}
++
++/// The position a cursor points at.
++fn decode(text: &str) -> Result<(DateTime<Utc>, Uuid), Error> {
++    let invalid = || Error::BadRequest(format!("`{text}` is not a cursor this service issued"));
++    if text.len() != CURSOR_LENGTH || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        return Err(invalid());
++    }
++    let (instant, identity) = text.split_at(16);
++    let micros = i64::from_str_radix(instant, 16).map_err(|_| invalid())?;
++    // An instant this service could not have written is not a position: `from_timestamp_micros`
++    // rejects the values outside the range a `timestamptz` column can hold.
++    let at = DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?;
++    let id = Uuid::parse_str(identity).map_err(|_| invalid())?;
++    Ok((at, id))
+ }
