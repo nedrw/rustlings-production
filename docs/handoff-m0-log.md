@@ -32,6 +32,8 @@
   做到 1.21：容器化；`container-repro`；基础镜像解析与可选构建缓存
 - [第十五段 · 2026-10 · 1.22 落地，T1 22/22 写完](#第十五段--2026-10--122-落地t1-2222-写完) — 1.22 落地：design 步骤模板、夹具
   `#![allow(dead_code)]`、runbook 的链接
+- [第十六段 · 2026-10 · M0 收尾：三份呈现自检、一次不可复现的红，与它的真因](#第十六段--2026-10--m0-收尾三份呈现自检一次不可复现的红与它的真因) — 三份呈现自检（正文 / CLI / 文档，30 条发现）、T1 文档整理、
+  以及那次不可复现的红：真因是 1.18 没等待的投递断言，端口碰撞是另一处，一并修了
 
 ## 第二段 · 2026-10 · T1 1.4–1.6 完成
 
@@ -667,3 +669,87 @@ scaffold 的两个洞正对应这两半：演练“报告它希望发生的事�
 2. **runbook 里用反引号写路径等于没写**：`links` 门因此判“一页没有一个链接”——它判得对，凌晨三点的人要的是能点的东西。
    参考解的页面现在链到
    `src/delivery.rs`、`src/deliveries.rs`、`src/newsletter.rs`、`src/metrics.rs`、`src/logging.rs`、`src/http.rs` 与演练文件本身。
+
+## 第十六段 · 2026-10 · M0 收尾：三份呈现自检、一次不可复现的红，与它的真因
+
+M0 的三条验收命令在 `c08f33a` 上是绿的，但那验的是**功能**。这一段做的是**呈现**：把 22 篇正文逐句
+对拍规格与 scaffold、把每个命令的输出实跑一遍、把维护文档与 CLI 的现实对一遍；随后追平了那次
+**不可复现的红**。三份审计共 30 条发现，没有一条是纯粹的功能缺陷——全是措辞、格式或「说了不成立的话」。
+
+### 改了什么（十二个提交）
+
+- `65345cd` **课程正文** 13 处：1.4/1.14 的 TRAP 引用的是注释里的句子而不是规格真正打印的那句；
+  1.12/1.13/1.16 把 rustdoc 的 `[`X`]` 语法漏进正文（页面渲染出方括号）；1.10 的行内代码里套了反引号；
+  1.8 的 FURTHER 把 `std::net::TcpStream` 标成 `http::Request`；1.19 唯一一个没标语言的围栏；
+  1.22 把 `backoff` 记在 1.15 名下（是 1.14 的）；1.16 把「不是令牌」的 400 记在 1.10（应 1.12）；
+  1.6 说 `RunId` 什么都没做（scaffold 已实现）；1.9 把三个文件数成四件事；
+  curriculum §6 说 1.1 用 `cargo metadata` 断言布局（实际是 `cargo check --lib`）。
+  另外 `course.toml` 的结课语让学员跑 `kiln list relay`——那条命令当时 exit 2，改成 `kiln caps`。
+- `6e618e3` **kiln 的输出**（最大的一块）：`doctor` 与失败的闸门打印 `exit code Some(101)`（Rust 调试格式）
+  且 podman 的 ANSI 会渗进后面的行；已计划未写的 track 现在答「is not authored yet」并 **exit 3**
+  （文档里的「3 = 内容未写」在此之前不可达）；给 track 型命令一个 step id、给一个空 id 都有人话回应；
+  无 `app/` 的树里跑中段步骤不再报补丁解析器的「文件不存在」，而是说清哪条命令建项目（骨架步是例外），
+  也不再留下空目录；失败的规格与通过的闸门都补上「下一步」指向；`caps` 的
+  「(track not authored yet) not authored yet」、`check` 的「0 not implemented yet」、
+  `images` 的提示位置都改了；`run`/`watch` 把子进程的流直接接到终端（`process::run_streamed`），
+  转录顺序与发生顺序一致（此前 cargo 的进度行落在测试结果之后）；
+  `list` 的行从最长 179 列收到 100 列、id 列按本 track 最长 id、`kind · time · teaches` 挪到第二行、
+  `◐` 有页脚定义、`exit capabilities` 会折行；裸 `kiln` 的第一屏补上正文路径与项目目录；
+  `watch` 每轮打时间戳（`[00:19]`，从开始计起）、头部只打一次、变更点名哪个文件变了
+  （`cmd::project_files` 与闸门缓存共用同一次遍历）。
+- `dc58e23` / `54fd694` / `d69440b` / `6ddabf6` / `6c09ea3` / `7dbba4f` **文档**：handoff 拆成简报 + 本日志；
+  README 的状态段重写成实测数字；草稿标注为已归档；plan.md §11 记 M0 结束、§5 指名 design 步的样本、
+  §10 的依赖基线改成「T1 已钉、T2 照做」。
+- `573eb65` **T1 文档整理**：新增 **[t1-mailer.md](t1-mailer.md)**——22 步一览（交付物 + teaches +
+  新接的门）、项目最后的形状（18 模块 / 10 条路由 + 兜底 / 4 个迁移 / 设置 / 退出码 / 镜像 /
+  谁引的依赖）、8 个测试夹具与谁在用、可照抄到 T2–T5 的 11 个模式、实测数字、T1 范围内的缺口。
+  curriculum §6 删掉与正文重复的「过关条件」列并指向它；handoff-m0 从 116 行收到 87 行、改成导航表；
+  authoring §9 开头让人先看参考实现。
+- `5145e34` / `62e7c5c` **报告看得懂**：`selftest` 的报告此前优先 stderr，而测试的 panic、断言消息与
+  失败测试名在 **stdout**——红了也看不出是哪个测试。现在 `Ran::first_message()`（`verify` 与
+  `selftest` 都走它）先找「说出失败是什么」的那一行（`thread '…' panicked at`、
+  `---- <name> stdout ----`、`test result: FAILED`），找不到才退回 stderr。一条规则，`process.rs` 里，
+  两处共用。
+- `61a44c7` **端口的 TOCTOU**：`tests/support/service.rs`（1.16 的 scaffold）先 bind `127.0.0.1:0`、
+  关掉监听，再把端口交给子进程；两个 spec 文件并行时可能拿到同一个端口——输的那个服务以
+  `Address already in use` 退出，更糟的是**测试的连接会打到另一个测试的服务上**（任何 listener 都会
+  接受连接）。改成 1.7 规格里早就演示过的握手：端口传 `0`，由内核交给**这个**子进程，装置从服务自己的
+  `listening address=…` 行里读回来（pretty 与 JSON 都认），等待就绪前先问子进程是否还活着。1.7 与 1.14
+  里各自复制的同类装置一并修掉。
+- `62e7c5c`（同一个提交里）**1.18 的断言没有等待**：`a_subscriber_reads_their_own_deliveries` 发布一期
+  之后立刻断言投递行「已发送」；而 `POST /newsletter` 答 `202` 只是排进队列（这正是 1.17 要教的），
+  worker 先 claim、再发、最后才写 `sent_at`。六路并行下它的读数落在窗口里（`sent_at: null,
+  attempts: 1`）。现在照 1.17 的写法等这个事实（`delivered_history`，10 秒上限），失败信息说明它在等什么。
+
+### 那次红，与它的真因
+
+`cargo xtask ci` 红过一次：527.51s、`21/22 step(s) hold the contract`，`mailer/1.18-authz-boundary`
+（scaffold ✓ / 参考解应用 ✓ / 规格仍失败，exit 101），而**重跑五次全绿**（单步 selftest 30s、全量
+selftest 500s、`cargo xtask ci` 530s、同一天 `verify` 22 passed、`kiln run` 六次全过）。
+
+修完之后再看，**最可能的真因不是端口碰撞，而是 1.18 自己那条没等待的断言**：同一个步骤、同一个测试，
+六路并行下两次里必红一次，而当时的报告看不出是哪个测试（这正好是 `5145e34` 要修的）。端口碰撞是同一段
+harness 里另一处真缺陷（会让测试连到别人的服务上），一并修了——两件事都不是噪声。
+
+**过程中还暴露了三处自己的毛病**（记下来，因为都是「验证本身不诚实」这一类）：
+① 我漏跑 `cargo fmt --all`，`cargo xtask ci` 第一步就红，后面五步根本没跑（`5145e34` 的测试代码是
+`style_edition = "2024"` 下的一行断行差异）；
+② 调试端口碰撞时留下的临时探针文件 `app/mailer/tests/spec_probe_collision.rs` 没删，它是 git-ignored 的，
+但 `fmt` 门会扫到它——于是 `verify` 里 21 个步骤的 `fmt` 门全红、1.3 的 spec 也红（它跑项目自己的
+`cargo xtask ci`，第一步就是 fmt）。删掉后 `verify` 22/22；
+③ 六路并行把 4 vCPU / 4 GiB 的 podman VM 打崩（`Cannot connect to Podman … podman machine start`），
+残留 9 个 `kiln-pg-*` 容器，也一并清了。**三路并行是这台机器能承受的上限**，而 CI 与 selftest 本身是
+逐步串行的，不受影响。
+
+另外两条已知缺口（都不改，写在这里）：`xtask ci` 不跑 `kiln links`（只有每步的 `links` 门，且它只看
+项目内那一页），所以仓库文档的链接腐烂只有手工 `kiln links` 拦得住；`spec/1.6/logging.rs` 与
+`spec/1.9/migrations.rs` 仍自己挑端口——1.6 断言的是「启动行报告配置的那个端口」而其中一档是
+`level=error`（那时服务什么都不说，端口无从得知），1.9 要的端口就是「这里没人听」这个前提本身；
+两者的失败都会是响的。
+
+### 复测
+
+`kiln verify --json mailer`（`62e7c5c`，3m01s）：`passed 22 · failed 0 · blocked 0 · not_authored 0 ·
+clean true`。`kiln selftest mailer/1.18-authz-boundary`：1/1 满契约。三路并行的 spec 二进制连跑四轮
+（含 `spec_authz`）全绿——同一负载此前的失败率是两次一红。`kiln links` 31 页 / 206 链 / 0 findings；
+`kiln --lang ja list` 正常回退。`cargo xtask ci` 在 `62e7c5c` 上的结果：见下一条更新。
