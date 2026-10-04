@@ -1,0 +1,116 @@
+diff --git a/src/pagination.rs b/src/pagination.rs
+new file mode 100644
+index 0000000..0480f94
+--- /dev/null
++++ b/src/pagination.rs
+@@ -0,0 +1,110 @@
++//! Pages: where a caller is in a stream that keeps growing, and how it asks for what is next.
++//!
++//! Step `relay/2.4-cursor-pagination` implements it. A caller cannot ask for "all of a tenant's
++//! events": the table grows while it reads, the answer would be unbounded, and the second request
++//! would be a different question than the first — a result set that shifts under a reader is how a
++//! batch job skips a row it never knew was there.
++//!
++//! So a caller asks for a *page*, and the service answers with the rows plus a **cursor**: an opaque
++//! position in the stream that the next request carries back. Three things make that work, and each
++//! is a way to get it wrong:
++//!
++//! * the position is a **pair** — when the last row was accepted *and* which row it was. An instant
++//!   on its own is not a position: several events share one, and "after that instant" steps over
++//!   every row that has it;
++//! * the order and the comparison are the **same order**. A cursor only means something relative to
++//!   an `ORDER BY`, and the two have to be written down together — the same goes for the index that
++//!   lets the database walk in that order instead of sorting;
++//! * a page is **one** statement. Asking for one row more than the page holds is what answers "is
++//!   there more?" without a second query and without guessing.
++//!
++//! The two constants below are the contract rather than a choice: [`DEFAULT_LIMIT`] is what a caller
++//! that asks for no size gets, and [`MAX_LIMIT`] is the largest page this service serves. A caller
++//! asking for more is told so — silently shrinking the page would be an answer to a question nobody
++//! asked.
++
++use chrono::{DateTime, Utc};
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::TenantId;
++use crate::error::Error;
++use crate::events::Event;
++
++/// How many rows a page holds when the caller does not ask for a size.
++pub const DEFAULT_LIMIT: i64 = 25;
++/// The most rows one page may hold.
++pub const MAX_LIMIT: i64 = 100;
++
++/// A position in the event stream: the last event a caller has already seen.
++///
++/// Opaque to the caller and exact to this service. How the position is written down is this step's
++/// decision, and the two properties that are not negotiable are:
++///
++/// * it **round-trips**: what an event is turned into is read back as the position of that event,
++///   exactly — an instant that loses its microseconds puts the cursor in the wrong place;
++/// * it is **validated on the way in**: it arrives from a stranger, so anything that is not a
++///   position this service wrote is a `400` rather than a query.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Cursor(String);
++
++impl Cursor {
++    /// The cursor that continues after `event`.
++    #[must_use]
++    pub fn after(event: &Event) -> Self {
++        let _ = event;
++        todo!("step relay/2.4-cursor-pagination")
++    }
++
++    /// Read a cursor a caller sent back.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::BadRequest`] when the text is not a cursor this service issued.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        let _ = text;
++        todo!("step relay/2.4-cursor-pagination")
++    }
++
++    /// The text form, as the API hands it out and takes it back.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++/// One page request, exactly as `GET /events` received it.
++///
++/// The parameters are kept as text on purpose: "a size within `1..=MAX_LIMIT`" and "a cursor this
++/// service issued" are decided by the query that needs them, so one place answers what makes a
++/// request usable for the whole route.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Query {
++    /// `limit=`, when the caller asked for a size.
++    pub limit: Option<String>,
++    /// `cursor=`, when the caller asked to continue from somewhere.
++    pub cursor: Option<String>,
++    /// `kind=`, when the caller wants one kind of event.
++    pub kind: Option<String>,
++}
++
++/// One page of a tenant's events, newest first.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Page {
++    /// The events in this page, in the order the cursor continues from.
++    pub events: Vec<Event>,
++    /// Where the next page starts, or `None` when this page is the end of the stream.
++    pub next: Option<Cursor>,
++}
++
++/// Read one page of a tenant's events.
++///
++/// # Errors
++///
++/// Returns [`Error::BadRequest`] when the request is not one this API serves (a `limit` outside
++/// `1..=MAX_LIMIT`, or a cursor this service did not issue), and [`Error::Database`] when the read
++/// fails.
++pub async fn page(pool: &PgPool, tenant: TenantId, query: &Query) -> Result<Page, Error> {
++    let _ = (pool, tenant, query);
++    todo!("step relay/2.4-cursor-pagination")
++}
