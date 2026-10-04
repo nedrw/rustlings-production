@@ -314,7 +314,7 @@ index 1f5aad7..6e7e8c0 100644
              format!(
                  "worker.handler = {}",
 diff --git a/src/service/mod.rs b/src/service/mod.rs
-index 5f719ad..dddf679 100644
+index 5f719ad..93e0c28 100644
 --- a/src/service/mod.rs
 +++ b/src/service/mod.rs
 @@ -27,7 +27,7 @@ pub mod worker;
@@ -376,3 +376,19 @@ index 5f719ad..dddf679 100644
      Ok(Arc::new(store))
  }
  
+@@ -164,7 +186,14 @@ async fn open_durable(url: &str, lease: Duration) -> Result<Arc<dyn Store>, Erro
+ /// know which flag to rebuild with, and "use `memory`" tells them nothing they did not already know
+ /// (the probe of `jobq/3.4-feature-assembly` reads this sentence for exactly that reason).
+ #[cfg(not(feature = "postgres"))]
+-async fn open_durable(url: &str, _lease: Duration) -> Result<Arc<dyn Store>, Error> {
++// A build without the feature never opens a durable store, so the policy is taken and unused: the
++// alternative is a call site that has to know which assembly it was compiled into, which is the
++// sprinkled `cfg` this function exists to avoid.
++async fn open_durable(
++    url: &str,
++    _lease: Duration,
++    _policy: Policy,
++) -> Result<Arc<dyn Store>, Error> {
+     Err(Error::Config {
+         detail: format!(
+             "`{}` names a durable store and this build has no `postgres` feature: rebuild with \
