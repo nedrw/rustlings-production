@@ -1,0 +1,114 @@
+diff --git a/migrations/0011_events_payload_bytes.sql b/migrations/0011_events_payload_bytes.sql
+new file mode 100644
+index 0000000..859f7e7
+--- /dev/null
++++ b/migrations/0011_events_payload_bytes.sql
+@@ -0,0 +1,31 @@
++-- Expand: the size of what a tenant sent, recorded rather than recomputed
++-- (`relay/2.23-online-schema`).
++--
++-- Three properties make this migration shippable while the *previous* release is
++-- still running against the same table:
++--
++--   * nullable, and no default: `alter table … add column` with neither rewrites
++--     nothing and takes no lock worth waiting for, and an `insert` that names only
++--     the columns of `0003_events.sql` — which is what the old binary is doing
++--     right now — keeps working because the new column may be absent;
++--   * additive: no column is renamed, dropped or reinterpreted, so every query the
++--     old binary runs still means what it meant;
++--   * **nothing is backfilled here.** A migration that updates every row is a
++--     migration that holds a write lock over the whole table for as long as the
++--     update takes, on a table the old release is still writing to. The backfill
++--     is `src/backfill.rs`, run in batches, by whoever is deploying, and it can be
++--     stopped and run again because it only ever touches rows that have no value.
++--
++-- The contract phase — `not null`, and the read path in `src/pagination.rs` losing
++-- its fallback — is a *later release*, after no row can be null. Doing both halves
++-- in one deploy is what turns a rollout into an outage.
++alter table events
++    add column payload_bytes integer;
++
++-- The backfill asks for the rows that have no value yet, oldest first, and stops
++-- after its batch: an index in exactly that shape keeps it from reading the whole
++-- tenant history to find the handful of rows it still owes. Partial, because the
++-- rows with a value are not the question.
++create index events_missing_bytes_idx
++    on events (received_at, id)
++    where payload_bytes is null;
+diff --git a/src/backfill.rs b/src/backfill.rs
+new file mode 100644
+index 0000000..8d76966
+--- /dev/null
++++ b/src/backfill.rs
+@@ -0,0 +1,71 @@
++//! Filling a column that did not exist when the rows were written
++//! (`relay/2.23-online-schema`).
++//!
++//! The three phases of a schema change that has to happen while the service is running, and which
++//! file owns each of them:
++//!
++//! 1. **expand** — a migration adds the column, nullable and with no default, so it takes no
++//!    rewrite and the *previous* release (which does not know the column exists) keeps writing rows
++//!    that do not mention it;
++//! 2. **backfill** — this module: the rows that predate the column are filled in batches, by
++//!    whoever is deploying, until none is left. Batches because the alternative is one `update`
++//!    over the whole table, which holds a write lock for as long as it takes and turns a deploy
++//!    into a pause — and *idempotent* because a backfill that has to be re-runnable is a backfill
++//!    that can be interrupted, resumed, and run twice by two people without a guard;
++//! 3. **contract** — a later release makes the column `not null` and removes the read path's
++//!    fallback. It is a separate deploy because the thing it depends on ("no row is null") is only
++//!    true once the backfill has finished everywhere, and because rolling back a release is easy
++//!    and rolling back a *contract* is not.
++//!
++//! What makes the middle phase re-runnable is the predicate rather than a bookkeeping table: it
++//! selects rows whose value is *absent*, so a row that already has one is never written twice, and
++//! the second run of a finished backfill does nothing at all.
++
++use sqlx::PgPool;
++
++use crate::error::Error;
++
++/// How many rows one batch fixes when the caller does not name a size.
++///
++/// A few hundred: big enough that the round trips are not the cost, small enough that the lock a
++/// batch holds on the rows it writes is measured in milliseconds. It is not a tunable setting — a
++/// deployment that needs another size passes one — and the reason is that the number that matters
++/// is the deployment's, not this service's.
++pub const BATCH: i64 = 500;
++
++/// What one run of the backfill did.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Backfilled {
++    /// How many batches ran.
++    pub batches: usize,
++    /// How many rows were filled, across all of them.
++    pub rows: u64,
++}
++
++/// Fill the column for at most `batch` rows that do not have it, and answer how many that was.
++///
++/// One statement, so a batch is atomic: either its rows are filled or none of them is, and either
++/// way the next call sees a consistent table.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the batch cannot be written. A partial run is not a failure: the
++/// rows it filled are filled, and the next call carries on from them.
++pub async fn bytes(pool: &PgPool, batch: i64) -> Result<u64, Error> {
++    let _ = (pool, batch);
++    todo!("step relay/2.23-online-schema")
++}
++
++/// Run [`bytes`] until a batch fills nothing, and answer what the whole run did.
++///
++/// The loop ends when a batch *fills nothing*, not when a batch fills less than it asked for: a
++/// batch that fills nothing is the statement's own answer that there is no work left, and it is the
++/// only end condition that is also correct when rows are being written while the backfill runs.
++///
++/// # Errors
++///
++/// The same failures as [`bytes`], from whichever batch hit them first.
++pub async fn run(pool: &PgPool, batch: i64) -> Result<Backfilled, Error> {
++    let _ = (pool, batch);
++    todo!("step relay/2.23-online-schema")
++}
