@@ -210,9 +210,13 @@ pub enum Command {
     /// The course's own anti-rot check (plan §10): every step's spec must fail before its solution
     /// and pass after it. Steps other than the named ones are set up silently as prerequisites.
     Selftest {
-        /// Steps to assert on (default: every authored step of the default track).
+        /// Steps to assert on (default: every authored step of the track).
         #[arg(value_name = "STEP")]
         steps: Vec<String>,
+
+        /// Track to walk (default: the course's default track).
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
 
     /// Judge every authored step: its spec tests and its gates, plus what the result is worth.
@@ -363,7 +367,9 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Hint { step }) => hint::run(&session, step.as_deref()),
         Some(Command::Reset { step }) => reset::run(&mut session, step.as_deref()),
         Some(Command::Solution { step }) => solution::run(&mut session, step.as_deref()),
-        Some(Command::Selftest { steps }) => selftest::run(cli, &session, steps),
+        Some(Command::Selftest { steps, track }) => {
+            selftest::run(cli, &session, steps, track.as_deref())
+        }
         Some(Command::Verify { track, json, slow }) => {
             verify::run(&mut session, track.as_deref(), *json, *slow)
         }

@@ -571,51 +571,29 @@ fn check_recall(
         );
     }
 
-    // The reference has to be the right kind of step:
-    // * `deepen` builds on a step that established one of the slots this step goes deeper on;
-    // * `transfer` redoes a slot this step *requires*, in a new project.
-    match step.origin {
-        Origin::Teach => {}
-        Origin::Deepen => {
-            let builds_on = referenced.iter().any(|earlier| {
-                earlier.teaches.iter().any(|taught| {
-                    step.teaches.iter().any(|deepening| {
-                        taught.id == deepening.id && taught.level.rank() < deepening.level.rank()
-                    })
-                })
-            });
-            if !builds_on {
-                issue(
-                    report,
-                    format!(
-                        "{} deepens {} but its RECALL points at steps that never established those \
-                         slots — name the step that did",
-                        step.qualified_id(),
-                        join(&step.teaches)
-                    ),
-                );
-            }
-        }
-        Origin::Transfer => {
-            let transfers = referenced.iter().any(|earlier| {
-                earlier.teaches.iter().any(|taught| {
-                    step.requires
-                        .iter()
-                        .any(|required| required.id == taught.id && required.level == taught.level)
-                })
-            });
-            if !transfers {
-                issue(
-                    report,
-                    format!(
-                        "{} transfers {} but its RECALL names no step that taught them — a transfer \
-                         points at what it is redoing",
-                        step.qualified_id(),
-                        join(&step.requires)
-                    ),
-                );
-            }
-        }
+    // The reference has to be the right kind of step: it must have established something this step
+    // builds on — one of its `requires` (what a transfer redoes) or a shallower depth of what a
+    // `deepen` step takes further.
+    let meaningful = referenced.iter().any(|earlier| {
+        earlier.teaches.iter().any(|taught| {
+            step.requires.iter().any(|required| {
+                required.id == taught.id && taught.level.rank() >= required.level.rank()
+            }) || step.teaches.iter().any(|deepening| {
+                taught.id == deepening.id && taught.level.rank() < deepening.level.rank()
+            })
+        })
+    });
+    if !meaningful {
+        issue(
+            report,
+            format!(
+                "{} (origin = {}) builds on {} but its RECALL points at steps that never established \
+                 them — name the step that did",
+                step.qualified_id(),
+                step.origin,
+                join(&step.requires)
+            ),
+        );
     }
 }
 
@@ -1164,7 +1142,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("never established those slots")),
+                .any(|issue| issue.contains("never established")),
             "{issues:?}"
         );
     }

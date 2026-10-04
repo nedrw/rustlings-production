@@ -34,8 +34,16 @@ struct Report {
 }
 
 /// Run the course's self-check.
-pub fn run(cli: &Cli, session: &Session, requested: &[String]) -> Result<u8> {
-    let track = session.course().default_track()?;
+///
+/// `track` names the track to walk: a bare `kiln selftest` checks the course's default track, and
+/// `kiln selftest --track relay` checks T2 the same way. One track at a time is deliberate — the
+/// sandbox walks a track in order, and steps before the ones being asserted are the state a step
+/// starts from.
+pub fn run(cli: &Cli, session: &Session, requested: &[String], track: Option<&str>) -> Result<u8> {
+    let track = match track {
+        Some(id) => session.course().track(id)?,
+        None => session.course().default_track()?,
+    };
     let authored: Vec<&Step> = track
         .step
         .iter()
@@ -91,7 +99,8 @@ pub fn run(cli: &Cli, session: &Session, requested: &[String]) -> Result<u8> {
         }
     }
     let sandbox = Session::at(scratch.path(), cli)?;
-    let track = sandbox.course().default_track()?;
+    // The same track, loaded from the sandbox: the ids are the course's, the files are the copy's.
+    let track = sandbox.course().track(&track.id)?;
     println!(
         "kiln selftest · {} · a throwaway copy at {}",
         track.id,
