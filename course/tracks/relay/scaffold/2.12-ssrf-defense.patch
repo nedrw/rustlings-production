@@ -1,0 +1,365 @@
+diff --git a/src/target.rs b/src/target.rs
+new file mode 100644
+index 0000000..086b593
+--- /dev/null
++++ b/src/target.rs
+@@ -0,0 +1,359 @@
++//! Only deliver where we are allowed to: the addresses a delivery may go to.
++//!
++//! A subscriber is a URL, and a tenant chooses it. A URL is not where a request
++//! goes: the address is decided by whoever answers for that name, at the moment a
++//! connection is made. This service dials URLs its own users control, which is
++//! exactly the shape of a server-side request forgery — and the targets that make
++//! one worth attacking are not on the internet. They are the process's own
++//! administration port, the database next to it, an internal service somebody
++//! forgot, and the metadata endpoint every cloud provider runs at a fixed
++//! link-local address and answers with credentials.
++//!
++//! The client itself is `relay/2.7-outbound-client`'s: what it owes is bounded
++//! time, connection reuse and a redirect policy, and none of that is repeated
++//! here. What this module adds is *where*:
++//!
++//! * **a URL is judged in two places, and they answer different questions.**
++//!   [`check`] is what registration can decide with no name service at all: the
++//!   shape of the authority, and names that can only mean "here". [`pin`] is what
++//!   delivery decides: the addresses a name answers with, checked, and then the
++//!   address that is *connected to*. A registration check that claimed to know
++//!   where a name points would be a claim about an address nobody has resolved;
++//! * **the address that is checked is the address that is used.** [`Resolver`] is a
++//!   port, and [`pin`] answers a [`SocketAddr`] the client dials. The bug this
++//!   prevents is the one every naive check has: resolve to validate, then let the
++//!   client resolve *again* to connect. An attacker answers the first question with
++//!   a public address and the second with theirs, and the window between the two is
++//!   the whole attack (DNS rebinding). One resolution, and it is the one that is
++//!   connected to;
++//! * **a refusal is permanent, not retryable.** A subscriber we are not allowed to
++//!   talk to is not a subscriber that is briefly unhappy: another attempt finds the
++//!   same address and the same rule. It reaches the worker as
++//!   [`crate::delivery::SendError::Permanent`], so the delivery is buried and its
++//!   reason is readable in `dead_letters` instead of being retried until the retry
++//!   budget runs out.
++//!
++//! One rule this module deliberately does **not** restate: which schemes a target
++//! may use. `http` and `https` and nothing else is
++//! [`crate::domain::EndpointUrl`]'s rule (`relay/2.1-project-skeleton`), it holds
++//! for every URL that reaches this file, and a second list here would be a second
++//! place to forget one.
++
++use std::fmt;
++use std::future::Future;
++use std::net::{IpAddr, SocketAddr};
++use std::pin::Pin;
++
++use crate::config::Config;
++use crate::domain::EndpointUrl;
++
++/// The class of an address, as far as a delivery is concerned.
++///
++/// The classes exist because a refusal has to be able to say *which* rule it broke:
++/// "169.254.169.254" is not refused for being an address, it is refused for being a
++/// cloud provider's metadata endpoint, and that sentence is what an operator reads
++/// at three in the morning.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Class {
++    /// An address on the public internet: the only class a delivery is for.
++    Public,
++    /// The machine talking to itself: `127.0.0.0/8`, `::1`.
++    Loopback,
++    /// A network that is not on the public internet and is not one of the three
++    /// classes below — RFC 1918, carrier-grade NAT, multicast, the blocks reserved
++    /// for documentation and benchmarking, and IPv6 unique-local (`fc00::/7`).
++    Private,
++    /// A network that exists on one link: `169.254.0.0/16`, `fe80::/10`.
++    LinkLocal,
++    /// The address a cloud provider answers its instance metadata on, which is the
++    /// one address in this file that hands out credentials.
++    Metadata,
++}
++
++impl Class {
++    /// The class of `address`.
++    ///
++    /// A check that only knows IPv4 is a check with an IPv6 way around it, and one
++    /// that only knows the text of an address misses the `::ffff:` spelling of every
++    /// IPv4 address there is.
++    #[must_use]
++    pub fn of(address: IpAddr) -> Self {
++        let _ = address;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// The word this class is called in a refusal, and in the sentence an operator
++    /// reads in `last_error`.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++impl fmt::Display for Class {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(self.as_str())
++    }
++}
++
++/// Why a target is not one this service will deliver to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Refusal {
++    /// The authority is not one a delivery can be made to: it cannot be split into a
++    /// host and a port.
++    Authority(String),
++    /// The authority carries credentials (`http://user@host/`). A subscriber's URL is
++    /// not a place to put a password, and the credentials hide the host from every
++    /// reader of the URL — including a check that reads the wrong side of the `@`.
++    Credentials(String),
++    /// The host is a name that can only mean this machine, or the network it is on.
++    Name(String),
++    /// The address is one no delivery has any business reaching.
++    Address {
++        /// The address that was refused.
++        address: IpAddr,
++        /// What kind of address it is.
++        class: Class,
++    },
++}
++
++impl Refusal {
++    /// The stable token this refusal is called, for a caller switching on it.
++    #[must_use]
++    pub fn kind(&self) -> &'static str {
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++impl fmt::Display for Refusal {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let _ = f;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++/// The host a delivery goes to, and how to reach it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Host {
++    /// The name or the literal address, normalised: lower case, no trailing dot, no
++    /// brackets, no port.
++    pub name: String,
++    /// The port, or the one the scheme implies.
++    pub port: u16,
++    /// The address, when the host *is* an address rather than a name for one.
++    pub literal: Option<IpAddr>,
++}
++
++/// The port an `http` target without one means.
++pub const HTTP_PORT: u16 = 80;
++/// The port an `https` target without one means.
++pub const HTTPS_PORT: u16 = 443;
++
++/// Split a target into the host a delivery goes to and the port it goes to.
++///
++/// The two shapes an authority has are an IPv6 literal in brackets (`[::1]:8443`)
++/// and everything else (`host`, `host:port`). The brackets exist precisely because a
++/// colon inside an address is not a port separator, so a check that splits on the
++/// first colon reads `http://[::1]:9/` as the host `[` and lets the loopback through.
++///
++/// # Errors
++///
++/// Returns [`Refusal::Credentials`] when the authority carries credentials, and
++/// [`Refusal::Authority`] when it is neither shape.
++pub fn host_of(url: &EndpointUrl) -> Result<Host, Refusal> {
++    let _ = url;
++    todo!("step relay/2.12-ssrf-defense")
++}
++
++/// The names that can only mean this machine, or the network it is on.
++///
++/// A name is not an address, so this says nothing about where it points — that is
++/// [`pin`]'s question, and it is asked later, once. What it says is that the name
++/// itself means "here": `localhost` is the loopback interface by definition (RFC
++/// 6761), `.local` is the mDNS namespace of the local link, and `.internal` is the
++/// namespace a private network hands out. A deployment that does not deliver to its
++/// own networks does not deliver to "here" either, and a URL that says "here" is a
++/// URL no delivery can ever be allowed to use.
++///
++/// # Errors
++///
++/// Returns [`Refusal::Name`] when the name is one of them.
++pub fn check_name(name: &str) -> Result<(), Refusal> {
++    let _ = name;
++    todo!("step relay/2.12-ssrf-defense")
++}
++
++/// What a deployment is willing to talk to.
++///
++/// Four flags rather than one, because *which* rule a target broke is the part an
++/// operator has to be able to read — and because a caller may legitimately mean
++/// something narrower than the service does: this track's own specs allow loopback
++/// (their subscribers are a scripted server on `127.0.0.1`) while refusing private
++/// addresses, which is one line with four flags and impossible with one.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Rules {
++    /// Deliver to loopback addresses.
++    pub allow_loopback: bool,
++    /// Deliver to private, shared and otherwise non-public addresses.
++    pub allow_private: bool,
++    /// Deliver to link-local addresses.
++    pub allow_link_local: bool,
++    /// Deliver to a cloud provider's metadata endpoint.
++    pub allow_metadata: bool,
++}
++
++impl Rules {
++    /// Every class allowed: the rules of a caller that has no deployment policy of
++    /// its own.
++    ///
++    /// This is what `Policy::default()` carries, and it is deliberately *not* what a
++    /// service runs with: the service's rules come from its configuration
++    /// ([`Rules::of`]), where the default is [`Rules::public_only`].
++    #[must_use]
++    pub fn permissive() -> Self {
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// Only the public internet: our own networks are not subscribers.
++    #[must_use]
++    pub fn public_only() -> Self {
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// The rules this deployment configured.
++    #[must_use]
++    pub fn of(config: &Config) -> Self {
++        let _ = config;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// Whether a delivery may go to an address of this class.
++    #[must_use]
++    pub fn allows(&self, class: Class) -> bool {
++        let _ = class;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// Whether a name that means "here" may be a target.
++    ///
++    /// A name cannot be checked address by address, so the answer is the coarser
++    /// one: a deployment that is allowed to reach its own networks is allowed to
++    /// name them.
++    #[must_use]
++    pub fn allows_local_names(&self) -> bool {
++        todo!("step relay/2.12-ssrf-defense")
++    }
++
++    /// Whether a delivery may go to this address, or why not.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Refusal::Address`] when the address is of a class these rules do
++    /// not allow.
++    pub fn check(&self, address: IpAddr) -> Result<(), Refusal> {
++        let _ = address;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++/// Everything that can be decided about a target *without* resolving it.
++///
++/// Registration calls this, and so does a caller that wants to refuse a URL before
++/// a delivery ever exists. What it can decide is the shape of the authority and
++/// names that mean "here"; what it cannot decide is where a name points, and
++/// pretending otherwise is the hole this module is about.
++///
++/// # Errors
++///
++/// Returns the [`Refusal`] that says which rule the target broke.
++pub fn check(url: &EndpointUrl, rules: &Rules) -> Result<Host, Refusal> {
++    let _ = (url, rules);
++    todo!("step relay/2.12-ssrf-defense")
++}
++
++/// Where a name becomes addresses: the seam that makes "resolved once" observable.
++///
++/// A port rather than a call to `tokio::net::lookup_host` inside the client, for the
++/// reason every port in this service exists: a test cannot ask a real name service
++/// to answer one thing and then another, and the property this step is about is
++/// exactly the difference between the two. The future is boxed for the same reason
++/// [`crate::delivery::Sender`]'s is: a trait's `async fn` is not dispatchable
++/// through a trait object.
++pub trait Resolver: Send + Sync + fmt::Debug + 'static {
++    /// Every address `host` answers with right now, in the order they should be
++    /// tried.
++    ///
++    /// # Errors
++    ///
++    /// Returns a sentence when the name service could not be asked at all. That is a
++    /// *failure*, not a refusal: it says nothing about the target, and the attempt
++    /// is worth repeating.
++    fn resolve(
++        &self,
++        host: &str,
++        port: u16,
++    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, String>> + Send + '_>>;
++}
++
++/// The resolver a deployment gets: the name service of the machine it runs on.
++#[derive(Debug, Default, Clone, Copy)]
++pub struct System;
++
++impl Resolver for System {
++    fn resolve(
++        &self,
++        host: &str,
++        port: u16,
++    ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, String>> + Send + '_>> {
++        let _ = (host, port);
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++/// The two ways a target does not become an address.
++///
++/// They are separate answers because the worker does different things with them, and
++/// the difference is the whole point: one is a decision that no attempt will change,
++/// the other is a failure that says nothing about the target.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Unreachable {
++    /// A decision: no attempt will change it, so the delivery is not retried.
++    Refused(Refusal),
++    /// A failure: the name service did not answer, which is a thing that happens.
++    Unresolved(String),
++}
++
++impl fmt::Display for Unreachable {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let _ = f;
++        todo!("step relay/2.12-ssrf-defense")
++    }
++}
++
++/// The address a delivery to `host` goes to: resolved **once**, checked, and then
++/// connected to by address.
++///
++/// Every address the name answers with has to pass: a name that answers with one
++/// internal address is a name this service does not dial at all. That is stricter
++/// than picking the first address that would be allowed, and it is the honest
++/// reading of a name that resolves to two places — the tenant registered a name they
++/// control, and a name that resolves into the deployment's own network is not a
++/// subscriber whose traffic we misjudged.
++///
++/// The answer is a [`SocketAddr`], not a name: the client connects to *this* value,
++/// so there is no second resolution between the check and the connection for an
++/// attacker to answer differently.
++///
++/// # Errors
++///
++/// Returns [`Unreachable::Refused`] when the name or one of its addresses is not one
++/// a delivery may use, and [`Unreachable::Unresolved`] when the name service could
++/// not be asked.
++pub async fn pin(
++    host: &Host,
++    rules: &Rules,
++    resolver: &dyn Resolver,
++) -> Result<SocketAddr, Unreachable> {
++    let _ = (host, rules, resolver);
++    todo!("step relay/2.12-ssrf-defense")
++}

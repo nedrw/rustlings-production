@@ -392,7 +392,9 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
+    "images",
 ]
+images = ["postgres:17-alpine"]
 hint = "Resolve once, check the address you resolved, and connect to that address — checking the hostname and then letting the client resolve it again is the rebinding hole."
 
 # ---------------------------------------------------------------------------------------
