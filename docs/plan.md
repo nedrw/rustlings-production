@@ -84,7 +84,7 @@ rustlings 的 runner 假设「把一个 `.rs` 拷进临时 crate 跑 `cargo test
 | — | `kiln caps` | 能力台账：深度、证据、上次验证时间 |
 | — | `kiln review --due` | 间隔重复：久未用到的能力重新抽查 |
 | — | `kiln lint-caps` | 课程自检：跨 track 重复教学、依赖不可达 |
-| — | `kiln lang` / `kiln i18n status` | 切换内容与 CLI 语言；翻译覆盖率与漂移 |
+| — | `kiln --lang`（全局开关）/ `kiln i18n status` | 切换内容语言；翻译覆盖率与漂移 |
 | — | `kiln images [pull]` | 探测容器运行时、预拉本 track 需要的镜像 |
 | — | `kiln doctor` | 一次性诊断：工具链、容器运行时、缺失的 cargo 工具、镜像、DB 连通性 |
 | — | `kiln review [step]` / `solution [step]` | 我的 diff vs 参考解 + 自评清单 / 应用参考解（留痕） |

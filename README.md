@@ -12,13 +12,13 @@ kiln hint     # one nudge, and where to read the rest
 kiln reset    # take this step's scaffold back out, keeping your code
 kiln solution # apply the reference solution (recorded, not prevented)
 kiln verify   # full check, CI mode (--json, --slow)
-kiln watch    # re-run on save
+kiln watch    # judge again whenever the project's contents change
 ```
 
 Every step = a short brief (WHY / TASK / DONE WHEN / TRAP / FURTHER) + read-only spec tests + a set of
-production gates: a lint ladder that only ever tightens, `cargo-mutants` proving the specs are not
-vacuous, public-API baselines, perf budgets, dependency and `unsafe` budgets, graceful shutdown and
-failure drills.
+production gates. The lint ladder that only ever tightens is in; the gates that need heavier
+machinery (`cargo-mutants` proving the specs are not vacuous, public-API baselines, perf budgets,
+dependency and `unsafe` budgets) arrive with the milestones that need them, see plan.md §11.
 
 **No repeated teaching across projects.** Every learnable thing is a *capability* with a depth
 (`aware → apply → design → operate`). A step declares what it teaches and at which depth; the runner
@@ -55,7 +55,7 @@ locale fallback and translation-drift detection, so other languages can be added
 
 ## Status
 
-**M0 is closed.** The metadata layer, the capability lint, the twelve gates and the runner are in, and
+**M0 is closed.** The metadata layer, the capability lint, the gates and the runner are in, and
 T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec tests, a scaffold, a
 reference solution and gate wiring. T2–T5 are metadata and step tables only. M1 is next (T2 plus the
 capability-dedup runtime); see [docs/plan.md](docs/plan.md) §11.
@@ -95,10 +95,11 @@ cargo run -p kiln -- i18n status
 ```
 
 Also in: the course metadata under `course/` (`course.toml`, `capabilities.toml`, all 22 T1 steps in
-`tracks/mailer/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; the gates
-`spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` / `docs:public` / `exit-code` / `i18n` /
-`images` / `container-repro` / `links` (`timeout` is deliberately the runner's own deadline rather
-than a per-step gate, see plan.md §6); `list` / `caps` / `run` / `check` / `hint` / `reset` /
+`tracks/mailer/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; eleven implemented
+gates — `spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` / `docs:public` / `exit-code` /
+`i18n` / `images` / `container-repro` / `links` — plus `timeout`, which is the runner's own deadline
+rather than a per-step gate (plan.md §6), and `conformance`, which the catalogue holds for T3;
+`list` / `caps` / `run` / `check` / `hint` / `reset` /
 `solution` / `spec restore` / `spec manifest` / `selftest` / `verify` / `watch` / `doctor` / `images` /
 `links` / `i18n status`; and the locale fallback chain. `tools/lint-caps-md.py` is the prototype the
 Rust lint was ported from; it still cross-checks the ledger against the curriculum's own tables,
