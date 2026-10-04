@@ -1,0 +1,312 @@
+diff --git a/migrations/0002_job_events.sql b/migrations/0002_job_events.sql
+new file mode 100644
+index 0000000..78627e2
+--- /dev/null
++++ b/migrations/0002_job_events.sql
+@@ -0,0 +1,16 @@
++-- The trail: one row per settle, and the constraint that makes an append idempotent.
++--
++-- Step `jobq/3.6-transaction-isolation`. This is the project's second migration, so it is
++-- `0002` (`0001` wrote `jobs`; `mailer` and `relay` number their own files).
++--
++-- The file is yours to write. What it has to hold is one line of `src/engine/events.rs` per row:
++-- `id` (this line's own identity), `job_id` (the job it is about), `kind` (`completed`,
++-- `attempt-failed`, `reclaimed`), `attempt` (the row's own count, as the settle saw it), `detail`
++-- (the reason, when there is one) and `at` (the instant the caller stamped it with).
++--
++-- Two things about the file are decisions rather than transcription:
++-- 1. a line's identity is `(job_id, kind, attempt)` — the same settle appended twice has to be the
++--    same line, and that promise is one the *database* keeps, not one an application checks first;
++-- 2. an operator reads one job's trail, and later steps read all of them (`jobq/3.16-dlq-tooling`
++--    lists what died, `jobq/3.17-error-budget-alerts` counts by kind), so which index that needs is
++--    worth one thought before the table is written.
+diff --git a/src/engine/events.rs b/src/engine/events.rs
+new file mode 100644
+index 0000000..fa07ef4
+--- /dev/null
++++ b/src/engine/events.rs
+@@ -0,0 +1,184 @@
++//! The trail: what has happened to a job, in the order it happened.
++//!
++//! The `jobs` table says where a job *is*. It cannot say how it got there: a retried attempt, an
++//! attempt nobody watched, a completion that followed two failures — each of those leaves a row
++//! that looks exactly like the row a first success leaves. Step `jobq/3.6-transaction-isolation`
++//! is where the trail becomes something the project keeps, and this module is the vocabulary it is
++//! kept in: one [`JobEvent`] per settle, naming the job, what happened, which attempt it happened
++//! to, why, and when.
++//!
++//! Three decisions are written into the shapes below, and the step argues them:
++//!
++//! * **the trail is about settles, not about state.** [`EventKind::Completed`],
++//!   [`EventKind::AttemptFailed`] and [`EventKind::Reclaimed`] are the three ways an attempt ends.
++//!   A claim is deliberately not one of them: an attempt that has been *started* is on the row
++//!   (`attempts`), and a trail that recorded starts would double the writes a claim does for
++//!   nothing an operator reads. What the trail answers is "what happened to this job"; "somebody
++//!   is holding it right now" is the row's own answer.
++//! * **an event is a value, and it carries the instant it was appended to.** The clock is the
++//!   caller's — a store stamps what it is given — because two stores each reading their own clock
++//!   is the disagreement `jobq/3.5-store-port-conformance` exists to prevent.
++//! * **`attempt` is the attempt the event *describes*.** Two lines can name the same attempt (a
++//!   reclaim of an attempt that later fails), so the identity of a line is
++//!   `(job_id, kind, attempt)` rather than its position — which is what lets a store append one
++//!   twice and get one line instead of two.
++
++use std::fmt;
++
++use chrono::{DateTime, Utc};
++use uuid::Uuid;
++
++use crate::engine::domain::JobId;
++
++/// What happened to a job.
++///
++/// `#[non_exhaustive]`, for the same reason [`crate::engine::JobState`] is: this list grows — a
++/// replay, a purge and a run somebody cancelled are all events an operator has to be able to read —
++/// and a caller that wrote a wildcard arm on day one should not have to be rebuilt the day one of
++/// them arrives.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum EventKind {
++    /// The attempt finished the job.
++    Completed,
++    /// The attempt failed and the job moved on: back to the queue, or out of it.
++    AttemptFailed,
++    /// The attempt was abandoned rather than finished — the worker holding it stopped, or its
++    /// lease ran out — and the job went back to the queue.
++    Reclaimed,
++}
++
++impl EventKind {
++    /// The name this kind is stored and printed under.
++    ///
++    /// `kebab-case`, like the `state` column: the string is what a migration, a query and an
++    /// operator's `grep` all have to agree on, so it is written once, here.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            EventKind::Completed => "completed",
++            EventKind::AttemptFailed => "attempt-failed",
++            EventKind::Reclaimed => "reclaimed",
++        }
++    }
++}
++
++impl fmt::Display for EventKind {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++/// One line of the trail: a settle, and which attempt it settled.
++///
++/// Fields are private and read through accessors, like [`crate::engine::Job`]: a store writes the
++/// row and everybody else reads it, so a later step adding a column (the worker that settled it,
++/// the queue it belonged to) is a change inside the crate rather than a rebuild of every caller.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct JobEvent {
++    /// This line's own identity, distinct from the job's.
++    id: Uuid,
++    /// The job it is about.
++    job_id: JobId,
++    /// What happened.
++    kind: EventKind,
++    /// Which attempt it happened to: the row's own count, as the settle saw it.
++    attempt: u32,
++    /// Why, when there is a why: a failure's reason, or the note a reclaimer leaves.
++    detail: Option<String>,
++    /// When it was appended, by the caller's clock.
++    at: DateTime<Utc>,
++}
++
++impl JobEvent {
++    /// A fresh line.
++    #[must_use]
++    pub fn new(
++        job_id: JobId,
++        kind: EventKind,
++        attempt: u32,
++        detail: Option<String>,
++        at: DateTime<Utc>,
++    ) -> Self {
++        Self {
++            id: Uuid::new_v4(),
++            job_id,
++            kind,
++            attempt,
++            detail,
++            at,
++        }
++    }
++
++    /// A line a store has already written, identity and all.
++    ///
++    /// The read half of the round trip: [`JobEvent::new`] mints an identity for a line that is about
++    /// to be appended, and this is how a store hands a row back *without* minting a second one.
++    /// That matters more than it looks: a line's identity is what makes appending it twice the same
++    /// line, so a read that invented a fresh identity would make every line look new to whatever
++    /// compared two of them.
++    #[must_use]
++    pub fn stored(
++        id: Uuid,
++        job_id: JobId,
++        kind: EventKind,
++        attempt: u32,
++        detail: Option<String>,
++        at: DateTime<Utc>,
++    ) -> Self {
++        Self {
++            id,
++            job_id,
++            kind,
++            attempt,
++            detail,
++            at,
++        }
++    }
++
++    /// This line's identity, for a store that wants to answer which row it wrote.
++    #[must_use]
++    pub fn id(&self) -> Uuid {
++        self.id
++    }
++
++    /// The job it is about.
++    #[must_use]
++    pub fn job_id(&self) -> JobId {
++        self.job_id
++    }
++
++    /// What happened.
++    #[must_use]
++    pub fn kind(&self) -> EventKind {
++        self.kind
++    }
++
++    /// Which attempt it happened to.
++    #[must_use]
++    pub fn attempt(&self) -> u32 {
++        self.attempt
++    }
++
++    /// Why, when there is a why.
++    #[must_use]
++    pub fn detail(&self) -> Option<&str> {
++        self.detail.as_deref()
++    }
++
++    /// When the caller said it happened.
++    #[must_use]
++    pub fn at(&self) -> DateTime<Utc> {
++        self.at
++    }
++}
++
++impl fmt::Display for JobEvent {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "{} of attempt {} of job {}",
++            self.kind, self.attempt, self.job_id
++        )
++    }
++}
+diff --git a/src/engine/retry.rs b/src/engine/retry.rs
+new file mode 100644
+index 0000000..b2b39a6
+--- /dev/null
++++ b/src/engine/retry.rs
+@@ -0,0 +1,94 @@
++//! Retrying what the database refused, with a bound.
++//!
++//! Two writers touching the same rows do not both need to be told no: one of them is told *again*.
++//! PostgreSQL says it in a class of its own — `40001` (a serialisation failure under an isolation
++//! level that holds a snapshot) and `40P01` (a deadlock) — and that class is a failure another
++//! attempt can change, which is exactly what [`Error::is_retryable`] answers. Step
++//! `jobq/3.6-transaction-isolation` is where the engine gains both the class
++//! (`Error::Conflict`, raised by the durable backend) and this: the loop that acts on it.
++//!
++//! Why a helper rather than a `loop` at each call site:
++//!
++//! * **the bound is the point.** Retrying without a limit turns one contended row into a process
++//!   that never finishes; retrying zero times turns a transient refusal into a failed job. The
++//!   number is a parameter, the default is [`DEFAULT_ATTEMPTS`], and the *closure* is what gets
++//!   repeated — so the caller writes the transaction once and the retry is not a second copy of it;
++//! * **the caller says what is retried, the engine says when.** The predicate is the engine's own
++//!   classification ([`Error::is_retryable`]), so a caller cannot accidentally retry a rejected
++//!   payload, and a failure the engine has not classified as retryable stops at one attempt —
++//!   which is why a *closure* is the right shape: an operation that can fail twice for two
++//!   different reasons is retried only for the reason that is worth it;
++//! * **the answer says how many attempts it took.** A settle that converged on the second try is a
++//!   different story from one that never lost a race, and it is the number a log line or a counter
++//!   needs; [`Retried::attempts`] is where it is kept.
++//!
++//! What this deliberately is *not*: a backoff. How long to wait between attempts — if at all —
++//! is a policy that needs a clock the engine does not own yet (`jobq/3.8-clock-injection` puts one
++//! behind an interface), and a `sleep` written here would make every test that exercises this file
++//! slower than the thing it tests. The bound is the whole of the policy for now.
++
++use std::future::Future;
++
++use crate::engine::error::Error;
++
++/// How many attempts a retryable operation gets when the caller does not say.
++///
++/// Three, which is the same shape the engine gives a job: enough to absorb a deadlock with a second
++/// writer, few enough that a queue which has stopped making progress fails loudly instead of
++/// spinning.
++pub const DEFAULT_ATTEMPTS: u32 = 3;
++
++/// What a retried operation ended with: its answer, and how many attempts it took.
++///
++/// Both halves are the caller's business: the value is why the operation was run, and the count is
++/// what an operator reads when a queue starts retrying more than it used to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Retried<T> {
++    /// What the operation answered.
++    value: T,
++    /// How many times the closure was called: `1` when it succeeded first time.
++    attempts: u32,
++}
++
++impl<T> Retried<T> {
++    /// The answer.
++    #[must_use]
++    pub fn value(self) -> T {
++        self.value
++    }
++
++    /// How many attempts it took, counting the one that worked.
++    #[must_use]
++    pub fn attempts(&self) -> u32 {
++        self.attempts
++    }
++}
++
++/// Run `operation`, and run it again while it fails with an error the engine calls retryable.
++///
++/// `attempts` is the number of tries, and it is read as *at least one*: an operation nobody runs has
++/// no answer to give, and `retry(0, …)` silently returning the closure's own future unpolled would
++/// be a much worse reading of the same sentence.
++///
++/// The closure is `FnMut` and is called once per attempt — a future that has resolved cannot be
++/// polled again, so "retrying the future" is not a thing, and "calling the closure again" is what
++/// a retry actually is. Whatever the closure does per attempt (opening a transaction, taking a
++/// connection) therefore happens again on the retry, which is the point.
++///
++/// # Errors
++///
++/// The last failure, unchanged. A caller that needs to know how many attempts were spent before
++/// giving up counts its own calls (the closure is called once per attempt); replacing the failure
++/// with "I tried three times" would throw away the only sentence in the error that says what went
++/// wrong.
++pub async fn retry<T, F, Fut>(attempts: u32, mut operation: F) -> Result<Retried<T>, Error>
++where
++    F: FnMut() -> Fut,
++    Fut: Future<Output = Result<T, Error>>,
++{
++    let _ = attempts;
++    let _ = operation;
++    todo!(
++        "jobq/3.6-transaction-isolation: call the closure, and call it again while the failure is one another attempt could change"
++    )
++}

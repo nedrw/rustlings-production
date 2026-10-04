@@ -11,3 +11,4 @@ format_version = 1
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
 "spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"
 "spec/3.5/port_conformance.rs" = "sha256:b1fb6df091056dfc45d4adcb2910f769b365afdf44693693f3629e79c765c09e"
+"spec/3.6/isolation.rs" = "sha256:1eafb7eb46c5f81b54180e3219af58b5b042fd8c5305b961e142d21a5f45d252"
