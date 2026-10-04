@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..f6b5253
 --- /dev/null
 +++ b/tests/support/container.rs
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,544 @@
 +//! A container built from this project, for one test (step `mailer/1.21-container`).
 +//!
 +//! The other fixtures in this directory run a *service* (`service.rs`), a *database* (`postgres.rs`)
@@ -96,6 +96,9 @@ index 0000000..f6b5253
 +const RETRY: Duration = Duration::from_millis(100);
 +/// How often `run_bounded` looks at its child.
 +const POLL: Duration = Duration::from_millis(20);
++
++/// How many times a start that lost the race for a host port is tried again.
++const START_ATTEMPTS: u32 = 3;
 +/// Where the build cache is mounted inside the image, and the value passed as `CARGO_TARGET_DIR`.
 +///
 +/// Deliberately *not* the target directory a Dockerfile would use by itself: a mount is not a layer,
@@ -344,7 +347,18 @@ index 0000000..f6b5253
 +        }
 +        args.push(tag.to_owned());
 +        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-+        let outcome = run_bounded(engine, &borrowed, COMMAND_DEADLINE);
++        let mut attempt = 0;
++        let outcome = loop {
++            attempt += 1;
++            let outcome = run_bounded(engine, &borrowed, COMMAND_DEADLINE);
++            let lost = lost_the_port_race(&outcome.said());
++            if outcome.status.success() || attempt >= START_ATTEMPTS || !lost {
++                break outcome;
++            }
++            // The engine handed the port this start needs to somebody else. Take the name back
++            // (`-v` for the reason `Drop` gives) and ask it for another.
++            let _ = run_bounded(engine, &["rm", "-f", "-v", &name], COMMAND_DEADLINE);
++        };
 +        assert!(
 +            outcome.status.success(),
 +            "`{engine} run` failed for `{tag}`:\n{}",
@@ -509,6 +523,17 @@ index 0000000..f6b5253
 +    pub fn said(&self) -> String {
 +        format!("{}{}", self.stdout, self.stderr)
 +    }
++}
++
++/// Did the engine lose the race for a host port, rather than fail at something a retry cannot fix?
++///
++/// `-p 127.0.0.1::8080` has the engine pick a free host port, and the engine's allocator is not
++/// atomic: two containers started at the same moment — the spec targets of one `cargo test` run in
++/// parallel — can be handed the same port, and the loser says `address already in use`. The port is
++/// not this fixture's to choose, so the start is tried again; one that keeps failing is still a
++/// failure, in the engine's own words.
++fn lost_the_port_race(complaint: &str) -> bool {
++    complaint.contains("address already in use")
 +}
 +
 +/// Run one engine command, and answer what it printed — or panic with what it said.

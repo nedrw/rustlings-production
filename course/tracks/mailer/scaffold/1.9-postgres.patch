@@ -127,7 +127,7 @@ new file mode 100644
 index 0000000..198d768
 --- /dev/null
 +++ b/tests/support/postgres.rs
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,467 @@
 +//! A Postgres container for one test (step `mailer/1.9-postgres`).
 +//!
 +//! The specs that need a database pull this file in with
@@ -171,6 +171,9 @@ index 0000000..198d768
 +/// How often `run_bounded` looks at its child.
 +const POLL: Duration = Duration::from_millis(20);
 +
++/// How many times a start that lost the race for a host port is tried again.
++const START_ATTEMPTS: u32 = 3;
++
 +/// One Postgres container, with one empty database, for the length of one test.
 +pub struct Postgres {
 +    engine: &'static str,
@@ -194,24 +197,38 @@ index 0000000..198d768
 +            COUNTER.fetch_add(1, Ordering::Relaxed)
 +        );
 +        let password = format!("POSTGRES_PASSWORD={PASSWORD}");
-+        let started = run_or_panic(
-+            engine,
-+            &[
-+                // The host port is whatever is free (`127.0.0.1::5432`), so two tests never meet on
-+                // one port; `port` below is how this module learns which one it got.
-+                "run",
-+                "-d",
-+                "--name",
-+                &name,
-+                "-e",
-+                &password,
-+                "-p",
-+                "127.0.0.1::5432",
-+                "--pull=never",
-+                &image,
-+            ],
-+            COMMAND_DEADLINE,
-+        );
++        let started = {
++            let mut attempt = 0;
++            loop {
++                attempt += 1;
++                let ran = run_or_panic(
++                    engine,
++                    &[
++                        // The host port is whatever is free (`127.0.0.1::5432`), so two tests never
++                        // meet on one port on purpose; `port` below is how this module learns which
++                        // one it got.
++                        "run",
++                        "-d",
++                        "--name",
++                        &name,
++                        "-e",
++                        &password,
++                        "-p",
++                        "127.0.0.1::5432",
++                        "--pull=never",
++                        &image,
++                    ],
++                    COMMAND_DEADLINE,
++                );
++                let lost = lost_the_port_race(&ran.message());
++                if ran.success() || attempt >= START_ATTEMPTS || !lost {
++                    break ran;
++                }
++                // The engine handed the port this start needs to somebody else. Take the name back
++                // (`-v` for the reason `Drop` gives) and ask it for another.
++                let _ = try_run(engine, &["rm", "-f", "-v", &name], COMMAND_DEADLINE);
++            }
++        };
 +        if !started.success() {
 +            panic!(
 +                "`{engine} run` could not start {image}: {}",
@@ -511,6 +528,17 @@ index 0000000..198d768
 +            .unwrap_or("no output")
 +            .to_owned()
 +    }
++}
++
++/// Did the engine lose the race for a host port, rather than fail at something a retry cannot fix?
++///
++/// `-p 127.0.0.1::5432` has the engine pick a free host port, and the engine's allocator is not
++/// atomic: two containers started at the same moment — the spec targets of one `cargo test` run in
++/// parallel — can be handed the same port, and the loser says `address already in use`. The port is
++/// not this fixture's to choose, so the start is tried again; one that keeps failing is still a
++/// failure, in the engine's own words.
++fn lost_the_port_race(complaint: &str) -> bool {
++    complaint.contains("address already in use")
 +}
 +
 +/// Run a command the module has already proved exists.

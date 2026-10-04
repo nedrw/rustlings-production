@@ -165,7 +165,7 @@ new file mode 100644
 index 0000000..2cb6430
 --- /dev/null
 +++ b/tests/support/mailpit.rs
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,327 @@
 +//! A real mail server for one test (step `mailer/1.19-test-layering`).
 +//!
 +//! The specs before this one hand the service a *fake* sender (`tests/support/email.rs`) and judge
@@ -213,6 +213,9 @@ index 0000000..2cb6430
 +/// How often `run_bounded` looks at its child.
 +const POLL: Duration = Duration::from_millis(20);
 +
++/// How many times a start that lost the race for a host port is tried again.
++const START_ATTEMPTS: u32 = 3;
++
 +/// One mailpit container, for the length of one test.
 +pub struct Mailpit {
 +    engine: &'static str,
@@ -231,22 +234,37 @@ index 0000000..2cb6430
 +        let engine = engine();
 +        let image = local_image(engine);
 +        let name = format!("kiln-mailpit-{}", std::process::id());
-+        run_or_panic(
-+            engine,
-+            &[
-+                "run",
-+                "-d",
-+                "--name",
-+                &name,
-+                // Both ports are whatever is free on the host, so two tests never meet on one.
-+                "-p",
-+                "127.0.0.1::1025",
-+                "-p",
-+                "127.0.0.1::8025",
-+                "--pull=never",
-+                &image,
-+            ],
-+        );
++        let mut attempt = 0;
++        loop {
++            attempt += 1;
++            let outcome = run_bounded(
++                engine,
++                &[
++                    "run",
++                    "-d",
++                    "--name",
++                    &name,
++                    // Both ports are whatever is free on the host, so two tests never meet on one
++                    // on purpose.
++                    "-p",
++                    "127.0.0.1::1025",
++                    "-p",
++                    "127.0.0.1::8025",
++                    "--pull=never",
++                    &image,
++                ],
++            );
++            if outcome.status.success() {
++                break;
++            }
++            let complaint = format!("{}{}", outcome.stdout, outcome.stderr);
++            if attempt >= START_ATTEMPTS || !lost_the_port_race(&complaint) {
++                panic!("`{engine} run` could not start {image}: {complaint}");
++            }
++            // The engine handed one of the ports this start needs to somebody else. Take the name
++            // back (`-v` for the reason `Drop` gives) and ask it for others.
++            let _ = run_bounded(engine, &["rm", "-f", "-v", &name]);
++        }
 +
 +        let smtp_port = published_port(engine, &name, SMTP_PORT);
 +        let http_port = published_port(engine, &name, HTTP_PORT);
@@ -395,6 +413,17 @@ index 0000000..2cb6430
 +        .rsplit_once(':')
 +        .and_then(|(_, port)| port.trim().parse().ok())
 +        .unwrap_or_else(|| panic!("the engine did not publish port {port} of {name}: `{listed}`"))
++}
++
++/// Did the engine lose the race for a host port, rather than fail at something a retry cannot fix?
++///
++/// `-p 127.0.0.1::1025` has the engine pick a free host port, and the engine's allocator is not
++/// atomic: two containers started at the same moment — the spec targets of one `cargo test` run in
++/// parallel — can be handed the same port, and the loser says `address already in use`. The port is
++/// not this fixture's to choose, so the start is tried again; one that keeps failing is still a
++/// failure, in the engine's own words.
++fn lost_the_port_race(complaint: &str) -> bool {
++    complaint.contains("address already in use")
 +}
 +
 +/// Run one engine command, and answer what it printed — or panic with what it said.
