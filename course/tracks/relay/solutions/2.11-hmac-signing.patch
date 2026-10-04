@@ -1,0 +1,327 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index d2d5632..50dfd8e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod openapi;
+ pub mod ordering;
+ pub mod outbound;
+ pub mod pagination;
++pub mod signing;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+ pub const USAGE: &str = "\
+diff --git a/src/outbound.rs b/src/outbound.rs
+index e834226..9167f22 100644
+--- a/src/outbound.rs
++++ b/src/outbound.rs
+@@ -36,15 +36,18 @@
+ use std::collections::HashMap;
+ use std::future::Future;
+ use std::pin::Pin;
+-use std::sync::{Mutex, MutexGuard};
++use std::sync::{Arc, Mutex, MutexGuard};
+ use std::time::Duration;
+ 
++use chrono::Utc;
++
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::TcpStream;
+ use tokio::time::timeout;
+ 
+ use crate::delivery::{Receipt, SendError, SendRequest, Sender};
+ use crate::domain::EndpointUrl;
++use crate::signing::{self, Secrets};
+ 
+ /// The most a response head may be before this client gives up on it. A head is a few hundred bytes;
+ /// a target that sends a megabyte of them is not answering, it is filling memory.
+@@ -477,17 +480,39 @@ impl Client {
+ /// This is the adapter `relay/2.6-at-least-once` asked for: the worker holds a `&dyn Sender` and
+ /// knows nothing about HTTP, and what a status code means is decided here, in [`Outcome`], and
+ /// mapped to [`SendError`] — the only two categories the worker acts on.
++///
++/// It is also where a delivery is signed (`relay/2.11-hmac-signing`), because a signature is a
++/// header and this is the component that writes headers. The key comes from a [`Secrets`] store
++/// rather than from the request: the worker never handles key material, and the adapter looks the
++/// secret up where it is used.
+ #[derive(Debug)]
+ pub struct HttpSender {
+     client: Client,
++    /// The store to sign with, or `None` for a sender that sends unsigned requests (a test, a
++    /// deployment that has not configured signing yet).
++    secrets: Option<Arc<dyn Secrets>>,
+ }
+ 
+ impl HttpSender {
+-    /// A sender that speaks to targets through a client with this policy.
++    /// A sender that speaks to targets through a client with this policy, unsigned.
+     #[must_use]
+     pub fn new(policy: Policy) -> Self {
+         Self {
+             client: Client::new(policy),
++            secrets: None,
++        }
++    }
++
++    /// A sender that signs every attempt with the secret of the endpoint it is going to.
++    ///
++    /// A delivery this sender cannot sign is *not sent*: an unsigned request is a request the
++    /// receiver cannot tell from anybody else's, so the attempt fails — permanently when the
++    /// endpoint has no secret at all, retryably when the store could not be read.
++    #[must_use]
++    pub fn signing(policy: Policy, secrets: Arc<dyn Secrets>) -> Self {
++        Self {
++            client: Client::new(policy),
++            secrets: Some(secrets),
+         }
+     }
+ 
+@@ -503,10 +528,12 @@ impl Sender for HttpSender {
+         &self,
+         request: SendRequest,
+     ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
++        let secrets = self.secrets.clone();
+         Box::pin(async move {
+             // What the subscriber is handed: the event as the API answers with it, plus which
+             // attempt this is. The delivery id travels in a header of its own, because it is not
+             // part of the event — it is the receiver's key for "I have already handled this".
++            let tenant = request.event.tenant_id;
+             let body = serde_json::json!({
+                 "id": request.event.id.to_string(),
+                 "kind": request.event.kind,
+@@ -514,11 +541,43 @@ impl Sender for HttpSender {
+                 "received_at": request.event.received_at.to_rfc3339(),
+                 "attempt": request.attempt,
+             });
+-            let outbound = Request::post(request.url.clone())
++            // The bytes, once: the body that is signed is the body that is written, and a signature
++            // over a second serialisation of the same value is a signature over a spelling the
++            // receiver never saw.
++            let payload = body.to_string();
++            let mut outbound = Request::post(request.url.clone())
+                 .header("x-relay-delivery", &request.delivery.to_string())
+-                .header("x-relay-attempt", &request.attempt.to_string())
+-                .json(&body);
++                .header("x-relay-attempt", &request.attempt.to_string());
++
++            if let Some(secrets) = secrets {
++                let secret = match secrets.secret_for(tenant, &request.url).await {
++                    Ok(Some(secret)) => secret,
++                    // No key for this target: sending anyway would make the signature optional,
++                    // and retrying will not find one.
++                    Ok(None) => {
++                        return Err(SendError::Permanent(format!(
++                            "no signing secret for `{}`",
++                            request.url
++                        )));
++                    }
++                    Err(error) => {
++                        return Err(SendError::Retryable(format!(
++                            "the signing secret of `{}` could not be read: {error}",
++                            request.url
++                        )));
++                    }
++                };
++                let timestamp = Utc::now().timestamp();
++                let signature =
++                    signing::sign(&secret, timestamp, request.delivery, payload.as_bytes());
++                outbound = outbound
++                    .header(signing::TIMESTAMP_HEADER, &timestamp.to_string())
++                    .header(signing::SIGNATURE_HEADER, &signature);
++            }
+ 
++            let outbound = outbound
++                .header("content-type", "application/json")
++                .body(payload);
+             match self.client.attempt(&outbound).await {
+                 Outcome::Success(response) => Ok(Receipt {
+                     status: response.status,
+diff --git a/src/signing.rs b/src/signing.rs
+index 5dffa1f..98205da 100644
+--- a/src/signing.rs
++++ b/src/signing.rs
+@@ -28,14 +28,15 @@
+ //! of the endpoint it is about to talk to. The port is a trait because the answer is a lookup, and
+ //! the lookup is not always a database: a test knows its keys, a deployment reads them.
+ //!
+-//! **This file is the scaffold**: the shapes are here, and the three functions this step is about
+-//! answer `todo!()`, so the spec fails here until they are written.
+-
+ use std::fmt;
++use std::fmt::Write as _;
+ use std::future::Future;
+ use std::pin::Pin;
+ 
++use hmac::{Hmac, Mac};
++use sha2::Sha256;
+ use sqlx::PgPool;
++use subtle::ConstantTimeEq;
+ use uuid::Uuid;
+ 
+ use crate::domain::{EndpointUrl, TenantId};
+@@ -147,7 +148,8 @@ pub enum SignatureError {
+ /// makes a signature reproducible in a test and a bug report.
+ #[must_use]
+ pub fn sign(secret: &Secret, timestamp: i64, delivery: Uuid, body: &[u8]) -> String {
+-    todo!("step relay/2.11-hmac-signing: the tag over the body, the instant and the delivery")
++    let tag = tag_of(secret, &signing_string(timestamp, delivery, body));
++    format!("{VERSION}.{timestamp}.{delivery}.{tag}")
+ }
+ 
+ /// Verify a signature a receiver was handed.
+@@ -171,7 +173,44 @@ pub fn verify(
+     now: i64,
+     window: Window,
+ ) -> Result<Verified, SignatureError> {
+-    todo!("step relay/2.11-hmac-signing: the receiver's half of the signature")
++    let signature = header(headers, SIGNATURE_HEADER)
++        .ok_or_else(|| SignatureError::Malformed(format!("no `{SIGNATURE_HEADER}` header")))?;
++    let (timestamp, claimed, tag) = parse(signature)?;
++
++    let stamped = header(headers, TIMESTAMP_HEADER)
++        .ok_or_else(|| SignatureError::Malformed(format!("no `{TIMESTAMP_HEADER}` header")))?
++        .trim()
++        .parse::<i64>()
++        .map_err(|_| {
++            SignatureError::Malformed(format!(
++                "`{TIMESTAMP_HEADER}` is not a whole number of seconds"
++            ))
++        })?;
++
++    // The order is the order a receiver reads its own log line in: is this a scheme I know (in
++    // `parse`), is it recent, is it *for this request* — and only then the tag, which is the
++    // expensive half. The instant is in two headers and they are one value: a receiver that checked
++    // one and hashed the other has a hole exactly the size of a replay.
++    if stamped != timestamp {
++        return Err(SignatureError::Mismatch);
++    }
++    if now.saturating_sub(timestamp) > window.max_age
++        || timestamp.saturating_sub(now) > window.max_skew
++    {
++        return Err(SignatureError::Stale { timestamp, now });
++    }
++    // The delivery the signature claims has to be the delivery the receiver is being told about.
++    // Without this, a valid tag is a bearer token: it proves that somebody with the key sent *this
++    // body*, and says nothing about which delivery it belongs to.
++    if claimed != delivery {
++        return Err(SignatureError::Mismatch);
++    }
++
++    let expected = tag_of(secret, &signing_string(timestamp, claimed, body));
++    if !tags_match(&expected, &tag) {
++        return Err(SignatureError::Mismatch);
++    }
++    Ok(Verified { timestamp })
+ }
+ 
+ /// Whether two tags are the same, in time that does not depend on *where* they differ.
+@@ -182,7 +221,85 @@ pub fn verify(
+ /// should not have to write its own.
+ #[must_use]
+ pub fn tags_match(expected: &str, provided: &str) -> bool {
+-    todo!("step relay/2.11-hmac-signing: a comparison that does not leak where it diverges")
++    let expected = expected.as_bytes();
++    let provided = provided.as_bytes();
++    // The length is not a secret — a tag is sixty-four characters by construction, and anybody can
++    // count. What must not leak is *where* two tags of the same length differ, which is what
++    // `ct_eq` promises and what `==` does not: `==` on bytes stops at the first one that is wrong,
++    // and the time it takes is a measurement the other end gets to repeat as often as it likes.
++    if expected.len() != provided.len() {
++        return false;
++    }
++    expected.ct_eq(provided).into()
++}
++
++/// The HMAC-SHA256 tag of one signing string, as lower-case hex.
++fn tag_of(secret: &Secret, signing_string: &[u8]) -> String {
++    // HMAC accepts a key of any length, so the only failure this crate can report is about a
++    // *typed* key — which this is not. The branch is written down rather than unwrapped because
++    // library code in this course does not unwrap (`docs/authoring.md` §7.4), and because an
++    // `unwrap` here would be a panic in the one function an attacker gets to call in a loop.
++    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
++        unreachable!("an HMAC key of any length is a key");
++    };
++    mac.update(signing_string);
++    hex(&mac.finalize().into_bytes())
++}
++
++/// What the tag is computed over: the version, the instant, the delivery, and the body *bytes*.
++///
++/// The body is bytes and not a value on purpose: a tag computed over a re-serialisation of the
++/// event is a tag over a spelling of it, and the receiver hashed the spelling that arrived.
++fn signing_string(timestamp: i64, delivery: Uuid, body: &[u8]) -> Vec<u8> {
++    let mut signing_string = format!("{VERSION}.{timestamp}.{delivery}.").into_bytes();
++    signing_string.extend_from_slice(body);
++    signing_string
++}
++
++/// The parts of a signature header after its version: the instant, the delivery, and the tag.
++fn parse(signature: &str) -> Result<(i64, Uuid, String), SignatureError> {
++    let mut parts = signature.split('.');
++    let version = parts
++        .next()
++        .filter(|version| !version.is_empty())
++        .ok_or_else(|| SignatureError::Malformed("an empty signature".to_owned()))?;
++    if version != VERSION {
++        return Err(SignatureError::UnknownVersion(version.to_owned()));
++    }
++    let malformed = |what: &str| SignatureError::Malformed(format!("{what} in `{signature}`"));
++    let timestamp = parts
++        .next()
++        .and_then(|part| part.parse::<i64>().ok())
++        .ok_or_else(|| malformed("no timestamp"))?;
++    let delivery = parts
++        .next()
++        .and_then(|part| part.parse::<Uuid>().ok())
++        .ok_or_else(|| malformed("no delivery id"))?;
++    let tag = parts.next().ok_or_else(|| malformed("no tag"))?;
++    if parts.next().is_some() {
++        return Err(malformed("more parts than a signature has"));
++    }
++    Ok((timestamp, delivery, tag.to_owned()))
++}
++
++/// One header by name, case-insensitively.
++fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
++    headers
++        .iter()
++        .find(|(header, _)| header.eq_ignore_ascii_case(name))
++        .map(|(_, value)| value.as_str())
++}
++
++/// Lower-case hex, which is what a header can carry and a receiver can compare character by
++/// character.
++fn hex(bytes: &[u8]) -> String {
++    let mut hex = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        // Writing into a `String` cannot fail; the alternative is a dependency on a hex crate for
++        // sixteen characters of alphabet.
++        let _ = write!(hex, "{byte:02x}");
++    }
++    hex
+ }
+ 
+ /// Where an adapter finds the signing secret of the endpoint it is about to talk to.
+@@ -237,6 +354,22 @@ impl Secrets for DbSecrets {
+         tenant: TenantId,
+         endpoint: &EndpointUrl,
+     ) -> Pin<Box<dyn Future<Output = Result<Option<Secret>, Error>> + Send + '_>> {
+-        todo!("step relay/2.11-hmac-signing: the secret of one endpoint, read where it is stored")
++        // The URL is copied out of the caller's request before the future is built: this port's
++        // future borrows the *store*, and the shape of the trait says nothing about how long the
++        // caller's URL lives.
++        let endpoint = endpoint.as_str().to_owned();
++        Box::pin(async move {
++            // `unique (tenant_id, url)` is the index this probe uses: a secret is looked up by the
++            // identity the service registered an endpoint under, not by its row id, because the row
++            // id is not what a delivery carries.
++            let found: Option<(String,)> =
++                sqlx::query_as("select secret from endpoints where tenant_id = $1 and url = $2")
++                    .bind(tenant.as_uuid())
++                    .bind(&endpoint)
++                    .fetch_optional(&self.pool)
++                    .await
++                    .map_err(Error::Database)?;
++            Ok(found.map(|(secret,)| Secret::new(secret)))
++        })
+     }
+ }

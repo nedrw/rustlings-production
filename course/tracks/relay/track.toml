@@ -361,7 +361,12 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
+    # The spec's last case registers an endpoint over HTTP and reads the secret it was answered
+    # with, so this step needs the database like its neighbours: `images` is step-scoped, and "needs
+    # Postgres" is a fact about the step (`relay/2.10-dlq`'s spec does the same).
+    "images",
 ]
+images = ["postgres:17-alpine"]
 hint = "Sign the exact bytes you send, include a timestamp and the delivery id, and compare with `subtle` — a `==` on a tag leaks where it diverges."
 
 [[step]]

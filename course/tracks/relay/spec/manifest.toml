@@ -8,6 +8,7 @@ format_version = 1
 [spec]
 "spec/2.1/skeleton.rs" = "sha256:7d698e3e2bf41044a18ae383cae500831b6ef1c8b906e85443a0d7ee041c98c0"
 "spec/2.10/dlq.rs" = "sha256:2e24ffc6f7b1df958525d36ffa398e10bcef3c2cf4123a4bbe30294e287aa463"
+"spec/2.11/signing.rs" = "sha256:73fb11d65380ded5f47068de32814529e12f14557065c2e1c28f44682f7259fc"
 "spec/2.2/ingest.rs" = "sha256:630fb551ae2b1089a1360ece37fd580a71bf1b7823889221880b0498011d1010"
 "spec/2.3/contract.rs" = "sha256:8e5c359cbca23db80b707e1ead184c5ea8b0f0dff282c1dcd7c510abd580e2d5"
 "spec/2.4/pagination.rs" = "sha256:ff6a4d6602d3af5e9f0ff8ddeb3bb38b60af8a6a84ca1ebe60b898ea90381c7b"

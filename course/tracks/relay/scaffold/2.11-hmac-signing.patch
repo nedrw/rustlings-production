@@ -1,0 +1,340 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 828726c..4e50ce5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,10 @@ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["json", "fmt", "env-filter"] }
+ uuid = { version = "1.18.1", features = ["v4", "serde"] }
+ chrono = { version = "0.4.42", features = ["serde"] }
++# The HMAC of step `relay/2.11-hmac-signing`: a keyed tag over the exact bytes of a request,
++# and the constant-time comparison that keeps the check from leaking where a guess diverged.
++hmac = "0.12"
++subtle = "2.6"
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+diff --git a/src/signing.rs b/src/signing.rs
+new file mode 100644
+index 0000000..5dffa1f
+--- /dev/null
++++ b/src/signing.rs
+@@ -0,0 +1,242 @@
++//! Signing: what this service sends with a delivery so that the receiver can tell who sent it.
++//!
++//! A webhook target is a URL, and a URL is not an identity: anybody who learns this service's
++//! endpoint — from a log, a screenshot, a misconfigured proxy — can post a body to it, and the
++//! receiver has no way to tell that delivery from a real one. TLS does not help: it proves what the
++//! *server* is, not who wrote the request. The only thing that can is a secret that both ends know
++//! and nobody else does, and the way to use it is a **keyed MAC**: a tag over the exact bytes of the
++//! request, which only the holder of the key can produce.
++//!
++//! Three shapes in this file are decisions rather than taste:
++//!
++//! * **the tag is computed over the bytes that leave the socket**, together with the instant and the
++//!   delivery id, and the whole tuple is written into the header: `v1.<timestamp>.<delivery>.<tag>`.
++//!   Signing a re-serialisation of the body instead of the body is the classic way to produce a
++//!   signature nobody can verify — JSON has many spellings for the same value;
++//! * **the signature carries the delivery it is for.** A tag that only proves "somebody with the key
++//!   sent this body" is a bearer token: the receiver would accept it for a delivery somebody else
++//!   replayed. The delivery id is *inside* the signed material and is checked against the delivery
++//!   the receiver is being told about;
++//! * **the comparison is constant time.** A tag comparison that stops at the first byte that is
++//!   wrong tells an attacker how much of a guess was right, one byte at a time, and a signature is
++//!   exactly the value an attacker gets to guess with as many requests as they like. That is what
++//!   [`subtle`] is for, and it is a dependency this step adds.
++//!
++//! Two more things live here rather than in the adapter: the [`Window`] a receiver accepts a
++//! timestamp in (a signature with no expiry is a signature that can be replayed forever, which is
++//! why the instant is signed at all), and the [`Secrets`] port — where an adapter *finds* the key
++//! of the endpoint it is about to talk to. The port is a trait because the answer is a lookup, and
++//! the lookup is not always a database: a test knows its keys, a deployment reads them.
++//!
++//! **This file is the scaffold**: the shapes are here, and the three functions this step is about
++//! answer `todo!()`, so the spec fails here until they are written.
++
++use std::fmt;
++use std::future::Future;
++use std::pin::Pin;
++
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::{EndpointUrl, TenantId};
++use crate::error::Error;
++
++/// The header a signature travels in.
++pub const SIGNATURE_HEADER: &str = "x-relay-signature";
++/// The header the instant it was made travels in.
++///
++/// Separate from the signature on purpose: a receiver that wants to reject a request made an hour
++/// ago can do it before it computes anything, and `x-relay-signature`'s timestamp is inside a string
++/// a parser has to be careful with.
++pub const TIMESTAMP_HEADER: &str = "x-relay-timestamp";
++/// The only version of the signature this service makes — and the only one it accepts.
++///
++/// A version is what makes the format changeable: a receiver that does not recognize `v2` refuses
++/// it, and a receiver that guessed would be verifying a scheme nobody agreed to.
++pub const VERSION: &str = "v1";
++
++/// An endpoint's signing secret, as it was answered at registration.
++///
++/// A type rather than a `String` because of what it *is*: the one value in this service that must
++/// not end up in a log line. Its [`fmt::Debug`] is written by hand for that reason, and everything
++/// that holds one has to ask for the bytes explicitly.
++#[derive(Clone, PartialEq, Eq)]
++pub struct Secret(String);
++
++impl Secret {
++    /// Wrap the secret an endpoint was registered with.
++    #[must_use]
++    pub fn new(secret: impl Into<String>) -> Self {
++        Self(secret.into())
++    }
++
++    /// The secret, for the one function that has to hash with it.
++    #[must_use]
++    pub fn as_bytes(&self) -> &[u8] {
++        self.0.as_bytes()
++    }
++}
++
++impl fmt::Debug for Secret {
++    /// Never the secret itself: a `Debug` that prints one is a key in every log line that ever
++    /// mentioned a request.
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("Secret(<redacted>)")
++    }
++}
++
++/// How stale, or how far in the future, a signature may be.
++///
++/// Both directions, because clocks disagree in both: a receiver five minutes behind is a normal
++/// deployment, and one that only looked backwards would refuse everything from a sender that is
++/// ahead. The numbers are a deployment's business — what matters is that a window exists, since a
++/// signature with no expiry is a request that can be replayed forever.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Window {
++    /// How old a timestamp may be, in seconds.
++    pub max_age: i64,
++    /// How far ahead of this receiver's clock a timestamp may be, in seconds.
++    pub max_skew: i64,
++}
++
++impl Default for Window {
++    /// The window a receiver gets when it configures nothing: five minutes behind, one minute ahead.
++    fn default() -> Self {
++        Self {
++            max_age: 300,
++            max_skew: 60,
++        }
++    }
++}
++
++/// What a verified signature proves.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Verified {
++    /// The instant the signature was made, inside the window this receiver accepted it in.
++    pub timestamp: i64,
++}
++
++/// Why a signature was refused.
++///
++/// Four reasons, and none of them says *where* a tag diverged: an error that reports how much of a
++/// guess was right is the timing side channel written down in words.
++#[derive(Debug, thiserror::Error)]
++pub enum SignatureError {
++    /// A version this service does not make.
++    #[error("unknown signature version `{0}`")]
++    UnknownVersion(String),
++    /// A header that is not the shape this service writes.
++    #[error("malformed signature: {0}")]
++    Malformed(String),
++    /// A timestamp outside the window this receiver accepts.
++    #[error("the signature was made at {timestamp} and this receiver is at {now}")]
++    Stale {
++        /// The instant the signature claims.
++        timestamp: i64,
++        /// This receiver's instant.
++        now: i64,
++    },
++    /// The signature is not this body's, this delivery's, or this instant's.
++    #[error("the signature does not match this request")]
++    Mismatch,
++}
++
++/// Sign one request: the value of [`SIGNATURE_HEADER`] for this body, delivery and instant.
++///
++/// Deterministic: the same key, instant, delivery and bytes answer the same header, which is what
++/// makes a signature reproducible in a test and a bug report.
++#[must_use]
++pub fn sign(secret: &Secret, timestamp: i64, delivery: Uuid, body: &[u8]) -> String {
++    todo!("step relay/2.11-hmac-signing: the tag over the body, the instant and the delivery")
++}
++
++/// Verify a signature a receiver was handed.
++///
++/// Reads [`SIGNATURE_HEADER`] and [`TIMESTAMP_HEADER`] out of `headers` (case-insensitively),
++/// checks that the signature is for `delivery` and inside `window` of `now`, and answers what it
++/// proves. This is the receiver's half of the contract, written here because a receiver that has to
++/// guess how to check a signature has no way to be sure it got it right.
++///
++/// # Errors
++///
++/// Returns [`SignatureError::UnknownVersion`] for a version this service does not make,
++/// [`SignatureError::Malformed`] for a header that is not the shape it writes,
++/// [`SignatureError::Stale`] for an instant outside `window`, and [`SignatureError::Mismatch`] when
++/// the signature is not this body's, this delivery's, or this instant's.
++pub fn verify(
++    secret: &Secret,
++    headers: &[(String, String)],
++    body: &[u8],
++    delivery: Uuid,
++    now: i64,
++    window: Window,
++) -> Result<Verified, SignatureError> {
++    todo!("step relay/2.11-hmac-signing: the receiver's half of the signature")
++}
++
++/// Whether two tags are the same, in time that does not depend on *where* they differ.
++///
++/// `a == b` on a tag is a comparison that stops at the first byte that is wrong, and the time it
++/// takes is a measurement the other end gets to make as often as it likes. This is the function the
++/// verification uses, and it is public because a receiver that wants to look at the check itself
++/// should not have to write its own.
++#[must_use]
++pub fn tags_match(expected: &str, provided: &str) -> bool {
++    todo!("step relay/2.11-hmac-signing: a comparison that does not leak where it diverges")
++}
++
++/// Where an adapter finds the signing secret of the endpoint it is about to talk to.
++///
++/// A port rather than a field on the request: the worker's request type is
++/// `relay/2.6-at-least-once`'s (`SendRequest`), the worker itself never handles key material, and
++/// the adapter is the only component that needs the secret — so the secret is looked up where it is
++/// used rather than carried through every layer that touches a request. The future is boxed for the
++/// same reason [`crate::delivery::Sender`]'s is: a trait's `async fn` is not dispatchable through a
++/// trait object, and this port is held as `Arc<dyn Secrets>`.
++pub trait Secrets: Send + Sync + fmt::Debug + 'static {
++    /// The secret `endpoint` was registered with for `tenant`, or `None` when this service has no
++    /// secret for it.
++    ///
++    /// `Ok(None)` is a real answer — an endpoint this service does not know — and an adapter that
++    /// cannot sign must not send: a request without a signature is a request the receiver cannot
++    /// trust, and a signature is not optional.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::Database`] when the lookup cannot be made at all, which is a *retryable*
++    /// failure: the endpoint may be perfectly fine.
++    fn secret_for(
++        &self,
++        tenant: TenantId,
++        endpoint: &EndpointUrl,
++    ) -> Pin<Box<dyn Future<Output = Result<Option<Secret>, Error>> + Send + '_>>;
++}
++
++/// The signing secrets as this service stores them: the `endpoints` table.
++///
++/// One indexed lookup per attempt. `unique (tenant_id, url)` already indexes it, so the lookup is a
++/// probe rather than a scan, and reading the table is what makes a secret rotation visible without
++/// a restart. A cache is the optimization this does not need yet, and it is the one that has to
++/// answer "what if a secret changes while I am holding it".
++#[derive(Debug)]
++pub struct DbSecrets {
++    pool: PgPool,
++}
++
++impl DbSecrets {
++    /// A store over this connection pool.
++    #[must_use]
++    pub fn new(pool: PgPool) -> Self {
++        Self { pool }
++    }
++}
++
++impl Secrets for DbSecrets {
++    fn secret_for(
++        &self,
++        tenant: TenantId,
++        endpoint: &EndpointUrl,
++    ) -> Pin<Box<dyn Future<Output = Result<Option<Secret>, Error>> + Send + '_>> {
++        todo!("step relay/2.11-hmac-signing: the secret of one endpoint, read where it is stored")
++    }
++}
+diff --git a/tests/support/keys.rs b/tests/support/keys.rs
+new file mode 100644
+index 0000000..0b1baa1
+--- /dev/null
++++ b/tests/support/keys.rs
+@@ -0,0 +1,71 @@
++//! The signing secrets a test decides on: a [`Secrets`] store that is a map.
++//!
++//! `relay/2.11-hmac-signing` puts the adapter's secret lookup behind a trait, and a spec about
++//! signatures is not a spec about a database: what it needs is a store that answers the secrets it
++//! chose, for the endpoints it registered. `signing::DbSecrets` is the production one and its own
++//! test uses it; this fixture is what a spec about the *format* uses.
++//!
++//! The spec loads this file with `#[path = "support/keys.rs"] mod keys;` — it is the harness, not
++//! the course, and `tests/support/mod.rs` does not have to mention it.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::collections::HashMap;
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Mutex;
++
++use relay::domain::{EndpointUrl, TenantId};
++use relay::error::Error;
++use relay::signing::{Secret, Secrets};
++
++/// One test's secrets, keyed the way the service keys them: one endpoint per tenant.
++///
++/// `Debug` is derived and safe to derive: a [`Secret`] prints as `Secret(<redacted>)`, which is why
++/// the type is a type and not a `String`.
++#[derive(Debug, Default)]
++pub struct Keys {
++    secrets: Mutex<HashMap<(TenantId, String), Secret>>,
++}
++
++impl Keys {
++    /// No secrets yet.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Add one endpoint's secret, as registering it would have answered.
++    #[must_use]
++    pub fn with(self, tenant: TenantId, endpoint: &str, secret: &str) -> Self {
++        self.secrets
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++            .insert(
++                (tenant, endpoint.to_owned()),
++                Secret::new(secret.to_owned()),
++            );
++        self
++    }
++}
++
++impl Secrets for Keys {
++    fn secret_for(
++        &self,
++        tenant: TenantId,
++        endpoint: &EndpointUrl,
++    ) -> Pin<Box<dyn Future<Output = Result<Option<Secret>, Error>> + Send + '_>> {
++        // Copied out of the caller's request for the same reason `DbSecrets` copies it: the future
++        // borrows the store, not the URL.
++        let endpoint = endpoint.as_str().to_owned();
++        Box::pin(async move {
++            let found = self
++                .secrets
++                .lock()
++                .unwrap_or_else(|poisoned| poisoned.into_inner())
++                .get(&(tenant, endpoint))
++                .cloned();
++            Ok(found)
++        })
++    }
++}
