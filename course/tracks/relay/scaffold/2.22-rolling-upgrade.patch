@@ -1,0 +1,193 @@
+diff --git a/migrations/0010_deliveries_endpoint_idx.sql b/migrations/0010_deliveries_endpoint_idx.sql
+new file mode 100644
+index 0000000..cf6a863
+--- /dev/null
++++ b/migrations/0010_deliveries_endpoint_idx.sql
+@@ -0,0 +1,23 @@
++-- no-transaction
++-- The index the per-tenant claim of `relay/2.14-backpressure` reads
++-- (`relay/2.22-rolling-upgrade`).
++--
++-- The claim is one statement, and it finds *one* tenant's claimable rows with
++-- `endpoint_id in (select id from endpoints where tenant_id = $1)`. Without an
++-- index in that shape the statement walks the claimable rows in
++-- `(next_attempt_at, id)` order — which is exactly the wrong order when another
++-- tenant is flooding: the quiet tenant's row is behind the flood in the index,
++-- and the fairness the claim deals out in the database stops being fairness in
++-- the planner. This index is in the shape the subquery asks for, partial in the
++-- two states a claim may take, so the subquery stops after its limit.
++--
++-- `concurrently` because of what the alternative does *while* the old version is
++-- still delivering: a plain `CREATE INDEX` takes an `ACCESS EXCLUSIVE` lock on
++-- `deliveries`, so every worker in every process — including the one serving
++-- traffic during the rolling upgrade — stops writing until the build finishes.
++-- The directive on the first line is the other half of the same decision: a
++-- `CREATE INDEX CONCURRENTLY` cannot run inside a transaction, and sqlx runs a
++-- migration inside one unless the file says otherwise.
++create index concurrently deliveries_endpoint_claimable_idx
++    on deliveries (endpoint_id, next_attempt_at)
++    where state in ('pending', 'retrying');
+diff --git a/src/readiness.rs b/src/readiness.rs
+new file mode 100644
+index 0000000..353d5e5
+--- /dev/null
++++ b/src/readiness.rs
+@@ -0,0 +1,158 @@
++//! Readiness: the question `/readyz` answers, and why the answer is not "the socket is bound".
++//!
++//! Two probes, two questions, and `relay/2.22-rolling-upgrade` is where the difference becomes a
++//! deployment decision rather than a sentence in a runbook:
++//!
++//! * **liveness** (`/healthz`) is "this process is running". It does not touch the database, and it
++//!   must not: a process that is restarted because the database blipped is a process that loses
++//!   every in-flight attempt it was holding (`relay/2.15-shutdown-leases`);
++//! * **readiness** (`/readyz`) is "this process can take traffic". Answering it is a *question
++//!   about the schema*: a process whose database does not hold the migrations it was built for will
++//!   answer every business request with an error, and one whose database holds migrations it does
++//!   not know about is a process from the previous release still serving during a rolling upgrade.
++//!   The second one is ready on purpose — the migration that made the schema grow is additive or
++//!   it is not shippable (`relay/2.23-online-schema`) — and only the first one is not.
++//!
++//! The answer is computed from the database on every probe rather than cached from startup: what a
++//! probe reports is the state *now*, and a probe that reports what was true at boot reports a
++//! schema that may no longer exist.
++
++use std::fmt;
++
++use sqlx::PgPool;
++
++/// What the database's own record says about the schema this binary needs.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Schema {
++    /// The database records exactly the migrations this binary embeds.
++    Current {
++        /// The migration version the database is at.
++        version: i64,
++    },
++    /// The database has been migrated further than this binary knows about: a process from the
++    /// previous release, serving while the new one is deployed.
++    Ahead {
++        /// The highest version the database records.
++        applied: i64,
++        /// The highest version this binary embeds.
++        needed: i64,
++    },
++    /// The database is missing migrations this binary needs: it will answer business requests with
++    /// errors until somebody applies them.
++    Behind {
++        /// The highest version the database records as applied.
++        applied: i64,
++        /// The highest version this binary embeds.
++        needed: i64,
++    },
++    /// The database did not answer at all.
++    Unreachable(String),
++}
++
++impl Schema {
++    /// Whether a process with this schema can take traffic.
++    ///
++    /// `Current` and `Ahead` are ready, and `Ahead` being ready is the decision this step makes: the
++    /// schema grew, the process does not know the new column, and it keeps serving because an
++    /// additive migration does not change what the old code reads. The alternative — refusing to
++    /// serve on a schema from the future — makes a rolling upgrade impossible, because the moment
++    /// the new instance migrates, every old instance stops.
++    #[must_use]
++    pub fn is_ready(&self) -> bool {
++        matches!(self, Self::Current { .. } | Self::Ahead { .. })
++    }
++
++    /// The version this binary needs, whichever state the database is in.
++    #[must_use]
++    pub fn required(&self) -> i64 {
++        match self {
++            Self::Current { version } => *version,
++            Self::Ahead { needed, .. } | Self::Behind { needed, .. } => *needed,
++            Self::Unreachable(_) => 0,
++        }
++    }
++}
++
++impl fmt::Display for Schema {
++    /// One line an operator can read in a log and a caller can read in a body.
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Current { version } => write!(f, "schema {version} is in place"),
++            Self::Ahead { applied, needed } => write!(
++                f,
++                "schema {applied} was applied by a newer version of this service; this process \
++                 needs {needed} and can serve"
++            ),
++            Self::Behind { applied, needed } => write!(
++                f,
++                "schema {applied} is applied and this process needs {needed}: the migrations it was \
++                 built for are not in the database"
++            ),
++            Self::Unreachable(why) => write!(f, "the database did not answer: {why}"),
++        }
++    }
++}
++
++/// The highest migration version embedded in this binary: what it was built for.
++///
++/// Embedded rather than read from disk for the reason `relay/2.1-project-skeleton` gives about the
++/// migrations themselves: a deployed service has no `migrations/` directory next to it.
++#[must_use]
++pub fn needed() -> i64 {
++    sqlx::migrate!("./migrations")
++        .migrations
++        .iter()
++        .map(|migration| migration.version)
++        .max()
++        .unwrap_or(0)
++}
++
++/// Ask the database which migrations it records, and answer what that means for this process.
++///
++/// One query answers all three questions — is the database there, which version does it record, has
++/// it ever been migrated — because a probe that makes three round trips is a probe that reports a
++/// state assembled from three moments.
++pub async fn probe(pool: &PgPool) -> Schema {
++    let _ = (pool, needed);
++    todo!("step relay/2.22-rolling-upgrade")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_a_schema_that_is_missing_migrations_is_not_ready() {
++        assert!(Schema::Current { version: 9 }.is_ready());
++        assert!(
++            Schema::Ahead {
++                applied: 12,
++                needed: 9
++            }
++            .is_ready()
++        );
++        assert!(
++            !Schema::Behind {
++                applied: 4,
++                needed: 9
++            }
++            .is_ready()
++        );
++        assert!(!Schema::Unreachable("connection refused".to_owned()).is_ready());
++    }
++
++    #[test]
++    fn every_state_says_which_versions_it_is_about() {
++        assert_eq!(needed() > 0, true, "this binary embeds migrations");
++        let behind = Schema::Behind {
++            applied: 4,
++            needed: 9,
++        };
++        assert!(behind.to_string().contains('4') && behind.to_string().contains('9'));
++        assert!(
++            Schema::Unreachable("timeout".to_owned())
++                .to_string()
++                .contains("timeout")
++        );
++    }
++}
