@@ -245,6 +245,14 @@ track 骨架的规则与 patch 的规则一样）。
 夹具、探针 crate、design 步、`.sqlx` 元数据这些形状都有现成样本，不必重新发明。
 
 - [ ] 步骤只教 ≤3 个新概念，`time_hint` 在 30–120 分钟之间
+- [ ] **先查台账再看正文**：这一步要建立的 (能力, 深度) 是否已被别的步骤建立（`grep` 台账或
+      `kiln caps`）；若在别的 track 已建立**同深度**，本步只能是 `transfer`（把它写进 `requires`，
+      **不写进 `teaches`**）——`lint-caps` R0/R1/R2 会拦，但作者要在设计前就想清楚
+- [ ] **相邻能力的边界要写在正文里**：新能力与已教过的东西**同名或近义**时（`delivery/idempotency`
+      与 `api/idempotency-key`、T1 的投递 claim 与 `db/atomic-claim`、`delivery/idempotency` 与
+      `delivery/at-least-once`），正文必须点名**那一项能力与那个步骤**，并写清「本次不重复的是什么、
+      多出来的是什么」。这条对 `teach` 步同样成立（`deepen`/`transfer` 的 RECALL 由 R5 机械校验，
+      `teach` 步靠这句人工规则：相似的名字会让学员以为在重讲，也会让后续作者把边界越写越模糊）
 - [ ] `teaches`/`requires` 声明完整，`kiln lint-caps` 通过
 - [ ] 正文模板与 `origin` 匹配（teach 有 WHY；deepen/transfer 有 RECALL+DELTA，无 WHY）
 - [ ] TRAP 写的是具体失败现象，不是忠告
