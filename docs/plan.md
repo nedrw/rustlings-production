@@ -358,8 +358,13 @@ T1 已按这份表钉过一次精确版本（在 `app/mailer/Cargo.toml` 里，�
 
 进度（2026-10）：**M0 已结束**——T1 的 22 步全部写完，冻结在 `c08f33a` 的验收是
 `cargo xtask ci` 486s / 最后一行 `22/22 step(s) hold the contract`、`kiln verify --json mailer`
-205s / 22 passed，逐条证据在 [handoff-m0.md](handoff-m0.md) §1。里程碑表里 M0 那一行自此是「已完成」，
-M1 从 T2 `relay` 与去重机制的运行时部分接着做。
+205s / 22 passed，逐条证据在 [handoff-m0.md](handoff-m0.md) §1。里程碑表里 M0 那一行自此是「已完成」。
+
+**M1 进行中**：去重机制的运行时部分已经落地——`state.toml` 为每个能力记 `level`/`last_verified`/
+`evidence`，`kiln probe`（`course/probes/`，`--check` 进 CI）、`kiln review --due`、`kiln plan --fast`
+与 `kiln skip`（跳过只认**通过的 probe**），`lint-caps` R5 增加「RECALL 必须点名真实存在的更早步骤」。
+T2 `relay` 的 24 步元数据与骨架已就位，正文/规格/scaffold/参考解逐步落地；怎么接手、验收怎么跑、
+这批实测数字在哪，都在 [handoff-m1.md](handoff-m1.md)。
 
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。
