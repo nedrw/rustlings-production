@@ -1,0 +1,244 @@
+diff --git a/src/ratelimit.rs b/src/ratelimit.rs
+new file mode 100644
+index 0000000..b14c3f6
+--- /dev/null
++++ b/src/ratelimit.rs
+@@ -0,0 +1,238 @@
++//! Who may ask, and how often: one bucket per caller, refilled by the clock.
++//!
++//! The ingest path is the cheapest thing this service does and the most attractive one to flood: one
++//! request writes a row, and every row is owed to every endpoint the tenant registered. A tenant
++//! that sends a hundred thousand events in a minute does not only slow itself down — it spends the
++//! workers, the connections and the subscribers of everybody else, and the first symptom is
++//! somebody else's delivery arriving late.
++//!
++//! So a caller may spend a **quota**: a bucket of `burst` requests that refills at
++//! `per_second` requests a second. Empty is a `429` with a `Retry-After` that says how long the wait
++//! is, because a refusal that does not say when to come back is a refusal that turns into a retry
++//! storm.
++//!
++//! Three shapes here are decisions rather than taste:
++//!
++//! * **the bucket is per caller, not per service.** One shared bucket is a shared fate: a tenant
++//!   with a stuck loop spends everybody's quota, and the service's answer to a customer asking "why
++//!   am I being refused" is "somebody else was busy". The caller is identified by the credential
++//!   they presented, hashed, so the limiter needs no database lookup to decide — and a request that
++//!   presented nothing shares one bucket with every other request that presented nothing, because a
++//!   source address is a claim the network makes and a flood has as many of them as it likes;
++//! * **the time is a port.** A bucket's behaviour is a function of elapsed time, and a test cannot
++//!   wait a second per token to find out whether the refill is right: [`Clock`] is injected, the
++//!   arithmetic is "elapsed × rate", and the tests move the clock by hand. It also keeps the
++//!   limiter free of a dependency: `governor` and friends are good crates, and this is forty lines
++//!   of arithmetic that has to be deterministic under a test's clock;
++//! * **a refusal is an answer, not an error page.** It is a `429` with the same `Error` body every
++//!   other failure has, plus `Retry-After`: the caller is told to come back, in a way a client can
++//!   act on without a human reading it.
++//!
++//! **And the boundary that has to be said out loud**: this is *admission* control, and it is aimed
++//! at the caller. `delivery/retry-budget@design` — step `relay/2.8-retry-budget` — has a breaker
++//! and a retry budget aimed at the *downstream*, and they are not the same thing: the bucket decides
++//! which requests this service accepts (it never sends anything, it only refuses), and the budget
++//! decides what this service does about a subscriber that is failing (it never refuses anything, it
++//! only stops trying). A caller's quota does not protect a subscriber, and a breaker does not
++//! protect this service from a caller. `relay/2.14-backpressure` is the third side of that
++//! triangle: how much *work* this process holds at once, whichever caller it came from.
++
++use std::collections::HashMap;
++use std::num::NonZeroU32;
++use std::sync::{Arc, Mutex, MutexGuard};
++use std::time::{Duration, Instant};
++
++use crate::error::Error;
++
++/// How many buckets this limiter holds before it looks for the ones nobody is using.
++///
++/// The bound is not the number of tenants, and cannot be: a bucket is keyed by the credential a
++/// caller presented, and a caller who is attacking this service presents as many as it likes. So the
++/// map is swept once it is larger than this, and the sweep drops only the buckets that are full
++/// again — a bucket at its burst and no bucket at all behave identically, so nothing is forgotten
++/// that anybody could observe.
++const SWEEP_AT: usize = 64;
++
++/// The bucket every request that presented no credential shares.
++pub const ANONYMOUS: &str = "anonymous";
++
++/// Requests one caller may have in a burst, and the rate the burst comes back at.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Quota {
++    burst: NonZeroU32,
++    per_second: NonZeroU32,
++}
++
++impl Quota {
++    /// A quota, or why the two numbers are not one.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::Config`] when either number is zero: a bucket that holds nothing and never
++    /// refills refuses every request forever, and a rate of zero refills for ever — both are a
++    /// deployment taking its own service down with a typo, and neither is what anybody meant.
++    pub fn new(burst: u32, per_second: u32) -> Result<Self, Error> {
++        let _ = (burst, per_second);
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// How many requests one caller may make in a burst.
++    #[must_use]
++    pub fn burst(self) -> u32 {
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// How many requests a second the bucket refills with.
++    #[must_use]
++    pub fn per_second(self) -> u32 {
++        todo!("step relay/2.13-rate-limit")
++    }
++}
++
++/// Which bucket a caller belongs to.
++///
++/// The credential they presented, hashed — never the credential itself, because this string ends up
++/// in a map for the length of a run and a key in memory is a key in a core dump — or the one bucket
++/// anonymous callers share. Hashing here rather than looking the key up is what lets the limit be
++/// enforced *before* authentication: the refusal that costs a database round trip is the refusal a
++/// flood wants this service to make.
++#[must_use]
++pub fn bucket_of(key: Option<&str>) -> String {
++    let _ = key;
++    todo!("step relay/2.13-rate-limit")
++}
++
++/// Where the limiter reads the time.
++///
++/// A port, and for the reason every port in this service exists: a bucket's whole behaviour is a
++/// function of elapsed time, and a test cannot wait a second per token to find out whether the
++/// refill is right. The value is monotonic and only differences matter, so a caller may start it
++/// wherever it likes.
++pub trait Clock: Send + Sync + std::fmt::Debug + 'static {
++    /// How much time has passed since this clock's own origin.
++    fn now(&self) -> Duration;
++}
++
++/// The clock a deployment gets: `Instant`, which is monotonic and does not go backwards.
++#[derive(Debug)]
++pub struct System {
++    /// The instant this clock started counting from.
++    origin: Instant,
++}
++
++impl System {
++    /// A clock that starts counting now.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("step relay/2.13-rate-limit")
++    }
++}
++
++impl Default for System {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Clock for System {
++    fn now(&self) -> Duration {
++        todo!("step relay/2.13-rate-limit")
++    }
++}
++
++/// One caller's bucket: what is left of their burst, and when it was last counted.
++#[derive(Debug, Clone, Copy)]
++struct Bucket {
++    /// Requests left, fractional: a bucket that has been idle for half a refill interval has half a
++    /// request, and rounding that away is how a rate limiter becomes slower than its own setting.
++    left: f64,
++    /// The instant this bucket was last refilled.
++    at: Duration,
++}
++
++impl Bucket {
++    /// A bucket nobody has spent anything from, as of `now`.
++    fn full(quota: Quota, now: Duration) -> Self {
++        let _ = (quota, now);
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// Add what the elapsed time earned, up to the burst.
++    ///
++    /// Never past it: a caller who was idle for an hour has one burst to spend, not an hour's worth
++    /// of requests. That is the difference between a rate limit and a queue of credits, and it is
++    /// the difference between a service that survives a burst and one that hands every caller the
++    /// burst they waited for at the same instant.
++    fn refill(&mut self, quota: Quota, now: Duration) {
++        let _ = (quota, now);
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// Whether this bucket holds everything it can hold.
++    fn is_full(&self, quota: Quota) -> bool {
++        let _ = quota;
++        todo!("step relay/2.13-rate-limit")
++    }
++}
++
++/// What one check came to.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Verdict {
++    /// The caller had a request left.
++    Allowed,
++    /// The caller's bucket is empty.
++    Refused {
++        /// How long until this caller has one request again, so the refusal can say when to come
++        /// back.
++        retry_after: Duration,
++    },
++}
++
++/// The buckets, one per caller.
++#[derive(Debug)]
++pub struct Limiter {
++    quota: Quota,
++    clock: Arc<dyn Clock>,
++    buckets: Mutex<HashMap<String, Bucket>>,
++}
++
++impl Limiter {
++    /// A limiter with this quota, reading the time from `clock`.
++    #[must_use]
++    pub fn new(quota: Quota, clock: Arc<dyn Clock>) -> Self {
++        let _ = (quota, clock);
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// The quota this limiter hands out.
++    #[must_use]
++    pub fn quota(&self) -> Quota {
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// Spend one request of `caller`'s bucket.
++    ///
++    /// The refill happens here and nowhere else: there is no timer, no background task and no
++    /// per-bucket task to leak — a bucket is arithmetic, and the arithmetic is done when somebody
++    /// asks.
++    pub fn check(&self, caller: &str) -> Verdict {
++        let _ = caller;
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// How many buckets this limiter is holding.
++    ///
++    /// A number that has to come back down: a limiter that keeps one bucket per credential it has
++    /// ever seen grows with an attacker's imagination, and this is the number the spec watches.
++    #[must_use]
++    pub fn known(&self) -> usize {
++        todo!("step relay/2.13-rate-limit")
++    }
++
++    /// The buckets, whether or not another thread panicked while holding the lock.
++    fn buckets(&self) -> MutexGuard<'_, HashMap<String, Bucket>> {
++        self.buckets
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}

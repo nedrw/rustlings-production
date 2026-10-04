@@ -424,7 +424,9 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
+    "images",
 ]
+images = ["postgres:17-alpine"]
 hint = "A shared bucket is a shared fate: one bucket per tenant (plus one for unauthenticated callers), and 429 has to say when to come back."
 
 [[step]]

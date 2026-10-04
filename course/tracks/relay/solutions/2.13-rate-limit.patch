@@ -1,0 +1,581 @@
+diff --git a/src/config.rs b/src/config.rs
+index 6a27f31..efb2052 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -12,6 +12,7 @@
+ use std::path::PathBuf;
+ 
+ use crate::error::Error;
++use crate::ratelimit::Quota;
+ 
+ /// Environment variables this service reads are prefixed with this, and nested with `__`.
+ pub const ENV_PREFIX: &str = "RELAY__";
+@@ -90,6 +91,14 @@ pub struct Delivery {
+     pub allow_private_targets: bool,
+ }
+ 
++/// How much one caller may ask for.
++///
++/// The limiter's own type rather than a second struct with two numbers in it: a bucket of zero
++/// requests, or a refill rate of zero, is a service that refuses everything for ever, and
++/// [`Quota`] is the type that cannot hold either. This is the parse-don't-validate rule of
++/// `relay/2.1-project-skeleton` applied to a setting whose wrong value is an outage.
++pub type RateLimit = Quota;
++
+ /// Tenants seeded from configuration at startup (`name=key`).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Bootstrap {
+@@ -108,6 +117,8 @@ pub struct Config {
+     pub database: Database,
+     /// Delivery settings.
+     pub delivery: Delivery,
++    /// What one caller may ask for.
++    pub rate_limit: RateLimit,
+     /// Tenants to seed on startup.
+     pub bootstrap: Bootstrap,
+ }
+@@ -235,6 +246,9 @@ impl Config {
+             .map(|text| parse_flag("delivery.allow_private_targets", &text))
+             .transpose()?
+             .unwrap_or(false);
++        let burst = read_count(&env_layer, file.as_ref(), "rate_limit.burst")?.unwrap_or(32);
++        let per_second =
++            read_count(&env_layer, file.as_ref(), "rate_limit.per_second")?.unwrap_or(16);
+         let tenants_text = env_layer
+             .get("bootstrap.tenants")
+             .or_else(|| file.as_ref().and_then(|file| file.get("bootstrap.tenants")));
+@@ -249,6 +263,7 @@ impl Config {
+             delivery: Delivery {
+                 allow_private_targets,
+             },
++            rate_limit: Quota::new(burst, per_second)?,
+             bootstrap: Bootstrap {
+                 tenants: parse_tenants(tenants_text.as_deref())?,
+             },
+@@ -280,6 +295,11 @@ impl Config {
+             "  delivery.allow_private_targets = {}",
+             self.delivery.allow_private_targets
+         ));
++        lines.push(format!("  rate_limit.burst = {}", self.rate_limit.burst()));
++        lines.push(format!(
++            "  rate_limit.per_second = {}",
++            self.rate_limit.per_second()
++        ));
+         let names: Vec<&str> = self
+             .bootstrap
+             .tenants
+@@ -387,6 +407,29 @@ fn flatten(
+     }
+ }
+ 
++/// One whole-number setting, from the environment or the file, or why it is not one.
++///
++/// `None` is "nobody set it" — the caller decides the default. A number that is not a number, or
++/// one that does not fit, is a configuration error: a limit that quietly became something else is
++/// worse than a service that did not start.
++fn read_count(
++    env_layer: &EnvLayer,
++    file: Option<&FileLayer>,
++    name: &str,
++) -> Result<Option<u32>, Error> {
++    let Some(text) = env_layer
++        .get(name)
++        .or_else(|| file.and_then(|file| file.get(name)))
++    else {
++        return Ok(None);
++    };
++    text.trim().parse().map(Some).map_err(|_| {
++        Error::Config(format!(
++            "`{text}` is not a value for `{name}`: expected a whole number"
++        ))
++    })
++}
++
+ /// Read a boolean setting, refusing text that is neither.
+ ///
+ /// A setting that is silently false because it was spelled `true `, `TRUE` or `1n` is the kind of
+@@ -504,6 +547,46 @@ mod tests {
+         assert!(!report.contains("key-acme-123"), "{report}");
+     }
+ 
++    #[test]
++    fn a_limit_is_read_and_a_limit_of_nothing_is_refused() {
++        let configured = Config::load(
++            &Flags::default(),
++            &env(&[
++                ("RELAY__RATE_LIMIT__BURST", "7"),
++                ("RELAY__RATE_LIMIT__PER_SECOND", "3"),
++            ]),
++        )
++        .expect("the settings load");
++        assert_eq!(
++            (
++                configured.rate_limit.burst(),
++                configured.rate_limit.per_second()
++            ),
++            (7, 3)
++        );
++        let defaults = Config::load(&Flags::default(), &env(&[])).expect("the defaults load");
++        assert!(
++            defaults.rate_limit.burst() > 0 && defaults.rate_limit.per_second() > 0,
++            "a service nobody configured still has a quota: {:?}",
++            defaults.rate_limit
++        );
++        assert!(
++            Config::load(
++                &Flags::default(),
++                &env(&[("RELAY__RATE_LIMIT__BURST", "0")])
++            )
++            .is_err(),
++            "a bucket of nothing is not a rate limit"
++        );
++        assert!(
++            Config::load(
++                &Flags::default(),
++                &env(&[("RELAY__RATE_LIMIT__BURST", "many")])
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn a_delivery_setting_is_read_and_checked_where_it_is_read() {
+         assert!(
+diff --git a/src/error.rs b/src/error.rs
+index 3139993..a67fa01 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -5,6 +5,8 @@
+ //! [`Error::kind`] is the stable token a caller may switch on; the words in the body will change,
+ //! the token is part of the API.
+ 
++use std::time::Duration;
++
+ use crate::domain::ValueError;
+ 
+ /// Everything that can go wrong.
+@@ -37,6 +39,13 @@ pub enum Error {
+     /// The work cannot be accepted right now (queue full, tenant over quota).
+     #[error("{0}")]
+     Unavailable(String),
++    /// The caller is over its quota: this request was not looked at, and the same one will be
++    /// answerable later.
++    #[error("rate limit exceeded: come back in {}", retry_after.as_secs().max(1))]
++    RateLimited {
++        /// How long the caller has to wait for the next request.
++        retry_after: Duration,
++    },
+     /// The endpoint's URL is not a usable target, kept with its cause.
+     #[error("bad endpoint url: {0}")]
+     Endpoint(#[from] ValueError),
+@@ -59,7 +68,8 @@ impl Error {
+             | Error::NotFound
+             | Error::Target(_)
+             | Error::Delivery(_)
+-            | Error::Unavailable(_) => 1,
++            | Error::Unavailable(_)
++            | Error::RateLimited { .. } => 1,
+         }
+     }
+ 
+@@ -73,6 +83,10 @@ impl Error {
+             // A target we refuse is a policy decision, not a missing resource: 422 says "the
+             // request was understood and this is not something we will do".
+             Error::Target(_) => 422,
++            // `429 Too Many Requests`: the request itself may be perfect, and this caller may
++            // not make it right now. It is the only answer here that is about *who* is asking
++            // rather than about what they asked.
++            Error::RateLimited { .. } => 429,
+             Error::Unavailable(_) => 503,
+             Error::Config(_) | Error::Database(_) | Error::Delivery(_) => 500,
+         }
+@@ -91,6 +105,7 @@ impl Error {
+             Error::Target(_) => "target_rejected",
+             Error::Delivery(_) => "delivery_failed",
+             Error::Unavailable(_) => "unavailable",
++            Error::RateLimited { .. } => "rate_limited",
+             Error::Endpoint(_) => "bad_endpoint",
+         }
+     }
+@@ -102,6 +117,9 @@ impl Error {
+     /// worker rather than to a caller, so it is not advertised as one here.
+     #[must_use]
+     pub fn is_retryable(&self) -> bool {
+-        matches!(self, Error::Unavailable(_) | Error::Database(_))
++        matches!(
++            self,
++            Error::Unavailable(_) | Error::Database(_) | Error::RateLimited { .. }
++        )
+     }
+ }
+diff --git a/src/http.rs b/src/http.rs
+index 6e01c02..f847022 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -1,9 +1,11 @@
+ //! The HTTP surface: which routes exist, what each one may assume, and in which order.
+ //!
+-//! The order is the lesson of this step: **correlation id → request log → authentication →
++//! The order is the lesson: **correlation id → request log → rate limit → authentication →
+ //! handler**. A layer that runs outside the log cannot be seen failing, and a request rejected by
+ //! authentication must still appear in the log with the id it was given — otherwise the only
+-//! requests an operator cannot follow are the ones that were refused.
++//! requests an operator cannot follow are the ones that were refused. The rate limit sits *outside*
++//! authentication on purpose (`relay/2.13-rate-limit`): a request over quota is refused before the
++//! lookup that would have identified it, which is the refusal a flood is supposed to get.
+ //!
+ //! Each layer is one function, and each one is in this file rather than in a route handler, because
+ //! that is what makes the order a decision instead of an accident.
+@@ -32,6 +34,7 @@ use crate::events;
+ use crate::logging::{self, RunId};
+ use crate::openapi;
+ use crate::pagination;
++use crate::ratelimit::{self, Limiter, System, Verdict};
+ use crate::target;
+ use uuid::Uuid;
+ 
+@@ -40,6 +43,7 @@ use uuid::Uuid;
+ pub struct AppState {
+     config: Arc<Config>,
+     db: Db,
++    limiter: Arc<Limiter>,
+     run: RunId,
+ }
+ 
+@@ -63,9 +67,14 @@ impl AppState {
+         let db = Db::connect(&url).await?;
+         db.migrate().await?;
+         db.seed_tenants(&config.bootstrap.tenants).await?;
++        // One limiter for the process, built from this configuration and reading the monotonic
++        // clock: a limiter rebuilt per request would hand every caller a full bucket, which is a
++        // rate limit that does not limit.
++        let limiter = Arc::new(Limiter::new(config.rate_limit, Arc::new(System::new())));
+         Ok(Self {
+             config: Arc::new(config),
+             db,
++            limiter,
+             run: run.clone(),
+         })
+     }
+@@ -82,6 +91,12 @@ impl AppState {
+         &self.db
+     }
+ 
++    /// The buckets this process hands out.
++    #[must_use]
++    pub fn limiter(&self) -> &Limiter {
++        &self.limiter
++    }
++
+     /// The id of this run.
+     #[must_use]
+     pub fn run(&self) -> &RunId {
+@@ -108,10 +123,16 @@ pub fn router(state: AppState) -> Router {
+         // What the worker gave up on, and the one way back into the queue (`relay/2.10-dlq`).
+         .route("/dlq", get(list_dead_letters))
+         .route("/dlq/{id}/replay", post(replay_dead_letter))
++        // The identity, and the quota outside it. The last layer applied is the outermost one, so
++        // the limiter runs *first*: a caller over their limit is refused before this service spends
++        // a database round trip finding out who they are, and a request that carries no credential
++        // at all is limited too — in one bucket shared by every such request, because a source
++        // address is a claim the network makes rather than an identity.
+         .layer(middleware::from_fn_with_state(
+             state.clone(),
+             require_principal,
+-        ));
++        ))
++        .layer(middleware::from_fn_with_state(state.clone(), limit_calls));
+ 
+     public
+         .merge(tenant)
+@@ -215,6 +236,19 @@ async fn log_request(request: Request, next: Next) -> Response {
+     response
+ }
+ 
++/// Spend one request of the caller's quota, or answer `429` with the wait.
++///
++/// The caller is identified by the credential they presented — hashed, and never looked up — or by
++/// nothing at all, and the bucket is spent before authentication for the reason the layer is where
++/// it is: this is the one refusal that has to be cheap.
++async fn limit_calls(State(state): State<AppState>, request: Request, next: Next) -> Response {
++    let bucket = ratelimit::bucket_of(bearer_token(request.headers()).as_deref());
++    match state.limiter().check(&bucket) {
++        Verdict::Allowed => next.run(request).await,
++        Verdict::Refused { retry_after } => Error::RateLimited { retry_after }.into_response(),
++    }
++}
++
+ /// Resolve the caller's API key to a tenant, or refuse the request.
+ async fn require_principal(
+     State(state): State<AppState>,
+@@ -659,6 +693,16 @@ impl IntoResponse for Error {
+             "message": self.to_string(),
+             "retryable": self.is_retryable(),
+         }));
+-        (status, body).into_response()
++        let mut response = (status, body).into_response();
++        // A refusal a client cannot act on is a retry storm waiting to happen, so the one answer
++        // that carries a *when* carries it as a header too (`Retry-After`, whole seconds, never
++        // zero): the JSON body is for the person, the header is for the client.
++        if let Error::RateLimited { retry_after } = &self {
++            let seconds = retry_after.as_secs().max(1);
++            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
++                response.headers_mut().insert("retry-after", value);
++            }
++        }
++        response
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index daff1a5..987de10 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod openapi;
+ pub mod ordering;
+ pub mod outbound;
+ pub mod pagination;
++pub mod ratelimit;
+ pub mod signing;
+ pub mod target;
+ 
+diff --git a/src/openapi.rs b/src/openapi.rs
+index ae43c77..8742bf7 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -68,6 +68,7 @@ pub fn document() -> Value {
+                             "Every endpoint of this tenant, never its signing secret.",
+                         ),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "429": too_many(),
+                     },
+                 },
+                 "post": {
+@@ -94,6 +95,7 @@ pub fn document() -> Value {
+                              own networks, the metadata endpoint, or a name that can only mean \
+                              `here`.",
+                         ),
++                        "429": too_many(),
+                     },
+                 },
+             },
+@@ -139,6 +141,7 @@ pub fn document() -> Value {
+                              service issued.",
+                         ),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "429": too_many(),
+                     },
+                 },
+                 "post": {
+@@ -170,6 +173,7 @@ pub fn document() -> Value {
+                         "400": answer("Error", "The body, or the Idempotency-Key header, is not \
+                                         usable."),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "429": too_many(),
+                     },
+                 },
+             },
+@@ -193,6 +197,7 @@ pub fn document() -> Value {
+                         "200": answer("DeadLetterList", "The tenant's dead letters, newest first."),
+                         "400": answer("Error", "The `limit` is not a number between 1 and 200."),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "429": too_many(),
+                     },
+                 },
+             },
+@@ -222,6 +227,7 @@ pub fn document() -> Value {
+                             "No such delivery for this tenant — including one that belongs to \
+                              another.",
+                         ),
++                        "429": too_many(),
+                     },
+                 },
+             },
+@@ -380,6 +386,20 @@ pub fn document() -> Value {
+     })
+ }
+ 
++/// The answer every route of a tenant can give when the caller is over its quota.
++///
++/// One function, because the answer is one answer: the routes differ in what they do, and they do
++/// not differ in what "come back in a second" means. It is described on every one of them, because
++/// `relay/2.13-rate-limit` puts the limiter in front of all of them — a document that described it
++/// once would be describing a status a caller cannot get where they are reading.
++fn too_many() -> Value {
++    answer(
++        "Error",
++        "The caller is over its quota: this request was not looked at. `Retry-After` says how many \
++         seconds to wait.",
++    )
++}
++
+ /// One JSON answer: the schema a caller gets, and what the status means.
+ fn answer(schema: &str, description: &str) -> Value {
+     json!({
+diff --git a/src/ratelimit.rs b/src/ratelimit.rs
+index b14c3f6..00ecc95 100644
+--- a/src/ratelimit.rs
++++ b/src/ratelimit.rs
+@@ -72,20 +72,27 @@ impl Quota {
+     /// refills refuses every request forever, and a rate of zero refills for ever — both are a
+     /// deployment taking its own service down with a typo, and neither is what anybody meant.
+     pub fn new(burst: u32, per_second: u32) -> Result<Self, Error> {
+-        let _ = (burst, per_second);
+-        todo!("step relay/2.13-rate-limit")
++        let burst = NonZeroU32::new(burst).ok_or_else(|| {
++            Error::Config("`rate_limit.burst` cannot be zero: that is an empty bucket".to_owned())
++        })?;
++        let per_second = NonZeroU32::new(per_second).ok_or_else(|| {
++            Error::Config(
++                "`rate_limit.per_second` cannot be zero: that bucket never refills".to_owned(),
++            )
++        })?;
++        Ok(Self { burst, per_second })
+     }
+ 
+     /// How many requests one caller may make in a burst.
+     #[must_use]
+     pub fn burst(self) -> u32 {
+-        todo!("step relay/2.13-rate-limit")
++        self.burst.get()
+     }
+ 
+     /// How many requests a second the bucket refills with.
+     #[must_use]
+     pub fn per_second(self) -> u32 {
+-        todo!("step relay/2.13-rate-limit")
++        self.per_second.get()
+     }
+ }
+ 
+@@ -98,8 +105,7 @@ impl Quota {
+ /// flood wants this service to make.
+ #[must_use]
+ pub fn bucket_of(key: Option<&str>) -> String {
+-    let _ = key;
+-    todo!("step relay/2.13-rate-limit")
++    key.map_or_else(|| ANONYMOUS.to_owned(), crate::auth::hash_api_key)
+ }
+ 
+ /// Where the limiter reads the time.
+@@ -124,7 +130,9 @@ impl System {
+     /// A clock that starts counting now.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("step relay/2.13-rate-limit")
++        Self {
++            origin: Instant::now(),
++        }
+     }
+ }
+ 
+@@ -136,7 +144,7 @@ impl Default for System {
+ 
+ impl Clock for System {
+     fn now(&self) -> Duration {
+-        todo!("step relay/2.13-rate-limit")
++        self.origin.elapsed()
+     }
+ }
+ 
+@@ -153,8 +161,10 @@ struct Bucket {
+ impl Bucket {
+     /// A bucket nobody has spent anything from, as of `now`.
+     fn full(quota: Quota, now: Duration) -> Self {
+-        let _ = (quota, now);
+-        todo!("step relay/2.13-rate-limit")
++        Self {
++            left: f64::from(quota.burst()),
++            at: now,
++        }
+     }
+ 
+     /// Add what the elapsed time earned, up to the burst.
+@@ -164,14 +174,15 @@ impl Bucket {
+     /// the difference between a service that survives a burst and one that hands every caller the
+     /// burst they waited for at the same instant.
+     fn refill(&mut self, quota: Quota, now: Duration) {
+-        let _ = (quota, now);
+-        todo!("step relay/2.13-rate-limit")
++        let elapsed = now.saturating_sub(self.at).as_secs_f64();
++        let earned = elapsed * f64::from(quota.per_second());
++        self.left = (self.left + earned).min(f64::from(quota.burst()));
++        self.at = now;
+     }
+ 
+     /// Whether this bucket holds everything it can hold.
+     fn is_full(&self, quota: Quota) -> bool {
+-        let _ = quota;
+-        todo!("step relay/2.13-rate-limit")
++        self.left >= f64::from(quota.burst())
+     }
+ }
+ 
+@@ -200,14 +211,17 @@ impl Limiter {
+     /// A limiter with this quota, reading the time from `clock`.
+     #[must_use]
+     pub fn new(quota: Quota, clock: Arc<dyn Clock>) -> Self {
+-        let _ = (quota, clock);
+-        todo!("step relay/2.13-rate-limit")
++        Self {
++            quota,
++            clock,
++            buckets: Mutex::new(HashMap::new()),
++        }
+     }
+ 
+     /// The quota this limiter hands out.
+     #[must_use]
+     pub fn quota(&self) -> Quota {
+-        todo!("step relay/2.13-rate-limit")
++        self.quota
+     }
+ 
+     /// Spend one request of `caller`'s bucket.
+@@ -216,8 +230,36 @@ impl Limiter {
+     /// per-bucket task to leak — a bucket is arithmetic, and the arithmetic is done when somebody
+     /// asks.
+     pub fn check(&self, caller: &str) -> Verdict {
+-        let _ = caller;
+-        todo!("step relay/2.13-rate-limit")
++        let now = self.clock.now();
++        let mut buckets = self.buckets();
++        let quota = self.quota;
++        let bucket = buckets
++            .entry(caller.to_owned())
++            .or_insert_with(|| Bucket::full(quota, now));
++        bucket.refill(quota, now);
++
++        let verdict = if bucket.left >= 1.0 {
++            bucket.left -= 1.0;
++            Verdict::Allowed
++        } else {
++            Verdict::Refused {
++                retry_after: Duration::from_secs_f64(
++                    (1.0 - bucket.left) / f64::from(quota.per_second()),
++                ),
++            }
++        };
++
++        // The map is bounded here rather than by a timer: the buckets that are full again are the
++        // ones nobody has spent anything from, and forgetting them changes nothing a caller can
++        // observe. Doing it on every check would be a scan per request; doing it never is a limiter
++        // that grows with the number of credentials an attacker invents.
++        if buckets.len() > SWEEP_AT {
++            buckets.retain(|_, bucket| {
++                bucket.refill(quota, now);
++                !bucket.is_full(quota)
++            });
++        }
++        verdict
+     }
+ 
+     /// How many buckets this limiter is holding.
+@@ -226,7 +268,7 @@ impl Limiter {
+     /// ever seen grows with an attacker's imagination, and this is the number the spec watches.
+     #[must_use]
+     pub fn known(&self) -> usize {
+-        todo!("step relay/2.13-rate-limit")
++        self.buckets().len()
+     }
+ 
+     /// The buckets, whether or not another thread panicked while holding the lock.
