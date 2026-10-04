@@ -36,7 +36,7 @@ index 0000000..a5b17aa
 +    on deliveries (next_attempt_at, id)
 +    where state in ('pending', 'retrying');
 diff --git a/src/claim.rs b/src/claim.rs
-index ef7f182..a90fc98 100644
+index ef7f182..00473b2 100644
 --- a/src/claim.rs
 +++ b/src/claim.rs
 @@ -28,15 +28,19 @@ use chrono::{DateTime, Utc};
@@ -154,7 +154,7 @@ index ef7f182..a90fc98 100644
  }
  
  /// Record a failed attempt: the row is owed again at `next_attempt_at`, and `attempts` grows.
-@@ -113,8 +177,20 @@ pub async fn mark_retry(
+@@ -113,16 +177,41 @@ pub async fn mark_retry(
      why: &str,
      next_attempt_at: DateTime<Utc>,
  ) -> Result<bool, Error> {
@@ -177,7 +177,11 @@ index ef7f182..a90fc98 100644
  }
  
  /// Give up on a delivery: it will not be attempted again, and `why` is what an operator reads.
-@@ -123,6 +199,16 @@ pub async fn mark_retry(
+ ///
++/// The attempt that ended it counts like any other failure, so `attempts` is "how many attempts
++/// this delivery has failed", whichever state that left it in.
++///
+ /// # Errors
  ///
  /// Returns [`Error::Database`] when the update fails.
  pub async fn mark_dead(pool: &PgPool, delivery: Uuid, why: &str) -> Result<bool, Error> {
@@ -185,8 +189,8 @@ index ef7f182..a90fc98 100644
 -    todo!("step relay/2.5-atomic-claim")
 +    let ran = sqlx::query(
 +        "update deliveries \
-+            set state = 'dead', last_error = $2, locked_by = null, locked_at = null, \
-+                lease_expires_at = null \
++            set state = 'dead', attempts = attempts + 1, last_error = $2, locked_by = null, \
++                locked_at = null, lease_expires_at = null \
 +          where id = $1 and state = 'claimed'",
 +    )
 +    .bind(delivery)
