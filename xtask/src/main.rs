@@ -29,6 +29,56 @@ fn main() -> ExitCode {
     }
 }
 
+/// The course's own anti-rot check, once per authored track (plan §10).
+///
+/// `kiln selftest` walks **one** track in order — that is deliberate, because the steps before the
+/// ones being asserted are the state the step starts from. CI has to cover the rest of the path, so
+/// the loop lives here rather than in the runner: a learner typing `kiln selftest` gets their own
+/// track, and the repository's CI gets all of them, in path order.
+///
+/// A track is *authored* when at least one of its steps has a body, a spec and a reference solution;
+/// a track whose content is still being written is named and skipped instead of failing the build.
+fn selftest(root: &Path) -> Result<(), String> {
+    let course = kiln::info::Course::load(root).map_err(|error| error.to_string())?;
+    let mut tracks: Vec<&kiln::info::Track> = course.tracks().iter().collect();
+    tracks.sort_by_key(|track| track.index);
+
+    let mut walked = 0usize;
+    for track in tracks {
+        let authored = track
+            .step
+            .iter()
+            .any(|step| kiln::project::missing_content(&course, track, step).is_empty());
+        if !authored {
+            println!(
+                "xtask ci: kiln selftest — {} has no authored step yet, skipped",
+                track.id
+            );
+            continue;
+        }
+        println!("xtask ci: kiln selftest --track {}", track.id);
+        run(
+            root,
+            "cargo",
+            &[
+                "run",
+                "--quiet",
+                "--package",
+                "kiln",
+                "--",
+                "selftest",
+                "--track",
+                &track.id,
+            ],
+        )?;
+        walked += 1;
+    }
+    if walked == 0 {
+        return Err("no track of this course has authored content yet".to_owned());
+    }
+    Ok(())
+}
+
 /// Every check CI runs, in the order that fails fastest.
 fn ci() -> Result<(), String> {
     let root = workspace_root()?;
@@ -56,12 +106,10 @@ fn ci() -> Result<(), String> {
     links(&root)?;
     probe_check(&root)?;
     // The course's own anti-rot check (plan §10). It is the command a learner can run too, so CI
-    // and a human have one implementation between them, not two.
-    run(
-        &root,
-        "cargo",
-        &["run", "--quiet", "--package", "kiln", "--", "selftest"],
-    )?;
+    // and a human have one implementation between them, not two. Every authored track is walked:
+    // `kiln selftest` defaults to the course's default track (the one a learner is on), and CI has
+    // to cover the others or T2+ would only be checked when somebody remembers to.
+    selftest(&root)?;
     println!("\nxtask ci: all checks passed");
     Ok(())
 }
