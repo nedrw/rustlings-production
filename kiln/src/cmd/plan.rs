@@ -402,9 +402,9 @@ mod tests {
     #[test]
     fn a_slot_with_no_exercise_is_not_sent_to_a_command_that_would_fail() {
         let (temp, course) = fixture();
-        // The catalogue is empty, which is the state of a track whose slots were chosen ahead of
-        // its exercises: 13 of T2's 24 steps are in it. `kiln probe <slot>` exits 2 there, so the
-        // verdict has to say that instead of naming it.
+        // The catalogue is empty, which is the state of a slot the track chose ahead of its
+        // exercises: 11 of T2's 24 steps open with such a slot. `kiln probe <slot>` exits 2 there,
+        // so the verdict has to say that instead of naming it.
         let probes = catalogue(&temp, &course, &[]);
         let first = course.step("mailer/1.1").expect("the first step");
         let Disposition::Keep(blocker) = disposition(&State::default(), first, &probes) else {

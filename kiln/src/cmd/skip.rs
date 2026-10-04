@@ -76,10 +76,9 @@ fn skip_one(session: &mut Session, step: &Step, probes: &[Probe], force: bool) -
         plan::Disposition::Keep(blocker) => {
             if !force {
                 println!("✗ {id} is not skippable — {}", blocker.detail);
-                println!(
-                    "  the verdict above says what would prove it; `kiln skip {id} --force` skips \
-                     anyway and records that you did"
-                );
+                // The verdict names the route to a proof when the catalogue has one; this line
+                // must stay true when it has none, so it points at nothing above it.
+                println!("  `kiln skip {id} --force` skips it anyway and records that you did");
                 return Ok(false);
             }
             println!("  {id}: forced past — {}", blocker.detail);

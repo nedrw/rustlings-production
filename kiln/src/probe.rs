@@ -322,29 +322,43 @@ pub enum Exercise<'a> {
 
 /// The exercise that re-checks `capability` at `level`, if the catalogue has one.
 ///
-/// Two commands print a line about a slot a learner has not proven — `kiln plan --fast` when it
-/// keeps a step, `kiln review --due` when it lists a stale proof — and a line that names a command
-/// has to name one that works: `kiln probe <capability>@<level>` exits 2 when nothing in
+/// The answer is the exercise *closest* to the depth asked about: at or above that depth it is the
+/// proof (the shallowest one that suffices), below it the closest a re-check gets (the deepest one
+/// there is). Two commands print a line about a slot a learner has not proven — `kiln plan --fast`
+/// when it keeps a step, `kiln review --due` when it lists a stale proof — and a line that names a
+/// command has to name one that works: `kiln probe <capability>@<level>` exits 2 when nothing in
 /// `course/probes/` answers to that slot. Both ask this function, so the answer and the wording
 /// cannot drift apart.
 #[must_use]
 pub fn exercise<'a>(probes: &'a [Probe], capability: &str, level: Level) -> Exercise<'a> {
+    let mut at_depth: Option<&Probe> = None;
     let mut shallower: Option<&Probe> = None;
     for probe in probes
         .iter()
         .filter(|probe| probe.requirement().id.as_str() == capability)
     {
         if probe.requirement().level.rank() >= level.rank() {
-            return Exercise::AtDepth(probe);
-        }
-        // Several shallow exercises can exist; the deepest one is the closest to what was asked.
-        if shallower
-            .is_none_or(|best| probe.requirement().level.rank() > best.requirement().level.rank())
-        {
+            if at_depth.is_none_or(|best| closer(probe, best, level)) {
+                at_depth = Some(probe);
+            }
+        } else if shallower.is_none_or(|best| closer(probe, best, level)) {
             shallower = Some(probe);
         }
     }
-    shallower.map_or(Exercise::Missing, Exercise::Shallower)
+    match (at_depth, shallower) {
+        (Some(probe), _) => Exercise::AtDepth(probe),
+        (None, Some(probe)) => Exercise::Shallower(probe),
+        (None, None) => Exercise::Missing,
+    }
+}
+
+/// Whether `candidate` answers `level` better than `best`: nearer in depth, then smaller slug.
+///
+/// The slug is the tie-break so that the answer never depends on the order `load` happened to read
+/// the catalogue in — a report may not change between two runs over the same files.
+fn closer(candidate: &Probe, best: &Probe, level: Level) -> bool {
+    let distance = |probe: &Probe| probe.requirement().level.rank().abs_diff(level.rank());
+    (distance(candidate), candidate.slug()) < (distance(best), best.slug())
 }
 
 /// Parse one exercise file: header, then the checks the catalogue depends on.
