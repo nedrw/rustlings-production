@@ -1,0 +1,753 @@
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 0a0cfcc..a16f92f 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -32,8 +32,26 @@ impl Queue {
+     /// contains anything but lower-case ASCII letters, digits, `.`, `_` and `-`. A name is a key in
+     /// an operator's dashboard and a column in a table, so the set is deliberately tiny.
+     pub fn parse(name: &str) -> Result<Self, Error> {
+-        let _ = name;
+-        todo!("jobq/3.1-engine-boundary: validate a queue name and wrap it")
++        let invalid = |detail: String| Error::Invalid { detail };
++        if name.is_empty() {
++            return Err(invalid("a queue name cannot be empty".to_owned()));
++        }
++        if name.len() > QUEUE_NAME_MAX {
++            return Err(invalid(format!(
++                "`{name}` is {} bytes; the limit is {QUEUE_NAME_MAX}",
++                name.len()
++            )));
++        }
++        if !name.bytes().all(|byte| {
++            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
++        }) {
++            return Err(invalid(format!(
++                "`{name}` may only contain lower-case letters, digits, `.`, `_` and `-`: a queue \
++                 name is a table column, a metric label and something a person types, so it stays \
++                 in the character set all three can spell"
++            )));
++        }
++        Ok(Self(name.to_owned()))
+     }
+ 
+     /// The name, as it is written everywhere.
+diff --git a/src/engine/scheduler.rs b/src/engine/scheduler.rs
+index 44f90b0..ceb8ce9 100644
+--- a/src/engine/scheduler.rs
++++ b/src/engine/scheduler.rs
+@@ -37,8 +37,8 @@ impl<S: Store> Engine<S> {
+     /// [`Error::Invalid`] when the request could never run, [`Error::Store`] when the backend
+     /// refused the write.
+     pub async fn submit(&self, request: SubmitRequest) -> Result<JobId, Error> {
+-        let _ = request;
+-        todo!("jobq/3.1-engine-boundary: write the request through the store")
++        let job = self.store.enqueue(request).await?;
++        Ok(job.id())
+     }
+ 
+     /// Take up to `limit` due jobs for `worker`.
+@@ -52,8 +52,7 @@ impl<S: Store> Engine<S> {
+         queue: &Queue,
+         limit: usize,
+     ) -> Result<Vec<Job>, Error> {
+-        let _ = (worker, queue, limit);
+-        todo!("jobq/3.1-engine-boundary: ask the store for due jobs")
++        self.store.claim(worker, queue, limit).await
+     }
+ 
+     /// Mark a job this worker holds as done.
+@@ -63,8 +62,7 @@ impl<S: Store> Engine<S> {
+     /// [`Error::NotFound`] when there is no such job, [`Error::Store`] when the backend refused the
+     /// write.
+     pub async fn complete(&self, worker: &WorkerId, id: &JobId) -> Result<(), Error> {
+-        let _ = (worker, id);
+-        todo!("jobq/3.1-engine-boundary: record the success")
++        self.store.complete(worker, id).await
+     }
+ 
+     /// Record a failed attempt, and answer where the job went: back to `queued`, or to `failed`.
+@@ -79,8 +77,9 @@ impl<S: Store> Engine<S> {
+         id: &JobId,
+         reason: &str,
+     ) -> Result<JobState, Error> {
+-        let _ = (worker, id, reason);
+-        todo!("jobq/3.1-engine-boundary: record the failure and let the store pick the next state")
++        // The store decides where a failed job goes, because only it knows the attempt count and
++        // the budget it was given; the engine hands the decision back unchanged.
++        self.store.fail(worker, id, reason).await
+     }
+ 
+     /// Read one job, or say there is none.
+@@ -90,7 +89,6 @@ impl<S: Store> Engine<S> {
+     /// [`Error::NotFound`] when there is no such job, [`Error::Store`] when the backend refused the
+     /// read.
+     pub async fn inspect(&self, id: &JobId) -> Result<Job, Error> {
+-        let _ = id;
+-        todo!("jobq/3.1-engine-boundary: read the job and turn `None` into NotFound")
++        self.store.get(id).await?.ok_or(Error::NotFound { id: *id })
+     }
+ }
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 73c03d8..2113e73 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -58,8 +58,30 @@ impl MemoryStore {
+ impl Store for MemoryStore {
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
+         Box::pin(async move {
+-            let _ = request;
+-            todo!("jobq/3.1-engine-boundary: validate the request and write it into the map")
++            if request.max_attempts == 0 {
++                return Err(Error::Invalid {
++                    detail: "a job with a budget of zero attempts can never run: either give it \
++                             one attempt or do not queue it"
++                        .to_owned(),
++                });
++            }
++            let job = Job {
++                id: JobId::new(),
++                queue: request.queue,
++                payload: request.payload,
++                state: JobState::Queued,
++                priority: request.priority,
++                // `None` means "as soon as somebody looks", and the store is where that becomes an
++                // instant: the caller's clock is not the store's, and only one of them is the
++                // authority on when a job is due (step `jobq/3.8-clock-injection` moves this read
++                // behind an injected clock).
++                run_at: request.run_at.unwrap_or_else(chrono::Utc::now),
++                attempts: 0,
++                max_attempts: request.max_attempts,
++                last_error: None,
++            };
++            self.jobs().insert(job.id, job.clone());
++            Ok(job)
+         })
+     }
+ 
+@@ -70,8 +92,24 @@ impl Store for MemoryStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            let _ = (worker, queue, limit);
+-            todo!("jobq/3.1-engine-boundary: take the first `limit` due jobs and mark them running")
++            // The memory store has no leases yet (step `jobq/3.7-leases-and-recovery` adds them),
++            // so who holds a job is not recorded here. The names are still the interface: the two
++            // implementations must answer the same questions.
++            let _ = worker;
++            let now = chrono::Utc::now();
++            let due = self.due(queue, now);
++            let mut jobs = self.jobs();
++            let mut claimed = Vec::new();
++            for id in due.into_iter().take(limit) {
++                if let Some(job) = jobs.get_mut(&id) {
++                    job.state = JobState::Running;
++                    // An attempt starts when a worker takes the job, not when it finishes: a
++                    // worker that dies holding a job must still have spent one.
++                    job.attempts += 1;
++                    claimed.push(job.clone());
++                }
++            }
++            Ok(claimed)
+         })
+     }
+ 
+@@ -81,8 +119,23 @@ impl Store for MemoryStore {
+         id: &'a JobId,
+     ) -> BoxFuture<'a, Result<(), Error>> {
+         Box::pin(async move {
+-            let _ = (worker, id);
+-            todo!("jobq/3.1-engine-boundary: mark the job succeeded")
++            let _ = worker;
++            let mut jobs = self.jobs();
++            let Some(job) = jobs.get_mut(id) else {
++                return Err(Error::NotFound { id: *id });
++            };
++            if job.state != JobState::Running {
++                return Err(Error::Invalid {
++                    detail: format!(
++                        "job {id} is {}, not running: only the worker that claimed it can complete \
++                         it",
++                        job.state
++                    ),
++                });
++            }
++            job.state = JobState::Succeeded;
++            job.last_error = None;
++            Ok(())
+         })
+     }
+ 
+@@ -93,15 +146,31 @@ impl Store for MemoryStore {
+         reason: &'a str,
+     ) -> BoxFuture<'a, Result<JobState, Error>> {
+         Box::pin(async move {
+-            let _ = (worker, id, reason);
+-            todo!("jobq/3.1-engine-boundary: count the attempt and decide queued-or-failed")
++            let _ = worker;
++            let mut jobs = self.jobs();
++            let Some(job) = jobs.get_mut(id) else {
++                return Err(Error::NotFound { id: *id });
++            };
++            if job.state != JobState::Running {
++                return Err(Error::Invalid {
++                    detail: format!(
++                        "job {id} is {}, not running: a failure is only recorded against an \
++                         attempt somebody actually started",
++                        job.state
++                    ),
++                });
++            }
++            job.last_error = Some(reason.to_owned());
++            job.state = if job.attempts < job.max_attempts {
++                JobState::Queued
++            } else {
++                JobState::Failed
++            };
++            Ok(job.state)
+         })
+     }
+ 
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+-        Box::pin(async move {
+-            let _ = id;
+-            todo!("jobq/3.1-engine-boundary: read one job")
+-        })
++        Box::pin(async move { Ok(self.jobs().get(id).cloned()) })
+     }
+ }
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 15e0ecb..1c4a26c 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -37,12 +37,33 @@ impl Flags {
+     /// [`Error::Invalid`] for an unknown flag or a flag whose value is missing: a daemon that
+     /// ignores an argument it does not understand is a daemon whose operator believes it did
+     /// something it did not.
+-    pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self, Error> {
+-        let _ = args;
+-        todo!("jobq/3.1-engine-boundary: parse the command line")
++    pub fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, Error> {
++        let mut flags = Self::default();
++        while let Some(argument) = args.next() {
++            match argument.as_str() {
++                "--config" => flags.config = Some(PathBuf::from(value(&mut args, "--config")?)),
++                "--worker-name" => flags.worker_name = Some(value(&mut args, "--worker-name")?),
++                "--check-config" => flags.check_config = true,
++                "--help" | "-h" => flags.help = true,
++                "--version" => flags.version = true,
++                other => {
++                    return Err(Error::Invalid {
++                        detail: format!("unknown argument `{other}`"),
++                    });
++                }
++            }
++        }
++        Ok(flags)
+     }
+ }
+ 
++/// The value of a flag that needs one, or a sentence naming the flag that was left hanging.
++fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Error> {
++    args.next().ok_or_else(|| Error::Invalid {
++        detail: format!("`{flag}` needs a value"),
++    })
++}
++
+ /// Where the log goes and in what shape.
+ #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+ pub enum LogFormat {
+@@ -97,7 +118,124 @@ pub struct Config {
+     pub log: LogSettings,
+ }
+ 
++impl LogFormat {
++    /// The name a configuration file and the report use.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            LogFormat::Text => "text",
++            LogFormat::Json => "json",
++        }
++    }
++
++    /// Read the name.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] for anything but `text` and `json`, so a typo in a configuration file is
++    /// answered with a sentence instead of a log nobody can read.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        match text {
++            "text" => Ok(LogFormat::Text),
++            "json" => Ok(LogFormat::Json),
++            other => Err(Error::Invalid {
++                detail: format!("`{other}` is not a log format: use `text` or `json`"),
++            }),
++        }
++    }
++}
++
++/// One table of the configuration file. Every key is optional, because a file that has to repeat
++/// the defaults is a file that goes stale.
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileConfig {
++    /// `[store]`.
++    #[serde(default)]
++    store: FileStore,
++    /// `[worker]`.
++    #[serde(default)]
++    worker: FileWorker,
++    /// `[log]`.
++    #[serde(default)]
++    log: FileLog,
++}
++
++/// `[store]` in a file.
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileStore {
++    /// Connection string.
++    #[serde(default)]
++    url: Option<String>,
++    /// Migrate on the way in.
++    #[serde(default)]
++    migrate: Option<bool>,
++}
++
++/// `[worker]` in a file.
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileWorker {
++    /// What this process calls itself.
++    #[serde(default)]
++    name: Option<String>,
++    /// Queues to drain.
++    #[serde(default)]
++    queues: Option<Vec<String>>,
++    /// Jobs per turn.
++    #[serde(default)]
++    batch: Option<usize>,
++    /// Wait after an empty turn.
++    #[serde(default)]
++    poll_interval_ms: Option<u64>,
++    /// How long the drain may take after a stop signal.
++    #[serde(default)]
++    shutdown_seconds: Option<u64>,
++}
++
++/// `[log]` in a file.
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileLog {
++    /// Filter.
++    #[serde(default)]
++    level: Option<String>,
++    /// `text` or `json`.
++    #[serde(default)]
++    format: Option<String>,
++}
++
++impl Default for Config {
++    fn default() -> Self {
++        Self {
++            store: StoreSettings {
++                url: None,
++                migrate: true,
++            },
++            worker: WorkerSettings {
++                name: "jobqd".to_owned(),
++                queues: Vec::new(),
++                batch: 8,
++                poll_interval_ms: 250,
++                shutdown_seconds: 10,
++            },
++            log: LogSettings {
++                level: "info".to_owned(),
++                format: LogFormat::default(),
++            },
++        }
++    }
++}
++
+ impl Config {
++    /// The values every layer starts from.
++    fn defaults() -> Self {
++        let mut config = Self::default();
++        config.worker.queues = vec![Queue::default()];
++        config
++    }
++
+     /// Merge defaults, the `--config` file, the environment and the flags.
+     ///
+     /// `env` is passed in rather than read here, so a test can state the environment it means
+@@ -106,17 +244,218 @@ impl Config {
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Invalid`] for a value that cannot be read (a bad number, an unknown log format);
+-    /// [`Error::Config`] when the file cannot be read or parsed.
++    /// [`Error::Invalid`] for a value that cannot be read (a bad number, an unknown log format) and
++    /// for an environment variable whose name this build does not know; [`Error::Config`] when the
++    /// file cannot be read or parsed.
+     pub fn load(flags: &Flags, env: &[(String, String)]) -> Result<Self, Error> {
+-        let _ = (flags, env);
+-        todo!("jobq/3.1-engine-boundary: merge defaults, file, environment and flags")
++        let mut config = Self::defaults();
++        if let Some(path) = &flags.config {
++            config.apply_file(path)?;
++        }
++        config.apply_env(env)?;
++        // The command line is the last word: an operator overriding one setting for one run should
++        // not have to edit the file the deployment ships.
++        if let Some(name) = &flags.worker_name {
++            config.worker.name = name.clone();
++        }
++        config.validate()?;
++        Ok(config)
++    }
++
++    /// The file layer.
++    fn apply_file(&mut self, path: &std::path::Path) -> Result<(), Error> {
++        let text = std::fs::read_to_string(path).map_err(|source| Error::Config {
++            detail: format!("{} could not be read: {source}", path.display()),
++        })?;
++        let file: FileConfig = toml::from_str(&text).map_err(|error| Error::Config {
++            detail: format!("{} could not be parsed: {error}", path.display()),
++        })?;
++
++        if let Some(url) = file.store.url {
++            self.store.url = Some(url);
++        }
++        if let Some(migrate) = file.store.migrate {
++            self.store.migrate = migrate;
++        }
++        if let Some(name) = file.worker.name {
++            self.worker.name = name;
++        }
++        if let Some(queues) = file.worker.queues {
++            self.worker.queues = parse_queues("worker.queues", &queues)?;
++        }
++        if let Some(batch) = file.worker.batch {
++            self.worker.batch = batch;
++        }
++        if let Some(interval) = file.worker.poll_interval_ms {
++            self.worker.poll_interval_ms = interval;
++        }
++        if let Some(seconds) = file.worker.shutdown_seconds {
++            self.worker.shutdown_seconds = seconds;
++        }
++        if let Some(level) = file.log.level {
++            self.log.level = level;
++        }
++        if let Some(format) = file.log.format {
++            self.log.format = LogFormat::parse(&format)?;
++        }
++        Ok(())
++    }
++
++    /// The environment layer: `JOBQ__SECTION__KEY`, the convention T1 established.
++    fn apply_env(&mut self, env: &[(String, String)]) -> Result<(), Error> {
++        for (name, value) in env {
++            let Some(key) = name.strip_prefix(ENV_PREFIX) else {
++                continue;
++            };
++            let mut parts = key.split("__");
++            match (parts.next(), parts.next(), parts.next()) {
++                (Some("STORE"), Some("URL"), None) => self.store.url = Some(value.clone()),
++                (Some("STORE"), Some("MIGRATE"), None) => {
++                    self.store.migrate = parse_bool(name, value)?;
++                }
++                (Some("WORKER"), Some("NAME"), None) => self.worker.name = value.clone(),
++                (Some("WORKER"), Some("QUEUES"), None) => {
++                    let names: Vec<String> = value
++                        .split(',')
++                        .map(str::trim)
++                        .filter(|name| !name.is_empty())
++                        .map(str::to_owned)
++                        .collect();
++                    self.worker.queues = parse_queues(name, &names)?;
++                }
++                (Some("WORKER"), Some("BATCH"), None) => {
++                    self.worker.batch = parse_number(name, value)?;
++                }
++                (Some("WORKER"), Some("POLL_INTERVAL_MS"), None) => {
++                    self.worker.poll_interval_ms = parse_number(name, value)?;
++                }
++                (Some("WORKER"), Some("SHUTDOWN_SECONDS"), None) => {
++                    self.worker.shutdown_seconds = parse_number(name, value)?;
++                }
++                (Some("LOG"), Some("LEVEL"), None) => self.log.level = value.clone(),
++                (Some("LOG"), Some("FORMAT"), None) => {
++                    self.log.format = LogFormat::parse(value)?;
++                }
++                // A misspelled variable that is quietly ignored is how a process runs with a
++                // setting nobody chose (the lesson of `mailer/1.4-layered-config`).
++                _ => {
++                    return Err(Error::Invalid {
++                        detail: format!("`{name}` is not a setting this daemon knows"),
++                    });
++                }
++            }
++        }
++        Ok(())
++    }
++
++    /// Settings that are individually valid but together are not.
++    fn validate(&self) -> Result<(), Error> {
++        if self.worker.queues.is_empty() {
++            return Err(Error::Invalid {
++                detail:
++                    "at least one queue is required: a worker that drains nothing is a process \
++                         that looks healthy and does nothing"
++                        .to_owned(),
++            });
++        }
++        if self.worker.batch == 0 {
++            return Err(Error::Invalid {
++                detail: "worker.batch must be at least 1".to_owned(),
++            });
++        }
++        if self.worker.poll_interval_ms == 0 {
++            return Err(Error::Invalid {
++                detail: "worker.poll_interval_ms must be at least 1: a zero would busy-wait"
++                    .to_owned(),
++            });
++        }
++        if self.worker.shutdown_seconds == 0 {
++            return Err(Error::Invalid {
++                detail: "worker.shutdown_seconds must be at least 1".to_owned(),
++            });
++        }
++        if self.log.level.trim().is_empty() {
++            return Err(Error::Invalid {
++                detail: "log.level cannot be empty".to_owned(),
++            });
++        }
++        Ok(())
+     }
+ 
+     /// The effective settings, one `key = value` per line, with the connection string redacted.
+     #[must_use]
+     pub fn report(&self) -> Vec<String> {
+-        let _ = self;
+-        todo!("jobq/3.1-engine-boundary: print what this process will do, without the password")
++        let queues: Vec<&str> = self.worker.queues.iter().map(Queue::as_str).collect();
++        vec![
++            format!(
++                "store.url = {}",
++                self.store
++                    .url
++                    .as_deref()
++                    .map_or_else(|| "memory".to_owned(), redact)
++            ),
++            format!("store.migrate = {}", self.store.migrate),
++            format!("worker.name = {}", self.worker.name),
++            format!("worker.queues = {}", queues.join(",")),
++            format!("worker.batch = {}", self.worker.batch),
++            format!("worker.poll_interval_ms = {}", self.worker.poll_interval_ms),
++            format!("worker.shutdown_seconds = {}", self.worker.shutdown_seconds),
++            format!("log.level = {}", self.log.level),
++            format!("log.format = {}", self.log.format.as_str()),
++        ]
++    }
++}
++
++/// A connection string with the credentials taken out of it.
++///
++/// The user is kept and the password is not: an operator matching a report against a
++/// `pg_stat_activity` row needs the first, and nobody needs the second in a ticket.
++fn redact(url: &str) -> String {
++    let Some((scheme, rest)) = url.split_once("://") else {
++        return url.to_owned();
++    };
++    match rest.split_once('@') {
++        Some((credentials, host)) => {
++            let user = credentials
++                .split_once(':')
++                .map_or(credentials, |(user, _)| user);
++            format!("{scheme}://{user}@{host}")
++        }
++        None => url.to_owned(),
++    }
++}
++
++/// Parse a queue list, naming where it came from when one of the names is not valid.
++fn parse_queues(source: &str, names: &[String]) -> Result<Vec<Queue>, Error> {
++    if names.is_empty() {
++        return Err(Error::Invalid {
++            detail: format!("{source} must name at least one queue"),
++        });
++    }
++    names
++        .iter()
++        .map(|name| {
++            Queue::parse(name).map_err(|error| Error::Invalid {
++                detail: format!("{source}: {error}"),
++            })
++        })
++        .collect()
++}
++
++/// Parse a number that came from the environment, naming the variable when it is not one.
++fn parse_number<T: std::str::FromStr>(name: &str, value: &str) -> Result<T, Error> {
++    value.parse::<T>().map_err(|_| Error::Invalid {
++        detail: format!("`{name}={value}` is not a number"),
++    })
++}
++
++/// Parse a boolean that came from the environment.
++fn parse_bool(name: &str, value: &str) -> Result<bool, Error> {
++    match value {
++        "true" | "1" | "yes" => Ok(true),
++        "false" | "0" | "no" => Ok(false),
++        other => Err(Error::Invalid {
++            detail: format!("`{name}={other}` is not a boolean: use `true` or `false`"),
++        }),
+     }
+ }
+diff --git a/src/service/logging.rs b/src/service/logging.rs
+index 44d9d27..27263db 100644
+--- a/src/service/logging.rs
++++ b/src/service/logging.rs
+@@ -50,7 +50,8 @@ impl fmt::Display for RunId {
+ 
+ /// Install the subscriber for the rest of the process's life.
+ ///
+-/// Called once, before anything that might log.
++/// Called once, before anything that might log: a daemon with no subscriber drops every line it
++/// writes, and a daemon that installs two panics inside the second one.
+ ///
+ /// # Errors
+ ///
+@@ -61,5 +62,25 @@ pub fn init(
+     level: &str,
+     run: &RunId,
+ ) -> Result<(), crate::engine::error::Error> {
+-    todo!("jobq/3.1-engine-boundary: install one subscriber, text or json, with the run id")
++    use tracing_subscriber::EnvFilter;
++
++    let filter =
++        EnvFilter::try_new(level).map_err(|error| crate::engine::error::Error::Config {
++            detail: format!("log level `{level}`: {error}"),
++        })?;
++    let builder = tracing_subscriber::fmt()
++        .with_env_filter(filter)
++        // stdout, because the harness (and an operator's `kubectl logs`) reads where the daemon was
++        // told to write; stderr stays for the panic messages that never came through the log.
++        .with_writer(std::io::stdout)
++        .with_ansi(false);
++    match format {
++        crate::service::config::LogFormat::Text => builder.init(),
++        crate::service::config::LogFormat::Json => builder.json().init(),
++    }
++
++    // The first line of every run, and the one an operator uses to tell two runs apart in a
++    // collector: T1's `mailer/1.6-structured-logs` asked for exactly this and it still holds.
++    tracing::info!(run = %run, "logging installed");
++    Ok(())
+ }
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 1bcd9e1..8d49ba7 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -22,6 +22,8 @@ setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`).
+ pub mod config;
+ pub mod logging;
+ 
++use crate::engine::domain::Queue;
++use crate::engine::store::MemoryStore;
+ pub use config::{Config, Flags};
+ pub use logging::RunId;
+ 
+@@ -35,7 +37,88 @@ pub use logging::RunId;
+ /// # Errors
+ ///
+ /// [`crate::engine::error::Error::Config`] when the settings do not name a store this build knows
+-/// how to open, and whatever the store itself reports when it cannot be opened.
++/// how to open.
+ pub async fn serve(config: Config, run: RunId) -> Result<(), crate::engine::error::Error> {
+-    todo!("jobq/3.1-engine-boundary: open the store, announce the drain, wait for the signal")
++    // The store is opened here rather than inside the drain loop: from step
++    // `jobq/3.5-store-port-conformance` on this is a connection pool, and a pool that cannot be
++    // opened must stop the process before it claims anything.
++    let store = open_store(&config)?;
++    let queues: Vec<&str> = config.worker.queues.iter().map(Queue::as_str).collect();
++
++    tracing::info!(
++        run = %run,
++        queues = %queues.join(","),
++        batch = config.worker.batch,
++        worker = %config.worker.name,
++        "draining"
++    );
++
++    shutdown_signal().await;
++    tracing::info!(run = %run, "stopped");
++
++    // Nothing drains yet: the loop that claims, handles and settles arrives with the step that
++    // gives it a handler and a lease (`jobq/3.7-leases-and-recovery`). What this step owns is the
++    // shape of the process — what it was told to do, what it says, and how it stops.
++    drop(store);
++    Ok(())
++}
++
++/// The backend the settings name.
++///
++/// `memory` (and nothing at all) is the in-process store: honest for a demo, useful for a test, and
++/// the only backend this build knows — the durable one arrives with
++/// `jobq/3.5-store-port-conformance`.
++fn open_store(config: &Config) -> Result<MemoryStore, crate::engine::error::Error> {
++    match config.store.url.as_deref() {
++        None | Some("memory") => Ok(MemoryStore::new()),
++        Some(other) => Err(crate::engine::error::Error::Config {
++            detail: format!(
++                "`{}` is not a store this build can open: use `memory`, or wait for the durable \
++                 backend of jobq/3.5-store-port-conformance",
++                redact_url(other)
++            ),
++        }),
++    }
++}
++
++/// A connection string with the credentials taken out, for a message a person will read.
++fn redact_url(url: &str) -> String {
++    match url.split_once('@') {
++        Some((credentials, host)) => {
++            let user = credentials
++                .split_once(':')
++                .map_or(credentials, |(user, _)| user);
++            let scheme = credentials
++                .split_once("://")
++                .map_or("", |(scheme, _)| scheme);
++            if scheme.is_empty() {
++                format!("{user}@{host}")
++            } else {
++                format!("{scheme}://{user}@{host}")
++            }
++        }
++        None => url.to_owned(),
++    }
++}
++
++/// Resolve when the process is asked to stop: `SIGTERM` (an orchestrator) or `Ctrl-C` (a person).
++async fn shutdown_signal() {
++    let ctrl_c = async {
++        let _ = tokio::signal::ctrl_c().await;
++    };
++    #[cfg(unix)]
++    let terminate = async {
++        if let Ok(mut signal) =
++            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
++        {
++            signal.recv().await;
++        }
++    };
++    #[cfg(not(unix))]
++    let terminate = std::future::pending::<()>();
++
++    tokio::select! {
++        () = ctrl_c => {}
++        () = terminate => {}
++    }
+ }

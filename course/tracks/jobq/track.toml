@@ -1,0 +1,824 @@
+# T3 `jobq` — a reusable job queue engine (26 steps), see `docs/curriculum.md` §8.
+#
+# Same conventions as `course/tracks/{mailer,relay}/track.toml` (`kiln lint-caps` enforces them):
+# `teaches` matches the capability ledger slot by slot (R0), `requires` is what this step provably
+# builds on (R3), `entry`/`spec`/`scaffold`/`solution` are relative to this track directory,
+# `run.cmd` runs in `project` below and never through a shell, and the gate ladder only ever tightens.
+#
+# The ladder starts at `clippy@2` (where T2 ended), reaches `clippy@3` at 3.3 (`missing_errors_doc`
+# and the pedantic whitelist; `disallowed_methods` only starts firing once 3.8 writes `clippy.toml`)
+# and `clippy@4` at 3.20 (no new lints: the slow quality gates are must rather than should).
+# Every step keeps the ladder T1 and T2 established — `spec-integrity`, `caps`, `i18n`, `fmt`,
+# `no-todo`, `docs:public`, `exit-code` — and the step-scoped gates are declared only where the
+# artifact they judge exists: `images` on the steps whose spec starts the service against Postgres,
+# `links` on the steps that ship a page, `slow:conformance@N` where the store port is the subject.
+#
+# The slow gates are `kiln`'s own implementations (docs/handoff-m2.md §1): `semver@baseline` compiles
+# a course-owned witness of the public surface against the learner's crate, `mutants` mutates the
+# modules this step's reference solution touches, `bench-budget` compares counters against a course
+# baseline, `unsafe-budget` counts documented `unsafe`, `conformance` re-runs this step's spec once
+# per backend in `conformance.toml`. None of them needs a cargo tool this machine may not have;
+# `?coverage` is the one that does, and it is a *should* gate for exactly that reason.
+#
+# `origin`: 3.1 is a `transfer` (the third project skeleton in a row), fourteen steps are `deepen`
+# (T1/T2 established the capability at a shallower depth), eleven are `teach`.
+
+format_version = 1
+id = "jobq"
+index = 3
+title = "Jobq — a job queue engine (library, worker, CLI)"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/jobq"
+
+# Exit capabilities (curriculum.md §5): what this track has to have established by its last step.
+exit = [
+    "api/library-design@apply",
+    "db/port-conformance@apply",
+    "db/atomic-claim@design",
+    "async/graceful-shutdown@operate",
+    "delivery/dlq@operate",
+    "test/mutation@apply",
+    "perf/bench-budget@apply",
+    "unsafe/budget@apply",
+    "ops/runbook-drill@design",
+]
+
+# --------------------------------------------------------------------------------------------
+# Phase A — the engine and its contract (3.1-3.4): a library someone else can depend on.
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "3.1-engine-boundary"
+title = "Draw the engine boundary: a library the service depends on, never the other way"
+kind = "milestone"
+origin = "transfer"
+entry = "docs/steps/en/jobq/3.1-engine-boundary.md"
+time_hint = "120m"
+concepts = ["engine vs service", "dependency direction", "public surface"]
+teaches = ["api/library-design@aware"]
+requires = [
+    "repo/workspace-layout@apply",
+    "cfg/layered-config@apply",
+    "obs/structured-logs@apply",
+    "db/migrations@apply",
+    "http/service-skeleton@apply",
+    "http/middleware-layering@apply",
+]
+run = { cmd = "cargo test -p jobq --test spec_engine_boundary" }
+spec = ["spec/3.1/engine_boundary.rs"]
+scaffold = "skeleton"
+solution = "solutions/3.1-engine-boundary.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "Two things are being judged: the engine runs an in-memory queue with no server in the process, and nothing under `src/engine/` reaches into `src/service/` or `src/cli/`."
+
+[[step]]
+id = "3.2-public-api-baseline"
+title = "Write the public surface down, so a break is a compile error"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.2-public-api-baseline.md"
+time_hint = "120m"
+concepts = ["public surface snapshot", "re-exports", "non_exhaustive"]
+teaches = ["api/library-design@apply"]
+requires = ["api/library-design@aware", "err/typed-errors@apply"]
+run = { cmd = "cargo test -p jobq --test spec_public_api" }
+spec = ["spec/3.2/public_api.rs"]
+scaffold = "scaffold/3.2-public-api-baseline.patch"
+solution = "solutions/3.2-public-api-baseline.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "The baseline witness is the specification: a function pointer per public function, an exhaustive `match` per public enum, `..` per `#[non_exhaustive]` struct. Rename a parameter type and the crate stops compiling against its own contract."
+
+[[step]]
+id = "3.3-library-errors"
+title = "An error type is part of the API: variants, sources, and wording you can promise"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.3-library-errors.md"
+time_hint = "90m"
+concepts = ["library error surface", "source chain", "error snapshot"]
+teaches = ["err/typed-errors@design"]
+requires = ["err/typed-errors@apply", "api/library-design@apply"]
+run = { cmd = "cargo test -p jobq --test spec_library_errors" }
+spec = ["spec/3.3/library_errors.rs"]
+scaffold = "scaffold/3.3-library-errors.patch"
+solution = "solutions/3.3-library-errors.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "A caller decides what to do from the enum and reads the chain for the why; the Display text is a promise too — a test that pins it is what stops the next refactor from rewriting it."
+
+[[step]]
+id = "3.4-feature-assembly"
+title = "Feature flags that assemble one engine, not one program per feature"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.4-feature-assembly.md"
+time_hint = "120m"
+concepts = ["cargo features", "additive features", "compile-time assembly"]
+teaches = ["cfg/layered-config@design"]
+requires = ["cfg/layered-config@apply", "api/library-design@apply"]
+run = { cmd = "cargo test -p jobq --test spec_feature_assembly" }
+spec = ["spec/3.4/feature_assembly.rs"]
+scaffold = "scaffold/3.4-feature-assembly.patch"
+solution = "solutions/3.4-feature-assembly.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "Features are additive: `--no-default-features` has to build, `--all-features` has to build, and the combinations have to agree on behaviour — a matrix the spec walks one combination at a time."
+
+# --------------------------------------------------------------------------------------------
+# Phase B — the store and the worker (3.5-3.9): one suite, two implementations, one lease.
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "3.5-store-port-conformance"
+title = "One suite, two implementations: the store port and its conformance tests"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.5-store-port-conformance.md"
+time_hint = "120m"
+concepts = ["port and adapter", "conformance suite", "in-memory vs Postgres"]
+teaches = ["db/port-conformance@apply"]
+requires = ["db/migrations@apply", "db/transactions@apply", "api/library-design@apply"]
+run = { cmd = "cargo test -p jobq --test spec_port_conformance" }
+spec = ["spec/3.5/port_conformance.rs"]
+scaffold = "scaffold/3.5-store-port-conformance.patch"
+solution = "solutions/3.5-store-port-conformance.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "The suite is the contract and the backends are the implementations: the same assertions have to run against both, so the spec takes the backend from `KILN_BACKEND` and the harness builds the store from it."
+
+[[step]]
+id = "3.6-transaction-isolation"
+title = "Serialisation conflicts and the uniqueness race: retry, or prevent"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.6-transaction-isolation.md"
+time_hint = "120m"
+concepts = ["isolation level", "serialisation failure", "unique as a lock"]
+teaches = ["db/transactions@design", "db/unique-as-concurrency@design"]
+requires = [
+    "db/transactions@apply",
+    "db/unique-as-concurrency@apply",
+    "db/port-conformance@apply",
+]
+run = { cmd = "cargo test -p jobq --test spec_isolation" }
+spec = ["spec/3.6/isolation.rs"]
+scaffold = "scaffold/3.6-transaction-isolation.patch"
+solution = "solutions/3.6-transaction-isolation.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "Two writers, one invariant: either the database refuses the loser (`40001`) and the caller retries with a bound, or a unique index makes the second writer a no-op. Pick per operation and say why in the ADR."
+
+[[step]]
+id = "3.7-leases-and-recovery"
+title = "Leases, renewal and crash recovery: nobody runs a job twice by accident"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.7-leases-and-recovery.md"
+time_hint = "120m"
+concepts = ["visibility timeout", "lease renewal", "crash recovery"]
+teaches = ["db/atomic-claim@design", "async/graceful-shutdown@operate"]
+requires = [
+    "db/atomic-claim@apply",
+    "async/graceful-shutdown@design",
+    "db/transactions@design",
+]
+run = { cmd = "cargo test -p jobq --test spec_leases" }
+spec = ["spec/3.7/leases.rs"]
+scaffold = "scaffold/3.7-leases-and-recovery.patch"
+solution = "solutions/3.7-leases-and-recovery.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "The delta over `relay/2.15` is that the lease outlives the process: renewal has to fail loudly, the reclaimer has to be observable, and a worker killed mid-job has to become visible again without an operator."
+
+[[step]]
+id = "3.8-clock-injection"
+title = "Time is a dependency: inject the clock, ban reading the system one"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.8-clock-injection.md"
+time_hint = "90m"
+concepts = ["clock port", "monotonic vs wall clock", "deterministic tests"]
+teaches = ["time/clock-injection@apply"]
+requires = ["db/atomic-claim@design", "async/graceful-shutdown@operate"]
+run = { cmd = "cargo test -p jobq --test spec_clock" }
+spec = ["spec/3.8/clock.rs"]
+scaffold = "scaffold/3.8-clock-injection.patch"
+solution = "solutions/3.8-clock-injection.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "`clippy.toml` is the other half of the lesson: once business code may not call `SystemTime::now`, every test that used to `sleep` becomes a two-line advance of a fake clock."
+
+[[step]]
+id = "3.9-priority-fairness"
+title = "Priority without starvation: a scheduler the noisy tenant cannot capture"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.9-priority-fairness.md"
+time_hint = "120m"
+concepts = ["work-conserving order", "aging", "per-tenant fairness"]
+teaches = ["sched/fairness@design", "http/rate-limit@design"]
+requires = ["http/rate-limit@apply", "db/atomic-claim@design", "db/transactions@design"]
+run = { cmd = "cargo test -p jobq --test spec_fairness" }
+spec = ["spec/3.9/fairness.rs"]
+scaffold = "scaffold/3.9-priority-fairness.patch"
+solution = "solutions/3.9-priority-fairness.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "Strict priority plus one flooded tenant is a starvation bug with good throughput numbers: the spec drains a low-priority job while a high-priority tenant keeps refilling its queue."
+
+# --------------------------------------------------------------------------------------------
+# Phase C — schedules, identities and tooling (3.10-3.18): the engine owns time, tenants and jobs.
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "3.10-cron-schedules"
+title = "Cron expressions: next-run arithmetic that survives DST"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.10-cron-schedules.md"
+time_hint = "90m"
+concepts = ["cron fields", "schedule arithmetic", "DST and time zones"]
+teaches = ["sched/cron@apply"]
+requires = ["time/clock-injection@apply", "sched/fairness@design"]
+run = { cmd = "cargo test -p jobq --test spec_cron" }
+spec = ["spec/3.10/cron.rs"]
+scaffold = "scaffold/3.10-cron-schedules.patch"
+solution = "solutions/3.10-cron-schedules.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "A schedule answers `next_after(t)` and nothing else: the missed-run policy and the DST hour are decisions of the caller, and both are arithmetic you can test with a table instead of a clock."
+
+[[step]]
+id = "3.11-delayed-timers"
+title = "Delayed jobs: a timer that costs nothing while it waits"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.11-delayed-timers.md"
+time_hint = "120m"
+concepts = ["ready set", "timer heap", "wake-up discipline"]
+teaches = ["sched/delayed-timers@apply"]
+requires = ["time/clock-injection@apply", "db/atomic-claim@design"]
+run = { cmd = "cargo test -p jobq --test spec_timers" }
+spec = ["spec/3.11/timers.rs"]
+scaffold = "scaffold/3.11-delayed-timers.patch"
+solution = "solutions/3.11-delayed-timers.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "A million jobs scheduled a year out must not become a million wake-ups: the claim query and the in-process timer have to agree on who asks the store, and when."
+
+[[step]]
+id = "3.12-dedup-window"
+title = "Deduplicate: for how long, and what happens at the edge of the window"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.12-dedup-window.md"
+time_hint = "90m"
+concepts = ["dedup key", "window boundary", "late vs duplicate"]
+teaches = ["delivery/idempotency@design"]
+requires = ["delivery/idempotency@apply", "db/unique-as-concurrency@design", "time/clock-injection@apply"]
+run = { cmd = "cargo test -p jobq --test spec_dedup" }
+spec = ["spec/3.12/dedup.rs"]
+scaffold = "scaffold/3.12-dedup-window.patch"
+solution = "solutions/3.12-dedup-window.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "The window is a decision with an ADR: what a caller may assume after it expires, what the store keeps to enforce it, and what the two do at exactly `t + window`."
+
+[[step]]
+id = "3.13-queue-authz-attribution"
+title = "Queues as tenants: quotas, attribution and the noisy neighbour"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.13-queue-authz-attribution.md"
+time_hint = "120m"
+concepts = ["queue ACL", "usage attribution", "noisy neighbour"]
+teaches = ["sec/authz-tenant-isolation@operate"]
+requires = ["sec/authz-tenant-isolation@design", "obs/metrics-slo@apply", "sched/fairness@design"]
+run = { cmd = "cargo test -p jobq --test spec_authz" }
+spec = ["spec/3.13/authz.rs"]
+scaffold = "scaffold/3.13-queue-authz-attribution.patch"
+solution = "solutions/3.13-queue-authz-attribution.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+]
+images = ["postgres:17-alpine"]
+hint = "The delta over `relay/2.16` is attribution: the operator has to be able to answer \"who consumed the worker pool last night\" from counters, not from log archaeology."
+
+[[step]]
+id = "3.14-job-state-machine"
+title = "Job states as a type: transitions that cannot be written down wrong"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.14-job-state-machine.md"
+time_hint = "90m"
+concepts = ["state enum", "transition function", "terminal states"]
+teaches = ["domain/state-machine@apply"]
+requires = ["db/atomic-claim@design", "sched/delayed-timers@apply"]
+run = { cmd = "cargo test -p jobq --test spec_state_machine" }
+spec = ["spec/3.14/state_machine.rs"]
+scaffold = "scaffold/3.14-job-state-machine.patch"
+solution = "solutions/3.14-job-state-machine.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "Model the transitions as a total function on (state, event) and let the compiler refuse the illegal ones; the row's `state` column is then the encoding, never the model."
+
+[[step]]
+id = "3.15-cli-contract"
+title = "The CLI is an interface: subcommands, exit codes, machine-readable output"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.15-cli-contract.md"
+time_hint = "120m"
+concepts = ["subcommand grammar", "exit codes", "stdout vs stderr"]
+teaches = ["cli/contract@apply"]
+requires = ["api/library-design@apply", "domain/state-machine@apply", "err/typed-errors@design"]
+run = { cmd = "cargo test -p jobq --test spec_cli" }
+spec = ["spec/3.15/cli.rs"]
+scaffold = "scaffold/3.15-cli-contract.patch"
+solution = "solutions/3.15-cli-contract.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+]
+images = ["postgres:17-alpine"]
+hint = "Scripts are the customer: `--json` on stdout, diagnostics on stderr, one exit code per failure class, and no question a human has to answer for the non-interactive path."
+
+[[step]]
+id = "3.16-dlq-tooling"
+title = "Dead letters: inspect, replay and drop, with a trail"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.16-dlq-tooling.md"
+time_hint = "120m"
+concepts = ["dead letter store", "replay semantics", "audit trail"]
+teaches = ["ops/dlq-tooling@apply", "delivery/dlq@operate"]
+requires = ["delivery/dlq@apply", "cli/contract@apply", "domain/state-machine@apply"]
+run = { cmd = "cargo test -p jobq --test spec_dlq" }
+spec = ["spec/3.16/dlq.rs"]
+scaffold = "scaffold/3.16-dlq-tooling.patch"
+solution = "solutions/3.16-dlq-tooling.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+    "slow:conformance@2",
+]
+images = ["postgres:17-alpine"]
+hint = "The delta over `relay/2.10` is the operator's half: replay is idempotent, every replay or drop leaves an audit row, and the command works while the worker is running."
+
+[[step]]
+id = "3.17-error-budget-alerts"
+title = "Error budgets and alerts that deserve to wake someone"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.17-error-budget-alerts.md"
+time_hint = "120m"
+concepts = ["error budget", "alert rule", "alert noise"]
+teaches = ["obs/metrics-slo@design", "obs/structured-logs@design"]
+requires = ["obs/metrics-slo@apply", "obs/structured-logs@apply", "delivery/dlq@operate"]
+run = { cmd = "cargo test -p jobq --test spec_alerts" }
+spec = ["spec/3.17/alerts.rs"]
+scaffold = "scaffold/3.17-error-budget-alerts.patch"
+solution = "solutions/3.17-error-budget-alerts.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "links",
+    "semver@baseline",
+]
+images = ["postgres:17-alpine"]
+hint = "A rule is a decision you defend: the spec reads `docs/alerts.md` and checks that every rule names its metric, its threshold, its window and the drill that is supposed to trigger it."
+
+[[step]]
+id = "3.18-trace-sampling"
+title = "Tracing a queue: propagation into workers, and sampling that keeps the tail"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.18-trace-sampling.md"
+time_hint = "120m"
+concepts = ["sampling policy", "tail retention", "queue hops"]
+teaches = ["obs/tracing-propagation@operate"]
+requires = ["obs/tracing-propagation@apply", "obs/metrics-slo@design"]
+run = { cmd = "cargo test -p jobq --test spec_tracing" }
+spec = ["spec/3.18/tracing.rs"]
+scaffold = "scaffold/3.18-trace-sampling.patch"
+solution = "solutions/3.18-trace-sampling.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+]
+images = ["postgres:17-alpine"]
+hint = "The delta over `relay/2.19` is the sampling decision: a job submitted with sampling off must still produce a trace when it fails, and the worker cannot decide that from the parent's flags alone."
+
+# --------------------------------------------------------------------------------------------
+# Phase D — prove it (3.19-3.26): properties, mutation, coverage, budgets, releases, runbooks.
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "3.19-property-invariants"
+title = "Properties over examples: invariants a random walk keeps"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.19-property-invariants.md"
+time_hint = "120m"
+concepts = ["generator", "invariant", "shrinking"]
+teaches = ["test/property-based@apply"]
+requires = ["domain/state-machine@apply", "sched/delayed-timers@apply"]
+run = { cmd = "cargo test -p jobq --test spec_invariants" }
+spec = ["spec/3.19/invariants.rs"]
+scaffold = "scaffold/3.19-property-invariants.patch"
+solution = "solutions/3.19-property-invariants.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@3",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+]
+hint = "A property that cannot fail is decoration: the spec asks for the counter-example the walk found (a seed and the operation sequence), and for the invariant to be checked after every step rather than at the end."
+
+[[step]]
+id = "3.20-mutation-threshold"
+title = "Mutation testing: prove the specs are not decoration"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.20-mutation-threshold.md"
+time_hint = "120m"
+concepts = ["mutation score", "surviving mutant", "threshold policy"]
+teaches = ["test/mutation@apply"]
+requires = ["test/property-based@apply", "test/integration-layering@apply"]
+run = { cmd = "cargo test -p jobq --test spec_mutation" }
+spec = ["spec/3.20/mutation.rs"]
+scaffold = "scaffold/3.20-mutation-threshold.patch"
+solution = "solutions/3.20-mutation-threshold.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "semver@baseline",
+    "slow:mutants@80",
+]
+hint = "`kiln verify --slow` mutates this step's modules and runs your specs against each mutant: the score is the share that died, and every survivor names the assertion that is missing."
+
+[[step]]
+id = "3.21-coverage-policy"
+title = "Coverage as a policy: the branches that must be walked"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.21-coverage-policy.md"
+time_hint = "120m"
+concepts = ["line vs branch coverage", "error-branch inventory", "threshold justification"]
+teaches = ["test/coverage-policy@apply"]
+requires = ["test/mutation@apply", "err/typed-errors@design"]
+run = { cmd = "cargo test -p jobq --test spec_coverage_policy" }
+spec = ["spec/3.21/coverage_policy.rs"]
+scaffold = "scaffold/3.21-coverage-policy.patch"
+solution = "solutions/3.21-coverage-policy.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "semver@baseline",
+    "slow:?coverage@80",
+    "slow:mutants@80",
+]
+hint = "The number is the easy half; the policy is `docs/coverage.md`: which error branch each line of the inventory is walked by, and why the threshold is not 100%."
+
+[[step]]
+id = "3.22-bench-budget"
+title = "A performance budget that a slow machine cannot fail"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.22-bench-budget.md"
+time_hint = "120m"
+concepts = ["work counters", "baseline as content", "complexity guard"]
+teaches = ["perf/bench-budget@apply"]
+requires = ["test/coverage-policy@apply", "db/atomic-claim@design"]
+run = { cmd = "cargo test -p jobq --test spec_budget" }
+spec = ["spec/3.22/budget.rs"]
+scaffold = "scaffold/3.22-bench-budget.patch"
+solution = "solutions/3.22-bench-budget.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "semver@baseline",
+    "slow:bench-budget@10",
+    "slow:?coverage@80",
+]
+hint = "Wall-clock numbers on a shared machine are noise, so the budget counts work instead: the harness reports `jobq-budget` counters, `kiln` compares them with the baseline the course shipped, and a complexity guard catches the O(n^2) rewrite that a small input hides."
+
+[[step]]
+id = "3.23-online-schema"
+title = "Expand, backfill, contract: changing the queue's own schema online"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.23-online-schema.md"
+time_hint = "120m"
+concepts = ["expand/backfill/contract", "dual read", "backfill rate"]
+teaches = ["db/schema-online-evolution@apply"]
+requires = [
+    "db/schema-online-evolution@aware",
+    "db/migrations@apply",
+    "db/port-conformance@apply",
+]
+run = { cmd = "cargo test -p jobq --test spec_online_schema" }
+spec = ["spec/3.23/online_schema.rs"]
+scaffold = "scaffold/3.23-online-schema.patch"
+solution = "solutions/3.23-online-schema.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "semver@baseline",
+]
+images = ["postgres:17-alpine"]
+hint = "The delta over `relay/2.23` is that the backfill is now a job in the queue it is migrating: batched, rate-limited, resumable, and cancellable without leaving the table half-converted."
+
+[[step]]
+id = "3.24-unsafe-budget"
+title = "An unsafe budget: deny by default, document every exception"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.24-unsafe-budget.md"
+time_hint = "90m"
+concepts = ["deny(unsafe_code)", "safety comment", "budget as a number"]
+teaches = ["unsafe/budget@apply"]
+requires = ["unsafe/budget@aware", "api/library-design@apply"]
+run = { cmd = "cargo test -p jobq --test spec_unsafe_budget" }
+spec = ["spec/3.24/unsafe_budget.rs"]
+scaffold = "scaffold/3.24-unsafe-budget.patch"
+solution = "solutions/3.24-unsafe-budget.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "semver@baseline",
+]
+hint = "The delta over `relay/2.21` is that the budget is a number the gate can hold you to: zero is a decision, and allowing one block costs a `// SAFETY:` comment that says what would break if it were wrong."
+
+[[step]]
+id = "3.25-release-artifacts"
+title = "Ship it: versioned artifacts, checksums and a changelog nobody has to reconstruct"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/jobq/3.25-release-artifacts.md"
+time_hint = "120m"
+concepts = ["artifact contract", "checksum", "changelog discipline"]
+teaches = ["release/artifacts@apply"]
+requires = ["cli/contract@apply", "api/library-design@apply", "ci/pipeline@apply"]
+run = { cmd = "cargo test -p jobq --test spec_release" }
+spec = ["spec/3.25/release.rs"]
+scaffold = "scaffold/3.25-release-artifacts.patch"
+solution = "solutions/3.25-release-artifacts.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "semver@baseline",
+]
+hint = "An artifact is a promise about a file: the release build produces the two binaries and a checksum file, the version in the binaries matches the tag, and `CHANGELOG.md` says what changed since the last one."
+
+[[step]]
+id = "3.26-runbook-drill"
+title = "Run the runbook: a drill that finds the operator's missing step"
+kind = "design"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.26-runbook-drill.md"
+time_hint = "120m"
+concepts = ["drill script", "rollback path", "postmortem"]
+teaches = ["ops/runbook-drill@design"]
+requires = ["ops/runbook-drill@apply", "obs/metrics-slo@design", "ops/dlq-tooling@apply"]
+run = { cmd = "cargo test -p jobq --test spec_runbook" }
+spec = ["spec/3.26/runbook.rs"]
+scaffold = "scaffold/3.26-runbook-drill.patch"
+solution = "solutions/3.26-runbook-drill.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "semver@baseline",
+    "slow:?coverage@80",
+]
+hint = "A runbook that has never been executed is a wish: the drill drives the failure through the engine's own ports (a store that refuses writes, a lease holder that goes silent) and the page has to name the symptom, the check and the action for each."
