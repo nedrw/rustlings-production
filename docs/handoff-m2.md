@@ -334,7 +334,34 @@ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --
 
 ## 4. 实测数字与验收证据
 
-（每 5–6 步同步一次；收尾时写完整。）
+### 4.1 验收演练的固定做法（M2 收尾时执行，结果写在这里）
+
+验收标准是「故意引入的劣化能被 `mutants` 与 `bench-budget` 抓到、`semver` 能拦住破坏性改动」。
+做法固定成下面四步，每步都留原始输出：
+
+```sh
+# 1) 在 app/jobq 里得到整条 track 的参考解状态（真项目，不是夹具）
+CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
+  cargo run -q -p kiln -- skip --all --force --track jobq
+
+# 2) 四类故意劣化，每次只改一处，改完跑那一步的判定
+git -C app/jobq diff            # 先存下“好树”
+#   a) semver：把 Engine::submit 改名或改返回类型
+#   b) mutants：改一处行为而不动测试（该步模块里留下一个存活变异体）
+#   c) bench-budget：把被预算盯着的路径换成 O(n^2) 扫描（或去掉索引）
+#   d) conformance：让 PG 后端在某条用例上与内存后端不一致（例如去掉 skip locked）
+CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
+  cargo run -q -p kiln -- check jobq/<受影响的那一步> --track jobq
+
+# 3) 每次都用 git -C app/jobq checkout -- . 回到好树，确认同一个命令变绿（对照实验）
+```
+
+判据：劣化 → 对应的门必须红且点出位置（文件:行 / 指标名 / 编译错误）；回到好树 → 同一个命令绿。
+两次结论一致才算数。
+
+### 4.2 施工中的数字
+
+（每 5–6 步同步一次。）
 
 ## 5. 缺口
 
