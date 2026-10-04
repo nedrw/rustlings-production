@@ -1,0 +1,847 @@
+diff --git a/src/config.rs b/src/config.rs
+index be9cb63..6a27f31 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -76,6 +76,20 @@ pub struct Database {
+     pub url: Option<String>,
+ }
+ 
++/// What a delivery may go to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Delivery {
++    /// Whether a target on this machine's own networks — loopback, private, link-local, a cloud
++    /// provider's metadata endpoint — is a subscriber.
++    ///
++    /// Off unless a deployment turns it on. A webhook service dials URLs its own tenants chose, so
++    /// the addresses that make a request forgery worth attempting are exactly the ones that are not
++    /// on the public internet; a deployment whose subscribers really are on a network only it can
++    /// reach sets this. Which addresses each class is, and why the classes are separate, is
++    /// [`crate::target::Rules`].
++    pub allow_private_targets: bool,
++}
++
+ /// Tenants seeded from configuration at startup (`name=key`).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Bootstrap {
+@@ -92,6 +106,8 @@ pub struct Config {
+     pub log: Log,
+     /// Database settings.
+     pub database: Database,
++    /// Delivery settings.
++    pub delivery: Delivery,
+     /// Tenants to seed on startup.
+     pub bootstrap: Bootstrap,
+ }
+@@ -210,6 +226,15 @@ impl Config {
+         let url = env_layer
+             .get("database.url")
+             .or_else(|| file.as_ref().and_then(|file| file.get("database.url")));
++        let allow_private_targets = env_layer
++            .get("delivery.allow_private_targets")
++            .or_else(|| {
++                file.as_ref()
++                    .and_then(|file| file.get("delivery.allow_private_targets"))
++            })
++            .map(|text| parse_flag("delivery.allow_private_targets", &text))
++            .transpose()?
++            .unwrap_or(false);
+         let tenants_text = env_layer
+             .get("bootstrap.tenants")
+             .or_else(|| file.as_ref().and_then(|file| file.get("bootstrap.tenants")));
+@@ -221,6 +246,9 @@ impl Config {
+                 format: LogFormat::parse(&format_text)?,
+             },
+             database: Database { url },
++            delivery: Delivery {
++                allow_private_targets,
++            },
+             bootstrap: Bootstrap {
+                 tenants: parse_tenants(tenants_text.as_deref())?,
+             },
+@@ -248,6 +276,10 @@ impl Config {
+                 }
+             ),
+         ];
++        lines.push(format!(
++            "  delivery.allow_private_targets = {}",
++            self.delivery.allow_private_targets
++        ));
+         let names: Vec<&str> = self
+             .bootstrap
+             .tenants
+@@ -355,6 +387,21 @@ fn flatten(
+     }
+ }
+ 
++/// Read a boolean setting, refusing text that is neither.
++///
++/// A setting that is silently false because it was spelled `true `, `TRUE` or `1n` is the kind of
++/// mistake this course refuses everywhere else: the value is parsed where it is read, and a value
++/// nobody can read is a configuration error rather than a default.
++fn parse_flag(name: &str, text: &str) -> Result<bool, Error> {
++    match text.trim().to_ascii_lowercase().as_str() {
++        "true" | "1" | "yes" => Ok(true),
++        "false" | "0" | "no" => Ok(false),
++        other => Err(Error::Config(format!(
++            "`{other}` is not a value for `{name}`: expected `true` or `false`"
++        ))),
++    }
++}
++
+ /// Parse `name=key,name=key` into tenants, refusing a name or a key that is not usable.
+ fn parse_tenants(text: Option<&str>) -> Result<Vec<(String, String)>, Error> {
+     let Some(text) = text else {
+@@ -457,6 +504,39 @@ mod tests {
+         assert!(!report.contains("key-acme-123"), "{report}");
+     }
+ 
++    #[test]
++    fn a_delivery_setting_is_read_and_checked_where_it_is_read() {
++        assert!(
++            !Config::load(&Flags::default(), &env(&[]))
++                .expect("the defaults load")
++                .delivery
++                .allow_private_targets,
++            "a service nobody configured does not deliver to its own networks"
++        );
++        let configured = Config::load(
++            &Flags::default(),
++            &env(&[("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true")]),
++        )
++        .expect("the setting loads");
++        assert!(configured.delivery.allow_private_targets);
++        assert!(
++            configured
++                .report()
++                .iter()
++                .any(|line| line.contains("delivery.allow_private_targets = true")),
++            "and `--check-config` says so: {:?}",
++            configured.report()
++        );
++        assert!(
++            Config::load(
++                &Flags::default(),
++                &env(&[("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "yes please")]),
++            )
++            .is_err(),
++            "text that is not a boolean is a configuration error, not a quiet false"
++        );
++    }
++
+     #[test]
+     fn a_tenant_entry_is_checked_where_it_is_read() {
+         assert!(parse_tenants(Some("acme=key-acme-123")).is_ok());
+diff --git a/src/http.rs b/src/http.rs
+index c29acf4..6e01c02 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -32,6 +32,7 @@ use crate::events;
+ use crate::logging::{self, RunId};
+ use crate::openapi;
+ use crate::pagination;
++use crate::target;
+ use uuid::Uuid;
+ 
+ /// Everything a handler may need, built once per process.
+@@ -309,6 +310,14 @@ async fn create_endpoint(
+         Ok(url) => url,
+         Err(error) => return Error::Endpoint(error).into_response(),
+     };
++    // Where this target points is decided at delivery: a name has no address until it is resolved,
++    // and resolving it here would be judging an answer nobody has asked for yet. What *can* be
++    // decided now — the shape of the authority, and the names that can only mean "here" — is, and a
++    // URL no delivery may ever use is refused where it enters the system instead of being accepted
++    // and buried later (`relay/2.12-ssrf-defense`).
++    if let Err(refusal) = target::check(&url, &target::Rules::of(state.config())) {
++        return Error::Target(refusal.to_string()).into_response();
++    }
+     let id = EndpointId::new();
+     let secret = new_secret();
+     let inserted = sqlx::query(
+diff --git a/src/lib.rs b/src/lib.rs
+index 50dfd8e..daff1a5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -25,6 +25,7 @@ pub mod ordering;
+ pub mod outbound;
+ pub mod pagination;
+ pub mod signing;
++pub mod target;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+ pub const USAGE: &str = "\
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 44a3a0d..ae43c77 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -88,6 +88,12 @@ pub fn document() -> Value {
+                         ),
+                         "400": answer("Error", "The body is not a usable endpoint."),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "422": answer(
++                            "Error",
++                            "The target is one this service does not deliver to: an address on its \
++                             own networks, the metadata endpoint, or a name that can only mean \
++                             `here`.",
++                        ),
+                     },
+                 },
+             },
+diff --git a/src/outbound.rs b/src/outbound.rs
+index 9167f22..75313a9 100644
+--- a/src/outbound.rs
++++ b/src/outbound.rs
+@@ -32,6 +32,13 @@
+ //! The port this implements is [`crate::delivery::Sender`], and [`HttpSender`] is that
+ //! implementation: an attempt is one request, and the classification is the mapping between
+ //! [`Outcome`] and [`SendError`].
++//!
++//! One more decision, and it is `relay/2.12-ssrf-defense`'s: **where a request may go**. The
++//! deadlines here bound how long an attempt may take; [`Policy::targets`] and
++//! [`crate::target::Resolver`] decide whether it may be made at all, and the address that is
++//! checked is the address this client connects to. How a redirect is *walked* is this module's
++//! policy; whether the next hop is a place a delivery may go is the target rules', and every hop
++//! is checked again.
+ 
+ use std::collections::HashMap;
+ use std::future::Future;
+@@ -45,17 +52,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::TcpStream;
+ use tokio::time::timeout;
+ 
++use crate::config::Config;
+ use crate::delivery::{Receipt, SendError, SendRequest, Sender};
+ use crate::domain::EndpointUrl;
+ use crate::signing::{self, Secrets};
++use crate::target::{self, Host, Refusal, Resolver, Rules, System, Unreachable};
+ 
+ /// The most a response head may be before this client gives up on it. A head is a few hundred bytes;
+ /// a target that sends a megabyte of them is not answering, it is filling memory.
+ const MAX_HEAD: usize = 64 * 1024;
+ /// How many connections this client keeps for one authority.
+ const MAX_IDLE: usize = 4;
+-/// The port an `http` URL without one means, as the scheme's default.
+-const DEFAULT_PORT: u16 = 80;
+ /// Headers that describe a connection rather than a request. They are the client's business: it is
+ /// the one that decides how the next hop is reached, so it never forwards the caller's answer.
+ const HOP_BY_HOP: [&str; 9] = [
+@@ -70,8 +77,8 @@ const HOP_BY_HOP: [&str; 9] = [
+     "upgrade",
+ ];
+ 
+-/// How long an attempt may take, how long it may wait for an answer, and how far it follows a
+-/// redirect.
++/// How long an attempt may take, how long it may wait for an answer, how far it follows a
++/// redirect, and where it is allowed to go.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Policy {
+     /// How long the TCP connection to a target may take to come up.
+@@ -82,16 +89,67 @@ pub struct Policy {
+     pub deadline: Duration,
+     /// How many redirects one attempt may follow.
+     pub redirects: usize,
++    /// Which addresses a delivery may go to.
++    ///
++    /// A `Client` built by hand can set anything here, and that is deliberate: the rules a
++    /// *deployment* delivers with come from its configuration ([`Policy::of`]), while a library
++    /// caller states its own — a test whose subscribers are a scripted server on `127.0.0.1` is a
++    /// caller with a legitimate reason to allow loopback and nothing else.
++    pub targets: Rules,
+ }
+ 
+ impl Default for Policy {
+-    /// The defaults a deployment gets when it configures nothing.
++    /// The defaults a *client* gets, which is not the same thing as a deployment's policy.
++    ///
++    /// The timeouts are the ones an attempt needs, and the rules are [`Rules::permissive`] — no
++    /// address is refused — because this is the value a library caller and a test build, and a
++    /// library does not get to decide who a deployment may talk to. A service builds its policy
++    /// from its configuration with [`Policy::of`], where the default refuses every address that is
++    /// not on the public internet.
+     fn default() -> Self {
+         Self {
+             connect: Duration::from_secs(3),
+             read: Duration::from_secs(10),
+             deadline: Duration::from_secs(30),
+             redirects: 3,
++            targets: Rules::permissive(),
++        }
++    }
++}
++
++impl Policy {
++    /// The policy this deployment delivers with.
++    ///
++    /// One place decides it, and it is the deployment's configuration rather than the library's
++    /// defaults: `delivery.allow_private_targets` is off unless a deployment turns it on, so a
++    /// service that nobody configured delivers to the public internet and to nothing else.
++    #[must_use]
++    pub fn of(config: &Config) -> Self {
++        Self {
++            targets: Rules::of(config),
++            ..Self::default()
++        }
++    }
++}
++
++/// Why an exchange produced no answer, in the two categories the redirect walk acts on.
++///
++/// The distinction only exists because the answer to "may we go there" is not the answer to "did it
++/// answer": the first is a rule, and a rule does not change between attempts.
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum Failure {
++    /// The target is not one a delivery may reach, and no attempt will change that.
++    NotAllowed(Refusal),
++    /// The attempt failed for a reason that may pass: a name service that did not answer, a
++    /// connection that was refused, an answer that stopped halfway.
++    Retryable(String),
++}
++
++impl From<Unreachable> for Failure {
++    fn from(unreachable: Unreachable) -> Self {
++        match unreachable {
++            Unreachable::Refused(refusal) => Self::NotAllowed(refusal),
++            Unreachable::Unresolved(why) => Self::Retryable(why),
+         }
+     }
+ }
+@@ -176,16 +234,36 @@ pub enum Outcome {
+ #[derive(Debug)]
+ pub struct Client {
+     policy: Policy,
++    /// Where names become addresses: the operating system, unless a caller says otherwise.
++    resolver: Arc<dyn Resolver>,
+     /// Connections an earlier answer left open, by authority.
+     idle: Mutex<HashMap<String, Vec<TcpStream>>>,
+ }
+ 
+ impl Client {
+     /// A client with this policy, and nothing open yet.
++    ///
++    /// Names are resolved by the machine this process runs on ([`System`]): the deployment's
++    /// resolver, and the only one that can be right about a name a tenant controls.
+     #[must_use]
+     pub fn new(policy: Policy) -> Self {
+         Self {
+             policy,
++            resolver: Arc::new(System),
++            idle: Mutex::new(HashMap::new()),
++        }
++    }
++
++    /// A client that resolves names with `resolver`.
++    ///
++    /// The seam that makes "the address that is checked is the address that is connected to"
++    /// something a test can watch: a real name service cannot be asked to answer one thing for the
++    /// check and another for the connection, and a fake one can.
++    #[must_use]
++    pub fn resolving(policy: Policy, resolver: Arc<dyn Resolver>) -> Self {
++        Self {
++            policy,
++            resolver,
+             idle: Mutex::new(HashMap::new()),
+         }
+     }
+@@ -229,7 +307,14 @@ impl Client {
+         loop {
+             let response = match self.exchange(&method, &url, &request.headers, &body).await {
+                 Ok(response) => response,
+-                Err(why) => return Outcome::Retryable(why),
++                // A place this service may not deliver to is not a subscriber that is briefly
++                // unhappy: another attempt resolves the same name and consults the same rule. It is
++                // permanent, which is what buries the delivery rather than spending the retry
++                // budget on a decision.
++                Err(Failure::NotAllowed(refusal)) => {
++                    return Outcome::Permanent(refusal.to_string());
++                }
++                Err(Failure::Retryable(why)) => return Outcome::Retryable(why),
+             };
+ 
+             match response.status {
+@@ -325,11 +410,15 @@ impl Client {
+         url: &EndpointUrl,
+         headers: &[(String, String)],
+         body: &[u8],
+-    ) -> Result<Response, String> {
++    ) -> Result<Response, Failure> {
+         let authority = url.authority().to_owned();
++        // Where this request goes, decided before anything is dialled: the authority is split into a
++        // host and a port, and the *address* is resolved and judged on the way to connecting. An
++        // authority this client cannot read is a target it does not dial.
++        let host = target::host_of(url).map_err(Failure::NotAllowed)?;
+         let mut stream = match self.take_connection(&authority) {
+             Some(stream) => stream,
+-            None => self.connect(&authority).await?,
++            None => self.connect(&host).await?,
+         };
+ 
+         let bytes = request_bytes(method, url, &authority, headers, body);
+@@ -337,19 +426,25 @@ impl Client {
+             // A write that fails on a *reused* connection is the common case: the target closed it
+             // while it sat idle, and this client cannot tell that from any other broken socket. The
+             // attempt is retryable; the pool drops the connection because it is not put back.
+-            return Err(format!(
++            return Err(Failure::Retryable(format!(
+                 "writing the request to {authority} failed: {error}"
+-            ));
++            )));
+         }
+         if let Err(error) = stream.flush().await {
+-            return Err(format!(
++            return Err(Failure::Retryable(format!(
+                 "writing the request to {authority} failed: {error}"
+-            ));
++            )));
+         }
+ 
+-        let (head, rest) = self.read_head(&mut stream).await?;
+-        let (status, headers) = parse_head(&head)?;
+-        let (body, reusable) = self.read_body(&mut stream, status, &headers, rest).await?;
++        let (head, rest) = self
++            .read_head(&mut stream)
++            .await
++            .map_err(Failure::Retryable)?;
++        let (status, headers) = parse_head(&head).map_err(Failure::Retryable)?;
++        let (body, reusable) = self
++            .read_body(&mut stream, status, &headers, rest)
++            .await
++            .map_err(Failure::Retryable)?;
+         if reusable {
+             self.keep_connection(&authority, stream);
+         }
+@@ -360,15 +455,24 @@ impl Client {
+         })
+     }
+ 
+-    /// A connection to `authority`, cut at the connect deadline when it does not come up.
+-    async fn connect(&self, authority: &str) -> Result<TcpStream, String> {
+-        match timeout(self.policy.connect, connect_target(authority)).await {
++    /// A connection to `host`, cut at the connect deadline when it does not come up.
++    ///
++    /// The address comes from [`target::pin`]: the name is resolved **once**, every address it
++    /// answers with is checked against [`Policy::targets`], and the socket is opened to the
++    /// *address*. Nothing between the check and the connection asks a name service anything, which
++    /// is what makes a name that changes its answer unable to send this request anywhere it was not
++    /// allowed to go.
++    async fn connect(&self, host: &Host) -> Result<TcpStream, Failure> {
++        let address = target::pin(host, &self.policy.targets, self.resolver.as_ref()).await?;
++        match timeout(self.policy.connect, TcpStream::connect(address)).await {
+             Ok(Ok(stream)) => Ok(stream),
+-            Ok(Err(error)) => Err(format!("connecting to {authority} failed: {error}")),
+-            Err(_) => Err(format!(
+-                "connecting to {authority} took longer than {:?}",
++            Ok(Err(error)) => Err(Failure::Retryable(format!(
++                "connecting to {address} failed: {error}"
++            ))),
++            Err(_) => Err(Failure::Retryable(format!(
++                "connecting to {address} took longer than {:?}",
+                 self.policy.connect
+-            )),
++            ))),
+         }
+     }
+ 
+@@ -589,15 +693,6 @@ impl Sender for HttpSender {
+     }
+ }
+ 
+-/// Connect to an authority, which for an `http` URL without a port means port 80.
+-async fn connect_target(authority: &str) -> std::io::Result<TcpStream> {
+-    if authority.contains(':') {
+-        TcpStream::connect(authority).await
+-    } else {
+-        TcpStream::connect((authority, DEFAULT_PORT)).await
+-    }
+-}
+-
+ /// One request, as bytes: the request line, the headers that are not the connection's business, and
+ /// the body.
+ fn request_bytes(
+diff --git a/src/target.rs b/src/target.rs
+index 086b593..be2fbe4 100644
+--- a/src/target.rs
++++ b/src/target.rs
+@@ -41,7 +41,7 @@
+ 
+ use std::fmt;
+ use std::future::Future;
+-use std::net::{IpAddr, SocketAddr};
++use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+ use std::pin::Pin;
+ 
+ use crate::config::Config;
+@@ -72,21 +72,93 @@ pub enum Class {
+ 
+ impl Class {
+     /// The class of `address`.
+-    ///
+-    /// A check that only knows IPv4 is a check with an IPv6 way around it, and one
+-    /// that only knows the text of an address misses the `::ffff:` spelling of every
+-    /// IPv4 address there is.
+     #[must_use]
+     pub fn of(address: IpAddr) -> Self {
+-        let _ = address;
+-        todo!("step relay/2.12-ssrf-defense")
++        match address {
++            IpAddr::V4(address) => Self::of_v4(address),
++            IpAddr::V6(address) => Self::of_v6(address),
++        }
++    }
++
++    /// One IPv4 address, classified.
++    fn of_v4(address: Ipv4Addr) -> Self {
++        let [first, second, third, _] = address.octets();
++        // The metadata endpoint lives inside the link-local block, and it is checked
++        // first on purpose: an allowlist that permits a whole `/16` of neighbours
++        // still refuses the one address in it that answers with credentials.
++        if address == Ipv4Addr::new(169, 254, 169, 254) {
++            return Self::Metadata;
++        }
++        if first == 127 {
++            return Self::Loopback;
++        }
++        if first == 169 && second == 254 {
++            return Self::LinkLocal;
++        }
++        let not_public = first == 0 // `this network`
++            || first == 10
++            || (first == 172 && (16..=31).contains(&second))
++            || (first == 192 && second == 168)
++            || (first == 100 && (64..=127).contains(&second)) // carrier-grade NAT
++            || (first == 192 && second == 0 && third == 0) // IETF protocol assignments
++            || (first == 192 && second == 0 && third == 2) // documentation
++            || (first == 198 && (second == 18 || second == 19)) // benchmarking
++            || (first == 198 && second == 51 && third == 100) // documentation
++            || (first == 203 && second == 0 && third == 113) // documentation
++            || first >= 224; // multicast, and the block above it
++        if not_public {
++            Self::Private
++        } else {
++            Self::Public
++        }
++    }
++
++    /// One IPv6 address, classified.
++    fn of_v6(address: Ipv6Addr) -> Self {
++        // A v4-mapped address (`::ffff:127.0.0.1`) *is* an IPv4 address wearing a
++        // different hat, and a check that reads only the text sees neither the
++        // loopback nor the metadata endpoint underneath it.
++        if let Some(embedded) = address.to_ipv4_mapped() {
++            return Self::of_v4(embedded);
++        }
++        if address.is_loopback() {
++            return Self::Loopback;
++        }
++        // `fd00:ec2::254` is the same service as `169.254.169.254`, one protocol
++        // later; it sits in the unique-local block, so the block's rule would let it
++        // through.
++        if address == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
++            return Self::Metadata;
++        }
++        let segments = address.segments();
++        let first = segments.first().copied().unwrap_or(0);
++        if (first & 0xfe00) == 0xfc00 {
++            return Self::Private; // unique-local
++        }
++        if (first & 0xffc0) == 0xfe80 {
++            return Self::LinkLocal;
++        }
++        let not_public = first == 0 // unspecified, and the v4-compatible block
++            || (first & 0xff00) == 0xff00 // multicast
++            || (first == 0x2001 && segments.get(1) == Some(&0x0db8)); // documentation
++        if not_public {
++            Self::Private
++        } else {
++            Self::Public
++        }
+     }
+ 
+     /// The word this class is called in a refusal, and in the sentence an operator
+     /// reads in `last_error`.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("step relay/2.12-ssrf-defense")
++        match self {
++            Self::Public => "public",
++            Self::Loopback => "loopback",
++            Self::Private => "private",
++            Self::LinkLocal => "link-local",
++            Self::Metadata => "metadata",
++        }
+     }
+ }
+ 
+@@ -121,14 +193,37 @@ impl Refusal {
+     /// The stable token this refusal is called, for a caller switching on it.
+     #[must_use]
+     pub fn kind(&self) -> &'static str {
+-        todo!("step relay/2.12-ssrf-defense")
++        match self {
++            Self::Authority(_) => "authority",
++            Self::Credentials(_) => "credentials",
++            Self::Name(_) => "name",
++            Self::Address { .. } => "address",
++        }
+     }
+ }
+ 
+ impl fmt::Display for Refusal {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = f;
+-        todo!("step relay/2.12-ssrf-defense")
++        match self {
++            Self::Authority(authority) => write!(
++                f,
++                "`{authority}` is not a host and a port: a delivery target is `host` or `host:port`"
++            ),
++            Self::Credentials(authority) => write!(
++                f,
++                "`{authority}` carries credentials, and a subscriber's URL is not a place to put a \
++                 password"
++            ),
++            Self::Name(name) => write!(
++                f,
++                "`{name}` is a name that means this machine or this network, not a subscriber"
++            ),
++            Self::Address { address, class } => write!(
++                f,
++                "{address} is a {class} address, and this service does not deliver to {class} \
++                 addresses"
++            ),
++        }
+     }
+ }
+ 
+@@ -161,8 +256,61 @@ pub const HTTPS_PORT: u16 = 443;
+ /// Returns [`Refusal::Credentials`] when the authority carries credentials, and
+ /// [`Refusal::Authority`] when it is neither shape.
+ pub fn host_of(url: &EndpointUrl) -> Result<Host, Refusal> {
+-    let _ = url;
+-    todo!("step relay/2.12-ssrf-defense")
++    let authority = url.authority();
++    if authority.contains('@') {
++        return Err(Refusal::Credentials(authority.to_owned()));
++    }
++    let default_port = if url.is_https() {
++        HTTPS_PORT
++    } else {
++        HTTP_PORT
++    };
++
++    // A bracketed literal: the address is everything up to the closing bracket, and
++    // whatever follows is the port.
++    if let Some(rest) = authority.strip_prefix('[') {
++        let Some((inside, after)) = rest.split_once(']') else {
++            return Err(Refusal::Authority(authority.to_owned()));
++        };
++        let port = port_of(after.strip_prefix(':'), authority, default_port)?;
++        return host_of_parts(inside, port, authority);
++    }
++
++    // Everything else: an optional port after the last colon. A host name cannot
++    // contain one, so the last colon is the separator.
++    match authority.rsplit_once(':') {
++        Some((name, port)) => {
++            let port = port_of(Some(port), authority, default_port)?;
++            host_of_parts(name, port, authority)
++        }
++        None => host_of_parts(authority, default_port, authority),
++    }
++}
++
++/// One host and its port, as a [`Host`], or why the text is not one.
++fn host_of_parts(name: &str, port: u16, authority: &str) -> Result<Host, Refusal> {
++    // The name is normalised once, and the normalised form is what is resolved and
++    // what is judged: `LocalHost.` and `localhost` are the same name, and a check
++    // that only knows the second one is a check with a way around it.
++    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
++    if name.is_empty() {
++        return Err(Refusal::Authority(authority.to_owned()));
++    }
++    Ok(Host {
++        literal: name.parse::<IpAddr>().ok(),
++        name,
++        port,
++    })
++}
++
++/// The port an authority named, or the scheme's default when it named none.
++fn port_of(text: Option<&str>, authority: &str, default_port: u16) -> Result<u16, Refusal> {
++    match text {
++        None | Some("") => Ok(default_port),
++        Some(text) => text
++            .parse()
++            .map_err(|_| Refusal::Authority(authority.to_owned())),
++    }
+ }
+ 
+ /// The names that can only mean this machine, or the network it is on.
+@@ -179,8 +327,15 @@ pub fn host_of(url: &EndpointUrl) -> Result<Host, Refusal> {
+ ///
+ /// Returns [`Refusal::Name`] when the name is one of them.
+ pub fn check_name(name: &str) -> Result<(), Refusal> {
+-    let _ = name;
+-    todo!("step relay/2.12-ssrf-defense")
++    let local = name == "localhost"
++        || name.ends_with(".localhost")
++        || name.ends_with(".local")
++        || name.ends_with(".internal");
++    if local {
++        Err(Refusal::Name(name.to_owned()))
++    } else {
++        Ok(())
++    }
+ }
+ 
+ /// What a deployment is willing to talk to.
+@@ -211,27 +366,45 @@ impl Rules {
+     /// ([`Rules::of`]), where the default is [`Rules::public_only`].
+     #[must_use]
+     pub fn permissive() -> Self {
+-        todo!("step relay/2.12-ssrf-defense")
++        Self {
++            allow_loopback: true,
++            allow_private: true,
++            allow_link_local: true,
++            allow_metadata: true,
++        }
+     }
+ 
+     /// Only the public internet: our own networks are not subscribers.
+     #[must_use]
+     pub fn public_only() -> Self {
+-        todo!("step relay/2.12-ssrf-defense")
++        Self {
++            allow_loopback: false,
++            allow_private: false,
++            allow_link_local: false,
++            allow_metadata: false,
++        }
+     }
+ 
+     /// The rules this deployment configured.
+     #[must_use]
+     pub fn of(config: &Config) -> Self {
+-        let _ = config;
+-        todo!("step relay/2.12-ssrf-defense")
++        if config.delivery.allow_private_targets {
++            Self::permissive()
++        } else {
++            Self::public_only()
++        }
+     }
+ 
+     /// Whether a delivery may go to an address of this class.
+     #[must_use]
+     pub fn allows(&self, class: Class) -> bool {
+-        let _ = class;
+-        todo!("step relay/2.12-ssrf-defense")
++        match class {
++            Class::Public => true,
++            Class::Loopback => self.allow_loopback,
++            Class::Private => self.allow_private,
++            Class::LinkLocal => self.allow_link_local,
++            Class::Metadata => self.allow_metadata,
++        }
+     }
+ 
+     /// Whether a name that means "here" may be a target.
+@@ -241,7 +414,7 @@ impl Rules {
+     /// name them.
+     #[must_use]
+     pub fn allows_local_names(&self) -> bool {
+-        todo!("step relay/2.12-ssrf-defense")
++        self.allow_loopback && self.allow_private && self.allow_link_local
+     }
+ 
+     /// Whether a delivery may go to this address, or why not.
+@@ -251,8 +424,12 @@ impl Rules {
+     /// Returns [`Refusal::Address`] when the address is of a class these rules do
+     /// not allow.
+     pub fn check(&self, address: IpAddr) -> Result<(), Refusal> {
+-        let _ = address;
+-        todo!("step relay/2.12-ssrf-defense")
++        let class = Class::of(address);
++        if self.allows(class) {
++            Ok(())
++        } else {
++            Err(Refusal::Address { address, class })
++        }
+     }
+ }
+ 
+@@ -267,8 +444,15 @@ impl Rules {
+ ///
+ /// Returns the [`Refusal`] that says which rule the target broke.
+ pub fn check(url: &EndpointUrl, rules: &Rules) -> Result<Host, Refusal> {
+-    let _ = (url, rules);
+-    todo!("step relay/2.12-ssrf-defense")
++    let host = host_of(url)?;
++    if let Some(literal) = host.literal {
++        rules.check(literal)?;
++        return Ok(host);
++    }
++    if !rules.allows_local_names() {
++        check_name(&host.name)?;
++    }
++    Ok(host)
+ }
+ 
+ /// Where a name becomes addresses: the seam that makes "resolved once" observable.
+@@ -305,8 +489,17 @@ impl Resolver for System {
+         host: &str,
+         port: u16,
+     ) -> Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, String>> + Send + '_>> {
+-        let _ = (host, port);
+-        todo!("step relay/2.12-ssrf-defense")
++        let host = host.to_owned();
++        Box::pin(async move {
++            let found: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
++                .await
++                .map_err(|error| format!("`{host}` could not be resolved: {error}"))?
++                .collect();
++            if found.is_empty() {
++                return Err(format!("`{host}` resolves to no address at all"));
++            }
++            Ok(found)
++        })
+     }
+ }
+ 
+@@ -325,8 +518,10 @@ pub enum Unreachable {
+ 
+ impl fmt::Display for Unreachable {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = f;
+-        todo!("step relay/2.12-ssrf-defense")
++        match self {
++            Self::Refused(refusal) => refusal.fmt(f),
++            Self::Unresolved(why) => f.write_str(why),
++        }
+     }
+ }
+ 
+@@ -354,6 +549,21 @@ pub async fn pin(
+     rules: &Rules,
+     resolver: &dyn Resolver,
+ ) -> Result<SocketAddr, Unreachable> {
+-    let _ = (host, rules, resolver);
+-    todo!("step relay/2.12-ssrf-defense")
++    if let Some(literal) = host.literal {
++        rules.check(literal).map_err(Unreachable::Refused)?;
++        return Ok(SocketAddr::new(literal, host.port));
++    }
++    if !rules.allows_local_names() {
++        check_name(&host.name).map_err(Unreachable::Refused)?;
++    }
++    let found = resolver
++        .resolve(&host.name, host.port)
++        .await
++        .map_err(Unreachable::Unresolved)?;
++    for address in &found {
++        rules.check(address.ip()).map_err(Unreachable::Refused)?;
++    }
++    found.first().copied().ok_or_else(|| {
++        Unreachable::Unresolved(format!("`{}` resolves to no address at all", host.name))
++    })
+ }

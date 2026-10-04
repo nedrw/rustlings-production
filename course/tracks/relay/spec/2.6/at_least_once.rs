@@ -66,6 +66,11 @@ impl Fixture {
         let app = App::start(app::config(&[
             var(app::DATABASE_URL, postgres.url()),
             var(app::BOOTSTRAP_TENANTS, format!("{}={}", ACME.0, ACME.1)),
+            // The subscribers of this file are a scripted target on `127.0.0.1`, and the service
+            // refuses an address on its own networks unless the deployment says otherwise
+            // (`relay/2.12-ssrf-defense`): this fixture is a deployment whose subscribers are
+            // internal, so it says so.
+            var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
         ]));
         // The fixture's readiness check is the *port*, and the kernel answers a connect before the
         // service has finished starting. This file reads the tables, so it waits for an answer only
