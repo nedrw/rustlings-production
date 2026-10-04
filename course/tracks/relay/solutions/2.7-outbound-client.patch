@@ -1,0 +1,510 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 384c4be..7581426 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,6 +19,7 @@ pub mod events;
+ pub mod http;
+ pub mod logging;
+ pub mod openapi;
++pub mod outbound;
+ pub mod pagination;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+diff --git a/src/outbound.rs b/src/outbound.rs
+index 2f80780..e834226 100644
+--- a/src/outbound.rs
++++ b/src/outbound.rs
+@@ -33,13 +33,40 @@
+ //! implementation: an attempt is one request, and the classification is the mapping between
+ //! [`Outcome`] and [`SendError`].
+ 
++use std::collections::HashMap;
+ use std::future::Future;
+ use std::pin::Pin;
++use std::sync::{Mutex, MutexGuard};
+ use std::time::Duration;
+ 
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpStream;
++use tokio::time::timeout;
++
+ use crate::delivery::{Receipt, SendError, SendRequest, Sender};
+ use crate::domain::EndpointUrl;
+ 
++/// The most a response head may be before this client gives up on it. A head is a few hundred bytes;
++/// a target that sends a megabyte of them is not answering, it is filling memory.
++const MAX_HEAD: usize = 64 * 1024;
++/// How many connections this client keeps for one authority.
++const MAX_IDLE: usize = 4;
++/// The port an `http` URL without one means, as the scheme's default.
++const DEFAULT_PORT: u16 = 80;
++/// Headers that describe a connection rather than a request. They are the client's business: it is
++/// the one that decides how the next hop is reached, so it never forwards the caller's answer.
++const HOP_BY_HOP: [&str; 9] = [
++    "connection",
++    "keep-alive",
++    "proxy-connection",
++    "proxy-authenticate",
++    "proxy-authorization",
++    "te",
++    "trailer",
++    "transfer-encoding",
++    "upgrade",
++];
++
+ /// How long an attempt may take, how long it may wait for an answer, and how far it follows a
+ /// redirect.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -146,13 +173,18 @@ pub enum Outcome {
+ #[derive(Debug)]
+ pub struct Client {
+     policy: Policy,
++    /// Connections an earlier answer left open, by authority.
++    idle: Mutex<HashMap<String, Vec<TcpStream>>>,
+ }
+ 
+ impl Client {
+     /// A client with this policy, and nothing open yet.
+     #[must_use]
+     pub fn new(policy: Policy) -> Self {
+-        Self { policy }
++        Self {
++            policy,
++            idle: Mutex::new(HashMap::new()),
++        }
+     }
+ 
+     /// The policy this client was built with.
+@@ -166,8 +198,277 @@ impl Client {
+     /// The three deadlines in [`Policy`] are applied here: the whole attempt is bounded by
+     /// `deadline`, the connection by `connect`, and every read by `read`.
+     pub async fn attempt(&self, request: &Request) -> Outcome {
+-        let _ = request;
+-        todo!("step relay/2.7-outbound-client")
++        if request.url.is_https() {
++            return Outcome::Permanent(
++                "this client speaks plain http: a subscriber that needs TLS terminates it in front                  of itself, or the deployment grows a client that speaks it"
++                    .to_owned(),
++            );
++        }
++        // The outermost deadline, around everything: connect, every read, every redirect. It is the
++        // only bound that a chain of individually-fast hops cannot exceed in total.
++        match timeout(self.policy.deadline, self.follow(request)).await {
++            Ok(outcome) => outcome,
++            Err(_) => Outcome::Retryable(format!(
++                "the attempt did not finish within {:?}",
++                self.policy.deadline
++            )),
++        }
++    }
++
++    /// Walk the redirects of one request and classify the answer at the end of the chain.
++    async fn follow(&self, request: &Request) -> Outcome {
++        let mut method = request.method.clone();
++        let mut body = request.body.clone();
++        let mut url = request.url.clone();
++        let mut visited = vec![url.as_str().to_owned()];
++        let mut hops = 0usize;
++
++        loop {
++            let response = match self.exchange(&method, &url, &request.headers, &body).await {
++                Ok(response) => response,
++                Err(why) => return Outcome::Retryable(why),
++            };
++
++            match response.status {
++                200..=299 => return Outcome::Success(response),
++                300..=399 => match self.next_hop(&url, &response, &visited, hops) {
++                    Ok(next) => {
++                        // A `303 See Other` says "the answer is over there", and the method it
++                        // means is GET. Its older siblings are left alone: a `301`/`302` in front
++                        // of a webhook is a target saying "send the same thing here instead", and
++                        // dropping the body on the way would deliver an empty request to it.
++                        if response.status == 303 {
++                            method = "GET".to_owned();
++                            body = Vec::new();
++                        }
++                        hops += 1;
++                        visited.push(next.as_str().to_owned());
++                        url = next;
++                    }
++                    Err(why) => return Outcome::Permanent(why),
++                },
++                // These two 4xx are the subscriber saying "come back later": the one case where a
++                // client-generated retry is the target's own request rather than our optimism.
++                408 | 429 => {
++                    return Outcome::Retryable(format!(
++                        "the subscriber answered {}: come back later",
++                        response.status
++                    ));
++                }
++                400..=499 => {
++                    return Outcome::Permanent(format!(
++                        "the subscriber answered {}: this request will not be accepted",
++                        response.status
++                    ));
++                }
++                500..=599 => {
++                    return Outcome::Retryable(format!(
++                        "the subscriber answered {}",
++                        response.status
++                    ));
++                }
++                other => {
++                    return Outcome::Permanent(format!(
++                        "the subscriber answered {other}, which this client does not understand"
++                    ));
++                }
++            }
++        }
++    }
++
++    /// Where a redirect points, or why this client will not go there.
++    fn next_hop(
++        &self,
++        url: &EndpointUrl,
++        response: &Response,
++        visited: &[String],
++        hops: usize,
++    ) -> Result<EndpointUrl, String> {
++        let Some(location) = header(&response.headers, "location") else {
++            return Err(format!(
++                "the subscriber answered {} without saying where to go",
++                response.status
++            ));
++        };
++        if hops >= self.policy.redirects {
++            return Err(format!(
++                "the subscriber redirected more than {} time(s)",
++                self.policy.redirects
++            ));
++        }
++        let next = resolve(url, location)?;
++        if next.is_https() {
++            return Err(
++                "the subscriber redirected to https, and this client speaks plain http".to_owned(),
++            );
++        }
++        if visited.iter().any(|seen| seen == next.as_str()) {
++            return Err(format!(
++                "the subscriber redirected to `{next}`, which this attempt has already visited"
++            ));
++        }
++        Ok(next)
++    }
++
++    /// One request and its answer, on a reused connection when there is one.
++    ///
++    /// `Err` is why the exchange failed, and everything it can report is retryable: a connection
++    /// that would not come up, a target that went quiet, an answer that stopped halfway. Which of
++    /// those deserves another delivery attempt is `relay/2.8-retry-budget`'s question; that they
++    /// are all "not delivered" is this one's.
++    async fn exchange(
++        &self,
++        method: &str,
++        url: &EndpointUrl,
++        headers: &[(String, String)],
++        body: &[u8],
++    ) -> Result<Response, String> {
++        let authority = url.authority().to_owned();
++        let mut stream = match self.take_connection(&authority) {
++            Some(stream) => stream,
++            None => self.connect(&authority).await?,
++        };
++
++        let bytes = request_bytes(method, url, &authority, headers, body);
++        if let Err(error) = stream.write_all(&bytes).await {
++            // A write that fails on a *reused* connection is the common case: the target closed it
++            // while it sat idle, and this client cannot tell that from any other broken socket. The
++            // attempt is retryable; the pool drops the connection because it is not put back.
++            return Err(format!(
++                "writing the request to {authority} failed: {error}"
++            ));
++        }
++        if let Err(error) = stream.flush().await {
++            return Err(format!(
++                "writing the request to {authority} failed: {error}"
++            ));
++        }
++
++        let (head, rest) = self.read_head(&mut stream).await?;
++        let (status, headers) = parse_head(&head)?;
++        let (body, reusable) = self.read_body(&mut stream, status, &headers, rest).await?;
++        if reusable {
++            self.keep_connection(&authority, stream);
++        }
++        Ok(Response {
++            status,
++            headers,
++            body,
++        })
++    }
++
++    /// A connection to `authority`, cut at the connect deadline when it does not come up.
++    async fn connect(&self, authority: &str) -> Result<TcpStream, String> {
++        match timeout(self.policy.connect, connect_target(authority)).await {
++            Ok(Ok(stream)) => Ok(stream),
++            Ok(Err(error)) => Err(format!("connecting to {authority} failed: {error}")),
++            Err(_) => Err(format!(
++                "connecting to {authority} took longer than {:?}",
++                self.policy.connect
++            )),
++        }
++    }
++
++    /// Read a response head, and answer with it and whatever arrived after it.
++    async fn read_head(&self, stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
++        let mut raw = Vec::new();
++        loop {
++            if let Some(end) = find(&raw, b"\r\n\r\n") {
++                let head = String::from_utf8_lossy(raw.get(..end).unwrap_or_default()).into_owned();
++                let rest = raw
++                    .get(end.saturating_add(4)..)
++                    .unwrap_or_default()
++                    .to_vec();
++                return Ok((head, rest));
++            }
++            if raw.len() > MAX_HEAD {
++                return Err("the answer's head is longer than any HTTP head".to_owned());
++            }
++            if self.read_more(stream, &mut raw).await? == 0 {
++                return Err("the connection closed before the answer arrived".to_owned());
++            }
++        }
++    }
++
++    /// Read the body an answer promised, and answer with it and whether the connection is reusable.
++    ///
++    /// Two ways for a body to end, and both are in the wild: a `content-length`, or the close of the
++    /// connection. Reading only the first loses the bodies of every target that uses the second.
++    async fn read_body(
++        &self,
++        stream: &mut TcpStream,
++        status: u16,
++        headers: &[(String, String)],
++        mut body: Vec<u8>,
++    ) -> Result<(Vec<u8>, bool), String> {
++        let closes =
++            header(headers, "connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
++        // A status that means "there is no body, whatever the headers say".
++        if matches!(status, 204 | 304) || (100..200).contains(&status) {
++            return Ok((Vec::new(), !closes));
++        }
++        match content_length(headers) {
++            Some(length) => {
++                while body.len() < length {
++                    if self.read_more(stream, &mut body).await? == 0 {
++                        return Err(format!(
++                            "the answer promised {length} bytes of body and sent {}",
++                            body.len()
++                        ));
++                    }
++                }
++                body.truncate(length);
++                Ok((body, !closes))
++            }
++            None => {
++                // No length: the end of the body is the end of the connection, so the connection is
++                // finished by definition.
++                loop {
++                    if self.read_more(stream, &mut body).await? == 0 {
++                        return Ok((body, false));
++                    }
++                }
++            }
++        }
++    }
++
++    /// One read, cut at the read deadline: the deadline a target that went quiet runs into.
++    async fn read_more(&self, stream: &mut TcpStream, into: &mut Vec<u8>) -> Result<usize, String> {
++        let mut buffer = [0u8; 4096];
++        match timeout(self.policy.read, stream.read(&mut buffer)).await {
++            Ok(Ok(read)) => {
++                into.extend_from_slice(buffer.get(..read).unwrap_or_default());
++                Ok(read)
++            }
++            Ok(Err(error)) => Err(format!("the connection broke while reading: {error}")),
++            Err(_) => Err(format!(
++                "the subscriber sent nothing for {:?}",
++                self.policy.read
++            )),
++        }
++    }
++
++    /// A connection an earlier answer left open for `authority`, if there is one.
++    fn take_connection(&self, authority: &str) -> Option<TcpStream> {
++        self.connections().get_mut(authority)?.pop()
++    }
++
++    /// Keep `authority`'s connection for the next attempt, up to a small number of them.
++    fn keep_connection(&self, authority: &str, stream: TcpStream) {
++        let mut idle = self.connections();
++        let kept = idle.entry(authority.to_owned()).or_default();
++        if kept.len() < MAX_IDLE {
++            kept.push(stream);
++        }
++        // Anything over the limit is dropped here, which closes it.
++    }
++
++    /// The pool, whether or not another thread panicked while holding it: a poisoned pool is not a
++    /// reason to fail a delivery.
++    fn connections(&self) -> MutexGuard<'_, HashMap<String, Vec<TcpStream>>> {
++        self.idle
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
+     }
+ }
+ 
+@@ -202,7 +503,150 @@ impl Sender for HttpSender {
+         &self,
+         request: SendRequest,
+     ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
+-        let _ = request;
+-        todo!("step relay/2.7-outbound-client")
++        Box::pin(async move {
++            // What the subscriber is handed: the event as the API answers with it, plus which
++            // attempt this is. The delivery id travels in a header of its own, because it is not
++            // part of the event — it is the receiver's key for "I have already handled this".
++            let body = serde_json::json!({
++                "id": request.event.id.to_string(),
++                "kind": request.event.kind,
++                "payload": request.event.payload,
++                "received_at": request.event.received_at.to_rfc3339(),
++                "attempt": request.attempt,
++            });
++            let outbound = Request::post(request.url.clone())
++                .header("x-relay-delivery", &request.delivery.to_string())
++                .header("x-relay-attempt", &request.attempt.to_string())
++                .json(&body);
++
++            match self.client.attempt(&outbound).await {
++                Outcome::Success(response) => Ok(Receipt {
++                    status: response.status,
++                }),
++                Outcome::Retryable(why) => Err(SendError::Retryable(why)),
++                Outcome::Permanent(why) => Err(SendError::Permanent(why)),
++            }
++        })
++    }
++}
++
++/// Connect to an authority, which for an `http` URL without a port means port 80.
++async fn connect_target(authority: &str) -> std::io::Result<TcpStream> {
++    if authority.contains(':') {
++        TcpStream::connect(authority).await
++    } else {
++        TcpStream::connect((authority, DEFAULT_PORT)).await
++    }
++}
++
++/// One request, as bytes: the request line, the headers that are not the connection's business, and
++/// the body.
++fn request_bytes(
++    method: &str,
++    url: &EndpointUrl,
++    authority: &str,
++    headers: &[(String, String)],
++    body: &[u8],
++) -> Vec<u8> {
++    let mut head = format!(
++        "{method} {} HTTP/1.1\r\nhost: {authority}\r\n",
++        path_of(url)
++    );
++    for (name, value) in headers {
++        if is_hop_by_hop(name) {
++            continue;
++        }
++        head.push_str(&format!("{name}: {value}\r\n"));
++    }
++    head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
++    let mut bytes = head.into_bytes();
++    bytes.extend_from_slice(body);
++    bytes
++}
++
++/// The path (with its query) a request line carries.
++fn path_of(url: &EndpointUrl) -> String {
++    let text = url.as_str();
++    let after_scheme = text.split_once("://").map_or(text, |(_, rest)| rest);
++    match after_scheme.find(['/', '?']) {
++        Some(index) => {
++            let rest = after_scheme.get(index..).unwrap_or("/");
++            if rest.starts_with('/') {
++                rest.to_owned()
++            } else {
++                format!("/{rest}")
++            }
++        }
++        None => "/".to_owned(),
++    }
++}
++
++/// Where a `location` points, resolved against the URL that carried it.
++fn resolve(url: &EndpointUrl, location: &str) -> Result<EndpointUrl, String> {
++    let location = location.trim();
++    let absolute = if location.contains("://") {
++        location.to_owned()
++    } else {
++        let scheme = url
++            .as_str()
++            .split_once("://")
++            .map_or("http", |(scheme, _)| scheme);
++        let authority = url.authority();
++        if location.starts_with('/') {
++            format!("{scheme}://{authority}{location}")
++        } else {
++            let path = path_of(url);
++            let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
++            format!("{scheme}://{authority}{directory}/{location}")
++        }
++    };
++    absolute.parse().map_err(|error| {
++        format!(
++            "the redirect points at `{location}`, which this service cannot deliver to: {error}"
++        )
++    })
++}
++
++/// `true` for a header that describes the connection rather than the request.
++fn is_hop_by_hop(name: &str) -> bool {
++    let name = name.trim().to_ascii_lowercase();
++    HOP_BY_HOP.contains(&name.as_str())
++}
++
++/// One header by name, case-insensitively.
++fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
++    headers
++        .iter()
++        .find(|(header, _)| header.eq_ignore_ascii_case(name))
++        .map(|(_, value)| value.as_str())
++}
++
++/// The length an answer promised, when it promised one.
++fn content_length(headers: &[(String, String)]) -> Option<usize> {
++    header(headers, "content-length")?.trim().parse().ok()
++}
++
++/// The status and headers of a response head.
++fn parse_head(head: &str) -> Result<(u16, Vec<(String, String)>), String> {
++    let mut lines = head.split("\r\n");
++    let status_line = lines.next().unwrap_or_default();
++    let status = status_line
++        .split_whitespace()
++        .nth(1)
++        .and_then(|code| code.parse().ok())
++        .ok_or_else(|| format!("the answer's status line is not HTTP: `{status_line}`"))?;
++    let headers = lines
++        .filter_map(|line| line.split_once(':'))
++        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
++        .collect();
++    Ok((status, headers))
++}
++
++/// Where `needle` sits in `haystack`.
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    if needle.is_empty() || haystack.len() < needle.len() {
++        return None;
+     }
++    (0..=haystack.len() - needle.len())
++        .find(|start| haystack.get(*start..start + needle.len()) == Some(needle))
+ }

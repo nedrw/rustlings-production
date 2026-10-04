@@ -1,0 +1,582 @@
+diff --git a/src/outbound.rs b/src/outbound.rs
+new file mode 100644
+index 0000000..2f80780
+--- /dev/null
++++ b/src/outbound.rs
+@@ -0,0 +1,208 @@
++//! Reaching a subscriber: HTTP/1.1 over a plain socket, with the deadlines and the redirect policy
++//! that make an attempt something a worker can bound.
++//!
++//! A webhook delivery is an HTTP request to somebody else's server, and the failure modes are all
++//! about *time*: a target that accepts the connection and never answers, a target that answers in
++//! forty seconds, a chain of redirects that never ends. A client that hands all of that to the
++//! operating system's defaults hands an unbounded wait to a worker that has a queue to drain — so
++//! the deadlines are the point of this module, and there are three of them:
++//!
++//! | deadline | what it bounds | what it catches |
++//! | --- | --- | --- |
++//! | connect | the TCP handshake | a host that is down, filtered, or slow to route |
++//! | read | **one** read | a target that took the connection and went quiet |
++//! | the attempt | everything below it | a chain of slow hops, each of which is inside its own deadline |
++//!
++//! The third is the one that is easy to leave out, and the one whose absence is invisible until a
++//! subscriber redirects a delivery through four hosts that each answer slowly.
++//!
++//! Three more decisions live here:
++//!
++//! * **it speaks HTTP/1.1 itself**, over `tokio::net::TcpStream`, instead of pulling in a client
++//!   library: what a delivery needs from HTTP is a method, a body, a status and a *bound*, and the
++//!   bound is the part a library hides. One connection is reused for the next request to the same
++//!   authority (`connection: keep-alive` is HTTP/1.1's default), because a worker that opens a TCP
++//!   connection per delivery spends more time connecting than delivering;
++//! * **a redirect is followed, with a policy**: a chain is followed up to a limit, a loop is
++//!   refused, a `303` means `GET` at the next hop, and a redirect out of what this client can speak
++//!   (to `https`, or with no `Location` at all) is refused rather than guessed at;
++//! * **an answer is classified for the worker**, not parsed for a caller: [`Outcome`] answers the
++//!   only question the delivery layer asks — did it land, is it worth trying again, or is it over.
++//!
++//! The port this implements is [`crate::delivery::Sender`], and [`HttpSender`] is that
++//! implementation: an attempt is one request, and the classification is the mapping between
++//! [`Outcome`] and [`SendError`].
++
++use std::future::Future;
++use std::pin::Pin;
++use std::time::Duration;
++
++use crate::delivery::{Receipt, SendError, SendRequest, Sender};
++use crate::domain::EndpointUrl;
++
++/// How long an attempt may take, how long it may wait for an answer, and how far it follows a
++/// redirect.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Policy {
++    /// How long the TCP connection to a target may take to come up.
++    pub connect: Duration,
++    /// How long one read from a target may take to produce bytes.
++    pub read: Duration,
++    /// How long the whole attempt may take, redirects included.
++    pub deadline: Duration,
++    /// How many redirects one attempt may follow.
++    pub redirects: usize,
++}
++
++impl Default for Policy {
++    /// The defaults a deployment gets when it configures nothing.
++    fn default() -> Self {
++        Self {
++            connect: Duration::from_secs(3),
++            read: Duration::from_secs(10),
++            deadline: Duration::from_secs(30),
++            redirects: 3,
++        }
++    }
++}
++
++/// One request this client will make.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Request {
++    /// The HTTP method, as written on the request line.
++    pub method: String,
++    /// Where it goes.
++    pub url: EndpointUrl,
++    /// Headers, in the order they will be written. The hop-by-hop ones are the client's business
++    /// and are dropped on the way out, whatever the caller sent.
++    pub headers: Vec<(String, String)>,
++    /// The body, as bytes.
++    pub body: Vec<u8>,
++}
++
++impl Request {
++    /// `POST url`, with no headers and no body yet.
++    #[must_use]
++    pub fn post(url: EndpointUrl) -> Self {
++        Self {
++            method: "POST".to_owned(),
++            url,
++            headers: Vec::new(),
++            body: Vec::new(),
++        }
++    }
++
++    /// Add a header.
++    #[must_use]
++    pub fn header(mut self, name: &str, value: &str) -> Self {
++        self.headers.push((name.to_owned(), value.to_owned()));
++        self
++    }
++
++    /// Replace the body.
++    #[must_use]
++    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
++        self.body = body.into();
++        self
++    }
++
++    /// Send `value` as JSON, with the matching `content-type`.
++    #[must_use]
++    pub fn json(self, value: &serde_json::Value) -> Self {
++        self.header("content-type", "application/json")
++            .body(value.to_string())
++    }
++}
++
++/// One answer, as it arrived.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Response {
++    /// The status code from the status line.
++    pub status: u16,
++    /// The headers, in the order they arrived.
++    pub headers: Vec<(String, String)>,
++    /// The body: as long as the answer said it would be.
++    pub body: Vec<u8>,
++}
++
++/// What one attempt means to the worker.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Outcome {
++    /// The subscriber took the request.
++    Success(Response),
++    /// Trying again cannot help: the target answered something no retry can fix, or the policy
++    /// refuses to go where it points. Retrying spends the budget of the deliveries that would work.
++    Permanent(String),
++    /// The attempt failed in a way that may pass: a 5xx, a connection that never came up, an answer
++    /// that never arrived.
++    Retryable(String),
++}
++
++/// The client: a policy, and whatever it needs to keep between attempts.
++///
++/// `attempt` takes `&self`, and a worker holds one client for its whole life, so anything this
++/// client keeps between attempts (a connection it means to reuse, say) lives behind a lock rather
++/// than in a `&mut`.
++#[derive(Debug)]
++pub struct Client {
++    policy: Policy,
++}
++
++impl Client {
++    /// A client with this policy, and nothing open yet.
++    #[must_use]
++    pub fn new(policy: Policy) -> Self {
++        Self { policy }
++    }
++
++    /// The policy this client was built with.
++    #[must_use]
++    pub fn policy(&self) -> &Policy {
++        &self.policy
++    }
++
++    /// Make one attempt: send the request, follow its redirects, and say what the answer means.
++    ///
++    /// The three deadlines in [`Policy`] are applied here: the whole attempt is bounded by
++    /// `deadline`, the connection by `connect`, and every read by `read`.
++    pub async fn attempt(&self, request: &Request) -> Outcome {
++        let _ = request;
++        todo!("step relay/2.7-outbound-client")
++    }
++}
++
++/// The delivery port, on top of [`Client`]: one attempt is one request.
++///
++/// This is the adapter `relay/2.6-at-least-once` asked for: the worker holds a `&dyn Sender` and
++/// knows nothing about HTTP, and what a status code means is decided here, in [`Outcome`], and
++/// mapped to [`SendError`] — the only two categories the worker acts on.
++#[derive(Debug)]
++pub struct HttpSender {
++    client: Client,
++}
++
++impl HttpSender {
++    /// A sender that speaks to targets through a client with this policy.
++    #[must_use]
++    pub fn new(policy: Policy) -> Self {
++        Self {
++            client: Client::new(policy),
++        }
++    }
++
++    /// The client this sender uses, for a caller that wants to look at its policy.
++    #[must_use]
++    pub fn client(&self) -> &Client {
++        &self.client
++    }
++}
++
++impl Sender for HttpSender {
++    fn send(
++        &self,
++        request: SendRequest,
++    ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
++        let _ = request;
++        todo!("step relay/2.7-outbound-client")
++    }
++}
+diff --git a/tests/support/target.rs b/tests/support/target.rs
+new file mode 100644
+index 0000000..0fa43a4
+--- /dev/null
++++ b/tests/support/target.rs
+@@ -0,0 +1,362 @@
++//! A scripted HTTP target: a subscriber a test can point a client at, and look at afterwards.
++//!
++//! The specs for the outbound client are all about what a *server* does at the other end of a
++//! socket — answering slowly, answering nothing, redirecting, closing — so the fixture has to be a
++//! server rather than a mock: nothing below the client's own code is stubbed out, and a test that
++//! passes here passes against something that really spoke HTTP/1.1.
++//!
++//! What it offers:
++//!
++//! * **a port of its own**, read off its own socket (`127.0.0.1:0`): no test picks a port, and two
++//!   targets in one spec cannot collide;
++//! * **a script of answers**, replayed in order; when the script runs out, the last answer repeats,
++//!   which is what makes "every hop redirects to itself" a two-line test;
++//! * **a record of what arrived**: method, path, headers, body, and *which connection* it came in
++//!   on — the last one is how a keep-alive test is written at all;
++//! * **the three ways an answer can misbehave**: it can be slow (`delay`), it can never come
++//!   (`silent`), and it can end without saying how long it is (`without_length`, which closes the
++//!   connection).
++//!
++//! The spec loads this file with `#[path = "support/target.rs"] mod target;` — it is the harness,
++//! not the course, and `tests/support/mod.rs` does not have to mention it.
++//!
++//! Threads here are deliberately detached and never joined: a test that walks away from a connection
++//! (the read-deadline tests do exactly that) has to be able to finish, and a server thread still
++//! parked in a read is taken away when the test process exits.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::io::{Read, Write};
++use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++/// How long the target holds a silent connection before giving up on the test.
++const PARK: Duration = Duration::from_secs(60);
++
++/// One answer the target gives.
++#[derive(Debug, Clone)]
++pub struct Reply {
++    /// Status code of the status line.
++    pub status: u16,
++    /// Headers, as they will be written. `content-length` is added unless it is already here.
++    pub headers: Vec<(String, String)>,
++    /// Body.
++    pub body: String,
++    /// Wait this long before answering.
++    pub delay: Duration,
++    /// Answer nothing at all, and hold the connection open.
++    pub silent: bool,
++    /// Write the body without a `content-length`, and close: the other way an answer can end.
++    pub without_length: bool,
++}
++
++impl Reply {
++    /// `200` with a body.
++    #[must_use]
++    pub fn ok(body: &str) -> Self {
++        Self {
++            status: 200,
++            headers: Vec::new(),
++            body: body.to_owned(),
++            delay: Duration::ZERO,
++            silent: false,
++            without_length: false,
++        }
++    }
++
++    /// One status, no body.
++    #[must_use]
++    pub fn status(status: u16) -> Self {
++        Self {
++            status,
++            ..Self::ok("")
++        }
++    }
++
++    /// `302` with a `location`.
++    #[must_use]
++    pub fn redirect(location: &str) -> Self {
++        Self::status(302).header("location", location)
++    }
++
++    /// Answer nothing at all, ever.
++    #[must_use]
++    pub fn silent() -> Self {
++        Self {
++            silent: true,
++            ..Self::ok("")
++        }
++    }
++
++    /// Wait this long before answering.
++    #[must_use]
++    pub fn slow(self, millis: u64) -> Self {
++        Self {
++            delay: Duration::from_millis(millis),
++            ..self
++        }
++    }
++
++    /// Write no `content-length`, and close the connection after the body.
++    #[must_use]
++    pub fn without_length(self) -> Self {
++        Self {
++            without_length: true,
++            ..self
++        }
++    }
++
++    /// Add a header.
++    #[must_use]
++    pub fn header(mut self, name: &str, value: &str) -> Self {
++        self.headers.push((name.to_owned(), value.to_owned()));
++        self
++    }
++
++    /// Replace the body.
++    #[must_use]
++    pub fn body(mut self, body: &str) -> Self {
++        self.body = body.to_owned();
++        self
++    }
++}
++
++/// One request the target received.
++#[derive(Debug, Clone)]
++pub struct Recorded {
++    /// The method on the request line.
++    pub method: String,
++    /// The path (with its query) on the request line.
++    pub path: String,
++    /// The headers, as they were written.
++    pub headers: Vec<(String, String)>,
++    /// The body, as text.
++    pub body: String,
++    /// Which connection this request arrived on, counting from 1.
++    pub connection: usize,
++}
++
++impl Recorded {
++    /// One header by name, case-insensitively.
++    #[must_use]
++    pub fn header(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(header, _)| header.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++}
++
++/// A target that answers what it was told to, in order.
++pub struct Target {
++    address: SocketAddr,
++    shared: Arc<Shared>,
++}
++
++/// Everything the connection threads share.
++struct Shared {
++    /// Answers left to give, in order.
++    script: Mutex<Vec<Reply>>,
++    /// Headers, in the order they arrived.
++    requests: Mutex<Vec<Recorded>>,
++    /// How many connections have been accepted.
++    connections: AtomicUsize,
++}
++
++impl Target {
++    /// Start a target on a port the kernel picks, answering `script` in order.
++    ///
++    /// The last answer of the script repeats when the script runs out, and an empty script answers
++    /// `200` with no body.
++    #[must_use]
++    pub fn start(script: Vec<Reply>) -> Self {
++        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
++        let address = listener
++            .local_addr()
++            .expect("a bound listener has an address");
++        let shared = Arc::new(Shared {
++            script: Mutex::new(script),
++            requests: Mutex::new(Vec::new()),
++            connections: AtomicUsize::new(0),
++        });
++        let accepting = Arc::clone(&shared);
++        std::thread::spawn(move || {
++            for connection in listener.incoming() {
++                let Ok(stream) = connection else {
++                    continue;
++                };
++                let shared = Arc::clone(&accepting);
++                let number = shared.connections.fetch_add(1, Ordering::SeqCst) + 1;
++                std::thread::spawn(move || serve(stream, number, &shared));
++            }
++        });
++        Self { address, shared }
++    }
++
++    /// Where this target listens.
++    #[must_use]
++    pub fn address(&self) -> SocketAddr {
++        self.address
++    }
++
++    /// A URL on this target, e.g. `http://127.0.0.1:49152/hook`.
++    #[must_use]
++    pub fn url(&self, path: &str) -> String {
++        format!("http://{}{path}", self.address)
++    }
++
++    /// The requests that arrived, in order.
++    #[must_use]
++    pub fn requests(&self) -> Vec<Recorded> {
++        self.shared
++            .requests
++            .lock()
++            .expect("the fixture is not poisoned")
++            .clone()
++    }
++
++    /// How many connections this target has accepted.
++    #[must_use]
++    pub fn connections(&self) -> usize {
++        self.shared.connections.load(Ordering::SeqCst)
++    }
++}
++
++/// Serve one connection: read requests until one of them closes it.
++fn serve(mut stream: TcpStream, number: usize, shared: &Shared) {
++    let _ = stream.set_read_timeout(Some(PARK));
++    loop {
++        let Some(request) = read_request(&mut stream) else {
++            return;
++        };
++        let reply = {
++            let mut script = shared.script.lock().expect("the fixture is not poisoned");
++            if script.len() > 1 {
++                script.remove(0)
++            } else {
++                script.first().cloned().unwrap_or_else(|| Reply::ok(""))
++            }
++        };
++        let closes = reply.headers.iter().any(|(name, value)| {
++            name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close")
++        });
++        shared
++            .requests
++            .lock()
++            .expect("the fixture is not poisoned")
++            .push(Recorded {
++                method: request.method,
++                path: request.path,
++                headers: request.headers,
++                body: request.body,
++                connection: number,
++            });
++        if reply.silent {
++            // Nothing at all, for longer than any deadline a test uses: the connection stays open
++            // and the client is the one that has to give up.
++            std::thread::sleep(PARK);
++            return;
++        }
++        if !reply.delay.is_zero() {
++            std::thread::sleep(reply.delay);
++        }
++        if write_reply(&mut stream, &reply).is_err() {
++            return;
++        }
++        if closes || reply.without_length {
++            let _ = stream.shutdown(Shutdown::Both);
++            return;
++        }
++    }
++}
++
++/// One request, or `None` when the connection ended.
++fn read_request(stream: &mut TcpStream) -> Option<Parsed> {
++    let mut raw = Vec::new();
++    let mut buffer = [0u8; 1024];
++    let end = loop {
++        if let Some(end) = find(&raw, b"\r\n\r\n") {
++            break end;
++        }
++        if raw.len() > 64 * 1024 {
++            return None;
++        }
++        let read = stream.read(&mut buffer).ok()?;
++        if read == 0 {
++            return None;
++        }
++        raw.extend_from_slice(&buffer[..read]);
++    };
++    let head = String::from_utf8_lossy(&raw[..end]).into_owned();
++    let mut lines = head.split("\r\n");
++    let request_line = lines.next().unwrap_or_default();
++    let mut parts = request_line.split_whitespace();
++    let method = parts.next().unwrap_or_default().to_owned();
++    let path = parts.next().unwrap_or_default().to_owned();
++    let headers: Vec<(String, String)> = lines
++        .filter_map(|line| line.split_once(':'))
++        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
++        .collect();
++    let length: usize = headers
++        .iter()
++        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
++        .and_then(|(_, value)| value.parse().ok())
++        .unwrap_or(0);
++    let mut body = raw[end + 4..].to_vec();
++    while body.len() < length {
++        let read = stream.read(&mut buffer).ok()?;
++        if read == 0 {
++            break;
++        }
++        body.extend_from_slice(&buffer[..read]);
++    }
++    Some(Parsed {
++        method,
++        path,
++        headers,
++        body: String::from_utf8_lossy(&body).into_owned(),
++    })
++}
++
++/// One request, as the fixture parsed it.
++struct Parsed {
++    method: String,
++    path: String,
++    headers: Vec<(String, String)>,
++    body: String,
++}
++
++/// Write one answer.
++fn write_reply(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
++    let mut head = format!("HTTP/1.1 {} fixture\r\n", reply.status);
++    let length = reply.body.len();
++    for (name, value) in &reply.headers {
++        head.push_str(&format!("{name}: {value}\r\n"));
++    }
++    if !reply.without_length
++        && !reply
++            .headers
++            .iter()
++            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
++    {
++        head.push_str(&format!("content-length: {length}\r\n"));
++    }
++    if reply.without_length {
++        head.push_str("connection: close\r\n");
++    }
++    head.push_str("\r\n");
++    stream.write_all(head.as_bytes())?;
++    stream.write_all(reply.body.as_bytes())?;
++    stream.flush()
++}
++
++/// Where `needle` sits in `haystack`.
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    if needle.is_empty() || haystack.len() < needle.len() {
++        return None;
++    }
++    (0..=haystack.len() - needle.len())
++        .find(|start| &haystack[*start..*start + needle.len()] == needle)
++}
