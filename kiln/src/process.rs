@@ -54,8 +54,16 @@ impl Ran {
     /// Cargo narrates as it goes (`Compiling …`, `Finished …`), and those lines are the first thing
     /// a report would otherwise quote at a learner. Skipping them is what makes an exit-code summary
     /// useful instead of noise.
+    ///
+    /// A line that names the *failure* wins over a line that merely reports it: a test binary writes
+    /// `test name … FAILED` and the panic to stdout while the tool that started it writes one line
+    /// to stderr, so stderr-first produces `exit code 101: error: test failed` — a report nobody can
+    /// act on (this is what made one red `kiln selftest` run undiagnosable).
     #[must_use]
     pub fn first_message(&self) -> Option<&str> {
+        if let Some(line) = self.stdout.lines().find(|line| names_a_failure(line)) {
+            return Some(line.trim());
+        }
         let text = if self.stderr.trim().is_empty() {
             &self.stdout
         } else {
@@ -77,6 +85,22 @@ impl Ran {
             None => exit_code_text(self.code),
         }
     }
+}
+
+/// Whether a line of output says *what* failed rather than *that* it did.
+///
+/// One rule for every report that quotes a failing command: `test name … FAILED`,
+/// `---- name stdout ----` and `thread 'name' panicked at …` are written by the test binary to
+/// stdout, while `error: test failed` is written by the tool that started it to stderr. Both are
+/// true; only one tells a reader where to look.
+#[must_use]
+pub fn names_a_failure(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("panicked at")
+        || line.starts_with("assertion")
+        || line.starts_with("thread '")
+        || line.starts_with("---- ")
+        || line.contains("FAILED")
 }
 
 /// How an exit code reads in a report: `exit code 1`, never `Some(1)`.

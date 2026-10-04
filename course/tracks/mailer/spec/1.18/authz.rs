@@ -24,6 +24,18 @@ mod service;
 use postgres::Postgres;
 use serde_json::Value;
 use service::Service;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long the fixture's issue is given to be recorded as sent.
+///
+/// Delivery is asynchronous by design (step `mailer/1.14-worker`: the answer to `POST /newsletter`
+/// does not wait for a mail server), so a copy is visible before the worker has recorded that it
+/// went out — the row is claimed, sent, and only then does `sent_at` appear. This spec is about
+/// *who* may see what, not about *when*, so it waits for the fact and then asserts on it.
+const DELIVERED_DEADLINE: Duration = Duration::from_secs(10);
+/// How often the wait looks again.
+const RETRY: Duration = Duration::from_millis(25);
 
 /// The password the fixture subscribes with.
 const PASSWORD: &str = "correct horse battery staple";
@@ -120,36 +132,56 @@ fn fixture() -> (Postgres, Service, i64, i64, String) {
     (postgres, service, ada, grace, cookie)
 }
 
+/// The history of one subscriber, once the fixture's copy has been recorded as sent.
+///
+/// The wait is bounded and its failure names what it was waiting for: a test that asserted on the
+/// first read would be racing the worker the step it follows (`mailer/1.14-worker`) introduced.
+fn delivered_history(service: &Service, cookie: &str, id: i64) -> Value {
+    let deadline = Instant::now() + DELIVERED_DEADLINE;
+    loop {
+        let answer = service.get_with(
+            &format!("/subscribers/{id}/deliveries"),
+            &[("Cookie", cookie)],
+        );
+        assert_eq!(
+            answer.status, 200,
+            "a subscriber may read their own history: {} {}",
+            answer.status, answer.body
+        );
+        let history: Value = serde_json::from_str(&answer.body).expect("the history is JSON");
+        if history
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["sent_at"].is_string()))
+        {
+            return history;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fixture's issue was not recorded as sent within {DELIVERED_DEADLINE:?}: {}",
+            answer.body
+        );
+        thread::sleep(RETRY);
+    }
+}
+
 #[test]
 fn a_subscriber_reads_their_own_deliveries() {
     let (_postgres, service, ada, _grace, cookie) = fixture();
 
-    let answer = service.get_with(
-        &format!("/subscribers/{ada}/deliveries"),
-        &[("Cookie", &cookie)],
-    );
-    assert_eq!(
-        answer.status, 200,
-        "a subscriber may read their own history: {} {}",
-        answer.status, answer.body
-    );
-    let history: Value = serde_json::from_str(&answer.body).expect("the history is JSON");
+    let history = delivered_history(&service, &cookie, ada);
     let rows = history.as_array().expect("the history is a list");
     assert_eq!(
         rows.len(),
         1,
-        "one published issue is one copy for this subscriber: {}",
-        answer.body
+        "one published issue is one copy for this subscriber: {history}"
     );
     assert_eq!(
         rows[0]["subject"], "First issue",
-        "and the copy says which issue it is: {}",
-        answer.body
+        "and the copy says which issue it is: {history}"
     );
     assert!(
         rows[0]["sent_at"].is_string(),
-        "the fixture's issue was delivered, and the row says when: {}",
-        answer.body
+        "the fixture's issue was delivered, and the row says when: {history}"
     );
 }
 

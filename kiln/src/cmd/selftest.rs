@@ -327,7 +327,7 @@ fn first_line(ran: &Ran) -> String {
 /// that says a spec still fails without saying which test failed is a report nobody can act on.
 fn complaint(ran: &Ran) -> String {
     let stdout = ran.stdout.trim();
-    if stdout.lines().any(names_a_failure) {
+    if stdout.lines().any(crate::process::names_a_failure) {
         return ran.stdout.clone();
     }
     if ran.stderr.trim().is_empty() {
@@ -335,16 +335,6 @@ fn complaint(ran: &Ran) -> String {
     } else {
         ran.stderr.clone()
     }
-}
-
-/// Whether a line of output says *what* failed rather than *that* it did.
-fn names_a_failure(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("panicked at")
-        || line.starts_with("assertion")
-        || line.starts_with("thread '")
-        || line.starts_with("---- ")
-        || line.contains("FAILED")
 }
 
 fn clip(ran: &Ran) -> String {
@@ -374,7 +364,8 @@ fn indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{complaint, names_a_failure};
+    use super::complaint;
+    use crate::process::names_a_failure;
 
     fn ran(stdout: &str, stderr: &str) -> crate::process::Ran {
         crate::process::Ran {
@@ -394,7 +385,10 @@ mod tests {
         let cargo = "   Compiling mailer v0.1.0\n    Finished `test` profile\n     Running tests/spec_authz.rs\nerror: test failed, to rerun pass `-p mailer --test spec_authz`\n";
         let libtest = "\nrunning 4 tests\ntest a_subscriber_reads_their_own ... FAILED\n\nfailures:\n\n---- a_subscriber_reads_their_own stdout ----\nthread 'a_subscriber_reads_their_own' panicked at tests/spec_authz.rs:44:5:\nthe answer for somebody else's delivery is 404, not 200\n\ntest result: FAILED. 3 passed; 1 failed\n";
         let text = complaint(&ran(libtest, cargo));
-        assert!(text.contains("thread 'a_subscriber_reads_their_own'"), "{text}");
+        assert!(
+            text.contains("thread 'a_subscriber_reads_their_own'"),
+            "{text}"
+        );
         assert!(!text.contains("Compiling"), "{text}");
     }
 
