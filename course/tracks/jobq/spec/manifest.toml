@@ -14,3 +14,4 @@ format_version = 1
 "spec/3.6/isolation.rs" = "sha256:b20b72dbfec6f4ae4aca5317c9fcc5797c5fd0277eec906dd90fc4e793bd9859"
 "spec/3.7/leases.rs" = "sha256:20e2e95bb8447ac9a2acc8bad2a7afd4b72dfa6934f02faceda710ef9974cc5a"
 "spec/3.8/clock.rs" = "sha256:e0ca93e2f910a0ddbd771a6d594b148485a4c97553e6d77574307b015e57fa55"
+"spec/3.9/fairness.rs" = "sha256:d726b413178702d38cfcaf88e10eda65f9961ec77c78969a1d53962e79457968"

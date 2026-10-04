@@ -1,0 +1,83 @@
+diff --git a/src/engine/policy.rs b/src/engine/policy.rs
+new file mode 100644
+index 0000000..5d7a2dd
+--- /dev/null
++++ b/src/engine/policy.rs
+@@ -0,0 +1,77 @@
++//! The scheduling policy: who waits, and for how long.
++//!
++//! Strict priority is the obvious order and it has a failure mode that does not show up in a
++//! benchmark: one queue that keeps refilling with high-priority work owns the workers, and every
++//! other queue waits forever. Throughput looks excellent; the p99 for everybody else is unbounded.
++//!
++//! Two knobs, and they answer two different questions:
++//!
++//! * **aging** answers "how long may a low-priority job wait?" — after `aging_after`, one extra
++//!   level of effective priority per interval waited, so a queue that floods eventually competes
++//!   with the work it is flooding past. The wait is measured from the instant the job became due
++//!   (`run_at`), which is the only instant the row already carries;
++//! * **`max_in_flight_per_queue`** answers "how much of the pool may one queue hold?" — a cap that
++//!   the *claim* enforces, because claiming is where the resource is taken. Jobs over the cap are
++//!   not failed and not delayed: they stay queued, and the next claim that finds a free slot takes
++//!   them.
++//!
++//! The defaults are the engine's old behaviour (strict priority, no cap), which is what makes this
++//! step additive: every spec written before it keeps answering the same way, and a deployment that
++//! wants fairness asks for it (`jobq/3.9-priority-fairness` is where that argument is written out).
++
++use std::time::Duration;
++
++/// How a store orders its due jobs and how much of a queue it will admit at once.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub struct Policy {
++    /// How long a due job may wait before its effective priority rises by one level.
++    ///
++    /// `None` is strict priority: a job's rank is the priority it was submitted with, for as long as
++    /// it takes.
++    aging_after: Option<Duration>,
++    /// How many jobs of one queue may be running at the same time. `None` is unlimited.
++    max_in_flight_per_queue: Option<usize>,
++}
++
++impl Policy {
++    /// Strict priority, no cap: the engine's behaviour before this step.
++    #[must_use]
++    pub fn strict() -> Self {
++        Self::default()
++    }
++
++    /// A policy that ages waiting jobs and admits at most `cap` per queue.
++    #[must_use]
++    pub fn fair(aging_after: Duration, cap: usize) -> Self {
++        Self {
++            aging_after: Some(aging_after),
++            max_in_flight_per_queue: Some(cap),
++        }
++    }
++
++    /// The same policy with aging, leaving the cap alone.
++    #[must_use]
++    pub fn with_aging(mut self, aging_after: Duration) -> Self {
++        self.aging_after = Some(aging_after);
++        self
++    }
++
++    /// The same policy with a per-queue in-flight cap, leaving aging alone.
++    #[must_use]
++    pub fn with_cap(mut self, cap: usize) -> Self {
++        self.max_in_flight_per_queue = Some(cap);
++        self
++    }
++
++    /// How long a job may wait before its rank rises, if it does.
++    #[must_use]
++    pub fn aging_after(&self) -> Option<Duration> {
++        self.aging_after
++    }
++
++    /// How many jobs one queue may hold running at once, if there is a limit.
++    #[must_use]
++    pub fn max_in_flight_per_queue(&self) -> Option<usize> {
++        self.max_in_flight_per_queue
++    }
++}

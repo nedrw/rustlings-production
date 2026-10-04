@@ -1,0 +1,378 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index f1fd434..f3d04be 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -22,6 +22,7 @@ pub(crate) mod clock;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
++pub(crate) mod policy;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
+ pub(crate) mod store;
+@@ -34,6 +35,7 @@ pub use domain::{
+ };
+ pub use error::Error;
+ pub use events::{EventKind, JobEvent};
++pub use policy::Policy;
+ pub use retry::{DEFAULT_ATTEMPTS, Retried, retry};
+ pub use scheduler::Engine;
+ #[cfg(feature = "postgres")]
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 685e9dd..a29b431 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -27,6 +27,7 @@ use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
++use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ 
+@@ -101,6 +102,8 @@ pub struct MemoryStore {
+     lease: Duration,
+     /// The clock every instant this store writes is read from.
+     clock: Arc<dyn Clock>,
++    /// How due jobs are ordered and how much of one queue may run at once.
++    policy: Policy,
+ }
+ 
+ impl Default for MemoryStore {
+@@ -109,6 +112,7 @@ impl Default for MemoryStore {
+             ledger: Mutex::default(),
+             lease: DEFAULT_LEASE,
+             clock: Arc::new(SystemClock),
++            policy: Policy::strict(),
+         }
+     }
+ }
+@@ -142,6 +146,17 @@ impl MemoryStore {
+         self
+     }
+ 
++    /// The same store, ordering due jobs and admitting them by `policy`
++    /// (`jobq/3.9-priority-fairness`).
++    ///
++    /// The default is strict priority with no cap — the engine's behaviour before this step — so a
++    /// caller that wants fairness asks for it rather than discovering it.
++    #[must_use]
++    pub fn with_policy(mut self, policy: Policy) -> Self {
++        self.policy = policy;
++        self
++    }
++
+     /// The store's contents, taken without a panic path: a poisoned mutex means some other thread
+     /// died holding it, and refusing to read the jobs after that would turn one thread's panic into
+     /// the whole process's.
+@@ -159,15 +174,22 @@ impl MemoryStore {
+     /// on: `claim` selects and stamps under *one* lock, so the rows this function names cannot be
+     /// claimed by somebody else in between (step `jobq/3.5-store-port-conformance` is the step that
+     /// found the other spelling of this — select, unlock, stamp — handing one job to two workers).
+-    fn due(jobs: &BTreeMap<JobId, Job>, queue: &Queue, now: DateTime<Utc>) -> Vec<JobId> {
++    fn due(
++        jobs: &BTreeMap<JobId, Job>,
++        queue: &Queue,
++        now: DateTime<Utc>,
++        policy: Policy,
++    ) -> Vec<JobId> {
+         let mut due: Vec<&Job> = jobs
+             .values()
+             .filter(|job| job.queue == *queue && job.state == JobState::Queued && job.run_at <= now)
+             .collect();
+         due.sort_by(|left, right| {
+-            right
+-                .priority
+-                .cmp(&left.priority)
++            // Aging first, priority second: a job that has been waiting long enough is worth as much
++            // as a fresh one submitted at that rank, which is what keeps a flooding queue from owning
++            // the workers (`jobq/3.9-priority-fairness`).
++            rank(right, now, policy)
++                .cmp(&rank(left, now, policy))
+                 .then_with(|| left.run_at.cmp(&right.run_at))
+                 .then_with(|| left.id.cmp(&right.id))
+         });
+@@ -175,6 +197,21 @@ impl MemoryStore {
+     }
+ }
+ 
++/// A job's rank under `policy`: the priority it was submitted with, plus one level per whole
++/// interval it has been due and unclaimed.
++///
++/// The wait is measured from `run_at` rather than from the moment the row was written: a job
++/// scheduled for tomorrow is not being starved today, and the instant it became due is the one the
++/// row already carries.
++fn rank(job: &Job, now: DateTime<Utc>, policy: Policy) -> i64 {
++    let priority = i64::from(job.priority);
++    let Some(interval) = policy.aging_after() else {
++        return priority;
++    };
++    let waited = now.signed_duration_since(job.run_at).num_seconds().max(0);
++    priority + waited / interval.as_secs().max(1) as i64
++}
++
+ // The seal the port requires (step `jobq/3.2-public-api-baseline`): this backend is the one the
+ // crate certifies with its own suite, and no outside implementation can say the same about itself.
+ impl Sealed for MemoryStore {}
+@@ -224,9 +261,21 @@ impl Store for MemoryStore {
+             // happen in the same critical section, so a second claim on this store cannot read the
+             // same row as free while this one is on its way to marking it running.
+             let mut ledger = self.ledger();
+-            let due = Self::due(&ledger.jobs, queue, now);
++            // The cap is about the queue, so it is counted before anything is chosen: a claim that
++            // fills the queue to its limit and *then* notices is a claim that took the resource
++            // already (`jobq/3.9-priority-fairness`).
++            let in_flight = ledger
++                .jobs
++                .values()
++                .filter(|job| job.queue == *queue && job.state == JobState::Running)
++                .count();
++            let room = match self.policy.max_in_flight_per_queue() {
++                Some(cap) => cap.saturating_sub(in_flight),
++                None => limit,
++            };
++            let due = Self::due(&ledger.jobs, queue, now, self.policy);
+             let mut claimed = Vec::new();
+-            for id in due.into_iter().take(limit) {
++            for id in due.into_iter().take(limit.min(room)) {
+                 if let Some(job) = ledger.jobs.get_mut(&id) {
+                     job.state = JobState::Running;
+                     // An attempt starts when a worker takes the job, not when it finishes: a
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 3d7d428..2e9afc1 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -45,6 +45,7 @@ use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
++use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ 
+@@ -69,6 +70,8 @@ pub struct PostgresStore {
+     lease: Duration,
+     /// The clock every instant this store writes is read from.
+     clock: Arc<dyn Clock>,
++    /// How due jobs are ordered and how much of one queue may run at once.
++    policy: Policy,
+ }
+ 
+ impl PostgresStore {
+@@ -88,6 +91,7 @@ impl PostgresStore {
+             pool,
+             lease: DEFAULT_LEASE,
+             clock: Arc::new(SystemClock),
++            policy: Policy::strict(),
+         })
+     }
+ 
+@@ -113,6 +117,18 @@ impl PostgresStore {
+         self.clock = clock;
+         self
+     }
++
++    /// The same store, ordering due jobs and admitting them by `policy`
++    /// (`jobq/3.9-priority-fairness`).
++    ///
++    /// The ordering lives in the statement rather than in a Rust-side sort: the rows are chosen by
++    /// the database under `for update skip locked`, so sorting the answer afterwards would order what
++    /// was already taken without changing which rows those are.
++    #[must_use]
++    pub fn with_policy(mut self, policy: Policy) -> Self {
++        self.policy = policy;
++        self
++    }
+ }
+ 
+ impl Sealed for PostgresStore {}
+@@ -205,7 +221,14 @@ impl Store for PostgresStore {
+                      where id in ( \
+                          select id from jobs \
+                          where queue = $1 and state = 'queued' and run_at <= $2 \
+-                         order by priority desc, run_at asc, id asc \
++                           and ($6 = 0 or ( \
++                               select count(*) from jobs running \
++                               where running.queue = $1 and running.state = 'running' \
++                           ) < $6) \
++                         order by priority + case when $7 > 0 \
++                                      then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
++                                      else 0 end desc, \
++                                  run_at asc, id asc \
+                          limit $3 \
+                          for update skip locked \
+                      ) \
+@@ -214,7 +237,10 @@ impl Store for PostgresStore {
+                  ) \
+                  select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+                         max_attempts, last_error, lease_owner, lease_expires_at \
+-                 from taken order by priority desc, run_at asc, id asc",
++                 from taken order by priority + case when $7 > 0 \
++                                        then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
++                                        else 0 end desc, \
++                                      run_at asc, id asc",
+             )
+             .bind(queue.as_str())
+             .bind(now)
+@@ -228,6 +254,16 @@ impl Store for PostgresStore {
+             // authorities disagree eventually (step `jobq/3.8-clock-injection` is where the engine's
+             // becomes injectable, and it must be the only one either backend reads).
+             .bind(now + self.lease)
++            // The two policy parameters: the per-queue cap (`0` = no cap) and the aging interval in
++            // whole seconds (`0` = strict priority). Both are bound rather than written into the
++            // statement because a deployment's numbers are its own, and a statement that has to be
++            // rebuilt when a setting changes is a statement that ends up with the setting inlined.
++            .bind(i64::try_from(self.policy.max_in_flight_per_queue().unwrap_or(0)).unwrap_or(i64::MAX))
++            .bind(
++                self.policy
++                    .aging_after()
++                    .map_or(0, |interval| i64::try_from(interval.as_secs()).unwrap_or(i64::MAX)),
++            )
+             .fetch_all(&self.pool)
+             .await
+             .map_err(refused)?;
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 1f5aad7..6e7e8c0 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -106,6 +106,17 @@ pub struct WorkerSettings {
+     pub poll_interval_ms: u64,
+     /// How long the drain may take after a stop signal before the process ends anyway.
+     pub shutdown_seconds: u64,
++    /// How long a due job may wait before its rank rises by one level, in seconds.
++    ///
++    /// `jobq/3.9-priority-fairness`'s first knob, and `0` is the engine's old behaviour: strict
++    /// priority, where a queue that keeps refilling with high-priority work owns the workers and
++    /// every other queue waits for as long as it takes.
++    pub aging_seconds: u64,
++    /// How many jobs of one queue this process will hold running at once; `0` is unlimited.
++    ///
++    /// The second knob of the same step, and the one that protects a shared pool from one queue:
++    /// jobs over the cap are not failed and not delayed — they stay queued until a slot frees.
++    pub max_in_flight_per_queue: usize,
+     /// How long a claim by this process is good for.
+     ///
+     /// `jobq/3.7-leases-and-recovery`'s number, and it is a trade rather than a default: longer than
+@@ -206,6 +217,12 @@ struct FileWorker {
+     /// How long the drain may take after a stop signal.
+     #[serde(default)]
+     shutdown_seconds: Option<u64>,
++    /// How long a due job may wait before its rank rises, in seconds.
++    #[serde(default)]
++    aging_seconds: Option<u64>,
++    /// How many jobs of one queue may run at once; `0` is unlimited.
++    #[serde(default)]
++    max_in_flight_per_queue: Option<usize>,
+     /// How long a claim is good for.
+     #[serde(default)]
+     lease_seconds: Option<u64>,
+@@ -239,6 +256,8 @@ impl Default for Config {
+                 batch: 8,
+                 poll_interval_ms: 250,
+                 shutdown_seconds: 10,
++                aging_seconds: 300,
++                max_in_flight_per_queue: 0,
+                 lease_seconds: 60,
+                 handler: None,
+             },
+@@ -314,6 +333,12 @@ impl Config {
+         if let Some(seconds) = file.worker.shutdown_seconds {
+             self.worker.shutdown_seconds = seconds;
+         }
++        if let Some(seconds) = file.worker.aging_seconds {
++            self.worker.aging_seconds = seconds;
++        }
++        if let Some(cap) = file.worker.max_in_flight_per_queue {
++            self.worker.max_in_flight_per_queue = cap;
++        }
+         if let Some(seconds) = file.worker.lease_seconds {
+             self.worker.lease_seconds = seconds;
+         }
+@@ -360,6 +385,12 @@ impl Config {
+                 (Some("WORKER"), Some("SHUTDOWN_SECONDS"), None) => {
+                     self.worker.shutdown_seconds = parse_number(name, value)?;
+                 }
++                (Some("WORKER"), Some("AGING_SECONDS"), None) => {
++                    self.worker.aging_seconds = parse_number(name, value)?;
++                }
++                (Some("WORKER"), Some("MAX_IN_FLIGHT_PER_QUEUE"), None) => {
++                    self.worker.max_in_flight_per_queue = parse_number(name, value)?;
++                }
+                 (Some("WORKER"), Some("LEASE_SECONDS"), None) => {
+                     self.worker.lease_seconds = parse_number(name, value)?;
+                 }
+@@ -454,6 +485,11 @@ impl Config {
+             format!("worker.batch = {}", self.worker.batch),
+             format!("worker.poll_interval_ms = {}", self.worker.poll_interval_ms),
+             format!("worker.shutdown_seconds = {}", self.worker.shutdown_seconds),
++            format!("worker.aging_seconds = {}", self.worker.aging_seconds),
++            format!(
++                "worker.max_in_flight_per_queue = {}",
++                self.worker.max_in_flight_per_queue
++            ),
+             format!("worker.lease_seconds = {}", self.worker.lease_seconds),
+             format!(
+                 "worker.handler = {}",
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 5f719ad..dddf679 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -27,7 +27,7 @@ pub mod worker;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+-use crate::engine::{Error, MemoryStore, Queue, Store};
++use crate::engine::{Error, MemoryStore, Policy, Queue, Store};
+ pub use config::{Config, Flags};
+ pub use logging::RunId;
+ use worker::{Shutdown, Worker, WorkerSettings};
+@@ -134,12 +134,33 @@ fn worker_settings(config: &Config) -> WorkerSettings {
+ /// feature gate belongs.
+ async fn open_store(config: &Config) -> Result<Arc<dyn Store>, Error> {
+     let lease = Duration::from_secs(config.worker.lease_seconds);
++    let policy = policy(config);
+     match config.store.url.as_deref() {
+-        None | Some("memory") => Ok(Arc::new(MemoryStore::new().with_lease(lease))),
+-        Some(other) => open_durable(other, lease).await,
++        None | Some("memory") => Ok(Arc::new(
++            MemoryStore::new().with_lease(lease).with_policy(policy),
++        )),
++        Some(other) => open_durable(other, lease, policy).await,
+     }
+ }
+ 
++/// The scheduling policy the settings ask for (`jobq/3.9-priority-fairness`).
++///
++/// Both knobs are settings rather than constants because both are the deployment's: how long a job
++/// may wait before it outranks fresh work, and how much of the pool one queue may hold. `0` means
++/// "off" in both cases, and off is the engine's old behaviour — the daemon's own defaults turn aging
++/// on (five minutes) and leave the cap unlimited, because a cap that nobody chose is a cap that
++/// looks like a stuck queue.
++fn policy(config: &Config) -> Policy {
++    let mut policy = Policy::strict();
++    if config.worker.aging_seconds > 0 {
++        policy = policy.with_aging(Duration::from_secs(config.worker.aging_seconds));
++    }
++    if config.worker.max_in_flight_per_queue > 0 {
++        policy = policy.with_cap(config.worker.max_in_flight_per_queue);
++    }
++    policy
++}
++
+ /// Open the durable backend the settings name.
+ ///
+ /// The durable backend landed with `jobq/3.5-store-port-conformance`, behind the `postgres` feature
+@@ -151,10 +172,11 @@ async fn open_store(config: &Config) -> Result<Arc<dyn Store>, Error> {
+ /// across the crate is a feature that is off in one code path and on in another, and the
+ /// combination nobody tried is the one that breaks.
+ #[cfg(feature = "postgres")]
+-async fn open_durable(url: &str, lease: Duration) -> Result<Arc<dyn Store>, Error> {
++async fn open_durable(url: &str, lease: Duration, policy: Policy) -> Result<Arc<dyn Store>, Error> {
+     let store = crate::engine::PostgresStore::connect(url)
+         .await?
+-        .with_lease(lease);
++        .with_lease(lease)
++        .with_policy(policy);
+     Ok(Arc::new(store))
+ }
+ 
