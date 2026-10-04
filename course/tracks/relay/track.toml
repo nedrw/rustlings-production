@@ -127,7 +127,12 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
+    # The contract spec starts the service, which needs the database — so this step declares the
+    # image like its neighbours (the worker who wrote it noticed the gap: `images` is step-scoped,
+    # and "needs Postgres" is a fact about the step, not about the route it serves).
+    "images",
 ]
+images = ["postgres:17-alpine"]
 hint = "A snapshot nobody compares is decoration: the test has to fail when a field is renamed, and the old client's payload has to keep parsing."
 
 [[step]]
