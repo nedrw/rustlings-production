@@ -1,0 +1,403 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+index 62e2d6b..03b86fd 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -1,38 +1,107 @@
+ # Runbook: the service is degraded
+ 
+ The page a responder reads when deliveries are not arriving and the service is still up. Everything
+-in it is something a person can *do* or *look at*, and the three drills at the bottom are what makes
+-it evidence rather than prose.
++in it is something a person can *do* or *look at*, and the three drills at the bottom are what make
++it evidence rather than prose: each one replays a way this service degrades, in one command, against
++a database of its own.
+ 
+-This is the skeleton: the sections are the ones an incident needs, and every link is a placeholder
+-until the step's last task is done — `kiln check relay/2.24-degradation-drill` runs the `links` gate
+-over this file, and it fails while the targets are `TODO`.
++The one sentence to read first: **this service is at-least-once, and a delivery is only lost when it
++is neither `sent` nor `dead`.** Everything below is about finding out which of the three states the
++work is in (`pending`, `claimed`, `retrying`) and why — see
++[adr/0001-at-least-once.md](adr/0001-at-least-once.md).
+ 
+ ## Symptoms
+ 
+-What does a responder see first, from the outside? (the alert, the metric, what a subscriber reports)
++What a responder notices first, in the order it usually arrives:
++
++- a subscriber writes "we are not getting your webhooks", and their endpoint is up;
++- an alert on `relay_backlog_depth{tenant="…"}` rising, or on
++  `relay_delivery_duration_seconds` p99 rising past the budget;
++- `relay_deliveries_total{outcome="dead"}` climbing — the one signal that means *somebody will never
++  hear from us* about those events, whatever happens next;
++- the queue depth rising while the process is healthy: `/healthz` answers, `/readyz` answers, the CPU
++  is where it always was.
++
++The first question is never "is the service up" — it is **which of the three degradations this is**,
++because the answer decides whether restarting anything helps at all (it almost never does).
+ 
+ ## Signals
+ 
+-| what to look at | where |
+-| --- | --- |
+-| [the number that says the queue is growing](TODO) | `GET /metrics` |
+-| [the number that says deliveries are being given up on](TODO) | `GET /metrics` |
+-| [the line in the log that says which delivery is being attempted](TODO) | |
++| what to look at | where | what it means |
++| --- | --- | --- |
++| [the queue growing](https://prometheus.io/docs/practices/instrumentation/#gauges) | `curl -s localhost:8080/metrics \| grep relay_backlog_depth` | how much work is owed, per tenant. Rising with a flat p99 is a subscriber that is slow, not a service that is broken |
++| [how long attempts take](https://prometheus.io/docs/practices/histograms/) | `relay_delivery_duration_seconds` | the p99 is the subscriber's answer time. A step change is the subscriber; a slow rise is this service (or its database) |
++| [what is being given up on](https://prometheus.io/docs/practices/instrumentation/#counter-vs-gauge) | `relay_deliveries_total{outcome="dead"}` | the retry budget is spent. Those deliveries are in the DLQ and are replayed from there — a rising `dead` is a decision, not a glitch |
++| which state the work is in | `psql -c "select state, count(*) from deliveries group by state"` | `claimed` with a stale `lease_expires_at` is a worker that died; `pending` growing is the ingest side outrunning the seats |
++| who is holding what | `psql -c "select locked_by, count(*) from deliveries where state = 'claimed' group by 1"` | one worker holding everything is one worker that is stuck, not a queue that is slow |
++| the last thing each attempt said | `psql -c "select last_error, count(*) from deliveries where state in ('retrying','dead') group by 1"` | the subscriber's own words: a timeout, a 500, a 422 |
++| one delivery's whole life | `psql -c "select * from dead_letters where delivery_id = '…'"` | every life it lost, with its attempt count and the reason |
+ 
+ ## Steps
+ 
+-1. [what to check before touching anything](TODO)
+-2. [what to look at when the database is the suspect](TODO)
+-3. [what to look at when one subscriber is the suspect](TODO)
+-4. [what to look at when one tenant is the suspect](TODO)
++1. **Do not restart anything yet.** The queue lives in the database, and a restart gives up the
++   *leases* this process is holding — the rows come back after `delivery.lease_seconds`
++   (`relay/2.15-shutdown-leases`). A restart is a thing to do when the *process* is the problem, and
++   the signals above say whether it is;
++2. **Find out which degradation it is** (the three drills below are the vocabulary):
++   - *the database is away*: `/readyz` is `503` while `/healthz` is `200`, and the log line says which
++     schema is applied and which one this process needs. Check the database's own health, not this
++     process's: nothing this service does will fix it, and the deliveries are safe — they are rows,
++     and the rows come back when the database does;
++   - *the subscriber is slow*: p99 up, backlog up, `sent` still moving, no `dead`. Read
++     `last_error`: a timeout at the target is the subscriber's problem, and the seats are the only
++     thing this service can turn up (`delivery.max_in_flight`). **Raising the seats past what the
++     database and the target can take makes this worse**, not better — the queue is bounded for the
++     same reason (`relay/2.14-backpressure`);
++   - *one tenant is flooding*: `relay_backlog_depth` is one tenant's, and other tenants' p99 is flat.
++     The claim is fair (`relay/2.14-backpressure`), so the quiet tenants are still served; the fix
++     is on the flooding tenant's side (their rates) or in more capacity, and the *wrong* fix is to
++     let the queue grow unbounded, because the bound is what keeps one tenant from turning the
++     whole service into a queue;
++3. **Say what you see, in the incident.** Which signal, which tenant, which state, since when. The
++   numbers above are the whole vocabulary, and a handover that has them is a handover somebody can
++   act on;
++4. **Replay the drill that matches** (below) before you change anything, so you know what "recovered"
++   looks like on this system right now — not on the system as it was when this page was written.
+ 
+ ## Verification
+ 
+-- [the command that replays each drill](TODO)
+-- [the number that has to be back where it was](TODO)
++Recovered means, in this order:
++
++- `relay_backlog_depth` is falling, per tenant, and `relay_deliveries_total{outcome="sent"}` is
++  rising;
++- `psql -c "select count(*) from deliveries where state in ('pending','claimed','retrying')"` is
++  going down and is eventually `0` for the events you accepted — that number is the promise;
++- `relay_deliveries_total{outcome="dead"}` has stopped moving: whatever was given up on is now the
++  DLQ's problem, and the DLQ is replayed on purpose (`relay/2.10-dlq`), not by hoping;
++- the drill you are replaying reports nothing owed:
++
++```sh
++cargo test -p relay --test spec_degradation_drill the_database_away_drill
++cargo test -p relay --test spec_degradation_drill the_slow_subscriber_drill
++cargo test -p relay --test spec_degradation_drill the_tenant_storm_drill
++```
++
++Each one starts a database of its own and replays the failure with the thing that broke *coming
++back*, and then with it *never* coming back — the second run has to report the loss, which is what
++makes the first one evidence. A drill that is green in both worlds is a drill wired to nothing.
+ 
+ ## Escalation
+ 
+-- [what to do when the subscriber is not coming back today](TODO)
+-- [who or what to involve, and with what information](TODO)
++- **The subscriber is not coming back today.** Do not keep retrying into it: the retry budget will
++  give up on those deliveries anyway, and until it does, they are work this service is holding for
++  nobody. The honest choices are to disable the endpoint (`relay/2.12-ssrf-defense`'s validation is
++  where a target is refused, and an endpoint whose target is refused is buried rather than retried)
++  and to tell the customer that events are being given up on, with the DLQ as the record of what;
++- **the database is not coming back today.** Stop taking events: the ingest path answers `503` once
++  the queue is at its bound (`delivery.max_backlog`), and that is the service saying "come back"
++  rather than accepting work it cannot keep. The accepted events are rows and they are as safe as the
++  database's own backups; what is *not* safe is the traffic you keep accepting into a queue nobody
++  can drain;
++- **one tenant is taking the service down for everybody.** The fair claim keeps the other tenants
++  moving, so the decision is about that tenant: their quota (`rate_limit.per_second` is per tenant
++  already), their endpoints, or their contract. Write down which one you chose and why — the next
++  person gets the same alert;
++- **what to hand over**: the signal that moved and when, the tenants affected, the state counts from
++  the query above, which drill you replayed and what it reported, and the one decision you are
++  handing them. Not "the queue is big" — the numbers.
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+index 7fbb3d3..8205d66 100644
+--- a/tests/support/drill.rs
++++ b/tests/support/drill.rs
+@@ -64,6 +64,11 @@ const PER_TURN: usize = 4;
+ const TURNS: usize = 12;
+ /// How many seats the drills work with.
+ const SEATS: u32 = 4;
++/// How many subscribers the slow-subscriber drill registers, and therefore how many attempts can be
++/// in flight at once: attempts to *one* endpoint are serialised by its lane
++/// (`relay/2.9-ordering`), so a drill about a subscriber that is slow needs one lane per attempt it
++/// wants to see.
++const LANES: usize = 4;
+ 
+ /// The way this service degrades: one per drill.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -150,20 +155,10 @@ pub fn run(scenario: Scenario) -> Report {
+ 
+ /// Run one drill, with `recovery` deciding whether the failure ends.
+ ///
+-/// **This is the version that reports the promise kept whatever happens.** The world is set up — a
+-/// database of this drill's own, the service running against it, the events accepted — and then the
+-/// report is *decided here* rather than measured from the service: `delivered` is set to the number
+-/// of events the drill accepted, and `outstanding` to zero, because that is the answer a first
+-/// version of a drill usually hard-codes. Turning it into a drill means one thing per scenario:
+-///
+-/// * the failure has to be *real* before the recovery means anything — the worker has to lose the
+-///   rows it is holding (the database goes away), the attempts have to be in flight (the subscriber
+-///   parks them), the flood has to be queued behind the quiet tenant's event;
+-/// * `Recovery` has to be obeyed: `ComesBack` lets the broken thing work again and the drill waits
+-///   for the queue to move; `Never` leaves it broken, and the drill reports what is *still owed*;
+-/// * the numbers have to be read from the service's records — `sent`, `dead`, and the three states
+-///   that mean "still owed" — because a report that describes what the drill arranged is a test of
+-///   the drill.
++/// The failure is made real, the recovery is either let through or not, and then the report is read
++/// from the *service's* records: how many deliveries a subscriber took, how many the service gave
++/// up on, and how many it still owes. A report that described what the drill arranged would be a
++/// test of the drill — which is what the spec's `Never` cases exist to catch.
+ #[must_use]
+ pub fn run_with(scenario: Scenario, recovery: Recovery) -> Report {
+     let drill = Drill::start();
+@@ -172,25 +167,217 @@ pub fn run_with(scenario: Scenario, recovery: Recovery) -> Report {
+         .enable_all()
+         .build()
+         .expect("the drill's runtime starts");
+-    let accepted = runtime.block_on(async {
++    let (accepted, what) = runtime.block_on(async {
+         match scenario {
+-            Scenario::DatabaseAway => drill.accept_many(ACME.1, &keys("database-away", EVENTS)),
+-            Scenario::SlowSubscriber => drill.accept_many(ACME.1, &keys("slow-subscriber", EVENTS)),
+-            Scenario::TenantStorm => {
+-                let flood = drill.accept_many(ACME.1, &keys("tenant-storm", FLOOD));
+-                flood + drill.accept_many(GLOBEX.1, &keys("quiet-tenant", 1))
+-            }
++            Scenario::DatabaseAway => database_away(&drill, recovery).await,
++            Scenario::SlowSubscriber => slow_subscriber(&drill, recovery).await,
++            Scenario::TenantStorm => tenant_storm(&drill, recovery).await,
+         }
+     });
+-    let _ = recovery;
++    // What is owed, as the rows say it rather than as the drill intended it. `claimed` counts on
++    // purpose: a row a worker is holding is work this service still owes, and a drill that called
++    // that "delivered" would report every crash as a success (`relay/2.5-atomic-claim`).
+     Report {
+         scenario,
+         accepted,
+-        delivered: i64::try_from(accepted).unwrap_or(i64::MAX),
+-        dead: 0,
+-        outstanding: 0,
+-        what: "the report was decided by the drill rather than measured from the service"
+-            .to_owned(),
++        delivered: drill.count("select count(*) from deliveries where state = 'sent'"),
++        dead: drill.count("select count(*) from deliveries where state = 'dead'"),
++        outstanding: drill.count(
++            "select count(*) from deliveries where state in ('pending', 'claimed', 'retrying')",
++        ),
++        what,
++    }
++}
++
++/// The worker's database goes away while it is holding the deliveries it claimed.
++///
++/// What is broken is the connection the worker runs on, which is the failure this service actually
++/// sees when a database fails over or a network partition is closed: the pool it holds is gone, and
++/// the rows it had claimed are stamped with a holder that will never answer. Nothing is lost —
++/// because a claim is a *lease* (`relay/2.15-shutdown-leases`) and the rows are still there.
++async fn database_away(drill: &Drill, recovery: Recovery) -> (usize, String) {
++    drill.register(ACME.1, "database-away");
++    let accepted = drill.accept_many(ACME.1, &keys("database-away", EVENTS));
++    let deliveries = drill.count("select count(*) from deliveries");
++    let seats = u32::try_from(deliveries).unwrap_or(SEATS);
++
++    // The connection the worker runs on, which is about to go away: it claims every delivery — the
++    // work this process is holding — and then the pool is closed under it.
++    let worker_pool = drill.pool().await;
++    let held = concurrency::claim_fair(&worker_pool, "drill-database-away", deliveries, LEASE)
++        .await
++        .expect("the claim runs");
++    assert_eq!(
++        held.len(),
++        usize::try_from(deliveries).unwrap_or(0),
++        "the worker claimed every delivery before its database went away"
++    );
++    worker_pool.close().await;
++
++    // The failure is real before anything is decided about the recovery: every row is held by a
++    // worker whose database is not answering.
++    let held = drill.count("select count(*) from deliveries where state = 'claimed'");
++    assert_eq!(
++        held, deliveries,
++        "the database went away while this worker was holding every row, and the rows say so: a \
++         fixture that had already recovered would prove nothing about either world"
++    );
++
++    match recovery {
++        Recovery::Never => (
++            accepted,
++            format!(
++                "the worker's database never came back: {held} delivery(ies) are stamped with a \
++                 holder that is gone, and nobody will reclaim them until a lease expires"
++            ),
++        ),
++        Recovery::ComesBack => {
++            // The lease is what a worker that is gone leaves behind, and the drill ages it rather
++            // than waiting for one: the deadline is the knob a deployment turns, and sleeping
++            // through a real one would make the drill a sleep rather than a replay.
++            drill.postgres.execute(
++                "update deliveries set lease_expires_at = now() - interval '1 second' \
++                  where state = 'claimed'",
++            );
++            let pool = drill.pool().await;
++            let reclaimed = lease::reclaim_expired(&pool)
++                .await
++                .expect("the reclaim runs");
++            assert_eq!(
++                reclaimed,
++                u64::try_from(deliveries).unwrap_or(0),
++                "the next worker found every row the dead one was holding: this is the recovery, \
++                 and it is the lease that made it possible"
++            );
++            let counted = Arc::new(Counted::new());
++            let report = drill
++                .worker(&pool, seats, &counted)
++                .work(4)
++                .await
++                .expect("the worker runs");
++            (
++                accepted,
++                format!(
++                    "the database came back, {reclaimed} delivery(ies) came back with it, and {} \
++                     attempt(s) were made in {report:?}",
++                    counted.finished()
++                ),
++            )
++        }
++    }
++}
++
++/// The subscriber stops answering, so every attempt that is in flight stays in flight.
++async fn slow_subscriber(drill: &Drill, recovery: Recovery) -> (usize, String) {
++    // One subscriber per attempt the drill wants in flight: `relay/2.9-ordering` gives each endpoint
++    // a lane of its own, so attempts to one subscriber are serialised on purpose — which is right
++    // for a subscriber and useless for a drill that wants to see *every* delivery in flight.
++    for lane in 0..LANES {
++        drill.register(ACME.1, &format!("slow-subscriber-{lane}"));
++    }
++    let accepted = drill.accept_many(ACME.1, &keys("slow-subscriber", EVENTS));
++    let deliveries = drill.count("select count(*) from deliveries");
++    let seats = u32::try_from(deliveries).unwrap_or(SEATS);
++    let pool = drill.pool().await;
++
++    // The subscriber takes every attempt and holds it (`tests/support/load.rs`): the failure is
++    // real — every delivery is in flight and none is answered — before the recovery is decided.
++    let counted = Arc::new(Counted::new());
++    counted.hold();
++    let worker = drill.worker(&pool, seats, &counted);
++    let working = tokio::spawn(async move { worker.turn().await });
++    // Every lane is occupied: the failure is real — a full set of attempts is in flight and none of
++    // them has been answered — before anything is decided about the recovery.
++    counted.wait_for_started(LANES).await;
++    let held = drill.count("select count(*) from deliveries where state = 'claimed'");
++    assert_eq!(
++        held, deliveries,
++        "every delivery was claimed by the worker that is waiting on the subscriber"
++    );
++
++    match recovery {
++        Recovery::Never => {
++            // Nobody ever lets them through. The attempts stay in flight and the rows stay claimed:
++            // the drill reports what is owed rather than waiting for a subscriber that is not
++            // coming back — which is the difference between an incident and an outage nobody ends.
++            working.abort();
++            (
++                accepted,
++                format!(
++                    "the subscriber never answered: {} attempt(s) are in flight and {held} \
++                     delivery(ies) are claimed by a worker waiting on them",
++                    counted.in_flight()
++                ),
++            )
++        }
++        Recovery::ComesBack => {
++            counted.release();
++            let tick = working
++                .await
++                .expect("the turn ends")
++                .expect("the turn runs");
++            (
++                accepted,
++                format!(
++                    "the subscriber started answering and the attempts in flight finished: \
++                     {tick:?}"
++                ),
++            )
++        }
++    }
++}
++
++/// One tenant floods the queue while another tenant's one event waits behind it.
++async fn tenant_storm(drill: &Drill, recovery: Recovery) -> (usize, String) {
++    drill.register(ACME.1, "flooding-tenant");
++    drill.register(GLOBEX.1, "quiet-tenant");
++    let mut accepted = drill.accept_many(ACME.1, &keys("tenant-storm", FLOOD));
++    accepted += drill.accept_many(GLOBEX.1, &keys("quiet-tenant", 1));
++    let pool = drill.pool().await;
++    let counted = Arc::new(Counted::new());
++    let worker = drill.worker(&pool, SEATS, &counted);
++
++    match recovery {
++        Recovery::Never => {
++            // The flood does not end: every turn accepts more events than the seats can attempt, so
++            // the queue grows while the service is as fast as it was ever going to be. That is what
++            // a storm is, and the drill stops after a bounded number of turns to report what is
++            // still owed.
++            for turn in 0..TURNS {
++                accepted += drill.accept_many(ACME.1, &keys(&format!("storm-{turn}"), PER_TURN));
++                worker.turn().await.expect("the worker runs");
++            }
++            (
++                accepted,
++                format!(
++                    "the flood never ended: {TURNS} turns of {PER_TURN} new event(s) against \
++                     {SEATS} seats, and the queue is what grew"
++                ),
++            )
++        }
++        Recovery::ComesBack => {
++            // The storm ends, and the seats work through what was accepted — including the quiet
++            // tenant's one delivery, which the claim deals a share of the seats to
++            // (`relay/2.14-backpressure`).
++            let report = worker.work(TURNS).await.expect("the worker runs");
++            let served = drill.count(
++                "select count(*) from deliveries as d \
++                   join endpoints as e on e.id = d.endpoint_id \
++                  where e.url like '%quiet-tenant' and d.state = 'sent'",
++            );
++            assert_eq!(
++                served, 1,
++                "the tenant with one event was served while the other tenant's flood was being \
++                 worked through: a claim that took the oldest rows would serve the flood first, \
++                 because every one of its rows is older"
++            );
++            (
++                accepted,
++                format!(
++                    "the flood ended, the queue drained ({report:?}), and the quiet tenant was served"
++                ),
++            )
++        }
+     }
+ }
+ 

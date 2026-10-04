@@ -22,6 +22,7 @@ format_version = 1
 "spec/2.21/policy.rs" = "sha256:6adb5a1e9c5d6db8e5b729d0ad90e46f5be2b1048d0a1c90ba3eceba9c6c6a94"
 "spec/2.22/rolling.rs" = "sha256:c4245086eaddd39b2b8e265c3decf3ada6e80d6f5392e098f301a901d17ca364"
 "spec/2.23/schema.rs" = "sha256:75f6d7733efa30b3f6d16a5402ce61f8bea16f0cd776352db1cd418e45596f2e"
+"spec/2.24/degradation_drill.rs" = "sha256:d9a12c1a1e1bcb9d39855369b01f21118a926404c4fc3583dc0cc2cd92309584"
 "spec/2.3/contract.rs" = "sha256:8e5c359cbca23db80b707e1ead184c5ea8b0f0dff282c1dcd7c510abd580e2d5"
 "spec/2.4/pagination.rs" = "sha256:ff6a4d6602d3af5e9f0ff8ddeb3bb38b60af8a6a84ca1ebe60b898ea90381c7b"
 "spec/2.5/claim.rs" = "sha256:59d41695c325541310e645560f76b47d8f45e978120dc0241192031e660e1f13"
