@@ -1,0 +1,1139 @@
+diff --git a/migrations/0008_audit.sql b/migrations/0008_audit.sql
+new file mode 100644
+index 0000000..71eacc9
+--- /dev/null
++++ b/migrations/0008_audit.sql
+@@ -0,0 +1,40 @@
++-- Who may do what, and what they did.
++--
++-- Two things live here, and they are two halves of one decision: a tenant has a *role*, and a
++-- privileged action leaves a *row* (step relay/2.16-authz-audit).
++--
++-- The role is a column on `tenants` rather than a table of its own, and that is this service's
++-- simplification rather than the general answer: a tenant here has exactly one API key, so a role
++-- per tenant and a role per credential are the same thing. A service whose tenants hold several
++-- keys — a laptop, a CI runner, a person — needs a table keyed by the credential, and the shape of
++-- the matrix does not change when it does.
++alter table tenants
++    add column role text not null default 'tenant-admin';
++
++-- A role this service does not have is not a role a row may hold: the second place the list of
++-- roles is written down is the database's, and it is the one that holds when somebody edits a row
++-- with `psql` at three in the morning.
++alter table tenants
++    add constraint tenants_role_known
++        check (role in ('tenant-admin', 'tenant-reader'));
++
++-- The trail. `decision` is both halves of the question — `allow`, or the reason a request was
++-- refused — because the two are always asked together by whoever reads it. The credential is not
++-- here, and never will be: this table outlives the key it is about, and a trail that quoted the
++-- key would be a second copy of it with a longer retention.
++create table audit_log (
++    id uuid primary key default gen_random_uuid(),
++    tenant_id uuid not null references tenants (id) on delete cascade,
++    role text not null,
++    action text not null,
++    target text not null,
++    decision text not null,
++    request_id text not null,
++    at timestamptz not null default now()
++);
++
++-- One query reads this table: one tenant's decisions, newest first. The index is in exactly that
++-- shape, so the listing is a range scan that stops after its limit instead of a sort over every
++-- decision this service has ever made.
++create index audit_log_tenant_at_idx
++    on audit_log (tenant_id, at desc, id desc);
+diff --git a/src/audit.rs b/src/audit.rs
+index a96e687..d7d8813 100644
+--- a/src/audit.rs
++++ b/src/audit.rs
+@@ -86,7 +86,20 @@ pub struct Record {
+ /// Returns [`Error::Database`] when the row cannot be written. The caller lets that end the
+ /// request rather than acting on it.
+ pub async fn record(pool: &PgPool, entry: &Entry<'_>) -> Result<(), Error> {
+-    todo!("step relay/2.16-authz-audit")
++    sqlx::query(
++        "insert into audit_log (tenant_id, role, action, target, decision, request_id) \
++         values ($1, $2, $3, $4, $5, $6)",
++    )
++    .bind(entry.tenant.as_uuid())
++    .bind(entry.role.as_str())
++    .bind(entry.action.as_str())
++    .bind(entry.target)
++    .bind(entry.decision.as_str())
++    .bind(entry.request_id)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(())
+ }
+ 
+ /// The calling tenant's trail, newest first.
+@@ -96,5 +109,70 @@ pub async fn record(pool: &PgPool, entry: &Entry<'_>) -> Result<(), Error> {
+ /// Returns [`Error::Database`] when the rows cannot be read, including a row this service would
+ /// not have written (an action or a role token it does not know).
+ pub async fn list(pool: &PgPool, tenant: TenantId, limit: i64) -> Result<Vec<Record>, Error> {
+-    todo!("step relay/2.16-authz-audit")
++    // The tenant is in the `where` clause, and it is the only thing that makes one tenant's trail
++    // invisible to the next: a list that ordered and limited first and filtered afterwards is a
++    // list that hands out somebody else's rows for the first page.
++    let rows: Vec<Row> = sqlx::query_as(
++        "select a.id, t.name, a.role, a.action, a.target, a.decision, a.request_id, a.at \
++           from audit_log as a join tenants as t on t.id = a.tenant_id \
++          where a.tenant_id = $1 \
++          order by a.at desc, a.id desc \
++          limit $2",
++    )
++    .bind(tenant.as_uuid())
++    .bind(limit)
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    rows.into_iter().map(described_by).collect()
++}
++
++/// One row of the table, in the order the query reads it.
++type Row = (
++    Uuid,
++    String,
++    String,
++    String,
++    String,
++    String,
++    String,
++    DateTime<Utc>,
++);
++
++/// A row as a [`Record`], refusing the words this service would not have written.
++///
++/// A trail is read long after it was written, by a person, usually while something is wrong — so a
++/// token it does not know is a failure with a sentence rather than a row quietly rendered as
++/// "unknown" that nobody can act on.
++fn described_by(row: Row) -> Result<Record, Error> {
++    let (id, tenant, role, action, target, decision, request_id, at) = row;
++    let tenant = TenantName::parse(&tenant).map_err(|error| {
++        Error::Database(sqlx::Error::Protocol(format!(
++            "audit row {id} names a tenant this service would not have written: {error}"
++        )))
++    })?;
++    let role = Role::parse(&role).map_err(|error| {
++        Error::Database(sqlx::Error::Protocol(format!(
++            "audit row {id} has a role this service does not have: {error}"
++        )))
++    })?;
++    if !crate::authz::ACTIONS
++        .iter()
++        .any(|known| known.as_str() == action)
++    {
++        return Err(Error::Database(sqlx::Error::Protocol(format!(
++            "audit row {id} names an action this service does not have: `{action}`"
++        ))));
++    }
++    Ok(Record {
++        id,
++        tenant,
++        role,
++        action,
++        target,
++        decision,
++        request_id,
++        at,
++    })
+ }
+diff --git a/src/auth.rs b/src/auth.rs
+index baa75c7..64d4770 100644
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -8,23 +8,35 @@
+ use sha2::{Digest, Sha256};
+ use sqlx::PgPool;
+ 
++use crate::authz::Role;
+ use crate::domain::{TenantId, TenantName};
+ use crate::error::Error;
+ 
+ /// The identity a request acts as.
++///
++/// The role travels with it because it is a property of the *row* the key was found in, not of the
++/// request: it is read in the same lookup as the name, and from that point on a request's
++/// permissions are facts about this value rather than claims about the request. A header, a query
++/// parameter or an extra key in a body cannot reach it (`relay/2.16-authz-audit`).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Principal {
+     /// Tenant the key belongs to.
+     pub tenant_id: TenantId,
+     /// Tenant's name, for logs and audit lines.
+     pub name: TenantName,
++    /// What this credential may do.
++    pub role: Role,
+ }
+ 
+ impl Principal {
+-    /// Build a principal from the two things a lookup returns.
++    /// Build a principal from the three things a lookup returns.
+     #[must_use]
+-    pub fn new(tenant_id: TenantId, name: TenantName) -> Self {
+-        Self { tenant_id, name }
++    pub fn new(tenant_id: TenantId, name: TenantName, role: Role) -> Self {
++        Self {
++            tenant_id,
++            name,
++            role,
++        }
+     }
+ }
+ 
+@@ -40,6 +52,7 @@ pub fn hash_api_key(key: &str) -> String {
+ struct TenantRow {
+     id: uuid::Uuid,
+     name: String,
++    role: String,
+ }
+ 
+ /// Look the key up and answer who it is, or `None` when it belongs to nobody.
+@@ -57,7 +70,7 @@ pub async fn authenticate(pool: &PgPool, key: &str) -> Result<Option<Principal>,
+     }
+     let hash = hash_api_key(key);
+     let row: Option<TenantRow> =
+-        sqlx::query_as("select id, name from tenants where api_key_hash = $1")
++        sqlx::query_as("select id, name, role from tenants where api_key_hash = $1")
+             .bind(&hash)
+             .fetch_optional(pool)
+             .await
+@@ -71,7 +84,20 @@ pub async fn authenticate(pool: &PgPool, key: &str) -> Result<Option<Principal>,
+                     row.id
+                 )))
+             })?;
+-            Ok(Some(Principal::new(TenantId::from_uuid(row.id), name)))
++            // A row whose role is a word this service does not know is not a tenant with fewer
++            // permissions: it is a row this service would not have written, and the honest answer
++            // is a failure rather than a guess at what the row meant.
++            let role = Role::parse(&row.role).map_err(|error| {
++                Error::Database(sqlx::Error::Protocol(format!(
++                    "tenant {} has a role this service does not have: {error}",
++                    row.id
++                )))
++            })?;
++            Ok(Some(Principal::new(
++                TenantId::from_uuid(row.id),
++                name,
++                role,
++            )))
+         }
+     }
+ }
+diff --git a/src/authz.rs b/src/authz.rs
+index 121cafb..0343680 100644
+--- a/src/authz.rs
++++ b/src/authz.rs
+@@ -67,13 +67,23 @@ impl Role {
+     ///
+     /// Returns [`ValueError`] when the text is not a role a tenant may have.
+     pub fn parse(text: &str) -> Result<Self, ValueError> {
+-        todo!("step relay/2.16-authz-audit")
++        match text {
++            "tenant-reader" => Ok(Self::Reader),
++            "tenant-admin" => Ok(Self::Admin),
++            other => Err(ValueError::Invalid(format!(
++                "`{other}` is not a role: expected `tenant-admin` or `tenant-reader`"
++            ))),
++        }
+     }
+ 
+     /// The role as text: what the database stores and what a log line carries.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::Anonymous => "anonymous",
++            Self::Reader => "tenant-reader",
++            Self::Admin => "tenant-admin",
++        }
+     }
+ }
+ 
+@@ -131,7 +141,19 @@ impl Action {
+     /// and the token is what a query groups by.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::ReadHealth => "read-health",
++            Self::ReadReadiness => "read-readiness",
++            Self::ReadContract => "read-contract",
++            Self::ReadMetrics => "read-metrics",
++            Self::ReadEndpoints => "read-endpoints",
++            Self::WriteEndpoints => "write-endpoints",
++            Self::ReadEvents => "read-events",
++            Self::WriteEvents => "write-events",
++            Self::ReadDlq => "read-dlq",
++            Self::ReplayDlq => "replay-dlq",
++            Self::ReadAudit => "read-audit",
++        }
+     }
+ 
+     /// `true` when this action works on a tenant's behalf, and therefore costs quota.
+@@ -143,7 +165,10 @@ impl Action {
+     /// is here rather than in the limiter because it is a fact about the action.
+     #[must_use]
+     pub fn is_metered(self) -> bool {
+-        todo!("step relay/2.16-authz-audit")
++        !matches!(
++            self,
++            Self::ReadHealth | Self::ReadReadiness | Self::ReadContract
++        )
+     }
+ 
+     /// `true` when this action changes something, and therefore leaves a row behind it.
+@@ -153,7 +178,17 @@ impl Action {
+     /// nobody can afford to keep.
+     #[must_use]
+     pub fn is_privileged(self) -> bool {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::WriteEndpoints | Self::WriteEvents | Self::ReplayDlq => true,
++            Self::ReadHealth
++            | Self::ReadReadiness
++            | Self::ReadContract
++            | Self::ReadMetrics
++            | Self::ReadEndpoints
++            | Self::ReadEvents
++            | Self::ReadDlq
++            | Self::ReadAudit => false,
++        }
+     }
+ }
+ 
+@@ -183,12 +218,64 @@ pub struct Grant {
+ /// (role, action) pair that appears here with [`Scope::Own`] is allowed, and everything else is
+ /// refused. The scaffold ships it empty, which is a service that refuses everything — the state the
+ /// spec of this step can tell apart from a working one.
+-pub const GRANTS: &[Grant] = &[];
++pub const GRANTS: &[Grant] = &[
++    // Anyone at all may ask whether the process is up, whether it can take traffic, and what it
++    // promises. An orchestrator has no API key, and a service that required one for its liveness
++    // probe would be restarted by the thing that noticed it was down.
++    grant(Role::Anonymous, Action::ReadHealth),
++    grant(Role::Anonymous, Action::ReadReadiness),
++    grant(Role::Anonymous, Action::ReadContract),
++    // A reader: the whole of the tenant's data, read.
++    grant(Role::Reader, Action::ReadHealth),
++    grant(Role::Reader, Action::ReadReadiness),
++    grant(Role::Reader, Action::ReadContract),
++    grant(Role::Reader, Action::ReadEndpoints),
++    grant(Role::Reader, Action::ReadEvents),
++    grant(Role::Reader, Action::ReadDlq),
++    // An administrator: everything a reader may do, plus every action that changes something and
++    // the one that reads what changed.
++    grant(Role::Admin, Action::ReadHealth),
++    grant(Role::Admin, Action::ReadReadiness),
++    grant(Role::Admin, Action::ReadContract),
++    grant(Role::Admin, Action::ReadMetrics),
++    grant(Role::Admin, Action::ReadEndpoints),
++    grant(Role::Admin, Action::WriteEndpoints),
++    grant(Role::Admin, Action::ReadEvents),
++    grant(Role::Admin, Action::WriteEvents),
++    grant(Role::Admin, Action::ReadDlq),
++    grant(Role::Admin, Action::ReplayDlq),
++    grant(Role::Admin, Action::ReadAudit),
++];
++
++/// One cell of the matrix, as `const` data may be written: the scope is always the caller's own.
++///
++/// A function rather than a struct literal at every row, and a `const fn` rather than a `let`, so
++/// that the table above is a table and not a program. There is no way to write a grant for another
++/// tenant's rows with it, which is the point of it being the only way the list is written.
++const fn grant(role: Role, action: Action) -> Grant {
++    Grant {
++        role,
++        action,
++        scope: Scope::Own,
++    }
++}
++
++/// How wide a scope is: `Any` is everything `Own` is, and more.
++const fn width(scope: Scope) -> u8 {
++    match scope {
++        Scope::Own => 0,
++        Scope::Any => 1,
++    }
++}
+ 
+ /// The widest scope `role` is granted for `action`, or `None` when the matrix says no.
+ #[must_use]
+ pub fn granted(role: Role, action: Action) -> Option<Scope> {
+-    todo!("step relay/2.16-authz-audit")
++    GRANTS
++        .iter()
++        .filter(|cell| cell.role == role && cell.action == action)
++        .map(|cell| cell.scope)
++        .max_by_key(|scope| width(*scope))
+ }
+ 
+ /// Why a request was refused.
+@@ -208,13 +295,21 @@ impl Reason {
+     /// The status a refusal with this reason answers with.
+     #[must_use]
+     pub fn status(self) -> u16 {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::Unauthenticated => 401,
++            Self::NotPermitted => 403,
++            Self::NotVisible => 404,
++        }
+     }
+ 
+     /// The refusal as text, for the audit row.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::Unauthenticated => "unauthenticated",
++            Self::NotPermitted => "not-permitted",
++            Self::NotVisible => "not-visible",
++        }
+     }
+ }
+ 
+@@ -234,7 +329,10 @@ impl Decision {
+     /// why" — and the two questions are asked together, always, by whoever reads the trail.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("step relay/2.16-authz-audit")
++        match self {
++            Self::Allow => "allow",
++            Self::Deny(reason) => reason.as_str(),
++        }
+     }
+ }
+ 
+@@ -244,7 +342,21 @@ impl Decision {
+ /// combination the matrix does not list is a refusal rather than a panic or a default allow.
+ #[must_use]
+ pub fn decide(role: Role, action: Action, scope: Scope) -> Decision {
+-    todo!("step relay/2.16-authz-audit")
++    match granted(role, action) {
++        // A grant covers its own scope and everything narrower than it, which is what makes `Own`
++        // and `Any` comparable rather than two unrelated words.
++        Some(granted) if width(granted) >= width(scope) => Decision::Allow,
++        // Granted, but not that far: the caller is trying to reach rows that are not its own. The
++        // refusal for that is the one that says nothing, and it is the same refusal a row that does
++        // not exist gets.
++        Some(_) => Decision::Deny(Reason::NotVisible),
++        // The matrix says no to the role, so the caller learns nothing about the rows either: an
++        // unknown caller is told to identify itself, and a known one is told it may not.
++        None => Decision::Deny(match role {
++            Role::Anonymous => Reason::Unauthenticated,
++            Role::Reader | Role::Admin => Reason::NotPermitted,
++        }),
++    }
+ }
+ 
+ /// One route of the service, as the matrix sees it.
+@@ -262,7 +374,58 @@ pub struct Route {
+ ///
+ /// The scaffold ships it empty. The paths are the ones axum matches, placeholders and all, because
+ /// that is the form a request carries when the question is asked ([`axum::extract::MatchedPath`]).
+-pub const ROUTES: &[Route] = &[];
++pub const ROUTES: &[Route] = &[
++    Route {
++        method: "get",
++        path: "/healthz",
++        action: Action::ReadHealth,
++    },
++    Route {
++        method: "get",
++        path: "/readyz",
++        action: Action::ReadReadiness,
++    },
++    Route {
++        method: "get",
++        path: "/openapi.json",
++        action: Action::ReadContract,
++    },
++    Route {
++        method: "get",
++        path: "/endpoints",
++        action: Action::ReadEndpoints,
++    },
++    Route {
++        method: "post",
++        path: "/endpoints",
++        action: Action::WriteEndpoints,
++    },
++    Route {
++        method: "get",
++        path: "/events",
++        action: Action::ReadEvents,
++    },
++    Route {
++        method: "post",
++        path: "/events",
++        action: Action::WriteEvents,
++    },
++    Route {
++        method: "get",
++        path: "/dlq",
++        action: Action::ReadDlq,
++    },
++    Route {
++        method: "post",
++        path: "/dlq/{id}/replay",
++        action: Action::ReplayDlq,
++    },
++    Route {
++        method: "get",
++        path: "/audit",
++        action: Action::ReadAudit,
++    },
++];
+ 
+ /// The route one request matched, or `None` when this service does not authorize it.
+ ///
+@@ -272,5 +435,8 @@ pub const ROUTES: &[Route] = &[];
+ /// as the target: the route, never the path the caller typed.
+ #[must_use]
+ pub fn route_of(method: &str, path: &str) -> Option<Route> {
+-    todo!("step relay/2.16-authz-audit")
++    ROUTES
++        .iter()
++        .find(|route| route.method.eq_ignore_ascii_case(method) && route.path == path)
++        .copied()
+ }
+diff --git a/src/config.rs b/src/config.rs
+index a1507e5..306b094 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -12,6 +12,7 @@
+ use std::path::PathBuf;
+ use std::time::Duration;
+ 
++use crate::authz::Role;
+ use crate::concurrency::Limits;
+ use crate::error::Error;
+ use crate::ratelimit::Quota;
+@@ -114,11 +115,28 @@ pub struct Delivery {
+ /// `relay/2.1-project-skeleton` applied to a setting whose wrong value is an outage.
+ pub type RateLimit = Quota;
+ 
+-/// Tenants seeded from configuration at startup (`name=key`).
++/// Tenants seeded from configuration at startup (`name=key`, or `name:role=key`).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Bootstrap {
+-    /// One entry per tenant: the name and the API key it authenticates with.
+-    pub tenants: Vec<(String, String)>,
++    /// One entry per tenant.
++    pub tenants: Vec<TenantConfig>,
++}
++
++/// One tenant, as the configuration names it: who exists, how it authenticates, and what it may do.
++///
++/// The role is part of the entry rather than a second list beside it, because a tenant whose role is
++/// configured somewhere else is a tenant whose role nobody remembers to configure
++/// (`relay/2.16-authz-audit`). An entry that names no role is an administrator: the shape that was
++/// in every configuration written before there were roles keeps working, and a deployment that never
++/// thinks about the matrix keeps the permissions it already had.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TenantConfig {
++    /// Tenant name: what appears in configuration, in logs and in metric labels.
++    pub name: String,
++    /// The API key it authenticates with. Never printed and never stored in the clear.
++    pub key: String,
++    /// What that key may do.
++    pub role: Role,
+ }
+ 
+ /// The effective configuration.
+@@ -346,7 +364,7 @@ impl Config {
+             .bootstrap
+             .tenants
+             .iter()
+-            .map(|(name, _)| name.as_str())
++            .map(|tenant| tenant.name.as_str())
+             .collect();
+         lines.push(format!(
+             "  bootstrap.tenants = {} ({})",
+@@ -506,8 +524,13 @@ fn parse_flag(name: &str, text: &str) -> Result<bool, Error> {
+     }
+ }
+ 
+-/// Parse `name=key,name=key` into tenants, refusing a name or a key that is not usable.
+-fn parse_tenants(text: Option<&str>) -> Result<Vec<(String, String)>, Error> {
++/// Parse `name=key`, `name:role=key`, comma-separated, refusing anything that is not usable.
++///
++/// The role is written on the *name*, not on the key: a key is an opaque secret that may contain any
++/// character at all (including `:` and `,`, which is why the key is the last thing on the line),
++/// while a tenant name's alphabet is closed (`crate::domain::TenantName`) — so the split is
++/// unambiguous, and a name that carries a role is a name the domain would have refused otherwise.
++fn parse_tenants(text: Option<&str>) -> Result<Vec<TenantConfig>, Error> {
+     let Some(text) = text else {
+         return Ok(Vec::new());
+     };
+@@ -517,20 +540,31 @@ fn parse_tenants(text: Option<&str>) -> Result<Vec<(String, String)>, Error> {
+         .map(str::trim)
+         .filter(|entry| !entry.is_empty())
+     {
+-        let Some((name, key)) = entry.split_once('=') else {
++        let Some((named, key)) = entry.split_once('=') else {
+             return Err(Error::Config(format!(
+-                "`{entry}` is not a tenant: expected `name=api-key`"
++                "`{entry}` is not a tenant: expected `name=api-key` or `name:role=api-key`"
+             )));
+         };
+-        crate::domain::TenantName::parse(name.trim())
+-            .map_err(|error| Error::Config(error.to_string()))?;
++        let (name, role) = match named.split_once(':') {
++            Some((name, role)) => (
++                name.trim(),
++                Role::parse(role.trim()).map_err(|error| Error::Config(error.to_string()))?,
++            ),
++            // No role named: the tenant is an administrator, which is what every entry written
++            // before this step meant.
++            None => (named.trim(), Role::Admin),
++        };
++        crate::domain::TenantName::parse(name).map_err(|error| Error::Config(error.to_string()))?;
+         if key.trim().len() < 8 {
+             return Err(Error::Config(format!(
+-                "the API key of `{}` is shorter than 8 characters",
+-                name.trim()
++                "the API key of `{name}` is shorter than 8 characters"
+             )));
+         }
+-        tenants.push((name.trim().to_owned(), key.trim().to_owned()));
++        tenants.push(TenantConfig {
++            name: name.to_owned(),
++            key: key.trim().to_owned(),
++            role,
++        });
+     }
+     Ok(tenants)
+ }
+diff --git a/src/db.rs b/src/db.rs
+index 6317f2a..42ab5ad 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -7,6 +7,7 @@
+ use sqlx::PgPool;
+ use sqlx::postgres::PgPoolOptions;
+ 
++use crate::config::TenantConfig;
+ use crate::error::Error;
+ 
+ /// How many connections a pool keeps, and how long it waits for one.
+@@ -85,16 +86,18 @@ impl Db {
+     /// # Errors
+     ///
+     /// Returns [`Error::Database`] when a tenant row cannot be written.
+-    pub async fn seed_tenants(&self, tenants: &[(String, String)]) -> Result<(), Error> {
+-        for (name, key) in tenants {
+-            let hash = crate::auth::hash_api_key(key);
++    pub async fn seed_tenants(&self, tenants: &[TenantConfig]) -> Result<(), Error> {
++        for tenant in tenants {
++            let hash = crate::auth::hash_api_key(&tenant.key);
+             sqlx::query(
+-                "insert into tenants (id, name, api_key_hash) values ($1, $2, $3) \
+-                 on conflict (name) do update set api_key_hash = excluded.api_key_hash",
++                "insert into tenants (id, name, api_key_hash, role) values ($1, $2, $3, $4) \
++                 on conflict (name) do update set api_key_hash = excluded.api_key_hash, \
++                                                role = excluded.role",
+             )
+             .bind(uuid::Uuid::new_v4())
+-            .bind(name)
++            .bind(&tenant.name)
+             .bind(&hash)
++            .bind(tenant.role.as_str())
+             .execute(&self.pool)
+             .await
+             .map_err(Error::Database)?;
+diff --git a/src/error.rs b/src/error.rs
+index a67fa01..b00bcd7 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -24,6 +24,15 @@ pub enum Error {
+     /// The request carries no usable identity.
+     #[error("authentication required: {0}")]
+     Unauthenticated(String),
++    /// The caller is known, and this is not something its role may do.
++    ///
++    /// Distinct from [`Error::NotFound`] on purpose, and the distinction is the whole of
++    /// `relay/2.16-authz-audit`: this is the refusal that says "you may not", and it is only ever
++    /// used about an action, never about a row. Which rows a caller may see is answered by the
++    /// queries they run -- and a row that belongs to somebody else answers exactly what a row that
++    /// does not exist answers.
++    #[error("{0}")]
++    Forbidden(String),
+     /// The caller may not do this to this resource — and must not learn whether it exists.
+     #[error("not found")]
+     NotFound,
+@@ -65,6 +74,7 @@ impl Error {
+             // These end a request, not a process; if one ever reaches `main` it is a deployment
+             // problem, which is what 1 means.
+             Error::Unauthenticated(_)
++            | Error::Forbidden(_)
+             | Error::NotFound
+             | Error::Target(_)
+             | Error::Delivery(_)
+@@ -79,6 +89,10 @@ impl Error {
+         match self {
+             Error::Usage(_) | Error::BadRequest(_) | Error::Endpoint(_) => 400,
+             Error::Unauthenticated(_) => 401,
++            // `403 Forbidden`: the caller is identified, and the action is refused for *who* they
++            // are. About the action and never about a row, or it would confirm that the row is
++            // there.
++            Error::Forbidden(_) => 403,
+             Error::NotFound => 404,
+             // A target we refuse is a policy decision, not a missing resource: 422 says "the
+             // request was understood and this is not something we will do".
+@@ -100,6 +114,7 @@ impl Error {
+             Error::Config(_) => "config",
+             Error::Database(_) => "database",
+             Error::Unauthenticated(_) => "unauthenticated",
++            Error::Forbidden(_) => "forbidden",
+             Error::NotFound => "not_found",
+             Error::BadRequest(_) => "bad_request",
+             Error::Target(_) => "target_rejected",
+diff --git a/src/http.rs b/src/http.rs
+index e90df7b..49a1e2f 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -1,12 +1,28 @@
+ //! The HTTP surface: which routes exist, what each one may assume, and in which order.
+ //!
+-//! The order is the lesson: **correlation id → request log → rate limit → authentication →
+-//! handler**. A layer that runs outside the log cannot be seen failing, and a request rejected by
+-//! authentication must still appear in the log with the id it was given — otherwise the only
+-//! requests an operator cannot follow are the ones that were refused. The rate limit sits *outside*
+-//! authentication on purpose (`relay/2.13-rate-limit`): a request over quota is refused before the
++//! The order is the lesson: **correlation id → request log → rate limit → identity → authorization
++//! → handler**. A layer that runs outside the log cannot be seen failing, and a request rejected
++//! further in must still appear in the log with the id it was given — otherwise the only requests
++//! an operator cannot follow are the ones that were refused. The rate limit sits *outside*
++//! identity on purpose (`relay/2.13-rate-limit`): a request over quota is refused before the
+ //! lookup that would have identified it, which is the refusal a flood is supposed to get.
+ //!
++//! The last two are the split `relay/2.16-authz-audit` makes, and the split is the point:
++//!
++//! * **identity is not a decision.** [`identify`] answers *who* is calling and nothing else. A
++//!   request with no key, and a request with a key nobody was issued, are both `Anonymous` — the
++//!   difference between them is not one a caller gets to see, because the two answers would be a
++//!   way to sort guesses;
++//! * **the matrix is the only place a permission is written.** [`authorize`] looks the matched
++//!   route up in [`crate::authz::ROUTES`], asks [`crate::authz::decide`], and either runs the
++//!   handler or answers with the refusal's status. There is no route that is public "by being in a
++//!   different sub-router": `/healthz` is public because the matrix says an anonymous caller may
++//!   read it, and a reviewer who wants to know who may do what reads one table;
++//! * **a privileged decision is written down before it is acted on.** The same layer that decides
++//!   records the decision in the trail (`relay/2.16-authz-audit`), and a trail that cannot be
++//!   written refuses the request: an action nobody can account for is an action this service does
++//!   not take.
++//!
+ //! Each layer is one function, and each one is in this file rather than in a route handler, because
+ //! that is what makes the order a decision instead of an accident.
+ 
+@@ -14,7 +30,7 @@ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use std::time::Instant;
+ 
+-use axum::extract::{Extension, Path, Query, Request, State};
++use axum::extract::{Extension, MatchedPath, Path, Query, Request, State};
+ use axum::http::{HeaderMap, HeaderValue, StatusCode};
+ use axum::middleware::{self, Next};
+ use axum::response::{IntoResponse, Response};
+@@ -24,7 +40,9 @@ use serde::Deserialize;
+ use serde_json::{Value, json};
+ use tokio::net::TcpListener;
+ 
++use crate::audit;
+ use crate::auth::{self, Principal};
++use crate::authz::{self, Action, Decision, Reason, Role, Scope};
+ use crate::config::Config;
+ use crate::db::Db;
+ use crate::dlq;
+@@ -105,38 +123,33 @@ impl AppState {
+ }
+ 
+ /// The routing table, with its layers.
++///
++/// One router, not two: there is no "public" sub-router any more, because "which routes may be
++/// reached without a key" is a cell of the matrix (`relay/2.16-authz-audit`) rather than a fact
++/// about how the router happens to be assembled.
+ pub fn router(state: AppState) -> Router {
+-    // Public routes: an orchestrator asking about this process has no API key and must not need one.
+-    let public = Router::new()
++    Router::new()
+         .route("/healthz", get(healthz))
+         .route("/readyz", get(readyz))
+-        // The contract is public: a client reads what this service promises before it has a
+-        // key, and a document that needs one to be fetched is a document nobody fetches.
+-        .route("/openapi.json", get(openapi_document));
+-
+-    // Everything a tenant owns is behind the authentication layer. Applying it to a *sub-router*
+-    // rather than inside each handler is what keeps the order above: the refusal happens after the
+-    // id and the log line, so a refused request is still visible.
+-    let tenant = Router::new()
++        // The contract is readable without a key: a client reads what this service promises before
++        // it has one, and a document that needs a key to be fetched is a document nobody fetches.
++        .route("/openapi.json", get(openapi_document))
+         .route("/endpoints", post(create_endpoint).get(list_endpoints))
+         .route("/events", post(create_event).get(list_events))
+         // What the worker gave up on, and the one way back into the queue (`relay/2.10-dlq`).
+         .route("/dlq", get(list_dead_letters))
+         .route("/dlq/{id}/replay", post(replay_dead_letter))
+-        // The identity, and the quota outside it. The last layer applied is the outermost one, so
+-        // the limiter runs *first*: a caller over their limit is refused before this service spends
+-        // a database round trip finding out who they are, and a request that carries no credential
+-        // at all is limited too — in one bucket shared by every such request, because a source
+-        // address is a claim the network makes rather than an identity.
+-        .layer(middleware::from_fn_with_state(
+-            state.clone(),
+-            require_principal,
+-        ))
+-        .layer(middleware::from_fn_with_state(state.clone(), limit_calls));
+-
+-    public
+-        .merge(tenant)
++        // What was decided about the actions above (`relay/2.16-authz-audit`).
++        .route("/audit", get(list_audit))
+         .fallback(not_found)
++        // The last layer applied is the outermost one, so the limiter runs *first*: a caller over
++        // their limit is refused before this service spends a database round trip finding out who
++        // they are, and a request that carries no credential at all is limited too — in one bucket
++        // shared by every such request, because a source address is a claim the network makes
++        // rather than an identity.
++        .layer(middleware::from_fn_with_state(state.clone(), authorize))
++        .layer(middleware::from_fn_with_state(state.clone(), identify))
++        .layer(middleware::from_fn_with_state(state.clone(), limit_calls))
+         .layer(middleware::from_fn_with_state(state.clone(), log_request))
+         .layer(middleware::from_fn_with_state(state.clone(), request_id))
+         .with_state(state)
+@@ -239,9 +252,22 @@ async fn log_request(request: Request, next: Next) -> Response {
+ /// Spend one request of the caller's quota, or answer `429` with the wait.
+ ///
+ /// The caller is identified by the credential they presented — hashed, and never looked up — or by
+-/// nothing at all, and the bucket is spent before authentication for the reason the layer is where
+-/// it is: this is the one refusal that has to be cheap.
++/// nothing at all, and the bucket is spent before identity for the reason the layer is where it is:
++/// this is the one refusal that has to be cheap.
++///
++/// Which routes are metered is [`crate::authz::Action::is_metered`]'s answer, and the answer is
++/// read from the matched route rather than from a second list here. A liveness or readiness probe
++/// is not a tenant's request: an orchestrator told `429` by the probe of a busy service restarts
++/// it, which is the opposite of what a quota is for.
+ async fn limit_calls(State(state): State<AppState>, request: Request, next: Next) -> Response {
++    let metered = request
++        .extensions()
++        .get::<MatchedPath>()
++        .and_then(|matched| authz::route_of(request.method().as_str(), matched.as_str()))
++        .is_some_and(|route| route.action.is_metered());
++    if !metered {
++        return next.run(request).await;
++    }
+     let bucket = ratelimit::bucket_of(bearer_token(request.headers()).as_deref());
+     match state.limiter().check(&bucket) {
+         Verdict::Allowed => next.run(request).await,
+@@ -249,27 +275,93 @@ async fn limit_calls(State(state): State<AppState>, request: Request, next: Next
+     }
+ }
+ 
+-/// Resolve the caller's API key to a tenant, or refuse the request.
+-async fn require_principal(
+-    State(state): State<AppState>,
+-    mut request: Request,
+-    next: Next,
+-) -> Response {
+-    let key = bearer_token(request.headers());
+-    let found = match key {
+-        Some(key) => auth::authenticate(state.db().pool(), &key).await,
+-        None => Err(Error::Unauthenticated(
+-            "no API key in the Authorization header".to_owned(),
+-        )),
++/// Resolve the caller's API key to a tenant, and let the request through either way.
++///
++/// The layer after this one decides. What happens here is a lookup: a key that is not there, or one
++/// that belongs to nobody, leaves the request *unidentified* — and a caller who cannot tell those
++/// two apart also cannot tell which of its guesses was closer.
++async fn identify(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
++    if let Some(key) = bearer_token(request.headers()) {
++        match auth::authenticate(state.db().pool(), &key).await {
++            Ok(Some(principal)) => {
++                request.extensions_mut().insert(principal);
++            }
++            // A key nobody was issued is not an error, it is an absence: this service answers it
++            // exactly as it answers no key at all.
++            Ok(None) => {}
++            Err(error) => return error.into_response(),
++        }
++    }
++    next.run(request).await
++}
++
++/// Ask the matrix about the route this request matched, record a privileged decision, and answer.
++///
++/// Three cases do not consult the matrix, and each of them is the router's business rather than
++/// this service's: a request no route matched (the fallback's 404), and a request whose method the
++/// matched route does not have (axum's 405). Neither is a route this service serves, so there is
++/// nothing to authorize — and letting them through is what keeps those two answers honest instead
++/// of turning every bad URL into a 403.
++async fn authorize(State(state): State<AppState>, request: Request, next: Next) -> Response {
++    let Some(matched) = request.extensions().get::<MatchedPath>() else {
++        return next.run(request).await;
+     };
+-    match found {
+-        Ok(Some(principal)) => {
+-            request.extensions_mut().insert(principal);
+-            next.run(request).await
++    let method = request.method().as_str();
++    let Some(route) = authz::route_of(method, matched.as_str()) else {
++        return next.run(request).await;
++    };
++
++    let principal = request.extensions().get::<Principal>().cloned();
++    let role = principal
++        .as_ref()
++        .map_or(Role::Anonymous, |principal| principal.role);
++    // The scope is always the caller's own, and it is not a claim the *request* makes: every query
++    // below this layer is filtered by the caller's tenant, so a request can only ever address the
++    // caller's rows. What the matrix adds is the question "may this role do this to its own rows",
++    // and the *other* scope -- somebody else's rows -- is asked by the spec, not by a request.
++    let decision = authz::decide(role, route.action, Scope::Own);
++
++    if route.action.is_privileged()
++        && let Some(principal) = principal.as_ref()
++    {
++        let request_id = request
++            .extensions()
++            .get::<RequestId>()
++            .map_or_else(String::new, |id| id.0.clone());
++        let entry = audit::Entry {
++            tenant: principal.tenant_id,
++            role,
++            action: route.action,
++            // The route, never the path the caller typed: an audit row is written by this service
++            // and read by people, and a column that quotes arbitrary caller input is a column full
++            // of whatever the caller felt like sending.
++            target: &format!("{} {}", route.method.to_uppercase(), route.path),
++            decision,
++            request_id: &request_id,
++        };
++        if let Err(error) = audit::record(state.db().pool(), &entry).await {
++            // An action this service cannot account for is an action it does not take.
++            return error.into_response();
+         }
+-        Ok(None) => Error::Unauthenticated("the API key does not belong to a tenant".to_owned())
+-            .into_response(),
+-        Err(error) => error.into_response(),
++    }
++
++    match decision {
++        Decision::Allow => next.run(request).await,
++        Decision::Deny(reason) => refusal(reason, route.action).into_response(),
++    }
++}
++
++/// The error a refusal answers with: the reason, in the words of the error table.
++///
++/// `NotPermitted` names the *action* and never the row, and `NotVisible` is exactly the error a
++/// missing row produces — the two sentences a caller can tell apart are the ones it may act on.
++fn refusal(reason: Reason, action: Action) -> Error {
++    match reason {
++        Reason::Unauthenticated => {
++            Error::Unauthenticated("the API key is missing or belongs to no tenant".to_owned())
++        }
++        Reason::NotPermitted => Error::Forbidden(format!("this role may not {}", action.as_str())),
++        Reason::NotVisible => Error::NotFound,
+     }
+ }
+ 
+@@ -662,6 +754,69 @@ async fn replay_dead_letter(
+     }
+ }
+ 
++/// The parameters `GET /audit` accepts.
++///
++/// Text rather than a number, for the reason `GET /dlq` gives: `?limit=abc` is a caller mistake,
++/// and it is a 400 with the same shape as every other bad request in this API.
++#[derive(Debug, Deserialize)]
++struct ListAudit {
++    /// `limit=`: how many decisions this answer may hold.
++    limit: Option<String>,
++}
++
++/// One decision, as the API answers with it.
++///
++/// The words are the stable tokens the matrix uses, not the sentences of a message: a reader of the
++/// trail groups by `action` and filters on `decision`, and both have to be the same tokens in every
++/// row a future version writes.
++fn audit_body(record: &audit::Record) -> Value {
++    json!({
++        "id": record.id.to_string(),
++        "tenant": record.tenant.as_str(),
++        "role": record.role.as_str(),
++        "action": record.action,
++        "target": record.target,
++        "decision": record.decision,
++        "request_id": record.request_id,
++        "at": record.at.to_rfc3339(),
++    })
++}
++
++/// The calling tenant's trail: the privileged decisions made about its rows, newest first.
++///
++/// A read is not a privileged action, so asking for this does not add to it — which is what makes
++/// the trail readable at all: a log of who read the log is a log that grows faster than the thing
++/// it describes.
++async fn list_audit(
++    State(state): State<AppState>,
++    Extension(principal): Extension<Principal>,
++    Query(params): Query<ListAudit>,
++) -> Response {
++    let limit = match params.limit {
++        None => audit::DEFAULT_LIMIT,
++        Some(text) => match text.trim().parse::<i64>() {
++            Ok(limit) if (1..=audit::MAX_LIMIT).contains(&limit) => limit,
++            _ => {
++                return Error::BadRequest(format!(
++                    "`limit` has to be a number between 1 and {}",
++                    audit::MAX_LIMIT
++                ))
++                .into_response();
++            }
++        },
++    };
++    match audit::list(state.db().pool(), principal.tenant_id, limit).await {
++        Err(error) => error.into_response(),
++        Ok(records) => (
++            StatusCode::OK,
++            Json(json!({
++                "entries": records.iter().map(audit_body).collect::<Vec<Value>>(),
++            })),
++        )
++            .into_response(),
++    }
++}
++
+ /// The `Idempotency-Key` header, when it carries something usable.
+ ///
+ /// Header names are case-insensitive and so is this lookup; the value is trimmed, because `Key: `
+diff --git a/src/lib.rs b/src/lib.rs
+index 08767d5..4ec8a06 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,7 +8,9 @@
+ //! they start doing something: the wiring is done and the behaviour is not. Read the specs — they
+ //! say what each module owes, from outside.
+ 
++pub mod audit;
+ pub mod auth;
++pub mod authz;
+ pub mod backoff;
+ pub mod claim;
+ pub mod concurrency;
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 222953f..4756c83 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -236,6 +236,38 @@ pub fn document() -> Value {
+                     },
+                 },
+             },
++            "/audit": {
++                "get": {
++                    "summary": "The calling tenant's audit trail, newest first.",
++                    "description": "One row per privileged decision made about this tenant's rows: \
++                                    the action, what it was aimed at, the role that asked, and what \
++                                    the matrix decided. A refused write is a decision like any \
++                                    other and it is here too. The credential is not: a trail that \
++                                    quoted the key it is about is a second copy of the key with a \
++                                    longer retention.",
++                    "parameters": [
++                        {
++                            "name": "limit",
++                            "in": "query",
++                            "required": false,
++                            "description": "How many decisions this answer may hold (default 50, most \
++                                            200).",
++                            "schema": { "type": "integer", "minimum": 1, "maximum": 200 },
++                        },
++                    ],
++                    "responses": {
++                        "200": answer("AuditList", "The tenant's decisions, newest first."),
++                        "400": answer("Error", "The `limit` is not a number between 1 and 200."),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "403": answer(
++                            "Error",
++                            "This role may not read the trail. Who did what is about the tenant's \
++                            rows, and it takes a role that may write them.",
++                        ),
++                        "429": too_many(),
++                    },
++                },
++            },
+         },
+         "components": {
+             "schemas": {
+@@ -366,6 +398,63 @@ pub fn document() -> Value {
+                         },
+                     },
+                 },
++                "AuditEntry": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": [
++                        "id",
++                        "tenant",
++                        "role",
++                        "action",
++                        "target",
++                        "decision",
++                        "request_id",
++                        "at",
++                    ],
++                    "properties": {
++                        "id": { "type": "string", "format": "uuid" },
++                        "tenant": {
++                            "type": "string",
++                            "description": "The tenant the decision was about, by name.",
++                        },
++                        "role": {
++                            "type": "string",
++                            "description": "The role the caller acted with: `tenant-admin` or \
++                                            `tenant-reader`.",
++                        },
++                        "action": {
++                            "type": "string",
++                            "description": "The action, as its stable token (`write-events`).",
++                        },
++                        "target": {
++                            "type": "string",
++                            "description": "What the action was aimed at: the method and the route \
++                                            (`POST /events`), never the path the caller typed.",
++                        },
++                        "decision": {
++                            "type": "string",
++                            "description": "`allow`, or the reason the request was refused \
++                                            (`not-permitted`, `unauthenticated`, `not-visible`).",
++                        },
++                        "request_id": {
++                            "type": "string",
++                            "description": "The correlation id of the request, so a row and a log \
++                                            line can be tied together.",
++                        },
++                        "at": { "type": "string", "format": "date-time" },
++                    },
++                },
++                "AuditList": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["entries"],
++                    "properties": {
++                        "entries": {
++                            "type": "array",
++                            "items": { "$ref": "#/components/schemas/AuditEntry" },
++                        },
++                    },
++                },
+                 "ReplayResult": {
+                     "type": "object",
+                     "additionalProperties": false,

@@ -1,0 +1,388 @@
+diff --git a/src/audit.rs b/src/audit.rs
+new file mode 100644
+index 0000000..a96e687
+--- /dev/null
++++ b/src/audit.rs
+@@ -0,0 +1,100 @@
++//! The audit trail: one row per privileged decision, and a way to read it back.
++//!
++//! A log line is written for a person watching a process; an audit row is written for a question
++//! asked months later — "who moved this, and what did we decide about it" — and the two are
++//! different artifacts. The log rotates, it goes to a collector with its own retention, and it
++//! holds whatever the format of the day holds. The trail is a table in the database the service
++//! already owns, filtered by the same tenant rule as every other table, and it survives the
++//! process that wrote it.
++//!
++//! Two decisions shape this module, and both are about *when*:
++//!
++//! * **the row is written before the action runs, not after.** The reason is the failure the trail
++//!   exists for: a process that dies halfway through a privileged action has to have left a row
++//!   saying that it was about to do it. A trail written afterwards is silent in exactly the case
++//!   somebody will want it for. What the row says is therefore a *decision*, not an outcome — and
++//!   a decision is a fact whether or not the action it authorized then succeeded;
++//! * **a trail that cannot be written refuses the action.** [`record`] answers with an error and
++//!   the caller does not run the handler: "we act only on what we can account for" is the only
++//!   version of an audit trail that is worth having, and it is testable, which the weaker version
++//!   is not.
++//!
++//! What is deliberately *not* here: the API key, the signing secret, the payload, and the request
++//! headers. A trail that quotes the credential it is about is a second copy of the credential, in
++//! a table with a longer retention than the one it was stolen from. The actors are named by tenant
++//! and role, and the target is the route that was asked for, not the body that was sent.
++
++use chrono::{DateTime, Utc};
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::authz::{Action, Decision, Role};
++use crate::domain::{TenantId, TenantName};
++use crate::error::Error;
++
++/// How many rows one page of the trail holds when the caller does not ask.
++pub const DEFAULT_LIMIT: i64 = 50;
++/// The most one page may hold.
++pub const MAX_LIMIT: i64 = 200;
++
++/// One decision about to be acted on, on its way into the table.
++///
++/// Borrowed rather than owned: the caller has the request's id and the route in hand, and a
++/// structure that copied them would be a second place for them to be wrong.
++#[derive(Debug, Clone, Copy)]
++pub struct Entry<'a> {
++    /// The tenant whose request this was.
++    pub tenant: TenantId,
++    /// The role it acted with — the answer to "as what", which is not always the same question as
++    /// "who".
++    pub role: Role,
++    /// What it asked to do.
++    pub action: Action,
++    /// What it asked it of: the route, with the id it named when it named one.
++    pub target: &'a str,
++    /// What the matrix decided.
++    pub decision: Decision,
++    /// The correlation id of the request, so a row and a log line can be tied together.
++    pub request_id: &'a str,
++}
++
++/// One row of the trail, as the API reads it back.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Record {
++    /// Identity of the row.
++    pub id: Uuid,
++    /// The tenant that acted.
++    pub tenant: TenantName,
++    /// The role it acted with.
++    pub role: Role,
++    /// The action, as its stable token.
++    pub action: String,
++    /// What the action was aimed at.
++    pub target: String,
++    /// The decision, as its stable token: `allow`, or the reason it was refused.
++    pub decision: String,
++    /// The correlation id of the request that produced it.
++    pub request_id: String,
++    /// When the decision was written.
++    pub at: DateTime<Utc>,
++}
++
++/// Write one row: the decision about a privileged action, before the action runs.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the row cannot be written. The caller lets that end the
++/// request rather than acting on it.
++pub async fn record(pool: &PgPool, entry: &Entry<'_>) -> Result<(), Error> {
++    todo!("step relay/2.16-authz-audit")
++}
++
++/// The calling tenant's trail, newest first.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the rows cannot be read, including a row this service would
++/// not have written (an action or a role token it does not know).
++pub async fn list(pool: &PgPool, tenant: TenantId, limit: i64) -> Result<Vec<Record>, Error> {
++    todo!("step relay/2.16-authz-audit")
++}
+diff --git a/src/authz.rs b/src/authz.rs
+new file mode 100644
+index 0000000..121cafb
+--- /dev/null
++++ b/src/authz.rs
+@@ -0,0 +1,276 @@
++//! Authorization, written down as data: which role may do which action to whose rows.
++//!
++//! `mailer/1.18-authz-boundary` asked one question — "is this row mine?" — inside the routes that
++//! could answer it. Here the same question is opened up into three: **who** is asking (`Role`),
++//! **what** they are asking for (`Action`), and **whose** rows the answer would touch (`Scope`).
++//! Those three are a table, the table is a `const`, and every route this service serves is judged
++//! by looking its action up in that table.
++//!
++//! The point of writing it as data rather than as `if` statements is that a table can be *read*:
++//! the spec of `relay/2.16-authz-audit` walks it cell by cell, and a reviewer can see in one screen
++//! who may do what — including the cells that are missing, which is where the interesting decisions
++//! are.
++//!
++//! Three shapes here are decisions rather than taste:
++//!
++//! * **a role is a property of a credential, not of a request.** Nothing in a request says what it
++//!   may do: the API key is hashed, looked up, and the tenant row it belongs to carries its role.
++//!   A header that claims a role is a header, and the trap of `relay/2.16-authz-audit` is the
++//!   service that believes one;
++//! * **a refusal says *why*, and the why decides the status.** "I do not know you" is 401; "I know
++//!   you and you may not" is 403; "this is not yours" is 404, and it is the *same* 404 a row that
++//!   does not exist gets — which is the whole reason the second question is asked with a scope in
++//!   it. A service that answered 403 for somebody else's row has just told the caller that the row
++//!   is there;
++//! * **the matrix has no cell for another tenant's rows.** [`Scope::Any`] exists as a value so that
++//!   the question can be asked and the answer can be written down: nobody is granted it, and
++//!   [`decide`] says so for every role and every action. Tenant isolation that lives in the
++//!   queries and *also* in the matrix is isolation that two different mistakes would have to break;
++//! * **two more facts about an action are derived here rather than repeated at every layer.**
++//!   [`Action::is_privileged`] says whether acting on it leaves a row in the trail, and
++//!   [`Action::is_metered`] says whether asking for it spends a tenant's quota. Both are asked by a
++//!   layer that runs over *every* route, and both would otherwise be a second list to keep in step
++//!   with this one.
++//!
++//! What this module deliberately does not do: it does not touch the database, it does not know
++//! about HTTP, and it has no opinion about which layer runs where. It is a pure function from
++//! (role, action, scope) to a decision, which is what makes it testable as a matrix.
++
++use crate::domain::ValueError;
++
++/// Who is asking.
++///
++/// Three roles, and the third is the one that is easy to forget: a request that carries no
++/// credential, or one that carries a key nobody issued, is *anonymous* — it is not "unknown", and
++/// the difference matters, because treating an unrecognised key as "no identity at all" is what
++/// keeps the answer to a stranger identical to the answer to nobody.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Role {
++    /// No usable credential.
++    Anonymous,
++    /// A key that may read its tenant's rows.
++    Reader,
++    /// A key that may read and write them.
++    Admin,
++}
++
++/// Every role, for the spec's matrix walk.
++pub const ROLES: [Role; 3] = [Role::Anonymous, Role::Reader, Role::Admin];
++
++impl Role {
++    /// Parse the role of a tenant, as configuration writes it.
++    ///
++    /// The two words are the two roles a *tenant* can have. `anonymous` is not among them on
++    /// purpose: no configuration makes a tenant anonymous — that is what a missing key is.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`ValueError`] when the text is not a role a tenant may have.
++    pub fn parse(text: &str) -> Result<Self, ValueError> {
++        todo!("step relay/2.16-authz-audit")
++    }
++
++    /// The role as text: what the database stores and what a log line carries.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("step relay/2.16-authz-audit")
++    }
++}
++
++/// What a request is asking to do.
++///
++/// One action per route, and the list is the routing table read as data. An action that exists
++/// here and is served by nobody is a permission nobody can use; a route that exists and has no
++/// action here is a route no one asked the matrix about — which is the failure mode this list
++/// exists to prevent.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Action {
++    /// Liveness: this process is running.
++    ReadHealth,
++    /// Readiness: this process can take traffic.
++    ReadReadiness,
++    /// The service's own contract document.
++    ReadContract,
++    /// The service's own numbers.
++    ReadMetrics,
++    /// List this tenant's endpoints.
++    ReadEndpoints,
++    /// Register an endpoint for this tenant.
++    WriteEndpoints,
++    /// One page of this tenant's events.
++    ReadEvents,
++    /// Accept one event for this tenant.
++    WriteEvents,
++    /// This tenant's dead letters.
++    ReadDlq,
++    /// Put one of this tenant's dead letters back in the queue.
++    ReplayDlq,
++    /// This tenant's audit trail.
++    ReadAudit,
++}
++
++/// Every action, for the spec's matrix walk.
++pub const ACTIONS: [Action; 11] = [
++    Action::ReadHealth,
++    Action::ReadReadiness,
++    Action::ReadContract,
++    Action::ReadMetrics,
++    Action::ReadEndpoints,
++    Action::WriteEndpoints,
++    Action::ReadEvents,
++    Action::WriteEvents,
++    Action::ReadDlq,
++    Action::ReplayDlq,
++    Action::ReadAudit,
++];
++
++impl Action {
++    /// The action as text: the audit row's token, and what a refusal names.
++    ///
++    /// Stable and lower-case, like [`crate::error::Error::kind`]: the words in a log will change,
++    /// and the token is what a query groups by.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("step relay/2.16-authz-audit")
++    }
++
++    /// `true` when this action works on a tenant's behalf, and therefore costs quota.
++    ///
++    /// The quota of `relay/2.13-rate-limit` is a *tenant's* quota, keyed by the credential that
++    /// asked — and a request that asks about the process itself is not a tenant's request. It is an
++    /// orchestrator's, and an orchestrator that is told `429` by the liveness probe of a busy
++    /// service restarts it. So three actions are not metered and everything else is, and the list
++    /// is here rather than in the limiter because it is a fact about the action.
++    #[must_use]
++    pub fn is_metered(self) -> bool {
++        todo!("step relay/2.16-authz-audit")
++    }
++
++    /// `true` when this action changes something, and therefore leaves a row behind it.
++    ///
++    /// The audit trail is written for the actions that changed what this service owes or who may
++    /// reach it: reading a page of events is not one of them, and a trail of every read is a trail
++    /// nobody can afford to keep.
++    #[must_use]
++    pub fn is_privileged(self) -> bool {
++        todo!("step relay/2.16-authz-audit")
++    }
++}
++
++/// Whose rows an action would touch.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Scope {
++    /// The caller's own: its tenant's rows, or the process it is asking about.
++    Own,
++    /// A tenant that is not the caller. Nothing in this service is ever granted this.
++    Any,
++}
++
++/// One cell of the matrix: a role, an action, and the scope the role may do it to.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Grant {
++    /// Who.
++    pub role: Role,
++    /// What.
++    pub action: Action,
++    /// Whose rows.
++    pub scope: Scope,
++}
++
++/// The matrix itself, cell by cell.
++///
++/// Every grant is for the caller's own scope, and the list is the whole permission model: a
++/// (role, action) pair that appears here with [`Scope::Own`] is allowed, and everything else is
++/// refused. The scaffold ships it empty, which is a service that refuses everything — the state the
++/// spec of this step can tell apart from a working one.
++pub const GRANTS: &[Grant] = &[];
++
++/// The widest scope `role` is granted for `action`, or `None` when the matrix says no.
++#[must_use]
++pub fn granted(role: Role, action: Action) -> Option<Scope> {
++    todo!("step relay/2.16-authz-audit")
++}
++
++/// Why a request was refused.
++///
++/// The three reasons are three statuses, and the third is the one this step exists for.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Reason {
++    /// The caller has no usable identity: 401.
++    Unauthenticated,
++    /// The caller is known and this is not something their role may do: 403.
++    NotPermitted,
++    /// The rows belong to somebody else — or to nobody: 404, and the same 404 either way.
++    NotVisible,
++}
++
++impl Reason {
++    /// The status a refusal with this reason answers with.
++    #[must_use]
++    pub fn status(self) -> u16 {
++        todo!("step relay/2.16-authz-audit")
++    }
++
++    /// The refusal as text, for the audit row.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("step relay/2.16-authz-audit")
++    }
++}
++
++/// What the matrix says about one (role, action, scope) question.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Decision {
++    /// The request may go on to the handler.
++    Allow,
++    /// The request stops here, for this reason.
++    Deny(Reason),
++}
++
++impl Decision {
++    /// The decision as text: what an audit row records, and the token a query groups by.
++    ///
++    /// A refusal carries its reason, so one column answers both "was it allowed" and "if not,
++    /// why" — and the two questions are asked together, always, by whoever reads the trail.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("step relay/2.16-authz-audit")
++    }
++}
++
++/// Ask the matrix.
++///
++/// A *total* function: every combination of the three has an answer, and the answer for a
++/// combination the matrix does not list is a refusal rather than a panic or a default allow.
++#[must_use]
++pub fn decide(role: Role, action: Action, scope: Scope) -> Decision {
++    todo!("step relay/2.16-authz-audit")
++}
++
++/// One route of the service, as the matrix sees it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Route {
++    /// HTTP method, lower case.
++    pub method: &'static str,
++    /// The route's path, with axum's placeholders (`/dlq/{id}/replay`).
++    pub path: &'static str,
++    /// The action this route performs.
++    pub action: Action,
++}
++
++/// The routing table as data: which action each route is.
++///
++/// The scaffold ships it empty. The paths are the ones axum matches, placeholders and all, because
++/// that is the form a request carries when the question is asked ([`axum::extract::MatchedPath`]).
++pub const ROUTES: &[Route] = &[];
++
++/// The route one request matched, or `None` when this service does not authorize it.
++///
++/// `None` is not "allow": it means the request never reached a route this service serves — the
++/// fallback, or a method a route does not have — and the router's own 404 and 405 answer those.
++/// What comes back is the whole [`Route`], because its `path` is also what the audit row records
++/// as the target: the route, never the path the caller typed.
++#[must_use]
++pub fn route_of(method: &str, path: &str) -> Option<Route> {
++    todo!("step relay/2.16-authz-audit")
++}

@@ -13,6 +13,7 @@ format_version = 1
 "spec/2.13/ratelimit.rs" = "sha256:879d5c919dabbfb994e15adce19d976e0a21786475126bcae362977617081ae3"
 "spec/2.14/backpressure.rs" = "sha256:97c3088cd67044ab111520c341a35059d63eab71241423e219f03c4a0a2457c5"
 "spec/2.15/leases.rs" = "sha256:ef9352bf993a9c1d5dd9570ac13418d7d26ed10b2c2ce923d4e899ac20d54480"
+"spec/2.16/authz.rs" = "sha256:e78cddc85cca4577a5b7a79e7c8c8fc466313d56fc05bbcfc75a0743e600b0a2"
 "spec/2.2/ingest.rs" = "sha256:630fb551ae2b1089a1360ece37fd580a71bf1b7823889221880b0498011d1010"
 "spec/2.3/contract.rs" = "sha256:8e5c359cbca23db80b707e1ead184c5ea8b0f0dff282c1dcd7c510abd580e2d5"
 "spec/2.4/pagination.rs" = "sha256:ff6a4d6602d3af5e9f0ff8ddeb3bb38b60af8a6a84ca1ebe60b898ea90381c7b"
