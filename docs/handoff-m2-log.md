@@ -91,4 +91,89 @@
 - **无 scaffold 的接口步会在 scaffold 态编译失败**（3.3 的 `E0559`）：这是 authoring §5.4 的正常形状，
   `selftest` 会加注说明，不应为了让“失败得很好看”而削弱规格。
 
-## 第三段（待写）
+## 第三段 · 2026-10 · 六个慢闸门落地，3.2–3.4 的 `semver` 由 pending 转真
+
+### 做了什么
+
+- **六个质量闸门实现完**（提交 `kiln(gates): the six quality gates…`）：`mutants@N`（变异本步参考解碰过的
+  `src/**.rs`，复用同一份项目副本、最多 6 个等距变异体、杀/存活计分、编译失败与时延不计分、
+  失败点名 `file:line` + 原文 + 改写）、`bench-budget@P`（跑课程基线文件里的 `command`，解析
+  `jobq-budget k=v`，逐指标 ±P%，`_max` 后缀判上界）、`semver@baseline`（取 ≤ 本步的最新见证文件，
+  当 `tests/semver_baseline.rs` 编译，报第一段编译错误）、`unsafe-budget@N`（源码里 `unsafe` 计数 +
+  每处 `SAFETY:` 注释 + N=0 时要求 `unsafe_code` deny）、`conformance@N`（按 `conformance.toml`
+  逐后端用 `KILN_BACKEND` 重跑本步 `run.cmd`）、`coverage@N`（找工具链里的 `llvm-cov`/`llvm-profdata`，
+  缺就 `blocked` + 安装行）。
+- 两个共享支撑模块：`gates/lexer.rs`（字符串/字符/注释的字面级分类，保证闸门不会改写或统计字面量里的文本）、
+  `gates/sources.rs`（「本步模块」= 参考解补丁碰过的文件；「≤ 本步的最新见证」规则）。
+- `deny` 仍为 `Pending`，理由改写成「它是 should 门（`cargo-deny` 不在工具链基线里）」；`tool.rs` 不再声称那些工具在判门。
+- **集成验证**：`kiln selftest jobq/3.2 jobq/3.3 jobq/3.4 --track jobq` 从 `8/9 (semver pending)` 变成
+  **每步 `gates ✓ 9/9 must green`**——闸门实现与课程见证文件第一次在真步骤上接上。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| `cargo test -p kiln` | `264 passed` + `21 passed (tests/gates.rs)` + `1 passed (ledger)` |
+| 六个新集成测试 | 每个都证明「劣化 → 红 / 好树 → 绿」，且各自点名了劣化的位置（例如 `src/lib.rs:3` 的存活变异、`scan_cells is 1024 … baseline 10`、`memory ✓, postgres ✗`）|
+| `kiln selftest jobq/3.2 jobq/3.3 jobq/3.4 --track jobq` | `3/3 step(s) hold the contract`；每步 `gates ✓ 9/9 must green` |
+| `kiln lint-caps` | `no issues.`（`checked 50 of 72 step bodies, 22 not authored yet`）|
+| `cargo fmt --all --check` / `clippy -D warnings` | 都干净 |
+
+### 坑与判读
+
+- **变异门必须先在未变异的副本上跑一次**：否则项目自己的规格本来就红时，每个变异体都会被当成“杀死”，
+  这是这个门最不能给出的错答案；共享 `CARGO_TARGET_DIR` 时还要在最后再跑一次好树，否则 cargo 按包名+版本
+  选的构建槽会把最后一个变异体二进制给学员自己的下一次 `cargo test`（两条都由集成测试证明）。
+- **`fs::copy` 会带着原时间戳**：沙箱副本看起来比已有产物旧，cargo 判新鲜度后默默用了陈旧二进制；
+  解法是把副本文件的时间戳往前推一秒（不是 `cargo clean -p`——共享 target 下它会删掉别的包的测试二进制，已验证）。
+- **`coverage` 的工具存在路径在本机没有验证过**（`llvm-tools-preview` 未装）：集成测试断言的是诚实的
+  `blocked` + 安装行，测量逻辑（导出 JSON → 行覆盖比例 → 阈值）用合成文档单位测试。这条写在这里，
+  不假装它被端到端验证过。
+
+## 第四段 · 2026-10 · 全量 `cargo xtask ci` 第一次跑通（含逐 track selftest）
+
+### 做了什么
+
+- 在**冻结快照**上跑端到端 CI（`git archive <commit> | tar -x` 到 `/private/tmp/ci-snapshot`，
+  私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`）。三次冻结：
+
+| 次 | 冻结 commit | 结果 |
+| --- | --- | --- |
+| A | `ec3b154` | **exit 1**，12.58 s，红在 `cargo fmt --all --check`（我 R1 修复里那行 102 字符）|
+| B | `0aad030` | **exit 1**，3.52 s，仍红在 `fmt`（第二处：`assert_eq!` 一行 82 字符，撞 `fn_call_width = 60`）|
+| C | `0927803` | **exit 0**，**1634.07 s（～27 min）**，`xtask ci: all checks passed` |
+
+### 数字（run C 原样）
+
+```
+xtask ci: cargo fmt --all --check                                  （静默）
+xtask ci: rustfmt --check on 149 course file(s) under course/     （静默）
+  50 spec file(s) pinned, 50 step(s) declare their own
+  97 capabilities · 134 slots · 118 ledger positions · 72 authored steps
+  63 page(s) · 392 link(s) · 238 external target(s) (not fetched)
+probe --check · 35 exercise(s) · 35 reference(s) passed
+xtask ci: kiln selftest --track mailer
+xtask ci: kiln selftest --track relay
+xtask ci: kiln selftest --track jobq
+xtask ci: all checks passed
+```
+
+三条 track 的结论行：**mailer `22/22`、relay `24/24`、jobq `4/4`**（jobq 当时只有 4 步已写；
+其中 3.2–3.4 的 `gates ✗ 8/9 (semver@baseline is pending)` 仍算 hold the contract——Pending 不计 breaking）。
+`cargo test --workspace`：`209 + 15 + 1` 全绿。**这是 `xtask ci` 的逐 track selftest 循环第一次真实执行**
+（之前只跑默认 track）。
+run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）；M2 收尾时需再跑一次。
+
+### 坑与判读
+
+- **fail-fast 的代价**：`xtask ci` 第一阶段就红，后面 clippy/tests/lint-caps/links/probe/selftest 一次都没跑；
+  所以“CI 红了”不代表“只有一处坏”。这次的归因靠的是：把剩下的阶段**按同序手跑一遍**（在同一个冻结快照上），
+  发现除 fmt 外还有一处真红（两处硬编码计数测试），而非猜测。
+- **冻结快照 + 共享 target 会“假装绿”（新环境事实）**：`git archive` 会带着提交时的 mtime，
+  共享 `CARGO_TARGET_DIR` 里的旧产物看起来比刚解包的源码新，cargo 不重编——于是旧提交跑出了**新提交才会有的绿**
+  （实测：同一次重跑第一次“通过”且二进制里是新断言文案，把源码 mtime 向前推一秒后同一条命令变成预期的红，
+  两次结论一致）。
+  **规则**：冻结不同 commit 跑 CI 时，要么每次用**独立的 target dir**，要么解包后把源码 mtime 前移一秒。
+  这与闸门实现里 `fs::copy` 要 `make_fresh` 是同一类问题（同一周踩到两次）。
+
+## 第五段（待写）
