@@ -1,0 +1,484 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 288953e..1316d0d 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -27,6 +27,7 @@ pub(crate) mod policy;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
+ pub(crate) mod store;
++pub(crate) mod timers;
+ 
+ mod sealed;
+ 
+@@ -43,3 +44,4 @@ pub use scheduler::Engine;
+ #[cfg(feature = "postgres")]
+ pub use store::PostgresStore;
+ pub use store::{BoxFuture, MemoryStore, Store};
++pub use timers::ReadySet;
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index a29b431..272423b 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -459,6 +459,25 @@ impl Store for MemoryStore {
+             Ok(u32::try_from(expired.len()).unwrap_or(u32::MAX))
+         })
+     }
++
++    fn next_due<'a>(
++        &'a self,
++        queue: &'a Queue,
++    ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>> {
++        Box::pin(async move {
++            // A map has no index to lean on, so this is a scan — and what makes it the port's answer
++            // rather than a backend's shortcut is that it returns one *instant*: the caller asked
++            // when to look again, not what is in the queue, so the depth of the queue is this
++            // store's problem and not the worker's.
++            let ledger = self.ledger();
++            Ok(ledger
++                .jobs
++                .values()
++                .filter(|job| job.queue == *queue && job.state == JobState::Queued)
++                .map(|job| job.run_at)
++                .min())
++        })
++    }
+ }
+ 
+ /// Put one row back in its queue, and answer which attempt the line it gets will name.
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 978795f..29c4e04 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -33,6 +33,8 @@ use std::future::Future;
+ use std::pin::Pin;
+ use std::time::Duration;
+ 
++use chrono::{DateTime, Utc};
++
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::JobEvent;
+@@ -248,4 +250,31 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     ///
+     /// [`Error::Store`] when the backend refused the read.
+     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>>;
++
++    /// The instant at which this queue's next queued job may be claimed, or `None` when it has none.
++    ///
++    /// This is the question a worker asks instead of polling (`jobq/3.11-delayed-timers`), and the
++    /// answer is the earliest `run_at` among the queue's **queued** rows: a job whose lease ran out
++    /// and went back to the queue is queued again and counts, while one that is running, done or
++    /// failed does not. A queue with nothing queued answers `None` rather than "now", because a
++    /// caller that cannot tell "nothing to wait for" from "something is due right now" has to poll
++    /// to find out which it was.
++    ///
++    /// It is one instant per queue and not the rows behind it, and that is the promise: the predicate
++    /// is the one `claim` uses to decide what is due, so a backend can answer from the same index
++    /// (`migrations/0001_jobs.sql`) and a queue a million rows deep costs what an empty one costs.
++    /// A worker whose waiting costs as much as its working is a worker that polls with extra steps.
++    ///
++    /// What it is *not* is a promise that a claim will succeed at that instant: another worker may
++    /// take the row first, the per-queue cap of `jobq/3.9-priority-fairness` may hold it back, and a
++    /// job submitted after this read is not in the answer at all. Those are the reasons a caller
++    /// caps its wait rather than sleeping until the deadline it was given.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    fn next_due<'a>(
++        &'a self,
++        queue: &'a Queue,
++    ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>>;
+ }
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 2e9afc1..630e8e8 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -384,6 +384,28 @@ impl Store for PostgresStore {
+             rows.into_iter().map(EventRow::into_event).collect()
+         })
+     }
++
++    fn next_due<'a>(
++        &'a self,
++        queue: &'a Queue,
++    ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>> {
++        Box::pin(async move {
++            // `min(run_at)` over the queue's queued rows: `jobs_claimable` is the partial index on
++            // exactly that predicate (`migrations/0001_jobs.sql`), so this is the same index step the
++            // claim's row selection takes, whatever the depth of the queue behind it. The instant is
++            // read back, not computed from the database clock, for the reason every other instant in
++            // this file is: two processes have to agree, and the clock they were handed is the only
++            // one they both have (`jobq/3.8-clock-injection`).
++            let asked: (Option<DateTime<Utc>>,) = sqlx::query_as(
++                "select min(run_at) from jobs where queue = $1 and state = 'queued'",
++            )
++            .bind(queue.as_str())
++            .fetch_one(&self.pool)
++            .await
++            .map_err(refused)?;
++            Ok(asked.0)
++        })
++    }
+ }
+ 
+ /// How many rows one run of the reclaimer may take back.
+diff --git a/src/engine/timers.rs b/src/engine/timers.rs
+index 01a658e..496d5f8 100644
+--- a/src/engine/timers.rs
++++ b/src/engine/timers.rs
+@@ -1,33 +1,49 @@
+ //! The ready set: when the next job is due, and how long a worker should wait.
+ //!
+ //! A worker with nothing to do has two answers and both are wrong on their own. It can ask the store
+-//! every `poll_interval` — one query per queue per turn, for ever, whether or not anything is
+-//! scheduled — or it can sleep until something tells it *when* the next thing is due. This module is
+-//! the second half of that answer: the in-process structure that holds the deadlines a worker waits
+-//! on, so the worker sleeps until the earliest one instead of asking in a loop.
++//! every `poll_interval` — which costs one query per queue per turn for ever, whether or not anything
++//! is scheduled — or it can sleep until it is told something changed, which needs the store to be
++//! able to say *when* the next thing is due. This module is the second half of that: the in-process
++//! structure that holds one deadline per queue, so a worker sleeps until the earliest one instead of
++//! asking in a loop.
+ //!
+-//! The promise to keep, in one line: **the cost of waiting is the number of queues, not the number of
+-//! jobs.** A million jobs scheduled a year out are one entry per queue here, and the store answers the
+-//! same question with the index the claim already uses.
++//! The promise, in one line: **the cost of waiting is the number of queues, not the number of jobs.**
++//! A million jobs scheduled a year out are one entry per queue here, and the store answers the same
++//! question with the same index the claim uses — `min(run_at)` over the rows that are queued. That is
++//! why the structure holds *deadlines* and not jobs: a job is a row, the store already holds the rows,
++//! and what a worker needs from them is the earliest instant one of them becomes claimable.
+ //!
+-//! Four decisions are this step's, and the body argues each of them:
++//! Three decisions are worth reading before the code.
+ //!
+-//! * **which structure.** A binary heap, a sorted index and a time wheel all answer "when is the next
+-//!   one?", and they differ in what insertion costs, what inspection costs, and what happens to
+-//!   memory when a deadline *moves* — which is the operation this structure gets most often, because
+-//!   a claim, a submit and a reclaim all move one;
+-//! * **what a moved deadline means.** A queue's next due instant is not a constant: the answer a
+-//!   worker holds is true until the next claim, and a structure that kept both answers would report
+-//!   an instant that is no longer anybody's;
+-//! * **why the entries are deadlines** rather than jobs: a job is a row and the store holds the rows,
+-//!   so what a worker needs from them is one instant per queue;
+-//! * **what a caller does with the answer.** The deadline exists to be slept on, and the arithmetic
+-//!   has a second half — the poll interval, which stays the floor so that a worker with nothing
+-//!   scheduled still looks, and so that a *stale* deadline cannot become a stalled queue.
+-//!
+-//! The type and its methods are the shape the spec holds this module to; the representation, and what
+-//! `wait` means at its edges, are the first two decisions and are deliberately not made here.
++//! * **Which structure.** The two operations are "when is the next one?" (asked every turn, and on
++//!   the hot path of an idle worker) and "this queue's deadline moved" (asked once per queue per
++//!   turn, both ways: a job was claimed, so the deadline moves later; a job was submitted or
++//!   reclaimed, so it moves earlier). A binary heap pushes in `log n` and peeks in `O(1)`, but a
++//!   deadline that *moves* has to be retired, and a heap cannot find an entry except at its top: the
++//!   usual answer is to push the new deadline and let the old one rot there until it surfaces, which
++//!   makes memory a function of how often deadlines move rather than of how many queues exist. A time
++//!   wheel inserts and advances in `O(1)` but quantises the clock to a fixed resolution and keeps a
++//!   bucket per tick — and the instants this engine waits for come from cron arithmetic and a
++//!   database column, so they are not quantised and there is no natural tick. What this keeps is the
++//!   sorted index plus a map: the index answers "the earliest" as its first element (`&self`, no
++//!   scan, no garbage), and the map answers "what does this queue owe?" so a moved deadline is
++//!   retracted in one lookup instead of a scan or a leak. Both operations are `log n`, memory is
++//!   exactly one entry per queue with work, and `n` is the number of queues a worker drains.
++//! * **What a deadline that moved means.** A claim takes a queue's work, so its next deadline moves
++//!   later; a submit, a reclaim or a retry moves it earlier. Every one of those is the same call —
++//!   [`ReadySet::insert`] — because the structure holds the *current* answer per queue: inserting a
++//!   queue that is already there replaces what it owed. A queue with nothing queued is
++//!   [`ReadySet::remove`]d rather than left with a stale instant, which is what keeps
++//!   [`ReadySet::next_deadline`] an answer about now.
++//! * **What a caller does with the answer.** [`ReadySet::wait`] is the arithmetic, and it is here
++//!   rather than in the worker because it is a rule with two halves that both need a test: the
++//!   deadline may only *shorten* the wait, and the poll interval is the floor under it. Shortening is
++//!   the point (a job due in 200ms is a wake in 200ms, not a poll later); the floor is what keeps the
++//!   new answer an optimisation rather than a new failure mode, because the deadline is a *snapshot*
++//!   — a job submitted by another process a moment after the store was asked is not in it — and a
++//!   worker that slept on a stale snapshot without a bound would have traded a poll for a stall.
+ 
++use std::collections::{BTreeSet, HashMap};
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+@@ -35,20 +51,25 @@ use chrono::{DateTime, Utc};
+ use crate::engine::domain::Queue;
+ 
+ /// When each queue that has work next has some.
++///
++/// One entry per queue, kept in two indexes that mean the same thing: the ordered one answers "what
++/// is the earliest deadline?" and the map answers "what does this queue owe?", which is what lets a
++/// deadline that moves be retracted instead of forgotten.
+ #[derive(Debug, Clone, Default)]
+ pub struct ReadySet {
+-    // The representation is part of what this step teaches, so it is not written down here: a heap
+-    // with lazily discarded entries, a sorted index with a map beside it, and a wheel of buckets all
+-    // satisfy the methods below, and the body of `jobq/3.11-delayed-timers` argues which one this
+-    // engine keeps — the trade being insertion cost, inspection cost and what happens to memory when
+-    // a deadline moves.
++    /// Every deadline in order, each paired with the queue that owes it. The queue is part of the
++    /// key rather than the value so that two queues due at the same instant are two entries, and the
++    /// first of them is still `first()`.
++    ordered: BTreeSet<(DateTime<Utc>, Queue)>,
++    /// What each queue owes now, so its previous deadline can be found in one lookup.
++    current: HashMap<Queue, DateTime<Utc>>,
+ }
+ 
+ impl ReadySet {
+     /// An empty ready set: nothing is scheduled, so a worker waits its poll interval.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("jobq/3.11-delayed-timers: an empty ready set")
++        Self::default()
+     }
+ 
+     /// Record that `queue` next has work at `at`, replacing whatever it owed before.
+@@ -57,50 +78,83 @@ impl ReadySet {
+     /// answer and not a history of them: a claim, a submit, a reclaim and a retry all arrive here
+     /// saying what is true now.
+     pub fn insert(&mut self, queue: Queue, at: DateTime<Utc>) {
+-        todo!(
+-            "jobq/3.11-delayed-timers: `{queue}` owes work at {at} — and what it owed before is not owed any more"
+-        )
++        // The previous answer has to leave the ordered index, or the structure would report an
++        // instant that is no longer this queue's: the whole reason the map exists next to the index.
++        if let Some(previous) = self.current.insert(queue.clone(), at) {
++            self.ordered.remove(&(previous, queue.clone()));
++        }
++        self.ordered.insert((at, queue));
+     }
+ 
+     /// Forget `queue`: it owes nothing.
+     ///
+-    /// Removing something that was never there is not an error: the caller asks this for every queue
+-    /// it drains, and it has no way to know which of them were known before it asked.
++    /// A queue whose work has all been claimed, or one nobody has told the worker about, is not a
++    /// queue to wait for. Removing something that was never there is not an error — the answer to
++    /// "forget this" is the same either way, and the caller (a worker asking the store about each of
++    /// its queues) has no way to know which of the two it is looking at.
+     pub fn remove(&mut self, queue: &Queue) {
+-        todo!("jobq/3.11-delayed-timers: `{queue}` owes nothing")
++        if let Some(previous) = self.current.remove(queue) {
++            self.ordered.remove(&(previous, queue.clone()));
++        }
+     }
+ 
+     /// The earliest deadline any queue owes, if any does.
+     ///
+-    /// The question a worker asks every idle turn, which is why answering it must not cost a scan of
+-    /// every queue.
++    /// The first element of the ordered index, which is why the index is ordered at all: this is the
++    /// question a worker asks every idle turn, and answering it by scanning would put the number of
++    /// queues on the hot path.
+     #[must_use]
+     pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
+-        todo!("jobq/3.11-delayed-timers: the earliest deadline, or nothing when no queue owes work")
++        self.ordered.first().map(|(at, _)| *at)
+     }
+ 
+     /// How long a caller that asked at `now` should wait before asking the store again.
+     ///
+-    /// Three cases, and the rule has to cover all of them: nothing scheduled, a deadline ahead, and
+-    /// a deadline that has already been reached — the last one being where a worker that was "clever"
+-    /// about arithmetic turns into a spin against the store.
++    /// The deadline shortens the wait; `floor` is what the wait never goes below, and the three
++    /// cases it covers are the rule:
++    ///
++    /// * **nothing scheduled** — there is nothing to wake for, and a worker that waited for ever
++    ///   would never see the job another process submits a second later, so it waits its poll
++    ///   interval and looks again;
++    /// * **a deadline already reached** — the work is due and the claim that just came back empty
++    ///   did not take it, which means something other than the clock is holding it (the per-queue
++    ///   cap of `jobq/3.9-priority-fairness`, or another worker that took the row in between).
++    ///   Waiting zero for that would turn an idle worker into a spin against the store, and the
++    ///   reason to look again is the cap, not the clock, so the wait is the interval the worker would
++    ///   have used before this step;
++    /// * **a deadline ahead** — the wait is the time until it, capped by the interval, which is the
++    ///   staleness bound: the store was asked a moment ago, and "a moment ago" is the only promise a
++    ///   snapshot can make.
+     #[must_use]
+     pub fn wait(&self, now: DateTime<Utc>, floor: Duration) -> Duration {
+-        todo!("jobq/3.11-delayed-timers: how long from {now}, with {floor:?} as the floor")
++        match self.next_deadline() {
++            Some(at) if at > now => at
++                .signed_duration_since(now)
++                .to_std()
++                .unwrap_or(Duration::ZERO)
++                .min(floor),
++            _ => floor,
++        }
+     }
+ 
+     /// How many queues owe work.
+     ///
+     /// The size the promise is about: it grows with queues, never with jobs, however many deadlines
+-    /// the worker has recorded over its life.
++    /// have been recorded over the life of the worker.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("jobq/3.11-delayed-timers: how many queues owe work")
++        debug_assert_eq!(
++            self.ordered.len(),
++            self.current.len(),
++            "the two indexes are kept in step by construction: a difference is a deadline that was \
++             inserted or retracted in one of them only"
++        );
++        self.current.len()
+     }
+ 
+     /// `true` when no queue owes work.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("jobq/3.11-delayed-timers: whether any queue owes work")
++        self.current.is_empty()
+     }
+ }
+diff --git a/src/service/worker.rs b/src/service/worker.rs
+index 91de070..22f69e7 100644
+--- a/src/service/worker.rs
++++ b/src/service/worker.rs
+@@ -5,7 +5,7 @@
+ //! [`Handler`], settle it, and — while that is happening — keep telling the store that the claim is
+ //! still alive.
+ //!
+-//! Four decisions, and the step argues them:
++//! Five decisions, and the step argues them:
+ //!
+ //! * **a claim is a lease.** Every row the worker takes carries its owner and an instant after which
+ //!   the claim is presumed abandoned, and the worker renews it for as long as it is handling the
+@@ -26,6 +26,12 @@
+ //!   (`jobq/3.6-transaction-isolation`), so this loop settles through `engine::retry` with
+ //!   [`DEFAULT_ATTEMPTS`](crate::engine::DEFAULT_ATTEMPTS) — the store reports the class, the
+ //!   caller decides what to do about it, and the worker is the caller.
++//! * **the wait has a deadline, and the poll interval is the floor under it.** A turn that finds
++//!   nothing asks each queue when it next has work and sleeps until the earliest of those instants
++//!   (step `jobq/3.11-delayed-timers`) — so a job due in 200ms is a wake in 200ms instead of a poll
++//!   interval later — and it never sleeps *longer* than [`WorkerSettings::poll_interval`], because
++//!   the deadlines are a snapshot: a queue nothing has told this worker about is still looked at,
++//!   and a stale instant costs a turn rather than a stall.
+ //!
+ //! What the loop needs from the port and the store does not have yet is written down in the step
+ //! body: `renew` (extend the leases this worker holds), `release` (hand back what it still holds)
+@@ -39,10 +45,12 @@ use tokio::sync::watch;
+ use tokio::task::JoinSet;
+ use tokio::time::{Instant, sleep, timeout_at};
+ 
++use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, Queue, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::retry::{DEFAULT_ATTEMPTS, retry};
+ use crate::engine::store::{BoxFuture, Store};
++use crate::engine::timers::ReadySet;
+ 
+ /// What a worker does with a job it has claimed.
+ ///
+@@ -287,6 +295,13 @@ pub struct Worker {
+     handler: Arc<dyn Handler>,
+     /// What this worker was told to do.
+     settings: WorkerSettings,
++    /// The clock every deadline is measured against.
++    ///
++    /// The one the store was built with: "how long until that deadline" is a subtraction between two
++    /// wall-clock instants, and a worker reading a clock of its own would be the second authority
++    /// step `jobq/3.8-clock-injection` exists to remove. A process leaves both at [`SystemClock`]; a
++    /// test that moves time hands the same clock to the store it builds and to this.
++    clock: Arc<dyn Clock>,
+ }
+ 
+ impl Worker {
+@@ -301,17 +316,31 @@ impl Worker {
+             store,
+             handler: Arc::new(handler),
+             settings,
++            clock: Arc::new(SystemClock),
+         }
+     }
+ 
++    /// The same worker, measuring its waits against `clock` (`jobq/3.11-delayed-timers`).
++    ///
++    /// The clock has to be the store's, and the caller is the one that knows that: this is the same
++    /// constructor-injection shape the stores use for their own clock (`with_clock`,
++    /// `jobq/3.8-clock-injection`), and handing both the same value is what makes "the deadline is two
++    /// hours away" a case a test can run in a few hundred milliseconds.
++    #[must_use]
++    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
++        self.clock = clock;
++        self
++    }
++
+     /// Drain until `shutdown` arrives, then finish or hand back what is in flight.
+     ///
+     /// The turn, in order: ask every queue for up to [`WorkerSettings::batch`] due jobs, hand each
+     /// one to the handler in its own task (this is what the lease has to cover), settle what comes
+     /// back, renew the leases this worker holds while that is happening, and reclaim what a worker
+-    /// that is no longer here left behind. A turn that finds nothing waits
+-    /// [`WorkerSettings::poll_interval`] — interruptibly, so a stop does not have to wait for an
+-    /// idle pause.
++    /// that is no longer here left behind. A turn that finds nothing asks each queue when it next
++    /// has work and waits until the earliest of those instants or
++    /// [`WorkerSettings::poll_interval`], whichever comes first — interruptibly, so a stop does not
++    /// have to wait for an idle pause.
+     ///
+     /// # Errors
+     ///
+@@ -320,6 +349,10 @@ impl Worker {
+     /// [`Store::fail`], and the report counts it.
+     pub async fn run(&self, shutdown: Shutdown) -> Result<Report, Error> {
+         let mut report = Report::default();
++        // What this worker knows about when each queue next has work, which starts empty: a
++        // structure full of guesses would be worse than no structure at all, and the first empty turn
++        // is what fills it in (step `jobq/3.11-delayed-timers`).
++        let mut deadlines = ReadySet::new();
+         // The renewals run *beside* the work rather than inside it, because the thing that has to be
+         // renewed knows nothing about the thing that is running: a handler that takes longer than a
+         // lease has no way to say "still here", and the row would quietly become claimable by
+@@ -343,7 +376,10 @@ impl Worker {
+ 
+             let turn = self.claim_a_turn(&mut report).await?;
+             if turn.is_empty() {
+-                self.wait_for_work(&shutdown).await;
++                // Nothing is due, so the next question is *when* something will be: one question per
++                // queue, and the answers are what the wait below is built from.
++                self.learn_deadlines(&mut deadlines).await?;
++                self.wait_for_work(&shutdown, &deadlines).await;
+                 continue;
+             }
+ 
+@@ -388,11 +424,36 @@ impl Worker {
+         Ok(turn)
+     }
+ 
++    /// Ask every queue when it next has work, and remember the answers.
++    ///
++    /// One question per queue, and that is the whole of what makes waiting cost the number of queues
++    /// rather than the number of jobs: the store answers "the earliest instant one of this queue's
++    /// jobs may be claimed" from the same index a claim uses, so a queue a million rows deep costs the
++    /// same as an empty one. A queue with nothing queued is forgotten rather than left holding the
++    /// instant it had, because a deadline that is no longer true is a worker that sleeps through work
++    /// arriving.
++    async fn learn_deadlines(&self, deadlines: &mut ReadySet) -> Result<(), Error> {
++        for queue in &self.settings.queues {
++            match self.store.next_due(queue).await? {
++                Some(at) => deadlines.insert(queue.clone(), at),
++                None => deadlines.remove(queue),
++            }
++        }
++        Ok(())
++    }
++
+     /// Wait out an empty turn, without making a stop wait for the pause.
+-    async fn wait_for_work(&self, shutdown: &Shutdown) {
++    ///
++    /// The wait is the ready set's arithmetic: until the earliest deadline it holds, capped by
++    /// [`WorkerSettings::poll_interval`] — which stays the floor, so a worker whose queues are empty
++    /// (or whose deadlines are an hour out) still looks at the store at the rate it always did. A
++    /// deadline can therefore make this worker look *sooner* than it used to and never later, which
++    /// is what keeps a wrong or a stale deadline a latency question rather than a stalled queue.
++    async fn wait_for_work(&self, shutdown: &Shutdown, deadlines: &ReadySet) {
++        let wait = deadlines.wait(self.clock.now(), self.settings.poll_interval);
+         tokio::select! {
+             () = shutdown.wait() => {}
+-            () = sleep(self.settings.poll_interval) => {}
++            () = sleep(wait) => {}
+         }
+     }
+ 

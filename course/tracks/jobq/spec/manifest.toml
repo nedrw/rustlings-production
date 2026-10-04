@@ -8,6 +8,7 @@ format_version = 1
 [spec]
 "spec/3.1/engine_boundary.rs" = "sha256:110317af240a9968eb2818cc3c27ddea78d03567227560c152b911768f48aeeb"
 "spec/3.10/cron.rs" = "sha256:88bb3aca3324bec743309174b0514fb991015341cf82ae7f11cf7e2c0696ad84"
+"spec/3.11/timers.rs" = "sha256:dac27d0f94103948898123d0186b18e66d076660465614da3d926acf3aaaedd1"
 "spec/3.2/public_api.rs" = "sha256:b0c44a93db4dcd20a829772f05f43c3e377645c43ad45779e058d1eebe2cd005"
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
 "spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"

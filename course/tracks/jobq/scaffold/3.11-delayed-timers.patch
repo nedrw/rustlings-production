@@ -1,0 +1,112 @@
+diff --git a/src/engine/timers.rs b/src/engine/timers.rs
+new file mode 100644
+index 0000000..01a658e
+--- /dev/null
++++ b/src/engine/timers.rs
+@@ -0,0 +1,106 @@
++//! The ready set: when the next job is due, and how long a worker should wait.
++//!
++//! A worker with nothing to do has two answers and both are wrong on their own. It can ask the store
++//! every `poll_interval` — one query per queue per turn, for ever, whether or not anything is
++//! scheduled — or it can sleep until something tells it *when* the next thing is due. This module is
++//! the second half of that answer: the in-process structure that holds the deadlines a worker waits
++//! on, so the worker sleeps until the earliest one instead of asking in a loop.
++//!
++//! The promise to keep, in one line: **the cost of waiting is the number of queues, not the number of
++//! jobs.** A million jobs scheduled a year out are one entry per queue here, and the store answers the
++//! same question with the index the claim already uses.
++//!
++//! Four decisions are this step's, and the body argues each of them:
++//!
++//! * **which structure.** A binary heap, a sorted index and a time wheel all answer "when is the next
++//!   one?", and they differ in what insertion costs, what inspection costs, and what happens to
++//!   memory when a deadline *moves* — which is the operation this structure gets most often, because
++//!   a claim, a submit and a reclaim all move one;
++//! * **what a moved deadline means.** A queue's next due instant is not a constant: the answer a
++//!   worker holds is true until the next claim, and a structure that kept both answers would report
++//!   an instant that is no longer anybody's;
++//! * **why the entries are deadlines** rather than jobs: a job is a row and the store holds the rows,
++//!   so what a worker needs from them is one instant per queue;
++//! * **what a caller does with the answer.** The deadline exists to be slept on, and the arithmetic
++//!   has a second half — the poll interval, which stays the floor so that a worker with nothing
++//!   scheduled still looks, and so that a *stale* deadline cannot become a stalled queue.
++//!
++//! The type and its methods are the shape the spec holds this module to; the representation, and what
++//! `wait` means at its edges, are the first two decisions and are deliberately not made here.
++
++use std::time::Duration;
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::domain::Queue;
++
++/// When each queue that has work next has some.
++#[derive(Debug, Clone, Default)]
++pub struct ReadySet {
++    // The representation is part of what this step teaches, so it is not written down here: a heap
++    // with lazily discarded entries, a sorted index with a map beside it, and a wheel of buckets all
++    // satisfy the methods below, and the body of `jobq/3.11-delayed-timers` argues which one this
++    // engine keeps — the trade being insertion cost, inspection cost and what happens to memory when
++    // a deadline moves.
++}
++
++impl ReadySet {
++    /// An empty ready set: nothing is scheduled, so a worker waits its poll interval.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("jobq/3.11-delayed-timers: an empty ready set")
++    }
++
++    /// Record that `queue` next has work at `at`, replacing whatever it owed before.
++    ///
++    /// One call for both directions of "the deadline moved", because the structure holds the current
++    /// answer and not a history of them: a claim, a submit, a reclaim and a retry all arrive here
++    /// saying what is true now.
++    pub fn insert(&mut self, queue: Queue, at: DateTime<Utc>) {
++        todo!(
++            "jobq/3.11-delayed-timers: `{queue}` owes work at {at} — and what it owed before is not owed any more"
++        )
++    }
++
++    /// Forget `queue`: it owes nothing.
++    ///
++    /// Removing something that was never there is not an error: the caller asks this for every queue
++    /// it drains, and it has no way to know which of them were known before it asked.
++    pub fn remove(&mut self, queue: &Queue) {
++        todo!("jobq/3.11-delayed-timers: `{queue}` owes nothing")
++    }
++
++    /// The earliest deadline any queue owes, if any does.
++    ///
++    /// The question a worker asks every idle turn, which is why answering it must not cost a scan of
++    /// every queue.
++    #[must_use]
++    pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
++        todo!("jobq/3.11-delayed-timers: the earliest deadline, or nothing when no queue owes work")
++    }
++
++    /// How long a caller that asked at `now` should wait before asking the store again.
++    ///
++    /// Three cases, and the rule has to cover all of them: nothing scheduled, a deadline ahead, and
++    /// a deadline that has already been reached — the last one being where a worker that was "clever"
++    /// about arithmetic turns into a spin against the store.
++    #[must_use]
++    pub fn wait(&self, now: DateTime<Utc>, floor: Duration) -> Duration {
++        todo!("jobq/3.11-delayed-timers: how long from {now}, with {floor:?} as the floor")
++    }
++
++    /// How many queues owe work.
++    ///
++    /// The size the promise is about: it grows with queues, never with jobs, however many deadlines
++    /// the worker has recorded over its life.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("jobq/3.11-delayed-timers: how many queues owe work")
++    }
++
++    /// `true` when no queue owes work.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("jobq/3.11-delayed-timers: whether any queue owes work")
++    }
++}
