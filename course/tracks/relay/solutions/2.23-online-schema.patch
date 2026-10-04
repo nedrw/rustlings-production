@@ -1,0 +1,367 @@
+diff --git a/src/backfill.rs b/src/backfill.rs
+index 8d76966..b27dcf8 100644
+--- a/src/backfill.rs
++++ b/src/backfill.rs
+@@ -52,8 +52,25 @@ pub struct Backfilled {
+ /// Returns [`Error::Database`] when the batch cannot be written. A partial run is not a failure: the
+ /// rows it filled are filled, and the next call carries on from them.
+ pub async fn bytes(pool: &PgPool, batch: i64) -> Result<u64, Error> {
+-    let _ = (pool, batch);
+-    todo!("step relay/2.23-online-schema")
++    // One statement, and the whole of the phase is in it: the rows are chosen by *not having a
++    // value*, in the order the partial index is in, at most a batch of them, and the value written
++    // is the same expression the read path falls back to (`src/pagination.rs`) — the stored number
++    // and the computed one have to be the same number, or the column is a second answer rather than
++    // a cache of the first.
++    let written = sqlx::query(
++        "update events as v \
++            set payload_bytes = octet_length(v.payload::text) \
++          where v.id in (select e.id from events as e \
++                          where e.payload_bytes is null \
++                          order by e.received_at, e.id \
++                          limit $1)",
++    )
++    .bind(batch)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?
++    .rows_affected();
++    Ok(written)
+ }
+ 
+ /// Run [`bytes`] until a batch fills nothing, and answer what the whole run did.
+@@ -66,6 +83,13 @@ pub async fn bytes(pool: &PgPool, batch: i64) -> Result<u64, Error> {
+ ///
+ /// The same failures as [`bytes`], from whichever batch hit them first.
+ pub async fn run(pool: &PgPool, batch: i64) -> Result<Backfilled, Error> {
+-    let _ = (pool, batch);
+-    todo!("step relay/2.23-online-schema")
++    let mut done = Backfilled::default();
++    loop {
++        let filled = bytes(pool, batch).await?;
++        if filled == 0 {
++            return Ok(done);
++        }
++        done.batches += 1;
++        done.rows += filled;
++    }
+ }
+diff --git a/src/config.rs b/src/config.rs
+index 306b094..9bb14c9 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -167,6 +167,14 @@ pub struct Flags {
+     pub listen_port: Option<u16>,
+     /// `--check-config`: print [`Config::report`] and exit.
+     pub check_config: bool,
++    /// `--backfill`: run the batched backfill of a column a migration added, and exit
++    /// (`relay/2.23-online-schema`).
++    ///
++    /// A flag rather than something startup does, because it is a *step of the rollout*: it has to
++    /// be runnable while the previous release is serving, it may be interrupted, and running it
++    /// again is free. A process that did it on every boot would make every restart a write over
++    /// somebody else's table.
++    pub backfill: bool,
+     /// `--help`.
+     pub help: bool,
+     /// `--version`.
+@@ -196,6 +204,7 @@ impl Flags {
+                 "--help" => flags.help = true,
+                 "--version" => flags.version = true,
+                 "--check-config" => flags.check_config = true,
++                "--backfill" => flags.backfill = true,
+                 "--config" => {
+                     let value = args
+                         .next()
+diff --git a/src/events.rs b/src/events.rs
+index 77cc64f..4cfc8ad 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -110,8 +110,14 @@ pub async fn ingest(
+     // have (see `docs/adr/0001-at-least-once.md`, in the project).
+     let mut transaction = pool.begin().await.map_err(Error::Database)?;
+     let written: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+-        "insert into events (id, tenant_id, idempotency_key, kind, payload) \
+-         values ($1, $2, $3, $4, $5::jsonb) \
++        // `payload_bytes` is the size of what was stored, computed by the database from the value it
++        // is storing (`relay/2.23-online-schema`): the read path falls back to the same expression
++        // for rows that predate the column, so both answer the same number. Computing it here
++        // instead — in Rust, from the JSON this process has in hand — would be a second
++        // implementation of "how big is this", and it would disagree with the first one about key
++        // order and spacing.
++        "insert into events (id, tenant_id, idempotency_key, kind, payload, payload_bytes) \
++         values ($1, $2, $3, $4, $5::jsonb, octet_length($5::jsonb::text)) \
+          on conflict (tenant_id, idempotency_key) do nothing \
+          returning id, received_at",
+     )
+diff --git a/src/http.rs b/src/http.rs
+index 50c0f49..37d8b97 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -666,11 +666,37 @@ async fn create_event(
+     }
+ }
+ 
++/// One event in a page, as the API hands it to a caller: the event, and the size of what it carried.
++///
++/// `relay/2.23-online-schema`: the field is answered from the column the expand migration added,
++/// with the payload computed as the fallback, so a row nobody has backfilled yet is answered like
++/// any other. The document declares a schema of its own for the page's items (`ListedEvent`) rather
++/// than reusing `Event`, because the answer really does have a field the other route does not.
++#[derive(Debug, serde::Serialize)]
++struct ListedEventBody<'a> {
++    /// The event itself, spread into this object rather than nested: a caller that wants the id
++    /// should not have to know which route it asked.
++    #[serde(flatten)]
++    event: EventBody<'a>,
++    /// Bytes of the payload this event was accepted with.
++    bytes: i64,
++}
++
++impl<'a> ListedEventBody<'a> {
++    /// The body one listed event is answered with.
++    fn of(listed: &'a pagination::Listed) -> Self {
++        Self {
++            event: EventBody::of(&listed.event),
++            bytes: listed.bytes,
++        }
++    }
++}
++
+ /// One page, as the API hands it to a caller.
+ #[derive(Debug, serde::Serialize)]
+ struct PageBody<'a> {
+     /// The events in this page, newest first.
+-    events: Vec<EventBody<'a>>,
++    events: Vec<ListedEventBody<'a>>,
+     /// Where the next page starts, or `null` when this page is the end of the stream.
+     next: Option<String>,
+ }
+@@ -706,7 +732,7 @@ async fn list_events(
+     match pagination::page(state.db().pool(), principal.tenant_id, &query).await {
+         Err(error) => error.into_response(),
+         Ok(page) => {
+-            let events = page.events.iter().map(EventBody::of).collect();
++            let events = page.events.iter().map(ListedEventBody::of).collect();
+             let next = page.next.as_ref().map(|cursor| cursor.as_str().to_owned());
+             (StatusCode::OK, Json(PageBody { events, next })).into_response()
+         }
+diff --git a/src/lib.rs b/src/lib.rs
+index 4732163..f80392d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -16,6 +16,7 @@
+ pub mod audit;
+ pub mod auth;
+ pub mod authz;
++pub mod backfill;
+ pub mod backoff;
+ pub mod claim;
+ pub mod concurrency;
+@@ -50,6 +51,7 @@ OPTIONS:
+     --listen-host <HOST>     address to bind (default 127.0.0.1)
+     --listen-port <PORT>     port to bind (default 8080; 0 asks the kernel)
+     --check-config           print the effective settings and exit
++    --backfill               fill the columns a migration added, in batches, and exit
+     --help                   print this help and exit
+     --version                print the version and exit
+ ";
+diff --git a/src/main.rs b/src/main.rs
+index 1492792..8cff43c 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -57,6 +57,25 @@ fn main() -> ExitCode {
+         }
+         return ExitCode::SUCCESS;
+     }
++    // The middle phase of a schema change (`relay/2.23-online-schema`), as a command rather than a
++    // paragraph: connect, make sure the schema is there, fill the rows that predate the column in
++    // batches, say how many, and exit. It does not serve, and it does not stop anything that is —
++    // which is the point of running it during a rollout.
++    if flags.backfill {
++        return match backfill_now(&config) {
++            Ok(report) => {
++                println!(
++                    "backfilled {} row(s) in {} batch(es)",
++                    report.rows, report.batches
++                );
++                ExitCode::SUCCESS
++            }
++            Err(error) => {
++                eprintln!("relay: {error}");
++                ExitCode::from(error.exit_code())
++            }
++        };
++    }
+ 
+     let run = RunId::of_this_process();
+     logging::init(config.log.format, &config.log.level, &run);
+@@ -69,6 +88,31 @@ fn main() -> ExitCode {
+     }
+ }
+ 
++/// Run the backfill of a column a migration added, on the database this configuration names.
++///
++/// `relay/2.23-online-schema` puts it here rather than in the library because it is the same
++/// decision the rest of this file makes: which pieces happen, in which order, and what the process
++/// exits with. The work itself is [`relay::backfill`].
++fn backfill_now(config: &Config) -> Result<relay::backfill::Backfilled, Error> {
++    let url = config.database.url.clone().ok_or_else(|| {
++        Error::Config(
++            "no database configured: set RELAY__DATABASE__URL or database.url in the config file"
++                .to_owned(),
++        )
++    })?;
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .map_err(|error| Error::Config(format!("tokio runtime: {error}")))?;
++    runtime.block_on(async move {
++        let db = relay::db::Db::connect(&url).await?;
++        // The migrations first: a backfill of a column that is not there yet is a statement about a
++        // table nobody has, and this is the one phase that cannot assume the schema arrived.
++        db.migrate().await?;
++        relay::backfill::run(db.pool(), relay::backfill::BATCH).await
++    })
++}
++
+ /// Build the runtime, the state and the listener, then serve until a signal arrives.
+ fn serve(config: Config, run: RunId) -> Result<(), Error> {
+     let address = format!("{}:{}", config.listen.host, config.listen.port);
+diff --git a/src/openapi.rs b/src/openapi.rs
+index a2bcdfa..133574d 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -372,6 +372,10 @@ pub fn document() -> Value {
+                     },
+                 },
+                 "Event": event_schema(false),
++                // The page's events carry one field the other route's do not
++                // (`relay/2.23-online-schema`), so they are a schema of their own: a document that
++                // reused `Event` here would be describing an answer this service does not give.
++                "ListedEvent": listed_event_schema(),
+                 "Page": {
+                     "type": "object",
+                     "additionalProperties": false,
+@@ -379,7 +383,7 @@ pub fn document() -> Value {
+                     "properties": {
+                         "events": {
+                             "type": "array",
+-                            "items": { "$ref": "#/components/schemas/Event" },
++                            "items": { "$ref": "#/components/schemas/ListedEvent" },
+                         },
+                         "next": {
+                             "type": ["string", "null"],
+@@ -563,6 +567,28 @@ fn answer(schema: &str, description: &str) -> Value {
+ /// One function for both shapes on purpose: `POST /events` answers with the event and whether it
+ /// was already there, and the listing answers with the events alone. A field renamed in one of them
+ /// and not the other is the kind of drift a document is supposed to make impossible.
++/// The schema of one event in a page: [`event_schema`], plus the size of what it carried.
++fn listed_event_schema() -> Value {
++    let mut schema = event_schema(false);
++    let object = schema
++        .as_object_mut()
++        .unwrap_or_else(|| unreachable!("the event schema is an object"));
++    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
++        properties.insert(
++            "bytes".to_owned(),
++            json!({
++                "type": "integer",
++                "minimum": 0,
++                "description": "Bytes of the payload this event was accepted with.",
++            }),
++        );
++    }
++    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
++        required.push(json!("bytes"));
++    }
++    schema
++}
++
+ fn event_schema(replayed: bool) -> Value {
+     let mut properties = Map::new();
+     properties.insert(
+diff --git a/src/pagination.rs b/src/pagination.rs
+index 65afe5c..28ded67 100644
+--- a/src/pagination.rs
++++ b/src/pagination.rs
+@@ -97,11 +97,30 @@ pub struct Query {
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Page {
+     /// The events in this page, in the order the cursor continues from.
+-    pub events: Vec<Event>,
++    pub events: Vec<Listed>,
+     /// Where the next page starts, or `None` when this page is the end of the stream.
+     pub next: Option<Cursor>,
+ }
+ 
++/// One event in a page: the event, and how big the payload it was accepted with was.
++///
++/// The size is a second field rather than a field of [`Event`] because it belongs to *this* view:
++/// `POST /events` answers with the event it stored and has no reason to measure it, and the page is
++/// where a caller asks "what is this tenant sending" (`relay/2.23-online-schema`).
++#[derive(Debug, Clone, PartialEq)]
++pub struct Listed {
++    /// The event itself, exactly as `POST /events` answers with it.
++    pub event: Event,
++    /// The bytes of the payload text this event was stored with.
++    ///
++    /// Read from the column the expand migration added, and **computed from the payload when that
++    /// column is empty** — which is what a row accepted before the migration, and not yet
++    /// backfilled, looks like. That fallback is the difference between a column arriving and the
++    /// read path breaking: the contract phase (a later release) is what removes it, and it can only
++    /// be removed once no row can be empty.
++    pub bytes: i64,
++}
++
+ /// Read one page of a tenant's events.
+ ///
+ /// # Errors
+@@ -125,8 +144,12 @@ pub async fn page(pool: &PgPool, tenant: TenantId, query: &Query) -> Result<Page
+     // combinations (with and without a cursor, with and without a filter) in one plan, and the row
+     // comparison `(received_at, id) < (…)` is the same order the index is in — and the same order
+     // the position is a pair for.
+-    let rows: Vec<(Uuid, String, String, DateTime<Utc>)> = sqlx::query_as(
+-        "select id, kind, payload::text, received_at from events \
++    // `coalesce` is the whole of the read path's half of the expand phase: the stored number when
++    // there is one, and the same expression the backfill writes when there is not.
++    let rows: Vec<(Uuid, String, String, DateTime<Utc>, i64)> = sqlx::query_as(
++        "select id, kind, payload::text, received_at, \
++                coalesce(payload_bytes, octet_length(payload::text))::bigint \
++           from events \
+          where tenant_id = $1 \
+            and ($2::text is null or kind = $2) \
+            and ($3::timestamptz is null or (received_at, id) < ($3, $4)) \
+@@ -143,13 +166,16 @@ pub async fn page(pool: &PgPool, tenant: TenantId, query: &Query) -> Result<Page
+     .map_err(Error::Database)?;
+ 
+     let mut events = Vec::with_capacity(rows.len());
+-    for (id, kind, payload, received_at) in rows {
+-        events.push(Event {
+-            id,
+-            tenant_id: tenant,
+-            kind,
+-            payload: events::decode_payload(&payload)?,
+-            received_at,
++    for (id, kind, payload, received_at, bytes) in rows {
++        events.push(Listed {
++            event: Event {
++                id,
++                tenant_id: tenant,
++                kind,
++                payload: events::decode_payload(&payload)?,
++                received_at,
++            },
++            bytes,
+         });
+     }
+ 
+@@ -161,7 +187,7 @@ pub async fn page(pool: &PgPool, tenant: TenantId, query: &Query) -> Result<Page
+         // The extra row was only ever the answer to "is there more?": the page is the rows the
+         // caller asked for, and the cursor points at the last of *those*, not at the extra one.
+         events.truncate(page_size);
+-        events.last().map(Cursor::after)
++        events.last().map(|listed| Cursor::after(&listed.event))
+     } else {
+         None
+     };
