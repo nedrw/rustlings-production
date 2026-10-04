@@ -1,6 +1,6 @@
 //! What the daemon was asked to do, and where the answer came from.
 //!
-//! The layering is T1's `mailer/1.4-layered-config` again, in a service that has no HTTP surface:
+//! The layering is T1's `mailer/1.4-config` again, in a service that has no HTTP surface:
 //! defaults in code, a TOML file next, the environment last, and the command line above all of
 //! them — each layer saying which key it changed, so `--check-config` can tell an operator what the
 //! process will actually do. One rule survives from that step unchanged: **the effective settings
@@ -101,7 +101,7 @@ impl Config {
     /// Merge defaults, the `--config` file, the environment and the flags.
     ///
     /// `env` is passed in rather than read here, so a test can state the environment it means
-    /// (T1's `mailer/1.4-layered-config` did this the same way, and for the same reason: a test that
+    /// (T1's `mailer/1.4-config` did this the same way, and for the same reason: a test that
     /// mutates the process environment cannot run beside another one).
     ///
     /// # Errors

@@ -50,7 +50,7 @@ fn scratch(label: &str) -> PathBuf {
 
 #[test]
 fn the_effective_configuration_is_reported_without_starting_the_service() {
-    // The layers a learner met in `mailer/1.4-layered-config`: defaults, then the file, then the
+    // The layers a learner met in `mailer/1.4-config`: defaults, then the file, then the
     // environment, then the flags. The file is written here so the case exercises all four.
     let dir = scratch("check-config");
     let file = dir.join("jobqd.toml");
@@ -104,7 +104,7 @@ fn the_effective_configuration_is_reported_without_starting_the_service() {
     assert!(
         !report.contains("hunter2"),
         "the report must not contain the password: it ends up in a ticket, a paste and a log line \
-         (`mailer/1.4-layered-config` made the same promise): {report}"
+         (`mailer/1.4-config` made the same promise): {report}"
     );
 }
 

@@ -1,6 +1,6 @@
 //! Structured logging, configured once at startup.
 //!
-//! Same shape as `mailer/1.6-structured-logs` and `relay`'s copy of it — one subscriber, JSON or
+//! Same shape as `mailer/1.6-logging` and `relay`'s copy of it — one subscriber, JSON or
 //! text, a run id on every line — with one difference that this project forces: the daemon has no
 //! request to hang a span on, so the *worker and the job* are the fields. Step
 //! `jobq/3.17-error-budget-alerts` is where those fields are judged as a contract.

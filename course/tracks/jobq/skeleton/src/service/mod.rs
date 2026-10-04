@@ -28,7 +28,7 @@ pub use logging::RunId;
 /// Build the store the settings name, announce that this process is draining, and wait for a
 /// signal.
 ///
-/// The order is the point, and it is the same one `mailer/1.9-migrations` established: everything
+/// The order is the point, and it is the same one `mailer/1.9-postgres` established: everything
 /// the process needs is in place *before* it says it is running, because a process that announces
 /// first and fails later is one an orchestrator routes work to.
 ///

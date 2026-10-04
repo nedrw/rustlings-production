@@ -482,7 +482,7 @@ index 15e0ecb..1c4a26c 100644
 +                    self.log.format = LogFormat::parse(value)?;
 +                }
 +                // A misspelled variable that is quietly ignored is how a process runs with a
-+                // setting nobody chose (the lesson of `mailer/1.4-layered-config`).
++                // setting nobody chose (the lesson of `mailer/1.4-config`).
 +                _ => {
 +                    return Err(Error::Invalid {
 +                        detail: format!("`{name}` is not a setting this daemon knows"),
@@ -643,7 +643,7 @@ index 44d9d27..27263db 100644
 +    }
 +
 +    // The first line of every run, and the one an operator uses to tell two runs apart in a
-+    // collector: T1's `mailer/1.6-structured-logs` asked for exactly this and it still holds.
++    // collector: T1's `mailer/1.6-logging` asked for exactly this and it still holds.
 +    tracing::info!(run = %run, "logging installed");
 +    Ok(())
  }
