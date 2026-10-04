@@ -201,8 +201,20 @@ fn list(findings: &[Finding]) -> String {
 
 /// Read every markdown page under `root` and judge its targets.
 pub fn scan(root: &Path) -> Result<Scan> {
+    scan_skipping(root, &[])
+}
+
+/// The same scan, with directories named in `skip` left out wherever they appear.
+///
+/// It exists for one caller: the repository-wide report. The course keeps its learner projects
+/// under a directory of its own (`app/<track>`, the tracks' `project` setting), and those pages are
+/// the *learner's* work in progress — the step's own `links` gate judges them while they are being
+/// written, and a half-finished project must never turn the repository's check red. So the report
+/// that has the repository as its root skips them, and says so rather than hiding it; the same
+/// directories are skipped by `cargo xtask ci`, so a maintainer and CI read one answer.
+pub fn scan_skipping(root: &Path, skip: &[&str]) -> Result<Scan> {
     let mut pages: Vec<Page> = Vec::new();
-    for path in markdown_files(root)? {
+    for path in markdown_files(root, skip)? {
         let text = read(&path)?;
         pages.push(Page {
             relative: relative_name(root, &path),
@@ -316,15 +328,15 @@ fn names_heading(anchors: &[String], anchor: &str) -> bool {
 }
 
 /// Every markdown file under `root`, sorted so two scans of one tree agree.
-fn markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
+fn markdown_files(root: &Path, skip: &[&str]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    walk(root, &mut files)?;
+    walk(root, skip, &mut files)?;
     files.sort();
     Ok(files)
 }
 
 /// Collect markdown files, skipping what is not the project.
-fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn walk(dir: &Path, skip: &[&str], files: &mut Vec<PathBuf>) -> Result<()> {
     let unreadable = |source| KilnError::Read {
         path: dir.to_path_buf(),
         source,
@@ -343,10 +355,10 @@ fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             continue;
         }
         if kind.is_dir() {
-            if name.starts_with('.') || name == GENERATED_DIR {
+            if name.starts_with('.') || name == GENERATED_DIR || skip.contains(&name.as_ref()) {
                 continue;
             }
-            walk(&entry.path(), files)?;
+            walk(&entry.path(), skip, files)?;
             continue;
         }
         if is_markdown(&name) {
@@ -1019,5 +1031,28 @@ mod tests {
         let scan = scan(temp.path()).expect("the tree should be readable");
         assert_eq!(scan.pages(), 1);
         assert!(scan.is_clean(), "{:?}", scan.findings());
+    }
+
+    #[test]
+    fn the_repository_scan_leaves_the_learner_s_project_out_and_the_gate_does_not() {
+        let temp = TempDir::new("links-learner");
+        temp.write("docs/plan.md", "# Plan\n\n[runbook](runbook.md)\n");
+        temp.write("docs/runbook.md", "# Runbook\n\n## Steps\n");
+        // What a project looks like mid-step: the page exists, the target does not yet.
+        temp.write("app/mailer/docs/runbook.md", "# Runbook\n\n[dash](TODO)\n");
+
+        let scan = scan_skipping(temp.path(), &["app"]).expect("the tree should be readable");
+        assert_eq!(
+            scan.pages(),
+            2,
+            "the repository's own pages, and only those"
+        );
+        assert!(scan.is_clean(), "{:?}", scan.findings());
+
+        // The same page, judged the way its step's gate judges it, is a failure — which is what a
+        // learner is supposed to see while the step is unfinished.
+        let outcome = judge(&temp.path().join("app/mailer")).expect("the tree should be readable");
+        assert_eq!(outcome.outcome, Outcome::Failed);
+        assert!(outcome.detail.contains("TODO"), "{}", outcome.detail);
     }
 }

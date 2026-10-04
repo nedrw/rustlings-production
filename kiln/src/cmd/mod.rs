@@ -258,10 +258,12 @@ pub enum Command {
     /// Check the links in a tree of markdown (default: this repository).
     ///
     /// The offline half is the `links` gate, so a learner sees exactly what the gate sees; a
-    /// maintainer can point it at the whole repository. `--external` adds the one thing no gate may
-    /// do — fetch a URL — which is why it is a flag here rather than a gate (plan §6).
+    /// maintainer can point it at the whole repository, whose own pages are what the default report
+    /// covers — the directories holding learner projects are skipped and named.
+    /// `--external` adds the one thing no gate may do — fetch a URL — which is why it is a flag here
+    /// rather than a gate (plan §6).
     Links {
-        /// Directory to scan (default: the repository root).
+        /// Directory to scan (default: the repository root, learner projects aside).
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
 

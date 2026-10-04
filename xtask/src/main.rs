@@ -51,6 +51,8 @@ fn ci() -> Result<(), String> {
     run(&root, "cargo", &["test", "--workspace"])?;
     spec_integrity(&root)?;
     lint_caps(&root)?;
+    // `links` reads the tree and answers in under a second; `probe_check` starts a scratch crate.
+    links(&root)?;
     probe_check(&root)?;
     // The course's own anti-rot check (plan §10). It is the command a learner can run too, so CI
     // and a human have one implementation between them, not two.
@@ -195,6 +197,44 @@ fn collect_rust(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// The repository's own markdown, held to the rule a learner's pages are held to.
+///
+/// `links` is offline by decision (plan §6), which is what makes it CI material: every thing it
+/// judges — does a relative target resolve, does an anchor name a heading that exists, is a target
+/// a placeholder — is a fact about the tree, and the answer is the same on two machines. Until this
+/// step existed, link rot in the repository's own pages (README, docs/) was only caught by a
+/// maintainer remembering to run `kiln links` by hand.
+///
+/// The learner projects under `app/` are skipped, exactly as the command's default report skips
+/// them: they are working copies, mid-step placeholders are the point of them, and the step's own
+/// `links` gate is what judges them.
+fn links(root: &Path) -> Result<(), String> {
+    println!("xtask ci: kiln links (offline; the repository's own markdown)");
+    let course = kiln::info::Course::load(root).map_err(|error| error.to_string())?;
+    let skipped = course.project_roots();
+    let names: Vec<&str> = skipped.iter().map(String::as_str).collect();
+    let scan =
+        kiln::gates::links::scan_skipping(root, &names).map_err(|error| error.to_string())?;
+    println!(
+        "  {} page(s) · {} link(s) · {} external target(s) (not fetched)",
+        scan.pages(),
+        scan.links(),
+        scan.external().len()
+    );
+    for name in &skipped {
+        println!("  skipped {name}/ — a learner's project, judged by its step's `links` gate");
+    }
+    if scan.is_clean() {
+        return Ok(());
+    }
+    for finding in scan.findings() {
+        println!("  {}", finding.line());
+    }
+    Err(format!(
+        "{} link(s) in the repository's markdown do not resolve",
+        scan.findings().len()
+    ))
+}
 /// Repository root, derived from this crate's location so the task works from anywhere.
 fn workspace_root() -> Result<PathBuf, String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -470,6 +470,27 @@ impl Course {
         &self.tracks
     }
 
+    /// The top-level directories the tracks keep their learner projects in (`app`, today).
+    ///
+    /// A learner project is a *working copy*, not course material: it is rewritten by `kiln run` and
+    /// `kiln reset`, it is where a learner is mid-step with placeholders on purpose, and it is
+    /// usually not under version control at all. Anything that judges the repository's own files
+    /// (the repository-wide `links` report, `cargo xtask ci`) walks past these, so its answer does
+    /// not depend on how far the person running it happens to have got.
+    #[must_use]
+    pub fn project_roots(&self) -> Vec<String> {
+        let mut roots: Vec<String> = self
+            .tracks
+            .iter()
+            .filter_map(|track| track.project.split('/').next())
+            .filter(|component| !component.is_empty())
+            .map(str::to_owned)
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
     /// Look up a track by id.
     pub fn track(&self, id: &str) -> Result<&Track> {
         self.tracks

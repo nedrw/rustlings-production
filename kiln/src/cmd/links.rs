@@ -9,8 +9,15 @@
 //!
 //! Exit codes: 0 nothing is gone, 1 at least one target answered with 404 or 410, 2 the fetch could
 //! not run at all (no `curl`) or the tree could not be read. Codes that only mean "a server did not
-//! want to answer a robot" — 403, 429, 5xx, a timeout — are printed as `?` and never make the command
+//! want to answer a robot" — 403, 429, 5xx, a timeout — are printed as `?` and never make the
+//! command
 //! fail: a check that goes red for reasons outside the tree is the kind of red nobody follows.
+//!
+//! A report about the repository covers the repository: the directories holding learner projects
+//! (`app/<track>`) are skipped and named, because a working copy mid-step has placeholders in it by
+//! design and this command is what a maintainer runs to check the course's own pages. `cargo xtask
+//! ci` skips exactly the same directories, so the two agree on what "the repository is clean"
+//! means. Passing a path (`kiln links app/mailer`) checks that tree and nothing else.
 
 use std::path::Path;
 use std::time::Duration;
@@ -28,10 +35,16 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = "kiln-link-check/1";
 
 /// Scan a tree and report; `--external` adds the network pass.
+///
+/// With no path the report covers the repository's own markdown, in the same sense `cargo xtask ci`
+/// means it: the directories holding learner projects (`Course::project_roots`) are skipped and
+/// named as skipped. Pointing the command at a path — `kiln links app/mailer` — prints a report
+/// about exactly that tree, which is how a step's `links` gate sees it.
 pub fn run(session: &Session, path: Option<&Path>, external: bool) -> Result<u8> {
-    let root = match path {
-        Some(path) => path.to_path_buf(),
-        None => session.course().root().to_path_buf(),
+    let course = session.course();
+    let (root, skipped) = match path {
+        Some(path) => (path.to_path_buf(), Vec::new()),
+        None => (course.root().to_path_buf(), course.project_roots()),
     };
     if !root.is_dir() {
         return Err(KilnError::Invalid(format!(
@@ -40,7 +53,8 @@ pub fn run(session: &Session, path: Option<&Path>, external: bool) -> Result<u8>
         )));
     }
 
-    let scan = links::scan(&root)?;
+    let names: Vec<&str> = skipped.iter().map(String::as_str).collect();
+    let scan = links::scan_skipping(&root, &names)?;
     println!("kiln links · {}", root.display());
     println!(
         "  {} page(s) · {} link(s) · {} external target(s)",
@@ -48,6 +62,12 @@ pub fn run(session: &Session, path: Option<&Path>, external: bool) -> Result<u8>
         scan.links(),
         scan.external().len()
     );
+    for name in &skipped {
+        println!(
+            "  skipped {name}/ — a learner's project, judged by its step's `links` gate \
+             (`kiln links {name}/<track>` checks one)"
+        );
+    }
     for finding in scan.findings() {
         println!("✗ {}", finding.line());
     }
