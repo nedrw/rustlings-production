@@ -1,0 +1,609 @@
+diff --git a/migrations/0001_jobs.sql b/migrations/0001_jobs.sql
+index 318d9bf..c4c50bc 100644
+--- a/migrations/0001_jobs.sql
++++ b/migrations/0001_jobs.sql
+@@ -1,10 +1,31 @@
+--- The `jobs` table, in the shape the port reads and writes.
++-- The queue's own table: one row per job, and the state a worker moved it through.
+ --
+ -- Step `jobq/3.5-store-port-conformance`. This is the project's first migration: `mailer` and
+ -- `relay` number their own files, and neither counter has anything to do with this project's.
+ --
+--- The file is yours to write. What it has to hold is what the port carries and nothing a caller
+--- cannot see -- identity, the queue, the payload, where the job is, its priority, the instant it
+--- may run, the attempts it has spent, the budget it was given, and the last reason it failed. The
+--- one question the table has to answer *while other claims are in flight* is `Store::claim`, so the
+--- predicate that claim runs (queue, state, `run_at`) is the one worth an index.
++-- The columns are the ones the port carries and nothing a caller cannot see. Two decisions in here
++-- are worth the paragraphs:
++--
++--   * `attempts` and `max_attempts` are `bigint`, so the engine's `u32` budget is stored without a
++--     conversion that could fail (`Store::enqueue` takes a budget of any size, and a backend that
++--     answered "too big for my column" would be a backend with an opinion the port does not have);
++--   * the claim's predicate is `queue`, `state` and `run_at`, which is what the partial index below
++--     is for. `claim` runs against a table that is mostly *not* due, on a statement that holds row
++--     locks, so the index is what keeps a claim from scanning the finished work to find the queue.
++--
++-- The order the port promises (priority, then the longest due, then identity) is not an index
++-- concern: `claim` sorts the rows it is about to stamp, which is a handful of rows, not the table.
++
++create table jobs (
++    id uuid primary key,
++    queue text not null,
++    payload jsonb not null,
++    state text not null,
++    priority integer not null,
++    run_at timestamptz not null,
++    attempts bigint not null,
++    max_attempts bigint not null,
++    last_error text
++);
++
++create index jobs_claimable on jobs (queue, run_at) where state = 'queued';
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index f7606d8..85c4d84 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -26,4 +26,6 @@ pub use domain::{
+ };
+ pub use error::Error;
+ pub use scheduler::Engine;
++#[cfg(feature = "postgres")]
++pub use store::PostgresStore;
+ pub use store::{BoxFuture, MemoryStore, Store};
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index ec5f929..132bf5d 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -41,11 +41,19 @@ impl MemoryStore {
+ 
+     /// Jobs in one queue that are due, in claim order.
+     ///
+-    /// Claim order is the engine's promise, which is why it lives here and not in a query: higher
++    /// Claim order is the port's promise, which is why it lives here and not in a query: higher
+     /// priority first, then the job that has been due longest, then identity — never the order a
+     /// map happens to hand out. Step `jobq/3.9-priority-fairness` is where this gets a policy.
+-    fn due(&self, queue: &Queue, now: chrono::DateTime<chrono::Utc>) -> Vec<JobId> {
+-        let jobs = self.jobs();
++    ///
++    /// The map is passed in rather than locked here, and that is what makes the answer safe to act
++    /// on: `claim` selects and stamps under *one* lock, so the rows this function names cannot be
++    /// claimed by somebody else in between (step `jobq/3.5-store-port-conformance` is the step that
++    /// found the other spelling of this — select, unlock, stamp — handing one job to two workers).
++    fn due(
++        jobs: &BTreeMap<JobId, Job>,
++        queue: &Queue,
++        now: chrono::DateTime<chrono::Utc>,
++    ) -> Vec<JobId> {
+         let mut due: Vec<&Job> = jobs
+             .values()
+             .filter(|job| job.queue == *queue && job.state == JobState::Queued && job.run_at <= now)
+@@ -107,8 +115,11 @@ impl Store for MemoryStore {
+             // implementations must answer the same questions.
+             let _ = worker;
+             let now = chrono::Utc::now();
+-            let due = self.due(queue, now);
++            // One lock, one decision: choosing the due jobs and stamping them happen in the same
++            // critical section, so a second claim on this store cannot read the same row as free
++            // while this one is on its way to marking it running.
+             let mut jobs = self.jobs();
++            let due = Self::due(&jobs, queue, now);
+             let mut claimed = Vec::new();
+             for id in due.into_iter().take(limit) {
+                 if let Some(job) = jobs.get_mut(&id) {
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 3550fcb..d3c0a14 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -2,8 +2,13 @@
+ //!
+ //! A port is a promise in two directions. The engine promises to use nothing but these methods, so
+ //! a backend only has to implement them; a backend promises the behaviour the conformance suite
+-//! asserts (step `jobq/3.5-store-port-conformance` is where the durable backend and that suite
+-//! arrive), so the engine does not have to care which one it was handed.
++//! asserts, so the engine does not have to care which one it was handed.
++//!
++//! `jobq/3.5-store-port-conformance` is the step that makes the second half of that real: it adds
++//! the durable backend below and the suite that runs the same assertions against both of them. A
++//! promise the suite asserts has to be a promise written *here* — a suite that reads a backend
++//! instead of the port is a suite that certifies one implementation, and the disagreement it
++//! cannot see is the one this whole arrangement exists to catch.
+ //!
+ //! The methods return boxed futures rather than being `async fn`: a trait with an `async fn` is not
+ //! dyn-compatible (rustc E0038, docs/handoff-m0.md §2), and the worker holds its store behind a
+@@ -23,8 +28,14 @@ use crate::engine::error::Error;
+ use crate::engine::sealed::Sealed;
+ 
+ pub(crate) mod memory;
++/// The durable backend, which is a feature rather than a fixture: a build that does not ask for it
++/// has no driver in it at all (step `jobq/3.4-feature-assembly`).
++#[cfg(feature = "postgres")]
++pub(crate) mod postgres;
+ 
+ pub use memory::MemoryStore;
++#[cfg(feature = "postgres")]
++pub use postgres::PostgresStore;
+ 
+ /// A future that can cross a trait object.
+ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+@@ -44,8 +55,14 @@ pub trait Store: Sealed + Send + Sync + 'static {
+ 
+     /// Take up to `limit` due jobs for `worker`, and mark them running.
+     ///
+-    /// Two workers asking at the same time must come back with disjoint sets: that is the whole
+-    /// reason the port exists rather than every caller writing its own query.
++    /// Claim order is part of the port rather than a detail of one backend: the jobs that are due
++    /// come back highest priority first, then the one that has been due longest, then by ascending
++    /// identity — never in whatever order a store happens to hand its rows out, because a caller
++    /// that receives work in a different sequence from every backend has no policy at all
++    /// (`jobq/3.9-priority-fairness` is where the policy behind the order is argued, and it can
++    /// only be argued because the port fixes the order first). Two workers asking at the same time
++    /// must come back with disjoint sets: that is the whole reason the port exists rather than
++    /// every caller writing its own query.
+     ///
+     /// # Errors
+     ///
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 180d3f8..86c96ae 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -22,13 +22,24 @@
+ //! The schema this file talks to is `migrations/0001_jobs.sql`, and the port's five methods are the
+ //! only place the column names appear: no other file in the crate knows that jobs live in a table.
+ 
++use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
++use sqlx::postgres::PgPoolOptions;
++use uuid::Uuid;
+ 
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::store::{BoxFuture, Store};
+ 
++// Why the statements below are written out rather than assembled, and why they look the way they
++// do: `sqlx` 0.9 takes a `&'static str` and nothing else (`SqlSafeStr`), so a query built with
++// `format!` is a compile error rather than a habit — the right trade here, where no caller data
++// reaches the SQL text (every value travels as a bind parameter) and the column list is therefore
++// spelled out in full wherever it is projected. The payload is cast to `text` in each projection
++// rather than decoded by the driver: the JSON is a `serde_json` value this crate already owns, and
++// the driver is asked for a string instead of being taught a second JSON type.
++
+ /// Jobs in a Postgres table, reached through one pool.
+ ///
+ /// It is a backend this crate certifies, so it carries the seal that lets the port accept it (step
+@@ -48,8 +59,12 @@ impl PostgresStore {
+     /// [`Error::Store`] when the pool cannot be opened — a refused connection, a database that does
+     /// not exist, a connection string this driver cannot read.
+     pub async fn connect(url: &str) -> Result<Self, Error> {
+-        let _ = url;
+-        todo!("jobq/3.5-store-port-conformance: open a pool against the URL the caller handed over")
++        // The pool's own defaults, deliberately: how many connections a deployment wants is a
++        // setting, and the configuration that would carry one belongs to the process that runs a
++        // pool of workers rather than to the store. `connect` waits for a real connection, so a URL
++        // that cannot be reached is refused here instead of at the first claim.
++        let pool = PgPoolOptions::new().connect(url).await.map_err(refused)?;
++        Ok(Self { pool })
+     }
+ 
+     /// Bring the schema up to date.
+@@ -62,7 +77,10 @@ impl PostgresStore {
+     ///
+     /// [`Error::Store`] when a migration fails.
+     pub async fn migrate(&self) -> Result<(), Error> {
+-        todo!("jobq/3.5-store-port-conformance: apply the migrations in `migrations/`")
++        sqlx::migrate!("./migrations")
++            .run(&self.pool)
++            .await
++            .map_err(|error| refused(sqlx::Error::Migrate(Box::new(error))))
+     }
+ }
+ 
+@@ -71,8 +89,44 @@ impl Sealed for PostgresStore {}
+ impl Store for PostgresStore {
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
+         Box::pin(async move {
+-            let _ = request;
+-            todo!("jobq/3.5-store-port-conformance: validate the request and insert the row")
++            if request.max_attempts == 0 {
++                return Err(Error::Invalid {
++                    detail: "a job with a budget of zero attempts can never run: either give it \
++                             one attempt or do not queue it"
++                        .to_owned(),
++                });
++            }
++            let payload = serde_json::to_string(&request.payload)
++                .map_err(|error| unreadable("payload", error.to_string()))?;
++            // The identity is the engine's, not the database's: a row whose key was invented by
++            // whichever backend happened to store it is a row whose key changes when the deployment
++            // moves it to the other one.
++            let id = JobId::new();
++            let row: JobRow = sqlx::query_as(
++                "insert into jobs \
++                     (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
++                 values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
++                 returning id, queue, payload::text as payload, state, priority, run_at, \
++                           attempts, max_attempts, last_error",
++            )
++            .bind(id.as_uuid())
++            .bind(request.queue.as_str())
++            .bind(payload)
++            .bind(JobState::Queued.as_str())
++            .bind(request.priority)
++            // `None` means "as soon as somebody looks", and the instant that becomes is the
++            // engine's clock — the same one the in-memory backend reads (step
++            // `jobq/3.8-clock-injection` moves it behind an injected clock for both of them at
++            // once).
++            .bind(request.run_at.unwrap_or_else(Utc::now))
++            // `i64::from(u32)` is total, which is why the budget column is a `bigint`: storing it
++            // as a 32-bit integer would make "the caller asked for more attempts than the table
++            // holds" a case this method has to answer, and there is no good answer to it.
++            .bind(i64::from(request.max_attempts))
++            .fetch_one(&self.pool)
++            .await
++            .map_err(refused)?;
++            row.into_job()
+         })
+     }
+ 
+@@ -83,10 +137,51 @@ impl Store for PostgresStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            let _ = (worker, queue, limit);
+-            todo!(
+-                "jobq/3.5-store-port-conformance: take the due jobs and stamp them, in one statement"
++            // Nothing records who holds a job yet (step `jobq/3.7-leases-and-recovery` adds the
++            // lease), so the worker is not written down here either — the two backends have to
++            // answer the same questions, and an answer the in-memory store cannot give is not one
++            // the port may rely on. The name is still the interface.
++            let _ = worker;
++            let now = Utc::now();
++            // One statement, and the shape of it is the whole promise: the rows are chosen with
++            // `for update skip locked` *inside* the update that stamps them, so a second claim
++            // running at the same time either waits for nothing (the row is already taken and it
++            // skips it) or finds a row that is still queued. Selecting the rows first and stamping
++            // them afterwards would leave the window in which both workers come back with the same
++            // job — the one concession the port does not make, because the engine would then run
++            // the same job twice with no way to notice.
++            //
++            // The outer `select` is what puts the answer in the port's claim order (priority, then
++            // longest due, then identity): `returning` says which rows changed, not in which
++            // order, and an order that comes out of the database by accident is an order that
++            // changes the day an index does.
++            let rows: Vec<JobRow> = sqlx::query_as(
++                "with taken as ( \
++                     update jobs set state = 'running', attempts = jobs.attempts + 1 \
++                     where id in ( \
++                         select id from jobs \
++                         where queue = $1 and state = 'queued' and run_at <= $2 \
++                         order by priority desc, run_at asc, id asc \
++                         limit $3 \
++                         for update skip locked \
++                     ) \
++                     returning id, queue, payload::text as payload, state, priority, run_at, \
++                               attempts, max_attempts, last_error \
++                 ) \
++                 select id, queue, payload::text as payload, state, priority, run_at, attempts, \
++                        max_attempts, last_error \
++                 from taken order by priority desc, run_at asc, id asc",
+             )
++            .bind(queue.as_str())
++            .bind(now)
++            // A `usize` limit is a `bigint` to Postgres, and the conversion can only fail for a
++            // queue no process could hold: saturating keeps that impossible case out of the port's
++            // error surface instead of adding a refusal nobody can reach.
++            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
++            .fetch_all(&self.pool)
++            .await
++            .map_err(refused)?;
++            rows.into_iter().map(JobRow::into_job).collect()
+         })
+     }
+ 
+@@ -96,8 +191,32 @@ impl Store for PostgresStore {
+         id: &'a JobId,
+     ) -> BoxFuture<'a, Result<(), Error>> {
+         Box::pin(async move {
+-            let _ = (worker, id);
+-            todo!("jobq/3.5-store-port-conformance: settle a job this worker is running")
++            let _ = worker;
++            // The `and state = 'running'` is the promise rather than a guard: a job nobody is
++            // running is a job whose outcome nobody gets to record, and a write that guessed
++            // would overwrite whatever the row was waiting for with "succeeded".
++            let written = sqlx::query(
++                "update jobs set state = 'succeeded', last_error = null \
++                                       where id = $1 and state = 'running'",
++            )
++            .bind(id.as_uuid())
++            .execute(&self.pool)
++            .await
++            .map_err(refused)?;
++            if written.rows_affected() > 0 {
++                return Ok(());
++            }
++            // Nothing changed, and there are two different reasons for that — which is why the
++            // refusal is a second question rather than a message invented here.
++            Err(match self.state_of(id).await? {
++                None => Error::NotFound { id: *id },
++                Some(state) => Error::Invalid {
++                    detail: format!(
++                        "job {id} is {state}, not running: only the worker that claimed it can \
++                         complete it"
++                    ),
++                },
++            })
+         })
+     }
+ 
+@@ -108,15 +227,182 @@ impl Store for PostgresStore {
+         reason: &'a str,
+     ) -> BoxFuture<'a, Result<JobState, Error>> {
+         Box::pin(async move {
+-            let _ = (worker, id, reason);
+-            todo!("jobq/3.5-store-port-conformance: count the attempt and decide queued-or-failed")
++            let _ = worker;
++            // Where a failed job goes is decided by the row's own budget, in the same statement
++            // that records the reason: a caller cannot be handed "queued" by a backend that then
++            // fails to write it, and the attempt count the in-memory backend keeps is the same
++            // count this `case` reads.
++            let row: Option<(String,)> = sqlx::query_as(
++                "update jobs set last_error = $2, \
++                     state = case when attempts < max_attempts then 'queued' else 'failed' end \
++                 where id = $1 and state = 'running' \
++                 returning state",
++            )
++            .bind(id.as_uuid())
++            .bind(reason)
++            .fetch_optional(&self.pool)
++            .await
++            .map_err(refused)?;
++            let Some((state,)) = row else {
++                return Err(match self.state_of(id).await? {
++                    None => Error::NotFound { id: *id },
++                    Some(state) => Error::Invalid {
++                        detail: format!(
++                            "job {id} is {state}, not running: a failure is only recorded against \
++                             an attempt somebody actually started"
++                        ),
++                    },
++                });
++            };
++            decode_state(&state)
+         })
+     }
+ 
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         Box::pin(async move {
+-            let _ = id;
+-            todo!("jobq/3.5-store-port-conformance: read one row")
++            let row: Option<JobRow> = sqlx::query_as(
++                "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
++                        max_attempts, last_error \
++                 from jobs where id = $1",
++            )
++            .bind(id.as_uuid())
++            .fetch_optional(&self.pool)
++            .await
++            .map_err(refused)?;
++            // A row that is not there is `Ok(None)` rather than an error: looking is allowed to
++            // come up empty, and the engine is the layer that turns that into `Error::NotFound`
++            // for the calls that owe the caller an answer about one specific job.
++            row.map(JobRow::into_job).transpose()
+         })
+     }
+ }
++
++impl PostgresStore {
++    /// What the `state` column says about one job, or `None` when there is no such row.
++    ///
++    /// Asked only after a write that changed nothing, to tell "this job is gone" from "this job is
++    /// not running" — the two refusals the port separates and the two a caller acts on
++    /// differently.
++    async fn state_of(&self, id: &JobId) -> Result<Option<String>, Error> {
++        let row: Option<(String,)> = sqlx::query_as("select state from jobs where id = $1")
++            .bind(id.as_uuid())
++            .fetch_optional(&self.pool)
++            .await
++            .map_err(refused)?;
++        Ok(row.map(|(state,)| state))
++    }
++}
++
++/// One row of `jobs`, in the shape the driver decodes it.
++///
++/// Not quite the shape [`Job`] has, and the difference is not cosmetic: Postgres' `bigint` arrives
++/// as `i64` while the engine counts in `u32`, the state is a text column, and the payload is JSON
++/// that this crate parses itself. [`JobRow::into_job`] is the one place those three are reconciled,
++/// so a row this backend wrote and cannot read back is reported where it can be seen rather than
++/// travelling through the engine as a nonsense value.
++#[derive(sqlx::FromRow)]
++struct JobRow {
++    /// Identity.
++    id: Uuid,
++    /// Queue name.
++    queue: String,
++    /// Payload, as text, parsed by `into_job`.
++    payload: String,
++    /// State, as text, decoded by `into_job`.
++    state: String,
++    /// Higher runs first.
++    priority: i32,
++    /// Not before this instant.
++    run_at: DateTime<Utc>,
++    /// Attempts started so far.
++    attempts: i64,
++    /// Attempts allowed in total.
++    max_attempts: i64,
++    /// Why the last attempt failed, when one did.
++    last_error: Option<String>,
++}
++
++impl JobRow {
++    /// The engine's row, or the reason the table holds something the engine cannot read.
++    fn into_job(self) -> Result<Job, Error> {
++        let queue =
++            Queue::parse(&self.queue).map_err(|error| unreadable("queue", error.to_string()))?;
++        let payload = serde_json::from_str(&self.payload)
++            .map_err(|error| unreadable("payload", error.to_string()))?;
++        Ok(Job {
++            id: JobId::from_uuid(self.id),
++            queue,
++            payload,
++            state: decode_state(&self.state)?,
++            priority: self.priority,
++            run_at: self.run_at,
++            attempts: count(self.attempts, "attempts")?,
++            max_attempts: count(self.max_attempts, "max_attempts")?,
++            last_error: self.last_error,
++        })
++    }
++}
++
++/// The `state` column, as the enum the engine uses.
++fn decode_state(text: &str) -> Result<JobState, Error> {
++    match text {
++        "queued" => Ok(JobState::Queued),
++        "running" => Ok(JobState::Running),
++        "succeeded" => Ok(JobState::Succeeded),
++        "failed" => Ok(JobState::Failed),
++        other => Err(unreadable(
++            "state",
++            format!("`{other}` is not a state this engine knows"),
++        )),
++    }
++}
++
++/// A count column, as the engine's unsigned count.
++///
++/// The table stores counts as `bigint`, so this is the one conversion between the two number types
++/// the two sides of the port use, and it is the direction that can fail: a negative or absurd count
++/// is not something this backend wrote, which makes it a store failure with a column name rather
++/// than a caller's problem.
++fn count(value: i64, column: &'static str) -> Result<u32, Error> {
++    u32::try_from(value).map_err(|_| unreadable(column, format!("{value} is not a count")))
++}
++
++/// A driver failure, as the port wants it: whole, for the caller that wants the detail.
++fn refused(source: sqlx::Error) -> Error {
++    Error::Store {
++        source: Box::new(source),
++    }
++}
++
++/// A row the engine cannot read back.
++fn unreadable(column: &'static str, detail: String) -> Error {
++    Error::Store {
++        source: Box::new(Unreadable { column, detail }),
++    }
++}
++
++/// Something in the `jobs` table that is not what this backend writes there.
++///
++/// A row this backend cannot read is a store failure and not a caller's mistake: the caller asked a
++/// question the port answers, and what came back was a value the engine has no meaning for. It is
++/// its own type so the message can name the column, and so a caller that wants to know whether the
++/// problem is its own input can `downcast_ref` and see that it is not.
++#[derive(Debug)]
++struct Unreadable {
++    /// Which column holds it.
++    column: &'static str,
++    /// What the engine made of the value.
++    detail: String,
++}
++
++impl std::fmt::Display for Unreadable {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            formatter,
++            "the `jobs` table holds a value the engine cannot read in `{}`: {}",
++            self.column, self.detail
++        )
++    }
++}
++
++impl std::error::Error for Unreadable {}
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 6790dff..009e3f2 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -78,11 +78,12 @@ fn open_store(config: &Config) -> Result<MemoryStore, Error> {
+ 
+ /// Open the durable backend the settings name.
+ ///
+-/// The durable backend arrives with `jobq/3.5-store-port-conformance` and lands **behind the
+-/// `postgres` feature**, which is what step `jobq/3.4-feature-assembly` builds: until it does, this
+-/// function is the seam, and what it can honestly do is refuse in the terms of *this* build — a
+-/// message that says whether the operator is looking at a build that has the feature and not the
+-/// backend yet, or at a build without the feature at all.
++/// The durable backend landed with `jobq/3.5-store-port-conformance`, behind the `postgres` feature
++/// that step `jobq/3.4-feature-assembly` builds — and this function is still a seam rather than the
++/// place a pool is opened, because what this process does with a store is drain it, and the loop
++/// that would arrives with `jobq/3.7-leases-and-recovery`. So what it can honestly do today is
++/// refuse in the terms of *this* build: a message that says whether the operator is looking at a
++/// build that has the feature and no drain loop, or at a build without the feature at all.
+ ///
+ /// The gate is deliberately in one function with one call site: a feature whose `cfg` is sprinkled
+ /// across the crate is a feature that is off in one code path and on in another, and the
+@@ -100,12 +101,14 @@ fn open_durable(url: &str) -> Result<MemoryStore, Error> {
+ /// What this build knows about a durable store, which is a compile-time fact.
+ ///
+ /// Two answers, because there are two different problems and only one of them is permanent: a build
+-/// that has the feature is waiting for a step, and a build without it is waiting for a flag. Both
+-/// name what to do next, because "use `memory`" tells an operator with a database nothing.
++/// that has the feature has a store and no loop to drain with it, and a build without the feature is
++/// waiting for a flag. Both name what to do next, because "use `memory`" tells an operator with a
++/// database nothing.
+ #[cfg(feature = "postgres")]
+ fn durable_backend() -> &'static str {
+-    "this build has the `postgres` feature, and the backend itself arrives with \
+-     `jobq/3.5-store-port-conformance`"
++    "this build has the `postgres` feature and the store it names — \
++     `jobq/3.5-store-port-conformance` ships that — and what this process is still missing is the \
++     worker loop that would drain one, which arrives with `jobq/3.7-leases-and-recovery`"
+ }
+ 
+ /// What this build knows about a durable store when the feature is off.
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index 7b1e852..46c6708 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -1,14 +1,16 @@
+ //! The test harness every jobq spec pulls in with `mod support;`.
+ //!
+-//! One fixture so far, one promise: nothing is shared between tests. Later steps add their own
+-//! fixture to this directory rather than growing this file — a step that needs a database adds
+-//! `postgres`, a step that needs both backends adds `store` — because the harness is the project's
+-//! own file. The specs (`tests/spec_*.rs`) are read-only and come from `course/`; this directory is
+-//! the learner's.
++//! Three fixtures, one promise: nothing is shared between tests. Each is a module of its own, and a
++//! spec uses the one it needs — a step that needs a database adds `postgres`, a step that has to
++//! judge the port rather than one backend adds `store` — because the harness is the project's own
++//! file, not the course's. The specs (`tests/spec_*.rs`) are read-only and come from `course/`; this
++//! directory is the learner's.
+ //!
+ //! | module | what it is | when a spec wants it |
+ //! | --- | --- | --- |
++//! | [`postgres`] | one Postgres container with one empty database, per test | anything a durable backend has to be measured against |
+ //! | [`service`] | the real `jobqd` binary as a child process: its log, its exit code, `SIGTERM` and `SIGKILL` | signals, drain order, crash recovery, two workers at once |
++//! | [`store`] | the store a conformance suite runs against, chosen by `KILN_BACKEND` | a spec that judges the port rather than one backend |
+ //!
+ //! Two rules hold for every fixture in here, and they are the reason the suite can run in parallel:
+ //!
+@@ -17,7 +19,16 @@
+ //! * **no fixture sleeps to synchronise.** Every wait is a condition with a deadline, so a failure
+ //!   says what it was waiting for instead of racing it.
+ 
++// The harness is a menu, and a spec orders from it: a fixture nothing in *this* target calls is not
++// unfinished work, it is a fixture another spec calls. The relaxation belongs at the root of the
++// directory rather than in each file, because there is no target in this project that compiles one
++// fixture without the module that declares it (authoring.md §7.4 says why a test target may be
++// relaxed, and this is that relaxation's smallest honest form).
++#![allow(dead_code)]
++
++pub mod postgres;
+ pub mod service;
++pub mod store;
+ 
+ /// One environment variable, as a fixture passes it to the process it starts.
+ ///
