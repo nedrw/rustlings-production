@@ -269,7 +269,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | --- | --- | --- | --- |
 | T1 `mailer` | rustlings 水平 | 服务骨架、类型化错误、迁移、后台 worker、可观测基线、容器发布 | 22 teach |
 | T2 `relay` | T1 全部 apply 级 | 至少一次投递、顺序与幂等、DLQ、签名、SSRF、限流、多租户 | 18 teach + 1 transfer + 5 deepen |
-| T3 `jobq` | T2 出口 + 库设计入门 | 库设计、事务深化、租约、cron、变异/覆盖率/基准、在线演进 | 编写时由 `lint-caps` 统计 |
+| T3 `jobq` | T2 出口 + 库设计入门 | 库设计、事务深化、租约、cron、变异/覆盖率/基准、在线演进 | 11 teach + 1 transfer + 14 deepen（在建） |
 | T4 `lakelet` | T3 出口 + 性能入门 | WAL 恢复、列式与压缩、查询引擎、批处理、剖析与 soak | 编写时由 `lint-caps` 统计 |
 | T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 编写时由 `lint-caps` 统计 |
 
@@ -371,6 +371,14 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | 2.24 | runbook v2 + 故障演练：DB 断连、下游慢、租户风暴 | deepen | `ops/degradation-modes@apply`（新增能力），并深化 T1 的 runbook 演练 | 三类演练脚本可复跑 |
 
 ## 8. T3 `jobq`：通用任务队列引擎（26 步）
+
+**状态：在建**（元数据、项目骨架与门阶梯已落地，逐步交付进度见
+[handoff-m2.md](handoff-m2.md) §2 与 [handoff-m2-log.md](handoff-m2-log.md)）。
+下面这张表是规划口径；实际交付以 `course/tracks/jobq/track.toml`（唯一真源）为准。
+
+origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见 `track.toml`。
+门阶梯：`clippy@2` 起，3.3 升 `@3`，3.20 升 `@4`；`semver@baseline` 从 3.2 起持久，
+`slow:conformance@2` 写在「判的就是存储端口」的步骤上。
 
 题材：把 T2 里临时实现的投递逻辑提炼成**可复用的引擎**（库 + worker 服务 + CLI）。
 这条 track 的重点从「写服务」转向「设计给别人用的东西」与「用工具证明质量」。
