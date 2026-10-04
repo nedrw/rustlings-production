@@ -14,6 +14,7 @@ use crate::caps::CapRequirement;
 use crate::cmd::Session;
 use crate::error::{EXIT_OK, Result};
 use crate::info::{Step, Track};
+use crate::probe::{self, Exercise, Probe};
 use crate::state::{State, StepStatus, days_between, unix_now};
 
 /// Why a step may be skipped.
@@ -54,13 +55,54 @@ pub enum Disposition {
     Skip(SkipReason),
 }
 
+/// The clause a keep-verdict prints when nothing is proven about the slot yet.
+fn prove_hint(probes: &[Probe], requirement: &CapRequirement) -> String {
+    match probe::exercise(probes, requirement.id.as_str(), requirement.level) {
+        Exercise::AtDepth(probe) => format!("`kiln probe {}` is what would prove it", probe.slug()),
+        Exercise::Shallower(probe) => format!(
+            "there is no exercise at {}; the closest is `kiln probe {}` ({}), which re-checks the \
+             habit and not this depth",
+            requirement.level,
+            probe.slug(),
+            probe.requirement().level
+        ),
+        Exercise::Missing => {
+            "there is no exercise for this slot (`kiln probe` lists the ones there \
+                              are), so this step cannot be skipped on proof"
+                .to_owned()
+        }
+    }
+}
+
+/// The clause a keep-verdict prints when the proof came from a step rather than a probe.
+fn recheck_hint(probes: &[Probe], requirement: &CapRequirement) -> String {
+    match probe::exercise(probes, requirement.id.as_str(), requirement.level) {
+        Exercise::AtDepth(probe) => format!(
+            "`kiln probe {}` is what re-checks it from an empty file",
+            probe.slug()
+        ),
+        Exercise::Shallower(probe) => format!(
+            "there is no exercise at {}; the closest is `kiln probe {}` ({}), which re-checks the \
+             habit — only redoing the step re-checks this depth",
+            requirement.level,
+            probe.slug(),
+            probe.requirement().level
+        ),
+        Exercise::Missing => {
+            "there is no exercise for this slot (`kiln probe` lists the ones there \
+                              are), so redoing the step is the only way back"
+                .to_owned()
+        }
+    }
+}
+
 /// Decide one step, from the learner's capability records alone.
 ///
 /// The rule has one sentence and one consequence. *A step may be skipped when every slot it
 /// teaches is proven by a probe the learner passed.* A step that teaches three slots and has two
 /// proven is **kept**: it still carries new material, and half a step is not a skip.
 #[must_use]
-pub fn disposition(state: &State, step: &Step) -> Disposition {
+pub fn disposition(state: &State, step: &Step, probes: &[Probe]) -> Disposition {
     let now = unix_now();
     if step.teaches.is_empty() {
         // R4 reports a step that teaches nothing as unbound metadata; here it is simply not
@@ -91,9 +133,10 @@ pub fn disposition(state: &State, step: &Step) -> Disposition {
                 return Disposition::Keep(Blocker {
                     requirement: Some(requirement.clone()),
                     detail: format!(
-                        "the deepest proof is {} ({}) — not a probe, so `kiln probe {}` is what \
-                         re-checks it from an empty file",
-                        record.evidence, record.level, requirement
+                        "the deepest proof is {} ({}) — not a probe; {}",
+                        record.evidence,
+                        record.level,
+                        recheck_hint(probes, requirement)
                     ),
                 });
             }
@@ -110,8 +153,9 @@ pub fn disposition(state: &State, step: &Step) -> Disposition {
                 return Disposition::Keep(Blocker {
                     requirement: Some(requirement.clone()),
                     detail: format!(
-                        "nothing proven about {} yet — `kiln probe {}` is what would prove it",
-                        requirement.id, requirement
+                        "nothing proven about {} yet — {}",
+                        requirement.id,
+                        prove_hint(probes, requirement)
                     ),
                 });
             }
@@ -122,8 +166,8 @@ pub fn disposition(state: &State, step: &Step) -> Disposition {
 
 /// One step's disposition, as a learner reads it.
 #[must_use]
-pub fn describe(state: &State, step: &Step) -> String {
-    match disposition(state, step) {
+pub fn describe(state: &State, step: &Step, probes: &[Probe]) -> String {
+    match disposition(state, step, probes) {
         Disposition::Skip(reason) => format!("skip ({})", reason.summary()),
         Disposition::Keep(blocker) => format!("keep ({})", blocker.detail),
     }
@@ -135,12 +179,15 @@ pub fn run(session: &Session, track: Option<&str>, fast: bool) -> Result<u8> {
         Some(id) => session.course().track(id)?,
         None => session.course().default_track()?,
     };
-    print_plan(session, track, fast);
+    // Read once, here: every verdict's wording depends on which exercises exist (`exercise`), and a
+    // report may not send a learner to a command that answers with an error.
+    let probes = probe::load(&session.course().dir())?;
+    print_plan(session, track, &probes, fast);
     Ok(EXIT_OK)
 }
 
 /// The plan itself, in the shape `kiln skip --all` acts on.
-pub fn print_plan(session: &Session, track: &Track, fast: bool) {
+pub fn print_plan(session: &Session, track: &Track, probes: &[Probe], fast: bool) {
     let state = session.state();
     let title = if fast { "plan --fast" } else { "plan" };
     let mut lines = Vec::new();
@@ -166,7 +213,7 @@ pub fn print_plan(session: &Session, track: &Track, fast: bool) {
         }
         planned += 1;
         if fast {
-            let disposition = disposition(state, step);
+            let disposition = disposition(state, step, probes);
             if matches!(disposition, Disposition::Skip(_)) {
                 skippable += 1;
             }
@@ -177,7 +224,7 @@ pub fn print_plan(session: &Session, track: &Track, fast: bool) {
             // The verdict gets its own line: it is a sentence, and a sentence pushed past the
             // terminal width is the column that stops being read.
             lines.push(format!("  {marker} {:<24} {teaches}", step.qualified_id()));
-            lines.push(format!("        {}", describe(state, step)));
+            lines.push(format!("        {}", describe(state, step, probes)));
         } else {
             lines.push(format!(
                 "  · {:<24} {:<34} {}",
@@ -227,12 +274,12 @@ pub fn print_plan(session: &Session, track: &Track, fast: bool) {
 
 /// The steps of a track the learner may skip right now, in order.
 #[must_use]
-pub fn skippable<'a>(state: &State, track: &'a Track) -> Vec<&'a Step> {
+pub fn skippable<'a>(state: &State, track: &'a Track, probes: &[Probe]) -> Vec<&'a Step> {
     track
         .step
         .iter()
         .filter(|step| state.status(&step.qualified_id()).is_unfinished())
-        .filter(|step| matches!(disposition(state, step), Disposition::Skip(_)))
+        .filter(|step| matches!(disposition(state, step, probes), Disposition::Skip(_)))
         .collect()
 }
 
@@ -251,7 +298,8 @@ mod tests {
     use crate::state::{Evidence, State};
     use crate::test_support::{TempDir, ledger_toml, load_course, one_track, step_toml};
 
-    /// A course with two steps: one that teaches two slots, one that teaches a single slot.
+    /// A course with three steps: one that teaches two slots, one that teaches a single slot, and
+    /// one that goes deeper than anything the catalogue holds.
     fn fixture() -> (TempDir, Course) {
         let temp = TempDir::new("plan-disposition");
         let steps = vec![
@@ -261,10 +309,12 @@ mod tests {
                 &["delivery/idempotency@apply", "db/migrations@apply"],
             ),
             step_toml("mailer", "1.2-second", &["db/migrations@apply"]),
+            step_toml("mailer", "1.3-deepen", &["delivery/idempotency@design"]),
         ];
         let ledger = ledger_toml(&[
             ("delivery/idempotency", "apply", "mailer/1.1"),
             ("db/migrations", "apply", "mailer/1.1"),
+            ("delivery/idempotency", "design", "mailer/1.3"),
         ]);
         let course = load_course(temp.path(), &one_track(&steps, &[]), &ledger);
         (temp, course)
@@ -277,52 +327,129 @@ mod tests {
         );
     }
 
+    /// Write one exercise per slot into the fixture course, then load the catalogue.
+    ///
+    /// The wording of a verdict depends on what `course/probes/` holds, so the tests read the same
+    /// catalogue the commands do instead of describing one.
+    fn catalogue(temp: &TempDir, course: &Course, slots: &[&str]) -> Vec<Probe> {
+        for slot in slots {
+            let slug = crate::probe::expected_slug(&slot.parse().expect("a slot"));
+            temp.write(
+                &format!("course/probes/{slug}.rs"),
+                &format!(
+                    "//! probe = \"{slot}\"\n//! title = \"A re-check\"\n//! hint = \"Try it again.\"\n\n\
+                     pub fn it_is_the_habit() {{ todo!() }}\n"
+                ),
+            );
+        }
+        crate::probe::load(&course.dir()).expect("the catalogue should load")
+    }
+
     #[test]
     fn a_step_is_kept_until_every_slot_it_teaches_is_proven() {
-        let (_temp, course) = fixture();
+        let (temp, course) = fixture();
+        let probes = catalogue(&temp, &course, &["db/migrations@apply"]);
         let track = course.track("mailer").expect("the fixture track");
         let first = course.step("mailer/1.1").expect("the first step");
         let second = course.step("mailer/1.2").expect("the second step");
 
         // Nothing proven: both steps are work.
         let state = State::default();
-        assert!(matches!(disposition(&state, first), Disposition::Keep(_)));
-        assert!(matches!(disposition(&state, second), Disposition::Keep(_)));
+        assert!(matches!(
+            disposition(&state, first, &probes),
+            Disposition::Keep(_)
+        ));
+        assert!(matches!(
+            disposition(&state, second, &probes),
+            Disposition::Keep(_)
+        ));
 
         // One of the two slots of `1.1` proven: `1.2` becomes skippable, `1.1` does not.
         let mut state = State::default();
         probe(&mut state, "db/migrations@apply");
         assert!(
-            matches!(disposition(&state, first), Disposition::Keep(_)),
+            matches!(disposition(&state, first, &probes), Disposition::Keep(_)),
             "half a step is not a skip"
         );
-        assert!(matches!(disposition(&state, second), Disposition::Skip(_)));
-        assert_eq!(skippable(&state, track).len(), 1);
+        assert!(matches!(
+            disposition(&state, second, &probes),
+            Disposition::Skip(_)
+        ));
+        assert_eq!(skippable(&state, track, &probes).len(), 1);
     }
 
     #[test]
     fn a_finished_step_is_not_the_same_evidence_as_a_probe() {
-        let (_temp, course) = fixture();
+        let (temp, course) = fixture();
+        let probes = catalogue(&temp, &course, &["db/migrations@apply"]);
         let second = course.step("mailer/1.2").expect("the second step");
         let mut state = State::default();
         state.record_capability(
             &"db/migrations@apply".parse().expect("a slot"),
             Evidence::Step("mailer/1.2-second"),
         );
-        let Disposition::Keep(blocker) = disposition(&state, second) else {
+        let Disposition::Keep(blocker) = disposition(&state, second, &probes) else {
             panic!("step evidence must not unlock a skip");
         };
         let detail = blocker.detail;
         assert!(detail.contains("not a probe"), "{detail}");
         assert!(
-            detail.contains("kiln probe db/migrations@apply"),
+            detail.contains("kiln probe db-migrations.apply"),
             "{detail}"
         );
     }
 
     #[test]
+    fn a_slot_with_no_exercise_is_not_sent_to_a_command_that_would_fail() {
+        let (temp, course) = fixture();
+        // The catalogue is empty, which is the state of a track whose slots were chosen ahead of
+        // its exercises: 13 of T2's 24 steps are in it. `kiln probe <slot>` exits 2 there, so the
+        // verdict has to say that instead of naming it.
+        let probes = catalogue(&temp, &course, &[]);
+        let first = course.step("mailer/1.1").expect("the first step");
+        let Disposition::Keep(blocker) = disposition(&State::default(), first, &probes) else {
+            panic!("nothing is proven, so the step is work");
+        };
+        let detail = blocker.detail;
+        assert!(detail.contains("no exercise for this slot"), "{detail}");
+        assert!(
+            !detail.contains("kiln probe db/migrations@apply"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_shallower_exercise_is_named_as_a_shallower_re_check() {
+        let (temp, course) = fixture();
+        // `delivery/idempotency` is taught at `design` by the third fixture step; the only exercise
+        // there is sits at `apply`. It may be named — as itself, not as a proof of `design`.
+        let probes = catalogue(&temp, &course, &["delivery/idempotency@apply"]);
+        let deepen = course.step("mailer/1.3-deepen").expect("the third step");
+        let Disposition::Keep(blocker) = disposition(&State::default(), deepen, &probes) else {
+            panic!("nothing is proven, so the step is work");
+        };
+        let detail = blocker.detail;
+        assert!(
+            detail.contains("there is no exercise at design"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("kiln probe delivery-idempotency.apply"),
+            "{detail}"
+        );
+        assert!(
+            matches!(
+                probe::exercise(&probes, "delivery/idempotency", crate::caps::Level::Design),
+                Exercise::Shallower(_)
+            ),
+            "a shallower exercise is not a proof of this depth"
+        );
+    }
+
+    #[test]
     fn a_deeper_depth_is_never_skipped() {
-        let (_temp, course) = fixture();
+        let (temp, course) = fixture();
+        let probes = catalogue(&temp, &course, &["db/migrations@apply"]);
         let first = course.step("mailer/1.1").expect("the first step");
         let mut state = State::default();
         // `db/migrations` is proven at `apply`; a step that teaches `design` would still be work.
@@ -334,7 +461,10 @@ mod tests {
             &"delivery/idempotency@apply".parse().expect("a slot"),
             Evidence::Probe("delivery-idempotency.apply"),
         );
-        assert!(matches!(disposition(&state, first), Disposition::Skip(_)));
+        assert!(matches!(
+            disposition(&state, first, &probes),
+            Disposition::Skip(_)
+        ));
 
         // The record is what the ledger's next depth would have to beat; the shallow record does
         // not make `design` skippable, which is the rule this test exists for.
@@ -349,21 +479,23 @@ mod tests {
 
     #[test]
     fn a_step_that_teaches_nothing_is_never_skippable() {
-        let (_temp, course) = fixture();
+        let (temp, course) = fixture();
+        let probes = catalogue(&temp, &course, &[]);
         // A step with an empty `teaches` list cannot be built through the fixture (the loader
         // rejects an unbound step), so this is checked on the failure path of the rule instead.
         let step = course.step("mailer/1.1").expect("the first step");
-        let keep = disposition(&State::default(), step);
+        let keep = disposition(&State::default(), step, &probes);
         assert!(matches!(keep, Disposition::Keep(_)));
     }
 
     #[test]
     fn describe_names_the_evidence_so_the_report_can_be_checked() {
-        let (_temp, course) = fixture();
+        let (temp, course) = fixture();
+        let probes = catalogue(&temp, &course, &["db/migrations@apply"]);
         let second = course.step("mailer/1.2").expect("the second step");
         let mut state = State::default();
         probe(&mut state, "db/migrations@apply");
-        let text = describe(&state, second);
+        let text = describe(&state, second, &probes);
         assert!(text.starts_with("skip ("), "{text}");
         assert!(text.contains("probe:delivery-idempotency.apply"), "{text}");
     }

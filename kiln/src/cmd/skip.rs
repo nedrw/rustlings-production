@@ -13,6 +13,7 @@
 use crate::cmd::{Session, plan};
 use crate::error::{EXIT_FAILED, EXIT_OK, KilnError, Result};
 use crate::info::Step;
+use crate::probe::{self, Probe};
 use crate::project;
 
 /// Skip one step, or every step `plan --fast` would skip.
@@ -24,7 +25,10 @@ pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: boo
             ));
         }
         let track = session.course().default_track()?.clone();
-        let steps: Vec<Step> = plan::skippable(session.state(), &track)
+        // One read of the catalogue for the whole pass: the verdicts and the refusal messages both
+        // name an exercise only when one exists (kiln/src/cmd/plan.rs).
+        let probes = probe::load(&session.course().dir())?;
+        let steps: Vec<Step> = plan::skippable(session.state(), &track, &probes)
             .into_iter()
             .cloned()
             .collect();
@@ -38,7 +42,7 @@ pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: boo
         }
         let mut skipped = 0usize;
         for step in &steps {
-            if skip_one(session, step, force)? {
+            if skip_one(session, step, &probes, force)? {
                 skipped += 1;
             }
         }
@@ -51,7 +55,8 @@ pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: boo
     }
 
     let step = super::resolve_step(session, reference)?;
-    if skip_one(session, &step, force)? {
+    let probes = probe::load(&session.course().dir())?;
+    if skip_one(session, &step, &probes, force)? {
         Ok(EXIT_OK)
     } else {
         Ok(EXIT_FAILED)
@@ -59,20 +64,20 @@ pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: boo
 }
 
 /// Skip one step. Returns `true` when it was skipped, `false` when it could not be.
-fn skip_one(session: &mut Session, step: &Step, force: bool) -> Result<bool> {
+fn skip_one(session: &mut Session, step: &Step, probes: &[Probe], force: bool) -> Result<bool> {
     let id = step.qualified_id();
     if let Some(status) = plan::behind_us(session.state(), step) {
         println!("  {id}: {}", status.label());
         return Ok(status == crate::state::StepStatus::Skipped);
     }
 
-    let reason = match plan::disposition(session.state(), step) {
+    let reason = match plan::disposition(session.state(), step, probes) {
         plan::Disposition::Skip(reason) => reason,
         plan::Disposition::Keep(blocker) => {
             if !force {
                 println!("✗ {id} is not skippable — {}", blocker.detail);
                 println!(
-                    "  `kiln probe <capability>` is how you prove it; `kiln skip {id} --force` skips \
+                    "  the verdict above says what would prove it; `kiln skip {id} --force` skips \
                      anyway and records that you did"
                 );
                 return Ok(false);

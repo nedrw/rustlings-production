@@ -309,6 +309,44 @@ fn suggestion(probes: &[Probe], wanted: &str) -> String {
     }
 }
 
+/// Which exercise answers a slot, given the catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exercise<'a> {
+    /// An exercise at that depth or deeper: passing it proves the slot.
+    AtDepth(&'a Probe),
+    /// Only a shallower exercise exists: it re-checks the habit, not the depth asked about.
+    Shallower(&'a Probe),
+    /// The catalogue has nothing for this capability.
+    Missing,
+}
+
+/// The exercise that re-checks `capability` at `level`, if the catalogue has one.
+///
+/// Two commands print a line about a slot a learner has not proven — `kiln plan --fast` when it
+/// keeps a step, `kiln review --due` when it lists a stale proof — and a line that names a command
+/// has to name one that works: `kiln probe <capability>@<level>` exits 2 when nothing in
+/// `course/probes/` answers to that slot. Both ask this function, so the answer and the wording
+/// cannot drift apart.
+#[must_use]
+pub fn exercise<'a>(probes: &'a [Probe], capability: &str, level: Level) -> Exercise<'a> {
+    let mut shallower: Option<&Probe> = None;
+    for probe in probes
+        .iter()
+        .filter(|probe| probe.requirement().id.as_str() == capability)
+    {
+        if probe.requirement().level.rank() >= level.rank() {
+            return Exercise::AtDepth(probe);
+        }
+        // Several shallow exercises can exist; the deepest one is the closest to what was asked.
+        if shallower
+            .is_none_or(|best| probe.requirement().level.rank() > best.requirement().level.rank())
+        {
+            shallower = Some(probe);
+        }
+    }
+    shallower.map_or(Exercise::Missing, Exercise::Shallower)
+}
+
 /// Parse one exercise file: header, then the checks the catalogue depends on.
 fn parse_file(path: &Path) -> Result<Probe> {
     let text = std::fs::read_to_string(path).map_err(|source| KilnError::Read {
@@ -652,6 +690,41 @@ mod tests {
 
         let unknown = find(&probes, "sec/hmac-signing@apply").unwrap_err();
         assert!(unknown.to_string().contains("no probe for"), "{unknown}");
+    }
+
+    #[test]
+    fn a_slot_is_answered_by_the_closest_exercise_or_says_there_is_none() {
+        let temp = TempDir::new("probe-exercise");
+        temp.write("course/probes/delivery-idempotency.apply.rs", EXERCISE);
+        temp.write(
+            "course/probes/delivery-idempotency.design.rs",
+            &EXERCISE.replace(
+                "probe = \"delivery/idempotency@apply\"",
+                "probe = \"delivery/idempotency@design\"",
+            ),
+        );
+        let probes = load(&temp.path().join("course")).expect("the catalogue should load");
+
+        // At and above the depth asked about, the exercise is the proof.
+        for level in [Level::Apply, Level::Design] {
+            let Exercise::AtDepth(probe) = exercise(&probes, "delivery/idempotency", level) else {
+                panic!("an exercise at {level} re-checks the slot itself");
+            };
+            assert_eq!(probe.requirement().level, level);
+        }
+
+        // Deeper than anything in the catalogue: the deepest shallow one is worth naming as itself,
+        // which is what keeps a report from sending a learner to a command that would fail.
+        let Exercise::Shallower(probe) = exercise(&probes, "delivery/idempotency", Level::Operate)
+        else {
+            panic!("only shallower exercises exist");
+        };
+        assert_eq!(probe.requirement().level, Level::Design);
+
+        assert_eq!(
+            exercise(&probes, "sec/hmac-signing", Level::Apply),
+            Exercise::Missing
+        );
     }
 
     #[test]
