@@ -1,0 +1,534 @@
+diff --git a/src/claim.rs b/src/claim.rs
+index c488887..695b330 100644
+--- a/src/claim.rs
++++ b/src/claim.rs
+@@ -213,22 +213,33 @@ pub async fn mark_retry(
+ /// Give up on a delivery: it will not be attempted again, and `why` is what an operator reads.
+ ///
+ /// The attempt that ended it counts like any other failure, so `attempts` is "how many attempts
+-/// this delivery has failed", whichever state that left it in.
++/// this delivery has failed", whichever state that left it in. The reading half of that sentence is
++/// a row in `dead_letters` (`relay/2.10-dlq`), written here so that the state and the history cannot
++/// disagree.
+ ///
+ /// # Errors
+ ///
+ /// Returns [`Error::Database`] when the update fails.
+ pub async fn mark_dead(pool: &PgPool, delivery: Uuid, why: &str) -> Result<bool, Error> {
+-    let ran = sqlx::query(
+-        "update deliveries \
+-            set state = 'dead', attempts = attempts + 1, last_error = $2, locked_by = null, \
+-                locked_at = null, lease_expires_at = null \
+-          where id = $1 and state = 'claimed'",
++    // One statement, and the dead letter is written in it: a row that says `dead` with no entry in
++    // `dead_letters` is a failure nobody can read, and a letter for a row that is not dead is a
++    // history of something that did not happen. `insert … select from buried` also carries the
++    // guard forward — a row that is not this worker's writes no letter — and the insert's count is
++    // the answer, so the caller cannot tell the two halves apart.
++    let written = sqlx::query(
++        "with buried as ( \
++             update deliveries \
++                set state = 'dead', attempts = attempts + 1, last_error = $2, locked_by = null, \
++                    locked_at = null, lease_expires_at = null \
++              where id = $1 and state = 'claimed' \
++              returning attempts) \
++         insert into dead_letters (delivery_id, attempts, reason) \
++         select $1, attempts, $2 from buried",
+     )
+     .bind(delivery)
+     .bind(why)
+     .execute(pool)
+     .await
+     .map_err(Error::Database)?;
+-    Ok(ran.rows_affected() == 1)
++    Ok(written.rows_affected() == 1)
+ }
+diff --git a/src/dlq.rs b/src/dlq.rs
+index 38e347c..f2a2dea 100644
+--- a/src/dlq.rs
++++ b/src/dlq.rs
+@@ -23,13 +23,6 @@
+ //!   instead of doing something surprising. Replaying the same id twice is therefore safe — the
+ //!   second call is a read.
+ //!
+-//! **This file is the scaffold**: the shapes are here, and both functions answer `todo!()`, so the
+-//! spec fails here until they are written.
+-//!
+-//! The migration is part of the scaffold as well, and the routes are not: `GET /dlq` and
+-//! `POST /dlq/{id}/replay` are yours to add (`src/http.rs`), and they have to appear in
+-//! `openapi::document()` with every status they can answer (`relay/2.3-contract-first`'s spec reads
+-//! that document).
+ 
+ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+@@ -85,17 +78,86 @@ pub enum Replay {
+     },
+ }
+ 
++/// One row of the listing query: the delivery, its event, what the event was about, where it was
++/// going, and how many times it has been replayed.
++type LetterRow = (Uuid, Uuid, String, String, i32);
++
++/// One row of the history query: one life of one delivery.
++type LifeRow = (Uuid, i32, String, DateTime<Utc>, Option<DateTime<Utc>>);
++
++/// How many dead letters a caller gets when it does not ask for a number.
++pub const DEFAULT_LIMIT: i64 = 50;
++/// The most a caller may ask for.
++///
++/// A listing nobody bounds answers with a tenant's whole history the first time somebody asks after
++/// an incident, which is the moment when a slow query is least welcome.
++pub const MAX_LIMIT: i64 = 200;
++
+ /// The calling tenant's dead letters, newest death first.
+ ///
+-/// `limit` bounds the answer: a listing nobody bounds is a listing that answers with a tenant's
+-/// whole history the first time somebody asks after an incident.
++/// `limit` bounds the answer. Two queries rather than one join: the letters, then the lives of those
++/// letters, grouped here — a listing is a read, not a snapshot, and the alternative is a database
++/// that has to hand back a nested shape.
+ ///
+ /// # Errors
+ ///
+ /// Returns [`Error::Database`] when the rows cannot be read, and [`Error::Endpoint`] when one of
+ /// them holds a target this service no longer accepts.
+ pub async fn list(pool: &PgPool, tenant: TenantId, limit: i64) -> Result<Vec<DeadLetter>, Error> {
+-    todo!("step relay/2.10-dlq: the tenant's dead letters, with the history of each")
++    // `count(l.id) filter (…)` is the number of replays this delivery has had: one per life that a
++    // replay has undone. The order is "what died most recently first", which is the order a person
++    // reads a list of failures in.
++    let letters: Vec<LetterRow> = sqlx::query_as(
++        "select d.id, v.id, v.kind, e.url, \
++                count(l.id) filter (where l.replayed_at is not null)::int \
++           from deliveries as d \
++           join events as v on v.id = d.event_id \
++           join endpoints as e on e.id = d.endpoint_id \
++           left join dead_letters as l on l.delivery_id = d.id \
++          where v.tenant_id = $1 and d.state = 'dead' \
++          group by d.id, v.id, v.kind, e.url \
++          order by max(l.died_at) desc nulls last, d.id \
++          limit $2",
++    )
++    .bind(tenant.as_uuid())
++    .bind(limit)
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    let deliveries: Vec<Uuid> = letters.iter().map(|letter| letter.0).collect();
++    let lives: Vec<LifeRow> = sqlx::query_as(
++        "select delivery_id, attempts, reason, died_at, replayed_at from dead_letters \
++          where delivery_id = any($1) order by delivery_id, id",
++    )
++    .bind(&deliveries)
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    letters
++        .into_iter()
++        .map(|(delivery, event, kind, url, replays)| {
++            let lives = lives
++                .iter()
++                .filter(|life| life.0 == delivery)
++                .map(|(_, attempts, reason, died_at, replayed_at)| Life {
++                    attempts: *attempts,
++                    reason: reason.clone(),
++                    died_at: *died_at,
++                    replayed_at: *replayed_at,
++                })
++                .collect();
++            Ok(DeadLetter {
++                delivery,
++                event,
++                kind,
++                url: url.parse()?,
++                replays,
++                lives,
++            })
++        })
++        .collect()
+ }
+ 
+ /// Put one dead letter back in the queue.
+@@ -112,5 +174,71 @@ pub async fn replay(
+     tenant: TenantId,
+     delivery: Uuid,
+ ) -> Result<Option<Replay>, Error> {
+-    todo!("step relay/2.10-dlq: one delivery, from dead back into the queue")
++    // A transaction, because a replay is three writes that have to agree: the row moves, the life
++    // that ended is stamped as undone, and the answer says how many times this delivery has been
++    // replayed. Half of it would leave a delivery owed twice, or a history that claims a replay
++    // that never happened.
++    let mut transaction = pool.begin().await.map_err(Error::Database)?;
++
++    // `for update` is what makes the decision below safe: the read and the writes are one
++    // transaction and nobody else can change this row's state in between. Two callers replaying the
++    // same id at the same moment therefore queue, and the second one finds a delivery that is
++    // already owed again.
++    let found: Option<(String, i32)> = sqlx::query_as(
++        "select d.state, \
++                (select count(*)::int from dead_letters as l \
++                  where l.delivery_id = d.id and l.replayed_at is not null) \
++           from deliveries as d \
++           join events as v on v.id = d.event_id \
++          where d.id = $1 and v.tenant_id = $2 \
++            for update of d",
++    )
++    .bind(delivery)
++    .bind(tenant.as_uuid())
++    .fetch_optional(&mut *transaction)
++    .await
++    .map_err(Error::Database)?;
++
++    let Some((state, replays)) = found else {
++        // Not this tenant's delivery, or no such delivery: one answer for both, because a caller
++        // must not be able to tell them apart.
++        transaction.rollback().await.map_err(Error::Database)?;
++        return Ok(None);
++    };
++
++    if state != "dead" {
++        // Nothing to undo. A delivery that is owed again, or one a subscriber has taken, is not a
++        // dead letter, and a replay that reset it anyway would send a duplicate nobody asked for.
++        transaction.rollback().await.map_err(Error::Database)?;
++        return Ok(Some(Replay::NotDead { state, replays }));
++    }
++
++    // The row moves: owed again, nothing spent, due now. `last_error` stays, because "what went
++    // wrong last time" is worth reading until the delivery succeeds (`mark_sent` is what clears it).
++    sqlx::query(
++        "update deliveries \
++            set state = 'pending', attempts = 0, next_attempt_at = now(), locked_by = null, \
++                locked_at = null, lease_expires_at = null \
++          where id = $1",
++    )
++    .bind(delivery)
++    .execute(&mut *transaction)
++    .await
++    .map_err(Error::Database)?;
++
++    // And the life that just ended is stamped as undone: the history keeps what it cost, and says
++    // that somebody has since replayed it.
++    sqlx::query(
++        "update dead_letters set replayed_at = now() \
++          where delivery_id = $1 and replayed_at is null",
++    )
++    .bind(delivery)
++    .execute(&mut *transaction)
++    .await
++    .map_err(Error::Database)?;
++
++    transaction.commit().await.map_err(Error::Database)?;
++    Ok(Some(Replay::Resurrected {
++        replays: replays.saturating_add(1),
++    }))
+ }
+diff --git a/src/http.rs b/src/http.rs
+index cfc4230..c29acf4 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -12,7 +12,7 @@ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use std::time::Instant;
+ 
+-use axum::extract::{Extension, Query, Request, State};
++use axum::extract::{Extension, Path, Query, Request, State};
+ use axum::http::{HeaderMap, HeaderValue, StatusCode};
+ use axum::middleware::{self, Next};
+ use axum::response::{IntoResponse, Response};
+@@ -25,12 +25,14 @@ use tokio::net::TcpListener;
+ use crate::auth::{self, Principal};
+ use crate::config::Config;
+ use crate::db::Db;
++use crate::dlq;
+ use crate::domain::{EndpointId, EndpointUrl};
+ use crate::error::Error;
+ use crate::events;
+ use crate::logging::{self, RunId};
+ use crate::openapi;
+ use crate::pagination;
++use uuid::Uuid;
+ 
+ /// Everything a handler may need, built once per process.
+ #[derive(Debug, Clone)]
+@@ -102,6 +104,9 @@ pub fn router(state: AppState) -> Router {
+     let tenant = Router::new()
+         .route("/endpoints", post(create_endpoint).get(list_endpoints))
+         .route("/events", post(create_event).get(list_events))
++        // What the worker gave up on, and the one way back into the queue (`relay/2.10-dlq`).
++        .route("/dlq", get(list_dead_letters))
++        .route("/dlq/{id}/replay", post(replay_dead_letter))
+         .layer(middleware::from_fn_with_state(
+             state.clone(),
+             require_principal,
+@@ -504,6 +509,115 @@ async fn list_events(
+     }
+ }
+ 
++/// The parameters `GET /dlq` accepts.
++///
++/// Text rather than a number on purpose: `?limit=abc` is a caller mistake, and a query struct that
++/// could not be parsed is a 400 with the same shape every other bad request has.
++#[derive(Debug, Deserialize)]
++struct ListDeadLetters {
++    /// `limit=`: how many letters this answer may hold.
++    limit: Option<String>,
++}
++
++/// One dead letter, as the API answers with it.
++///
++/// A shape of its own rather than `dlq::DeadLetter`'s fields: the service's types are the service's
++/// (`EndpointUrl` is not a string until somebody says it is), and the document in `openapi.rs`
++/// describes *this* object. The two have to agree, which is what the snapshot in the spec of
++/// `relay/2.3-contract-first` is for.
++fn dead_letter_body(letter: &dlq::DeadLetter) -> Value {
++    json!({
++        "id": letter.delivery.to_string(),
++        "event_id": letter.event.to_string(),
++        "kind": letter.kind,
++        "url": letter.url.as_str(),
++        "replays": letter.replays,
++        "lives": letter
++            .lives
++            .iter()
++            .map(|life| {
++                json!({
++                    "attempts": life.attempts,
++                    "reason": life.reason,
++                    "died_at": life.died_at.to_rfc3339(),
++                    "replayed_at": life.replayed_at.map(|at| at.to_rfc3339()),
++                })
++            })
++            .collect::<Vec<Value>>(),
++    })
++}
++
++/// The calling tenant's dead letters, newest death first.
++async fn list_dead_letters(
++    State(state): State<AppState>,
++    Extension(principal): Extension<Principal>,
++    Query(params): Query<ListDeadLetters>,
++) -> Response {
++    let limit = match params.limit {
++        None => dlq::DEFAULT_LIMIT,
++        Some(text) => match text.trim().parse::<i64>() {
++            Ok(limit) if (1..=dlq::MAX_LIMIT).contains(&limit) => limit,
++            _ => {
++                return Error::BadRequest(format!(
++                    "`limit` has to be a number between 1 and {}",
++                    dlq::MAX_LIMIT
++                ))
++                .into_response();
++            }
++        },
++    };
++    match dlq::list(state.db().pool(), principal.tenant_id, limit).await {
++        Err(error) => error.into_response(),
++        Ok(letters) => (
++            StatusCode::OK,
++            Json(json!({
++                "dead_letters": letters.iter().map(dead_letter_body).collect::<Vec<Value>>(),
++            })),
++        )
++            .into_response(),
++    }
++}
++
++/// Put one dead letter back in the queue.
++///
++/// The statuses are the boundary of a replay, written down: `200` with `replayed: false` for a
++/// delivery that is not a dead letter (nothing was reset, and it is not an error to ask), `400` for
++/// something that is not a delivery id at all, and `404` for a delivery this tenant cannot see —
++/// including one that belongs to somebody else.
++async fn replay_dead_letter(
++    State(state): State<AppState>,
++    Extension(principal): Extension<Principal>,
++    Path(id): Path<String>,
++) -> Response {
++    let Ok(delivery) = id.parse::<Uuid>() else {
++        return Error::BadRequest(format!("`{id}` is not a delivery id")).into_response();
++    };
++    match dlq::replay(state.db().pool(), principal.tenant_id, delivery).await {
++        Err(error) => error.into_response(),
++        Ok(None) => Error::NotFound.into_response(),
++        Ok(Some(dlq::Replay::Resurrected { replays })) => (
++            StatusCode::OK,
++            Json(json!({
++                "id": id,
++                "replayed": true,
++                "replays": replays,
++                "state": "pending",
++            })),
++        )
++            .into_response(),
++        Ok(Some(dlq::Replay::NotDead { state, replays })) => (
++            StatusCode::OK,
++            Json(json!({
++                "id": id,
++                "replayed": false,
++                "replays": replays,
++                "state": state,
++            })),
++        )
++            .into_response(),
++    }
++}
++
+ /// The `Idempotency-Key` header, when it carries something usable.
+ ///
+ /// Header names are case-insensitive and so is this lookup; the value is trimmed, because `Key: `
+diff --git a/src/lib.rs b/src/lib.rs
+index ce75f52..d2d5632 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,6 +14,7 @@ pub mod claim;
+ pub mod config;
+ pub mod db;
+ pub mod delivery;
++pub mod dlq;
+ pub mod domain;
+ pub mod error;
+ pub mod events;
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 2f8fc33..44a3a0d 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -167,6 +167,58 @@ pub fn document() -> Value {
+                     },
+                 },
+             },
++            "/dlq": {
++                "get": {
++                    "summary": "The calling tenant's dead letters, newest death first.",
++                    "description": "A dead letter is a delivery this service has given up on — a \
++                                    subscriber that refused it in a way no retry can fix, or an \
++                                    attempt budget that ran out — with every life it has lost and \
++                                    whether a replay has undone each one.",
++                    "parameters": [
++                        {
++                            "name": "limit",
++                            "in": "query",
++                            "required": false,
++                            "description": "How many letters this answer may hold (default 50, most 200).",
++                            "schema": { "type": "integer", "minimum": 1, "maximum": 200 },
++                        },
++                    ],
++                    "responses": {
++                        "200": answer("DeadLetterList", "The tenant's dead letters, newest first."),
++                        "400": answer("Error", "The `limit` is not a number between 1 and 200."),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                    },
++                },
++            },
++            "/dlq/{id}/replay": {
++                "post": {
++                    "summary": "Put one dead letter back in the queue.",
++                    "description": "The delivery keeps its id and starts again with nothing spent: \
++                                    `pending`, no attempts, due now. What the life that ended cost \
++                                    stays in the history, stamped as replayed. A delivery that is \
++                                    not a dead letter is not reset — the answer says so instead.",
++                    "parameters": [{
++                        "name": "id",
++                        "in": "path",
++                        "required": true,
++                        "description": "The delivery to replay.",
++                        "schema": { "type": "string", "format": "uuid" },
++                    }],
++                    "responses": {
++                        "200": answer(
++                            "ReplayResult",
++                            "What the replay did, or did not do, to the delivery.",
++                        ),
++                        "400": answer("Error", "The id is not a delivery id."),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "404": answer(
++                            "Error",
++                            "No such delivery for this tenant — including one that belongs to \
++                             another.",
++                        ),
++                    },
++                },
++            },
+         },
+         "components": {
+             "schemas": {
+@@ -245,6 +297,78 @@ pub fn document() -> Value {
+                     },
+                 },
+                 "IngestedEvent": event_schema(true),
++                "DeadLetter": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["id", "event_id", "kind", "url", "replays", "lives"],
++                    "properties": {
++                        "id": { "type": "string", "format": "uuid" },
++                        "event_id": { "type": "string", "format": "uuid" },
++                        "kind": { "type": "string" },
++                        "url": { "type": "string", "format": "uri" },
++                        "replays": {
++                            "type": "integer",
++                            "description": "How many times this delivery has been replayed.",
++                        },
++                        "lives": {
++                            "type": "array",
++                            "description": "Every life this delivery has lost, oldest first.",
++                            "items": { "$ref": "#/components/schemas/Life" },
++                        },
++                    },
++                },
++                "Life": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["attempts", "reason", "died_at", "replayed_at"],
++                    "properties": {
++                        "attempts": {
++                            "type": "integer",
++                            "description": "How many attempts this life burned.",
++                        },
++                        "reason": {
++                            "type": "string",
++                            "description": "What the subscriber said, or the budget's sentence.",
++                        },
++                        "died_at": { "type": "string", "format": "date-time" },
++                        "replayed_at": {
++                            "type": ["string", "null"],
++                            "format": "date-time",
++                            "description": "When a replay undid this life, or `null`.",
++                        },
++                    },
++                },
++                "DeadLetterList": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["dead_letters"],
++                    "properties": {
++                        "dead_letters": {
++                            "type": "array",
++                            "items": { "$ref": "#/components/schemas/DeadLetter" },
++                        },
++                    },
++                },
++                "ReplayResult": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["id", "replayed", "replays", "state"],
++                    "properties": {
++                        "id": { "type": "string", "format": "uuid" },
++                        "replayed": {
++                            "type": "boolean",
++                            "description": "Whether this call is the one that put it back.",
++                        },
++                        "replays": {
++                            "type": "integer",
++                            "description": "How many times the delivery has been replayed.",
++                        },
++                        "state": {
++                            "type": "string",
++                            "description": "The state it is in now: `pending` after a replay.",
++                        },
++                    },
++                },
+             },
+         },
+     })

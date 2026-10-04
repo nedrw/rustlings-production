@@ -1,0 +1,152 @@
+diff --git a/migrations/0006_dead_letters.sql b/migrations/0006_dead_letters.sql
+new file mode 100644
+index 0000000..53722c4
+--- /dev/null
++++ b/migrations/0006_dead_letters.sql
+@@ -0,0 +1,24 @@
++-- A delivery this service has given up on is still something somebody has to be able to read, and
++-- the history of *why* has to survive the day somebody replays it: one row per life a delivery lost.
++--
++-- `deliveries.state = 'dead'` says which deliveries are not coming back (`relay/2.5-atomic-claim`);
++-- this table is the story behind that state — how many attempts the life that ended had burned, and
++-- what the subscriber said — and a replay only adds to it: the old lives stay, stamped with the
++-- instant they were undone.
++create table dead_letters (
++    id bigserial primary key,
++    delivery_id uuid not null references deliveries (id) on delete cascade,
++    attempts integer not null,
++    reason text not null,
++    died_at timestamptz not null default now(),
++    replayed_at timestamptz,
++    constraint dead_letters_counts_a_life check (attempts >= 1)
++);
++
++-- The history is read one delivery at a time (a replay stamps it; a listing renders it), so the
++-- index is on the delivery and the order the rows were written in.
++create index dead_letters_delivery_idx on dead_letters (delivery_id, id);
++
++-- The listing is "the dead letters of one tenant", and a tenant's table holds everything it ever
++-- owed: a partial index keeps that listing from walking the deliveries it is not about.
++create index deliveries_dead_idx on deliveries (state, created_at, id) where state = 'dead';
+diff --git a/src/dlq.rs b/src/dlq.rs
+new file mode 100644
+index 0000000..38e347c
+--- /dev/null
++++ b/src/dlq.rs
+@@ -0,0 +1,116 @@
++//! Dead letters: the deliveries this service has given up on, and how one of them comes back.
++//!
++//! `relay/2.6-at-least-once` decided that a delivery is forgotten only when a subscriber has taken
++//! it or when the worker gives up on it. `relay/2.8-retry-budget` gave "giving up" two shapes — a
++//! failure no retry can fix, and a budget that ran out — and wrote the row's state to `dead`. What
++//! neither of them did is make that state *useful to a person*: a delivery that died is a fact an
++//! operator has to be able to read (what it was, where it was going, what the subscriber said, how
++//! many attempts it took) and act on.
++//!
++//! This module is that half of the promise. Two terminal failures, one place to look, and one way
++//! back:
++//!
++//! * **the listing is per tenant.** A dead letter names an endpoint and an event, which is one
++//!   tenant's business and nobody else's; the query filters on the event's tenant, so a tenant
++//!   cannot see — or replay — a delivery that is not theirs;
++//! * **a replay is a new life, not a new delivery.** The row keeps its identity (the receiver
++//!   deduplicates on the delivery id, `relay/2.6-at-least-once`) and starts again with nothing
++//!   spent: `pending`, no attempts, due now. What the last life cost stays in
++//!   `migrations/0006_dead_letters.sql`, so the second death is a second entry rather than a
++//!   rewrite of the first;
++//! * **a replay draws its own boundary.** It resurrects a *dead letter* and nothing else: a
++//!   delivery that is already owed again (or delivered) is not reset, and the answer says so
++//!   instead of doing something surprising. Replaying the same id twice is therefore safe — the
++//!   second call is a read.
++//!
++//! **This file is the scaffold**: the shapes are here, and both functions answer `todo!()`, so the
++//! spec fails here until they are written.
++//!
++//! The migration is part of the scaffold as well, and the routes are not: `GET /dlq` and
++//! `POST /dlq/{id}/replay` are yours to add (`src/http.rs`), and they have to appear in
++//! `openapi::document()` with every status they can answer (`relay/2.3-contract-first`'s spec reads
++//! that document).
++
++use chrono::{DateTime, Utc};
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::{EndpointUrl, TenantId};
++use crate::error::Error;
++
++/// One delivery this service has given up on, and every life it has lost.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DeadLetter {
++    /// The delivery. What a replay names, and the id the receiver deduplicated on.
++    pub delivery: Uuid,
++    /// The event it was owed for.
++    pub event: Uuid,
++    /// What the event was about (`invoice.paid`).
++    pub kind: String,
++    /// The endpoint that never took it.
++    pub url: EndpointUrl,
++    /// How many times this delivery has been replayed so far.
++    pub replays: i32,
++    /// The lives it has lost, oldest first. The last one is why it is in this list.
++    pub lives: Vec<Life>,
++}
++
++/// One life of a dead letter: an attempt budget that ran out, and what ended it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Life {
++    /// How many attempts this life burned.
++    pub attempts: i32,
++    /// What the subscriber said, or the budget's own sentence.
++    pub reason: String,
++    /// When this life was given up on.
++    pub died_at: DateTime<Utc>,
++    /// When a replay undid it, if one did.
++    pub replayed_at: Option<DateTime<Utc>>,
++}
++
++/// What a replay did.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Replay {
++    /// The delivery is owed again, and this is how many times it has now been replayed.
++    Resurrected {
++        /// The number of replays, this one included.
++        replays: i32,
++    },
++    /// Nothing was reset, because the delivery is not a dead letter any more.
++    NotDead {
++        /// The state it is in instead.
++        state: String,
++        /// The number of times it was replayed before this call.
++        replays: i32,
++    },
++}
++
++/// The calling tenant's dead letters, newest death first.
++///
++/// `limit` bounds the answer: a listing nobody bounds is a listing that answers with a tenant's
++/// whole history the first time somebody asks after an incident.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the rows cannot be read, and [`Error::Endpoint`] when one of
++/// them holds a target this service no longer accepts.
++pub async fn list(pool: &PgPool, tenant: TenantId, limit: i64) -> Result<Vec<DeadLetter>, Error> {
++    todo!("step relay/2.10-dlq: the tenant's dead letters, with the history of each")
++}
++
++/// Put one dead letter back in the queue.
++///
++/// Answers `None` when the delivery is not this tenant's (or does not exist), which is the same
++/// answer as "not yours": a caller must not be able to tell a delivery that is gone from one that
++/// belongs to somebody else.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the read or the writes fail.
++pub async fn replay(
++    pool: &PgPool,
++    tenant: TenantId,
++    delivery: Uuid,
++) -> Result<Option<Replay>, Error> {
++    todo!("step relay/2.10-dlq: one delivery, from dead back into the queue")
++}
