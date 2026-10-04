@@ -68,15 +68,19 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
 
     println!();
     println!(
-        "{must_passed}/{must_declared} must gates passed · {should} should gate(s) · {pending} not \
-         implemented yet"
+        "{must_passed}/{must_declared} must gates passed · {should} should gates run · {pending} \
+         catalogue gate(s) not implemented yet"
     );
     if passed {
-        println!("✓ every must gate passed for {}", step.qualified_id());
+        println!(
+            "✓ every must gate passed for {} — `kiln list` shows what is next",
+            step.qualified_id()
+        );
         Ok(EXIT_OK)
     } else {
         println!(
-            "✗ {blocking} must gate(s) did not pass for {}",
+            "✗ {blocking} must gate(s) did not pass for {} — `kiln hint {}` points at what to fix",
+            step.qualified_id(),
             step.qualified_id()
         );
         Ok(EXIT_FAILED)

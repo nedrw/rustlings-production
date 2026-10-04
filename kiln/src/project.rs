@@ -132,6 +132,35 @@ impl Outcome {
     }
 }
 
+/// Refuse to prepare a project that is not there.
+///
+/// A fresh clone has no `app/`: the first step of the track copies the skeleton there, and every
+/// later step patches what the earlier ones left. Running a mid-track step in an empty tree has
+/// always failed — this makes it fail with the reason and the command that fixes it, instead of
+/// the patch parser's "the file does not exist" (which names no project and no next action).
+///
+/// The step whose scaffold *is* the skeleton is the one that creates the project, so it is the one
+/// exception.
+fn require_project(course: &Course, track: &Track, step: &Step, project: &Path) -> Result<()> {
+    if project.is_dir() {
+        return Ok(());
+    }
+    if matches!(
+        load_scaffold(&track.dir(course.root()), step)?,
+        Some(Scaffold::Skeleton(_))
+    ) {
+        return Ok(());
+    }
+    let first = track
+        .step
+        .first()
+        .map_or_else(|| format!("{}/1", track.id), Step::qualified_id);
+    Err(KilnError::MissingProject {
+        project: relative_to(course.root(), project),
+        first,
+    })
+}
+
 /// Where a step's scaffold comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scaffold {
@@ -227,6 +256,7 @@ pub fn missing_content(course: &Course, track: &Track, step: &Step) -> Vec<Strin
 /// Sync the step's specs and apply its scaffold: everything `run` and `check` do before judging.
 pub fn prepare(course: &Course, track: &Track, step: &Step) -> Result<Outcome> {
     let project = track.project_dir(course.root());
+    require_project(course, track, step, &project)?;
     let mut outcome = Outcome::default();
     for sync in spec::sync(course.root(), track, step, &project, false)? {
         let action = match sync.action {
@@ -255,6 +285,7 @@ pub fn prepare(course: &Course, track: &Track, step: &Step) -> Result<Outcome> {
 pub fn apply_scaffold(course: &Course, track: &Track, step: &Step) -> Result<Outcome> {
     let track_dir = track.dir(course.root());
     let project = track.project_dir(course.root());
+    require_project(course, track, step, &project)?;
     let Some(scaffold) = load_scaffold(&track_dir, step)? else {
         return Ok(Outcome::default());
     };
@@ -637,6 +668,9 @@ mod tests {
         let course = course_with(&temp, None);
         let track = course.default_track().unwrap();
         let step = step_of(&course);
+        // The project exists by the time a scaffold-less step is judged: the track's first step is
+        // what creates it, and a step that only syncs specs does not.
+        temp.write("app/mailer/Cargo.toml", "[package]\nname = \"mailer\"\n");
         temp.write("course/tracks/mailer/spec/1.1/spec.rs", "//! spec\n");
 
         let outcome = prepare(&course, track, &step).unwrap();
@@ -686,6 +720,8 @@ mod tests {
         let course = course_with(&temp, Some("scaffold/1.1-workspace.patch"));
         let track = course.default_track().unwrap();
         let step = step_of(&course);
+        // The patch's target, so the project this test patches exists.
+        temp.write("app/mailer/README.md", "# mailer\n");
         let error = apply_scaffold(&course, track, &step).unwrap_err();
         assert!(error.to_string().contains("README.md"), "{error}");
     }

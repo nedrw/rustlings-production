@@ -195,8 +195,8 @@ pub fn failure_detail(ran: &crate::process::Ran) -> String {
         return format!("timed out after {:?}", ran.elapsed);
     }
     match ran.first_stderr_line() {
-        Some(line) => line.trim().to_owned(),
-        None => format!("exit code {:?}", ran.code),
+        Some(line) => crate::process::plain(line.trim()),
+        None => crate::process::exit_code_text(ran.code),
     }
 }
 

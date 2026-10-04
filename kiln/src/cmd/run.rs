@@ -22,7 +22,19 @@ use crate::spec;
 /// Run the spec tests of one step.
 pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     let step = super::resolve_step(session, reference)?;
-    print_step_header(session, &step)?;
+    let id = step.qualified_id();
+    judge(session, &id, true)
+}
+
+/// The body of `run`, shared with `watch`.
+///
+/// `announce` controls the header: a watcher prints it once and judges many times, and a header
+/// between every turn is scrollback nobody reads.
+pub(crate) fn judge(session: &mut Session, reference: &str, announce: bool) -> Result<u8> {
+    let step = super::resolve_step(session, Some(reference))?;
+    if announce {
+        print_step_header(session, &step)?;
+    }
 
     let track = session.course().track(&step.track)?;
     let project_label = track.project.clone();
@@ -76,7 +88,7 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         "> {}  (in {}, deadline {:?})",
         run.cmd, project_label, deadline
     );
-    let ran = process::run_line(&run.cmd, &project_dir, deadline)?;
+    let ran = process::run_streamed_line(&run.cmd, &project_dir, deadline)?;
     print_output(&ran);
 
     let passed = ran.success();
@@ -94,7 +106,12 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         );
         Ok(EXIT_OK)
     } else {
-        println!("✗ {} spec tests failed", step.qualified_id());
+        println!(
+            "✗ {} spec tests failed — `kiln hint {}` for a nudge, `kiln solution {}` to compare",
+            step.qualified_id(),
+            step.qualified_id(),
+            step.qualified_id()
+        );
         Ok(EXIT_FAILED)
     }
 }
@@ -146,6 +163,11 @@ pub fn print_step_header(session: &Session, step: &Step) -> Result<()> {
 }
 
 /// Print a command's output without letting it swallow the report.
+/// Print what the runner captured.
+///
+/// `kiln run` streams the child's output instead (`process::run_streamed_line`), so this only has
+/// something to say when a command timed out: there is no transcript to reorder, and the note has
+/// to be printed by somebody.
 fn print_output(ran: &process::Ran) {
     let stdout = ran.stdout.trim_end();
     if !stdout.is_empty() {

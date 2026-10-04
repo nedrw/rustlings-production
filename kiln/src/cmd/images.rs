@@ -33,11 +33,11 @@ pub fn run(session: &Session, pull: bool) -> Result<u8> {
         return Ok(EXIT_ERROR);
     };
 
-    report_mirror();
     println!(
         "images declared by the authored steps (`{}`):",
         engine.name()
     );
+    report_mirror();
 
     // One listing answers for every image: the engine is asked once, not once per step.
     let wanted: Vec<String> = declared.iter().map(|(_, image)| image.clone()).collect();

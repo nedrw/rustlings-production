@@ -423,9 +423,10 @@ fn key_of(spec: &crate::gates::GateSpec) -> String {
 ///
 /// `watch` is the only caller that needs this, and it is why the run's work lives here rather than in
 /// its own command file: a watcher and a one-shot run must not disagree about what "judging a step"
-/// means.
-pub(crate) fn run_step_once(session: &mut Session, step: &Step) -> Result<u8> {
-    crate::cmd::run::run(session, Some(step.qualified_id().as_str()))
+/// means. `announce` is false for every turn after the first: the step's header (title, kind, body
+/// path) does not change between turns, and reprinting it pushes the transcript off the screen.
+pub(crate) fn run_step_once(session: &mut Session, step: &Step, announce: bool) -> Result<u8> {
+    crate::cmd::run::judge(session, step.qualified_id().as_str(), announce)
 }
 
 /// A fingerprint of a project: the *contents* of every file in it, in one number.
@@ -435,16 +436,43 @@ pub(crate) fn run_step_once(session: &mut Session, step: &Step) -> Result<u8> {
 /// timestamps, because the other direction matters too: a spec sync that rewrites a file with the
 /// same bytes has not changed the tree, and a fingerprint that said it had would make every step's
 /// gates run again for nothing.
-pub(crate) fn tree_fingerprint(project_dir: &Path) -> String {
-    use std::hash::{Hash, Hasher};
+/// One file of a project: its path relative to the project, and a hash of its contents.
+pub(crate) type FilePrint = (String, String);
+
+/// The project's files, each with a hash of its contents, in path order.
+///
+/// The watch loop diffs two of these to say *what* changed; the gate cache turns one into a single
+/// number. Both walk the same tree under the same two exclusions (`target/`, `.git`), so "the
+/// project changed" means one thing everywhere.
+///
+/// Contents rather than timestamps, because the other direction matters too: a spec sync that
+/// rewrites a file with the same bytes has not changed the tree, and a fingerprint that said it had
+/// would make every step's gates run again for nothing.
+pub(crate) fn project_files(project_dir: &Path) -> Vec<FilePrint> {
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     collect_fingerprint(project_dir, project_dir, &mut files);
     files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+        .into_iter()
+        .map(|(path, bytes)| (path, hash_of(&bytes)))
+        .collect()
+}
+
+pub(crate) fn tree_fingerprint(project_dir: &Path) -> String {
+    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (path, bytes) in files {
+    for (path, hash) in project_files(project_dir) {
         path.hash(&mut hasher);
-        bytes.hash(&mut hasher);
+        hash.hash(&mut hasher);
     }
+    format!("{:016x}", hasher.finish())
+}
+
+/// A hash of one file's bytes, as the hex [`FilePrint`] carries.
+fn hash_of(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 

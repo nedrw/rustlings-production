@@ -271,6 +271,9 @@ impl Track {
             .split_once('/')
             .filter(|(track, _)| *track == self.id)
             .map_or(reference, |(_, local)| local);
+        if local.trim().is_empty() {
+            return Err(KilnError::NoStepGiven);
+        }
         let matches: Vec<&Step> = self
             .step
             .iter()
@@ -472,7 +475,7 @@ impl Course {
         self.tracks
             .iter()
             .find(|track| track.id == id)
-            .ok_or_else(|| KilnError::UnknownTrack(id.to_owned()))
+            .ok_or_else(|| self.unknown_track(id))
     }
 
     /// The track a bare `kiln` invocation continues.
@@ -491,6 +494,9 @@ impl Course {
     /// removes the ambiguity once five tracks exist.
     pub fn step(&self, reference: &str) -> Result<&Step> {
         let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(KilnError::NoStepGiven);
+        }
         if let Some((track_id, local)) = reference.split_once('/') {
             return self.track(track_id)?.step(local);
         }
@@ -509,6 +515,33 @@ impl Course {
                 matches: many.iter().map(|step| step.qualified_id()).collect(),
             }),
         }
+    }
+
+    /// The error for a track id nobody authored: a track the ledger plans says so, a typo does not.
+    ///
+    /// `kiln run relay/2.1` and `kiln list relay` have to answer "T2 is planned, nothing to judge
+    /// yet" — the difference between `EXIT_NOT_AUTHORED` and `EXIT_ERROR` is the whole point of the
+    /// exit-code contract, and before this only a track whose *metadata* existed could report it.
+    fn unknown_track(&self, id: &str) -> KilnError {
+        if let Some((track, _)) = id.split_once('/')
+            && self.tracks.iter().any(|known| known.id == track)
+        {
+            return KilnError::StepWhereTrackIsExpected {
+                given: id.to_owned(),
+                track: track.to_owned(),
+            };
+        }
+        if self
+            .ledger
+            .positions()
+            .iter()
+            .any(|(planned, _)| *planned == id)
+        {
+            return KilnError::NotAuthored {
+                what: format!("track `{id}`"),
+            };
+        }
+        KilnError::UnknownTrack(id.to_owned())
     }
 }
 

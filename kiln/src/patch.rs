@@ -456,7 +456,10 @@ impl SkipReason {
     pub fn detail(self) -> &'static str {
         match self {
             Self::AlreadyDone => "already in place, nothing to do",
-            Self::KeptYours => "is not what the patch expects, so the file was kept as it is",
+            Self::KeptYours => {
+                "is yours, so it was left untouched (the scaffold never overwrites \
+                               your code)"
+            }
         }
     }
 }

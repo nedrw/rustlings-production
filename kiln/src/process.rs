@@ -73,10 +73,66 @@ impl Ran {
             return format!("timed out after {:?}", self.elapsed);
         }
         match self.first_stderr_line() {
-            Some(line) => format!("exit code {:?}: {line}", self.code),
-            None => format!("exit code {:?}", self.code),
+            Some(line) => format!("{}: {}", exit_code_text(self.code), plain(line)),
+            None => exit_code_text(self.code),
         }
     }
+}
+
+/// How an exit code reads in a report: `exit code 1`, never `Some(1)`.
+#[must_use]
+pub fn exit_code_text(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exit code {code}"),
+        None => "the process was killed before it exited".to_owned(),
+    }
+}
+
+/// A line of a child's output with terminal control sequences removed.
+///
+/// kiln prints a child's line inside its own report, and a tool that colours its output (podman
+/// does) leaves the styling on for every line after it. Parsing keeps the raw text; only what a
+/// person reads goes through here.
+#[must_use]
+pub fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            out.push(character);
+            continue;
+        }
+        match characters.peek() {
+            // CSI: `ESC [`, then parameter bytes, then one final byte in `@`..=`~`.
+            Some('[') => {
+                characters.next();
+                for skipped in characters.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&skipped) {
+                        break;
+                    }
+                }
+            }
+            // OSC: `ESC ]`, then the payload, then `BEL` or `ESC \`.
+            Some(']') => {
+                characters.next();
+                while let Some(skipped) = characters.next() {
+                    if skipped == '\u{7}' {
+                        break;
+                    }
+                    if skipped == '\u{1b}' {
+                        characters.next();
+                        break;
+                    }
+                }
+            }
+            // Any other escape introduces one character.
+            Some(_) => {
+                characters.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// A cargo build directory every command this process starts should share, once somebody asks for
@@ -102,6 +158,12 @@ pub fn run(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Resul
     run_with_env(program, args, dir, timeout, &[])
 }
 
+/// The same as [`run`], with the child's output going straight to kiln's streams.
+pub fn run_streamed_line(line: &str, dir: &Path, timeout: Duration) -> Result<Ran> {
+    let (program, args) = split_command(line)?;
+    run_streamed(program, &args, dir, timeout)
+}
+
 /// The same, with environment variables set for the child.
 ///
 /// The environment is part of what a command *is* for the few callers that compare two runs of the
@@ -115,6 +177,48 @@ pub fn run_with_env(
     timeout: Duration,
     env: &[(String, String)],
 ) -> Result<Ran> {
+    let mut command = prepared(program, args, dir, env);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    execute(command, program, args, dir, timeout, true)
+}
+
+/// Run a command with its output going straight to kiln's own streams.
+///
+/// This is for the commands a person watches (`kiln run`, and `kiln watch` through it): cargo writes
+/// its progress lines to stderr and its test results to stdout, so capturing the two streams and
+/// printing one after the other shows the build finishing *after* the tests it ran. Nothing here is
+/// parsed — the caller needs the exit status, not the text — so the child owns the terminal's
+/// streams and the transcript arrives in the order it was written. On a timeout there is nothing to
+/// print after the child's own output, so the note lands in [`Ran::stderr`] for the caller to show.
+pub fn run_streamed(program: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<Ran> {
+    let mut command = prepared(program, args, dir, &[]);
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    execute(command, program, args, dir, timeout, false)
+}
+
+/// The command every runner here starts: same argv, directory, stdio defaults and cargo knobs.
+fn prepared(program: &str, args: &[&str], dir: &Path, env: &[(String, String)]) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    if let Some(target_dir) = CARGO_TARGET_DIR.get().filter(|_| program == "cargo") {
+        command.env("CARGO_TARGET_DIR", target_dir);
+    }
+    command
+}
+
+/// Spawn, watch the deadline, and collect what the caller asked for.
+fn execute(
+    mut command: Command,
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    timeout: Duration,
+    capture: bool,
+) -> Result<Ran> {
     let rendered = command_line(program, args);
     let started = Instant::now();
     let spawn_error = |source| KilnError::Spawn {
@@ -122,19 +226,6 @@ pub fn run_with_env(
         dir: dir.to_path_buf(),
         source,
     };
-    let shared_target_dir = CARGO_TARGET_DIR.get().filter(|_| program == "cargo");
-
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .envs(env.iter().map(|(name, value)| (name, value)))
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(target_dir) = shared_target_dir {
-        command.env("CARGO_TARGET_DIR", target_dir);
-    }
     let mut child = command.spawn().map_err(spawn_error)?;
 
     // Draining the pipes from threads keeps a chatty child from blocking on a full pipe while the
@@ -168,12 +259,13 @@ pub fn run_with_env(
         handle.map_or_else(String::new, |handle| handle.join().unwrap_or_default())
     };
     let stdout = collect(stdout);
-    let stderr = if timed_out {
-        let collected = collect(stderr);
-        format!("{collected}\n{rendered} was killed after {timeout:?}")
-    } else {
-        collect(stderr)
-    };
+    let mut stderr = collect(stderr);
+    if timed_out {
+        stderr = format!("{stderr}\n{rendered} was killed after {timeout:?}");
+    }
+    // In streamed mode the child wrote to the terminal itself, so there is nothing captured to
+    // hand back — except the timeout note above, which nobody else can print.
+    debug_assert!(capture || stdout.is_empty());
 
     Ok(Ran {
         code: status.and_then(|status| status.code()),
@@ -186,12 +278,17 @@ pub fn run_with_env(
 
 /// Run a whitespace-separated command line — the form `run.cmd` uses in `track.toml`.
 pub fn run_line(line: &str, dir: &Path, timeout: Duration) -> Result<Ran> {
+    let (program, args) = split_command(line)?;
+    run(program, &args, dir, timeout)
+}
+
+/// Split a whitespace-separated command line into program and arguments.
+fn split_command(line: &str) -> Result<(&str, Vec<&str>)> {
     let mut parts = line.split_whitespace();
     let program = parts.next().ok_or_else(|| {
         KilnError::Invalid("the command is empty: expected something like `cargo test`".to_owned())
     })?;
-    let args: Vec<&str> = parts.collect();
-    run(program, &args, dir, timeout)
+    Ok((program, parts.collect()))
 }
 
 /// Find a program on `PATH`, without `which` (which does not exist everywhere) or a shell.

@@ -200,9 +200,8 @@ fn judge(target: &str, ran: &Ran) -> Option<GateOutcome> {
     }
     if !output.contains(PROBE) {
         return Some(GateOutcome::failed(format!(
-            "`{target} {PROBE}` failed with exit code {:?} but never says which argument it \
-             refused:\n    {}",
-            ran.code,
+            "`{target} {PROBE}` failed with {} but never says which argument it refused:\n    {}",
+            crate::process::exit_code_text(ran.code),
             clip(&output, 6)
         )));
     }

@@ -85,6 +85,34 @@ pub enum KilnError {
     #[error("unknown track `{0}`")]
     UnknownTrack(String),
 
+    /// A step id was given to a command that only takes a track.
+    #[error(
+        "`{given}` is a step, not a track — `kiln list {track}` lists its track, `kiln hint {given}` \
+         shows the step"
+    )]
+    StepWhereTrackIsExpected {
+        /// What the user typed.
+        given: String,
+        /// Track the step belongs to, as the user would type it.
+        track: String,
+    },
+
+    /// A command that needs a step reference was given nothing.
+    #[error("no step id given — `kiln run` on its own judges the first unfinished step")]
+    NoStepGiven,
+
+    /// The learner project is not there yet, so there is nothing to prepare or judge.
+    #[error(
+        "{project} does not exist yet — `kiln run {first}` creates it from the track skeleton; the \
+         steps build on each other, so they are done in order"
+    )]
+    MissingProject {
+        /// Project directory, relative to the repository root (`app/mailer`).
+        project: String,
+        /// Step that creates it.
+        first: String,
+    },
+
     /// A step reference matched more than one step.
     #[error("ambiguous step `{requested}`: it matches {matches:?}")]
     AmbiguousStep {
@@ -172,7 +200,7 @@ impl KilnError {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NotAuthored { .. } => EXIT_NOT_AUTHORED,
+            Self::NotAuthored { .. } | Self::MissingProject { .. } => EXIT_NOT_AUTHORED,
             _ => EXIT_ERROR,
         }
     }

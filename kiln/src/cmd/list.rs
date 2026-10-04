@@ -8,6 +8,12 @@ use crate::error::{EXIT_OK, Result};
 use crate::info::{Step, Track};
 use crate::state::{State, StepStatus};
 
+/// What one listing line may occupy.
+///
+/// The listing is read in a terminal, so a row that runs past this wraps and the columns after the
+/// id are lost. 100 is the width the repository writes prose at (rustfmt.toml, the step bodies).
+const ROW_WIDTH: usize = 100;
+
 /// Print every authored track, or one of them.
 pub fn run(session: &Session, track: Option<&str>) -> Result<u8> {
     let tracks: Vec<&Track> = match track {
@@ -28,6 +34,7 @@ pub fn run(session: &Session, track: Option<&str>) -> Result<u8> {
 
     println!();
     println!("{done}/{total} steps done · `kiln run` judges a step, `kiln check` runs its gates");
+    println!("markers: ✓ step done · ◐ spec tests pass, gates still to run · · not started");
     if let Some(note) = session.locale_note()? {
         println!("{note}");
     }
@@ -43,7 +50,21 @@ pub fn welcome(session: &Session) -> Result<u8> {
     let track = session.course().default_track()?;
     match first_unfinished(track, session.state()) {
         Some(step) => {
+            let doc = crate::i18n::resolve_step_doc(
+                &session.course().dir(),
+                &step.entry,
+                session.locale(),
+                session.source(),
+            )?;
+            let body = doc
+                .path()
+                .strip_prefix(session.course().root())
+                .unwrap_or_else(|_| doc.path())
+                .display()
+                .to_string();
             println!("next step: {} — {}", step.qualified_id(), step.title);
+            println!("  read     {body}");
+            println!("  project  {}", track.project);
             println!(
                 "  `kiln run {}` to judge it, `kiln hint {}` for a nudge",
                 step.qualified_id(),
@@ -86,40 +107,86 @@ fn print_track(session: &Session, track: &Track) -> (usize, usize) {
     for step in &track.step {
         let id = step.qualified_id();
         let status = session.state().status(&id);
+        // The id column fits the longest id of the track: a hard-coded width breaks the alignment
+        // on the first longer id, which is exactly where a reader is looking for the title. The
+        // kind and the time hint move to the second line, so the title keeps its room: it is what
+        // the reader is scanning for.
+        let id_width = track
+            .step
+            .iter()
+            .map(|step| step.id.chars().count())
+            .max()
+            .unwrap_or(20);
         println!(
-            "  {} {:<20} {:<9} {:>4}  {}{}",
+            "  {} {:<id_width$}  {}",
             status.marker(),
             step.id,
-            step.kind,
-            step.time_hint,
-            step.title,
-            honesty_marks(session, &id)
+            clip(&step.title, ROW_WIDTH.saturating_sub(id_width + 6).max(24))
         );
+        let teaches = step
+            .teaches
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
         println!(
-            "        teaches {}",
-            step.teaches
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            "        {} · {} · teaches {teaches}",
+            step.kind, step.time_hint
         );
+        // The honesty marks get their own line: they are the record that this result is not the
+        // learner's own work (plan §3 D2), and a footnote is easier to see than a bracketed tail.
+        let marks = honesty_marks(session, &id);
+        if !marks.is_empty() {
+            println!("        {marks}");
+        }
     }
 
     if !track.exit.is_empty() {
-        println!(
-            "   exit capabilities: {}",
-            track
-                .exit
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let items: Vec<String> = track.exit.iter().map(ToString::to_string).collect();
+        for line in wrap_items("   exit capabilities: ", "      ", &items) {
+            println!("{line}");
+        }
     }
     (done, track.step.len())
 }
 
-/// " [solution applied, spec modified]" for a step whose result is not the learner's own.
+/// `prefix` + a comma-separated list, wrapped at [`ROW_WIDTH`] with `continuation` as the indent.
+fn wrap_items(prefix: &str, continuation: &str, items: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = prefix.to_owned();
+    for item in items {
+        let separator = if current.trim_end() == prefix.trim_end() {
+            ""
+        } else {
+            ", "
+        };
+        let candidate = format!("{current}{separator}{item}");
+        if candidate.chars().count() > ROW_WIDTH && !current.trim_end().ends_with(':') {
+            lines.push(current.trim_end().to_owned());
+            current = format!("{continuation}{item}");
+        } else {
+            current = candidate;
+        }
+    }
+    lines.push(current.trim_end().to_owned());
+    lines
+}
+
+/// A title cut to `width` characters, with an ellipsis when it had to lose something.
+fn clip(title: &str, width: usize) -> String {
+    let characters: Vec<char> = title.chars().collect();
+    if characters.len() <= width {
+        return title.to_owned();
+    }
+    let mut short: String = characters
+        .into_iter()
+        .take(width.saturating_sub(1))
+        .collect();
+    short.push('…');
+    short
+}
+
+/// "[solution applied, spec modified]" for a step whose result is not the learner's own.
 fn honesty_marks(session: &Session, step_id: &str) -> String {
     let Some(recorded) = session.state().steps.get(step_id) else {
         return String::new();
@@ -134,7 +201,7 @@ fn honesty_marks(session: &Session, step_id: &str) -> String {
     if marks.is_empty() {
         String::new()
     } else {
-        format!("  [{}]", marks.join(", "))
+        format!("[{}]", marks.join(", "))
     }
 }
 

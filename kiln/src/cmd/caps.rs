@@ -57,8 +57,8 @@ pub fn run(session: &Session, track: Option<&str>) -> Result<u8> {
     match track {
         Some(id) => println!("{shown} slots in {id} · {verified} verified"),
         None => println!(
-            "{shown} slots shown · {verified} verified · tracks not authored yet show their ledger \
-             position only"
+            "{shown} slots shown · {verified} verified (a step verifies every slot it declares) · \
+             tracks not authored yet show their ledger position only"
         ),
     }
     Ok(EXIT_OK)
@@ -85,10 +85,7 @@ fn evidence_for(
 ) -> Evidence {
     let Ok(track) = course.track(&position.track) else {
         return Evidence {
-            step: format!(
-                "{}/{} (track not authored yet)",
-                position.track, position.number
-            ),
+            step: format!("{}/{}", position.track, position.number),
             status: "not authored yet".into(),
             reteach: None,
             verified: false,
@@ -161,7 +158,7 @@ mod tests {
             &position("relay/2.1"),
         );
         assert!(
-            unauthored.step.contains("track not authored yet"),
+            unauthored.status == "not authored yet" && unauthored.step == "relay/2.1",
             "{unauthored:?}"
         );
         assert!(!unauthored.verified);
