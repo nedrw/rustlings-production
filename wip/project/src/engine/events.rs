@@ -110,6 +110,32 @@ impl JobEvent {
         }
     }
 
+    /// A line a store has already written, identity and all.
+    ///
+    /// The read half of the round trip: [`JobEvent::new`] mints an identity for a line that is about
+    /// to be appended, and this is how a store hands a row back *without* minting a second one.
+    /// That matters more than it looks: a line's identity is what makes appending it twice the same
+    /// line, so a read that invented a fresh identity would make every line look new to whatever
+    /// compared two of them.
+    #[must_use]
+    pub fn stored(
+        id: Uuid,
+        job_id: JobId,
+        kind: EventKind,
+        attempt: u32,
+        detail: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            job_id,
+            kind,
+            attempt,
+            detail,
+            at,
+        }
+    }
+
     /// This line's identity, for a store that wants to answer which row it wrote.
     #[must_use]
     pub fn id(&self) -> Uuid {

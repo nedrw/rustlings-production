@@ -88,5 +88,7 @@ where
 {
     let _ = attempts;
     let _ = operation;
-    todo!("jobq/3.6-transaction-isolation: call the closure, and call it again while the failure is one another attempt could change")
+    todo!(
+        "jobq/3.6-transaction-isolation: call the closure, and call it again while the failure is one another attempt could change"
+    )
 }

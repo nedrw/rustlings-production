@@ -18,6 +18,14 @@
 //! * **the categories are the interface.** `is_retryable()` is the engine's answer to "is another
 //!   attempt worth anything?", and `exit_code()` is the answer a shell reads; both are decisions a
 //!   caller makes on this type alone rather than by reading a message.
+//!
+//! `jobq/3.6-transaction-isolation` adds the fifth class, and it is the smallest honest one: a store
+//! that refused a *transaction* because somebody else got there first is not a store that is broken
+//! — it is a store that answered "not this time", and the engine has a word for that
+//! ([`Error::Conflict`]) plus a loop that acts on it (`crate::engine::retry`). It is a new variant
+//! rather than a field on `Store` because 3.3's promise is the shape of a variant, and it is not a
+//! string because a caller that wants the database's own code can walk `source()` to the driver's
+//! error and read it there.
 
 use thiserror::Error as ThisError;
 
@@ -70,6 +78,29 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
+    /// The store refused the transaction because another writer got there first.
+    ///
+    /// Retryable, and more precisely than `Store` is: the four-oh-oh-oh-ones. PostgreSQL raises
+    /// `40001` when a transaction at an isolation level that holds a snapshot loses a row to a
+    /// concurrent commit, and `40P01` when it detects a deadlock; both mean "the same statements
+    /// have not been tried yet", which is the one thing a retry can change. That is why the durable
+    /// backend tells them apart from every other refusal it can answer with, and why the class
+    /// exists at all rather than being folded into `Store` with a `detail` string nobody can branch
+    /// on.
+    ///
+    /// What a caller does with it is a policy and not this enum's business: the bound, and whether
+    /// there is a wait between attempts, belong to whoever is running the loop
+    /// (`crate::engine::retry` is the engine's own answer, and `jobq/3.8-clock-injection` is where a
+    /// backoff would get a clock to measure with).
+    #[error("conflict: {source}")]
+    Conflict {
+        /// The driver's refusal, whole. The database's own code (`40001`) and message are in there:
+        /// a `downcast_ref` reaches them, and a caller that only wants the sentence gets it from
+        /// `Display`.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     /// The service could not read its configuration.
     ///
     /// Not retryable: a file that says something this build cannot use does not say something else a
@@ -108,9 +139,14 @@ impl Error {
     /// The default for anything this list does not name is `false`, which is the safe half of the
     /// decision: a variant nobody has classified yet is a variant nobody has argued is retryable,
     /// and a queue that retried the unknown would turn one bug into a loop.
+    ///
+    /// `Conflict` (`jobq/3.6-transaction-isolation`) is the sharper half of `Store`: a transaction a
+    /// concurrent writer made the database refuse is the case where the *same* call is worth running
+    /// again, and the class naming it is what lets a caller retry that without retrying a store that
+    /// is simply unreachable.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Error::Store { .. })
+        matches!(self, Error::Store { .. } | Error::Conflict { .. })
     }
 
     /// Exit code for a binary that ends because of this error.
@@ -118,13 +154,15 @@ impl Error {
     /// One code per failure class, because a script's `$?` is an interface too (step
     /// `jobq/3.15-cli-contract` is where the classes are written down): a bad call is 2, a missing
     /// thing is 3, a refused store is 4, and a broken environment is 1. The two binaries already
-    /// exit with these codes, so the table moves only with them.
+    /// exit with these codes, so the table moves only with them — `Conflict` shares the store's 4
+    /// for the same reason: what a shell can act on is "the queue would not take it", and the
+    /// caller that could act on the difference retried before it ever got here.
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
             Error::Invalid { .. } => 2,
             Error::NotFound { .. } => 3,
-            Error::Store { .. } => 4,
+            Error::Store { .. } | Error::Conflict { .. } => 4,
             Error::Config { .. } | Error::Io { .. } => 1,
         }
     }

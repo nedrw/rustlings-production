@@ -4,14 +4,71 @@
 //! attempt budget, the ordering), which is exactly why the conformance suite can run against both
 //! (step `jobq/3.5-store-port-conformance`) and why a bug that only shows up in the other backend
 //! is a bug in the engine, not in the test harness.
+//!
+//! `jobq/3.6-transaction-isolation` adds the second half of that shape: the trail. A durable backend
+//! gets "the state change and the line that describes it commit together" from a transaction, and
+//! this one gets it from the lock it already holds — the row and the line are written while the same
+//! guard is alive, so a settle that is refused writes neither, and a settle that answers writes
+//! both. The *idempotence* of an append is the same kind of translation: a unique index under a
+//! table, and here the key of a map.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use chrono::{DateTime, Utc};
+
 use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
 use crate::engine::error::Error;
+use crate::engine::events::{EventKind, JobEvent};
 use crate::engine::sealed::Sealed;
 use crate::engine::store::{BoxFuture, Store};
+
+/// What this store knows, under one lock.
+///
+/// One struct rather than two maps with two mutexes, because the promise of
+/// `jobq/3.6-transaction-isolation` is about a *pair* of writes: a settle that changed the row and
+/// then lost the lock on its way to the trail would leave exactly the disagreement the trail exists
+/// to prevent, and a store that cannot get that wrong by construction does not need a comment
+/// explaining the order two locks have to be taken in.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// Every job this store knows, keyed by identity so two writes to one job cannot both win.
+    jobs: BTreeMap<JobId, Job>,
+    /// Every job's trail, appended in the order things happened.
+    events: BTreeMap<JobId, Vec<JobEvent>>,
+}
+
+impl Ledger {
+    /// Append one line, answering whether it was new.
+    ///
+    /// The identity of a line is `(kind, attempt)` within its job — the same identity the durable
+    /// backend's unique index holds — so a second append of the same settle is a no-op here too.
+    /// A scan of a job's lines rather than a keyed map: a trail is a handful of lines, and the
+    /// vector is what makes "oldest first" the order they were written in.
+    fn record(&mut self, event: &JobEvent) -> bool {
+        let trail = self.events.entry(event.job_id()).or_default();
+        if trail
+            .iter()
+            .any(|line| line.kind() == event.kind() && line.attempt() == event.attempt())
+        {
+            return false;
+        }
+        trail.push(event.clone());
+        true
+    }
+
+    /// One job's trail, oldest first, ties broken the way the port documents.
+    fn events_of(&self, id: &JobId) -> Vec<JobEvent> {
+        let mut trail = self.events.get(id).cloned().unwrap_or_default();
+        trail.sort_by(|left, right| {
+            left.at()
+                .cmp(&right.at())
+                .then_with(|| left.kind().cmp(&right.kind()))
+                .then_with(|| left.attempt().cmp(&right.attempt()))
+        });
+        trail
+    }
+}
 
 /// Jobs in a map, protected by a mutex. One process, no durability, honest about both.
 ///
@@ -21,8 +78,8 @@ use crate::engine::store::{BoxFuture, Store};
 /// implementation is not welcome.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    /// Every job this store knows, keyed by identity so two writes to one job cannot both win.
-    jobs: Mutex<BTreeMap<JobId, Job>>,
+    /// The rows and the trail behind one lock.
+    ledger: Mutex<Ledger>,
 }
 
 impl MemoryStore {
@@ -32,11 +89,11 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// The map, taken without a panic path: a poisoned mutex means some other thread died holding
-    /// it, and refusing to read the jobs after that would turn one thread's panic into the whole
-    /// process's.
-    fn jobs(&self) -> MutexGuard<'_, BTreeMap<JobId, Job>> {
-        self.jobs.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The store's contents, taken without a panic path: a poisoned mutex means some other thread
+    /// died holding it, and refusing to read the jobs after that would turn one thread's panic into
+    /// the whole process's.
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Jobs in one queue that are due, in claim order.
@@ -49,11 +106,7 @@ impl MemoryStore {
     /// on: `claim` selects and stamps under *one* lock, so the rows this function names cannot be
     /// claimed by somebody else in between (step `jobq/3.5-store-port-conformance` is the step that
     /// found the other spelling of this — select, unlock, stamp — handing one job to two workers).
-    fn due(
-        jobs: &BTreeMap<JobId, Job>,
-        queue: &Queue,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Vec<JobId> {
+    fn due(jobs: &BTreeMap<JobId, Job>, queue: &Queue, now: DateTime<Utc>) -> Vec<JobId> {
         let mut due: Vec<&Job> = jobs
             .values()
             .filter(|job| job.queue == *queue && job.state == JobState::Queued && job.run_at <= now)
@@ -93,12 +146,12 @@ impl Store for MemoryStore {
                 // instant: the caller's clock is not the store's, and only one of them is the
                 // authority on when a job is due (step `jobq/3.8-clock-injection` moves this read
                 // behind an injected clock).
-                run_at: request.run_at.unwrap_or_else(chrono::Utc::now),
+                run_at: request.run_at.unwrap_or_else(Utc::now),
                 attempts: 0,
                 max_attempts: request.max_attempts,
                 last_error: None,
             };
-            self.jobs().insert(job.id, job.clone());
+            self.ledger().jobs.insert(job.id, job.clone());
             Ok(job)
         })
     }
@@ -110,19 +163,20 @@ impl Store for MemoryStore {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
         Box::pin(async move {
-            // The memory store has no leases yet (step `jobq/3.7-leases-and-recovery` adds them),
-            // so who holds a job is not recorded here. The names are still the interface: the two
-            // implementations must answer the same questions.
+            // Nothing records who holds a job yet, so the worker is not written down here either —
+            // the two backends have to answer the same questions, and an answer only this one can
+            // give is not one the port may rely on (step `jobq/3.7-leases-and-recovery` gives both
+            // of them the lease). The name is still the interface.
             let _ = worker;
-            let now = chrono::Utc::now();
+            let now = Utc::now();
             // One lock, one decision: choosing the due jobs and stamping them happen in the same
             // critical section, so a second claim on this store cannot read the same row as free
             // while this one is on its way to marking it running.
-            let mut jobs = self.jobs();
-            let due = Self::due(&jobs, queue, now);
+            let mut ledger = self.ledger();
+            let due = Self::due(&ledger.jobs, queue, now);
             let mut claimed = Vec::new();
             for id in due.into_iter().take(limit) {
-                if let Some(job) = jobs.get_mut(&id) {
+                if let Some(job) = ledger.jobs.get_mut(&id) {
                     job.state = JobState::Running;
                     // An attempt starts when a worker takes the job, not when it finishes: a
                     // worker that dies holding a job must still have spent one.
@@ -141,8 +195,8 @@ impl Store for MemoryStore {
     ) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             let _ = worker;
-            let mut jobs = self.jobs();
-            let Some(job) = jobs.get_mut(id) else {
+            let mut ledger = self.ledger();
+            let Some(job) = ledger.jobs.get_mut(id) else {
                 return Err(Error::NotFound { id: *id });
             };
             if job.state != JobState::Running {
@@ -154,8 +208,19 @@ impl Store for MemoryStore {
                     ),
                 });
             }
+            let attempt = job.attempts;
             job.state = JobState::Succeeded;
             job.last_error = None;
+            // The line goes in while the same guard is held: this store has no transaction to commit
+            // or roll back, so the lock *is* the transaction, and a refusal above returns before
+            // either write happens.
+            ledger.record(&JobEvent::new(
+                *id,
+                EventKind::Completed,
+                attempt,
+                None,
+                Utc::now(),
+            ));
             Ok(())
         })
     }
@@ -168,8 +233,8 @@ impl Store for MemoryStore {
     ) -> BoxFuture<'a, Result<JobState, Error>> {
         Box::pin(async move {
             let _ = worker;
-            let mut jobs = self.jobs();
-            let Some(job) = jobs.get_mut(id) else {
+            let mut ledger = self.ledger();
+            let Some(job) = ledger.jobs.get_mut(id) else {
                 return Err(Error::NotFound { id: *id });
             };
             if job.state != JobState::Running {
@@ -181,17 +246,37 @@ impl Store for MemoryStore {
                     ),
                 });
             }
+            let attempt = job.attempts;
             job.last_error = Some(reason.to_owned());
             job.state = if job.attempts < job.max_attempts {
                 JobState::Queued
             } else {
                 JobState::Failed
             };
-            Ok(job.state)
+            let state = job.state;
+            // The attempt the line names is the one the claim started, read off the row the same
+            // guard is holding: a trail built from a second read could name an attempt that had
+            // already moved on (step `jobq/3.6-transaction-isolation`).
+            ledger.record(&JobEvent::new(
+                *id,
+                EventKind::AttemptFailed,
+                attempt,
+                Some(reason.to_owned()),
+                Utc::now(),
+            ));
+            Ok(state)
         })
     }
 
     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
-        Box::pin(async move { Ok(self.jobs().get(id).cloned()) })
+        Box::pin(async move { Ok(self.ledger().jobs.get(id).cloned()) })
+    }
+
+    fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
+        Box::pin(async move { Ok(self.ledger().record(event)) })
+    }
+
+    fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
+        Box::pin(async move { Ok(self.ledger().events_of(id)) })
     }
 }

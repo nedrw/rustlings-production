@@ -14,9 +14,18 @@
 //! dyn-compatible (rustc E0038, docs/handoff-m0.md §2), and the worker holds its store behind a
 //! reference. One box a call is the price of that, and it is paid once per claim, not per job.
 //!
+//! `jobq/3.6-transaction-isolation` widens the port by two methods, and the reason is the same
+//! reason the port exists: **a settle leaves a trail**, the trail is where an operator and the next
+//! tooling learn what happened to a job, and a trail that only one backend keeps is a promise the
+//! engine cannot make. So [`Store::record`] (append a line, idempotently by the line's own identity)
+//! and [`Store::events`] (read a job's lines, oldest first) are on the port, and the two backends
+//! keep them the way each of them can: a unique index under a durable table, a keyed map in memory.
+//! The *settles* append through that same promise inside their own transaction, so the row and the
+//! line that describes it commit together — which is the subject of that step.
+//!
 //! The port is **sealed** (step `jobq/3.2-public-api-baseline`): `Sealed` is a supertrait, so the
 //! two promises above are made by the crate and by the backends it ships, not by anyone who happens
-//! to implement five methods. A third-party backend could not keep the second promise — this crate
+//! to implement these methods. A third-party backend could not keep the second promise — this crate
 //! cannot run its suite for code it does not have — so it is refused at the point where the promise
 //! would have to be kept, which is the `impl`.
 
@@ -25,6 +34,7 @@ use std::pin::Pin;
 
 use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
 use crate::engine::error::Error;
+use crate::engine::events::JobEvent;
 use crate::engine::sealed::Sealed;
 
 pub(crate) mod memory;
@@ -107,4 +117,37 @@ pub trait Store: Sealed + Send + Sync + 'static {
     /// [`Error::Store`] when the backend refused the read (a missing row is `Ok(None)`, not an
     /// error: looking is allowed to come up empty).
     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>>;
+
+    /// Append one line to a job's trail, answering whether it was new.
+    ///
+    /// Appending is **idempotent by the line's own identity** (`jobq/3.6-transaction-isolation`): a
+    /// line is identified by `(job_id, kind, attempt)`, so appending the same settle twice leaves
+    /// one line, and the `false` a caller gets back is how it finds out its second attempt wrote
+    /// nothing new. The two backends keep that promise differently — a unique index the statement
+    /// defers to (`on conflict … do nothing`) under a table, the map the lines are keyed by in
+    /// memory — and it is on the port rather than in either of them because a caller that has to
+    /// know which backend it is talking to has no port.
+    ///
+    /// The settles a backend owns (`complete`, `fail`, and the reclaim of
+    /// `jobq/3.7-leases-and-recovery`) append their own lines *inside* the transaction that changes
+    /// the row, so this door is for callers whose work is not a settle: the tooling of
+    /// `jobq/3.16-dlq-tooling`, and the suite that holds every backend to the same trail.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Store`] when the backend refused the write.
+    fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>>;
+
+    /// One job's trail: what has happened to it, oldest first.
+    ///
+    /// The order is a promise, for the reason `claim`'s order is one: an operator reads a story, and
+    /// two backends telling it in different orders is two answers to one question. Lines that share
+    /// an instant come back in `(kind, attempt)` order so that the tie is decided the same way by
+    /// both. A job nobody wrote has an empty trail rather than an error, exactly as `get` answers
+    /// `Ok(None)` for it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Store`] when the backend refused the read.
+    fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>>;
 }

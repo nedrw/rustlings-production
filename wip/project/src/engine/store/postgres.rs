@@ -19,16 +19,28 @@
 //! day the container's clock does. `jobq/3.8-clock-injection` is where that clock becomes
 //! something a test can move.
 //!
-//! The schema this file talks to is `migrations/0001_jobs.sql`, and the port's five methods are the
-//! only place the column names appear: no other file in the crate knows that jobs live in a table.
+//! `jobq/3.6-transaction-isolation` gives the durable backend two things the in-memory one has to
+//! imitate rather than learn. The first is a **trail**: every settle writes a line into
+//! `job_events`, *in the same transaction* as the row it describes, because a trail that can
+//! disagree with the job it is about is worse than no trail at all — an operator reading "failed
+//! twice" next to a row that says `queued` has two answers and no way to pick. The second is
+//! **isolation**: a settle runs at `repeatable read` and hands the caller
+//! [`Error::Conflict`](crate::engine::Error::Conflict) when a concurrent writer made the database
+//! refuse it, so the loser of a race is told "again" instead of being left to act on a value that
+//! was true a moment ago.
+//!
+//! The schema this file talks to is `migrations/0001_jobs.sql` and `migrations/0002_job_events.sql`,
+//! and the port's methods are the only place the column names appear: no other file in the crate
+//! knows that jobs live in a table.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
 use crate::engine::error::Error;
+use crate::engine::events::{EventKind, JobEvent};
 use crate::engine::sealed::Sealed;
 use crate::engine::store::{BoxFuture, Store};
 
@@ -192,31 +204,9 @@ impl Store for PostgresStore {
     ) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             let _ = worker;
-            // The `and state = 'running'` is the promise rather than a guard: a job nobody is
-            // running is a job whose outcome nobody gets to record, and a write that guessed
-            // would overwrite whatever the row was waiting for with "succeeded".
-            let written = sqlx::query(
-                "update jobs set state = 'succeeded', last_error = null \
-                                       where id = $1 and state = 'running'",
-            )
-            .bind(id.as_uuid())
-            .execute(&self.pool)
-            .await
-            .map_err(refused)?;
-            if written.rows_affected() > 0 {
-                return Ok(());
-            }
-            // Nothing changed, and there are two different reasons for that — which is why the
-            // refusal is a second question rather than a message invented here.
-            Err(match self.state_of(id).await? {
-                None => Error::NotFound { id: *id },
-                Some(state) => Error::Invalid {
-                    detail: format!(
-                        "job {id} is {state}, not running: only the worker that claimed it can \
-                         complete it"
-                    ),
-                },
-            })
+            // The worker is not asked for a second time here either: the guard is the row's own
+            // state, which is the only thing that can decide this once two workers disagree.
+            self.settle(id, Change::Completed).await.map(|_| ())
         })
     }
 
@@ -228,33 +218,7 @@ impl Store for PostgresStore {
     ) -> BoxFuture<'a, Result<JobState, Error>> {
         Box::pin(async move {
             let _ = worker;
-            // Where a failed job goes is decided by the row's own budget, in the same statement
-            // that records the reason: a caller cannot be handed "queued" by a backend that then
-            // fails to write it, and the attempt count the in-memory backend keeps is the same
-            // count this `case` reads.
-            let row: Option<(String,)> = sqlx::query_as(
-                "update jobs set last_error = $2, \
-                     state = case when attempts < max_attempts then 'queued' else 'failed' end \
-                 where id = $1 and state = 'running' \
-                 returning state",
-            )
-            .bind(id.as_uuid())
-            .bind(reason)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(refused)?;
-            let Some((state,)) = row else {
-                return Err(match self.state_of(id).await? {
-                    None => Error::NotFound { id: *id },
-                    Some(state) => Error::Invalid {
-                        detail: format!(
-                            "job {id} is {state}, not running: a failure is only recorded against \
-                             an attempt somebody actually started"
-                        ),
-                    },
-                });
-            };
-            decode_state(&state)
+            self.settle(id, Change::Failed { reason }).await
         })
     }
 
@@ -275,22 +239,223 @@ impl Store for PostgresStore {
             row.map(JobRow::into_job).transpose()
         })
     }
+
+    fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
+        Box::pin(async move {
+            // One statement, so it needs no transaction of its own: the unique index decides who
+            // wins when two callers append the same line at the same instant, and `do nothing` is
+            // what makes the loser's write a no-op rather than an error it would have to translate.
+            let mut connection = self.pool.acquire().await.map_err(refused)?;
+            append(&mut connection, event).await
+        })
+    }
+
+    fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
+        Box::pin(async move {
+            // The order is the port's promise, so it is written here rather than left to whatever
+            // order the table hands rows back in: `at` first, then the two columns that settle a
+            // tie the same way the in-memory backend settles it.
+            let rows: Vec<EventRow> = sqlx::query_as(
+                "select id, job_id, kind, attempt, detail, at from job_events where job_id = $1 \
+                 order by at asc, kind asc, attempt asc",
+            )
+            .bind(id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(refused)?;
+            rows.into_iter().map(EventRow::into_event).collect()
+        })
+    }
+}
+
+/// The statement a settle's transaction starts with.
+///
+/// One line, and the step's whole isolation argument. At `repeatable read` a transaction's reads
+/// and its writes belong to one snapshot, so a writer that commits in between is a *refusal*
+/// (`40001`, [`Error::Conflict`]) rather than a `where` clause that quietly matches nothing. At the
+/// default level the same write waits for the other transaction, re-reads the row it no longer
+/// recognises, and either succeeds or finds nothing to do — with no way for this backend to tell
+/// "somebody else settled it" from "the row was never running", and no way for the trail to record
+/// which of the two happenings it was.
+///
+/// It is a `&'static str` because that is what the driver takes (see the note above the statements):
+/// the isolation level of a transaction is a decision of this file, not a value a caller hands over.
+const SETTLE: &str = "begin isolation level repeatable read";
+
+/// The statement that records a success.
+const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null \
+                       where id = $1 and state = 'running' \
+                       returning state, attempts";
+
+/// The statement that records a failure: the row's own budget decides where the job goes, in the
+/// same statement that writes the reason down.
+const FAIL: &str = "update jobs set last_error = $2, \
+                           state = case when attempts < max_attempts then 'queued' else 'failed' end \
+                    where id = $1 and state = 'running' \
+                    returning state, attempts";
+
+/// What a settle does to the row it touches.
+///
+/// An enum rather than a flag because the two settles differ in three places at once — the
+/// statement, the line they append, and the sentence a refusal is explained with — and a bool that
+/// picks between three things is how the third one gets forgotten.
+enum Change<'a> {
+    /// The attempt finished the job.
+    Completed,
+    /// The attempt failed: the reason goes on the row, and the budget decides where the job goes.
+    Failed {
+        /// Why it failed, in the caller's words.
+        reason: &'a str,
+    },
+}
+
+impl Change<'_> {
+    /// Move the row, or move nothing when there is no running row to move.
+    ///
+    /// The `where … and state = 'running'` is the promise rather than a guard, and the `returning`
+    /// is what hands the settle the attempt number its line has to name: read the attempt in a
+    /// second statement and the line can describe an attempt that had already moved on.
+    async fn apply(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        id: &JobId,
+    ) -> Result<Option<(String, i64)>, Error> {
+        let row = match self {
+            Change::Completed => sqlx::query_as(COMPLETE).bind(id.as_uuid()),
+            Change::Failed { reason } => sqlx::query_as(FAIL).bind(id.as_uuid()).bind(*reason),
+        }
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(refused)?;
+        Ok(row)
+    }
+
+    /// The kind of line this change appends.
+    fn kind(&self) -> EventKind {
+        match self {
+            Change::Completed => EventKind::Completed,
+            Change::Failed { .. } => EventKind::AttemptFailed,
+        }
+    }
+
+    /// What the line says, when there is something to say.
+    fn detail(&self) -> Option<String> {
+        match self {
+            Change::Completed => None,
+            Change::Failed { reason } => Some((*reason).to_owned()),
+        }
+    }
+
+    /// Why a row that did not move could not be moved by *this* settle, for the refusal's sentence.
+    fn refusal(&self) -> &'static str {
+        match self {
+            Change::Completed => "only the worker that claimed it can complete it",
+            Change::Failed { .. } => {
+                "a failure is only recorded against an attempt somebody actually started"
+            }
+        }
+    }
 }
 
 impl PostgresStore {
-    /// What the `state` column says about one job, or `None` when there is no such row.
+    /// Settle one job: change the row, and write the line that describes the change, in one
+    /// transaction.
     ///
-    /// Asked only after a write that changed nothing, to tell "this job is gone" from "this job is
-    /// not running" — the two refusals the port separates and the two a caller acts on
-    /// differently.
-    async fn state_of(&self, id: &JobId) -> Result<Option<String>, Error> {
-        let row: Option<(String,)> = sqlx::query_as("select state from jobs where id = $1")
-            .bind(id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(refused)?;
-        Ok(row.map(|(state,)| state))
+    /// The two writes are the step. A settle that changed the row and then failed to append would
+    /// leave a job nobody can explain; one that appended and then failed to change the row would
+    /// leave a trail that lies about where the job is. Either way the disagreement is invisible
+    /// until somebody has to reconstruct what happened, which is exactly when a queue's trail is
+    /// the only evidence left — so the commit is one, and the append is not a second call that could
+    /// be skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when there is no such row, [`Error::Invalid`] when the row is not
+    /// running, [`Error::Conflict`] when a concurrent writer made the database refuse the
+    /// transaction, [`Error::Store`] for anything else the backend refused.
+    async fn settle(&self, id: &JobId, change: Change<'_>) -> Result<JobState, Error> {
+        let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
+        let Some((state, attempts)) = change.apply(&mut transaction, id).await? else {
+            // Nothing moved, and there are two different reasons for that — which is why the
+            // refusal is a second question, asked through the transaction that just wrote, rather
+            // than a message invented here.
+            let unreadable = format!(
+                "job {id} is {}, not running: {}",
+                state_of(&mut transaction, id)
+                    .await?
+                    .as_deref()
+                    .unwrap_or("gone"),
+                change.refusal()
+            );
+            let refusal = match state_of(&mut transaction, id).await? {
+                Some(_) => Error::Invalid { detail: unreadable },
+                None => Error::NotFound { id: *id },
+            };
+            // Nothing was written (the update matched no row), so there is nothing to undo; the
+            // rollback is what says so out loud, and it releases the snapshot and the locks the
+            // transaction took the moment it began.
+            transaction.rollback().await.map_err(refused)?;
+            return Err(refusal);
+        };
+        append(
+            &mut transaction,
+            &JobEvent::new(
+                *id,
+                change.kind(),
+                count(attempts, "attempts")?,
+                change.detail(),
+                Utc::now(),
+            ),
+        )
+        .await?;
+        // One commit for the row and the line: a reader sees both or neither.
+        transaction.commit().await.map_err(refused)?;
+        decode_state(&state)
     }
+}
+
+/// Append one line of the trail through whatever connection or transaction the caller holds.
+///
+/// `on conflict … do nothing` is where the idempotence of an append lives, and the unique index of
+/// `migrations/0002_job_events.sql` is what makes it true: two transactions appending the same
+/// `(job_id, kind, attempt)` cannot both win, and the one that loses writes nothing instead of
+/// reporting an error the caller would have to translate back into "I already did this".
+///
+/// The answer is whether the line was new — `false` for a suppressed duplicate — because that is
+/// what a caller that retried its own work wants to know.
+async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool, Error> {
+    let written = sqlx::query(
+        "insert into job_events (id, job_id, kind, attempt, detail, at) \
+         values ($1, $2, $3, $4, $5, $6) \
+         on conflict (job_id, kind, attempt) do nothing",
+    )
+    .bind(event.id())
+    .bind(event.job_id().as_uuid())
+    .bind(event.kind().as_str())
+    // `i64::from(u32)` is total, and the column is a `bigint` for the same reason `attempts` is:
+    // the engine counts in `u32` and the table must be able to hold what the engine counts.
+    .bind(i64::from(event.attempt()))
+    .bind(event.detail())
+    .bind(event.at())
+    .execute(connection)
+    .await
+    .map_err(refused)?;
+    Ok(written.rows_affected() > 0)
+}
+
+/// What the `state` column says about one job, or `None` when there is no such row.
+///
+/// Asked only after a write that changed nothing, to tell "this job is gone" from "this job is not
+/// running" — the two refusals the port separates and the two a caller acts on differently. It is
+/// asked *through the transaction that just wrote*, so the answer belongs to the same snapshot as
+/// the refusal it explains.
+async fn state_of(connection: &mut PgConnection, id: &JobId) -> Result<Option<String>, Error> {
+    let row: Option<(String,)> = sqlx::query_as("select state from jobs where id = $1")
+        .bind(id.as_uuid())
+        .fetch_optional(connection)
+        .await
+        .map_err(refused)?;
+    Ok(row.map(|(state,)| state))
 }
 
 /// One row of `jobs`, in the shape the driver decodes it.
@@ -343,6 +508,62 @@ impl JobRow {
     }
 }
 
+/// One row of `job_events`, in the shape the driver decodes it.
+///
+/// The same kind of boundary as [`JobRow`], one table over: `bigint` is not `u32`, the kind is a
+/// text column, and [`EventRow::into_event`] is the one place those are reconciled, so a row this
+/// backend wrote and cannot read back is reported where it can be seen.
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    /// This line's own identity.
+    id: Uuid,
+    /// The job it is about.
+    job_id: Uuid,
+    /// What happened, as text.
+    kind: String,
+    /// Which attempt it happened to.
+    attempt: i64,
+    /// Why, when there is a why.
+    detail: Option<String>,
+    /// When the caller stamped it.
+    at: DateTime<Utc>,
+}
+
+impl EventRow {
+    /// The engine's line, or the reason this table holds something the engine cannot read.
+    fn into_event(self) -> Result<JobEvent, Error> {
+        Ok(JobEvent::stored(
+            self.id,
+            JobId::from_uuid(self.job_id),
+            decode_kind(&self.kind)?,
+            count(self.attempt, "attempt")?,
+            self.detail,
+            self.at,
+        ))
+    }
+}
+
+/// The `kind` column, as the enum the engine uses.
+///
+/// Written as a search over [`EventKind::as_str`] rather than a `match` on strings, so that the two
+/// directions of the encoding cannot drift: adding a kind to the enum without teaching this function
+/// about it is impossible, because there is nothing here to teach.
+fn decode_kind(text: &str) -> Result<EventKind, Error> {
+    [
+        EventKind::Completed,
+        EventKind::AttemptFailed,
+        EventKind::Reclaimed,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == text)
+    .ok_or_else(|| {
+        unreadable(
+            "kind",
+            format!("`{text}` is not an event this engine knows"),
+        )
+    })
+}
+
 /// The `state` column, as the enum the engine uses.
 fn decode_state(text: &str) -> Result<JobState, Error> {
     match text {
@@ -368,10 +589,39 @@ fn count(value: i64, column: &'static str) -> Result<u32, Error> {
 }
 
 /// A driver failure, as the port wants it: whole, for the caller that wants the detail.
+///
+/// One class is split off, and the split is the subject of `jobq/3.6-transaction-isolation`: a
+/// transaction the database refused because another writer got there first is the one refusal the
+/// *same* call can turn around, so it becomes [`Error::Conflict`], and everything else — a
+/// connection that is gone, a constraint that said no, a statement that does not parse — stays
+/// [`Error::Store`]. The driver's own error travels inside either of them, so a caller that wants
+/// the SQLSTATE can `downcast_ref` and read it.
 fn refused(source: sqlx::Error) -> Error {
+    if is_conflict(&source) {
+        return Error::Conflict {
+            source: Box::new(source),
+        };
+    }
     Error::Store {
         source: Box::new(source),
     }
+}
+
+/// Whether the driver's failure is the database refusing a transaction for concurrency.
+///
+/// PostgreSQL has two codes for it and this is both of them: `40001`, "could not serialize access"
+/// — a transaction at `repeatable read` or `serializable` that lost a row to a commit it never saw —
+/// and `40P01`, a deadlock the server broke by killing one of the two transactions. They are
+/// *classes* rather than messages: matching the text would break the day PostgreSQL rewords it, and
+/// treating anything wider as a conflict would retry failures that cannot change.
+fn is_conflict(source: &sqlx::Error) -> bool {
+    matches!(
+        source
+            .as_database_error()
+            .and_then(|error| error.code().map(|code| code.into_owned()))
+            .as_deref(),
+        Some("40001" | "40P01")
+    )
 }
 
 /// A row the engine cannot read back.
