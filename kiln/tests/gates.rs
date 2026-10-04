@@ -105,10 +105,39 @@ fn course_with_images(scratch: &Scratch, gates: &[&str], lib_rs: &str, images: &
     );
     scratch.write(
         "app/mailer/Cargo.toml",
-        "[package]\nname = \"mailer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+        &format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+            crate_name(scratch, "mailer")
+        ),
     );
     scratch.write("app/mailer/src/lib.rs", lib_rs.trim_start());
     Course::load(scratch.path()).expect("fixture course loads")
+}
+
+/// Add a second binary to the fixture project and answer its (unique) name.
+fn add_second_bin(scratch: &Scratch, body: &str) -> String {
+    let name = crate_name(scratch, "second");
+    scratch.write(&format!("app/mailer/src/bin/{name}.rs"), body.trim_start());
+    name
+}
+
+/// A crate name that no other fixture in this file can collide with.
+///
+/// Cargo writes every workspace's output into `CARGO_TARGET_DIR` when the environment sets one, and
+/// these fixtures are all called `mailer`: two tests running at the same time would overwrite each
+/// other's `debug/mailer`, and `exit-code` probes whichever binary landed last — a green step
+/// judged against the wrong program. The name carries the fixture directory's uniqueness, so the
+/// path is unique without depending on the environment (which is what a test cannot control).
+fn crate_name(scratch: &Scratch, label: &str) -> String {
+    let unique = scratch
+        .path()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    format!("{label}_{unique}")
 }
 
 /// Run the named gates against the fixture project.
@@ -422,7 +451,7 @@ fn exit_code_probes_every_binary_the_project_builds() {
     // anything.
     let course = course_with(&scratch, &["exit-code"], CLEAN);
     scratch.write("app/mailer/src/main.rs", REFUSING_BIN.trim_start());
-    scratch.write("app/mailer/src/bin/second.rs", IGNORING_BIN.trim_start());
+    let second = add_second_bin(&scratch, IGNORING_BIN);
     let results = judge(&course, &["exit-code"]);
     assert_eq!(
         outcomes(&results),
@@ -431,7 +460,7 @@ fn exit_code_probes_every_binary_the_project_builds() {
         report(&results)
     );
     assert!(
-        results[0].detail.contains("second"),
+        results[0].detail.contains(&second),
         "the gate has to keep probing after the first binary behaved: {}",
         results[0].detail
     );
@@ -442,7 +471,7 @@ fn exit_code_passes_only_when_every_binary_names_what_it_refuses() {
     let scratch = Scratch::new("exit-code-two-good-bins");
     let course = course_with(&scratch, &["exit-code"], CLEAN);
     scratch.write("app/mailer/src/main.rs", REFUSING_BIN.trim_start());
-    scratch.write("app/mailer/src/bin/second.rs", REFUSING_BIN.trim_start());
+    let second = add_second_bin(&scratch, REFUSING_BIN);
     let results = judge(&course, &["exit-code"]);
     assert_eq!(
         outcomes(&results),
@@ -451,7 +480,8 @@ fn exit_code_passes_only_when_every_binary_names_what_it_refuses() {
         report(&results)
     );
     assert!(
-        results[0].detail.contains("mailer") && results[0].detail.contains("second"),
+        results[0].detail.contains(&crate_name(&scratch, "mailer"))
+            && results[0].detail.contains(&second),
         "the report has to name every binary it probed: {}",
         results[0].detail
     );

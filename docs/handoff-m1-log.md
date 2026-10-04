@@ -280,3 +280,63 @@ var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
 - **2.21 的 source 策略放 `[sources]`**（cargo-deny 0.14 起 `unknown-registry`/`unknown-git` 属于那里），并离线判策略与依赖树（本机没装 cargo-deny，`?deny` 只是 should 门）。
 - **2.22 不把迁移放后台**（那会让早期规格进入竞态，而装置不许改）：改判三条确定性观测——探针每次问 schema、启动日志顺序（schema 行先于 listening 行）、进不了 schema 的进程退 1 且从不宣告端口。`Ahead` 是 ready（滚动升级成立的前提，安全来自 2.23 的加法纪律）。
 - **2.23 的列值由数据库算**（`octet_length($5::jsonb::text)`）：jsonb 会规范化，Rust 侧算长度必然在个别 payload 上差 1 字节。
+
+## 第九段 · 2026-10 · M1 收尾验证：两处环境事实与一个真缺陷
+
+收尾验证在冻结的 `5f178ab` 上跑（私有缓存、无并发 cargo）。结论与两处必须记下来的东西：
+
+### 真缺陷（已修）：`kiln` 自己的门测试在 `CARGO_TARGET_DIR` 下不密闭
+
+现象：**导出 `CARGO_TARGET_DIR` 后跑 `cargo xtask ci`，`cargo test --workspace` 会在 20 秒内红**，红的
+是 `kiln/tests/gates.rs` 里三条测试，症状是「该红却绿」（`exit_code_probes_every_binary_the_project_builds`、
+`exit_code_fails_when_a_binary_ignores_an_argument_it_does_not_know`、`print_stdout_is_a_library_lint_and_not_a_binary_one`）。
+
+真因可指名：那些夹具 crate 都叫 `mailer`（`src/bin/second.rs` 也都是 `second`），而 `cargo build` 继承环境里的
+`CARGO_TARGET_DIR`，于是**同一份 `debug/mailer` 被并行跑的测试互相覆盖**；`exit-code` 闸门按
+`<target_dir>/debug/<bin>` 取二进制去探，探到的可能是另一个测试编出来的程序。对照实验：
+
+```
+同一环境 + --test-threads=1                      → 15 passed（绿）
+同一测试二进制、默认并行、env -u CARGO_TARGET_DIR → 15 passed（绿）
+```
+
+修法：夹具的 crate 名与第二个 bin 的名字**带上夹具目录的唯一性**（`crate_name(scratch, "mailer")`、
+`add_second_bin`），于是路径不可能相撞，而无需依赖环境里有没有那个变量。修完连跑三次 15/15（带 `CARGO_TARGET_DIR`）。
+**判据没动**——闸门对真实项目是对的；不密闭的是它自己的测试夹具。
+
+### 环境事实一：本机 podman 的虚机只共享 `/Users`、`/private`、`/var/folders`
+
+`podman machine` 是 vfkit 虚机，宿主 `/tmp` **不在** virtio-fs 共享列表里（虚机里的 `/tmp` 是它自己的 tmpfs）。
+所以把缓存放到 `/tmp/...` 再跑容器门会红：
+
+```
+✗ container-repro   the image did not build … Error: validating volumes:
+                    faccessat /tmp/xdg-final/kiln/container-target: no such file or directory
+```
+
+对照：同一棵树、缓存放 `$HOME/.cache/...` → `1/1 step(s) hold the contract`。**规则**：这台机器上跑容器门
+（`container-repro`、容器夹具）时，`XDG_CACHE_HOME` 要么留在默认的 `$HOME/.cache`，要么写成 `/private/tmp/...`，
+不要写成 `/tmp/...`（`kiln` 的默认值本来就对；这是给「为了隔离而手工改缓存目录」的人的提醒）。
+
+### 环境事实二：`verify` 会把规格同步进 `app/<track>`
+
+`verify relay` 在一棵「只走到 2.1」的 `app/relay` 上会写出 22 个 `tests/spec_*.rs`（第二次跑时它们缺
+`tests/support/{sender,target,load,keys,lanes}.rs`，于是失败集合与第一次不同）。这不是内容问题：
+`app/` 是学员的个人状态（git-ignored），`verify` 在一棵不完整的树上给出的就是一串失败——**它报的是那棵树走到哪**。
+要拿完成态的证据用 `kiln selftest --track relay`（它在沙箱里把 24 步走完）。
+
+### 收尾验证的结论行（原样）
+
+```
+$ XDG_CACHE_HOME=$HOME/.cache/kiln-verify CARGO_TARGET_DIR=/tmp/final-target RUST_TEST_THREADS=1 cargo xtask ci
+   22/22 step(s) hold the contract: the spec fails on the scaffold, passes on the reference solution, and every must gate is green
+   xtask ci: all checks passed                                          exit=0   761 s
+   其中：202 passed（kiln 单测，含 19 道 probe 的引用校验）、15 passed（门测试）、19/19 probe references、
+   46 spec file(s) pinned
+
+$ cargo run -q -p kiln -- selftest --track relay
+   24/24 step(s) hold the contract: …                                   exit=0   476 s
+
+$ cargo run -q -p kiln -- lint-caps                                      exit=0   0 s   no issues.
+$ cargo run -q -p kiln -- links                                           exit=0   1 s   57 pages · 369 links · 0 findings
+```
