@@ -161,27 +161,44 @@ fn run_binary(env: &[support::Var], deadline: Duration) -> Ran {
     }
 }
 
-/// The newest migration file in the project, as text.
+/// The migration that creates `index`, as text — found by what it does rather than by being the
+/// newest file in the directory.
 ///
 /// A test that reads a migration *file* is measuring a structure rather than a behaviour, and the
 /// reason is worth writing down (authoring.md §6.6): what makes `create index concurrently` work is
 /// that sqlx runs a migration outside a transaction when, and only when, the file says so — the
-/// runner and the file are two halves of one rule, and the other half is asserted below by asking
+/// runner and the file are two halves of one rule, and the other half is asserted above by asking
 /// the database to run the statement inside a transaction.
-fn newest_migration() -> String {
+///
+/// It is found by name for the reason every spec in this track is written to hold on more than its
+/// own tree (authoring.md §6.8): a later step adds migrations of its own, and *that* migration is
+/// not this one — a check that assumed "the newest file" would fail on the next step's tree for a
+/// reason that has nothing to do with this step.
+fn migration_creating(index: &str) -> String {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", directory.display()))
+    let entries = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", directory.display()));
+    let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "sql"))
         .collect();
     files.sort();
-    let newest = files
-        .pop()
-        .unwrap_or_else(|| panic!("this project has migrations"));
-    std::fs::read_to_string(&newest)
-        .unwrap_or_else(|error| panic!("{} cannot be read: {error}", newest.display()))
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("{} cannot be read: {error}", file.display()));
+        if text.contains(index) {
+            return text;
+        }
+    }
+    panic!(
+        "no migration creates `{index}`: the migration of this step is: {}",
+        files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Liveness answers without the database; readiness is about the schema.
@@ -563,16 +580,16 @@ fn the_migration_that_grew_the_schema_was_applied_online() {
         "and the refusal says which rule was broken: {why}"
     );
 
-    let newest = newest_migration();
+    let migration = migration_creating("deliveries_endpoint_claimable_idx");
     assert!(
-        newest.starts_with("-- no-transaction"),
-        "the newest migration is the one this step rolled out, and it declares itself \
-         non-transactional: sqlx runs a migration inside a transaction unless the file's first line \
-         says otherwise, and a `create index concurrently` inside one fails"
+        migration.starts_with("-- no-transaction"),
+        "the migration that builds this index declares itself non-transactional: sqlx runs a \
+         migration inside a transaction unless the file's first line says otherwise, and a \
+         `create index concurrently` inside one fails"
     );
     assert!(
-        newest.to_ascii_lowercase().contains("concurrently"),
+        migration.to_ascii_lowercase().contains("concurrently"),
         "and it builds the index online, which is the difference between a rollout and a pause: \
-         {newest}"
+         {migration}"
     );
 }
