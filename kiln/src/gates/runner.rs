@@ -268,9 +268,9 @@ mod tests {
 
     #[test]
     fn the_catalogue_declares_which_gates_are_pending_and_why() {
-        // A pending gate must say when it arrives; that is what keeps `kiln check` honest while M0
-        // is being written. The names checked here are the ones T1's own metadata already points at
-        // and whose milestone is still ahead.
+        // A pending gate must say why it is not implemented, because `kiln check` prints the reason
+        // instead of a verdict. The slow gates left this list when M2 brought their implementations
+        // (handoff M2 §1); what is left is either enforced elsewhere or deliberately not built yet.
         let pending: Vec<(&str, &str)> = catalogue()
             .iter()
             .filter_map(|gate| match gate.status {
@@ -278,16 +278,22 @@ mod tests {
                 GateStatus::Ready => None,
             })
             .collect();
-        assert!(!pending.is_empty());
-        // `images` left this list when T1 step 9's content brought it, `links` when the course
-        // decided link checking must stay offline (plan §6), and `container-repro` when step 21's
-        // image arrived. `mutants` is the one no content has reached yet.
-        assert!(
-            pending.iter().any(|(name, _)| *name == "mutants"),
-            "`mutants` should still be pending: {pending:?}"
+        assert_eq!(
+            pending.iter().map(|(name, _)| *name).collect::<Vec<&str>>(),
+            ["timeout", "deny", "sim", "soak"],
+            "a gate moved between ready and pending"
         );
         for (name, reason) in &pending {
             assert!(!reason.is_empty(), "{name} is pending without a reason");
         }
+        // `deny` is the interesting one: pending is right for it even when it is implemented one day,
+        // because its reason is that it must stay a *should* gate.
+        let deny = pending
+            .iter()
+            .find(|(name, _)| *name == "deny")
+            .map(|(_, reason)| *reason)
+            .unwrap_or_default();
+        assert!(deny.contains("should"), "{deny}");
+        assert!(deny.contains("cargo-deny"), "{deny}");
     }
 }

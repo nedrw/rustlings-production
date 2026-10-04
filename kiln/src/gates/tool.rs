@@ -87,6 +87,10 @@ impl Tool {
     }
 
     /// Why the course wants it, for `kiln doctor`.
+    ///
+    /// The three tools the slow gates were once written around say what they are *now*: a tool that a
+    /// gate no longer needs is still worth reporting, but `doctor` may not claim a step depends on it
+    /// (handoff M2 §1 — a `must` gate is judged by `cargo`, `rustc` and the course's own files).
     #[must_use]
     pub fn purpose(self) -> &'static str {
         match self {
@@ -95,10 +99,19 @@ impl Tool {
             Tool::CargoWatch => "`kiln watch`",
             Tool::CargoExpand => "inspecting macro output while debugging",
             Tool::CargoNextest => "the faster test runner used from T3 on",
-            Tool::CargoLlvmCov => "the `coverage` gate (T3)",
-            Tool::CargoMutants => "the `mutants` gate (T3)",
-            Tool::CargoDeny => "the `deny` gate (T2)",
-            Tool::CargoSemverChecks => "the `semver` gate (T3)",
+            Tool::CargoLlvmCov => {
+                "measuring coverage outside the course: the `coverage` gate uses the toolchain's own \
+                 `llvm-tools-preview` component"
+            }
+            Tool::CargoMutants => {
+                "mutation testing outside the course: the `mutants` gate is implemented in `kiln` and \
+                 needs no tool"
+            }
+            Tool::CargoDeny => "hand-checking licences and sources: `deny` stays a `should` gate",
+            Tool::CargoSemverChecks => {
+                "checking a public API outside the course: the `semver` gate builds the course's own \
+                 witness with `cargo test`"
+            }
             Tool::CargoFuzz => "the `fuzz` work of T4",
         }
     }

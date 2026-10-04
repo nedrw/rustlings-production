@@ -306,8 +306,24 @@ pub fn run_line(line: &str, dir: &Path, timeout: Duration) -> Result<Ran> {
     run(program, &args, dir, timeout)
 }
 
-/// Split a whitespace-separated command line into program and arguments.
-fn split_command(line: &str) -> Result<(&str, Vec<&str>)> {
+/// The same, with environment variables set for the child.
+///
+/// A gate that re-runs a step's own command with a knob of its own needs this: `conformance` runs the
+/// same spec once per backend (`KILN_BACKEND=…`), and `coverage` runs it under `RUSTFLAGS`. Reusing
+/// the step's command is the point — the gate judges the spec the course shipped, not a paraphrase of
+/// it.
+pub fn run_line_with_env(
+    line: &str,
+    dir: &Path,
+    timeout: Duration,
+    env: &[(String, String)],
+) -> Result<Ran> {
+    let (program, args) = split_command(line)?;
+    run_with_env(program, &args, dir, timeout, env)
+}
+
+/// Split a whitespace-separated command line into program and arguments, without a shell.
+pub fn split_command(line: &str) -> Result<(&str, Vec<&str>)> {
     let mut parts = line.split_whitespace();
     let program = parts.next().ok_or_else(|| {
         KilnError::Invalid("the command is empty: expected something like `cargo test`".to_owned())
@@ -324,7 +340,27 @@ pub fn locate(program: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(path: &Path) -> bool {
+/// Where cargo will build for a command started in `project`.
+///
+/// The same answer the child gets, from the same one place: [`share_cargo_target_dir`] when a run has
+/// asked for a shared directory, the environment otherwise, and the project's own `target/` when
+/// neither says anything. A gate that has to find what cargo produced (`coverage` needs the binaries
+/// a profile was written from) asks here instead of guessing, because a wrong answer would report a
+/// missing measurement rather than a wrong one.
+#[must_use]
+pub fn target_dir(project: &Path) -> PathBuf {
+    if let Some(shared) = CARGO_TARGET_DIR.get() {
+        return shared.clone();
+    }
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => project.join("target"),
+    }
+}
+
+/// `true` when `path` is a file this machine would let a program run.
+#[must_use]
+pub fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };

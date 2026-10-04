@@ -19,8 +19,11 @@
 //!    that last rule is what keeps namespaced names such as `docs:public` readable.
 //!
 //! This module owns the grammar and the catalogue; running a gate belongs to the modules that
-//! implement one ([`fmt`], [`clippy`], [`no_todo`] so far), and probing the tools they need to
-//! [`tool`]. `kiln lint-caps` solves the same problem for capability metadata instead of code.
+//! implement one ([`fmt`], [`clippy`], [`mutants`], [`budget`] …), the little bit of source reading
+//! the textual gates share lives in [`lexer`] and [`sources`], and probing a tool belongs to
+//! [`tool`] — which now answers for the few tools a gate still needs, since the slow gates judge with
+//! `cargo`, `rustc` and the course's own files (handoff M2 §1). `kiln lint-caps` solves the same
+//! problem for capability metadata instead of code.
 
 use std::str::FromStr;
 
@@ -28,20 +31,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::KilnError;
 
+pub mod budget;
 pub mod caps;
 pub mod clippy;
+pub mod conformance;
 pub mod container_repro;
+pub mod coverage;
 pub mod docs_public;
 pub mod exit_code;
 pub mod fmt;
 pub mod i18n;
 pub mod images;
+pub mod lexer;
 pub mod links;
+pub mod mutants;
 pub mod no_todo;
 pub mod registry;
 pub mod runner;
+pub mod semver;
+pub mod sources;
 pub mod spec_integrity;
 pub mod tool;
+pub mod unsafe_budget;
 
 pub use registry::{GateDef, GateOutcome, GateStatus, Outcome, catalogue, lookup};
 pub use runner::{GateContext, GateResult, all_must_passed, run_all};

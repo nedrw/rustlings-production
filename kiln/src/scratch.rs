@@ -7,6 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::error::{KilnError, Result};
+
 /// A directory under the system temporary directory, removed when it is dropped.
 #[derive(Debug)]
 pub struct Scratch {
@@ -36,6 +38,18 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// A [`Scratch`] directory, as the typed failure a command reports when the system refuses one.
+///
+/// The gates that copy a project or write profile data need the directory rather than the
+/// `std::io::Error`, and they need it to fail loudly: a gate that silently did without its sandbox
+/// would measure the wrong tree.
+pub fn directory(label: &str) -> Result<Scratch> {
+    Scratch::new(label).map_err(|source| KilnError::Write {
+        path: std::env::temp_dir().join(format!("kiln-{label}")),
+        source,
+    })
 }
 
 /// The build directory a *sandboxed* run shares between its commands.

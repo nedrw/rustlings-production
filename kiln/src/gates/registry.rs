@@ -210,50 +210,70 @@ static CATALOGUE: &[GateDef] = &[
         name: "conformance",
         tool: None,
         purpose: "one suite runs against every implementation of a port",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // The project declares its backends in `conformance.toml` and the gate re-runs the step's own
+        // `run.cmd` once per backend, so nothing outside the toolchain is needed.
+        run: Some(crate::gates::conformance::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "mutants",
-        tool: Some(Tool::CargoMutants),
+        tool: None,
         purpose: "the specs are not vacuous",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // Implemented here rather than through `cargo-mutants` (handoff M2 §1): a `must` gate may
+        // only depend on what every machine running the course already has, and a textual mutation
+        // plus the step's own spec run needs nothing else. `kiln doctor` still reports the production
+        // tool, which is what a learner would reach for outside the course.
+        run: Some(crate::gates::mutants::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "coverage",
-        tool: Some(Tool::CargoLlvmCov),
+        tool: None,
         purpose: "error branches are exercised",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // `llvm-profdata`/`llvm-cov` come from a rustup component, which is not part of the toolchain
+        // baseline, so this gate probes the toolchain itself and reports `blocked` with the install
+        // line when they are missing (`tool` stays empty for that reason: an empty `tool` is what
+        // says the gate answers for itself).
+        run: Some(crate::gates::coverage::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "bench-budget",
         tool: None,
         purpose: "performance stays within a budget of the baseline",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // The baseline and the command that prints the counts are both course files, and the gate runs
+        // the command itself.
+        run: Some(crate::gates::budget::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "deny",
         tool: Some(Tool::CargoDeny),
         purpose: "licences, versions and sources follow policy",
         run: None,
-        status: GateStatus::Pending("T2"),
+        status: GateStatus::Pending(
+            "stays a `should` gate: `cargo-deny` is not part of the toolchain baseline, so a step that \
+             declared it `must` would go red on a good machine (plan §10)",
+        ),
     },
     GateDef {
         name: "unsafe-budget",
         tool: None,
         purpose: "no unexplained `unsafe`",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // Counting a word and reading a manifest is what it takes; the compiler is asked nothing, so
+        // the gate answers the same way on a machine that cannot build the project yet.
+        run: Some(crate::gates::unsafe_budget::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "semver",
-        tool: Some(Tool::CargoSemverChecks),
+        tool: None,
         purpose: "the public API stays compatible with its baseline",
-        run: None,
-        status: GateStatus::Pending("T3"),
+        // `cargo-semver-checks` is not installed here (handoff M2 §1). The judgement is the
+        // compiler's instead: the course's witness file is copied in and built, which is what makes
+        // `semver@baseline` a `must` gate a machine can always answer.
+        run: Some(crate::gates::semver::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "sim",
@@ -339,11 +359,10 @@ mod tests {
             .filter(|gate| gate.status == GateStatus::Ready)
             .map(|gate| gate.name)
             .collect();
-        // The gates a T1 step declares must be runnable, and the ones that need a tool must say
-        // which one: that pairing is what makes `kiln doctor` able to explain a blocked gate.
-        // `exit-code` arrives with T1 step 4's content, `docs:public` with step 5's, `images` with
-        // step 9's, `links` with step 22's and `container-repro` with step 21's; nothing a step
-        // mentions is pending any more.
+        // Every gate T1's and T3's metadata declares has to be runnable. The slow gates arrived with
+        // their own implementations rather than with `cargo-mutants`/`cargo-llvm-cov`
+        // (handoff M2 §1), which is why none of them names a tool: a `must` gate may only depend on
+        // what every machine running the course already has.
         assert_eq!(
             ready,
             [
@@ -358,6 +377,12 @@ mod tests {
                 "images",
                 "container-repro",
                 "links",
+                "conformance",
+                "mutants",
+                "coverage",
+                "bench-budget",
+                "unsafe-budget",
+                "semver",
             ],
             "a gate moved between ready and pending"
         );
@@ -371,5 +396,10 @@ mod tests {
                 gate.name
             );
         }
+        // The one gate that *is* a wrapper around an external binary stays `should`, and says so:
+        // `cargo-deny` is not part of the toolchain baseline (plan §10), so a step that declared
+        // `deny` as `must` would go red on a machine that is perfectly fine.
+        let deny = lookup("deny").expect("`deny` is catalogued");
+        assert_eq!(deny.tool, Some(Tool::CargoDeny));
     }
 }
