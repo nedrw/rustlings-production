@@ -201,7 +201,7 @@ app/jobq/
   src/bin/jobqd.rs    # 守护进程：配置、日志、迁移、HTTP（/healthz /readyz /metrics）
   src/bin/jobqc.rs    # CLI：submit/list/inspect/replay/purge + --json + 退出码
   src/service/**      # 守护进程内部（引擎不许反向依赖它，3.1 的判据）
-  tests/support/**    # client / app / service / postgres / store（按 JOBQ_BACKEND 造 store）
+  tests/support/**    # client / app / service / postgres / store（store 抽 `KILN_BACKEND` 造后端）
   migrations/**       # sqlx 迁移，前向编号
   docs/**             # runbook、capacity、coverage、adr/**、CHANGELOG.md
 ```
@@ -364,7 +364,8 @@ git -C app/jobq diff            # 先存下“好树”
 #   a) semver：把 Engine::submit 改名或改返回类型
 #   b) mutants：改一处行为而不动测试（该步模块里留下一个存活变异体）
 #   c) bench-budget：把被预算盯着的路径换成 O(n^2) 扫描（或去掉索引）
-#   d) conformance：让 PG 后端在某条用例上与内存后端不一致（例如去掉 skip locked）
+#   d) conformance：让 PG 后端与内存后端对同一问题给出不同答案。要选**读-然后-写**的 claim
+#      （先选行再更新）；把单语句里的 `SKIP LOCKED` 删掉是行为上看不见的（输者等锁后重查谓词，结果一样）
 CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
   cargo run -q -p kiln -- check jobq/<受影响的那一步> --track jobq
 

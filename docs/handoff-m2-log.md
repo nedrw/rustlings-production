@@ -176,4 +176,44 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   **规则**：冻结不同 commit 跑 CI 时，要么每次用**独立的 target dir**，要么解包后把源码 mtime 前移一秒。
   这与闸门实现里 `fs::copy` 要 `make_fresh` 是同一类问题（同一周踩到两次）。
 
-## 第五段（待写）
+## 第五段 · 2026-10 · 3.5（存储端口与一致性套件）：一次假红、两处我自己的缺陷、一个夹具加固
+
+### 做了什么
+
+- **3.5 交付**（提交 `course(jobq/3.5)`）：加性 scaffold（`sqlx` + `dep:sqlx` 插进 3.4 的多行 feature 列表、
+  `src/engine/store/postgres.rs` 五个 `todo!()`、`migrations/0001_jobs.sql` 空壳、容器夹具、
+  `tests/support/store.rs` 按 `KILN_BACKEND` 造后端、`conformance.toml`）+ 8 例规格（一次文件、逐后端各跑一次）+
+  参考解（DDL、单语句 claim、`pub(crate) mod postgres;` + 重导出、把 claim 顺序写进端口文档、
+  把内存 store 的 claim 从“读-然后-写”改成同一临界区）+ teach 正文。
+- **`slow:conformance@2` 第一次在真步骤上跑了两次后端**（内存 + 真 Postgres 容器），
+  `gates ✓ 11/11 must green`。回归：容器夹具按机器规则把**并发启动限到 3**（八个用例同时 `docker run`
+  会让虚机资源打架，红色来自 `docker run` 失败而不是断言），并在启动失败时按名字清掉容器
+  （否则那个值的 `Drop` 永远不会跑，就是泄漏的来源）。
+- **修了三处我自己写错的步骤 id**（提交 `course(jobq): T3 cited three step ids…`）：
+  `mailer/1.4-layered-config`/`1.6-structured-logs`/`1.9-migrations` → 真实 id `1.4-config`/`1.6-logging`/`1.9-postgres`；
+  做法是全树字符串替换（含 3.1 参考解补丁里的新增行，同行替换不动任何 hunk 头），重钉 3.1 规格哈希。
+  发现方式是写了一个小扫描：把 jobq 树里每个 `track/N.M-slug` 引用拿去和三份 track.toml 对（允许裸编号、不允许错 slug）。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| `kiln selftest jobq/3.5 --track jobq` | `scaffold ✓ the spec fails as it must (E0432: unresolved import support::store)` / `solution ✓ the spec passes` / `gates ✓ 11/11 must green`；连跑三次（含全新私有缓存）一致 |
+| `KILN_BACKEND=postgres cargo test --test spec_port_conformance` | `8 passed`，五个容器用例秒级到十秒级，跑完 `podman ps -a` 无残留 |
+| 并发用例的牙 | 把内存 store 的一锁修复回退后，10 次里 6 次报“two workers came back with the same job” |
+
+### 坑与判读
+
+- **一次假红**：`slow:conformance@2` 报 `postgres ✗ (… tests/support/postgres.rs:84 …)`——那是“容器起不来”的 panic，
+  不是断言。按 M1 协议单跑那一步（全新私有缓存）→ 绿；再连跑两次 → 绿。归因为环境（八个容器同时启动），
+  但 `must` 门会 flake 本身就是缺陷，所以做了上述夹具加固。
+- **启动失败会泄漏容器**：`docker run` 被 deadline 杀死时容器已 `Created` 但没起，而持有 `Drop` 的那个值
+  还没构造——失败路径现在按名字 `rm -f -v`。（机器上另有两个更早的残留 `kiln-pg-37015-3`、
+  `kiln-relay-pg-6462-4`，不是这次产生的，没去动它们。）
+- **`KILN_BACKEND` 与 `JOBQ_BACKEND`**：§1.3 的闸门契约与作业书写的是 `KILN_BACKEND`，§2.3 里的 `JOBQ_BACKEND`
+  是早期笔误，已改正。
+- **探测与规格的分歧被记下来**：`course/probes/db-port-conformance.apply.rs` 的正文写着“回来的是**集合**，顺序是后端自己的事”，
+  而本步把 claim 顺序写成了端口的承诺并断言它——两句话可以共存（没有承诺顺序的端口不该被断言顺序；
+  这个端口把顺序承诺写进了文档），已写进规格头与正文的说明里。
+
+## 第六段（待写）
