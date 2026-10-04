@@ -819,13 +819,18 @@ mod tests {
         assert_eq!(course.manifest().default_track, "mailer");
         assert_eq!(
             course.tracks().len(),
-            2,
-            "T1 and T2 have metadata; T3-T5 are ledger-only"
+            3,
+            "T1, T2 and T3 have metadata; T4-T5 are ledger-only"
         );
 
         let relay = course.track("relay").unwrap();
         assert_eq!(relay.step.len(), 24);
         assert_eq!(relay.project, "app/relay");
+
+        let jobq = course.track("jobq").unwrap();
+        assert_eq!(jobq.step.len(), 26);
+        assert_eq!(jobq.project, "app/jobq");
+        assert_eq!(jobq.index, 3, "the path order is T1, T2, T3");
 
         let mailer = course.default_track().unwrap();
         assert_eq!(mailer.step.len(), 22);
