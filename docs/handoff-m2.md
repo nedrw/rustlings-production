@@ -303,6 +303,21 @@ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --
       并在报告里明说改了哪几份早期规格
 - [ ] 报告里给原始命令与结论行（退出码、测试数、耗时），不要转述
 
+### 早期规格钉住的契约（后续步骤不得破坏）
+
+`verify` 与「学员做到后面再回头跑早期步骤」都会拿最终树重跑早期规格，所以下面这些是**累计约束**：
+
+- `jobqd --check-config` 必须继续打印 `store.url`（不含密码）、`worker.name`、`worker.queues`、`worker.batch`、
+  `log.level`、`log.format`，且三层（文件 < 环境变量 < flag）依旧生效；`--worker-name` 仍要认。新增设置只能加行，不能改行。
+- 守护进程启动后必须先打印**含 `draining`** 的日志行（夹具的就绪标记），再等信号；`SIGTERM` 后退出码必须是 0。
+  改这句文案就会弄红 3.1 的规格。
+- `src/engine/**` 里不得出现 `crate::service` / `crate::cli`（3.1 的结构断言），新文件同样受约束；
+  `src/engine` 下至少 4 个 `.rs`。
+- 内存 store 的语义：`claim` 即 `attempts += 1` 且 `state = running`；`complete` 只接受 running；
+  `fail` 按预算决定 `queued`/`failed` 并把原因写进 `last_error`；`get` 找不到返回 `Ok(None)`，
+  而 `Engine::inspect` 把它翻成 `Error::NotFound`。
+- `Store` 端口是密封的（3.2 起）：新增方法只能加在 trait 上（crate 内实现），不要在外部类型上实现它。
+
 ## 4. 实测数字与验收证据
 
 （每 5–6 步同步一次；收尾时写完整。）
