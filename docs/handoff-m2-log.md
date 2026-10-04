@@ -216,4 +216,46 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   而本步把 claim 顺序写成了端口的承诺并断言它——两句话可以共存（没有承诺顺序的端口不该被断言顺序；
   这个端口把顺序承诺写进了文档），已写进规格头与正文的说明里。
 
-## 第六段（待写）
+## 第六段 · 2026-10 · 3.6–3.7（审计轨迹/约束仲裁/有界重试 + 租约/续约/回收/worker 循环）
+
+### 做了什么
+
+- **3.6 交付**（提交 `course(jobq/3.6)`）：状态变更与它的审计行**同一事务**（`job_events`：`completed`/
+  `attempt_failed`/`reclaimed`；claim 不是 settle，理由写在 `events.rs`）；**唯一索引作仲裁**——
+  `(job_id, attempt, kind)` 上的唯一索引 + `insert … on conflict do nothing`，重复追加是 no-op；
+  **有界重试**——`retry(DEFAULT_ATTEMPTS, closure)` 认 SQLSTATE `40001`/`40P01`（经 3.3 的 `is_retryable`），
+  规格用两条连接、`repeatable read`、相反顺序触同一批行**真注入**冲突。新增 `Error::Conflict { source }`（新变体，
+  不动旧变体字段）。
+- **3.7 交付**（提交 `course(jobq/3.7)`）：租约（`lease_owner`/`lease_expires_at`、`renew`、`release`、
+  `reclaim_expired`）在**两个后端**上语义一致；`src/service/worker.rs` 的 worker 循环（`Handler` 端口、
+  claim → handle → settle、处理期间按 `lease/2` 续约、`SIGTERM` 后排空并退 0），`serve` 真的开始 drain；
+  迟到 worker 的写入被 `lease_owner = $worker` 的守卫拦住。
+- **“计数”的含义钉死**：尝试在**领取**时计数（3.5 的规则），所以 `reclaim_expired` 不重复加计数，
+  而是在预算耗尽时把作业终结——这正是让毒丸payload 会死掉的原因（规格里有一条“没人失败它也会死”的用例）。
+- **`Error::` 与端口**：`migrate` 移到端口上（内存答 `Ok(())`），因此 3.5 的夹具只调一次；守护进程的 handler 是
+  **一个程序**（payload 走 stdin，退出码就是判决），否则“kill -9 在途作业”“SIGTERM 时还有在途作业”
+  这两件事在测试里根本看不见。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| `kiln selftest jobq/3.6 jobq/3.7 --track jobq` | `2/2 step(s) hold the contract`；每步 `gates ✓ 11/11 must green`（含 `images` 与 `slow:conformance@2`）；两位作业者各自跑了两三次、含全新私有缓存，一致 |
+| 最终树上的回归 | 3.1 `6` / 3.2 `4` / 3.3 `4` / 3.4 `2` / 3.5 `8`(memory)+`8`(postgres) / 3.6 `7`+`7` / 3.7 `11`+`11` |
+| 有牙（故意破坏 → 点名用例红 → 回滚绿） | 3.6 把 settle 降到 `read committed` → “the loser of the race is refused rather than quietly re-read”；唯一索引降成普通索引 → “no unique or exclusion constraint matching the ON CONFLICT specification”；3.7 去掉 `lease_owner` 守卫 → “expected Error::Invalid, got Ok(())”；续约换成 `pending()` → “the row went back to Queued while its worker was still handling it” |
+| `lint-caps` | `no issues.`（`checked 53 of 72 step bodies`）|
+| 容器 | 跑完无新增残留（机器上仍有两个更早的 `kiln-pg-*`/`kiln-relay-pg-*`，不是本批产生）|
+
+### 坑与判读
+
+- **作业者修了 3.2 规格里的一个潜在匹配 bug**：`file_declaring` 用 `text.contains("pub struct Job")`，
+  于是新的 `pub struct JobEvent` 会替 `Job` 作答；改成整名匹配 `declares` 并重钉 3.2 的哈希（3.2 复跑 9/9 绿）。
+  这是「早期规格被后来的名字污染」的实例，值得记住。
+- **历史里留了 staging 提交**：本轮作业者用 `wip(...)` 提交把工作副本当检查点（因为 harness 两次丢掉未跟踪文件），
+  最后用 `chore(jobq): drop the staging tree` 删掉整棵树。**最终树干净**（`wip/` 不在 tip 里，两个补丁重现交付项目
+  已用 `diff -r` 验证），但历史里有 5 个 `wip(...)` 提交与它们携带的整棵副本。没有重写历史（`main` 会同步到用户主检出，
+  未经确认不动共享历史）；**若要发布，收尾时可把 9d9cceb..HEAD 压成两个步骤提交**。
+- **`jobq/3.6-isolation` 不是步骤 id**（真实 id 是 `3.6-transaction-isolation`），作业书里我写错了引用；
+  作业者按原样跑了一遍并报了 `unknown step`，再用真 id 继续。教训：作业书里的步骤 id 也要过一遍扫描。
+
+## 第七段（待写）
