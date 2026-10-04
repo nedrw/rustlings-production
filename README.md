@@ -62,13 +62,18 @@ locale fallback and translation-drift detection, so other languages can be added
 
 ## Status
 
-**M0 is closed.** The metadata layer, the capability lint, the gates and the runner are in, and
-T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec tests, a scaffold, a
-reference solution and gate wiring. T2–T5 are metadata and step tables only. M1 is next (T2 plus the
-capability-dedup runtime); see [docs/plan.md](docs/plan.md) §11.
+**M0 is closed; M1 is in progress.** The metadata layer, the capability lint, the gates and the
+runner are in, and T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec
+tests, a scaffold, a reference solution and gate wiring. M1 adds the runtime half of the
+de-duplication mechanism — `kiln plan --fast`, `kiln skip`, `kiln probe`, `kiln review --due` and one
+capability record per learner per capability — and authors T2 `relay` step by step (its 24 steps have
+metadata and a skeleton; the steps themselves land one commit at a time). See
+[docs/handoff-m1.md](docs/handoff-m1.md) for the state, the acceptance lines and how to continue.
 
-The numbers below were measured on this machine. The timings are from `62e7c5c`; the link counts
-were re-measured after CI gained the link step (`dd47c11`), which is why they are the smaller set: a
+**What the numbers below measure.** The timings and test counts were measured on the M0 tree
+(`62e7c5c`, re-verified at `dd47c11`); M1 has since added commands, tests, docs and 14 probe
+exercises, so a re-measurement is owed and will land with M1's close-out. The link counts were
+re-measured after CI gained the link step (`dd47c11`), which is why they are the smaller set: a
 repository-wide report counts the repository's own pages and says which directories it skipped.
 
 - `cargo xtask ci` — **579 s**, last line `22/22 step(s) hold the contract` (fmt, clippy
@@ -89,8 +94,9 @@ repository-wide report counts the repository's own pages and says which director
   `KILN_REGISTRY_MIRROR`.
 
 ```sh
-cargo xtask ci           # the only entry point CI calls: fmt, clippy -D warnings, tests,
-                         # spec integrity, lint-caps, the offline link check, `kiln selftest`
+cargo xtask ci           # the only entry point CI calls: fmt, `rustfmt --check` on course/,
+                         # clippy -D warnings, tests, spec integrity, lint-caps, the offline link
+                         # check, `kiln probe --check`, `kiln selftest`
 cargo run -p kiln --     # continue at the first unfinished step
 cargo run -p kiln -- list
 cargo run -p kiln -- run mailer/1.22-runbook    # scaffold + spec tests (specs are synced into app/)

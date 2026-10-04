@@ -56,8 +56,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 
 ## 3. T2 `relay`
 
-- 进度（2026-10）：**2.1–2.4 已交付**（骨架与装置、幂等接收、契约优先、游标分页），每步都过了
-  `kiln selftest relay/<id> --track relay`；`kiln verify relay` 会把早期步骤放在最终树上重判。
+- 进度（2026-10）：**2.1–2.11 已交付**（骨架与装置、幂等接收、契约优先、游标分页、原子领取、至少一次、
+  出站客户端、重试预算、顺序、DLQ、签名），每步都过了 `kiln selftest relay/<id> --track relay`；
+  `kiln verify relay` 会把早期步骤放在最终树上重判（在 2.11 的树上为 `11/11 judged pass`）。
   剩余步骤见 `kiln plan relay`。
 - 元数据：`course/tracks/relay/track.toml`（24 步，`exit` 能力 6 条，`clippy@2` 起、无提示）。
 - 骨架与装置：`course/tracks/relay/skeleton/`（模块签名 + `todo!()`、`tests/support/{client,app,service,postgres}.rs`）。

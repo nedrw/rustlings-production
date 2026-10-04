@@ -169,7 +169,7 @@ agent 正在同一台机器上编译，并发使用让某一步拿到不属于�
 
 - `kiln verify relay` → **`11/11 judged step(s) pass · 0 failed · 0 not prepared · 13 without content`**（81 s）
   —— 2.1–2.7 的规格一个字节未改（`git diff` 为空），2.5–2.7 的契约签名（`Sender`/`SendRequest`/`claim::*`）保持不变。
-- `lint-caps` `no issues`；`kiln links` 全仓 `45 page(s) · 295 link(s)` ✓；四个新规格与新装置（`tests/support/lanes.rs`、`keys.rs`）显式 rustfmt 干净。
+- `lint-caps` `no issues`；`kiln links` 全仓 `43 page(s) · 288 link(s) · 181 external` ✓（这是 `dd47c11` 之后的新默认：报表跳过 `app/` 并点名跳过；合并前的旧数字按旧默认量的）；四个新规格与新装置（`tests/support/lanes.rs`、`keys.rs`）显式 rustfmt 干净。
 
 ### 施工中钉下来的决定
 
