@@ -144,7 +144,7 @@ index 3550fcb..d3c0a14 100644
      /// # Errors
      ///
 diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
-index 1575d85..c8a097b 100644
+index 1575d85..c1a1ca7 100644
 --- a/src/engine/store/postgres.rs
 +++ b/src/engine/store/postgres.rs
 @@ -22,13 +22,24 @@
@@ -412,8 +412,8 @@ index 1575d85..c8a097b 100644
 +
 +/// One row of `jobs`, in the shape the driver decodes it.
 +///
-+/// Not quite the shape [`Job`] has, and the difference is not cosmetic: Postgres' `integer` arrives
-+/// as `i32` while the engine counts in `u32`, the state is a text column, and the payload is JSON
++/// Not quite the shape [`Job`] has, and the difference is not cosmetic: Postgres' `bigint` arrives
++/// as `i64` while the engine counts in `u32`, the state is a text column, and the payload is JSON
 +/// that this crate parses itself. [`JobRow::into_job`] is the one place those three are reconciled,
 +/// so a row this backend wrote and cannot read back is reported where it can be seen rather than
 +/// travelling through the engine as a nonsense value.
