@@ -47,7 +47,7 @@ index 0000000..318d9bf
 +-- predicate that claim runs (queue, state, `run_at`) is the one worth an index.
 diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
 new file mode 100644
-index 0000000..1575d85
+index 0000000..180d3f8
 --- /dev/null
 +++ b/src/engine/store/postgres.rs
 @@ -0,0 +1,122 @@
@@ -109,7 +109,7 @@ index 0000000..1575d85
 +    ///
 +    /// Runs on every start of the daemon, against a database that is usually already current, so
 +    /// "the second run changes nothing" is part of what this method owes rather than a detail of
-+    /// how it is written (step `mailer/1.9-migrations` made the same promise for one service).
++    /// how it is written (step `mailer/1.9-postgres` made the same promise for one service).
 +    ///
 +    /// # Errors
 +    ///

@@ -144,7 +144,7 @@ index 3550fcb..d3c0a14 100644
      /// # Errors
      ///
 diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
-index 1575d85..c1a1ca7 100644
+index 180d3f8..86c96ae 100644
 --- a/src/engine/store/postgres.rs
 +++ b/src/engine/store/postgres.rs
 @@ -22,13 +22,24 @@
