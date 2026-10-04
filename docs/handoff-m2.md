@@ -236,6 +236,73 @@ app/jobq/
   必须在同一步里实现完（否则 `no-todo` 红）。这条决定了骨架只能声明**本步要教的东西**——
   Postgres 后端、worker 循环、CLI 都随自己那一步的 scaffold 新增文件，而不是提前摆在骨架里。
 
+## 3.5 步骤作者作业书（给子 agent 的固定配方）
+
+每一步都按这个顺序做，不要跳步，也不要在工作树里跑 cargo。
+
+### 环境与禁令
+
+- **所有 cargo/rustc 命令都要带** `CARGO_TARGET_DIR=/private/tmp/<你的名字>-target`；用 `kiln` 的命令
+  再带 `XDG_CACHE_HOME=/private/tmp/xdg-<你的名字>`。worktree 里**绝不允许**出现 `target/`（Delta 的 VFS 会因此卡住）。
+- 路径用 `/private/tmp/...`，不用 `/tmp/...`（本机 podman 的 VM 只共享 `/Users`、`/private`、`/var/folders`）。
+- 别同时跑两个 cargo。红得可疑时：单跑那一步 → 换全新 `XDG_CACHE_HOME` 复跑，两次一致才算真红。
+- **不要**在 `app/jobq` 里手工折腾（`app/` 是学员状态，`kiln` 会自己建）；本地验证用 `kiln selftest`（它在沙箱里走）。
+
+### 每一步要交付的东西
+
+1. **正文** `course/docs/steps/en/jobq/<id>.md`，front-matter 三行（`id` = `jobq/<phase>.<index>-<slug>`、`title`、`locale = "en"`），
+   段标按 `origin`：`teach` → WHY/TASK/DONE WHEN/TRAP/FURTHER；`deepen`/`transfer` → RECALL/DELTA/TASK/DONE WHEN/TRAP
+   （**不得有 WHY**）。RECALL 必须写 `<能力>@<深度> — <track>/<phase>.<index>`，且那一步必须真的建立过本步的
+   `requires` 或要深化的槽位（R5 会查）。TRAP 必须写**具体失败现象**，不是忠告。
+2. **规格** `course/tracks/jobq/spec/<phase>/<name>.rs` —— 只读、哈希钉死、能被 `kiln run` 同步成
+   `tests/spec_<name>.rs`。只能依赖骨架与已交付步骤里已有的签名。多用 `mod support;` 拿夹具。
+3. **scaffold**（可缺）`course/tracks/jobq/scaffold/<id>.patch` —— **只能新增文件或往标记块里插行**，绝不删行；
+   本步要教的东西里「学员必须自己决定的那部分」不要给。
+4. **参考解** `course/tracks/jobq/solutions/<id>.patch` —— 普通 patch，可以新增/修改/删除，但**必须在树上精确匹配**；
+   它必须把该步 scaffold 引入的每个 `todo!()` 都实现掉（`no-todo` 是 must 门）。
+5. **元数据**：`track.toml` 里该步的 `scaffold`（没就删行）、`gates`。
+
+### 补丁怎么生成（记住 M1 的坑：不要在项目目录里 rm -rf）
+
+在**临时 git 仓库**里做两次 diff：
+
+```sh
+WT=.../rustlings-production                    # 你的 Delta worktree
+rm -rf /private/tmp/<step>-base /private/tmp/<step>-sol
+mkdir -p /private/tmp/<step>-base
+# base = 上一步交付后的状态：把 app/jobq 或沙箱里的那棵树拷过来，或者用 skeleton + 之前的 patch 依次 apply
+# 1) 先把 base 提交：cd /private/tmp/<step>-base && git init -q && git add -A && git commit -qm base
+# 2) 在 base 上写入 scaffold 的内容 -> git add -A && git diff --cached --no-renames --binary > scaffold.patch
+# 3) 提交 scaffold，再写参考解的内容 -> git add -A && git diff --cached --no-renames --binary > solution.patch
+```
+
+`git diff` 一律 `--no-renames --binary`（patch 解析器拒绝 `rename from/to`）。
+
+### 验收（每一步都要跑，并把原始结论行写回）
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/kiln-target XDG_CACHE_HOME=/private/tmp/xdg-<name> \
+  cargo run -q -p kiln -- spec manifest --track jobq      # 钉规格哈希
+CARGO_TARGET_DIR=... XDG_CACHE_HOME=... \
+  cargo run -q -p kiln -- selftest jobq/<id> --track jobq # 必须：scaffold ✗ / solution ✓ / gates N/N must green
+CARGO_TARGET_DIR=... cargo test -p kiln                   # 框架单测（改了 kiln 才需要）
+CARGO_TARGET_DIR=... cargo run -q -p kiln -- lint-caps    # 必须 no issues
+rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --check <你改过的每个 .rs>
+```
+
+规格与骨架里的 `.rs` 都要 rustfmt 干净（`xtask ci` 会查）；`tests/support/*` 这类只有被 `mod` 引用到的
+文件，要在有 `mod support;` 的树里 `cargo fmt` 才会被格式化——手写之后跑一次。
+
+### 每步收尾清单
+
+- [ ] 规格在 scaffold 上失败（`selftest` 自己会报 `BROKEN STEP`，别自己放宽）
+- [ ] 参考解在规格上全绿、全部 must 门绿
+- [ ] 正文段标与 origin 匹配，DONE WHEN 里是确切命令
+- [ ] `lint-caps` 无 issue；`spec manifest --track jobq` 已重跑
+- [ ] 如果改了共享契约面（结构体签名、Store 方法、配置 schema、迁移号），**同步改早期规格并把哈希重钉**，
+      并在报告里明说改了哪几份早期规格
+- [ ] 报告里给原始命令与结论行（退出码、测试数、耗时），不要转述
+
 ## 4. 实测数字与验收证据
 
 （每 5–6 步同步一次；收尾时写完整。）
