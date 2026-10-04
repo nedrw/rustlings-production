@@ -1,0 +1,624 @@
+diff --git a/src/claim.rs b/src/claim.rs
+index 695b330..7be3d83 100644
+--- a/src/claim.rs
++++ b/src/claim.rs
+@@ -113,25 +113,75 @@ pub async fn claim(
+     .await
+     .map_err(Error::Database)?;
+ 
+-    rows.into_iter()
+-        .map(
+-            |(delivery, attempts, due_at, url, event, tenant, kind, payload, received_at)| {
+-                Ok(Claimed {
+-                    delivery,
+-                    attempts,
+-                    due_at,
+-                    url: url.parse().map_err(Error::Endpoint)?,
+-                    event: Event {
+-                        id: event,
+-                        tenant_id: TenantId::from_uuid(tenant),
+-                        kind,
+-                        payload: events::decode_payload(&payload)?,
+-                        received_at,
+-                    },
+-                })
+-            },
+-        )
+-        .collect()
++    rows.into_iter().map(described_by).collect()
++}
++
++/// Take up to `limit` pieces of work that belong to one tenant.
++///
++/// The claim of [`claim`], narrowed to a tenant: one statement, the same lease, the same answer, and
++/// one more condition on it. It exists because a *bounded* worker deals its seats out between the
++/// tenants that have work (`relay/2.14-backpressure`): a claim that could not say whose work it
++/// takes could not give every tenant a share, and one tenant's flood would be served until it was
++/// over. The rows are the same rows and the states are the same states, so the statement lives here
++/// with the rest of them — a second file that knows the column names is a second place to forget one.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim cannot be written or read back, and
++/// [`Error::Endpoint`] when a claimed row's target is no longer a URL this service accepts.
++pub async fn for_tenant(
++    pool: &PgPool,
++    worker: &str,
++    tenant: Uuid,
++    limit: i64,
++    lease: Duration,
++) -> Result<Vec<Claimed>, Error> {
++    let rows: Vec<Row> = sqlx::query_as(
++        "update deliveries as d \
++            set state = 'claimed', locked_by = $1, locked_at = now(), \
++                lease_expires_at = now() + make_interval(secs => $4::double precision) \
++           from endpoints as e, events as v \
++          where d.endpoint_id = e.id and d.event_id = v.id and e.tenant_id = $3 \
++            and d.id in (select id from deliveries \
++                          where state in ('pending', 'retrying') \
++                            and next_attempt_at <= now() \
++                            and endpoint_id in (select id from endpoints where tenant_id = $3) \
++                          order by next_attempt_at, id \
++                          for update skip locked \
++                          limit $2) \
++         returning d.id, d.attempts, d.next_attempt_at, e.url, v.id, v.tenant_id, v.kind, \
++                   v.payload::text, v.received_at",
++    )
++    .bind(worker)
++    .bind(limit)
++    .bind(tenant)
++    .bind(lease.as_secs_f64())
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    rows.into_iter().map(described_by).collect()
++}
++
++/// One row of a claim's `returning` clause, as the work it describes.
++///
++/// Both claims read the same columns in the same order, and this is the one place that knows what
++/// they mean: a second mapping is a second place for the column order to drift.
++fn described_by(row: Row) -> Result<Claimed, Error> {
++    let (delivery, attempts, due_at, url, event, tenant, kind, payload, received_at) = row;
++    Ok(Claimed {
++        delivery,
++        attempts,
++        due_at,
++        url: url.parse().map_err(Error::Endpoint)?,
++        event: Event {
++            id: event,
++            tenant_id: TenantId::from_uuid(tenant),
++            kind,
++            payload: events::decode_payload(&payload)?,
++            received_at,
++        },
++    })
+ }
+ 
+ /// Hand a claim back, so whoever comes next can take it.
+diff --git a/src/concurrency.rs b/src/concurrency.rs
+index 38c6eb6..8b60c15 100644
+--- a/src/concurrency.rs
++++ b/src/concurrency.rs
+@@ -55,13 +55,13 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use sqlx::PgPool;
+-use tokio::sync::OwnedSemaphorePermit;
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+ 
+ use crate::backoff::Budget;
+-use crate::claim::Claimed;
+-use crate::delivery::{Sender, Tick};
++use crate::claim;
++use crate::delivery::{self, Sender, Tick};
+ use crate::error::Error;
+-use crate::ordering::Lanes;
++use crate::ordering::{self, Lanes};
+ 
+ /// How much delivery work one process takes on.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -81,20 +81,30 @@ impl Limits {
+     /// delivers nothing, and a backlog of nothing is a service that refuses every event — both are
+     /// a deployment turning its own service off with a typo.
+     pub fn new(in_flight: u32, backlog: u32) -> Result<Self, Error> {
+-        let _ = (in_flight, backlog);
+-        todo!("step relay/2.14-backpressure")
++        let in_flight = NonZeroU32::new(in_flight).ok_or_else(|| {
++            Error::Config(
++                "`delivery.max_in_flight` cannot be zero: nothing would ever be attempted"
++                    .to_owned(),
++            )
++        })?;
++        let backlog = NonZeroU32::new(backlog).ok_or_else(|| {
++            Error::Config(
++                "`delivery.max_backlog` cannot be zero: no event would ever be accepted".to_owned(),
++            )
++        })?;
++        Ok(Self { in_flight, backlog })
+     }
+ 
+     /// How many attempts one process may have in flight.
+     #[must_use]
+     pub fn in_flight(self) -> u32 {
+-        todo!("step relay/2.14-backpressure")
++        self.in_flight.get()
+     }
+ 
+     /// How much undelivered work this service will hold.
+     #[must_use]
+     pub fn backlog(self) -> u32 {
+-        todo!("step relay/2.14-backpressure")
++        self.backlog.get()
+     }
+ }
+ 
+@@ -104,6 +114,13 @@ impl Limits {
+ /// a property of that table, not of this process, and a bound counted in this process's own memory
+ /// would say nothing about the four other processes writing to the same rows.
+ ///
++/// The executor is a parameter rather than a pool, and that is the whole reason this is checked
++/// where it is: `events::ingest` asks the question *inside* the transaction that writes the work, so
++/// the count includes what that transaction has just written — "would we be past the bound if we
++/// accepted this", including the this — and a refusal can roll the transaction back and write
++/// nothing at all. A pool would only be able to ask the question before or after the write, and both
++/// of those answers are wrong for a caller who retries.
++///
+ /// The count is a number an operator can also ask for by hand, which is the point of putting the
+ /// bound here rather than on a channel: `select count(*) from deliveries where state in ('pending',
+ /// 'retrying', 'claimed')` is the backlog, and it is the number that grows when the subscribers are
+@@ -118,9 +135,17 @@ impl Limits {
+ ///
+ /// Returns [`Error::Database`] when the queue cannot be counted, which is the same failure as not
+ /// being able to write to it: the request is refused either way, and the reason is the database.
+-pub async fn has_room(pool: &PgPool, limits: Limits) -> Result<bool, Error> {
+-    let _ = (pool, limits);
+-    todo!("step relay/2.14-backpressure")
++pub async fn has_room<'e, E>(executor: E, limits: Limits) -> Result<bool, Error>
++where
++    E: sqlx::PgExecutor<'e>,
++{
++    let owed: i64 = sqlx::query_scalar(
++        "select count(*) from deliveries where state in ('pending', 'retrying', 'claimed')",
++    )
++    .fetch_one(executor)
++    .await
++    .map_err(Error::Database)?;
++    Ok(owed <= i64::from(limits.backlog()))
+ }
+ 
+ /// The seats: as many attempts in flight as this process is willing to have, and no more.
+@@ -132,7 +157,11 @@ pub struct Gate {
+     /// The seats themselves. Taking one is what "an attempt is in flight" means, and giving it back
+     /// is what "the attempt is over" means — including when the attempt failed, timed out, or the
+     /// task holding it was dropped.
+-    permits: Semaphore,
++    ///
++    /// Behind an [`Arc`] because a seat is handed to the *task* that will attempt the delivery: a
++    /// seat that borrowed the gate could not outlive the turn that spawned the task, and a turn that
++    /// waited for its own tasks has to be able to give them something they can hold.
++    permits: Arc<Semaphore>,
+     /// How many seats there are.
+     limit: u32,
+ }
+@@ -141,14 +170,16 @@ impl Gate {
+     /// A gate with as many seats as `limits` allows.
+     #[must_use]
+     pub fn new(limits: Limits) -> Self {
+-        let _ = limits;
+-        todo!("step relay/2.14-backpressure")
++        Self {
++            permits: Arc::new(Semaphore::new(limits.in_flight() as usize)),
++            limit: limits.in_flight(),
++        }
+     }
+ 
+     /// How many attempts may be in flight.
+     #[must_use]
+     pub fn limit(&self) -> u32 {
+-        todo!("step relay/2.14-backpressure")
++        self.limit
+     }
+ 
+     /// How many attempts are in flight right now.
+@@ -157,12 +188,22 @@ impl Gate {
+     /// between the seats there are and the seats nobody has taken.
+     #[must_use]
+     pub fn in_flight(&self) -> u32 {
+-        todo!("step relay/2.14-backpressure")
++        self.limit
++            .saturating_sub(self.permits.available_permits() as u32)
+     }
+ 
+     /// Wait for a seat, and hold it for as long as the attempt takes.
++    ///
++    /// The seat is *owned*, so the task that takes it can hold it across the whole attempt —
++    /// including across the `await` points of an HTTP request — without borrowing this gate.
+     pub async fn enter(&self) -> Permit {
+-        todo!("step relay/2.14-backpressure")
++        match Arc::clone(&self.permits).acquire_owned().await {
++            Ok(seat) => seat,
++            // Unreachable: this gate is never closed, and `close` is the only way `acquire` fails.
++            // Parking is how a library says "there is no seat and there never will be" without
++            // panicking, which is a failure mode callers cannot handle anyway.
++            Err(_) => std::future::pending().await,
++        }
+     }
+ 
+     /// Wait until nothing is in flight, or `deadline` passes. `true` means the gate is quiet.
+@@ -172,8 +213,15 @@ impl Gate {
+     /// answered by the runtime instead of by a loop that polls a number and hopes. A gate that is
+     /// quiet and a gate whose attempts were cut short differ only in the answer.
+     pub async fn quiesce(&self, deadline: Duration) -> bool {
+-        let _ = deadline;
+-        todo!("step relay/2.14-backpressure")
++        match tokio::time::timeout(deadline, self.permits.acquire_many(self.limit)).await {
++            Ok(Ok(seats)) => {
++                // The seats are given straight back: this was a question, not a claim on them.
++                seats.forget();
++                true
++            }
++            Ok(Err(_)) => true,
++            Err(_) => false,
++        }
+     }
+ }
+ 
+@@ -207,14 +255,20 @@ pub struct Report {
+ impl Report {
+     /// An empty report for a run of `turns` turns.
+     fn of(turns: usize) -> Self {
+-        let _ = turns;
+-        todo!("step relay/2.14-backpressure")
++        Self {
++            turns,
++            ..Self::default()
++        }
+     }
+ 
+     /// Add one turn's counts.
+     fn count(&mut self, tick: Tick) {
+-        let _ = tick;
+-        todo!("step relay/2.14-backpressure")
++        self.claimed += tick.claimed;
++        self.sent += tick.sent;
++        self.retried += tick.retried;
++        self.dead += tick.dead;
++        self.lost += tick.lost;
++        self.shed += tick.shed;
+     }
+ }
+ 
+@@ -255,20 +309,27 @@ impl Worker {
+         limits: Limits,
+         name: &str,
+     ) -> Self {
+-        let _ = (pool, sender, gate, lanes, budget, limits, name);
+-        todo!("step relay/2.14-backpressure")
++        Self {
++            pool,
++            sender,
++            gate,
++            lanes,
++            budget,
++            limits,
++            name: name.to_owned(),
++        }
+     }
+ 
+     /// The seats this worker holds work in.
+     #[must_use]
+     pub fn gate(&self) -> &Gate {
+-        todo!("step relay/2.14-backpressure")
++        &self.gate
+     }
+ 
+     /// The name its claims are stamped with.
+     #[must_use]
+     pub fn name(&self) -> &str {
+-        todo!("step relay/2.14-backpressure")
++        &self.name
+     }
+ 
+     /// One turn, with the bound applied: claim what there are seats for, attempt each with a seat in
+@@ -280,7 +341,59 @@ impl Worker {
+     /// [`Error::Delivery`] when an attempt ends without an answer (a panic, or a runtime that is
+     /// shutting down).
+     pub async fn turn(&self) -> Result<Tick, Error> {
+-        todo!("step relay/2.14-backpressure")
++        // The claim is the bound: one row claimed per seat there is, so the work this process holds
++        // is the work it can be attempting. A larger batch would be rows in memory that nobody may
++        // touch until a seat comes free, which is the queue's job and not this process's.
++        let claimed = claim_fair(
++            &self.pool,
++            &self.name,
++            i64::from(self.limits.in_flight()),
++            claim::LEASE,
++        )
++        .await?;
++        let claimed = ordering::in_queue_order(claimed);
++
++        let mut report = Tick::of(claimed.len());
++        let mut running = Vec::with_capacity(claimed.len());
++        for work in claimed {
++            // The seat is taken before the attempt starts and released when it is over, so the number
++            // of attempts in flight *is* the number of seats taken — and a turn that has to wait for
++            // a seat is a turn whose rows are already claimed, which is why the waiting happens here
++            // rather than in the claim.
++            let seat = self.gate.enter().await;
++            let pool = self.pool.clone();
++            let sender = Arc::clone(&self.sender);
++            let lanes = Arc::clone(&self.lanes);
++            // The budget is cloned per task on purpose: the clone shares the breaker, so two
++            // attempts to one endpoint see one history of failures rather than two.
++            let budget = self.budget.clone();
++            let worker = self.name.clone();
++            running.push(tokio::spawn(async move {
++                let recorded =
++                    delivery::attempt(&pool, sender.as_ref(), &lanes, &budget, &worker, work).await;
++                drop(seat);
++                recorded
++            }));
++        }
++
++        // Every task is joined, including the ones after a failure: a turn that walked away from its
++        // own attempts would report on rows that are still being written.
++        let mut failure = None;
++        for handle in running {
++            match handle.await {
++                Ok(Ok(recorded)) => report.count(recorded),
++                Ok(Err(error)) => failure = failure.or(Some(error)),
++                Err(join) => {
++                    failure = failure.or(Some(Error::Delivery(format!(
++                        "an attempt ended without an answer: {join}"
++                    ))));
++                }
++            }
++        }
++        match failure {
++            Some(error) => Err(error),
++            None => Ok(report),
++        }
+     }
+ 
+     /// `turns` turns, in sequence.
+@@ -289,8 +402,11 @@ impl Worker {
+     ///
+     /// The same failures as [`Worker::turn`], from whichever turn hit them first.
+     pub async fn work(&self, turns: usize) -> Result<Report, Error> {
+-        let _ = turns;
+-        todo!("step relay/2.14-backpressure")
++        let mut report = Report::of(turns);
++        for _ in 0..turns {
++            report.count(self.turn().await?);
++        }
++        Ok(report)
+     }
+ }
+ 
+@@ -314,7 +430,38 @@ pub async fn claim_fair(
+     worker: &str,
+     limit: i64,
+     lease: Duration,
+-) -> Result<Vec<Claimed>, Error> {
+-    let _ = (pool, worker, limit, lease);
+-    todo!("step relay/2.14-backpressure")
++) -> Result<Vec<claim::Claimed>, Error> {
++    // A claim for no seats takes nothing: it is what a worker with no room left asks for.
++    if limit <= 0 {
++        return Ok(Vec::new());
++    }
++    let waiting: Vec<uuid::Uuid> = sqlx::query_scalar(
++        "select v.tenant_id from deliveries as d \
++           join endpoints as e on e.id = d.endpoint_id \
++           join events as v on v.id = d.event_id \
++          where d.state in ('pending', 'retrying') and d.next_attempt_at <= now() \
++          group by v.tenant_id \
++          order by min(d.next_attempt_at), v.tenant_id",
++    )
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    // Nobody waiting is the ordinary end of a queue, not a division by zero: a turn that finds the
++    // work done is a turn that takes nothing.
++    if waiting.is_empty() {
++        return Ok(Vec::new());
++    }
++    let tenants = waiting.len() as i64;
++    let base = limit / tenants;
++    let extra = limit % tenants;
++    let mut claimed = Vec::new();
++    for (index, tenant) in waiting.iter().enumerate() {
++        let share = base + i64::from((index as i64) < extra);
++        if share <= 0 {
++            break;
++        }
++        claimed.extend(claim::for_tenant(pool, worker, *tenant, share, lease).await?);
++    }
++    Ok(ordering::in_queue_order(claimed))
+ }
+diff --git a/src/config.rs b/src/config.rs
+index efb2052..57938d6 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -11,6 +11,7 @@
+ 
+ use std::path::PathBuf;
+ 
++use crate::concurrency::Limits;
+ use crate::error::Error;
+ use crate::ratelimit::Quota;
+ 
+@@ -89,6 +90,12 @@ pub struct Delivery {
+     /// reach sets this. Which addresses each class is, and why the classes are separate, is
+     /// [`crate::target::Rules`].
+     pub allow_private_targets: bool,
++    /// How much delivery work this process takes on: how many attempts may be in flight, and how
++    /// much undelivered work the service will hold before it refuses more.
++    ///
++    /// [`Limits`] rather than two loose numbers, for the reason [`Quota`] is the rate limit's own
++    /// type: a bound of zero is a service that does nothing, and the type is what cannot hold one.
++    pub limits: Limits,
+ }
+ 
+ /// How much one caller may ask for.
+@@ -246,6 +253,10 @@ impl Config {
+             .map(|text| parse_flag("delivery.allow_private_targets", &text))
+             .transpose()?
+             .unwrap_or(false);
++        let max_in_flight =
++            read_count(&env_layer, file.as_ref(), "delivery.max_in_flight")?.unwrap_or(4);
++        let max_backlog =
++            read_count(&env_layer, file.as_ref(), "delivery.max_backlog")?.unwrap_or(10_000);
+         let burst = read_count(&env_layer, file.as_ref(), "rate_limit.burst")?.unwrap_or(32);
+         let per_second =
+             read_count(&env_layer, file.as_ref(), "rate_limit.per_second")?.unwrap_or(16);
+@@ -262,6 +273,7 @@ impl Config {
+             database: Database { url },
+             delivery: Delivery {
+                 allow_private_targets,
++                limits: Limits::new(max_in_flight, max_backlog)?,
+             },
+             rate_limit: Quota::new(burst, per_second)?,
+             bootstrap: Bootstrap {
+@@ -295,6 +307,14 @@ impl Config {
+             "  delivery.allow_private_targets = {}",
+             self.delivery.allow_private_targets
+         ));
++        lines.push(format!(
++            "  delivery.max_in_flight = {}",
++            self.delivery.limits.in_flight()
++        ));
++        lines.push(format!(
++            "  delivery.max_backlog = {}",
++            self.delivery.limits.backlog()
++        ));
+         lines.push(format!("  rate_limit.burst = {}", self.rate_limit.burst()));
+         lines.push(format!(
+             "  rate_limit.per_second = {}",
+@@ -547,6 +567,40 @@ mod tests {
+         assert!(!report.contains("key-acme-123"), "{report}");
+     }
+ 
++    #[test]
++    fn a_bound_is_read_and_a_bound_of_nothing_is_refused() {
++        let configured = Config::load(
++            &Flags::default(),
++            &env(&[
++                ("RELAY__DELIVERY__MAX_IN_FLIGHT", "2"),
++                ("RELAY__DELIVERY__MAX_BACKLOG", "5"),
++            ]),
++        )
++        .expect("the settings load");
++        assert_eq!(
++            (
++                configured.delivery.limits.in_flight(),
++                configured.delivery.limits.backlog()
++            ),
++            (2, 5)
++        );
++        assert!(
++            Config::load(
++                &Flags::default(),
++                &env(&[("RELAY__DELIVERY__MAX_IN_FLIGHT", "0")])
++            )
++            .is_err(),
++            "nothing in flight is a service that delivers nothing"
++        );
++        assert!(
++            Config::load(
++                &Flags::default(),
++                &env(&[("RELAY__DELIVERY__MAX_BACKLOG", "some")])
++            )
++            .is_err()
++        );
++    }
++
+     #[test]
+     fn a_limit_is_read_and_a_limit_of_nothing_is_refused() {
+         let configured = Config::load(
+diff --git a/src/events.rs b/src/events.rs
+index 3b98a5c..9c3b5fd 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+ use uuid::Uuid;
+ 
++use crate::concurrency::{self, Limits};
+ use crate::domain::TenantId;
+ use crate::error::Error;
+ 
+@@ -95,6 +96,7 @@ pub async fn ingest(
+     idempotency_key: &str,
+     kind: &str,
+     payload: &serde_json::Value,
++    limits: Limits,
+ ) -> Result<Ingested, Error> {
+     let id = Uuid::new_v4();
+     // The event and the deliveries it owes are written in one transaction, and committed together:
+@@ -119,6 +121,22 @@ pub async fn ingest(
+     match written {
+         Some((id, received_at)) => {
+             crate::delivery::fan_out(&mut transaction, id, tenant).await?;
++            // The queue has a bottom (`relay/2.14-backpressure`), and this is where it is checked:
++            // in the transaction that writes the work, so a refusal writes nothing back — no event,
++            // no deliveries, and no promise this service cannot keep. The count sees what this
++            // transaction has just written, which is the point: the question is "would we be past
++            // the bound if we accepted this", and the answer has to include the *this*.
++            //
++            // A replay never reaches this branch (the one below answers with the event that was
++            // stored when the key was first used), and that is deliberate: a caller retrying a
++            // request it is unsure about has to be told "you already sent this", not "come back".
++            if !concurrency::has_room(&mut *transaction, limits).await? {
++                transaction.rollback().await.map_err(Error::Database)?;
++                return Err(Error::Unavailable(format!(
++                    "this service is holding its bound of {} undelivered event(s): come back when                      the queue has moved",
++                    limits.backlog()
++                )));
++            }
+             transaction.commit().await.map_err(Error::Database)?;
+             Ok(Ingested::Accepted(Event {
+                 id,
+diff --git a/src/http.rs b/src/http.rs
+index f847022..e90df7b 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -485,6 +485,7 @@ async fn create_event(
+         &key,
+         kind,
+         &body.payload,
++        state.config().delivery.limits,
+     )
+     .await
+     {
+diff --git a/src/lib.rs b/src/lib.rs
+index 987de10..3a0fcfd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod auth;
+ pub mod backoff;
+ pub mod claim;
++pub mod concurrency;
+ pub mod config;
+ pub mod db;
+ pub mod delivery;
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 8742bf7..222953f 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -174,6 +174,11 @@ pub fn document() -> Value {
+                                         usable."),
+                         "401": answer("Error", "The API key is missing or belongs to no tenant."),
+                         "429": too_many(),
++                        "503": answer(
++                            "Error",
++                            "The service is holding its bound of undelivered work, so nothing was \
++                             written: come back when the queue has moved.",
++                        ),
+                     },
+                 },
+             },

@@ -1,0 +1,551 @@
+diff --git a/src/concurrency.rs b/src/concurrency.rs
+new file mode 100644
+index 0000000..38c6eb6
+--- /dev/null
++++ b/src/concurrency.rs
+@@ -0,0 +1,320 @@
++//! The bottom of the queue: how much work this process holds at once, and whose.
++//!
++//! A delivery service owes work, and the work arrives whether or not anybody can be reached. So the
++//! question under load is never "is the queue empty" — it is "how much of it is in *this* process".
++//! Three different numbers answer that, and confusing them is how a service dies:
++//!
++//! | what grows | bounded by | what happens when it is not |
++//! | --- | --- | --- |
++//! | undelivered rows | the `deliveries` table, and [`Limits::backlog`] | the caller is told to come back, and the database stops growing |
++//! | claimed rows | [`Limits::in_flight`], one per attempt | claimed work that nobody is attempting: invisible until a lease expires |
++//! | attempts in flight | one permit each | unbounded tasks, unbounded sockets, and a process that dies of memory rather than of load |
++//!
++//! The middle row is the one this step is really about. A worker that claims a thousand rows and
++//! then attempts them one after another is a worker whose *memory* grows with the queue depth: a
++//! thousand `Claimed` values, a thousand spawned tasks, a thousand database rows it cannot finish.
++//! A worker that takes a permit per attempt, and claims no more than it has permits for, leaves the
++//! thousand where they belong — in the table — and the number that grows under load is `backlog`,
++//! which is a number an operator can read with a query.
++//!
++//! Three shapes here are decisions rather than taste:
++//!
++//! * **the bound is the claim's size.** One permit per claim is a claim that cannot outgrow the
++//!   seats: `limit` seats means at most `limit` rows taken out of the table, so the work a process
++//!   holds is exactly the work it can be attempting. A bigger batch buys nothing but memory;
++//! * **the seats are per process, and the bound is one value.** [`Gate`] is shared by every worker
++//!   in the process (that is what makes it a *process* bound rather than a per-loop one), and it is
++//!   what makes a clean stop possible at all: [`Gate::quiesce`] waits for the seats to come back,
++//!   which is the same question as "is anything still in flight" and is answered without polling;
++//! * **every tenant with work gets a share of the seats.** The claim of `relay/2.5-atomic-claim`
++//!   answers "which rows are free", oldest first — and when one tenant floods, the oldest rows are
++//!   *always* that tenant's. A worker that claims strictly in queue order serves the flood until the
++//!   flood is over, which is starvation by design; [`claim_fair`] deals the seats out one round at a
++//!   time instead, so a delivery for everybody else is attempted while the flood is worked through.
++//!
++//! Boundaries, because the words are close together and the mechanisms are not:
++//!
++//! * `async/backpressure@aware` — `mailer/1.14-worker` — is where this idea was introduced: a queue
++//!   with a *capacity*, a `503` when it is full, and capacity reserved before the work it is for.
++//!   There the queue was in memory and the bound was the process's; here the queue is the
++//!   `deliveries` table, which is why the bound has to be asked of the database ([`has_room`]) and
++//!   why the thing that grows is a table rather than a `VecDeque`. What this step adds is the part
++//!   an in-memory queue did not need: a bound on the work *in flight*;
++//! * `delivery/ordering@apply` — `relay/2.9-ordering` — is about which attempts may overlap: one at
++//!   a time per endpoint, because a subscriber's events have an order. This is about how many may
++//!   overlap *in total*, and it does not repeat the lane: a lane is taken inside the attempt
++//!   ([`delivery::attempt`]), and a permit is taken before it starts.
++//!
++//! The one-turn helpers of `relay/2.6-at-least-once` and `relay/2.9-ordering` (`delivery::tick`,
++//! `ordering::spread`) are unchanged by this step and still claim with `claim::claim`: they exist for
++//! a caller that runs one turn and waits — a spec, a drill — and their contract is about a single
++//! turn's guarantee, not about a process that turns for ever. A worker runs [`turn`] and [`work`].
++
++use std::num::NonZeroU32;
++use std::sync::Arc;
++use std::time::Duration;
++
++use sqlx::PgPool;
++use tokio::sync::OwnedSemaphorePermit;
++
++use crate::backoff::Budget;
++use crate::claim::Claimed;
++use crate::delivery::{Sender, Tick};
++use crate::error::Error;
++use crate::ordering::Lanes;
++
++/// How much delivery work one process takes on.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Limits {
++    /// How many attempts may be in flight at once, and therefore how many rows one turn may claim.
++    in_flight: NonZeroU32,
++    /// How much undelivered work this service is willing to be holding before it refuses more.
++    backlog: NonZeroU32,
++}
++
++impl Limits {
++    /// Limits, or why the two numbers are not a pair.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::Config`] when either number is zero: no seat at all is a service that
++    /// delivers nothing, and a backlog of nothing is a service that refuses every event — both are
++    /// a deployment turning its own service off with a typo.
++    pub fn new(in_flight: u32, backlog: u32) -> Result<Self, Error> {
++        let _ = (in_flight, backlog);
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// How many attempts one process may have in flight.
++    #[must_use]
++    pub fn in_flight(self) -> u32 {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// How much undelivered work this service will hold.
++    #[must_use]
++    pub fn backlog(self) -> u32 {
++        todo!("step relay/2.14-backpressure")
++    }
++}
++
++/// Whether this service has room for one more piece of work.
++///
++/// Asked of the queue itself, because the queue is the `deliveries` table: how much work is owed is
++/// a property of that table, not of this process, and a bound counted in this process's own memory
++/// would say nothing about the four other processes writing to the same rows.
++///
++/// The count is a number an operator can also ask for by hand, which is the point of putting the
++/// bound here rather than on a channel: `select count(*) from deliveries where state in ('pending',
++/// 'retrying', 'claimed')` is the backlog, and it is the number that grows when the subscribers are
++/// slow.
++///
++/// It is a policy and not a lock: two requests arriving at the same instant can both find room and
++/// both write, so the queue can be one row over its bound. That is the honest trade — a bound
++/// enforced with a lock per ingest would be a queue in front of the queue — and the difference
++/// between "at the bound" and "one over the bound" is not a difference anybody can observe.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the queue cannot be counted, which is the same failure as not
++/// being able to write to it: the request is refused either way, and the reason is the database.
++pub async fn has_room(pool: &PgPool, limits: Limits) -> Result<bool, Error> {
++    let _ = (pool, limits);
++    todo!("step relay/2.14-backpressure")
++}
++
++/// The seats: as many attempts in flight as this process is willing to have, and no more.
++///
++/// One value per process, held by every worker in it, because the bound is the process's: two
++/// workers with a gate each have twice the bound and no idea that they do.
++#[derive(Debug)]
++pub struct Gate {
++    /// The seats themselves. Taking one is what "an attempt is in flight" means, and giving it back
++    /// is what "the attempt is over" means — including when the attempt failed, timed out, or the
++    /// task holding it was dropped.
++    permits: Semaphore,
++    /// How many seats there are.
++    limit: u32,
++}
++
++impl Gate {
++    /// A gate with as many seats as `limits` allows.
++    #[must_use]
++    pub fn new(limits: Limits) -> Self {
++        let _ = limits;
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// How many attempts may be in flight.
++    #[must_use]
++    pub fn limit(&self) -> u32 {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// How many attempts are in flight right now.
++    ///
++    /// A number that has to come back down, and the number the spec watches: it is the difference
++    /// between the seats there are and the seats nobody has taken.
++    #[must_use]
++    pub fn in_flight(&self) -> u32 {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// Wait for a seat, and hold it for as long as the attempt takes.
++    pub async fn enter(&self) -> Permit {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// Wait until nothing is in flight, or `deadline` passes. `true` means the gate is quiet.
++    ///
++    /// The wait is on the permits rather than on a counter, and that is not a detail: taking *every*
++    /// seat at once can only succeed when nobody holds one, which is exactly the question, and it is
++    /// answered by the runtime instead of by a loop that polls a number and hopes. A gate that is
++    /// quiet and a gate whose attempts were cut short differ only in the answer.
++    pub async fn quiesce(&self, deadline: Duration) -> bool {
++        let _ = deadline;
++        todo!("step relay/2.14-backpressure")
++    }
++}
++
++/// One seat, held for as long as an attempt takes. Dropping it lets the next attempt in.
++///
++/// Tokio's owned semaphore permit under this module's own name: the two things that matter are that
++/// it is *owned* — a task can hold it across the whole attempt, including its `await` points — and
++/// that dropping it is the only way to give the seat back. That happens on every path out of an
++/// attempt: the answer, the failure, a deadline, or the task being cut short when the process stops.
++pub type Permit = OwnedSemaphorePermit;
++
++/// What a run of turns did, summed over its turns.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Report {
++    /// How many turns were run.
++    pub turns: usize,
++    /// How many deliveries the claims handed to this worker.
++    pub claimed: usize,
++    /// How many the subscribers took.
++    pub sent: usize,
++    /// How many failed in a way worth another attempt.
++    pub retried: usize,
++    /// How many this worker gave up on.
++    pub dead: usize,
++    /// How many attempts could not be written down, because the row was no longer this worker's.
++    pub lost: usize,
++    /// How many attempts were not made, because their endpoint's breaker was open.
++    pub shed: usize,
++}
++
++impl Report {
++    /// An empty report for a run of `turns` turns.
++    fn of(turns: usize) -> Self {
++        let _ = turns;
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// Add one turn's counts.
++    fn count(&mut self, tick: Tick) {
++        let _ = tick;
++        todo!("step relay/2.14-backpressure")
++    }
++}
++
++/// One worker: where it claims from, who it delivers through, and what it shares.
++///
++/// A value rather than eight arguments, and the two things it makes explicit are the two that are
++/// easy to get wrong: the **gate** is an [`Arc`], so several workers in one process share one bound
++/// (a gate per worker is a bound per worker, which is no bound at all), and the **lanes** are shared
++/// the same way, because two workers with their own lanes could be in one endpoint at once
++/// (`relay/2.9-ordering`).
++#[derive(Debug, Clone)]
++pub struct Worker {
++    /// The queue it claims from. A pool is a handle, so holding one here costs a clone.
++    pool: PgPool,
++    /// What it hands a delivery to.
++    sender: Arc<dyn Sender>,
++    /// The seats it shares with every other worker in this process.
++    gate: Arc<Gate>,
++    /// The lanes it shares, for the same reason.
++    lanes: Arc<Lanes>,
++    /// What it spends on a subscriber that is failing.
++    budget: Budget,
++    /// What it is allowed to hold at once.
++    limits: Limits,
++    /// The name its claims are stamped with, so a row can say who took it.
++    name: String,
++}
++
++impl Worker {
++    /// A worker over `pool`, delivering through `sender`.
++    #[must_use]
++    pub fn new(
++        pool: PgPool,
++        sender: Arc<dyn Sender>,
++        gate: Arc<Gate>,
++        lanes: Arc<Lanes>,
++        budget: Budget,
++        limits: Limits,
++        name: &str,
++    ) -> Self {
++        let _ = (pool, sender, gate, lanes, budget, limits, name);
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// The seats this worker holds work in.
++    #[must_use]
++    pub fn gate(&self) -> &Gate {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// The name its claims are stamped with.
++    #[must_use]
++    pub fn name(&self) -> &str {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// One turn, with the bound applied: claim what there are seats for, attempt each with a seat in
++    /// hand, and wait for all of them.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::Database`] when the claim or one of the records fails, and
++    /// [`Error::Delivery`] when an attempt ends without an answer (a panic, or a runtime that is
++    /// shutting down).
++    pub async fn turn(&self) -> Result<Tick, Error> {
++        todo!("step relay/2.14-backpressure")
++    }
++
++    /// `turns` turns, in sequence.
++    ///
++    /// # Errors
++    ///
++    /// The same failures as [`Worker::turn`], from whichever turn hit them first.
++    pub async fn work(&self, turns: usize) -> Result<Report, Error> {
++        let _ = turns;
++        todo!("step relay/2.14-backpressure")
++    }
++}
++
++/// Claim the next batch of work, with a share for every tenant that has some.
++///
++/// One statement per tenant with work, and the seats dealt out between them: with `limit` seats and
++/// four tenants waiting, each takes `limit / 4` (the leftovers go to the oldest ones), so every
++/// tenant's deliveries move while one tenant's flood is being worked through. A tenant with less
++/// work than its share uses what it has, and the unused seats are claimed again on the next turn.
++///
++/// The order within one tenant is the queue's order — `(next_attempt_at, id)` — because a subscriber
++/// that is being served out of order is a subscriber that has to sort events itself
++/// (`relay/2.9-ordering`). The order *between* tenants is by who has been waiting longest.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when a claim cannot be written or read back, and [`Error::Endpoint`]
++/// when a claimed row's target is no longer a URL this service accepts.
++pub async fn claim_fair(
++    pool: &PgPool,
++    worker: &str,
++    limit: i64,
++    lease: Duration,
++) -> Result<Vec<Claimed>, Error> {
++    let _ = (pool, worker, limit, lease);
++    todo!("step relay/2.14-backpressure")
++}
+diff --git a/tests/support/load.rs b/tests/support/load.rs
+new file mode 100644
+index 0000000..67e4fe6
+--- /dev/null
++++ b/tests/support/load.rs
+@@ -0,0 +1,219 @@
++//! A subscriber that counts how many attempts are in flight, and can be held.
++//!
++//! The spec of `relay/2.14-backpressure` is about a *number* — how much work this process holds at
++//! once — and a number is not something a test can read off a clock. `tests/support/sender.rs`
++//! records what it was asked to send; this one records what is *still* being sent: every attempt
++//! that starts increments a count, every attempt that finishes decrements it, and the fixture
++//! remembers the highest the count ever was. That peak is the bound, observed where it matters —
++//! inside the adapter, at the moment the request would have gone out.
++//!
++//! An attempt can be **parked**: the fixture records it, tells nobody, and waits until the test
++//! lets it through. That is how a test says "the subscriber is slow" without sleeping, and it is
++//! what makes the peak a property of the code rather than of the machine's speed: with every
++//! attempt parked, the number of attempts in flight *is* the number of seats the worker took.
++//!
++//! Two waits, both bounded by a deadline and both reporting what they were waiting for: a test that
++//! never sees the count it wanted fails with the counters rather than hanging.
++//!
++//! The spec loads this file with `#[path = "support/load.rs"] mod load;` — it is the harness, not
++//! the course, and `tests/support/mod.rs` does not have to mention it.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Mutex;
++use std::time::{Duration, Instant};
++
++use relay::delivery::{Receipt, SendError, SendRequest, Sender};
++use uuid::Uuid;
++
++/// How long a parked attempt waits before the fixture decides the test is never going to let it
++/// through.
++const PARK: Duration = Duration::from_secs(30);
++/// How long a `wait_for_…` watches for its count.
++const WATCH: Duration = Duration::from_secs(30);
++/// How often a wait looks again: a condition with a deadline, polled, rather than a notification per
++/// event that would make the fixture's own bookkeeping the thing under test.
++const TICK: Duration = Duration::from_millis(1);
++
++/// A subscriber that keeps every attempt, counts what is in flight, and parks when it is held.
++pub struct Counted {
++    state: Mutex<State>,
++}
++
++/// What the fixture remembers between attempts.
++#[derive(Default)]
++struct State {
++    /// Whether attempts park instead of answering.
++    held: bool,
++    /// How many times the parked attempts have been let through.
++    releases: u64,
++    /// How many attempts are in flight right now.
++    in_flight: usize,
++    /// The most that were ever in flight at one moment: the number this fixture exists for.
++    peak: usize,
++    /// How many attempts have started.
++    started: usize,
++    /// How many have finished.
++    finished: usize,
++    /// The deliveries that were attempted, in the order the attempts started.
++    deliveries: Vec<Uuid>,
++}
++
++impl Counted {
++    /// A subscriber that takes everything, immediately.
++    #[must_use]
++    pub fn new() -> Self {
++        Self {
++            state: Mutex::new(State::default()),
++        }
++    }
++
++    /// Park every attempt: the ones already in the adapter wait, and so do the ones that arrive
++    /// next, until [`Counted::pulse`] or [`Counted::release`].
++    pub fn hold(&self) {
++        self.state().held = true;
++    }
++
++    /// Let the attempts that are parked *now* through, and keep holding what arrives next.
++    pub fn pulse(&self) {
++        let mut state = self.state();
++        state.releases += 1;
++    }
++
++    /// Stop holding: everything parked goes, and everything that arrives next answers at once.
++    pub fn release(&self) {
++        let mut state = self.state();
++        state.held = false;
++        state.releases += 1;
++    }
++
++    /// How many attempts are in flight right now.
++    pub fn in_flight(&self) -> usize {
++        self.state().in_flight
++    }
++
++    /// The most attempts that were in flight at one moment.
++    ///
++    /// The number the whole step is about: it may never exceed the seats.
++    pub fn peak(&self) -> usize {
++        self.state().peak
++    }
++
++    /// How many attempts have started.
++    pub fn started(&self) -> usize {
++        self.state().started
++    }
++
++    /// How many have finished.
++    pub fn finished(&self) -> usize {
++        self.state().finished
++    }
++
++    /// The deliveries that were attempted, in the order the attempts started.
++    pub fn deliveries(&self) -> Vec<Uuid> {
++        self.state().deliveries.clone()
++    }
++
++    /// Wait until `wanted` attempts have started.
++    pub async fn wait_for_started(&self, wanted: usize) {
++        self.watch(&format!("{wanted} attempt(s) to start"), wanted, false)
++            .await;
++    }
++
++    /// Wait until `wanted` attempts have finished.
++    pub async fn wait_for_finished(&self, wanted: usize) {
++        self.watch(&format!("{wanted} attempt(s) to finish"), wanted, true)
++            .await;
++    }
++
++    /// Wait for one of the two counts, with a deadline and a sentence when it does not come.
++    async fn watch(&self, what: &str, wanted: usize, finished: bool) {
++        let deadline = Instant::now() + WATCH;
++        while (if finished {
++            self.finished()
++        } else {
++            self.started()
++        }) < wanted
++        {
++            assert!(
++                Instant::now() < deadline,
++                "this test waited {WATCH:?} for {what} and the fixture never saw it: {}",
++                self.describe()
++            );
++            tokio::time::sleep(TICK).await;
++        }
++    }
++
++    /// The counters, on one line, for a failure message.
++    pub fn describe(&self) -> String {
++        let state = self.state();
++        format!(
++            "{} started, {} finished, {} in flight, peak {}",
++            state.started, state.finished, state.in_flight, state.peak
++        )
++    }
++
++    /// Wait until this attempt has been let through.
++    async fn park(&self, arrival: u64) {
++        let deadline = Instant::now() + PARK;
++        while self.state().releases == arrival {
++            assert!(
++                Instant::now() < deadline,
++                "this fixture was held for {PARK:?} and never let through: {}",
++                self.describe()
++            );
++            tokio::time::sleep(TICK).await;
++        }
++    }
++
++    /// The state, whether or not another thread panicked while holding it.
++    fn state(&self) -> std::sync::MutexGuard<'_, State> {
++        self.state
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}
++
++impl Default for Counted {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl std::fmt::Debug for Counted {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Counted")
++            .field("started", &self.started())
++            .field("peak", &self.peak())
++            .finish()
++    }
++}
++
++impl Sender for Counted {
++    fn send(
++        &self,
++        request: SendRequest,
++    ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
++        Box::pin(async move {
++            // The lock is released before anything is awaited: a fixture that held its state across a
++            // parked attempt would park every other attempt with it.
++            let parked = {
++                let mut state = self.state();
++                state.started += 1;
++                state.in_flight += 1;
++                state.peak = state.peak.max(state.in_flight);
++                state.deliveries.push(request.delivery);
++                state.held.then(|| state.releases)
++            };
++            if let Some(arrival) = parked {
++                self.park(arrival).await;
++            }
++            let mut state = self.state();
++            state.in_flight -= 1;
++            state.finished += 1;
++            Ok(Receipt { status: 200 })
++        })
++    }
++}
