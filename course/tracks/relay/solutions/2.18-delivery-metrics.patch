@@ -1,0 +1,602 @@
+diff --git a/src/authz.rs b/src/authz.rs
+index 0343680..08af99c 100644
+--- a/src/authz.rs
++++ b/src/authz.rs
+@@ -425,6 +425,11 @@ pub const ROUTES: &[Route] = &[
+         path: "/audit",
+         action: Action::ReadAudit,
+     },
++    Route {
++        method: "get",
++        path: "/metrics",
++        action: Action::ReadMetrics,
++    },
+ ];
+ 
+ /// The route one request matched, or `None` when this service does not authorize it.
+diff --git a/src/claim.rs b/src/claim.rs
+index 7be3d83..103c218 100644
+--- a/src/claim.rs
++++ b/src/claim.rs
+@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+ use uuid::Uuid;
+ 
+-use crate::domain::{EndpointUrl, TenantId};
++use crate::domain::{EndpointUrl, TenantId, TenantName};
+ use crate::error::Error;
+ use crate::events::{self, Event};
+ 
+@@ -48,6 +48,7 @@ type Row = (
+     Uuid,
+     String,
+     String,
++    String,
+     DateTime<Utc>,
+ );
+ 
+@@ -69,6 +70,13 @@ pub struct Claimed {
+     pub url: EndpointUrl,
+     /// What happened, with the payload the subscriber is handed.
+     pub event: Event,
++    /// The tenant that owns this delivery, by name.
++    ///
++    /// Brought back by the claim's own join rather than looked up by whoever needs it, for the same
++    /// reason the target and the event are: `relay/2.18-delivery-metrics` labels what an attempt
++    /// cost with it, and a second round trip per attempt to find out whose work it was is a cost
++    /// this service pays on every delivery.
++    pub tenant: TenantName,
+ }
+ 
+ /// Take up to `limit` pieces of work this worker may now do.
+@@ -95,8 +103,8 @@ pub async fn claim(
+         "update deliveries as d \
+             set state = 'claimed', locked_by = $1, locked_at = now(), \
+                 lease_expires_at = now() + make_interval(secs => $3::double precision) \
+-           from endpoints as e, events as v \
+-          where d.endpoint_id = e.id and d.event_id = v.id \
++           from endpoints as e, events as v, tenants as t \
++          where d.endpoint_id = e.id and d.event_id = v.id and t.id = v.tenant_id \
+             and d.id in (select id from deliveries \
+                           where state in ('pending', 'retrying') \
+                             and next_attempt_at <= now() \
+@@ -104,7 +112,7 @@ pub async fn claim(
+                           for update skip locked \
+                           limit $2) \
+          returning d.id, d.attempts, d.next_attempt_at, e.url, v.id, v.tenant_id, v.kind, \
+-                   v.payload::text, v.received_at",
++                   v.payload::text, t.name, v.received_at",
+     )
+     .bind(worker)
+     .bind(limit)
+@@ -140,8 +148,9 @@ pub async fn for_tenant(
+         "update deliveries as d \
+             set state = 'claimed', locked_by = $1, locked_at = now(), \
+                 lease_expires_at = now() + make_interval(secs => $4::double precision) \
+-           from endpoints as e, events as v \
+-          where d.endpoint_id = e.id and d.event_id = v.id and e.tenant_id = $3 \
++           from endpoints as e, events as v, tenants as t \
++          where d.endpoint_id = e.id and d.event_id = v.id and t.id = v.tenant_id \
++            and e.tenant_id = $3 \
+             and d.id in (select id from deliveries \
+                           where state in ('pending', 'retrying') \
+                             and next_attempt_at <= now() \
+@@ -150,7 +159,7 @@ pub async fn for_tenant(
+                           for update skip locked \
+                           limit $2) \
+          returning d.id, d.attempts, d.next_attempt_at, e.url, v.id, v.tenant_id, v.kind, \
+-                   v.payload::text, v.received_at",
++                   v.payload::text, t.name, v.received_at",
+     )
+     .bind(worker)
+     .bind(limit)
+@@ -168,7 +177,15 @@ pub async fn for_tenant(
+ /// Both claims read the same columns in the same order, and this is the one place that knows what
+ /// they mean: a second mapping is a second place for the column order to drift.
+ fn described_by(row: Row) -> Result<Claimed, Error> {
+-    let (delivery, attempts, due_at, url, event, tenant, kind, payload, received_at) = row;
++    let (delivery, attempts, due_at, url, event, tenant_id, kind, payload, name, received_at) = row;
++    // A row whose tenant name is not one this service would have written is not work this worker
++    // may label: the metric's label set is bounded because the names come from `tenants`, and a
++    // name nothing validated would be a series nobody chose.
++    let tenant = TenantName::parse(&name).map_err(|error| {
++        Error::Database(sqlx::Error::Protocol(format!(
++            "delivery {delivery} belongs to a tenant this service would not have written: {error}"
++        )))
++    })?;
+     Ok(Claimed {
+         delivery,
+         attempts,
+@@ -176,11 +193,12 @@ fn described_by(row: Row) -> Result<Claimed, Error> {
+         url: url.parse().map_err(Error::Endpoint)?,
+         event: Event {
+             id: event,
+-            tenant_id: TenantId::from_uuid(tenant),
++            tenant_id: TenantId::from_uuid(tenant_id),
+             kind,
+             payload: events::decode_payload(&payload)?,
+             received_at,
+         },
++        tenant,
+     })
+ }
+ 
+diff --git a/src/concurrency.rs b/src/concurrency.rs
+index 7d26944..7e95a6c 100644
+--- a/src/concurrency.rs
++++ b/src/concurrency.rs
+@@ -61,6 +61,7 @@ use crate::backoff::Budget;
+ use crate::claim;
+ use crate::delivery::{self, Sender, Tick};
+ use crate::error::Error;
++use crate::metrics::{Metrics, Outcome};
+ use crate::ordering::{self, Lanes};
+ 
+ /// How much delivery work one process takes on.
+@@ -297,6 +298,8 @@ pub struct Worker {
+     name: String,
+     /// How long its claims stay invisible if it stops answering.
+     lease: Duration,
++    /// Where each attempt's cost is written down (`relay/2.18-delivery-metrics`).
++    metrics: Arc<Metrics>,
+ }
+ 
+ impl Worker {
+@@ -320,6 +323,7 @@ impl Worker {
+             limits,
+             name: name.to_owned(),
+             lease: claim::LEASE,
++            metrics: Arc::new(Metrics::new()),
+         }
+     }
+ 
+@@ -335,6 +339,23 @@ impl Worker {
+         Self { lease, ..self }
+     }
+ 
++    /// The same worker, writing what each attempt cost into `metrics`.
++    ///
++    /// The registry is handed in rather than built here because the process that *renders* it is
++    /// the HTTP side of the service: a worker with a registry of its own would export the delivery
++    /// numbers from a place nothing can scrape. A worker nobody gave one keeps a registry nobody
++    /// reads, which is what makes this a builder rather than another argument of [`Worker::new`].
++    #[must_use]
++    pub fn metered(self, metrics: Arc<Metrics>) -> Self {
++        Self { metrics, ..self }
++    }
++
++    /// The registry this worker writes into.
++    #[must_use]
++    pub fn metrics(&self) -> &Arc<Metrics> {
++        &self.metrics
++    }
++
+     /// The pool this worker claims from.
+     #[must_use]
+     pub fn pool(&self) -> &PgPool {
+@@ -389,10 +410,21 @@ impl Worker {
+             // attempts to one endpoint see one history of failures rather than two.
+             let budget = self.budget.clone();
+             let worker = self.name.clone();
++            let metrics = Arc::clone(&self.metrics);
++            let tenant = work.tenant.as_str().to_owned();
+             running.push(tokio::spawn(async move {
++                // The clock is read around the attempt and nowhere else: what this number is about
++                // is how long the *subscriber* took, so the seat and the record are outside it.
++                let started = std::time::Instant::now();
+                 let recorded =
+                     delivery::attempt(&pool, sender.as_ref(), &lanes, &budget, &worker, work).await;
++                let elapsed = started.elapsed();
+                 drop(seat);
++                if let Ok(recorded) = &recorded
++                    && let Some(outcome) = outcome_of(recorded)
++                {
++                    metrics.record(&tenant, outcome, elapsed);
++                }
+                 recorded
+             }));
+         }
+@@ -431,6 +463,21 @@ impl Worker {
+     }
+ }
+ 
++/// What one attempt came to, in the vocabulary a metric has (`relay/2.18-delivery-metrics`).
++///
++/// Two of the worker's outcomes are deliberately not here: an attempt it could not write down
++/// (`lost`) and one it never made because the endpoint's breaker was open (`shed`). Neither is a
++/// fact about a *delivery* — one is a fact about a write that failed, the other about a decision not
++/// to try — and a label that stands for "ask the log" is a label that answers no question.
++const fn outcome_of(recorded: &delivery::Recorded) -> Option<Outcome> {
++    match recorded {
++        delivery::Recorded::Sent => Some(Outcome::Sent),
++        delivery::Recorded::Retried => Some(Outcome::Retried),
++        delivery::Recorded::Dead => Some(Outcome::Dead),
++        delivery::Recorded::Lost | delivery::Recorded::Shed => None,
++    }
++}
++
+ /// Claim the next batch of work, with a share for every tenant that has some.
+ ///
+ /// One statement per tenant with work, and the seats dealt out between them: with `limit` seats and
+diff --git a/src/http.rs b/src/http.rs
+index 49a1e2f..e891556 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -50,6 +50,7 @@ use crate::domain::{EndpointId, EndpointUrl};
+ use crate::error::Error;
+ use crate::events;
+ use crate::logging::{self, RunId};
++use crate::metrics::{self, Metrics};
+ use crate::openapi;
+ use crate::pagination;
+ use crate::ratelimit::{self, Limiter, System, Verdict};
+@@ -63,6 +64,10 @@ pub struct AppState {
+     db: Db,
+     limiter: Arc<Limiter>,
+     run: RunId,
++    /// The delivery numbers this process exports (`relay/2.18-delivery-metrics`). The worker is
++    /// given the same registry by the deployment, which is why it is a field here rather than a
++    /// static: one process, one set of numbers.
++    metrics: Arc<Metrics>,
+ }
+ 
+ impl AppState {
+@@ -94,6 +99,7 @@ impl AppState {
+             db,
+             limiter,
+             run: run.clone(),
++            metrics: Arc::new(Metrics::new()),
+         })
+     }
+ 
+@@ -120,6 +126,13 @@ impl AppState {
+     pub fn run(&self) -> &RunId {
+         &self.run
+     }
++
++    /// The registry of delivery numbers: what `/metrics` renders, and what the worker of this
++    /// process writes into.
++    #[must_use]
++    pub fn metrics(&self) -> &Arc<Metrics> {
++        &self.metrics
++    }
+ }
+ 
+ /// The routing table, with its layers.
+@@ -139,8 +152,10 @@ pub fn router(state: AppState) -> Router {
+         // What the worker gave up on, and the one way back into the queue (`relay/2.10-dlq`).
+         .route("/dlq", get(list_dead_letters))
+         .route("/dlq/{id}/replay", post(replay_dead_letter))
+-        // What was decided about the actions above (`relay/2.16-authz-audit`).
++        // What was decided about the actions above (`relay/2.16-authz-audit`), and what this
++        // process is doing (`relay/2.18-delivery-metrics`).
+         .route("/audit", get(list_audit))
++        .route("/metrics", get(export_metrics))
+         .fallback(not_found)
+         // The last layer applied is the outermost one, so the limiter runs *first*: a caller over
+         // their limit is refused before this service spends a database round trip finding out who
+@@ -817,6 +832,28 @@ async fn list_audit(
+     }
+ }
+ 
++/// What this process is doing, in the text a scraper reads.
++///
++/// The backlog is read *here*, once per scrape, rather than kept in the registry: it is a question
++/// about the queue, and the queue is the only place that can answer it. That makes this the one
++/// route of the service that needs the database to answer with a body — which it does, and answers
++/// with an error when it cannot, because a `200` with a stale gauge in it is a number an operator
++/// would act on.
++async fn export_metrics(State(state): State<AppState>) -> Response {
++    match metrics::backlog(state.db().pool()).await {
++        Err(error) => error.into_response(),
++        Ok(backlog) => (
++            StatusCode::OK,
++            [(
++                axum::http::header::CONTENT_TYPE,
++                "text/plain; version=0.0.4; charset=utf-8",
++            )],
++            state.metrics().render(&backlog),
++        )
++            .into_response(),
++    }
++}
++
+ /// The `Idempotency-Key` header, when it carries something usable.
+ ///
+ /// Header names are case-insensitive and so is this lookup; the value is trimmed, because `Key: `
+diff --git a/src/lib.rs b/src/lib.rs
+index 4ec8a06..1c37a12 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod events;
+ pub mod http;
+ pub mod lease;
+ pub mod logging;
++pub mod metrics;
+ pub mod openapi;
+ pub mod ordering;
+ pub mod outbound;
+diff --git a/src/main.rs b/src/main.rs
+index 654c2b8..301af07 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -155,6 +155,9 @@ fn worker_of(
+     // process holds (`limits`), and how long its claims stay invisible if it stops answering
+     // (`lease`).
+     let secrets = Arc::new(DbSecrets::new(state.db().pool().clone()));
++    // The registry the HTTP side renders and the worker writes into: one process, one set of
++    // numbers (`relay/2.18-delivery-metrics`).
++    let metrics = Arc::clone(state.metrics());
+     Worker::new(
+         state.db().pool().clone(),
+         Arc::new(HttpSender::signing(policy, secrets)),
+@@ -165,6 +168,7 @@ fn worker_of(
+         &format!("relay-{}", run.as_str()),
+     )
+     .leasing(lease)
++    .metered(metrics)
+ }
+ 
+ /// Resolve when the process is asked to stop, and tell both halves of it.
+diff --git a/src/metrics.rs b/src/metrics.rs
+index 9f0f056..2488529 100644
+--- a/src/metrics.rs
++++ b/src/metrics.rs
+@@ -46,11 +46,13 @@
+ //! by hand for the reason the rest of this project is: what a scraper reads should be visible in
+ //! the code that produces it.
+ 
++use std::collections::BTreeMap;
+ use std::sync::Mutex;
+ use std::time::Duration;
+ 
+ use sqlx::PgPool;
+ 
++use crate::domain::TenantName;
+ use crate::error::Error;
+ 
+ /// The label value everything that is not a tenant name folds into.
+@@ -106,17 +108,63 @@ impl Outcome {
+ /// which one.
+ #[derive(Debug, Default)]
+ pub struct Metrics {
+-    /// Everything observed so far. Its shape is yours; what has to be true of it is that `record`
+-    /// takes `&self` and that a histogram is kept per tenant label.
++    /// Everything observed so far: one histogram per tenant label, and one count per label and
++    /// outcome. A `BTreeMap` rather than a hash map because the renderer walks it, and an output
++    /// whose line order depends on a hash seed is an output nobody can diff.
+     state: Mutex<State>,
+ }
+ 
+ /// What one process has observed.
+-///
+-/// Fill it in with what the two methods below need: an observation per tenant label, and a count
+-/// per label and outcome.
+ #[derive(Debug, Default)]
+-struct State {}
++struct State {
++    /// How long attempts took, per tenant label.
++    durations: BTreeMap<String, Histogram>,
++    /// How many attempts had each outcome, per tenant label.
++    deliveries: BTreeMap<(String, Outcome), u64>,
++}
++
++/// One label's observations, as cumulative buckets and a sum.
++///
++/// Cumulative is the definition rather than a rendering choice: an observation inside five
++/// milliseconds is inside every bucket above it too, which is what makes `+Inf` the count and what
++/// a `histogram_quantile` reads. The last bucket is `+Inf` and holds everything.
++#[derive(Debug, Default, Clone, Copy)]
++struct Histogram {
++    /// One count per bound in [`BUCKETS`], plus the `+Inf` bucket at the end.
++    buckets: [u64; BUCKETS.len() + 1],
++    /// The observations added up, in seconds: what an average is computed from.
++    sum: f64,
++}
++
++impl Histogram {
++    /// Count one observation into every bucket it is inside.
++    fn observe(&mut self, seconds: f64) {
++        for (index, bound) in BUCKETS.iter().enumerate() {
++            if seconds <= *bound
++                && let Some(count) = self.buckets.get_mut(index)
++            {
++                *count += 1;
++            }
++        }
++        if let Some(infinity) = self.buckets.last_mut() {
++            *infinity += 1;
++        }
++        self.sum += seconds;
++    }
++}
++
++/// The label value for a tenant name this service could have written, and `unknown` for anything
++/// else.
++///
++/// The fold happens where the value *enters* the registry rather than where it is rendered: a
++/// registry that keeps the original strings has the unbounded set in memory already, and the point
++/// of the rule is the memory as much as the output.
++fn label(tenant: &str) -> String {
++    match TenantName::parse(tenant) {
++        Ok(name) => name.as_str().to_owned(),
++        Err(_) => UNKNOWN.to_owned(),
++    }
++}
+ 
+ impl Metrics {
+     /// A registry with nothing in it.
+@@ -130,7 +178,14 @@ impl Metrics {
+     /// Called by the worker with the tenant's name. A value that is not a tenant name this service
+     /// could have is folded into the `unknown` label rather than becoming a series of its own.
+     pub fn record(&self, tenant: &str, outcome: Outcome, elapsed: Duration) {
+-        todo!("step relay/2.18-delivery-metrics")
++        let tenant = label(tenant);
++        let mut state = self.state();
++        state
++            .durations
++            .entry(tenant.clone())
++            .or_default()
++            .observe(elapsed.as_secs_f64());
++        *state.deliveries.entry((tenant, outcome)).or_default() += 1;
+     }
+ 
+     /// The text a scraper reads: every family, and one sample per label set.
+@@ -143,7 +198,87 @@ impl Metrics {
+     /// so a family is present from the first scrape rather than after the first delivery.
+     #[must_use]
+     pub fn render(&self, backlog: &[Backlog]) -> String {
+-        todo!("step relay/2.18-delivery-metrics")
++        let state = self.state();
++        // The label set is the queue's tenants plus whatever has been observed: a family that
++        // appears only after somebody delivers is a family a dashboard has to guess at, and the
++        // backlog of a tenant that owes nothing is exactly the `0` an operator wants to see.
++        let mut tenants: Vec<String> = backlog
++            .iter()
++            .map(|backlog| label(&backlog.tenant))
++            .collect();
++        tenants.extend(state.durations.keys().cloned());
++        tenants.extend(state.deliveries.keys().map(|(tenant, _)| tenant.clone()));
++        tenants.sort();
++        tenants.dedup();
++
++        let mut out = String::new();
++        out.push_str(
++            "# HELP relay_delivery_duration_seconds How long one delivery attempt took, by \
++             tenant.\n",
++        );
++        out.push_str("# TYPE relay_delivery_duration_seconds histogram\n");
++        for tenant in &tenants {
++            let histogram = state.durations.get(tenant).copied().unwrap_or_default();
++            for (index, bound) in BUCKETS.iter().enumerate() {
++                out.push_str(&format!(
++                    "relay_delivery_duration_seconds_bucket{{tenant=\"{tenant}\",le=\"{bound}\"}} \
++                     {}\n",
++                    histogram.buckets.get(index).copied().unwrap_or_default()
++                ));
++            }
++            out.push_str(&format!(
++                "relay_delivery_duration_seconds_bucket{{tenant=\"{tenant}\",le=\"+Inf\"}} {}\n",
++                histogram.buckets.last().copied().unwrap_or_default()
++            ));
++            out.push_str(&format!(
++                "relay_delivery_duration_seconds_sum{{tenant=\"{tenant}\"}} {}\n",
++                histogram.sum
++            ));
++            out.push_str(&format!(
++                "relay_delivery_duration_seconds_count{{tenant=\"{tenant}\"}} {}\n",
++                histogram.buckets.last().copied().unwrap_or_default()
++            ));
++        }
++
++        out.push_str(
++            "# HELP relay_deliveries_total Delivery attempts, by tenant and what they came to.\n",
++        );
++        out.push_str("# TYPE relay_deliveries_total counter\n");
++        for tenant in &tenants {
++            // Every outcome is emitted for every tenant, including the ones with nothing in them:
++            // a spike in `dead` is only visible against a baseline that was there before it.
++            for outcome in OUTCOMES {
++                let count = state
++                    .deliveries
++                    .get(&(tenant.clone(), outcome))
++                    .copied()
++                    .unwrap_or_default();
++                out.push_str(&format!(
++                    "relay_deliveries_total{{tenant=\"{tenant}\",outcome=\"{}\"}} {count}\n",
++                    outcome.as_str()
++                ));
++            }
++        }
++
++        out.push_str("# HELP relay_backlog_depth Deliveries this service still owes, by tenant.\n");
++        out.push_str("# TYPE relay_backlog_depth gauge\n");
++        for entry in backlog {
++            out.push_str(&format!(
++                "relay_backlog_depth{{tenant=\"{}\"}} {}\n",
++                label(&entry.tenant),
++                entry.depth
++            ));
++        }
++        out
++    }
++
++    /// The lock, poisoned or not: a registry another thread panicked while writing is still a
++    /// registry this one can read — and refusing to render because of somebody else's panic would
++    /// take the metrics down with the process that was already failing.
++    fn state(&self) -> std::sync::MutexGuard<'_, State> {
++        self.state
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
+     }
+ }
+ 
+@@ -166,5 +301,26 @@ pub struct Backlog {
+ /// Returns [`Error::Database`] when the queue cannot be read. The caller answers with an error
+ /// rather than with numbers it could not check.
+ pub async fn backlog(pool: &PgPool) -> Result<Vec<Backlog>, Error> {
+-    todo!("step relay/2.18-delivery-metrics")
++    // One question, asked of the queue rather than of a cache: `pending`, `claimed` and `retrying`
++    // are the three states in which a delivery is neither delivered nor buried, and `claimed`
++    // counts on purpose — a row a worker is holding right now is work this service still owes
++    // (`relay/2.5-atomic-claim`).
++    //
++    // A left join from `tenants`, so a tenant that owes nothing answers `0` rather than nothing.
++    let rows: Vec<(String, i64)> = sqlx::query_as(
++        "select t.name, count(d.id) \
++           from tenants as t \
++           left join events as v on v.tenant_id = t.id \
++           left join deliveries as d on d.event_id = v.id \
++                 and d.state in ('pending', 'claimed', 'retrying') \
++          group by t.name \
++          order by t.name",
++    )
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(rows
++        .into_iter()
++        .map(|(tenant, depth)| Backlog { tenant, depth })
++        .collect())
+ }
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 4756c83..b7efc4b 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -236,6 +236,36 @@ pub fn document() -> Value {
+                     },
+                 },
+             },
++            "/metrics": {
++                "get": {
++                    "summary": "What this process is doing, in the Prometheus exposition format.",
++                    "description": "Three families: how long an attempt took (a histogram, with \
++                                    fixed buckets, labelled by tenant), how many attempts had each \
++                                    outcome (a counter, labelled by tenant and by `sent`, \
++                                    `retried` or `dead`), and how much work is still owed (a gauge, \
++                                    labelled by tenant, read from the queue when it is scraped). \
++                                    The label set is the tenants this service knows and nothing \
++                                    else: no endpoint, no event, no delivery.",
++                    "responses": {
++                        "200": {
++                            "description": "The numbers. Not JSON: a scraper reads the media type \
++                                            before the body.",
++                            "content": {
++                                "text/plain": { "schema": { "type": "string" } },
++                            },
++                        },
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                        "403": answer(
++                            "Error",
++                            "This role may not read the numbers: the label set is the tenants of \
++                            the whole service, which is not a reader's business.",
++                        ),
++                        "429": too_many(),
++                        "500": answer("Error", "The queue could not be read, so the backlog is \
++                                                unknown."),
++                    },
++                },
++            },
+             "/audit": {
+                 "get": {
+                     "summary": "The calling tenant's audit trail, newest first.",

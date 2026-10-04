@@ -1,0 +1,176 @@
+diff --git a/src/metrics.rs b/src/metrics.rs
+new file mode 100644
+index 0000000..9f0f056
+--- /dev/null
++++ b/src/metrics.rs
+@@ -0,0 +1,170 @@
++//! What this service is doing, in numbers a scraper can read.
++//!
++//! `mailer/1.20-metrics` put a `/metrics` endpoint on a service and counted requests with it. That
++//! answered "how much traffic" and nothing else. The three numbers that answer "is delivery
++//! healthy, and for whom" are different, and each one has a shape of its own:
++//!
++//! * **how long an attempt takes, as a distribution, per tenant.** An average hides the only thing
++//!   anybody acts on: the tail. A p99 needs buckets, and the buckets are a histogram — which is
++//!   also the only metric here whose *rising* value is a promise about something that has not
++//!   happened yet;
++//! * **how much work is still owed, per tenant.** A latency without a backlog tells you something
++//!   is slow and not whether it is falling behind. The gauge is read from the queue when it is
++//!   scraped rather than remembered between turns: "what do we owe right now" answered from a
++//!   cache is a number about the past;
++//! * **what attempts came to, per tenant.** Counted once per attempt, by the outcome the worker
++//!   decided on, so `sent` and `dead` count deliveries that ended and `retried` counts the attempts
++//!   that were handed back. A total that only counted successes cannot show a spike in failures at
++//!   all.
++//!
++//! ## The label set is a budget, not a description
++//!
++//! Every distinct label value is a series, a series costs memory in every scraper and index in the
++//! store behind it, and the cardinality of a metric is the product of its labels' values. So:
++//!
++//! * **the tenant label carries the tenant's *name*** — at most thirty-two characters of a closed
++//!   alphabet, one per row in `tenants`, and the set of them is bounded by configuration rather
++//!   than by traffic;
++//! * **nothing else is a label.** Not the endpoint's URL (a tenant may register thousands), not the
++//!   event id, not the delivery id, not the URL's path. Those belong in a log line, where they cost
++//!   a line rather than a series, and the trap of this step is a service whose metrics endpoint
++//!   grows until the scrape times out;
++//! * **a value outside the known set folds into `unknown`.** A label value this service did not
++//!   choose is a value somebody else did, and a metric that reports whatever it is handed has a
++//!   cardinality nobody can bound.
++//!
++//! ## What is deliberately not here
++//!
++//! No tracing, no histograms of queue depth, and no per-route metrics: the HTTP surface of this
++//! service is four routes and one tenant-scoped shape, and `relay/2.16-authz-audit` already writes
++//! down who did what. A metrics module that measures everything measures nothing anybody reads —
++//! and the two numbers an operator actually pages on, the backlog and the tail latency, are the two
++//! this module exists for.
++//!
++//! The text [`Metrics::render`] produces is the Prometheus exposition format: one `# HELP` and one
++//! `# TYPE` line per family, then one line per sample, `name{label="value"} value`. It is written
++//! by hand for the reason the rest of this project is: what a scraper reads should be visible in
++//! the code that produces it.
++
++use std::sync::Mutex;
++use std::time::Duration;
++
++use sqlx::PgPool;
++
++use crate::error::Error;
++
++/// The label value everything that is not a tenant name folds into.
++pub const UNKNOWN: &str = "unknown";
++
++/// The upper bound of each histogram bucket, in seconds.
++///
++/// The bounds are the ones a webhook attempt lives inside: a healthy subscriber answers in tens of
++/// milliseconds, a slow one in seconds, and anything past ten seconds is `Policy::deadline`'s
++/// business rather than a distribution's. They are fixed rather than configurable, because a bucket
++/// that moves between deploys is a dashboard that moves with it.
++pub const BUCKETS: [f64; 11] = [
++    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
++];
++
++/// What an attempt came to, as far as the traffic is concerned.
++///
++/// Three values and no more: this is a *label*, and a fourth value for "we could not record it" or
++/// "we did not try" would be a series that means "ask the log". The two outcomes the worker can also
++/// report — an attempt it could not write down (`lost`) and one it never made because the
++/// endpoint's breaker is open (`shed`) — are facts about the worker, and they stay in its report.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub enum Outcome {
++    /// The subscriber took it.
++    Sent,
++    /// The attempt failed and the delivery is owed again.
++    Retried,
++    /// The last attempt this delivery was going to get failed.
++    Dead,
++}
++
++/// Every outcome, for the tests that walk the label's values.
++pub const OUTCOMES: [Outcome; 3] = [Outcome::Sent, Outcome::Retried, Outcome::Dead];
++
++impl Outcome {
++    /// The outcome as text: the label's value, and a stable token a query groups by.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Self::Sent => "sent",
++            Self::Retried => "retried",
++            Self::Dead => "dead",
++        }
++    }
++}
++
++/// The numbers one process exports.
++///
++/// `record` takes `&self` because the attempts that record are several tasks of one turn running at
++/// once: a registry handed out as `&mut` would serialise the deliveries it measures, which is a
++/// measurement that changes the thing it measures. Whatever keeps the observations inside is
++/// therefore behind a lock or an atomic, and it is the scaffold's job to say *that* rather than
++/// which one.
++#[derive(Debug, Default)]
++pub struct Metrics {
++    /// Everything observed so far. Its shape is yours; what has to be true of it is that `record`
++    /// takes `&self` and that a histogram is kept per tenant label.
++    state: Mutex<State>,
++}
++
++/// What one process has observed.
++///
++/// Fill it in with what the two methods below need: an observation per tenant label, and a count
++/// per label and outcome.
++#[derive(Debug, Default)]
++struct State {}
++
++impl Metrics {
++    /// A registry with nothing in it.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Count one attempt: how long it took, and what it came to.
++    ///
++    /// Called by the worker with the tenant's name. A value that is not a tenant name this service
++    /// could have is folded into the `unknown` label rather than becoming a series of its own.
++    pub fn record(&self, tenant: &str, outcome: Outcome, elapsed: Duration) {
++        todo!("step relay/2.18-delivery-metrics")
++    }
++
++    /// The text a scraper reads: every family, and one sample per label set.
++    ///
++    /// `backlog` is passed in rather than measured here, because the gauge is a question about the
++    /// database and this function is a question about arithmetic: the caller that has a pool reads
++    /// the queue ([`backlog`]), and the caller that is rendering bytes stays synchronous.
++    ///
++    /// The label set is the tenants in `backlog` together with the tenants that have observations,
++    /// so a family is present from the first scrape rather than after the first delivery.
++    #[must_use]
++    pub fn render(&self, backlog: &[Backlog]) -> String {
++        todo!("step relay/2.18-delivery-metrics")
++    }
++}
++
++/// One tenant, and how much of its work this service still owes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Backlog {
++    /// The tenant's name: the label's value.
++    pub tenant: String,
++    /// How many of its deliveries are neither delivered nor buried.
++    pub depth: i64,
++}
++
++/// What every tenant is still owed, read from the queue when it is asked for.
++///
++/// One row per tenant in `tenants`, including the ones with nothing outstanding: a gauge that
++/// disappears when its value reaches zero is a gauge a dashboard shows as a gap.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the queue cannot be read. The caller answers with an error
++/// rather than with numbers it could not check.
++pub async fn backlog(pool: &PgPool) -> Result<Vec<Backlog>, Error> {
++    todo!("step relay/2.18-delivery-metrics")
++}
