@@ -1,0 +1,2044 @@
+diff --git a/migrations/0005_queues_and_usage.sql b/migrations/0005_queues_and_usage.sql
+index 3fa0feb..07f1047 100644
+--- a/migrations/0005_queues_and_usage.sql
++++ b/migrations/0005_queues_and_usage.sql
+@@ -4,31 +4,76 @@
+ -- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys; `mailer`
+ -- and `relay` number their own files).
+ --
+--- The file is yours to write, and it needs to hold four things and one idea:
++-- Five objects, and the argument for each of them is one sentence:
+ --
+--- 1. **which tenant owns which queue.** Exactly one owner per queue, because the counters below
+---    are attributed to it: a queue with two owners is a queue whose numbers nobody can add up.
+--- 2. **what everybody else may do with it**: one row per (queue, tenant, action), with the action's
+---    alphabet closed by a `check`, so that a typo lands in the migration rather than in a query that
+---    silently matches nothing. `relay/2.16-authz-audit` made the same move for a service's routes,
+---    and the argument is the same: a permission that is data can be reviewed as data.
+--- 3. **the rule, as something with a name.** Every query in the store needs the same two questions —
+---    "can this tenant see this queue" and "may this tenant do this with it" — and a `view` is the
+---    schema's own way of saying what those mean: an owner may do everything, a grant may do what it
+---    names, and a wider grant covers a narrower one. Write it once and every statement reads it,
+---    rather than five statements each spelling out a joining rule that has to stay identical.
+--- 4. **the counters.** Five totals per queue, and the columns are the five things that can happen to
+---    work (a `submitted` job, a `claimed` attempt, and the three ways an attempt ends). A queue
+---    nobody declared still accumulates traffic, so a counter row is created and updated by the
+---    write that causes it (`insert … on conflict (queue) do update`) and is *not* a foreign key to
+---    the ownership table: the numbers are a fact about traffic, and ownership is a fact about who is
+---    answerable for it.
+--- 5. **the trail of the access model**: one row per accepted change, naming the queue, the tenant
+---    that made it, the owner it left behind, and when. The grants are not copied into it — the
+---    current model is the row in (2), and this is how it got there. **Name this table
+---    `queue_audit`**: the step's specification takes its insert privilege away to check that a
+---    privileged change which cannot be recorded does not happen, so its name is part of the step
+---    rather than a free choice.
++--   * **`queues`**: exactly one owner per queue. The counters below are attributed to it, so a
++--     queue with two owners would be a queue whose numbers nobody can add up.
++--   * **`queue_grants`**: what somebody other than the owner may do, one row per
++--     (queue, tenant, action), with the action's alphabet closed by a `check`. A permission that is
++--     data is a permission a reviewer can read, which is the move `relay/2.16-authz-audit` made for
++--     a service's routes.
++--   * **`queue_permissions`** (a view): the *rule*, with a name. Every statement in the store needs
++--     the same two questions — can this tenant see this queue, and may it do this with it — and the
++--     rule has three clauses rather than one: the owner may do everything, a grant may do what it
++--     names, and `administer` covers the narrower two. Written as a view, every statement reads the
++--     same rule (`action in ($a, 'administer')` over one table) instead of each spelling out a join
++--     that has to stay identical to the others'.
++--   * **`queue_usage`**: five totals per queue, one column per thing that can happen to work. There
++--     is no foreign key to `queues` on purpose: the numbers are a fact about traffic and ownership
++--     is a fact about who is answerable for it, so a queue nobody declared — a project's queues
++--     before this step, an operator's experiment — still accumulates numbers instead of failing a
++--     constraint or disappearing from a report.
++--   * **`queue_audit`**: one row per accepted change of the access model. Not the grants
++--     themselves (the model above is the current state and this is how it got there), and *not* a
++--     row per refused change: the unit here is a change to a model, and a change that did not happen
++--     is not a decision about a queue. That is the one difference from the request-level trail of
++--     `relay/2.16-authz-audit`, where a refused request is a request that happened.
+ --
+--- One index belongs in here for the question the trail is read with (one queue's decisions, newest
+--- first). Nothing else is forced by the spec.
++-- Two indexes, both for a question this project asks rather than for a table it has: the trailing
++-- one is for the "what is this queue's story" query (`queue_audit` read newest first for one queue),
++-- and the usage table needs none — it is read by queue and written by queue, and both are the
++-- primary key.
++--
++-- The view is spelled out here rather than left to each statement because the `check` on the action
++-- alphabet and the widening rule are one decision: a store that asked the two questions with two
++-- queries of its own would be a store that could answer them inconsistently.
++
++create table queues (
++    queue text primary key,
++    owner text not null
++);
++
++create table queue_grants (
++    queue text not null references queues (queue) on delete cascade,
++    tenant text not null,
++    action text not null check (action in ('submit', 'claim', 'administer')),
++    primary key (queue, tenant, action)
++);
++
++create view queue_permissions as
++    select queue, owner as tenant, 'submit'::text as action from queues
++    union all
++    select queue, owner, 'claim' from queues
++    union all
++    select queue, owner, 'administer' from queues
++    union all
++    select queue, tenant, action from queue_grants;
++
++create table queue_usage (
++    queue text primary key,
++    submitted bigint not null default 0,
++    claimed bigint not null default 0,
++    succeeded bigint not null default 0,
++    failed bigint not null default 0,
++    reclaimed bigint not null default 0
++);
++
++create table queue_audit (
++    id uuid primary key,
++    queue text not null,
++    actor text not null,
++    owner text not null,
++    at timestamptz not null
++);
++
++create index queue_audit_of_a_queue on queue_audit (queue, at desc);
+diff --git a/src/engine/authz.rs b/src/engine/authz.rs
+index 9b7b100..056648e 100644
+--- a/src/engine/authz.rs
++++ b/src/engine/authz.rs
+@@ -56,7 +56,11 @@ impl QueueAction {
+     /// `grep` all agree on, so it is written once, here.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("jobq/3.13-queue-authz-attribution: the token this action is stored under")
++        match self {
++            QueueAction::Submit => "submit",
++            QueueAction::Claim => "claim",
++            QueueAction::Administer => "administer",
++        }
+     }
+ }
+ 
+@@ -160,10 +164,7 @@ impl QueueDeclaration {
+     /// nobody declared.
+     #[must_use]
+     pub fn visible_to(&self, tenant: &Tenant) -> bool {
+-        todo!(
+-            "jobq/3.13-queue-authz-attribution: whether `{tenant}` appears in this queue's access \
+-             model at all"
+-        )
++        &self.owner == tenant || self.grants.iter().any(|grant| grant.tenant() == tenant)
+     }
+ 
+     /// Whether `tenant` may do `action` with this queue.
+@@ -173,10 +174,13 @@ impl QueueDeclaration {
+     /// [`QueueDeclaration::visible_to`], which is the question a refusal is built from.
+     #[must_use]
+     pub fn allows(&self, tenant: &Tenant, action: QueueAction) -> bool {
+-        todo!(
+-            "jobq/3.13-queue-authz-attribution: whether `{tenant}` may `{action}` — the owner holds \
+-             every action, and a wider grant covers a narrower one"
+-        )
++        if &self.owner == tenant {
++            return true;
++        }
++        self.grants.iter().any(|grant| {
++            grant.tenant() == tenant
++                && (grant.action() == action || grant.action() == QueueAction::Administer)
++        })
+     }
+ }
+ 
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 1d8e226..736b0b2 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -34,25 +34,7 @@ impl Queue {
+     /// contains anything but lower-case ASCII letters, digits, `.`, `_` and `-`. A name is a key in
+     /// an operator's dashboard and a column in a table, so the set is deliberately tiny.
+     pub fn parse(name: &str) -> Result<Self, Error> {
+-        let invalid = |detail: String| Error::Invalid { detail };
+-        if name.is_empty() {
+-            return Err(invalid("a queue name cannot be empty".to_owned()));
+-        }
+-        if name.len() > QUEUE_NAME_MAX {
+-            return Err(invalid(format!(
+-                "`{name}` is {} bytes; the limit is {QUEUE_NAME_MAX}",
+-                name.len()
+-            )));
+-        }
+-        if !name.bytes().all(|byte| {
+-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+-        }) {
+-            return Err(invalid(format!(
+-                "`{name}` may only contain lower-case letters, digits, `.`, `_` and `-`: a queue \
+-                 name is a table column, a metric label and something a person types, so it stays \
+-                 in the character set all three can spell"
+-            )));
+-        }
++        check_name("queue", name, QUEUE_NAME_MAX)?;
+         Ok(Self(name.to_owned()))
+     }
+ 
+@@ -63,6 +45,36 @@ impl Queue {
+     }
+ }
+ 
++/// Whether `name` is a name this engine will write down, phrased for the kind of thing it names.
++///
++/// A queue and a tenant are held to the same rule (`jobq/3.13-queue-authz-attribution` added the
++/// second caller) because they are the same kind of name: a key in a table, a label in a metric and
++/// something a person types, so the character set is the one all three can spell. The rule is a
++/// function rather than a copy so that the alphabet cannot drift between them.
++pub(crate) fn check_name(kind: &str, name: &str, max: usize) -> Result<(), Error> {
++    let invalid = |detail: String| Error::Invalid { detail };
++    if name.is_empty() {
++        return Err(invalid(format!("a {kind} name cannot be empty")));
++    }
++    if name.len() > max {
++        return Err(invalid(format!(
++            "`{name}` is {} bytes; the limit is {max}",
++            name.len()
++        )));
++    }
++    if !name
++        .bytes()
++        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte))
++    {
++        return Err(invalid(format!(
++            "`{name}` may only contain lower-case letters, digits, `.`, `_` and `-`: a {kind} name \
++             is a table column, a metric label and something a person types, so it stays in the \
++             character set all three can spell"
++        )));
++    }
++    Ok(())
++}
++
+ impl fmt::Display for Queue {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+         formatter.write_str(self.as_str())
+diff --git a/src/engine/error.rs b/src/engine/error.rs
+index cf7210f..8090463 100644
+--- a/src/engine/error.rs
++++ b/src/engine/error.rs
+@@ -29,7 +29,7 @@
+ 
+ use thiserror::Error as ThisError;
+ 
+-use crate::engine::domain::JobId;
++use crate::engine::domain::{JobId, Queue};
+ 
+ /// Everything the engine and its service can fail at.
+ ///
+@@ -101,6 +101,36 @@ pub enum Error {
+         source: Box<dyn std::error::Error + Send + Sync + 'static>,
+     },
+ 
++    /// There is no such queue.
++    ///
++    /// Which is also the answer a queue this caller may not see gives
++    /// (`jobq/3.13-queue-authz-attribution`): one variant for both, because the bytes a caller
++    /// receives must not depend on whether the queue exists — a refusal that differed would be an
++    /// existence oracle, and answering "does this queue exist" for a stranger is exactly what an
++    /// access model is for (`relay/2.16-authz-audit` made the same call for a service's rows).
++    ///
++    /// Not retryable: a name this engine will not hand over stays that way, and a caller that asked
++    /// with the wrong tenant will ask with it again.
++    #[error("no queue {queue}")]
++    NoQueue {
++        /// The name that was asked for.
++        queue: Queue,
++    },
++
++    /// The caller may do this with its own queues, but not with this one.
++    ///
++    /// Not retryable, and the class is about an *action* rather than about a row: a caller that
++    /// holds `submit` on a queue and asks to `claim` from it is told what it may not do, and the
++    /// message names the action and nothing else. That is the narrower promise of the two — the
++    /// queue in it would be a queue the caller can already see — and it is the one variant that is
++    /// safe for the case where the two are not the same caller's.
++    #[error("forbidden: {action}")]
++    Forbidden {
++        /// The action's own name (`submit`, `claim`, `administer`, `usage`), as
++        /// [`crate::engine::QueueAction::as_str`] writes it.
++        action: String,
++    },
++
+     /// The service could not read its configuration.
+     ///
+     /// Not retryable: a file that says something this build cannot use does not say something else a
+@@ -160,8 +190,8 @@ impl Error {
+     #[must_use]
+     pub fn exit_code(&self) -> u8 {
+         match self {
+-            Error::Invalid { .. } => 2,
+-            Error::NotFound { .. } => 3,
++            Error::Invalid { .. } | Error::Forbidden { .. } => 2,
++            Error::NotFound { .. } | Error::NoQueue { .. } => 3,
+             Error::Store { .. } | Error::Conflict { .. } => 4,
+             Error::Config { .. } | Error::Io { .. } => 1,
+         }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 7ef1ded..2109c1c 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -18,6 +18,7 @@
+ //! `pub(crate)` module and `retry` — the module — is too, while `retry`, the *function*, is
+ //! re-exported below), so the next release can move them without touching anybody.
+ 
++pub(crate) mod authz;
+ pub(crate) mod clock;
+ pub(crate) mod cron;
+ pub(crate) mod dedup;
+@@ -28,10 +29,13 @@ pub(crate) mod policy;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
+ pub(crate) mod store;
++pub(crate) mod tenant;
+ pub(crate) mod timers;
++pub(crate) mod usage;
+ 
+ mod sealed;
+ 
++pub use authz::{QueueAction, QueueAudit, QueueDeclaration, QueueGrant};
+ pub use clock::{Clock, SystemClock};
+ pub use cron::Schedule;
+ pub use dedup::{DEDUP_KEY_MAX, Dedup};
+@@ -46,4 +50,6 @@ pub use scheduler::Engine;
+ #[cfg(feature = "postgres")]
+ pub use store::PostgresStore;
+ pub use store::{BoxFuture, MemoryStore, Store};
++pub use tenant::{TENANT_NAME_MAX, Tenant};
+ pub use timers::ReadySet;
++pub use usage::{QueueUsage, Usage};
+diff --git a/src/engine/policy.rs b/src/engine/policy.rs
+index 5d7a2dd..94e372b 100644
+--- a/src/engine/policy.rs
++++ b/src/engine/policy.rs
+@@ -31,6 +31,10 @@ pub struct Policy {
+     aging_after: Option<Duration>,
+     /// How many jobs of one queue may be running at the same time. `None` is unlimited.
+     max_in_flight_per_queue: Option<usize>,
++    /// How many jobs one tenant's queues may hold running at the same time. `None` is unlimited,
++    /// and a queue nobody declared belongs to nobody: the cap does not touch it
++    /// (`jobq/3.13-queue-authz-attribution`).
++    max_in_flight_per_tenant: Option<usize>,
+ }
+ 
+ impl Policy {
+@@ -46,6 +50,7 @@ impl Policy {
+         Self {
+             aging_after: Some(aging_after),
+             max_in_flight_per_queue: Some(cap),
++            max_in_flight_per_tenant: None,
+         }
+     }
+ 
+@@ -63,6 +68,21 @@ impl Policy {
+         self
+     }
+ 
++    /// The same policy with a per-tenant in-flight cap, leaving the other two alone
++    /// (`jobq/3.13-queue-authz-attribution`).
++    ///
++    /// The same cap as [`Policy::with_cap`], counted one level up: the *noisy neighbour* is not one
++    /// queue, it is one tenant with several of them, and a pool shared between tenants needs a
++    /// ceiling on the tenant rather than on each of its queues. It is a knob on this policy rather
++    /// than a second policy, because it is enforced in the same place (`claim`), with the same
++    /// rule about what happens over it (nothing is failed, nothing is lost: the work waits), and
++    /// against the same number the counters of this step publish.
++    #[must_use]
++    pub fn with_tenant_cap(mut self, cap: usize) -> Self {
++        self.max_in_flight_per_tenant = Some(cap);
++        self
++    }
++
+     /// How long a job may wait before its rank rises, if it does.
+     #[must_use]
+     pub fn aging_after(&self) -> Option<Duration> {
+@@ -74,4 +94,10 @@ impl Policy {
+     pub fn max_in_flight_per_queue(&self) -> Option<usize> {
+         self.max_in_flight_per_queue
+     }
++
++    /// How many jobs one tenant may hold running at once, if there is a limit.
++    #[must_use]
++    pub fn max_in_flight_per_tenant(&self) -> Option<usize> {
++        self.max_in_flight_per_tenant
++    }
+ }
+diff --git a/src/engine/scheduler.rs b/src/engine/scheduler.rs
+index ceb8ce9..a89775d 100644
+--- a/src/engine/scheduler.rs
++++ b/src/engine/scheduler.rs
+@@ -6,9 +6,12 @@
+ //! five methods. A caller that only ever sees [`Engine`] does not have to be rebuilt when one of
+ //! those decisions changes — which is the point of an engine at all.
+ 
++use crate::engine::authz::{QueueAudit, QueueDeclaration};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::store::Store;
++use crate::engine::tenant::Tenant;
++use crate::engine::usage::QueueUsage;
+ 
+ /// A queue engine over one store.
+ pub struct Engine<S: Store> {
+@@ -82,6 +85,58 @@ impl<S: Store> Engine<S> {
+         self.store.fail(worker, id, reason).await
+     }
+ 
++    /// Declare a queue: whose it is, and what everybody else may do with it
++    /// (`jobq/3.13-queue-authz-attribution`).
++    ///
++    /// The operator's door, and the one an engine over an unscoped store is for: a deployment seeds
++    /// its queues and hands them over here, and a *tenant's* engine — the handle
++    /// [`Engine::scoped`] answers — declares the queues it owns and changes the grants on them.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::NoQueue`] when this engine may not see the queue, [`Error::Forbidden`] when it may
++    /// see it and may not administer it, [`Error::Store`] when the backend refused the write.
++    pub async fn declare_queue(&self, declaration: &QueueDeclaration) -> Result<(), Error> {
++        self.store.declare_queue(declaration).await
++    }
++
++    /// The same store, as `tenant` sees it (`jobq/3.13-queue-authz-attribution`).
++    ///
++    /// The tenant's door next to the operator's: what it answers about somebody else's queue or job
++    /// is what it answers about a queue or a job nobody wrote, and every refusal it makes is the
++    /// port's. It is a handle rather than an argument for the reason the port's documentation
++    /// argues, and it is what a deployment hands each tenant's worker — a worker holds an
++    /// `Arc<dyn Store>` already (`jobq/3.7-leases-and-recovery`), so one process per tenant is one
++    /// worker with one handle.
++    #[must_use]
++    pub fn scoped(&self, tenant: &Tenant) -> Box<dyn Store> {
++        self.store.scoped(tenant)
++    }
++
++    /// What the queues this engine can see have done, in queue order
++    /// (`jobq/3.13-queue-authz-attribution`).
++    ///
++    /// The report an operator reads: the counters are written where the work happens and read here,
++    /// so "who consumed the worker pool last night" is a call rather than an afternoon of log
++    /// archaeology. [`crate::engine::Usage::running`] is the number that answers it directly.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    pub async fn usage(&self) -> Result<Vec<QueueUsage>, Error> {
++        self.store.usage().await
++    }
++
++    /// The privileged decisions about the queues this engine can see, newest first
++    /// (`jobq/3.13-queue-authz-attribution`).
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    pub async fn audit(&self, limit: usize) -> Result<Vec<QueueAudit>, Error> {
++        self.store.audit(limit).await
++    }
++
+     /// Read one job, or say there is none.
+     ///
+     /// # Errors
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 89452f3..292c7f0 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -17,18 +17,25 @@
+ //! durable backend makes in SQL — including the guard that matters most, which is that a settle only
+ //! counts from the worker the row still names.
+ //!
++//! `jobq/3.13-queue-authz-attribution` adds the fifth: who may touch any of it. The queued access
++//! model, the counters and the trail of the model live in the same [`Ledger`] as the rows, and the
++//! *scope* a handle acts as is a field of the store rather than a parameter of a method — so a
++//! scoped handle filters by asking the same map everything else is in, and the lock that makes a
++//! settle one write makes a declaration one write as well.
++//!
+ //! `jobq/3.12-dedup-window` adds the fourth: the deduplication key. It is a map beside the rows —
+ //! one entry per key, holding the job the key produced and the instant it stops answering — and it
+ //! is the same rule the durable backend writes as an upsert, asked under the lock this store
+ //! already takes: a key that is still live answers the first request's job *before* anything is
+ //! written, and a key whose window has passed is reset to this request.
+ 
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ 
++use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+@@ -36,6 +43,8 @@ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
++use crate::engine::tenant::Tenant;
++use crate::engine::usage::{QueueUsage, Usage};
+ 
+ /// What this store knows, under one lock.
+ ///
+@@ -55,6 +64,17 @@ struct Ledger {
+     /// the instant is what makes it dead, and the entry is overwritten the next time the key is
+     /// taken, which is memory management rather than correctness.
+     dedup: BTreeMap<(Queue, String), Held>,
++    /// The access model of every queue this store has been told about
++    /// (`jobq/3.13-queue-authz-attribution`). The declaration *is* the rule: this store asks
++    /// `allows`/`visible_to` about it rather than comparing owners and grants itself, so the model
++    /// has one implementation per backend rather than one per query.
++    queues: BTreeMap<Queue, QueueDeclaration>,
++    /// What every queue has done. A queue with traffic but no declaration has a row here and no
++    /// row above: the counters are facts about work, and ownership is a fact about answerability.
++    usage: BTreeMap<Queue, Usage>,
++    /// The privileged decisions, oldest first. A trail is read newest first, which is this
++    /// reversed — and appending is what a trail does, so the vector is the honest shape.
++    audit: Vec<QueueAudit>,
+ }
+ 
+ /// One held deduplication key.
+@@ -114,6 +134,144 @@ impl Ledger {
+         self.jobs.get(&held.job_id).cloned()
+     }
+ 
++    /// Whether the tenant this store acts as may see `queue` at all.
++    ///
++    /// An unscoped store (`None`) sees everything, including the queues nobody declared: it is the
++    /// operator's door, and the queues a project used before this step have owners nobody wrote
++    /// down.
++    fn visible(&self, scope: Option<&Tenant>, queue: &Queue) -> bool {
++        match scope {
++            None => true,
++            Some(tenant) => self
++                .queues
++                .get(queue)
++                .is_some_and(|declared| declared.visible_to(tenant)),
++        }
++    }
++
++    /// The queues `scope` may see, or `None` when there is no scope to narrow by.
++    ///
++    /// Collected rather than asked per row, because the callers of this are the maintenance
++    /// statements that walk every job: asking `visible` inside a `values_mut()` loop would borrow
++    /// this map twice, and a set answers the same question once.
++    fn visible_queues(&self, scope: Option<&Tenant>) -> Option<BTreeSet<Queue>> {
++        scope.map(|tenant| {
++            self.queues
++                .values()
++                .filter(|declared| declared.visible_to(tenant))
++                .map(|declared| declared.queue().clone())
++                .collect()
++        })
++    }
++
++    /// Whether `scope` may do `action` with `queue`, and which refusal it is when it may not.
++    ///
++    /// The two refusals are one decision made in this order, and the order is the promise: a queue
++    /// this scope cannot see is answered like a queue nobody declared, and only a queue it *can*
++    /// see is answered with what it may not do — the difference is what a stranger could learn from
++    /// asking.
++    fn permit(
++        &self,
++        scope: Option<&Tenant>,
++        queue: &Queue,
++        action: QueueAction,
++    ) -> Result<(), Error> {
++        let Some(tenant) = scope else {
++            return Ok(());
++        };
++        let Some(declared) = self.queues.get(queue) else {
++            return Err(no_such_queue(queue));
++        };
++        if declared.allows(tenant, action) {
++            return Ok(());
++        }
++        if declared.visible_to(tenant) {
++            return Err(forbidden(action));
++        }
++        Err(no_such_queue(queue))
++    }
++
++    /// A job this store may see, or the refusal a job nobody wrote is answered with.
++    ///
++    /// The row-level half of the same rule, and the reason it answers [`Error::NotFound`] rather
++    /// than anything about queues: a caller holding an identity it may not use is in exactly the
++    /// position of a caller holding an identity that does not exist, and it must not be able to
++    /// tell the two apart (`relay/2.16-authz-audit`).
++    fn visible_job(&self, scope: Option<&Tenant>, id: &JobId) -> Result<(), Error> {
++        let job = self.jobs.get(id);
++        match job {
++            Some(job) if self.visible(scope, &job.queue) => Ok(()),
++            _ => Err(Error::NotFound { id: *id }),
++        }
++    }
++
++    /// The tenant that owns `queue`, when it has been declared.
++    fn owner(&self, queue: &Queue) -> Option<&Tenant> {
++        self.queues.get(queue).map(QueueDeclaration::owner)
++    }
++
++    /// How many jobs `owner`'s queues hold running right now, across every one of them.
++    ///
++    /// The tenant cap's number, and the same number [`Usage::running`] answers once the counters
++    /// have been written: a job is running in the tenant's name when the queue it sits in is the
++    /// tenant's.
++    fn in_flight_of(&self, owner: &Tenant) -> usize {
++        self.jobs
++            .values()
++            .filter(|job| {
++                job.state == JobState::Running
++                    && self
++                        .queues
++                        .get(&job.queue)
++                        .is_some_and(|it| it.owner() == owner)
++            })
++            .count()
++    }
++
++    /// Count one thing that happened to `queue`.
++    fn count(&mut self, queue: &Queue, add: impl FnOnce(&mut Usage)) {
++        add(self.usage.entry(queue.clone()).or_default());
++    }
++
++    /// What the queues `scope` may see have done, in queue order.
++    ///
++    /// Two sets, unioned: the queues that have been declared and the queues that have traffic. The
++    /// first is what makes a queue an operator just created visible before anybody used it; the
++    /// second is what keeps a queue nobody declared from hiding its numbers.
++    fn usage_lines(&self, scope: Option<&Tenant>) -> Vec<QueueUsage> {
++        let mine = |queue: &Queue| match scope {
++            None => true,
++            Some(tenant) => self
++                .queues
++                .get(queue)
++                .is_some_and(|declared| declared.owner() == tenant),
++        };
++        let mut lines: BTreeMap<Queue, Usage> = BTreeMap::new();
++        for queue in self.queues.keys().chain(self.usage.keys()) {
++            if mine(queue) {
++                lines.insert(
++                    queue.clone(),
++                    self.usage.get(queue).copied().unwrap_or_default(),
++                );
++            }
++        }
++        lines
++            .into_iter()
++            .map(|(queue, usage)| QueueUsage::new(queue, usage))
++            .collect()
++    }
++
++    /// The privileged decisions about the queues `scope` may see, newest first.
++    fn audit_lines(&self, scope: Option<&Tenant>, limit: usize) -> Vec<QueueAudit> {
++        self.audit
++            .iter()
++            .rev()
++            .filter(|line| self.visible(scope, line.queue()))
++            .take(limit)
++            .cloned()
++            .collect()
++    }
++
+     /// Whether this row is this worker's to settle.
+     ///
+     /// The check the durable backend writes as `and lease_owner = $2` in its `where` clause, in the
+@@ -133,23 +291,31 @@ impl Ledger {
+ /// implementation is not welcome.
+ #[derive(Debug)]
+ pub struct MemoryStore {
+-    /// The rows and the trail behind one lock.
+-    ledger: Mutex<Ledger>,
++    /// The rows, the trail, the access model and the counters behind one lock. Shared with every
++    /// scoped handle over this store (`jobq/3.13-queue-authz-attribution`): a tenant's view of the
++    /// engine is one more handle on the same rows, not a second engine.
++    ledger: Arc<Mutex<Ledger>>,
+     /// How long a claim by this store is good for.
+     lease: Duration,
+     /// The clock every instant this store writes is read from.
+     clock: Arc<dyn Clock>,
+     /// How due jobs are ordered and how much of one queue may run at once.
+     policy: Policy,
++    /// The tenant this handle acts as, or `None` for the operator's door
++    /// (`jobq/3.13-queue-authz-attribution`). A field rather than a parameter of every method
++    /// because that is where an access rule cannot be forgotten: the filter is in the queries, and
++    /// a caller cannot ask the wrong question.
++    scope: Option<Tenant>,
+ }
+ 
+ impl Default for MemoryStore {
+     fn default() -> Self {
+         Self {
+-            ledger: Mutex::default(),
++            ledger: Arc::default(),
+             lease: DEFAULT_LEASE,
+             clock: Arc::new(SystemClock),
+             policy: Policy::strict(),
++            scope: None,
+         }
+     }
+ }
+@@ -270,6 +436,10 @@ impl Store for MemoryStore {
+             // durable backend needs (`jobq/3.6-transaction-isolation`). A live key returns before
+             // either write, so a repeat is not a write that was rolled back — it is no write.
+             let mut ledger = self.ledger();
++            // Who may write here, before anything is decided: a queue this handle may not see is
++            // answered like a queue nobody declared, and a request that is refused leaves the
++            // counters where they were because it never reached them.
++            ledger.permit(self.scope.as_ref(), &request.queue, QueueAction::Submit)?;
+             if let Some(dedup) = &dedup
+                 && let Some(job) = ledger.held(&request.queue, dedup.key(), now)
+             {
+@@ -305,6 +475,10 @@ impl Store for MemoryStore {
+                     },
+                 );
+             }
++            // The counter is written where the job is, under the same lock: a job that is not there
++            // cannot be counted, and one that is cannot be missing from the count
++            // (`jobq/3.6-transaction-isolation`'s argument, one column over).
++            ledger.count(&job.queue, |usage| usage.submitted += 1);
+             ledger.jobs.insert(job.id, job.clone());
+             Ok(job)
+         })
+@@ -322,6 +496,7 @@ impl Store for MemoryStore {
+             // happen in the same critical section, so a second claim on this store cannot read the
+             // same row as free while this one is on its way to marking it running.
+             let mut ledger = self.ledger();
++            ledger.permit(self.scope.as_ref(), queue, QueueAction::Claim)?;
+             // The cap is about the queue, so it is counted before anything is chosen: a claim that
+             // fills the queue to its limit and *then* notices is a claim that took the resource
+             // already (`jobq/3.9-priority-fairness`).
+@@ -334,6 +509,19 @@ impl Store for MemoryStore {
+                 Some(cap) => cap.saturating_sub(in_flight),
+                 None => limit,
+             };
++            // The tenant cap is the same cap counted one level up, and it is asked for the *owner*
++            // of the queue being claimed rather than for the caller: the pool a tenant holds is the
++            // work its queues are running, whoever is running it — which is the number the counters
++            // of this step publish, used as a ceiling
++            // (`jobq/3.13-queue-authz-attribution` uses `Policy`'s knob rather than a second
++            // policy). A queue nobody declared has no owner and no cap.
++            let room = match (self.policy.max_in_flight_per_tenant(), ledger.owner(queue)) {
++                (Some(cap), Some(owner)) => {
++                    let held = ledger.in_flight_of(owner);
++                    room.min(cap.saturating_sub(held))
++                }
++                _ => room,
++            };
+             let due = Self::due(&ledger.jobs, queue, now, self.policy);
+             let mut claimed = Vec::new();
+             for id in due.into_iter().take(limit.min(room)) {
+@@ -349,6 +537,8 @@ impl Store for MemoryStore {
+                     claimed.push(job.clone());
+                 }
+             }
++            let counted = u64::try_from(claimed.len()).unwrap_or(u64::MAX);
++            ledger.count(queue, |usage| usage.claimed += counted);
+             Ok(claimed)
+         })
+     }
+@@ -360,6 +550,10 @@ impl Store for MemoryStore {
+     ) -> BoxFuture<'a, Result<(), Error>> {
+         Box::pin(async move {
+             let mut ledger = self.ledger();
++            // A job this handle may not see is answered exactly like a job nobody wrote, and the
++            // question is asked before the lease guard so that a foreign row cannot be told apart
++            // from one that is merely not running (`jobq/3.13-queue-authz-attribution`).
++            ledger.visible_job(self.scope.as_ref(), id)?;
+             let Some(job) = ledger.jobs.get_mut(id) else {
+                 return Err(Error::NotFound { id: *id });
+             };
+@@ -373,6 +567,7 @@ impl Store for MemoryStore {
+                 });
+             }
+             let attempt = job.attempts;
++            let queue = job.queue.clone();
+             job.state = JobState::Succeeded;
+             job.last_error = None;
+             job.lease_owner = None;
+@@ -387,6 +582,10 @@ impl Store for MemoryStore {
+                 None,
+                 self.clock.now(),
+             ));
++            // The count moves with the row, in the same critical section: a settle that was refused
++            // returned before this line, and one that happened cannot be missing from the number an
++            // operator reads.
++            ledger.count(&queue, |usage| usage.succeeded += 1);
+             Ok(())
+         })
+     }
+@@ -399,6 +598,7 @@ impl Store for MemoryStore {
+     ) -> BoxFuture<'a, Result<JobState, Error>> {
+         Box::pin(async move {
+             let mut ledger = self.ledger();
++            ledger.visible_job(self.scope.as_ref(), id)?;
+             let Some(job) = ledger.jobs.get_mut(id) else {
+                 return Err(Error::NotFound { id: *id });
+             };
+@@ -412,6 +612,7 @@ impl Store for MemoryStore {
+                 });
+             }
+             let attempt = job.attempts;
++            let queue = job.queue.clone();
+             job.last_error = Some(reason.to_owned());
+             job.state = if job.attempts < job.max_attempts {
+                 JobState::Queued
+@@ -431,20 +632,45 @@ impl Store for MemoryStore {
+                 Some(reason.to_owned()),
+                 self.clock.now(),
+             ));
++            ledger.count(&queue, |usage| usage.failed += 1);
+             Ok(state)
+         })
+     }
+ 
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+-        Box::pin(async move { Ok(self.ledger().jobs.get(id).cloned()) })
++        Box::pin(async move {
++            let ledger = self.ledger();
++            // A row this handle may not see is a row that is not there: `Ok(None)`, the answer a job
++            // nobody wrote gets, and the engine turns it into `Error::NotFound` for the calls that
++            // owe the caller an answer about one job.
++            if ledger.visible_job(self.scope.as_ref(), id).is_err() {
++                return Ok(None);
++            }
++            Ok(ledger.jobs.get(id).cloned())
++        })
+     }
+ 
+     fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
+-        Box::pin(async move { Ok(self.ledger().record(event)) })
++        Box::pin(async move {
++            let mut ledger = self.ledger();
++            // A trail is about a job, so appending to one this handle may not see is the same
++            // refusal a job that does not exist gives: the alternative is a line in somebody else's
++            // story, written by a caller that has no way to read it back.
++            ledger.visible_job(self.scope.as_ref(), &event.job_id())?;
++            Ok(ledger.record(event))
++        })
+     }
+ 
+     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
+-        Box::pin(async move { Ok(self.ledger().events_of(id)) })
++        Box::pin(async move {
++            let ledger = self.ledger();
++            // An invisible job's trail is empty, which is what a job nobody wrote answers: a
++            // refusal here would say "this job exists and is not yours".
++            if ledger.visible_job(self.scope.as_ref(), id).is_err() {
++                return Ok(Vec::new());
++            }
++            Ok(ledger.events_of(id))
++        })
+     }
+ 
+     fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
+@@ -457,10 +683,17 @@ impl Store for MemoryStore {
+         Box::pin(async move {
+             let until = self.clock.now() + self.lease;
+             let mut ledger = self.ledger();
++            // A scope renews inside its own queues: a worker name is the deployment's to pick, and
++            // two tenants that happened to pick the same one must not be able to keep each other's
++            // claims alive (`jobq/3.13-queue-authz-attribution`).
++            let mine = ledger.visible_queues(self.scope.as_ref());
+             let mut renewed = 0;
+             for job in ledger.jobs.values_mut() {
+                 // The filter is the safety property: a worker renews what it holds, not what
+                 // it remembers holding.
++                if mine.as_ref().is_some_and(|it| !it.contains(&job.queue)) {
++                    continue;
++                }
+                 if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
+                     job.lease_expires_at = Some(until);
+                     renewed += 1;
+@@ -474,13 +707,17 @@ impl Store for MemoryStore {
+         Box::pin(async move {
+             let now = self.clock.now();
+             let mut ledger = self.ledger();
++            let mine = ledger.visible_queues(self.scope.as_ref());
+             let mut handed_back = Vec::new();
+             for (id, job) in ledger.jobs.iter_mut() {
++                if mine.as_ref().is_some_and(|it| !it.contains(&job.queue)) {
++                    continue;
++                }
+                 if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
+-                    handed_back.push((*id, put_back(job, HANDED_BACK)));
++                    handed_back.push((*id, job.queue.clone(), put_back(job, HANDED_BACK)));
+                 }
+             }
+-            for (id, attempt) in &handed_back {
++            for (id, queue, attempt) in &handed_back {
+                 ledger.record(&JobEvent::new(
+                     *id,
+                     EventKind::Reclaimed,
+@@ -488,6 +725,7 @@ impl Store for MemoryStore {
+                     Some(HANDED_BACK.to_owned()),
+                     now,
+                 ));
++                ledger.count(queue, |usage| usage.reclaimed += 1);
+             }
+             Ok(u32::try_from(handed_back.len()).unwrap_or(u32::MAX))
+         })
+@@ -497,18 +735,22 @@ impl Store for MemoryStore {
+         Box::pin(async move {
+             let now = self.clock.now();
+             let mut ledger = self.ledger();
++            let mine = ledger.visible_queues(self.scope.as_ref());
+             let mut expired = Vec::new();
+             for (id, job) in ledger.jobs.iter_mut() {
++                if mine.as_ref().is_some_and(|it| !it.contains(&job.queue)) {
++                    continue;
++                }
+                 // The instant decides, not the owner: the worker that took this row may still be
+                 // alive and merely stuck, and it is the lease — the promise it failed to keep —
+                 // that says the row belongs to somebody else now.
+                 if job.state == JobState::Running
+                     && job.lease_expires_at.is_some_and(|at| at <= now)
+                 {
+-                    expired.push((*id, put_back(job, ABANDONED)));
++                    expired.push((*id, job.queue.clone(), put_back(job, ABANDONED)));
+                 }
+             }
+-            for (id, attempt) in &expired {
++            for (id, queue, attempt) in &expired {
+                 ledger.record(&JobEvent::new(
+                     *id,
+                     EventKind::Reclaimed,
+@@ -516,6 +758,7 @@ impl Store for MemoryStore {
+                     Some(ABANDONED.to_owned()),
+                     now,
+                 ));
++                ledger.count(queue, |usage| usage.reclaimed += 1);
+             }
+             Ok(u32::try_from(expired.len()).unwrap_or(u32::MAX))
+         })
+@@ -531,6 +774,9 @@ impl Store for MemoryStore {
+             // when to look again, not what is in the queue, so the depth of the queue is this
+             // store's problem and not the worker's.
+             let ledger = self.ledger();
++            // The same question `claim` asks, refused the same way: a worker that was told "nothing
++            // is due" for a queue it may not see would poll it for ever without learning why.
++            ledger.permit(self.scope.as_ref(), queue, QueueAction::Claim)?;
+             Ok(ledger
+                 .jobs
+                 .values()
+@@ -539,6 +785,98 @@ impl Store for MemoryStore {
+                 .min())
+         })
+     }
++
++    fn declare_queue<'a>(
++        &'a self,
++        declaration: &'a QueueDeclaration,
++    ) -> BoxFuture<'a, Result<(), Error>> {
++        Box::pin(async move {
++            let mut ledger = self.ledger();
++            let queue = declaration.queue().clone();
++            if let Some(tenant) = self.scope.as_ref() {
++                match ledger.queues.get(&queue).map(|it| it.owner().clone()) {
++                    // A queue nobody declared is a queue this handle is creating, and it can only
++                    // create one for itself.
++                    None => {
++                        if declaration.owner() != tenant {
++                            return Err(forbidden(QueueAction::Administer));
++                        }
++                    }
++                    // A queue that exists needs `Administer`, and it keeps its owner: what a
++                    // tenant changes about somebody's queue is the grants, and handing a queue to
++                    // another tenant is a decision only the operator's door makes. A rule that let
++                    // a delegate name itself as the owner would be a grant of *everything*, which
++                    // is not what `administer` says.
++                    Some(owner) => {
++                        ledger.permit(self.scope.as_ref(), &queue, QueueAction::Administer)?;
++                        if declaration.owner() != &owner {
++                            return Err(forbidden(QueueAction::Administer));
++                        }
++                    }
++                }
++            }
++            // The model and the line that records it are one write, because this store's lock is
++            // its transaction (`jobq/3.6-transaction-isolation`): a change nobody can explain
++            // afterwards is worse than the model it replaced.
++            //
++            // The actor is the handle's tenant, or — on the operator's door, which has no tenant of
++            // its own — whoever the queue is moving away from: the closest thing that door has to a
++            // name, and the one an operator reading "who moved this" can act on.
++            let actor = self
++                .scope
++                .clone()
++                .or_else(|| ledger.queues.get(&queue).map(|it| it.owner().clone()))
++                .unwrap_or_else(|| declaration.owner().clone());
++            let at = self.clock.now();
++            ledger.queues.insert(queue.clone(), declaration.clone());
++            ledger.audit.push(QueueAudit::new(
++                queue,
++                actor,
++                declaration.owner().clone(),
++                at,
++            ));
++            Ok(())
++        })
++    }
++
++    fn scoped(&self, tenant: &Tenant) -> Box<dyn Store> {
++        // The same ledger behind one more handle, so a scoped store and the store it came from see
++        // the same rows: `Arc` rather than a second map, and cheap enough to hand out per tenant.
++        Box::new(Self {
++            ledger: Arc::clone(&self.ledger),
++            lease: self.lease,
++            clock: Arc::clone(&self.clock),
++            policy: self.policy,
++            scope: Some(tenant.clone()),
++        })
++    }
++
++    fn usage<'a>(&'a self) -> BoxFuture<'a, Result<Vec<QueueUsage>, Error>> {
++        Box::pin(async move { Ok(self.ledger().usage_lines(self.scope.as_ref())) })
++    }
++
++    fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>> {
++        Box::pin(async move { Ok(self.ledger().audit_lines(self.scope.as_ref(), limit)) })
++    }
++}
++
++/// The refusal a queue this scope may not see gives, worded like the one a queue nobody declared
++/// gives, because they have to be the same answer.
++fn no_such_queue(queue: &Queue) -> Error {
++    Error::NoQueue {
++        queue: queue.clone(),
++    }
++}
++
++/// The refusal a scope that may see a queue but may not do this with it gives.
++///
++/// The action and nothing else: the queue is one the caller can see, but the same variant answers a
++/// case where it is not, and a message that named the queue would be a message that sometimes
++/// answers a question the caller had no right to ask.
++fn forbidden(action: QueueAction) -> Error {
++    Error::Forbidden {
++        action: action.as_str().to_owned(),
++    }
+ }
+ 
+ /// Put one row back in its queue, and answer which attempt the line it gets will name.
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index a3b0868..556265e 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -23,6 +23,15 @@
+ //! The *settles* append through that same promise inside their own transaction, so the row and the
+ //! line that describes it commit together — which is the subject of that step.
+ //!
++//! `jobq/3.13-queue-authz-attribution` widens it by four more, and they are the operator's half of
++//! `sec/authz-tenant-isolation@design`: a queue has an owner and an access model
++//! ([`Store::declare_queue`]), a *tenant's* view of the store is a handle rather than a parameter
++//! ([`Store::scoped`]), and the numbers an operator acts on come back as values
++//! ([`Store::usage`], [`Store::audit`]). The shape of the first three is one decision: **the
++//! access model is a property of the handle a caller holds, not an argument it passes**, because a
++//! filter that lives in the queries cannot be forgotten by a call site, and a tenant that is a
++//! parameter is a tenant a caller can get wrong.
++//!
+ //! The port is **sealed** (step `jobq/3.2-public-api-baseline`): `Sealed` is a supertrait, so the
+ //! two promises above are made by the crate and by the backends it ships, not by anyone who happens
+ //! to implement these methods. A third-party backend could not keep the second promise — this crate
+@@ -35,10 +44,13 @@ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ 
++use crate::engine::authz::{QueueAudit, QueueDeclaration};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::JobEvent;
+ use crate::engine::sealed::Sealed;
++use crate::engine::tenant::Tenant;
++use crate::engine::usage::QueueUsage;
+ 
+ pub(crate) mod memory;
+ /// The durable backend, which is a feature rather than a fixture: a build that does not ask for it
+@@ -95,7 +107,8 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     ///
+     /// [`Error::Invalid`] when the request could never run (an empty queue, an attempt budget of
+     /// zero, a deduplication key the engine cannot keep, a key with no window);
+-    /// [`Error::Store`] when the backend refused it.
++    /// [`Error::NoQueue`] when this store may not see the queue at all, [`Error::Forbidden`] when
++    /// it may see it and may not submit to it; [`Error::Store`] when the backend refused it.
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>>;
+ 
+     /// Take up to `limit` due jobs for `worker`, mark them running, and lease them to that worker.
+@@ -117,7 +130,9 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Store`] when the backend refused the claim.
++    /// [`Error::NoQueue`] when this store may not see the queue at all, [`Error::Forbidden`] when
++    /// it may see it and may not claim from it; [`Error::Store`] when the backend refused the
++    /// claim.
+     fn claim<'a>(
+         &'a self,
+         worker: &'a WorkerId,
+@@ -287,9 +302,102 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Store`] when the backend refused the read.
++    /// [`Error::NoQueue`] when this store may not see the queue at all,
++    /// [`Error::Forbidden`] when it may see it and may not claim from it — the same refusal
++    /// [`Store::claim`] gives, because a worker told "nothing is due" for a queue it may not claim
++    /// from would poll it for ever without learning why; [`Error::Store`] when the backend refused
++    /// the read.
+     fn next_due<'a>(
+         &'a self,
+         queue: &'a Queue,
+     ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>>;
++
++    /// Declare a queue: whose it is, and what everybody else may do with it.
++    ///
++    /// A queue exists for a tenant the moment a declaration names it — as the owner or in a grant —
++    /// and not before: everything this port says to a tenant about a queue the model does not name
++    /// is what it says about a queue nobody declared (`Error::NoQueue`). That is the whole of the
++    /// refusal semantics of this step, and it is deliberately *structural* rather than a check
++    /// somebody remembers to write: a name that is in the model can see the queue, and a name that
++    /// is not cannot.
++    ///
++    /// An **unscoped** store — the operator's door, the one a migration, a tool or a test builds —
++    /// declares anything for anybody, which is how a deployment seeds its queues and how a queue is
++    /// handed over. A **scoped** store declares a queue for the tenant it acts as, and only that:
++    /// a declaration naming another owner is `Error::Forbidden`, because handing a queue to somebody
++    /// else is an operator's decision rather than a tenant's. A queue that is already declared may
++    /// be re-declared by a tenant that may `Administer` it, which is how grants change and how an
++    /// administrator is delegated.
++    ///
++    /// The declaration and its line in the audit trail are **one commit**. That is the argument of
++    /// `jobq/3.6-transaction-isolation` applied to the access model: a change that cannot be
++    /// recorded is a change this port does not make, because a model nobody can explain afterwards
++    /// is worse than the model it replaced.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::NoQueue`] when this store may not see the queue, [`Error::Forbidden`] when it may
++    /// see it and may not administer it (or when a scoped store declares an owner that is not its
++    /// own tenant), [`Error::Store`] when the backend refused the write.
++    fn declare_queue<'a>(
++        &'a self,
++        declaration: &'a QueueDeclaration,
++    ) -> BoxFuture<'a, Result<(), Error>>;
++
++    /// A handle on this store that acts as `tenant`.
++    ///
++    /// Every read and every write this handle makes is that tenant's: the jobs it can see, the
++    /// queues it may submit to, claim from and administer, the counters it may read and the trail
++    /// of its own queues. What it answers about anybody else's is what it answers about a queue or
++    /// a job nobody ever wrote — `Error::NoQueue` for a queue, `Ok(None)` for a job — and that is a
++    /// promise about *this* method rather than about a caller's discipline.
++    ///
++    /// The handle owns what it needs (a pool handle, a lock's `Arc`) rather than borrowing the store
++    /// it came from, so it can outlive the call that built it and travel into a worker of its own.
++    /// That is also the answer to "where does a deployment put the tenant": one process, one handle
++    /// per tenant, and no path in the engine that takes an identity from a request.
++    ///
++    /// Calling this on a handle that is already scoped answers a handle scoped to the new tenant:
++    /// the scope is the last word, not a stack of them.
++    fn scoped(&self, tenant: &Tenant) -> Box<dyn Store>;
++
++    /// What the queues this store can see have done, in queue order.
++    ///
++    /// The number an operator acts on, read through the engine rather than reconstructed from logs:
++    /// `submitted`, `claimed` and the three ways an attempt ends, per queue (`jobq/3.13-queue-authz-attribution`).
++    /// [`crate::engine::Usage::running`] is the one an operator reaches for first — the attempts
++    /// holding a worker right now — and it is derived from the other five rather than counted,
++    /// so two readings of one queue cannot disagree about it.
++    ///
++    /// What is *seen* differs by handle, and that is the whole of the difference: a scoped store
++    /// answers for the queues **it owns**, with a line of zeros for one that has been declared and
++    /// has seen no traffic (so a queue an operator just created is visible before it is used); an
++    /// unscoped store answers for every queue it could be asked about, which is every declared
++    /// queue plus every queue that merely has traffic. A queue nobody declared still accumulates
++    /// numbers — the counters are facts about traffic, and tracing only declared queues would hide
++    /// the one case an operator is looking for.
++    ///
++    /// The order is a promise, like [`Store::events`]: ascending queue name, so that two backends
++    /// answer a report the same way and a diff of two readings is a diff of the numbers.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    fn usage<'a>(&'a self) -> BoxFuture<'a, Result<Vec<QueueUsage>, Error>>;
++
++    /// The privileged decisions about the queues this store can see, newest first.
++    ///
++    /// One line per accepted change to a queue's access model: who made it, whose the queue became,
++    /// and when. A *refused* change leaves nothing, because nothing changed — the difference from
++    /// the request-level trail of `relay/2.16-authz-audit`, and why: there, a refused request is a
++    /// request that happened; here, the unit is a change to the model, and a change that did not
++    /// happen is not a decision about a queue.
++    ///
++    /// Newest first, with `limit` bounding the answer: the question this table exists for is "who
++    /// moved this, and when", and the answer an operator wants is the end of the story.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>>;
+ }
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 4a92e2f..2457bd2 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -29,6 +29,14 @@
+ //! refuse it, so the loser of a race is told "again" instead of being left to act on a value that
+ //! was true a moment ago.
+ //!
++//! `jobq/3.13-queue-authz-attribution` adds the scope, and with it the rule this backend keeps in
++//! SQL rather than in Rust: `migrations/0005_queues_and_usage.sql` writes the access model as a
++//! **view** (`queue_permissions`: an owner may do everything, a grant may do what it names, and a
++//! wider grant covers a narrower one), so that every statement that has to ask "may this tenant
++//! touch this row" asks the same one thing with a name. A scoped store carries the tenant it acts
++//! as, and the predicates below are written as `$n::text is null or …`: `null` is the operator's
++//! door, and a bound parameter is what keeps this backend one implementation rather than two.
++//!
+ //! The schema this file talks to is `migrations/0001_jobs.sql` and `migrations/0002_job_events.sql`,
+ //! and the port's methods are the only place the column names appear: no other file in the crate
+ //! knows that jobs live in a table.
+@@ -41,6 +49,7 @@ use sqlx::postgres::{PgConnection, PgPoolOptions};
+ use sqlx::{PgPool, Postgres, Transaction};
+ use uuid::Uuid;
+ 
++use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+@@ -48,6 +57,8 @@ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
++use crate::engine::tenant::Tenant;
++use crate::engine::usage::{QueueUsage, Usage};
+ 
+ // Why the statements below are written out rather than assembled, and why they look the way they
+ // do: `sqlx` 0.9 takes a `&'static str` and nothing else (`SqlSafeStr`), so a query built with
+@@ -72,6 +83,9 @@ pub struct PostgresStore {
+     clock: Arc<dyn Clock>,
+     /// How due jobs are ordered and how much of one queue may run at once.
+     policy: Policy,
++    /// The tenant this handle acts as, or `None` for the operator's door
++    /// (`jobq/3.13-queue-authz-attribution`).
++    scope: Option<Tenant>,
+ }
+ 
+ impl PostgresStore {
+@@ -92,6 +106,7 @@ impl PostgresStore {
+             lease: DEFAULT_LEASE,
+             clock: Arc::new(SystemClock),
+             policy: Policy::strict(),
++            scope: None,
+         })
+     }
+ 
+@@ -130,6 +145,88 @@ impl PostgresStore {
+         self
+     }
+ 
++    /// The tenant this handle acts as, as the string a statement binds (`None` is the operator's).
++    fn scope(&self) -> Option<&str> {
++        self.scope.as_ref().map(Tenant::as_str)
++    }
++
++    /// The refusal a scoped handle gets for `queue` and `action`, or `None` when it may do it.
++    ///
++    /// One helper for the doors that take a *queue* (`enqueue`, `claim`, `next_due`,
++    /// `declare_queue`), and it answers two questions in the order the refusal is built from: a
++    /// queue this scope cannot see is answered like a queue nobody declared, and only a queue it
++    /// can see is answered with what it may not do. Both are questions about the model, and the
++    /// model is the view (`migrations/0005_queues_and_usage.sql`), so this is the SQL half of what
++    /// `QueueDeclaration::allows` is to the in-memory backend.
++    ///
++    /// The rows *behind* the queue are filtered inside the statements that touch them, which is the
++    /// other half and not this one's business: a job is refused by the query that would have found
++    /// it, so that the answer for somebody else's job is the answer for a job nobody wrote.
++    async fn refuse(
++        &self,
++        connection: &mut PgConnection,
++        queue: &Queue,
++        action: QueueAction,
++    ) -> Result<Option<Error>, Error> {
++        let Some(tenant) = self.scope() else {
++            return Ok(None);
++        };
++        let allowed: Option<(i32,)> = sqlx::query_as(
++            "select 1 from queue_permissions \
++             where queue = $1 and tenant = $2 and action in ($3, 'administer')",
++        )
++        .bind(queue.as_str())
++        .bind(tenant)
++        .bind(action.as_str())
++        .fetch_optional(&mut *connection)
++        .await
++        .map_err(refused)?;
++        if allowed.is_some() {
++            return Ok(None);
++        }
++        let visible: Option<(i32,)> =
++            sqlx::query_as("select 1 from queue_permissions where queue = $1 and tenant = $2")
++                .bind(queue.as_str())
++                .bind(tenant)
++                .fetch_optional(&mut *connection)
++                .await
++                .map_err(refused)?;
++        Ok(Some(if visible.is_some() {
++            forbidden(action)
++        } else {
++            no_such_queue(queue)
++        }))
++    }
++
++    /// The privileged access changes this store has recorded, newest first.
++    async fn audit_lines(&self, limit: usize) -> Result<Vec<QueueAudit>, Error> {
++        // The order is a promise, so it is written here rather than left to the table: `at`
++        // descending, and a queue name to settle the ties the way the in-memory backend settles
++        // them — two declarations made at the same instant come back the same way from both.
++        let rows: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
++            "select queue, actor, owner, at from queue_audit \
++             where $2::text is null \
++                or queue in (select queue from queue_permissions where tenant = $2) \
++             order by at desc, queue asc \
++             limit $1",
++        )
++        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
++        .bind(self.scope())
++        .fetch_all(&self.pool)
++        .await
++        .map_err(refused)?;
++        rows.into_iter()
++            .map(|(queue, actor, owner, at)| {
++                Ok(QueueAudit::new(
++                    Queue::parse(&queue)?,
++                    Tenant::parse(&actor)?,
++                    Tenant::parse(&owner)?,
++                    at,
++                ))
++            })
++            .collect()
++    }
++
+     /// Write one job row that no deduplication key is involved in, and hand it back.
+     ///
+     /// Split out of [`Store::enqueue`] so that the statement a keyed request runs is the only thing
+@@ -142,12 +239,23 @@ impl PostgresStore {
+         payload: String,
+         run_at: DateTime<Utc>,
+     ) -> Result<Job, Error> {
++        // The row and the counter are one statement, and the counter is a second `with` clause
++        // rather than a second call: a job that is not there cannot be counted, and one that is
++        // cannot be missing from the count (`jobq/3.6-transaction-isolation`'s argument, one table
++        // over).
+         let row: JobRow = sqlx::query_as(
+-            "insert into jobs \
++            "with written as ( \
++                 insert into jobs \
+                      (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
+                  values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
+                  returning id, queue, payload::text as payload, state, priority, run_at, \
+-                           attempts, max_attempts, last_error, lease_owner, lease_expires_at",
++                           attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++             ), counted as ( \
++                 insert into queue_usage (queue, submitted) values ($2, 1) \
++                 on conflict (queue) do update set submitted = queue_usage.submitted + 1 \
++             ) \
++             select id, queue, payload, state, priority, run_at, attempts, max_attempts, \
++                    last_error, lease_owner, lease_expires_at from written",
+         )
+         .bind(id.as_uuid())
+         .bind(request.queue.as_str())
+@@ -192,6 +300,16 @@ impl Store for PostgresStore {
+                 });
+             }
+             let dedup = request.dedup()?;
++            // Who may write here, before anything is decided: a queue this handle may not see is
++            // answered like a queue nobody declared, and a refused request never reaches the
++            // counters.
++            let mut connection = self.pool.acquire().await.map_err(refused)?;
++            if let Some(refusal) = self
++                .refuse(&mut connection, &request.queue, QueueAction::Submit)
++                .await?
++            {
++                return Err(refusal);
++            }
+             let payload = serde_json::to_string(&request.payload)
+                 .map_err(|error| unreadable("payload", error.to_string()))?;
+             // The identity is the engine's, not the database's: a row whose key was invented by
+@@ -239,6 +357,10 @@ impl Store for PostgresStore {
+                      where exists (select 1 from taken) \
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+                                attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                 ), counted as ( \
++                     insert into queue_usage (queue, submitted) \
++                     select $1, (select count(*) from taken) \
++                     on conflict (queue) do update set submitted = queue_usage.submitted + excluded.submitted \
+                  ) \
+                  select id, queue, payload, state, priority, run_at, attempts, max_attempts, \
+                         last_error, lease_owner, lease_expires_at from fresh \
+@@ -278,6 +400,13 @@ impl Store for PostgresStore {
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+             let now = self.clock.now();
++            let mut connection = self.pool.acquire().await.map_err(refused)?;
++            if let Some(refusal) = self
++                .refuse(&mut connection, queue, QueueAction::Claim)
++                .await?
++            {
++                return Err(refusal);
++            }
+             // One statement, and the shape of it is the whole promise: the rows are chosen with
+             // `for update skip locked` *inside* the update that stamps them, so a second claim
+             // running at the same time either waits for nothing (the row is already taken and it
+@@ -305,6 +434,13 @@ impl Store for PostgresStore {
+                                select count(*) from jobs running \
+                                where running.queue = $1 and running.state = 'running' \
+                            ) < $6) \
++                           and ($8 = 0 or ( \
++                               select count(*) from jobs holding \
++                               where holding.state = 'running' and holding.queue in ( \
++                                   select owner_of.queue from queues owner_of \
++                                   where owner_of.owner = (select owner from queues where queue = $1) \
++                               ) \
++                           ) < $8) \
+                          order by priority + case when $7 > 0 \
+                                       then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
+                                       else 0 end desc, \
+@@ -314,6 +450,10 @@ impl Store for PostgresStore {
+                      ) \
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+                                attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                 ), counted as ( \
++                     insert into queue_usage (queue, claimed) \
++                     select $1, (select count(*) from taken) \
++                     on conflict (queue) do update set claimed = queue_usage.claimed + excluded.claimed \
+                  ) \
+                  select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+                         max_attempts, last_error, lease_owner, lease_expires_at \
+@@ -344,7 +484,17 @@ impl Store for PostgresStore {
+                     .aging_after()
+                     .map_or(0, |interval| i64::try_from(interval.as_secs()).unwrap_or(i64::MAX)),
+             )
+-            .fetch_all(&self.pool)
++            // The per-tenant cap: the same cap as `$6` counted one level up, over the queues of
++            // the tenant that *owns* the queue being claimed — because the pool a tenant holds is
++            // the work its queues are running, whoever runs it, which is the number the counters of
++            // `jobq/3.13-queue-authz-attribution` publish. It is a knob on the policy of
++            // `jobq/3.9-priority-fairness` rather than a second policy, and a queue nobody declared
++            // has no owner and therefore no cap.
++            .bind(
++                i64::try_from(self.policy.max_in_flight_per_tenant().unwrap_or(0))
++                    .unwrap_or(i64::MAX),
++            )
++            .fetch_all(&mut *connection)
+             .await
+             .map_err(refused)?;
+             rows.into_iter().map(JobRow::into_job).collect()
+@@ -373,9 +523,16 @@ impl Store for PostgresStore {
+             let row: Option<JobRow> = sqlx::query_as(
+                 "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+                         max_attempts, last_error, lease_owner, lease_expires_at \
+-                 from jobs where id = $1",
++                 from jobs where id = $1 \
++                   and ($2::text is null or jobs.queue in ( \
++                       select queue from queue_permissions where tenant = $2))",
+             )
+             .bind(id.as_uuid())
++            // The scope is a parameter of the *query* rather than a check in Rust: a row this
++            // handle may not see is a row that is not there, and the promise has to hold for every
++            // statement rather than for the ones somebody remembered
++            // (`jobq/3.13-queue-authz-attribution`).
++            .bind(self.scope())
+             .fetch_optional(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -392,6 +549,24 @@ impl Store for PostgresStore {
+             // wins when two callers append the same line at the same instant, and `do nothing` is
+             // what makes the loser's write a no-op rather than an error it would have to translate.
+             let mut connection = self.pool.acquire().await.map_err(refused)?;
++            // A trail is about a job, so appending to one this handle may not see is the same
++            // refusal a job that does not exist gives — asked *before* the insert, because `false`
++            // already means something here ("that line was already there") and a refusal folded
++            // into it would be a refusal a caller could not tell from a no-op.
++            let visible: Option<(i32,)> = sqlx::query_as(
++                "select 1 from jobs \
++                 where id = $1 \
++                   and ($2::text is null or jobs.queue in ( \
++                       select queue from queue_permissions where tenant = $2))",
++            )
++            .bind(event.job_id().as_uuid())
++            .bind(self.scope())
++            .fetch_optional(&mut *connection)
++            .await
++            .map_err(refused)?;
++            if visible.is_none() {
++                return Err(Error::NotFound { id: event.job_id() });
++            }
+             append(&mut connection, event).await
+         })
+     }
+@@ -402,12 +577,18 @@ impl Store for PostgresStore {
+             // still holds the row (and the instant moves) or it does not (and nothing happens).
+             let renewed = sqlx::query(
+                 "update jobs set lease_expires_at = $2 \
+-                 where lease_owner = $1 and state = 'running'",
++                 where lease_owner = $1 and state = 'running' \
++                   and ($3::text is null or jobs.queue in ( \
++                       select queue from queue_permissions where tenant = $3))",
+             )
+             .bind(worker.as_str())
+             // The engine's clock again, bound in: a renewal measured against the database's clock
+             // would be a second authority on how long a lease is.
+             .bind(self.clock.now() + self.lease)
++            // A worker name is the deployment's to pick, and two tenants that picked the same one
++            // must not be able to keep each other's claims alive
++            // (`jobq/3.13-queue-authz-attribution`).
++            .bind(self.scope())
+             .execute(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -427,6 +608,10 @@ impl Store for PostgresStore {
+                 .bind(HANDED_BACK)
+                 .bind(EventKind::Reclaimed.as_str())
+                 .bind(self.clock.now())
++                // A scope hands back the work it holds in its own queues: handing back somebody
++                // else's claim puts an attempt that is running right now back in a queue its owner
++                // is draining (`jobq/3.13-queue-authz-attribution`).
++                .bind(self.scope())
+                 .execute(&self.pool)
+                 .await
+                 .map_err(refused)?;
+@@ -441,6 +626,7 @@ impl Store for PostgresStore {
+                 .bind(RECLAIM_BATCH)
+                 .bind(ABANDONED)
+                 .bind(EventKind::Reclaimed.as_str())
++                .bind(self.scope())
+                 .execute(&self.pool)
+                 .await
+                 .map_err(refused)?;
+@@ -454,10 +640,18 @@ impl Store for PostgresStore {
+             // order the table hands rows back in: `at` first, then the two columns that settle a
+             // tie the same way the in-memory backend settles it.
+             let rows: Vec<EventRow> = sqlx::query_as(
+-                "select id, job_id, kind, attempt, detail, at from job_events where job_id = $1 \
++                "select id, job_id, kind, attempt, detail, at from job_events \
++                 where job_id = $1 \
++                   and ($2::text is null or exists ( \
++                       select 1 from jobs \
++                       where jobs.id = job_events.job_id \
++                         and jobs.queue in ( \
++                             select queue from queue_permissions where tenant = $2))) \
+                  order by at asc, kind asc, attempt asc",
+             )
+             .bind(id.as_uuid())
++            // An invisible job's trail is empty, which is what a job nobody wrote answers.
++            .bind(self.scope())
+             .fetch_all(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -470,6 +664,15 @@ impl Store for PostgresStore {
+         queue: &'a Queue,
+     ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>> {
+         Box::pin(async move {
++            let mut connection = self.pool.acquire().await.map_err(refused)?;
++            // The same question `claim` asks, refused the same way: a worker told "nothing is due"
++            // for a queue it may not see would poll it for ever without learning why.
++            if let Some(refusal) = self
++                .refuse(&mut connection, queue, QueueAction::Claim)
++                .await?
++            {
++                return Err(refusal);
++            }
+             // `min(run_at)` over the queue's queued rows: `jobs_claimable` is the partial index on
+             // exactly that predicate (`migrations/0001_jobs.sql`), so this is the same index step the
+             // claim's row selection takes, whatever the depth of the queue behind it. The instant is
+@@ -480,12 +683,197 @@ impl Store for PostgresStore {
+                 "select min(run_at) from jobs where queue = $1 and state = 'queued'",
+             )
+             .bind(queue.as_str())
+-            .fetch_one(&self.pool)
++            .fetch_one(&mut *connection)
+             .await
+             .map_err(refused)?;
+             Ok(asked.0)
+         })
+     }
++
++    fn declare_queue<'a>(
++        &'a self,
++        declaration: &'a QueueDeclaration,
++    ) -> BoxFuture<'a, Result<(), Error>> {
++        Box::pin(async move {
++            // One transaction, and the reason is the audit line rather than the seven columns it
++            // writes: the model and the record of how it got there are one commit, so a change this
++            // backend could not record is a change it does not make
++            // (`jobq/3.13-queue-authz-attribution`).
++            let mut transaction = self.pool.begin().await.map_err(refused)?;
++            let queue = declaration.queue().clone();
++            if let Some(tenant) = self.scope.as_ref() {
++                let current: Option<(String,)> =
++                    sqlx::query_as("select owner from queues where queue = $1")
++                        .bind(queue.as_str())
++                        .fetch_optional(&mut *transaction)
++                        .await
++                        .map_err(refused)?;
++                match current {
++                    // A queue nobody declared is a queue this handle is creating, and it can only
++                    // create one for itself.
++                    None => {
++                        if declaration.owner() != tenant {
++                            return Err(forbidden(QueueAction::Administer));
++                        }
++                    }
++                    // A queue that exists needs `Administer`, and it keeps its owner: what a
++                    // tenant changes about somebody's queue is the grants, and handing a queue to
++                    // another tenant is a decision only the operator's door makes. A rule that let
++                    // a delegate name itself as the owner would be a grant of *everything*, which
++                    // is not what `administer` says.
++                    Some((owner,)) => {
++                        if let Some(refusal) = self
++                            .refuse(&mut transaction, &queue, QueueAction::Administer)
++                            .await?
++                        {
++                            return Err(refusal);
++                        }
++                        if declaration.owner().as_str() != owner {
++                            return Err(forbidden(QueueAction::Administer));
++                        }
++                    }
++                }
++            }
++            // The model is two tables and the declaration is the whole of it: the owner, then the
++            // grants. Deleting the queue's grants first is what makes a re-declaration a *model*
++            // rather than an addition — a grant nobody asked for again is a grant that is gone.
++            sqlx::query(
++                "insert into queues (queue, owner) values ($1, $2) \
++                 on conflict (queue) do update set owner = excluded.owner",
++            )
++            .bind(queue.as_str())
++            .bind(declaration.owner().as_str())
++            .execute(&mut *transaction)
++            .await
++            .map_err(refused)?;
++            sqlx::query("delete from queue_grants where queue = $1")
++                .bind(queue.as_str())
++                .execute(&mut *transaction)
++                .await
++                .map_err(refused)?;
++            for grant in declaration.grants() {
++                sqlx::query(
++                    "insert into queue_grants (queue, tenant, action) values ($1, $2, $3) \
++                     on conflict (queue, tenant, action) do nothing",
++                )
++                .bind(queue.as_str())
++                .bind(grant.tenant().as_str())
++                .bind(grant.action().as_str())
++                .execute(&mut *transaction)
++                .await
++                .map_err(refused)?;
++            }
++            // The actor is the handle's tenant, or — on the operator's door, which has no tenant of
++            // its own — whoever the queue is moving away from: the closest thing that door has to a
++            // name, and the one an operator reading "who moved this" can act on. Read inside the
++            // transaction, so it is the owner the change is being made *to*, not one that has
++            // moved since.
++            let previous: Option<(String,)> =
++                sqlx::query_as("select owner from queues where queue = $1")
++                    .bind(queue.as_str())
++                    .fetch_optional(&mut *transaction)
++                    .await
++                    .map_err(refused)?;
++            let actor = self
++                .scope
++                .clone()
++                .or_else(|| previous.and_then(|(owner,)| Tenant::parse(&owner).ok()))
++                .unwrap_or_else(|| declaration.owner().clone());
++            sqlx::query(
++                "insert into queue_audit (id, queue, actor, owner, at) values ($1, $2, $3, $4, $5)",
++            )
++            .bind(Uuid::new_v4())
++            .bind(queue.as_str())
++            .bind(actor.as_str())
++            .bind(declaration.owner().as_str())
++            .bind(self.clock.now())
++            .execute(&mut *transaction)
++            .await
++            .map_err(refused)?;
++            transaction.commit().await.map_err(refused)
++        })
++    }
++
++    fn scoped(&self, tenant: &Tenant) -> Box<dyn Store> {
++        // The pool is a handle, so a scoped store is one more handle on the same database: the
++        // scope is the only thing that differs, and that is what makes the filter impossible to
++        // forget rather than a discipline a caller keeps.
++        Box::new(Self {
++            pool: self.pool.clone(),
++            lease: self.lease,
++            clock: Arc::clone(&self.clock),
++            policy: self.policy,
++            scope: Some(tenant.clone()),
++        })
++    }
++
++    fn usage<'a>(&'a self) -> BoxFuture<'a, Result<Vec<QueueUsage>, Error>> {
++        Box::pin(async move {
++            // Two sets unioned, and the same two the in-memory backend unions: the queues that have
++            // traffic and the queues that have been declared (the second with zeros, so that a queue
++            // an operator just created is visible before anybody used it).
++            //
++            // What the scope does to the answer is one predicate: a scoped store answers for the
++            // queues the tenant *owns* — including the ones it owns and has never used, and
++            // excluding the ones it may merely submit to. A queue nobody declared has numbers and no
++            // owner, so it appears in the operator's report and in nobody's.
++            let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
++                "with lines as ( \
++                     select queue, submitted, claimed, succeeded, failed, reclaimed from queue_usage \
++                     union all \
++                     select queue, 0, 0, 0, 0, 0 from queues \
++                     where queue not in (select queue from queue_usage) \
++                 ) \
++                 select queue, submitted, claimed, succeeded, failed, reclaimed from lines \
++                 where $1::text is null or queue in (select queue from queues where owner = $1) \
++                 order by queue asc",
++            )
++            .bind(self.scope())
++            .fetch_all(&self.pool)
++            .await
++            .map_err(refused)?;
++            rows.into_iter()
++                .map(
++                    |(queue, submitted, claimed, succeeded, failed, reclaimed)| {
++                        Ok(QueueUsage::new(
++                            Queue::parse(&queue)?,
++                            Usage {
++                                submitted: total(submitted, "submitted")?,
++                                claimed: total(claimed, "claimed")?,
++                                succeeded: total(succeeded, "succeeded")?,
++                                failed: total(failed, "failed")?,
++                                reclaimed: total(reclaimed, "reclaimed")?,
++                            },
++                        ))
++                    },
++                )
++                .collect()
++        })
++    }
++
++    fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>> {
++        Box::pin(async move { self.audit_lines(limit).await })
++    }
++}
++
++/// The refusal a queue this scope may not see gives, worded exactly like the one a queue nobody
++/// declared gives.
++///
++/// The same two functions the in-memory backend has, written twice on purpose: the *phrasing* of a
++/// refusal is this crate's, and a store that composed its own would be a store whose answers a
++/// caller could tell apart from the other backend's — which is the one thing a refusal must not
++/// make possible.
++fn no_such_queue(queue: &Queue) -> Error {
++    Error::NoQueue {
++        queue: queue.clone(),
++    }
++}
++
++/// The refusal a scope that may see a queue but may not do this with it gives.
++fn forbidden(action: QueueAction) -> Error {
++    Error::Forbidden {
++        action: action.as_str().to_owned(),
++    }
+ }
+ 
+ /// How many rows one run of the reclaimer may take back.
+@@ -510,6 +898,8 @@ const RECLAIM_BATCH: i64 = 128;
+ const GIVE_BACK: &str = "with held as ( \
+         select id, attempts, max_attempts from jobs \
+         where state = 'running' and lease_owner = $1 \
++          and ($5::text is null or jobs.queue in ( \
++              select queue from queue_permissions where tenant = $5)) \
+         for update \
+     ), put_back as ( \
+         update jobs set \
+@@ -519,7 +909,11 @@ const GIVE_BACK: &str = "with held as ( \
+             lease_expires_at = null \
+         from held \
+         where jobs.id = held.id \
+-        returning jobs.id as id, jobs.attempts as attempt \
++        returning jobs.id as id, jobs.attempts as attempt, jobs.queue as queue \
++    ), counted as ( \
++        insert into queue_usage (queue, reclaimed) \
++        select queue, count(*) from put_back group by queue \
++        on conflict (queue) do update set reclaimed = queue_usage.reclaimed + excluded.reclaimed \
+     ) \
+     insert into job_events (id, job_id, kind, attempt, detail, at) \
+     select gen_random_uuid(), id, $3, attempt, $2, $4 from put_back \
+@@ -536,6 +930,8 @@ const GIVE_BACK: &str = "with held as ( \
+ const RECLAIM: &str = "with expired as ( \
+         select id, attempts, max_attempts from jobs \
+         where state = 'running' and lease_expires_at <= $1 \
++          and ($5::text is null or jobs.queue in ( \
++              select queue from queue_permissions where tenant = $5)) \
+         order by lease_expires_at asc, id asc \
+         limit $2 \
+         for update skip locked \
+@@ -547,7 +943,11 @@ const RECLAIM: &str = "with expired as ( \
+             lease_expires_at = null \
+         from expired \
+         where jobs.id = expired.id \
+-        returning jobs.id as id, jobs.attempts as attempt \
++        returning jobs.id as id, jobs.attempts as attempt, jobs.queue as queue \
++    ), counted as ( \
++        insert into queue_usage (queue, reclaimed) \
++        select queue, count(*) from put_back group by queue \
++        on conflict (queue) do update set reclaimed = queue_usage.reclaimed + excluded.reclaimed \
+     ) \
+     insert into job_events (id, job_id, kind, attempt, detail, at) \
+     select gen_random_uuid(), id, $4, attempt, $3, $1 from put_back \
+@@ -577,7 +977,9 @@ const SETTLE: &str = "begin isolation level repeatable read";
+ const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null, \
+                                lease_owner = null, lease_expires_at = null \
+                        where id = $1 and state = 'running' and lease_owner = $2 \
+-                       returning state, attempts";
++                         and ($3::text is null or jobs.queue in ( \
++                             select queue from queue_permissions where tenant = $3)) \
++                       returning state, attempts, queue";
+ 
+ /// The statement that records a failure: the row's own budget decides where the job goes, in the
+ /// same statement that writes the reason down — and the same lease guard.
+@@ -585,7 +987,9 @@ const FAIL: &str = "update jobs set last_error = $3, \
+                            state = case when attempts < max_attempts then 'queued' else 'failed' end, \
+                            lease_owner = null, lease_expires_at = null \
+                     where id = $1 and state = 'running' and lease_owner = $2 \
+-                    returning state, attempts";
++                      and ($4::text is null or jobs.queue in ( \
++                          select queue from queue_permissions where tenant = $4)) \
++                    returning state, attempts, queue";
+ 
+ /// What a settle does to the row it touches.
+ ///
+@@ -613,15 +1017,18 @@ impl Change<'_> {
+         transaction: &mut Transaction<'_, Postgres>,
+         worker: &WorkerId,
+         id: &JobId,
+-    ) -> Result<Option<(String, i64)>, Error> {
++        scope: Option<&str>,
++    ) -> Result<Option<(String, i64, String)>, Error> {
+         let row = match self {
+             Change::Completed => sqlx::query_as(COMPLETE)
+                 .bind(id.as_uuid())
+-                .bind(worker.as_str()),
++                .bind(worker.as_str())
++                .bind(scope),
+             Change::Failed { reason } => sqlx::query_as(FAIL)
+                 .bind(id.as_uuid())
+                 .bind(worker.as_str())
+-                .bind(*reason),
++                .bind(*reason)
++                .bind(scope),
+         }
+         .fetch_optional(&mut **transaction)
+         .await
+@@ -637,6 +1044,11 @@ impl Change<'_> {
+         }
+     }
+ 
++    /// Whether this change counts as a success for the queue's numbers.
++    fn counts_success(&self) -> bool {
++        matches!(self, Change::Completed)
++    }
++
+     /// What the line says, when there is something to say.
+     fn detail(&self) -> Option<String> {
+         match self {
+@@ -679,12 +1091,15 @@ impl PostgresStore {
+         change: Change<'_>,
+     ) -> Result<JobState, Error> {
+         let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
+-        let Some((state, attempts)) = change.apply(&mut transaction, worker, id).await? else {
++        let scope = self.scope();
++        let Some((state, attempts, queue)) =
++            change.apply(&mut transaction, worker, id, scope).await?
++        else {
+             // Nothing moved, and there are three different reasons for that — which is why the
+             // refusal is a second question, asked through the transaction that just wrote, rather
+             // than a message invented here. The third one is the step: the row is running, and it
+             // is somebody else's.
+-            let refusal = match state_and_holder(&mut transaction, id).await? {
++            let refusal = match state_and_holder(&mut transaction, id, scope).await? {
+                 None => Error::NotFound { id: *id },
+                 Some((state, Some(owner))) if owner != worker.as_str() => Error::Invalid {
+                     detail: format!(
+@@ -715,7 +1130,29 @@ impl PostgresStore {
+             ),
+         )
+         .await?;
+-        // One commit for the row and the line: a reader sees both or neither.
++        // The counter goes in the same transaction as the row and the line, and the count is
++        // written as an upsert for the reason the row's own is: a queue that was enqueued to before
++        // this step existed has no counter row yet, and a settle is not the place to discover that.
++        // A refused settle returned before this line, so nothing that did not happen is counted.
++        let counted = if change.counts_success() {
++            "succeeded"
++        } else {
++            "failed"
++        };
++        sqlx::query(
++            "insert into queue_usage (queue, succeeded, failed) \
++             values ($1, case when $2 = 'succeeded' then 1 else 0 end, \
++                        case when $2 = 'failed' then 1 else 0 end) \
++             on conflict (queue) do update set \
++                 succeeded = queue_usage.succeeded + case when $2 = 'succeeded' then 1 else 0 end, \
++                 failed = queue_usage.failed + case when $2 = 'failed' then 1 else 0 end",
++        )
++        .bind(&queue)
++        .bind(counted)
++        .execute(&mut *transaction)
++        .await
++        .map_err(refused)?;
++        // One commit for the row, the line and the counter: a reader sees all three or none.
+         transaction.commit().await.map_err(refused)?;
+         decode_state(&state)
+     }
+@@ -760,13 +1197,22 @@ async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool,
+ async fn state_and_holder(
+     connection: &mut PgConnection,
+     id: &JobId,
++    scope: Option<&str>,
+ ) -> Result<Option<(String, Option<String>)>, Error> {
+-    let row: Option<(String, Option<String>)> =
+-        sqlx::query_as("select state, lease_owner from jobs where id = $1")
+-            .bind(id.as_uuid())
+-            .fetch_optional(connection)
+-            .await
+-            .map_err(refused)?;
++    // The predicate is why this is a question about a *job* and not about an access model: a row
++    // this scope may not see reads as no row at all, so the settle it just refused is answered with
++    // what a job nobody wrote is answered with (`jobq/3.13-queue-authz-attribution`).
++    let row: Option<(String, Option<String>)> = sqlx::query_as(
++        "select state, lease_owner from jobs \
++         where id = $1 \
++           and ($2::text is null or jobs.queue in ( \
++               select queue from queue_permissions where tenant = $2))",
++    )
++    .bind(id.as_uuid())
++    .bind(scope)
++    .fetch_optional(connection)
++    .await
++    .map_err(refused)?;
+     Ok(row)
+ }
+ 
+@@ -909,6 +1355,15 @@ fn count(value: i64, column: &'static str) -> Result<u32, Error> {
+     u32::try_from(value).map_err(|_| unreadable(column, format!("{value} is not a count")))
+ }
+ 
++/// The same reconciliation for a `bigint` column the engine counts without a bound.
++///
++/// The counters of `jobq/3.13-queue-authz-attribution` are totals rather than attempts, so they are
++/// `u64` in the engine and `bigint` in the table: a total that arrived negative is a row this
++/// backend wrote and cannot read back, which is reported rather than converted.
++fn total(value: i64, column: &'static str) -> Result<u64, Error> {
++    u64::try_from(value).map_err(|_| unreadable(column, format!("{value} is not a total")))
++}
++
+ /// A driver failure, as the port wants it: whole, for the caller that wants the detail.
+ ///
+ /// One class is split off, and the split is the subject of `jobq/3.6-transaction-isolation`: a
+diff --git a/src/engine/tenant.rs b/src/engine/tenant.rs
+index ecd4a70..699d4b4 100644
+--- a/src/engine/tenant.rs
++++ b/src/engine/tenant.rs
+@@ -21,7 +21,7 @@
+ use std::fmt;
+ use std::str::FromStr;
+ 
+-use crate::engine::domain::QUEUE_NAME_MAX;
++use crate::engine::domain::{QUEUE_NAME_MAX, check_name};
+ use crate::engine::error::Error;
+ 
+ /// Longest tenant name the engine accepts, in bytes.
+@@ -42,17 +42,16 @@ impl Tenant {
+     /// [`Error::Invalid`] when the name is empty, longer than [`TENANT_NAME_MAX`] bytes, or
+     /// contains anything but lower-case ASCII letters, digits, `.`, `_` and `-`.
+     pub fn parse(name: &str) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.13-queue-authz-attribution: a tenant name the engine can write down — the \
+-             alphabet and the bound are the ones a queue name uses, and the reason is in this \
+-             module's documentation"
+-        )
++        // The same rule a queue name is held to, asked with this kind of name: a tenant is a column
++        // and a label too, and `check_name` is where that sentence is written once.
++        check_name("tenant", name, TENANT_NAME_MAX)?;
++        Ok(Self(name.to_owned()))
+     }
+ 
+     /// The name, as it is written in a table and printed in a report.
+     #[must_use]
+     pub fn as_str(&self) -> &str {
+-        todo!("jobq/3.13-queue-authz-attribution: the name this tenant was built with")
++        &self.0
+     }
+ }
+ 
+diff --git a/src/engine/usage.rs b/src/engine/usage.rs
+index 0ebadca..2be0353 100644
+--- a/src/engine/usage.rs
++++ b/src/engine/usage.rs
+@@ -53,31 +53,31 @@ impl Usage {
+     /// Jobs written into the queue.
+     #[must_use]
+     pub fn submitted(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: how many jobs were written into this queue")
++        self.submitted
+     }
+ 
+     /// Attempts a worker started.
+     #[must_use]
+     pub fn claimed(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: how many attempts started")
++        self.claimed
+     }
+ 
+     /// Attempts that finished their job.
+     #[must_use]
+     pub fn succeeded(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: how many attempts completed their job")
++        self.succeeded
+     }
+ 
+     /// Attempts that reported a failure, whether or not the job was retried.
+     #[must_use]
+     pub fn failed(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: how many attempts failed")
++        self.failed
+     }
+ 
+     /// Attempts that ended without being finished or failed.
+     #[must_use]
+     pub fn reclaimed(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: how many attempts were handed back")
++        self.reclaimed
+     }
+ 
+     /// Attempts that have started and not ended: the jobs holding a worker right now.
+@@ -88,7 +88,12 @@ impl Usage {
+     /// wrote it as its own column would have a sixth number that could disagree with these five.
+     #[must_use]
+     pub fn running(&self) -> u64 {
+-        todo!("jobq/3.13-queue-authz-attribution: attempts that started and have not ended")
++        // Derived rather than counted, and `saturating` because the subtraction is a subtraction:
++        // an attempt that ended is an attempt that was claimed, so the difference cannot go
++        // negative — and a report that answered a nonsense number under a bug would be worse than
++        // one that answered zero.
++        self.claimed
++            .saturating_sub(self.succeeded + self.failed + self.reclaimed)
+     }
+ }
+ 

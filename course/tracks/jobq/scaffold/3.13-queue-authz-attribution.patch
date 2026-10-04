@@ -1,0 +1,491 @@
+diff --git a/migrations/0005_queues_and_usage.sql b/migrations/0005_queues_and_usage.sql
+new file mode 100644
+index 0000000..3fa0feb
+--- /dev/null
++++ b/migrations/0005_queues_and_usage.sql
+@@ -0,0 +1,34 @@
++-- Queues as things somebody owns: the access model, the audit trail of it, and the counters.
++--
++-- Step `jobq/3.13-queue-authz-attribution`. This is the project's fifth migration, so it is `0005`
++-- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys; `mailer`
++-- and `relay` number their own files).
++--
++-- The file is yours to write, and it needs to hold four things and one idea:
++--
++-- 1. **which tenant owns which queue.** Exactly one owner per queue, because the counters below
++--    are attributed to it: a queue with two owners is a queue whose numbers nobody can add up.
++-- 2. **what everybody else may do with it**: one row per (queue, tenant, action), with the action's
++--    alphabet closed by a `check`, so that a typo lands in the migration rather than in a query that
++--    silently matches nothing. `relay/2.16-authz-audit` made the same move for a service's routes,
++--    and the argument is the same: a permission that is data can be reviewed as data.
++-- 3. **the rule, as something with a name.** Every query in the store needs the same two questions —
++--    "can this tenant see this queue" and "may this tenant do this with it" — and a `view` is the
++--    schema's own way of saying what those mean: an owner may do everything, a grant may do what it
++--    names, and a wider grant covers a narrower one. Write it once and every statement reads it,
++--    rather than five statements each spelling out a joining rule that has to stay identical.
++-- 4. **the counters.** Five totals per queue, and the columns are the five things that can happen to
++--    work (a `submitted` job, a `claimed` attempt, and the three ways an attempt ends). A queue
++--    nobody declared still accumulates traffic, so a counter row is created and updated by the
++--    write that causes it (`insert … on conflict (queue) do update`) and is *not* a foreign key to
++--    the ownership table: the numbers are a fact about traffic, and ownership is a fact about who is
++--    answerable for it.
++-- 5. **the trail of the access model**: one row per accepted change, naming the queue, the tenant
++--    that made it, the owner it left behind, and when. The grants are not copied into it — the
++--    current model is the row in (2), and this is how it got there. **Name this table
++--    `queue_audit`**: the step's specification takes its insert privilege away to check that a
++--    privileged change which cannot be recorded does not happen, so its name is part of the step
++--    rather than a free choice.
++--
++-- One index belongs in here for the question the trail is read with (one queue's decisions, newest
++-- first). Nothing else is forced by the spec.
+diff --git a/src/engine/authz.rs b/src/engine/authz.rs
+new file mode 100644
+index 0000000..9b7b100
+--- /dev/null
++++ b/src/engine/authz.rs
+@@ -0,0 +1,239 @@
++//! The access model of a queue: whose it is, who may do what with it, and who moved it.
++//!
++//! Step `jobq/3.13-queue-authz-attribution` is the operator's half of
++//! `sec/authz-tenant-isolation@design` (`relay/2.16-authz-audit` built the matrix for a service's
++//! routes); what changes here is what the model is *about*. A queue is not a route: it is a thing
++//! with work in it, and the three questions an operator has to be able to answer about it are who
++//! may put work in, who may take work out, and who may change the answer.
++//!
++//! Three decisions are written into the shapes below rather than into a handler:
++//!
++//! * **the model is data, and it is one value.** A [`QueueDeclaration`] is the whole of a queue's
++//!   access: an owner and a list of [`QueueGrant`]s. Two things follow. The first is that a grant
++//!   for something the model cannot express — one tenant reading another tenant's queue — has
++//!   nowhere to be written, which is the property `relay/2.16` built its matrix for. The second is
++//!   that the *rule* is one function ([`QueueDeclaration::allows`]) that a store asks, rather than
++//!   a comparison repeated in every query a store runs;
++//! * **a wider grant covers a narrower one.** `Administer` covers `Submit` and `Claim`, so a
++//!   delegated administrator does not need three rows, and the matrix has one direction rather than
++//!   a table of exceptions;
++//! * **a name that is in the model at all is a name that can see the queue.** Visibility is not a
++//!   fourth action: the queue exists *for* a tenant the moment the tenant or its owner appears in
++//!   the model, and everything the engine says about a queue to a tenant the model does not name is
++//!   the same thing it says about a queue nobody ever declared.
++//!
++//! What is *not* here: the refusal. Which of "there is no such queue" and "not with your name" a
++//! caller gets is [`crate::engine::Error`]'s business — `NoQueue` and `Forbidden` — and the store's
++//! documentation says which one each method answers with.
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::domain::Queue;
++use crate::engine::tenant::Tenant;
++
++/// What somebody may do with a queue.
++///
++/// Three, and they are the three a queue has: put work in, take work out, and decide who may do
++/// either. `#[non_exhaustive]`, like every list in this crate's public vocabulary
++/// (`jobq/3.2-public-api-baseline`): a fourth (a purge, a metrics read) is a decision somebody will
++/// make later, and a caller that wrote a wildcard arm should not have to be rebuilt for it.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum QueueAction {
++    /// Write a job into the queue.
++    Submit,
++    /// Take a job out of the queue, and settle it.
++    Claim,
++    /// Change who may do the other two.
++    Administer,
++}
++
++impl QueueAction {
++    /// The name this action is stored and printed under.
++    ///
++    /// `kebab-case` is not needed for three one-word names, but the *rule* is the one
++    /// [`crate::engine::EventKind`] follows: the string is what a migration, a query and a person's
++    /// `grep` all agree on, so it is written once, here.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("jobq/3.13-queue-authz-attribution: the token this action is stored under")
++    }
++}
++
++impl std::fmt::Display for QueueAction {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++/// One grant: who, and what they may do.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct QueueGrant {
++    /// Who holds it.
++    tenant: Tenant,
++    /// What it lets them do.
++    action: QueueAction,
++}
++
++impl QueueGrant {
++    /// A grant of `action` to `tenant`.
++    #[must_use]
++    pub fn new(tenant: Tenant, action: QueueAction) -> Self {
++        Self { tenant, action }
++    }
++
++    /// Who holds it.
++    #[must_use]
++    pub fn tenant(&self) -> &Tenant {
++        &self.tenant
++    }
++
++    /// What it lets them do.
++    #[must_use]
++    pub fn action(&self) -> QueueAction {
++        self.action
++    }
++}
++
++/// A queue's access model: whose it is, and who else may do what with it.
++///
++/// Built rather than written as a struct literal, so that the defaults stay in one place (a queue
++/// with no grants at all is a queue only its owner can use) and so that a field added later is a
++/// change inside the crate rather than a rebuild of every caller
++/// (`jobq/3.2-public-api-baseline`).
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct QueueDeclaration {
++    /// The queue this is about.
++    queue: Queue,
++    /// Who owns it: the tenant that may do everything, including handing it over.
++    owner: Tenant,
++    /// What everybody else may do.
++    grants: Vec<QueueGrant>,
++}
++
++impl QueueDeclaration {
++    /// A queue owned by `owner`, with nobody else named.
++    #[must_use]
++    pub fn new(queue: Queue, owner: Tenant) -> Self {
++        Self {
++            queue,
++            owner,
++            grants: Vec::new(),
++        }
++    }
++
++    /// The same declaration, with `action` granted to `tenant`.
++    ///
++    /// Granting the owner something is allowed and changes nothing: the owner already may do
++    /// everything, and a store that wrote the row would be recording a fact twice.
++    #[must_use]
++    pub fn with_grant(mut self, tenant: Tenant, action: QueueAction) -> Self {
++        self.grants.push(QueueGrant::new(tenant, action));
++        self
++    }
++
++    /// The queue this is about.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        &self.queue
++    }
++
++    /// Who owns it.
++    #[must_use]
++    pub fn owner(&self) -> &Tenant {
++        &self.owner
++    }
++
++    /// What everybody else may do.
++    #[must_use]
++    pub fn grants(&self) -> &[QueueGrant] {
++        &self.grants
++    }
++
++    /// Whether `tenant` may see this queue at all.
++    ///
++    /// A tenant sees the queue the moment the model names it, as the owner or in any grant: the
++    /// question this answers is not "what may they do" but "does this queue exist for them", and
++    /// everything the engine says to a tenant the model does not name is what it says about a queue
++    /// nobody declared.
++    #[must_use]
++    pub fn visible_to(&self, tenant: &Tenant) -> bool {
++        todo!(
++            "jobq/3.13-queue-authz-attribution: whether `{tenant}` appears in this queue's access \
++             model at all"
++        )
++    }
++
++    /// Whether `tenant` may do `action` with this queue.
++    ///
++    /// Two rules, and both matter: the owner may do everything, and `Administer` covers the narrower
++    /// two. What this does *not* answer is whether the queue is visible — see
++    /// [`QueueDeclaration::visible_to`], which is the question a refusal is built from.
++    #[must_use]
++    pub fn allows(&self, tenant: &Tenant, action: QueueAction) -> bool {
++        todo!(
++            "jobq/3.13-queue-authz-attribution: whether `{tenant}` may `{action}` — the owner holds \
++             every action, and a wider grant covers a narrower one"
++        )
++    }
++}
++
++/// One privileged decision about a queue, as the trail records it.
++///
++/// A row per *accepted* change of the access model: who made it, whose the queue is now, and when.
++/// The grants themselves are not columns here — the queue's current model is the declaration a store
++/// holds, and this trail is the history of how it got there, which is what an operator reading
++/// "who moved this, and when" needs.
++///
++/// `#[non_exhaustive]`: the same promise as [`crate::engine::Job`], for the same reason.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct QueueAudit {
++    /// The queue whose model changed.
++    queue: Queue,
++    /// Who changed it.
++    actor: Tenant,
++    /// Whose it is now.
++    owner: Tenant,
++    /// When the change was made, by the caller's clock.
++    at: DateTime<Utc>,
++}
++
++impl QueueAudit {
++    /// One line of the trail.
++    #[must_use]
++    pub fn new(queue: Queue, actor: Tenant, owner: Tenant, at: DateTime<Utc>) -> Self {
++        Self {
++            queue,
++            actor,
++            owner,
++            at,
++        }
++    }
++
++    /// The queue whose model changed.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        &self.queue
++    }
++
++    /// Who changed it.
++    #[must_use]
++    pub fn actor(&self) -> &Tenant {
++        &self.actor
++    }
++
++    /// Whose it is now.
++    #[must_use]
++    pub fn owner(&self) -> &Tenant {
++        &self.owner
++    }
++
++    /// When the change was made.
++    #[must_use]
++    pub fn at(&self) -> DateTime<Utc> {
++        self.at
++    }
++}
+diff --git a/src/engine/tenant.rs b/src/engine/tenant.rs
+new file mode 100644
+index 0000000..ecd4a70
+--- /dev/null
++++ b/src/engine/tenant.rs
+@@ -0,0 +1,71 @@
++//! Who a queue belongs to.
++//!
++//! An engine that several people share has one question underneath everything else an operator
++//! asks: *whose* work is this? Step `jobq/3.13-queue-authz-attribution` is where that question
++//! gets a name, and the name is a [`Tenant`] — the unit of ownership, of the access model and of
++//! the numbers.
++//!
++//! Two decisions belong to this module:
++//!
++//! * **a tenant is a name the engine can write down**, with the alphabet and the bound a
++//!   [`crate::engine::Queue`] has and for the same reasons: it is a column, a metric label and
++//!   something a person types. A name that is not one of those is refused where it is given rather
++//!   than stored as a row nobody can read back;
++//! * **a tenant is not a credential.** Nothing in this module authenticates anybody: it says who
++//!   work belongs to, and the *caller* is whoever built the store handle it uses
++//!   ([`crate::engine::Store::scoped`]). Keeping the two apart is the point — a name that arrived
++//!   inside a request is text somebody typed (`relay/2.16-authz-audit` is where that argument is
++//!   written out for a service), and an engine that trusted one would have an access model anybody
++//!   on the network could edit.
++
++use std::fmt;
++use std::str::FromStr;
++
++use crate::engine::domain::QUEUE_NAME_MAX;
++use crate::engine::error::Error;
++
++/// Longest tenant name the engine accepts, in bytes.
++///
++/// The same bound a queue name has, because the two are the same kind of thing: a key in a table
++/// and a label somebody has to be able to read in a dashboard.
++pub const TENANT_NAME_MAX: usize = QUEUE_NAME_MAX;
++
++/// Who a queue belongs to: the unit an operator holds accountable for the work in it.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Tenant(String);
++
++impl Tenant {
++    /// Parse a tenant name.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the name is empty, longer than [`TENANT_NAME_MAX`] bytes, or
++    /// contains anything but lower-case ASCII letters, digits, `.`, `_` and `-`.
++    pub fn parse(name: &str) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.13-queue-authz-attribution: a tenant name the engine can write down — the \
++             alphabet and the bound are the ones a queue name uses, and the reason is in this \
++             module's documentation"
++        )
++    }
++
++    /// The name, as it is written in a table and printed in a report.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        todo!("jobq/3.13-queue-authz-attribution: the name this tenant was built with")
++    }
++}
++
++impl fmt::Display for Tenant {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++impl FromStr for Tenant {
++    type Err = Error;
++
++    fn from_str(text: &str) -> Result<Self, Self::Err> {
++        Self::parse(text)
++    }
++}
+diff --git a/src/engine/usage.rs b/src/engine/usage.rs
+new file mode 100644
+index 0000000..0ebadca
+--- /dev/null
++++ b/src/engine/usage.rs
+@@ -0,0 +1,123 @@
++//! What one queue has done, counted as it happened.
++//!
++//! The access model of [`crate::engine::authz`] answers *whether*: may this tenant submit, may it
++//! claim, may it administer. It cannot answer *how much*, and that is the question an operator acts
++//! on — "who consumed the worker pool last night", "is a tenant's failure rate rising" — so
++//! `jobq/3.13-queue-authz-attribution` keeps five numbers per queue and hands them back as a value.
++//!
++//! Three decisions are in this file:
++//!
++//! * **the five numbers are the five things that can happen to work**, and they are counted where
++//!   they happen rather than reconstructed afterwards: a job is *submitted*, an attempt is
++//!   *claimed*, and an attempt *ends* — successfully (`succeeded`), reporting a failure (`failed`),
++//!   or without either (`reclaimed`: the worker stopped, or its lease ran out). Nothing else moves
++//!   them, which is what makes the arithmetic below a fact rather than a convention;
++//! * **the number an operator reaches for is derivable** ([`Usage::running`]): the attempts that
++//!   have started and not ended are exactly the jobs holding a worker right now, which is the
++//!   "who consumed the pool" answer. Deriving it rather than storing it is the difference between
++//!   one number with one writer and a sixth counter that can disagree with the other five;
++//! * **a counter is not a job.** These are totals: they survive the row they counted (a purged job
++//!   is still work that ran), they are read by an operator rather than by the engine, and no
++//!   decision in the engine reads them. A number a decision depended on would have to be exact
++//!   under every race; a number a *report* depends on has to be honest under them.
++//!
++//! Where they are written is the other half of the step and it is not this file's business: the
++//! store's own documentation says it, and the answer is the same transaction as the state change
++//! (`jobq/3.6-transaction-isolation` is the pattern), so that a write which did not happen cannot be
++//! counted.
++
++use crate::engine::domain::Queue;
++
++/// What one queue has done, counted per event.
++///
++/// `#[non_exhaustive]` with private fields and accessors, like [`crate::engine::Job`]: a sixth count
++/// (a cancellation, a dead letter) is a change inside the crate, and the readers below are the
++/// interface.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Usage {
++    /// Jobs written into the queue.
++    pub(crate) submitted: u64,
++    /// Attempts a worker started.
++    pub(crate) claimed: u64,
++    /// Attempts that finished their job.
++    pub(crate) succeeded: u64,
++    /// Attempts that reported a failure.
++    pub(crate) failed: u64,
++    /// Attempts that ended without either: handed back by a worker on its way out, or declared
++    /// abandoned when their lease ran out.
++    pub(crate) reclaimed: u64,
++}
++
++impl Usage {
++    /// Jobs written into the queue.
++    #[must_use]
++    pub fn submitted(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: how many jobs were written into this queue")
++    }
++
++    /// Attempts a worker started.
++    #[must_use]
++    pub fn claimed(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: how many attempts started")
++    }
++
++    /// Attempts that finished their job.
++    #[must_use]
++    pub fn succeeded(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: how many attempts completed their job")
++    }
++
++    /// Attempts that reported a failure, whether or not the job was retried.
++    #[must_use]
++    pub fn failed(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: how many attempts failed")
++    }
++
++    /// Attempts that ended without being finished or failed.
++    #[must_use]
++    pub fn reclaimed(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: how many attempts were handed back")
++    }
++
++    /// Attempts that have started and not ended: the jobs holding a worker right now.
++    ///
++    /// The answer to "who consumed the worker pool", and the one number here that is *derived*
++    /// rather than counted: `claimed` minus the three ways an attempt can end. It cannot go
++    /// negative (every one of the three ends an attempt that `claimed` counted), and a store that
++    /// wrote it as its own column would have a sixth number that could disagree with these five.
++    #[must_use]
++    pub fn running(&self) -> u64 {
++        todo!("jobq/3.13-queue-authz-attribution: attempts that started and have not ended")
++    }
++}
++
++/// One queue's numbers, as an operator reads them.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct QueueUsage {
++    /// Which queue.
++    queue: Queue,
++    /// What it has done.
++    usage: Usage,
++}
++
++impl QueueUsage {
++    /// One line of a report.
++    #[must_use]
++    pub fn new(queue: Queue, usage: Usage) -> Self {
++        Self { queue, usage }
++    }
++
++    /// Which queue.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        &self.queue
++    }
++
++    /// What it has done.
++    #[must_use]
++    pub fn usage(&self) -> Usage {
++        self.usage
++    }
++}
