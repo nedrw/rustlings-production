@@ -10,7 +10,7 @@
 //! Nothing here sleeps its way out of a race: the service is *waited for* ([`wait_until`]).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -23,28 +23,36 @@ const READY_DEADLINE: Duration = Duration::from_secs(20);
 /// How often a waiting test tries again.
 const RETRY: Duration = Duration::from_millis(25);
 
-/// A port nothing is listening on right now, asked of the operating system.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port can be found");
-    listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port()
+/// The address in a line that says the service is listening, if this line is one.
+///
+/// The two log formats differ around it (`address=…` in the pretty one, `"address":"…"` in JSON),
+/// and nothing else in a startup line looks like a socket address, so the scanner is: find
+/// `address`, skip what separates it from its value, read the address.
+fn listening_address(line: &str) -> Option<SocketAddr> {
+    let rest = line.get(line.find("address")? + "address".len()..)?;
+    let rest = rest.trim_start_matches(['=', ':', '"', ' ']);
+    let end = rest
+        .find(|character: char| !(character.is_ascii_alphanumeric() || ".:-[]".contains(character)))
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
 }
 
 /// The service under test: a process, and the lines it prints while it runs.
 struct Service {
     child: Child,
     lines: Receiver<String>,
-    address: SocketAddr,
 }
 
 impl Service {
-    /// Start the service with `args`, on `port`, from an otherwise empty environment.
-    fn start(port: u16, extra: &[(&str, &str)]) -> Self {
+    /// Start the service with `extra` in its environment, on a port the kernel picks for it.
+    ///
+    /// Port 0, deliberately: a port chosen by binding `127.0.0.1:0` and closing the listener is a
+    /// port two spec files can be handed at once, and then one of them talks to the other's
+    /// service. The child says which port it got, and the spec reads that line.
+    fn start(extra: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mailer"));
         command
-            .args(["--listen-port", &port.to_string()])
+            .args(["--listen-port", "0"])
             .env_clear()
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -68,12 +76,7 @@ impl Service {
             }
         });
 
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
-        Self {
-            child,
-            lines,
-            address,
-        }
+        Self { child, lines }
     }
 
     /// The next line the service printed, waiting at most `timeout` for it.
@@ -82,20 +85,14 @@ impl Service {
         self.lines.recv_timeout(timeout).ok()
     }
 
-    /// The address of the first event that says where the service listens.
+    /// The address of the first line that says where the service listens.
     fn bound_address(&self) -> SocketAddr {
         let deadline = Instant::now() + READY_DEADLINE;
         while Instant::now() < deadline {
             let Some(line) = self.next_line(RETRY) else {
                 continue;
             };
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let Some(address) = event["fields"]["address"].as_str() else {
-                continue;
-            };
-            if let Ok(address) = address.parse() {
+            if let Some(address) = listening_address(&line) {
                 return address;
             }
         }
@@ -193,9 +190,8 @@ fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
 
 #[test]
 fn the_service_answers_the_matrix_it_promises() {
-    let port = free_port();
-    let service = Service::start(port, &[]);
-    let address = service.address;
+    let service = Service::start(&[]);
+    let address = service.bound_address();
     wait_until(
         || TcpStream::connect(address).is_ok(),
         "the service to accept connections",
@@ -243,7 +239,7 @@ fn the_service_answers_the_matrix_it_promises() {
 fn the_service_reports_the_address_it_actually_bound() {
     // Port 0 is "whatever is free": the configuration cannot know the port, so the service has to
     // say which one it got — otherwise nobody can send it a request.
-    let service = Service::start(0, &[("MAILER__LOG__FORMAT", "json")]);
+    let service = Service::start(&[("MAILER__LOG__FORMAT", "json")]);
     let address = service.bound_address();
     assert_ne!(address.port(), 0, "the bound port is a real one");
 

@@ -32,7 +32,7 @@ mod postgres;
 
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -351,14 +351,21 @@ fn a_process_that_is_asked_to_stop_finishes_what_it_has() {
     );
 }
 
-/// A port nothing is listening on right now, asked of the operating system.
+/// The address in a line that says the service is listening, if this line is one.
+///
+/// The two log formats differ around it (`address=…` in the pretty one, `"address":"…"` in JSON),
+/// and nothing else in a startup line looks like a socket address, so the scanner is: find
+/// `address`, skip what separates it from its value, read the address. The service is started with
+/// port 0 on purpose: a port picked by binding and closing the listener is a port two tests can be
+/// handed at once.
 #[cfg(unix)]
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a free port can be found");
-    listener
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port()
+fn listening_address(line: &str) -> Option<SocketAddr> {
+    let rest = line.get(line.find("address")? + "address".len()..)?;
+    let rest = rest.trim_start_matches(['=', ':', '"', ' ']);
+    let end = rest
+        .find(|character: char| !(character.is_ascii_alphanumeric() || ".:-[]".contains(character)))
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
 }
 
 /// The service under test: a process, and the lines it prints while it runs.
@@ -366,17 +373,22 @@ fn free_port() -> u16 {
 struct Service {
     child: Child,
     lines: Receiver<String>,
+    /// Lines read while waiting for the service to say where it listens, handed back first by
+    /// [`Service::log_lines`].
+    early: Mutex<Vec<String>>,
     address: SocketAddr,
 }
 
 #[cfg(unix)]
 impl Service {
-    /// Start the service with `extra` in its environment, on a port of this process's choosing.
+    /// Start the service with `extra` in its environment, on a port the kernel picks for it.
+    ///
+    /// Port 0: only the child knows which port it got, and it says so in its log — which is the
+    /// line this waits for.
     fn start(extra: &[(&str, &str)]) -> Self {
-        let port = free_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_mailer"));
         command
-            .args(["--listen-port", &port.to_string()])
+            .args(["--listen-port", "0"])
             .env_clear()
             .stdout(Stdio::piped());
         for (name, value) in extra {
@@ -399,29 +411,82 @@ impl Service {
             }
         });
 
-        let service = Self {
+        let mut service = Self {
             child,
             lines,
-            address: SocketAddr::from(([127, 0, 0, 1], port)),
+            early: Mutex::new(Vec::new()),
+            address: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
+        service.address = service.wait_for_listening();
         service.wait_until_ready();
         service
     }
 
-    /// Wait until the service accepts connections, so no test has to sleep and hope.
-    fn wait_until_ready(&self) {
+    /// The address the service says it bound, read from the line that announces it.
+    fn wait_for_listening(&mut self) -> SocketAddr {
         let deadline = Instant::now() + DEADLINE;
-        while Instant::now() < deadline {
+        loop {
+            match self.lines.recv_timeout(RETRY) {
+                Ok(line) => {
+                    let address = listening_address(&line);
+                    self.early
+                        .lock()
+                        .expect("the fixture is not poisoned")
+                        .push(line);
+                    if let Some(address) = address {
+                        return address;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!(
+                        "the service stopped before it said where it listens: {:?}",
+                        self.log_lines()
+                    );
+                }
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "the service exited with {} before it said where it listens: {:?}",
+                    status.code().unwrap_or(-1),
+                    self.log_lines()
+                );
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "the service did not say where it listens within {DEADLINE:?}: {:?}",
+                    self.log_lines()
+                );
+            }
+        }
+    }
+
+    /// Wait until the service accepts connections, so no test has to sleep and hope.
+    ///
+    /// The child is asked first: a connect can succeed against *any* listener on that address.
+    fn wait_until_ready(&mut self) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "the service exited with {} after saying it listens on {}: {:?}",
+                    status.code().unwrap_or(-1),
+                    self.address,
+                    self.log_lines()
+                );
+            }
             if TcpStream::connect(self.address).is_ok() {
                 return;
             }
+            if Instant::now() >= deadline {
+                panic!(
+                    "the service at {} never started accepting connections: {:?}",
+                    self.address,
+                    self.log_lines()
+                );
+            }
             std::thread::sleep(RETRY);
         }
-        panic!(
-            "the service at {} never started accepting connections: {:?}",
-            self.address,
-            self.log_lines()
-        );
     }
 
     /// One `POST` with a JSON body, answered as `(status, body)`.
@@ -497,7 +562,11 @@ impl Service {
 
     /// The lines the service has printed so far.
     fn log_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+        let mut lines = self
+            .early
+            .lock()
+            .expect("the fixture is not poisoned")
+            .clone();
         while let Ok(line) = self.lines.recv_timeout(RETRY) {
             lines.push(line);
         }
