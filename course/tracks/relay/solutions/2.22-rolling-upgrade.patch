@@ -1,0 +1,212 @@
+diff --git a/src/db.rs b/src/db.rs
+index 42ab5ad..20e7aaf 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -2,7 +2,10 @@
+ //!
+ //! The order is the lesson from `mailer/1.9-postgres`: connect, migrate, and only then start
+ //! serving. A service that answers requests before its schema is in place answers them with errors,
+-//! and a service that serves before its tenants are seeded rejects every key.
++//! and a service that serves before its tenants are seeded rejects every key. What
++//! `relay/2.22-rolling-upgrade` adds is the *other* direction of the same idea: the process reports
++//! whether the schema it needs is in place (`crate::readiness`), and a migration the database
++//! records and this binary does not know about is not a reason to refuse to start.
+ 
+ use sqlx::PgPool;
+ use sqlx::postgres::PgPoolOptions;
+@@ -51,24 +54,36 @@ impl Db {
+     /// and a migration that only runs when somebody remembers to copy a file is a migration that
+     /// runs in staging and not in production.
+     ///
++    /// A migration the database records and this binary does not know about is **not** an error
++    /// (`relay/2.22-rolling-upgrade`): during a rolling upgrade the new instance has already
++    /// applied it, and every *old* instance is still serving. Refusing to start — which is what
++    /// sqlx does by default — would make the old instances exit the moment the new one migrates,
++    /// and a rolling upgrade with a window where nothing is ready is an outage.
++    ///
++    /// What makes that safe is not this flag; it is the shape of the migrations themselves
++    /// (`relay/2.23-online-schema`): a migration may add a column, a table or an index, and it may
++    /// not remove or reinterpret what the previous release reads.
++    ///
+     /// # Errors
+     ///
+     /// Returns [`Error::Database`] when a migration fails. The caller does not start serving: a
+     /// service on a schema it does not understand is a service that corrupts data politely.
+     pub async fn migrate(&self) -> Result<(), Error> {
+-        sqlx::migrate!("./migrations")
++        let mut migrator = sqlx::migrate!("./migrations");
++        // The flag is set on the migrator rather than left at its default, and the reason is in the
++        // sentence above: the default refuses the *older* binary, which is the one that has to keep
++        // working.
++        migrator.set_ignore_missing(true);
++        migrator
+             .run(&self.pool)
+             .await
+             .map_err(|error| Error::Database(sqlx::Error::Migrate(Box::new(error))))
+     }
+ 
+-    /// `true` when the database answers a trivial query: what `GET /readyz` reports.
+-    pub async fn ready(&self) -> bool {
+-        sqlx::query_scalar::<_, i32>("select 1")
+-            .fetch_one(&self.pool)
+-            .await
+-            .is_ok()
+-    }
++    // `/readyz` used to be `select 1` sent from here (`relay/2.1-project-skeleton`). It is
++    // `relay::readiness::probe` now, and the question it answers is a strict superset: a probe that
++    // asks only whether the database answers reports a process as ready when the schema it needs is
++    // not in that database, which is the failure `relay/2.22-rolling-upgrade` exists to prevent.
+ 
+     /// The pool, for the queries the rest of the service runs.
+     #[must_use]
+diff --git a/src/http.rs b/src/http.rs
+index 3522289..50c0f49 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -54,6 +54,7 @@ use crate::metrics::{self, Metrics};
+ use crate::openapi;
+ use crate::pagination;
+ use crate::ratelimit::{self, Limiter, System, Verdict};
++use crate::readiness;
+ use crate::target;
+ use crate::trace::{self, Traceparent};
+ use uuid::Uuid;
+@@ -454,12 +455,21 @@ async fn healthz() -> impl IntoResponse {
+     (StatusCode::OK, Json(json!({ "status": "ok" })))
+ }
+ 
+-/// Readiness: this process can take traffic, which means the database answers.
++/// Readiness: this process can take traffic, which means the schema it was built for is in the
++/// database.
++///
++/// The question is asked of the database on every probe (`relay/2.22-rolling-upgrade`), and it is
++/// about the *schema* rather than about the socket: a process whose database answers but does not
++/// hold the migrations it needs will answer every business request with an error, and reporting
++/// "ready" for it is how an orchestrator routes traffic to it. The answer distinguishes the two
++/// cases a caller cares about in the body it returns — which migration is applied, which one this
++/// process needs — because "not ready" without those numbers is a page nobody can act on.
+ async fn readyz(State(state): State<AppState>) -> Response {
+-    if state.db().ready().await {
++    let schema = readiness::probe(state.db().pool()).await;
++    if schema.is_ready() {
+         (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response()
+     } else {
+-        Error::Unavailable("the database is not answering".to_owned()).into_response()
++        Error::Unavailable(schema.to_string()).into_response()
+     }
+ }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index d035ccc..4732163 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,6 +36,7 @@ pub mod ordering;
+ pub mod outbound;
+ pub mod pagination;
+ pub mod ratelimit;
++pub mod readiness;
+ pub mod signing;
+ pub mod target;
+ pub mod trace;
+diff --git a/src/logging.rs b/src/logging.rs
+index 43a5bf2..a4c458b 100644
+--- a/src/logging.rs
++++ b/src/logging.rs
+@@ -11,6 +11,7 @@ use std::net::SocketAddr;
+ use tracing_subscriber::EnvFilter;
+ 
+ use crate::config::LogFormat;
++use crate::readiness::Schema;
+ 
+ /// Identifies one run of the process.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -66,6 +67,17 @@ pub fn announce(run: &RunId, address: SocketAddr) {
+     tracing::info!(run = %run, address = %address, "listening");
+ }
+ 
++/// Announce the schema this process found, in the line an operator reads before the one that says
++/// where it listens.
++///
++/// The order is the contract `relay/2.22-rolling-upgrade` establishes: the migrations run, the
++/// process says which schema it is on, and only then does it say where it listens. A log whose
++/// listening line came first would be a service that took traffic before it knew whether it could
++/// answer.
++pub fn announce_schema(run: &RunId, schema: &Schema) {
++    tracing::info!(run = %run, schema = %schema, "the schema is in place");
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/main.rs b/src/main.rs
+index 03421c3..1492792 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -20,6 +20,7 @@ use relay::lease;
+ use relay::logging::{self, RunId};
+ use relay::ordering::Lanes;
+ use relay::outbound::{HttpSender, Policy};
++use relay::readiness;
+ use relay::signing::DbSecrets;
+ use relay::trace::DbTraces;
+ use relay::{USAGE, error::Error};
+@@ -95,6 +96,11 @@ fn serve(config: Config, run: RunId) -> Result<(), Error> {
+         let lease = config.delivery.lease;
+         let drain = config.delivery.drain;
+         let state = http::AppState::start(config, &run).await?;
++        // The schema, said out loud and *before* the line that announces the port
++        // (`relay/2.22-rolling-upgrade`): an operator reading a rollout in a log has to be able to
++        // see that the process migrated before it started taking traffic, and that order is the
++        // whole reason `/readyz` can be trusted by whatever routes to this process.
++        logging::announce_schema(&run, &readiness::probe(state.db().pool()).await);
+         let worker = worker_of(&state, policy, limits, lease, &run);
+ 
+         // One signal, two things that have to stop: the server stops accepting, and the worker stops
+diff --git a/src/readiness.rs b/src/readiness.rs
+index 353d5e5..5b1650a 100644
+--- a/src/readiness.rs
++++ b/src/readiness.rs
+@@ -113,8 +113,32 @@ pub fn needed() -> i64 {
+ /// it ever been migrated — because a probe that makes three round trips is a probe that reports a
+ /// state assembled from three moments.
+ pub async fn probe(pool: &PgPool) -> Schema {
+-    let _ = (pool, needed);
+-    todo!("step relay/2.22-rolling-upgrade")
++    // One query, three answers. `to_regclass` makes "this database has never been migrated" a `0`
++    // rather than an error, and the `case` is what lets a probe distinguish *that* from "the
++    // database is not answering": only the second one is a connectivity failure, and a probe that
++    // called both of them "unreachable" would send an operator to the wrong system.
++    //
++    // `where success` matters: a migration that failed is recorded, and a fresh start on a
++    // half-applied schema is not a ready process (`_sqlx_migrations.success` is what sqlx itself
++    // reads to decide whether the last run finished).
++    let recorded: Result<i64, sqlx::Error> = sqlx::query_scalar(
++        "select case when to_regclass('_sqlx_migrations') is null then 0 \
++                     else coalesce((select max(version) from _sqlx_migrations where success), 0) \
++                end",
++    )
++    .fetch_one(pool)
++    .await;
++
++    let needed = needed();
++    let applied = match recorded {
++        Ok(applied) => applied,
++        Err(error) => return Schema::Unreachable(error.to_string()),
++    };
++    match applied.cmp(&needed) {
++        std::cmp::Ordering::Equal => Schema::Current { version: applied },
++        std::cmp::Ordering::Greater => Schema::Ahead { applied, needed },
++        std::cmp::Ordering::Less => Schema::Behind { applied, needed },
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -143,7 +167,7 @@ mod tests {
+ 
+     #[test]
+     fn every_state_says_which_versions_it_is_about() {
+-        assert_eq!(needed() > 0, true, "this binary embeds migrations");
++        assert!(needed() > 0, "this binary embeds migrations");
+         let behind = Schema::Behind {
+             applied: 4,
+             needed: 9,
