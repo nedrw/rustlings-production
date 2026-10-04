@@ -92,9 +92,15 @@ pub(crate) fn judge(session: &mut Session, reference: &str, announce: bool) -> R
     print_output(&ran);
 
     let passed = ran.success();
-    session
-        .state_mut()
-        .record_spec(&step.qualified_id(), passed);
+    let id = step.qualified_id();
+    session.state_mut().record_spec(&id, passed);
+    // Spec and gates both green: the step is done, and its capabilities are proven. `check` writes
+    // the same record when it is the one that completes the step; the rule lives in the state so
+    // both paths agree on when "done" happened.
+    if session.state().status(&id) == crate::state::StepStatus::Done {
+        let teaches = step.teaches.clone();
+        session.state_mut().record_step_capabilities(&teaches, &id);
+    }
     session.save_state()?;
 
     println!();

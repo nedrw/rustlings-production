@@ -61,9 +61,15 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     session
         .state_mut()
         .record_spec_modified(&step.qualified_id(), !drift.is_clean());
-    session
-        .state_mut()
-        .record_gates(&step.qualified_id(), passed);
+    let id = step.qualified_id();
+    session.state_mut().record_gates(&id, passed);
+    // The learner's capability record is written the moment a step is *done* — spec tests and
+    // must gates both green — because that is the moment the capability is actually established.
+    // `kiln review --due` reads the timestamps this writes.
+    if session.state().status(&id) == crate::state::StepStatus::Done {
+        let teaches = step.teaches.clone();
+        session.state_mut().record_step_capabilities(&teaches, &id);
+    }
     session.save_state()?;
 
     println!();

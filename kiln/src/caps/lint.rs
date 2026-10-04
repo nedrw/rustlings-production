@@ -401,20 +401,28 @@ fn check_exits(course: &Course, report: &mut Report) {
 }
 
 /// R5: prose template versus `origin`, checked only where a step body exists.
+///
+/// Two halves. The first is structural — the template's sections, and no `WHY` on a step that must
+/// not re-explain. The second checks that a `deepen`/`transfer` step's `RECALL` is *true* rather
+/// than merely present: it has to name an earlier step of this course, name a depth, and point at a
+/// step that actually established what this one builds on (authoring.md §4.3).
 fn check_prose(course: &Course, report: &mut Report) -> Result<()> {
     let source = Locale::parse(&course.manifest().default_locale)?;
     let mut checked = 0usize;
     let mut missing = 0usize;
 
+    // The path order `RECALL` is checked against: a step may only look backwards.
+    let path: Vec<String> = course.steps().map(Step::qualified_id).collect();
+
     for step in course.steps() {
-        let path = step.source_path(&course.dir());
-        if !path.is_file() {
+        let path_of = step.source_path(&course.dir());
+        if !path_of.is_file() {
             missing += 1;
             continue;
         }
         checked += 1;
         report.bodies += 1;
-        let body = match read_step_body(&path) {
+        let body = match read_step_body(&path_of) {
             Ok(body) => body,
             Err(error) => {
                 report
@@ -455,6 +463,9 @@ fn check_prose(course: &Course, report: &mut Report) -> Result<()> {
                 ),
             ));
         }
+        if step.origin != Origin::Teach {
+            check_recall(course, step, &body, &path, report);
+        }
     }
 
     if missing > 0 {
@@ -465,6 +476,147 @@ fn check_prose(course: &Course, report: &mut Report) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The `RECALL` half of R5: it has to name the step and the depth this one builds on.
+fn check_recall(
+    course: &Course,
+    step: &Step,
+    body: &crate::i18n::StepBody,
+    path: &[String],
+    report: &mut Report,
+) {
+    let recall = crate::i18n::section_text(&body.text, "RECALL");
+    let issue = |report: &mut Report, message: String| {
+        report
+            .issues
+            .push(Issue::about(Rule::ProseStructure, step, message));
+    };
+    if recall.trim().is_empty() {
+        return; // The missing-section issue above already says it.
+    }
+
+    let here = path
+        .iter()
+        .position(|id| id == &step.qualified_id())
+        .unwrap_or(0);
+    let mut referenced: Vec<&Step> = Vec::new();
+    for token in recall.split(|character: char| {
+        character.is_whitespace()
+            || matches!(character, '`' | '(' | ')' | ',' | ';' | '*' | '"' | '\'')
+    }) {
+        let token = token.trim_end_matches(['.', ':']);
+        let Some((track, local)) = token.split_once('/') else {
+            continue;
+        };
+        if !track
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            || local.is_empty()
+            || !local.starts_with(|c: char| c.is_ascii_digit())
+        {
+            continue;
+        }
+        match course.step(token) {
+            Ok(earlier) => {
+                let at = path
+                    .iter()
+                    .position(|id| id == &earlier.qualified_id())
+                    .unwrap_or(usize::MAX);
+                if at >= here {
+                    issue(
+                        report,
+                        format!(
+                            "{}: RECALL names `{token}`, which comes at or after this step — RECALL \
+                             is for what you already learned",
+                            step.qualified_id()
+                        ),
+                    );
+                } else {
+                    referenced.push(earlier);
+                }
+            }
+            Err(_) => issue(
+                report,
+                format!(
+                    "{}: RECALL names `{token}`, which is not a step of this course",
+                    step.qualified_id()
+                ),
+            ),
+        }
+    }
+
+    if referenced.is_empty() {
+        issue(
+            report,
+            format!(
+                "{} (origin = {}) has a RECALL that names no earlier step — write it as \
+                 `<capability>@<depth> — <track>/<phase>.<index>: <what it established>`",
+                step.qualified_id(),
+                step.origin
+            ),
+        );
+    }
+    let depth_named = ["@aware", "@apply", "@design", "@operate"]
+        .iter()
+        .any(|depth| recall.contains(depth));
+    if !depth_named {
+        issue(
+            report,
+            format!(
+                "{}: RECALL names no depth (`@apply`, `@design`, …) — the learner needs to know \
+                 how deep the previous step went",
+                step.qualified_id()
+            ),
+        );
+    }
+
+    // The reference has to be the right kind of step:
+    // * `deepen` builds on a step that established one of the slots this step goes deeper on;
+    // * `transfer` redoes a slot this step *requires*, in a new project.
+    match step.origin {
+        Origin::Teach => {}
+        Origin::Deepen => {
+            let builds_on = referenced.iter().any(|earlier| {
+                earlier.teaches.iter().any(|taught| {
+                    step.teaches.iter().any(|deepening| {
+                        taught.id == deepening.id && taught.level.rank() < deepening.level.rank()
+                    })
+                })
+            });
+            if !builds_on {
+                issue(
+                    report,
+                    format!(
+                        "{} deepens {} but its RECALL points at steps that never established those \
+                         slots — name the step that did",
+                        step.qualified_id(),
+                        join(&step.teaches)
+                    ),
+                );
+            }
+        }
+        Origin::Transfer => {
+            let transfers = referenced.iter().any(|earlier| {
+                earlier.teaches.iter().any(|taught| {
+                    step.requires
+                        .iter()
+                        .any(|required| required.id == taught.id && required.level == taught.level)
+                })
+            });
+            if !transfers {
+                issue(
+                    report,
+                    format!(
+                        "{} transfers {} but its RECALL names no step that taught them — a transfer \
+                         points at what it is redoing",
+                        step.qualified_id(),
+                        join(&step.requires)
+                    ),
+                );
+            }
+        }
+    }
 }
 
 fn join(requirements: &[CapRequirement]) -> String {
@@ -876,7 +1028,7 @@ mod tests {
             temp.path(),
             &one_track(
                 &[
-                    step_toml("mailer", "1.1-workspace", &["repo/workspace-layout@apply"]),
+                    step_toml("mailer", "1.1-workspace", &["ci/pipeline@aware"]),
                     Step::new("mailer", "1.2-toolchain", &["ci/pipeline@apply"])
                         .origin("deepen")
                         .toml(),
@@ -884,20 +1036,136 @@ mod tests {
                 &["ci/pipeline@apply"],
             ),
             &ledger_toml(&[
-                ("repo/workspace-layout", "apply", "mailer/1.1"),
+                ("ci/pipeline", "aware", "mailer/1.1"),
                 ("ci/pipeline", "apply", "mailer/1.2"),
             ]),
         );
         temp.write(
             "course/docs/steps/en/mailer/1.2-toolchain.md",
-            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## RECALL\n\n## DELTA\n\n\
-             ## TASK\n\n## DONE WHEN\n\n## TRAP\n",
+            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## RECALL\n\n\
+             `ci/pipeline@aware` — `mailer/1.1`: a task runner that runs the checks.\n\n\
+             ## DELTA\n\n## TASK\n\n## DONE WHEN\n\n## TRAP\n",
         );
         let report = lint(&course).unwrap();
         assert!(
             report.issues_for(Rule::ProseStructure).count() == 0,
             "{:?}",
             report.issues
+        );
+    }
+
+    #[test]
+    fn r5_catches_a_recall_that_does_not_say_where_it_comes_from() {
+        let temp = TempDir::new("lint-r5-recall-empty");
+        let course = load_course(
+            temp.path(),
+            &one_track(
+                &[
+                    step_toml("mailer", "1.1-workspace", &["ci/pipeline@aware"]),
+                    Step::new("mailer", "1.2-toolchain", &["ci/pipeline@apply"])
+                        .origin("deepen")
+                        .toml(),
+                ],
+                &["ci/pipeline@apply"],
+            ),
+            &ledger_toml(&[
+                ("ci/pipeline", "aware", "mailer/1.1"),
+                ("ci/pipeline", "apply", "mailer/1.2"),
+            ]),
+        );
+        // An empty RECALL, a RECALL with a step that does not exist, and a RECALL that looks
+        // forward are all "you have not said what you already know".
+        temp.write(
+            "course/docs/steps/en/mailer/1.2-toolchain.md",
+            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## RECALL\n\nIt builds on the \
+             `ci/pipeline@aware` you saw earlier.\n\n## DELTA\n\n## TASK\n\n## DONE WHEN\n\n## TRAP\n",
+        );
+        let report = lint(&course).unwrap();
+        let issues: Vec<String> = report
+            .issues_for(Rule::ProseStructure)
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("names no earlier step")),
+            "{issues:?}"
+        );
+
+        temp.write(
+            "course/docs/steps/en/mailer/1.2-toolchain.md",
+            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## RECALL\n\n\
+             `ci/pipeline@apply` — `mailer/9.9`: a step that does not exist.\n\n## DELTA\n\n\
+             ## TASK\n\n## DONE WHEN\n\n## TRAP\n",
+        );
+        let report = lint(&course).unwrap();
+        let issues: Vec<String> = report
+            .issues_for(Rule::ProseStructure)
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("is not a step of this course")),
+            "{issues:?}"
+        );
+
+        temp.write(
+            "course/docs/steps/en/mailer/1.2-toolchain.md",
+            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## RECALL\n\n\
+             `ci/pipeline@apply` — `mailer/1.2`: this very step.\n\n## DELTA\n\n## TASK\n\n\
+             ## DONE WHEN\n\n## TRAP\n",
+        );
+        let report = lint(&course).unwrap();
+        let issues: Vec<String> = report
+            .issues_for(Rule::ProseStructure)
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("comes at or after this step")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn r5_catches_a_deepen_that_recalls_the_wrong_step() {
+        let temp = TempDir::new("lint-r5-recall-wrong-step");
+        let course = load_course(
+            temp.path(),
+            &one_track(
+                &[
+                    step_toml("mailer", "1.1-workspace", &["repo/workspace-layout@apply"]),
+                    step_toml("mailer", "1.2-toolchain", &["ci/pipeline@aware"]),
+                    Step::new("mailer", "1.3-ci", &["ci/pipeline@apply"])
+                        .origin("deepen")
+                        .toml(),
+                ],
+                &["ci/pipeline@apply"],
+            ),
+            &ledger_toml(&[
+                ("repo/workspace-layout", "apply", "mailer/1.1"),
+                ("ci/pipeline", "aware", "mailer/1.2"),
+                ("ci/pipeline", "apply", "mailer/1.3"),
+            ]),
+        );
+        temp.write(
+            "course/docs/steps/en/mailer/1.3-ci.md",
+            "+++\nid = \"mailer/1.3-ci\"\n+++\n\n# Title\n\n## RECALL\n\n\
+             `ci/pipeline@aware` — `mailer/1.1`: the workspace split, which taught nothing about \
+             pipelines.\n\n## DELTA\n\n## TASK\n\n## DONE WHEN\n\n## TRAP\n",
+        );
+        let report = lint(&course).unwrap();
+        let issues: Vec<String> = report
+            .issues_for(Rule::ProseStructure)
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("never established those slots")),
+            "{issues:?}"
         );
     }
 
@@ -922,7 +1190,8 @@ mod tests {
         );
         temp.write(
             "course/docs/steps/en/mailer/1.2-toolchain.md",
-            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## WHY\n\n## DELTA\n\n## TASK\n\n## DONE WHEN\n\n## TRAP\n",
+            "+++\nid = \"mailer/1.2-toolchain\"\n+++\n\n# Title\n\n## WHY\n\n## DELTA\n\n\
+             ## TASK\n\n## DONE WHEN\n\n## TRAP\n",
         );
         let report = lint(&course).unwrap();
         let issues: Vec<String> = report

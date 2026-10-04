@@ -248,6 +248,11 @@ pub struct StepBody {
     pub headings: Vec<String>,
     /// Code fence contents, in order — a translation must not touch them.
     pub fences: Vec<String>,
+    /// The prose after the front matter, headings and all.
+    ///
+    /// `lint-caps` reads one section of it: a `deepen` or `transfer` step has to say *where* it
+    /// builds on, and "should be true" is not a rule a linter can enforce (authoring.md §4.3).
+    pub text: String,
 }
 
 /// Read and parse a step body.
@@ -265,7 +270,42 @@ pub fn read_step_body(path: &Path) -> Result<StepBody> {
             .map(|line| line.trim().to_owned())
             .collect(),
         fences: code_fences(body),
+        text: body.to_owned(),
     })
+}
+
+/// The prose under one section heading (`## RECALL`), up to the next heading of any level.
+///
+/// Case-insensitive in the heading name, and forgiving about the level (`#`, `##`, `###`): the
+/// section names are the contract, not the exact number of hashes.
+#[must_use]
+pub fn section_text(text: &str, section: &str) -> String {
+    let wanted = section
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .to_ascii_uppercase();
+    let mut inside = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let heading = line.trim_start().starts_with('#');
+        if heading {
+            let name = line
+                .trim_start()
+                .trim_start_matches('#')
+                .trim()
+                .to_ascii_uppercase();
+            if inside {
+                break;
+            }
+            inside = name == wanted;
+            continue;
+        }
+        if inside {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
 }
 
 /// Split a body into front matter and prose.

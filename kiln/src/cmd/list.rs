@@ -34,7 +34,10 @@ pub fn run(session: &Session, track: Option<&str>) -> Result<u8> {
 
     println!();
     println!("{done}/{total} steps done · `kiln run` judges a step, `kiln check` runs its gates");
-    println!("markers: ✓ step done · ◐ spec tests pass, gates still to run · · not started");
+    println!(
+        "markers: ✓ step done · ◐ spec tests pass, gates still to run · » skipped by plan --fast · \
+         · not started"
+    );
     if let Some(note) = session.locale_note()? {
         println!("{note}");
     }
@@ -85,7 +88,7 @@ pub fn first_unfinished<'a>(track: &'a Track, state: &State) -> Option<&'a Step>
     track
         .step
         .iter()
-        .find(|step| state.status(&step.qualified_id()) != StepStatus::Done)
+        .find(|step| state.status(&step.qualified_id()).is_unfinished())
 }
 
 /// Print one track and return `(steps done, steps total)`.

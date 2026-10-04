@@ -35,9 +35,13 @@ pub mod images;
 pub mod links;
 pub mod lint_caps;
 pub mod list;
+pub mod plan;
+pub mod probe;
 pub mod reset;
+pub mod review;
 pub mod run;
 pub mod selftest;
+pub mod skip;
 pub mod solution;
 pub mod spec;
 pub mod verify;
@@ -98,6 +102,71 @@ pub enum Command {
     ///
     /// Prose rules (R5) report themselves as skipped while step bodies are not authored yet.
     LintCaps,
+
+    /// Show the path through a track, and what skipping would skip.
+    ///
+    /// `--fast` marks every step whose capabilities a passed probe has already proven (plan §3 D4).
+    /// `kiln skip` acts on the plan; nothing here changes the learner's project.
+    Plan {
+        /// Track to plan (default: the course's default track).
+        #[arg(value_name = "TRACK")]
+        track: Option<String>,
+
+        /// Mark the steps a passed probe already proved, instead of listing every step.
+        #[arg(long)]
+        fast: bool,
+    },
+
+    /// Skip one step (or every step `plan --fast` would skip), applying its reference solution.
+    ///
+    /// A skip is recorded, never passed off as progress: `kiln list` shows the step as `»` and
+    /// `kiln reset <step>` puts it back on the list.
+    Skip {
+        /// Step to skip (default: the first step `plan --fast` would skip).
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
+
+        /// Skip every step of the default track that a passed probe has proven.
+        #[arg(long)]
+        all: bool,
+
+        /// Skip without probe evidence, recording that you did.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Re-check a capability with a 3–10 minute exercise (spaced repetition, plan §10).
+    ///
+    /// With no argument it lists the catalogue. `kiln review --due` says which ones are stale.
+    Probe {
+        /// Capability (`delivery/idempotency`), slot (`…@apply`) or probe slug.
+        #[arg(value_name = "CAPABILITY")]
+        capability: Option<String>,
+
+        /// Run the reference solution in your copy — a comparison, never evidence.
+        #[arg(long)]
+        solution: bool,
+
+        /// Put the course exercise back into your copy (discards your edits).
+        #[arg(long)]
+        reset: bool,
+
+        /// Course maintenance: every reference solution must compile and pass.
+        #[arg(long)]
+        check: bool,
+    },
+
+    /// What this learner has proven per capability, and what has gone stale.
+    Review {
+        /// Only list proofs older than DAYS (default: 45 days).
+        #[arg(
+            long,
+            value_name = "DAYS",
+            num_args = 0..=1,
+            default_missing_value = "45"
+        )]
+        due: Option<u64>,
+    },
 
     /// Run a step's spec tests (the fast path; default: the first unfinished step).
     Run {
@@ -271,6 +340,23 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::List { track }) => list::run(&session, track.as_deref()),
         Some(Command::Caps { track }) => caps::run(&session, track.as_deref()),
         Some(Command::LintCaps) => lint_caps::run(&session),
+        Some(Command::Plan { track, fast }) => plan::run(&session, track.as_deref(), *fast),
+        Some(Command::Skip { step, all, force }) => {
+            skip::run(&mut session, step.as_deref(), *all, *force)
+        }
+        Some(Command::Probe {
+            capability,
+            solution,
+            reset,
+            check,
+        }) => probe::run(
+            &mut session,
+            capability.as_deref(),
+            *solution,
+            *reset,
+            *check,
+        ),
+        Some(Command::Review { due }) => review::run(&session, *due),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
         Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),

@@ -4,13 +4,20 @@
 //! the must gates ever pass?) and *honesty* (was the reference solution applied, was a spec file
 //! edited?). Plan §3 D2: the runner does not prevent the second, it records it, because a
 //! self-study course that pretends its progress file is evidence would be lying.
+//!
+//! A third table, `capability`, answers a different question — *what has this learner proven, and
+//! when* — and it is what `kiln review --due` (spaced repetition) and `kiln plan --fast` (skip
+//! what is already proven) read. It is keyed by capability rather than by step because the ledger
+//! and the learner's memory decay on different schedules.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::caps::{CapRequirement, CapabilityId, Level};
 use crate::error::{KilnError, Result};
 use crate::info::FORMAT_VERSION;
 
@@ -22,8 +29,9 @@ pub const STATE_FILE: &str = "state.toml";
 /// Header written above the serialized progress so the file explains itself.
 const HEADER: &str = "\
 # Progress recorded by kiln. Personal state, not course content: it is git-ignored on purpose.
-# spec_passed and gates_passed are the record of what actually ran; solution_applied and
-# spec_modified say whether the result is the learner's own work (plan §3 D2).
+# spec_passed and gates_passed are the record of what actually ran; solution_applied,
+# spec_modified and skipped say whether the result is the learner's own work (plan §3 D2).
+# [capability] remembers what was proven and when, for `kiln review --due` and `kiln plan --fast`.
 ";
 
 /// What the learner has achieved on one step.
@@ -45,7 +53,42 @@ pub struct StepState {
     /// A spec file was modified after it was recorded.
     #[serde(default)]
     pub spec_modified: bool,
+    /// The learner skipped this step on purpose (`kiln skip`), because every slot it teaches was
+    /// proven elsewhere. Skipping is recorded, never passed off as progress (plan §3 D4).
+    #[serde(default)]
+    pub skipped: bool,
 }
+
+/// What the learner has proven about one capability (plan §3 D4, §10: spaced repetition).
+///
+/// One entry per capability, not per step: the ledger says *where a depth is first established*,
+/// while this says *what this learner has shown and when*. Two different facts, and `kiln review
+/// --due` exists because the second one decays.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityState {
+    /// Deepest depth the learner has been judged at.
+    pub level: Level,
+    /// Unix timestamp of the last proof, if one was recorded.
+    #[serde(default)]
+    pub last_verified: Option<u64>,
+    /// What proved it: a step id (`mailer/1.14-worker`) or a probe slug (`probe:...`).
+    pub evidence: String,
+}
+
+impl CapabilityState {
+    /// `true` when the proof came from a probe the learner passed, rather than from a step.
+    ///
+    /// `kiln plan --fast` skips a step only on this kind of evidence: a step that can be passed by
+    /// following a scaffold is not proof that the capability survived a month away from it.
+    #[must_use]
+    pub fn from_probe(&self) -> bool {
+        self.evidence.starts_with(EVIDENCE_PROBE_PREFIX)
+    }
+}
+
+/// Prefix marking probe evidence in [`CapabilityState::evidence`].
+pub const EVIDENCE_PROBE_PREFIX: &str = "probe:";
 
 /// How far a step got, as `kiln list` shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +99,8 @@ pub enum StepStatus {
     SpecPassed,
     /// Spec tests and must gates both passed.
     Done,
+    /// Skipped on purpose (`kiln skip`), with the capability proven by a probe instead.
+    Skipped,
 }
 
 impl StepStatus {
@@ -66,6 +111,7 @@ impl StepStatus {
             StepStatus::Pending => "·",
             StepStatus::SpecPassed => "◐",
             StepStatus::Done => "✓",
+            StepStatus::Skipped => "»",
         }
     }
 
@@ -76,6 +122,31 @@ impl StepStatus {
             StepStatus::Pending => "not verified",
             StepStatus::SpecPassed => "spec passes, gates pending",
             StepStatus::Done => "verified",
+            StepStatus::Skipped => "skipped (proved by probe)",
+        }
+    }
+
+    /// `true` when the learner still has work to do here.
+    #[must_use]
+    pub fn is_unfinished(self) -> bool {
+        matches!(self, StepStatus::Pending | StepStatus::SpecPassed)
+    }
+}
+
+/// How a capability was proven, for the report lines that name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Evidence<'a> {
+    /// Judged on a step: the step's id.
+    Step(&'a str),
+    /// Passed as a probe exercise: the probe's slug.
+    Probe(&'a str),
+}
+
+impl fmt::Display for Evidence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Evidence::Step(step) => f.write_str(step),
+            Evidence::Probe(slug) => write!(f, "{EVIDENCE_PROBE_PREFIX}{slug}"),
         }
     }
 }
@@ -89,6 +160,10 @@ pub struct State {
     /// One entry per step the learner has judged, keyed by qualified step id.
     #[serde(default)]
     pub steps: BTreeMap<String, StepState>,
+    /// One entry per capability the learner has proven, keyed by capability id
+    /// (`async/graceful-shutdown`). Written when a step is done and when a probe passes.
+    #[serde(default)]
+    pub capability: BTreeMap<String, CapabilityState>,
 }
 
 impl Default for State {
@@ -96,6 +171,7 @@ impl Default for State {
         Self {
             format_version: FORMAT_VERSION,
             steps: BTreeMap::new(),
+            capability: BTreeMap::new(),
         }
     }
 }
@@ -158,6 +234,7 @@ impl State {
         match (state.spec_passed, state.gates_passed) {
             (true, true) => StepStatus::Done,
             (true, false) => StepStatus::SpecPassed,
+            _ if state.skipped => StepStatus::Skipped,
             _ => StepStatus::Pending,
         }
     }
@@ -197,11 +274,54 @@ impl State {
     ///
     /// Deliberately partial — see [`StepState`] for which half is which. The progress flags are
     /// what the learner re-earns by redoing the step, so they go; the honesty markers are what keeps
-    /// `kiln verify` truthful, so they stay.
+    /// `kiln verify` truthful, so they stay. A skip is undone too: after a reset the step is real
+    /// work again, which is exactly what `kiln reset` is for.
     pub fn forget_progress(&mut self, step_id: &str) {
         let state = self.entry(step_id);
         state.spec_passed = false;
         state.gates_passed = false;
+        state.skipped = false;
+    }
+
+    /// Record that a step the learner skipped is behind them now.
+    pub fn record_skipped(&mut self, step_id: &str, skipped: bool) {
+        let state = self.entry(step_id);
+        state.skipped = skipped;
+    }
+
+    /// What this learner has proven about one capability, if anything.
+    #[must_use]
+    pub fn capability(&self, id: &CapabilityId) -> Option<&CapabilityState> {
+        self.capability.get(id.as_str())
+    }
+
+    /// Record that a capability was proven at a depth, and when.
+    ///
+    /// A deeper proof replaces a shallower one; a shallower one never overwrites a deeper record,
+    /// because the record answers "how deep has this learner been judged" and nothing un-judges it.
+    /// The timestamp is refreshed on every proof, which is what `kiln review --due` reads.
+    pub fn record_capability(&mut self, requirement: &CapRequirement, evidence: Evidence<'_>) {
+        let now = unix_now();
+        let entry = self
+            .capability
+            .entry(requirement.id.to_string())
+            .or_insert_with(|| CapabilityState {
+                level: requirement.level,
+                last_verified: None,
+                evidence: String::new(),
+            });
+        if requirement.level.rank() >= entry.level.rank() {
+            entry.level = requirement.level;
+        }
+        entry.last_verified = Some(now);
+        entry.evidence = evidence.to_string();
+    }
+
+    /// Record every slot a step establishes, with that step as the evidence.
+    pub fn record_step_capabilities(&mut self, requirements: &[CapRequirement], step_id: &str) {
+        for requirement in requirements {
+            self.record_capability(requirement, Evidence::Step(step_id));
+        }
     }
 
     /// Number of steps whose spec tests and gates both pass.
@@ -212,6 +332,21 @@ impl State {
             .filter(|state| state.spec_passed && state.gates_passed)
             .count()
     }
+
+    /// Number of steps the learner skipped on purpose.
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.steps
+            .values()
+            .filter(|state| !state.spec_passed && !state.gates_passed && state.skipped)
+            .count()
+    }
+}
+
+/// Whole days between two Unix timestamps (later first).
+#[must_use]
+pub fn days_between(later: u64, earlier: u64) -> u64 {
+    later.saturating_sub(earlier) / 86_400
 }
 
 /// Seconds since the Unix epoch, or 0 when the clock is before it.
@@ -300,5 +435,90 @@ mod tests {
         assert_eq!(state.status("mailer/1.1-workspace"), StepStatus::Pending);
         assert!(state.steps["mailer/1.1-workspace"].solution_applied);
         assert_eq!(state.done_count(), 0);
+    }
+
+    fn capability(text: &str) -> CapRequirement {
+        text.parse().expect("a capability requirement")
+    }
+
+    #[test]
+    fn a_skipped_step_is_not_progress_and_keeps_counting_as_unfinished() {
+        let mut state = State::default();
+        state.record_skipped("relay/2.1-project-skeleton", true);
+        assert_eq!(
+            state.status("relay/2.1-project-skeleton"),
+            StepStatus::Skipped
+        );
+        assert_eq!(state.done_count(), 0);
+        assert_eq!(state.skipped_count(), 1);
+        assert!(!StepStatus::Skipped.is_unfinished());
+
+        // A step that was skipped and then really done stops being a skip.
+        state.record_spec("relay/2.1-project-skeleton", true);
+        state.record_gates("relay/2.1-project-skeleton", true);
+        assert_eq!(state.status("relay/2.1-project-skeleton"), StepStatus::Done);
+
+        // And `kiln reset` puts the work back on the list.
+        state.forget_progress("relay/2.1-project-skeleton");
+        state.record_skipped("relay/2.1-project-skeleton", true);
+        state.forget_progress("relay/2.1-project-skeleton");
+        assert_eq!(
+            state.status("relay/2.1-project-skeleton"),
+            StepStatus::Pending
+        );
+    }
+
+    #[test]
+    fn capability_records_remember_the_deepest_proof_and_its_evidence() {
+        let mut state = State::default();
+        state.record_capability(
+            &capability("db/migrations@apply"),
+            Evidence::Step("mailer/1.9"),
+        );
+        let record = state
+            .capability(&CapabilityId::parse("db/migrations").unwrap())
+            .expect("a record");
+        assert_eq!(record.level, Level::Apply);
+        assert_eq!(record.evidence, "mailer/1.9");
+        assert!(!record.from_probe());
+        assert!(record.last_verified.is_some());
+
+        // A deeper proof raises the level; a shallower one cannot lower it.
+        state.record_capability(
+            &capability("db/migrations@design"),
+            Evidence::Probe("db-migrations.design"),
+        );
+        let record = state
+            .capability(&CapabilityId::parse("db/migrations").unwrap())
+            .unwrap();
+        assert_eq!(record.level, Level::Design);
+        assert!(record.from_probe());
+        state.record_capability(&capability("db/migrations@apply"), Evidence::Step("x/1.1"));
+        assert_eq!(
+            state
+                .capability(&CapabilityId::parse("db/migrations").unwrap())
+                .unwrap()
+                .level,
+            Level::Design
+        );
+    }
+
+    #[test]
+    fn capability_records_round_trip_and_older_state_files_still_load() {
+        let temp = TempDir::new("state-capability");
+        temp.write(
+            ".kiln/state.toml",
+            "format_version = 1\n\n[steps.\"mailer/1.9-postgres\"]\nspec_passed = true\n",
+        );
+        let mut state = State::load(temp.path()).expect("a state file without capability records");
+        assert_eq!(state.status("mailer/1.9-postgres"), StepStatus::SpecPassed);
+
+        state.record_step_capabilities(&[capability("db/migrations@apply")], "mailer/1.9-postgres");
+        state.save(temp.path()).unwrap();
+        let reloaded = State::load(temp.path()).unwrap();
+        let record = reloaded
+            .capability(&CapabilityId::parse("db/migrations").unwrap())
+            .expect("the record survived the file");
+        assert_eq!(record.evidence, "mailer/1.9-postgres");
     }
 }

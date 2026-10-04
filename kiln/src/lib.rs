@@ -29,6 +29,7 @@ pub mod hash;
 pub mod i18n;
 pub mod info;
 pub mod patch;
+pub mod probe;
 pub mod process;
 pub mod project;
 pub mod runtime;
