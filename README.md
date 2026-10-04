@@ -68,12 +68,11 @@ reference solution and gate wiring. T2–T5 are metadata and step tables only. M
 capability-dedup runtime); see [docs/plan.md](docs/plan.md) §11.
 
 The numbers below were measured on this machine. The timings are from `62e7c5c`; the link counts
-were re-measured after CI gained the link step (`dd47c11`, and again at `f62d497`), which is why
-they are the smaller set: a repository-wide report counts the repository's own pages and says which
-directories it skipped.
+were re-measured after CI gained the link step (`dd47c11`), which is why they are the smaller set: a
+repository-wide report counts the repository's own pages and says which directories it skipped.
 
 - `cargo xtask ci` — **579 s**, last line `22/22 step(s) hold the contract` (fmt, clippy
-  `-D warnings`, workspace tests 183+15+1, spec integrity 22 pinned, `kiln lint-caps`
+  `-D warnings`, workspace tests 184+15+1, spec integrity 22 pinned, `kiln lint-caps`
   `97 capabilities · 134 slots · 118 ledger positions · 22 authored steps`, `kiln links` offline,
   then `kiln selftest`).
 - `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0, `blocked`: 0,
