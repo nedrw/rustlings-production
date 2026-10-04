@@ -742,7 +742,8 @@ harness 里另一处真缺陷（会让测试连到别人的服务上），一并
 逐步串行的，不受影响。
 
 另外两条已知缺口（都不改，写在这里）：`xtask ci` 不跑 `kiln links`（只有每步的 `links` 门，且它只看
-项目内那一页），所以仓库文档的链接腐烂只有手工 `kiln links` 拦得住；`spec/1.6/logging.rs` 与
+项目内那一页），所以仓库文档的链接腐烂只有手工 `kiln links` 拦得住——**这条已在第十七段关掉，README
+的数字也在那一段改成可复现的口径**；`spec/1.6/logging.rs` 与
 `spec/1.9/migrations.rs` 仍自己挑端口——1.6 断言的是「启动行报告配置的那个端口」而其中一档是
 `level=error`（那时服务什么都不说，端口无从得知），1.9 要的端口就是「这里没人听」这个前提本身；
 两者的失败都会是响的。
@@ -760,3 +761,66 @@ harness 里另一处真缺陷（会让测试连到别人的服务上），一并
 
 同一三路负载此前两次里红一次（`spec_authz`）；现在是零，且容器与卷的数量在两轮前后都回到基线
 （不再有 VM 耗尽）。跑完之后又清掉了 2 个早先被杀死的进程留下的 `kiln-pg-*` 容器。
+
+## 第十七段 · 2026-10 · 评审里那条「已知缺口」关掉了：CI 也跑 `kiln links`
+
+第十六段把三件事写成**刻意的边界，以免被当成遗漏**：`spec/1.6` / `spec/1.9` 自己挑端口、`xtask ci`
+不跑 `kiln links`、README 的验收数字标注在 `c08f33a`。这一段处理后两条，第一条不动——它的理由（1.6 断言
+的是「启动行报告配置的那个端口」，其中一档 `level=error` 时服务什么都不说；1.9 要的端口就是「这里没人
+听」这个前提本身）仍然成立，两者的红都是响的。
+
+### `cargo xtask ci` 现在判仓库文档的链接
+
+`kiln links` 此前是唯一没人自动跑的防腐检查：CI 只判每一步项目内的 `links` 门，README 与 `docs/` 的
+链接腐烂要等维护者想起来手工跑一次。现在它在 `xtask ci` 的清单里（`lint-caps` 之后、`selftest` 之前），
+用的是同一个扫描器、同一套规则，离线；`--external` 仍然只是命令，任何门与 CI 步骤都不许调用它
+（plan §6）。
+
+### 一条规则：什么叫「这个仓库」
+
+新加的 `Course::project_roots()` 从各 track 的 `project` 设置推出一级目录（今天就是 `app`），
+`kiln links` 的默认报告与 `xtask ci` 的这一步都跳过它，并且**把跳过了谁打印出来**：
+
+```
+kiln links · /…/rustlings-production
+  30 page(s) · 200 link(s) · 119 external target(s)
+  skipped app/ — a learner's project, judged by its step's `links` gate (`kiln links app/<track>` checks one)
+✓ every target resolves without leaving this machine
+```
+
+理由是学习者的工作副本按设计就是半成品（1.19/1.22 的页面用 `TODO` 占位目标），它由那一步自己的
+`links` 门判；`cargo xtask ci` 判课程自己的文件。`kiln links <path>` 不变：给了一个路径就只判那棵树
+（那正是 `app/mailer/docs` 这类检查的入口）。实现上 `gates::links::scan_skipping(root, skip)` 只是让
+walk 按名字跳目录，`scan()` 本身不变（门的行为一字未动）。
+
+**顺带把 README 的数字改成可复现的口径**：原先「29 页 / 167 链」（`c08f33a`）与第十六段的「31 页 /
+208 链」都是**当时机器上有一个 `app/mailer`** 的读数，换台机器（或换个学习进度）就变；仓库自己的页面
+在任何机器上都是 **30 页 / 200 链 / 119 外链 / 0 findings**。README 现在按这个口径写，并写明计时数字
+来自 `62e7c5c`（这一步只给它加了 ~0.5s 的一行输出）。
+
+### 证据
+
+- `cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo test -p kiln` 绿，含新单测
+  `the_repository_scan_leaves_the_learner_s_project_out_and_the_gate_does_not`（同一棵树：仓库口径
+  干净，而把 `app/mailer` 当项目判则必红——两种读者、两个答案，都是对的）。
+- ci 里新步骤的输出：`30 page(s) · 200 link(s) · 119 external target(s) (not fetched)` +
+  `skipped app/ …`，然后在 `selftest` 之前通过。
+- `cargo xtask ci` 本身在 `dd47c11` 上**没有拿到绿**（见下），所以 README 的 ci/verify 计时仍写
+  `62e7c5c` 的 579s / 181s。
+
+### 没拿到绿的两次，以及它暴露的东西
+
+两次全量 `cargo xtask ci` 都是 **24–25 分钟、`16/22` 与 `19/22`**，红的三步是
+`mailer/1.9-postgres`、`mailer/1.10-domain-types`、`mailer/1.18-authz-boundary`，报告都是
+`BROKEN STEP: the spec passes on the scaffold`；同一时刻**另一个 thread（T2 `relay`）正在这台机器的
+podman VM 上跑 6–11 个 `kiln-relay-pg-*` 容器**，`load average` 6–12（4 vCPU / 4 GiB）。单独重跑：
+`selftest mailer/1.10-domain-types` → `1/1 step(s) hold the contract`（1m30s）；`1.18` 单独重跑则红在
+另一种形态——`the service stopped before it said where it listens: []`（服务起不来，容器/VM 抢不到资源
+的典型样子）。
+
+结论分两半，都要留着：**这次红不是这段改动**（它只动了 links 扫描与 `xtask` 的一步），是「两个 thread
+共用一台 4 vCPU/4 GiB 的机器」；但**「负载下 selftest 会把某几步判成『scaffold 上就通过』」本身是一条新
+观测**——被判成「通过」的运行退出码是 0，报告里只有 cargo 的旁白（`clip` 截的是开头），所以它不是
+「报告看不懂」，而是**判据在负载下翻转**。复现办法：另一个 thread 跑容器 spec 的同时跑全量
+`kiln selftest`；下次再红，先把那一步单独重跑对照，再按 `BROKEN STEP` 那条运行的实际退出码与输出（把
+`clip` 的截取范围放宽/打印尾部）查下去。

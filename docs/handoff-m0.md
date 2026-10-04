@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | 全部内容 + 契约 | `cargo xtask ci` **486s**，最后一行 `22/22 step(s) hold the contract` | fmt / clippy `-D warnings` / workspace 179+15+1 测试 / spec-integrity 22 pinned / `lint-caps` 97 caps·134 slots·118 positions·22 authored |
 | 逐步规格 | `kiln verify --json mailer` **205s**：`passed 22 · failed 0 · not_authored 0 · blocked 0` | 两个容器/文档步（1.21 10/10 门、1.22 9/9 门）也在里面 |
-| 链接（离线 + 外链） | `kiln links` 29 页 167 链 0 findings；`kiln links --external` **115s**：`112 answered · 7 unclear · 0 gone` | 那 7 个 `?` 都是本机当时连不上的主机（docs/hub.docker.com、en.wikipedia、research.google、web.dev、sre.google），不是 404 |
+| 链接（离线 + 外链） | `kiln links` 29 页 167 链 0 findings；`kiln links --external` **115s**：`112 answered · 7 unclear · 0 gone` | 那 7 个 `?` 都是本机当时连不上的主机（docs/hub.docker.com、en.wikipedia、research.google、web.dev、sre.google），不是 404；**当时的读法把机器上的 `app/mailer` 也算进了页数**，现在 `kiln links` 只报仓库自己的页面（30 页 199 链 119 外链，且 CI 会跑它），见 [../README.md](../README.md) 的 Status 段与日志第十七段 |
 | 无译文 locale | `kiln --lang ja list` exit 0，打印 `content locale: ja — 0/22 step bodies, falling back through ja -> en` | 回退链在报告里可见，不静默 |
 | 容器步 | 1.9 / 1.19 / 1.21 在本机 podman 下跑通（1.21 另有 `container-repro` 门：16.5 MB / 25 MB、7 行 `--check-config` 与宿主逐行相同） | `kiln selftest` 里每步都在跑 |
 

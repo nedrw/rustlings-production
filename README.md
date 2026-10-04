@@ -67,16 +67,22 @@ T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec 
 reference solution and gate wiring. T2–T5 are metadata and step tables only. M1 is next (T2 plus the
 capability-dedup runtime); see [docs/plan.md](docs/plan.md) §11.
 
-The numbers below were measured on this machine at commit `c08f33a`, on the frozen tree:
+The numbers below were measured on this machine. The timings are from `62e7c5c`; the link counts
+were re-measured after CI gained the link step (`dd47c11`, and again at `f62d497`), which is why
+they are the smaller set: a repository-wide report counts the repository's own pages and says which
+directories it skipped.
 
-- `cargo xtask ci` — **486 s**, last line `22/22 step(s) hold the contract` (fmt, clippy
-  `-D warnings`, workspace tests 179+15+1, spec integrity 22 pinned, `kiln lint-caps`
-  `97 capabilities · 134 slots · 118 ledger positions · 22 authored steps`).
-- `kiln verify --json mailer` — **205 s**, `"passed": 22, "failed": 0, `blocked`: 0,
+- `cargo xtask ci` — **579 s**, last line `22/22 step(s) hold the contract` (fmt, clippy
+  `-D warnings`, workspace tests 183+15+1, spec integrity 22 pinned, `kiln lint-caps`
+  `97 capabilities · 134 slots · 118 ledger positions · 22 authored steps`, `kiln links` offline,
+  then `kiln selftest`).
+- `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0, `blocked`: 0,
   "not_authored": 0`.
-- `kiln links` (offline, whole repository) — 29 pages, 167 links, 0 findings;
-  `kiln links --external` — 115 s, `112 answered · 7 unclear · 0 gone` (the seven `?` are hosts that
-  were unreachable from that network, not 404s).
+- `kiln links` (offline, the repository's own markdown) — 30 pages, 200 links, 119 external
+  targets, 0 findings; a learner's project under `app/` is skipped and named, so the number is the
+  same on a fresh clone as on a machine mid-course. `kiln links --external` — 115 s,
+  `112 answered · 7 unclear · 0 gone` (the seven `?` are hosts that were unreachable from that
+  network, not 404s).
 - `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/22 step bodies, falling back through
   ja -> en`.
 - The three container steps (1.9 Postgres, 1.19 mailpit, 1.21 the image itself) run under local
@@ -85,7 +91,7 @@ The numbers below were measured on this machine at commit `c08f33a`, on the froz
 
 ```sh
 cargo xtask ci           # the only entry point CI calls: fmt, clippy -D warnings, tests,
-                         # spec integrity, lint-caps, and `kiln selftest` (the anti-rot check)
+                         # spec integrity, lint-caps, the offline link check, `kiln selftest`
 cargo run -p kiln --     # continue at the first unfinished step
 cargo run -p kiln -- list
 cargo run -p kiln -- run mailer/1.22-runbook    # scaffold + spec tests (specs are synced into app/)
@@ -98,7 +104,7 @@ cargo run -p kiln -- plan --fast                # what a passed probe would let 
 cargo run -p kiln -- probe                      # the review exercises; `probe --check` validates them
 cargo run -p kiln -- review --due               # capabilities whose last proof is over 45 days old
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
-cargo run -p kiln -- links                      # every relative link in the repository, offline
+cargo run -p kiln -- links                      # the repository's own links, offline (learner projects aside)
 cargo run -p kiln -- spec restore               # put the course's spec files back
 cargo run -p kiln -- lint-caps                  # 97 capabilities, 134 slots, 118 planned, see below
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
