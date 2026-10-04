@@ -1,0 +1,363 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+new file mode 100644
+index 0000000..62e2d6b
+--- /dev/null
++++ b/docs/runbook.md
+@@ -0,0 +1,38 @@
++# Runbook: the service is degraded
++
++The page a responder reads when deliveries are not arriving and the service is still up. Everything
++in it is something a person can *do* or *look at*, and the three drills at the bottom are what makes
++it evidence rather than prose.
++
++This is the skeleton: the sections are the ones an incident needs, and every link is a placeholder
++until the step's last task is done — `kiln check relay/2.24-degradation-drill` runs the `links` gate
++over this file, and it fails while the targets are `TODO`.
++
++## Symptoms
++
++What does a responder see first, from the outside? (the alert, the metric, what a subscriber reports)
++
++## Signals
++
++| what to look at | where |
++| --- | --- |
++| [the number that says the queue is growing](TODO) | `GET /metrics` |
++| [the number that says deliveries are being given up on](TODO) | `GET /metrics` |
++| [the line in the log that says which delivery is being attempted](TODO) | |
++
++## Steps
++
++1. [what to check before touching anything](TODO)
++2. [what to look at when the database is the suspect](TODO)
++3. [what to look at when one subscriber is the suspect](TODO)
++4. [what to look at when one tenant is the suspect](TODO)
++
++## Verification
++
++- [the command that replays each drill](TODO)
++- [the number that has to be back where it was](TODO)
++
++## Escalation
++
++- [what to do when the subscriber is not coming back today](TODO)
++- [who or what to involve, and with what information](TODO)
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+new file mode 100644
+index 0000000..7fbb3d3
+--- /dev/null
++++ b/tests/support/drill.rs
+@@ -0,0 +1,313 @@
++//! The degradation drills (step `relay/2.24-degradation-drill`) — the shape of three of them, and not
++//! one of them yet.
++//!
++//! A drill is the only kind of evidence a runbook can rest on: a promise about what happens when
++//! something is *broken*, replayed on demand, in one command, without a staging environment. This
++//! file holds three of them, one per way this service degrades, and the shape they share:
++//!
++//! * **one scenario, one world.** A drill sets up the failure it is about (the worker loses its
++//!   database, the subscriber stops answering, one tenant floods), runs the service against it, and
++//!   reports what happened;
++//! * **the failure is real before the recovery means anything.** A recovery that arrives before the
++//!   failure has happened proves nothing about either, so the drill waits for the failure to be
++//!   observable in the service's own records;
++//! * **the numbers come from the service, not from the drill.** "Nothing was lost" is a claim about
++//!   the *service's* rows: every delivery it accepted has ended in `sent` or `dead`, and none is
++//!   still `pending`, `claimed` or `retrying`. A drill that reported what it arranged to happen
++//!   would be testing itself — which is what this version does, and what the spec's `Never` cases
++//!   are there to catch: a drill that answers the same thing about every world is a green light
++//!   wired to nothing;
++//! * **a drill can be re-run.** Each call starts a database of its own, so a drill is a command
++//!   somebody can type twice — before and after a change — rather than a ceremony.
++//!
++//! `Recovery` is the second axis: the same failure with the broken thing coming back, and with it
++//! never coming back. The first is the promise kept; the second is the case a runbook exists for,
++//! and a drill that cannot tell them apart cannot be evidence of anything.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++#[path = "load.rs"]
++mod load;
++#[path = "mod.rs"]
++mod support;
++
++use std::fmt;
++use std::sync::Arc;
++
++use relay::backoff::Budget;
++use relay::claim::LEASE;
++use relay::concurrency::{self, Gate, Limits, Worker};
++use relay::db::Db;
++use relay::delivery::Sender;
++use relay::lease;
++use relay::ordering::Lanes;
++use serde_json::json;
++use sqlx::PgPool;
++
++use load::Counted;
++use support::app::{self, App};
++use support::client::{Client, Request};
++use support::postgres::Postgres;
++use support::var;
++
++/// The tenant that floods, and the key it authenticates with.
++pub const ACME: (&str, &str) = ("acme", "key-acme-5f3d");
++/// The tenant that is only ever trying to be served, and its key.
++pub const GLOBEX: (&str, &str) = ("globex", "key-globex-91b7");
++/// How many events the drills that are not about a flood accept.
++const EVENTS: usize = 8;
++/// How many events the flood accepts before the storm starts.
++const FLOOD: usize = 24;
++/// How many events the storm accepts per turn, once it is going.
++const PER_TURN: usize = 4;
++/// How many turns a drill runs before it stops and reports.
++const TURNS: usize = 12;
++/// How many seats the drills work with.
++const SEATS: u32 = 4;
++
++/// The way this service degrades: one per drill.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Scenario {
++    /// The worker loses its database while it is holding deliveries it has claimed.
++    DatabaseAway,
++    /// The subscriber stops answering, so the attempts that are in flight stay in flight.
++    SlowSubscriber,
++    /// One tenant floods the queue and everybody else waits behind it.
++    TenantStorm,
++}
++
++impl fmt::Display for Scenario {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::DatabaseAway => formatter.write_str("the database goes away"),
++            Self::SlowSubscriber => formatter.write_str("the subscriber goes slow"),
++            Self::TenantStorm => formatter.write_str("one tenant floods the queue"),
++        }
++    }
++}
++
++/// Whether the thing that broke comes back.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Recovery {
++    /// It comes back, which is the world the runbook describes.
++    ComesBack,
++    /// It never comes back, which is the world the runbook exists for.
++    Never,
++}
++
++/// What one drill found, read from the service's own records.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Report {
++    /// Which degradation this was.
++    pub scenario: Scenario,
++    /// How many events the drill accepted before and during it.
++    pub accepted: usize,
++    /// How many deliveries have been taken by a subscriber.
++    pub delivered: i64,
++    /// How many the service gave up on.
++    pub dead: i64,
++    /// How many it still owes: `pending`, `claimed` or `retrying`, which is the number this whole
++    /// file is about.
++    pub outstanding: i64,
++    /// One line a person reads, in the service's own vocabulary.
++    pub what: String,
++}
++
++impl Report {
++    /// The promise: every delivery this service accepted ended in `sent` or `dead`.
++    ///
++    /// Not "the subscriber got everything" — a delivery that was given up on after its retry budget
++    /// is a delivery this service is *not* hiding (`relay/2.10-dlq`), and the count of those is in
++    /// [`Report::dead`]. What may not happen is a delivery that is still owed and that nobody will
++    /// ever attempt: that is a loss nobody notices.
++    #[must_use]
++    pub fn nothing_was_lost(&self) -> bool {
++        self.outstanding == 0
++    }
++}
++
++impl fmt::Display for Report {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "{scenario}: {} accepted, {delivered} sent, {dead} given up, {outstanding} still owed — \
++             {what}",
++            self.accepted,
++            scenario = self.scenario,
++            delivered = self.delivered,
++            dead = self.dead,
++            outstanding = self.outstanding,
++            what = self.what,
++        )
++    }
++}
++
++/// Run one drill, with the thing that broke coming back.
++#[must_use]
++pub fn run(scenario: Scenario) -> Report {
++    run_with(scenario, Recovery::ComesBack)
++}
++
++/// Run one drill, with `recovery` deciding whether the failure ends.
++///
++/// **This is the version that reports the promise kept whatever happens.** The world is set up — a
++/// database of this drill's own, the service running against it, the events accepted — and then the
++/// report is *decided here* rather than measured from the service: `delivered` is set to the number
++/// of events the drill accepted, and `outstanding` to zero, because that is the answer a first
++/// version of a drill usually hard-codes. Turning it into a drill means one thing per scenario:
++///
++/// * the failure has to be *real* before the recovery means anything — the worker has to lose the
++///   rows it is holding (the database goes away), the attempts have to be in flight (the subscriber
++///   parks them), the flood has to be queued behind the quiet tenant's event;
++/// * `Recovery` has to be obeyed: `ComesBack` lets the broken thing work again and the drill waits
++///   for the queue to move; `Never` leaves it broken, and the drill reports what is *still owed*;
++/// * the numbers have to be read from the service's records — `sent`, `dead`, and the three states
++///   that mean "still owed" — because a report that describes what the drill arranged is a test of
++///   the drill.
++#[must_use]
++pub fn run_with(scenario: Scenario, recovery: Recovery) -> Report {
++    let drill = Drill::start();
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .worker_threads(2)
++        .enable_all()
++        .build()
++        .expect("the drill's runtime starts");
++    let accepted = runtime.block_on(async {
++        match scenario {
++            Scenario::DatabaseAway => drill.accept_many(ACME.1, &keys("database-away", EVENTS)),
++            Scenario::SlowSubscriber => drill.accept_many(ACME.1, &keys("slow-subscriber", EVENTS)),
++            Scenario::TenantStorm => {
++                let flood = drill.accept_many(ACME.1, &keys("tenant-storm", FLOOD));
++                flood + drill.accept_many(GLOBEX.1, &keys("quiet-tenant", 1))
++            }
++        }
++    });
++    let _ = recovery;
++    Report {
++        scenario,
++        accepted,
++        delivered: i64::try_from(accepted).unwrap_or(i64::MAX),
++        dead: 0,
++        outstanding: 0,
++        what: "the report was decided by the drill rather than measured from the service"
++            .to_owned(),
++    }
++}
++
++/// `count` idempotency keys under `prefix`, unique within one drill.
++fn keys(prefix: &str, count: usize) -> Vec<String> {
++    (0..count)
++        .map(|index| format!("{prefix}-{index}"))
++        .collect()
++}
++
++/// One database and one service, for the length of one drill.
++struct Drill {
++    app: App,
++    postgres: Postgres,
++}
++
++impl Drill {
++    /// Start a service with both tenants, over a database of its own.
++    fn start() -> Self {
++        let postgres = Postgres::start();
++        let app = App::start(app::config(&[
++            var(app::DATABASE_URL, postgres.url()),
++            var(
++                app::BOOTSTRAP_TENANTS,
++                format!("{}={},{}={}", ACME.0, ACME.1, GLOBEX.0, GLOBEX.1),
++            ),
++            // The drills dial `127.0.0.1` (`relay/2.12-ssrf-defense`) and accept more events than
++            // any default quota allows (`relay/2.13-rate-limit`): what they are about is the queue,
++            // and a drill that spent somebody's quota would be measuring the limiter.
++            var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
++            var("RELAY__RATE_LIMIT__BURST", "100000"),
++            var("RELAY__RATE_LIMIT__PER_SECOND", "100000"),
++        ]));
++        let ready = app.client().get("/readyz");
++        assert_eq!(
++            ready.status, 200,
++            "the drill's service has to be serving before it reads a table: {}",
++            ready.body
++        );
++        Self { app, postgres }
++    }
++
++    /// A client for the drill's service.
++    fn client(&self) -> Client {
++        self.app.client()
++    }
++
++    /// Register a subscriber for the tenant that authenticates with `api_key`.
++    fn register(&self, api_key: &str, name: &str) -> String {
++        let target = format!("http://127.0.0.1:9/{name}");
++        let answer = self
++            .client()
++            .post_json("/endpoints", api_key, &json!({ "url": target }));
++        assert_eq!(
++            answer.status, 201,
++            "the drill registers {target}: {}",
++            answer.body
++        );
++        target
++    }
++
++    /// Accept every one of `keys` for the tenant that authenticates with `api_key`, and answer how
++    /// many the service accepted.
++    ///
++    /// Two different things are named `key` in this file and neither is the other: the *idempotency
++    /// key* of one event, and the *API key* of the tenant sending it. A drill that swapped them
++    /// would be a drill the service answers `401` to, which is a failure with a sentence rather than
++    /// a wrong number.
++    fn accept_many(&self, api_key: &str, keys: &[String]) -> usize {
++        let mut accepted = 0;
++        for idempotency in keys {
++            let answer = self.client().send(
++                Request::post("/events", Vec::new())
++                    .bearer(api_key)
++                    .header("idempotency-key", idempotency)
++                    .json(&json!({ "kind": "invoice.paid", "payload": { "n": 1 } })),
++            );
++            assert_eq!(
++                answer.status, 201,
++                "the drill offers `{idempotency}` and the service accepts it: {}",
++                answer.body
++            );
++            accepted += 1;
++        }
++        accepted
++    }
++
++    /// The pool the drills' workers run on: the service's own policy.
++    async fn pool(&self) -> PgPool {
++        Db::connect(&self.postgres.url())
++            .await
++            .expect("the drill's pool connects")
++            .pool()
++            .clone()
++    }
++
++    /// One number, as `psql` answers it.
++    fn count(&self, sql: &str) -> i64 {
++        self.postgres
++            .query(sql)
++            .trim()
++            .parse()
++            .unwrap_or_else(|error| panic!("`{sql}` answers a number: {error}"))
++    }
++
++    /// A worker with `seats` seats, delivering through `counted`.
++    fn worker(&self, pool: &PgPool, seats: u32, counted: &Arc<Counted>) -> Worker {
++        let limits = Limits::new(seats, 10_000).expect("seats and room for the queue");
++        let sender: Arc<dyn Sender> = Arc::clone(counted) as Arc<dyn Sender>;
++        Worker::new(
++            pool.clone(),
++            sender,
++            Arc::new(Gate::new(limits)),
++            Arc::new(Lanes::new()),
++            Budget::default(),
++            limits,
++            "drill-worker",
++        )
++    }
++}
