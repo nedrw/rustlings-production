@@ -1,0 +1,312 @@
+diff --git a/docs/adr/0001-at-least-once.md b/docs/adr/0001-at-least-once.md
+new file mode 100644
+index 0000000..49ba44b
+--- /dev/null
++++ b/docs/adr/0001-at-least-once.md
+@@ -0,0 +1,79 @@
++# 0001 — A delivery is at least once
++
++- **Status:** accepted (step `relay/2.6-at-least-once`)
++- **Context:** the module this decides about is [src/delivery.rs](../../src/delivery.rs), the claim
++  it works on is [src/claim.rs](../../src/claim.rs), and the rows are
++  [migrations/0005_deliveries.sql](../../migrations/0005_deliveries.sql).
++
++## Decision
++
++The service guarantees **at least once**: an event that was accepted is delivered to every endpoint
++its tenant had at that instant, and it is delivered *at least* once — possibly more.
++
++A delivery is written down as a row, and that row is only forgotten when one of two things is true:
++
++- the subscriber took the request (the row is `sent`); or
++- the worker gave up on it (the row is `dead`, with the reason kept).
++
++Everything else is still owed. A crash, a restart, a lost lease, a rolled-back deploy: the row is
++still there, still owed, and the next worker that claims it sends it again.
++
++Each attempt carries the **delivery id**, which does not change between attempts. That id is the
++receiver's contract: a subscriber that receives an event twice can tell a duplicate from a new event
++by it, and is expected to. The service guarantees delivery; the receiver guarantees deduplication.
++
++## Alternatives
++
++**Exactly once.** The property everybody wants and nobody can have across a network. The service
++would have to know that the subscriber *stored* the event, which means either the subscriber
++answering with an idempotency promise of its own, or a distributed transaction between a database
++and a stranger's HTTP server. The first is at-least-once plus a receiver that deduplicates — which is
++what we chose, minus the lie. The second cannot be built here and is not how the web works.
++
++**At most once** (send once, never retry). Removes duplicates and loses events: a subscriber
++restarting for five seconds loses everything sent in those seconds, and nothing anywhere knows. For
++a webhook that means an invoice that is never paid and no alert about it. Losing an event is worse
++than delivering one twice, because the duplicate is visible and the loss is not.
++
++**Exactly once, on our side, with a lock per delivery.** One worker holds a row, sends it, records
++it, and no other worker may touch it — which is what [src/claim.rs](../../src/claim.rs) already does
++*while the worker is alive*. It does not survive the worker dying between the send and the record,
++which is the window below. Any design that closes that window closes it on the receiver's side.
++
++**A queue product instead of a table** (SQS, RabbitMQ, Kafka). They all offer the same choice
++between at-least-once and their own exactly-once story, which is at-least-once with deduplication
++inside the broker — a real option, and a real dependency: the delivery state would move out of the
++database that holds the events, and the two would have to agree. This step keeps the queue in
++Postgres because the events are already there and a claim on a table is something a reader can
++follow.
++
++## Consequences
++
++- **Duplicates are possible and allowed.** Between the instant the subscriber has taken a request
++  and the instant the row says so there is a window: the worker can die (`kill -9`, an OOM kill, a
++  node that goes away), or the write can fail. The delivery comes back through the window and is
++  sent again. The spec of this step measures exactly that, by dropping a worker mid-flight.
++- **The subscriber has to be idempotent**, and the delivery id is what it needs: it is stable across
++  attempts, it is in every request, and it is the row's primary key — so a subscriber that records
++  what it has already handled can answer a duplicate with the same answer it gave the first time.
++- **Ordering is not promised.** Two attempts of one delivery can be in flight at the same time (a
++  lease that expired while the request was still travelling), and two deliveries of one event to a
++  tenant's endpoints are independent rows. Where a subscriber needs order, that is
++  `relay/2.9-ordering`, and it is a property to build rather than one to assume.
++- **Retries are bounded.** At-least-once means "until it is taken or given up on", so giving up has
++  to exist: a delivery that keeps failing is buried (`dead`) instead of being retried forever. What
++  counts as "keeps failing" — a budget, backoff with jitter, a breaker — is
++  `relay/2.8-retry-budget`; this step keeps the count and the state.
++- **The numbers have to be read carefully.** "Deliveries sent" is not "events delivered": a metric
++  counted on attempts grows with every duplicate. The delivery id is what makes the two countable
++  apart (step `relay/2.18-delivery-metrics`).
++- **The work has to be observable after the fact.** A buried delivery is a memory of a failure, so
++  `last_error` and `attempts` are kept on the row and never cleared except by a delivery that
++  succeeds — the alternative is an operator reading a log line, if it is still there.
++
++## What would make us revisit this
++
++A subscriber protocol with an acknowledgement we can trust (a signed receipt, a webhook callback
++with an idempotency key the subscriber issues), or a business case where a duplicate costs more than
++a loss — a payment webhook that is not idempotent, say. At that point the *decision* changes, not
++the implementation: the delivery id stays, and the receiver stops being asked to deduplicate.
+diff --git a/src/delivery.rs b/src/delivery.rs
+index 5e3c974..cfe2c3d 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -32,11 +32,15 @@
+ use std::fmt;
+ use std::future::Future;
+ use std::pin::Pin;
++use std::time::Duration;
+ 
++use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
++use sqlx::postgres::PgConnection;
+ use uuid::Uuid;
+ 
+-use crate::domain::EndpointUrl;
++use crate::claim;
++use crate::domain::{EndpointUrl, TenantId};
+ use crate::error::Error;
+ use crate::events::Event;
+ 
+@@ -135,6 +139,126 @@ pub struct Tick {
+ /// Returns [`Error::Database`] when the claim or one of the records fails. A failure here is not a
+ /// lost delivery: the row is wherever the last write left it, and the next turn finds it again.
+ pub async fn tick(pool: &PgPool, sender: &dyn Sender, worker: &str) -> Result<Tick, Error> {
+-    let _ = (pool, sender, worker);
+-    todo!("step relay/2.6-at-least-once")
++    let claimed = claim::claim(pool, worker, claim::BATCH, claim::LEASE).await?;
++    let mut report = Tick {
++        claimed: claimed.len(),
++        ..Tick::default()
++    };
++    for work in claimed {
++        // One-based, and read off the row rather than remembered by the worker: the attempts that
++        // failed before this one are a fact about the delivery, not about this process.
++        let attempt = work.attempts.saturating_add(1);
++        let request = SendRequest {
++            delivery: work.delivery,
++            event: work.event,
++            attempt,
++            url: work.url,
++        };
++
++        let outcome = match sender.send(request).await {
++            Ok(_receipt) => Outcome::Sent,
++            Err(SendError::Permanent(why)) => Outcome::Dead(why),
++            // The budget, spent: a delivery that has failed `MAX_ATTEMPTS` times is not retried
++            // again. Retrying forever is a subscriber that never learns the delivery is not coming,
++            // and a queue that never drains.
++            Err(SendError::Retryable(why)) if attempt >= MAX_ATTEMPTS => {
++                Outcome::Dead(format!("gave up after {attempt} attempts: {why}"))
++            }
++            Err(SendError::Retryable(why)) => Outcome::Retry(why),
++        };
++
++        // Every branch writes the outcome down. Nothing here sends a request and moves on without
++        // saying what happened to it: the gap between those two is the window this step's decision
++        // record is about, and the only thing that closes it is recording what is known.
++        let recorded = match &outcome {
++            Outcome::Sent => claim::mark_sent(pool, work.delivery).await?,
++            Outcome::Retry(why) => {
++                claim::mark_retry(pool, work.delivery, why, next_attempt(attempt)).await?
++            }
++            Outcome::Dead(why) => claim::mark_dead(pool, work.delivery, why).await?,
++        };
++        if !recorded {
++            // The row was not this worker's to record any more (its lease ran out and another worker
++            // took it over). Counting this as an outcome would be a claim about a delivery this
++            // worker does not know the end of.
++            report.lost += 1;
++            continue;
++        }
++        match &outcome {
++            Outcome::Sent => report.sent += 1,
++            Outcome::Retry(_) => report.retried += 1,
++            Outcome::Dead(_) => report.dead += 1,
++        }
++    }
++    Ok(report)
++}
++
++/// Write down what one accepted event owes: one delivery per endpoint of its tenant.
++///
++/// Takes a connection rather than a pool because it runs **inside the transaction that accepted the
++/// event** (`events::ingest`): an accepted event and the work it creates are one commit. A crash
++/// between the two would be an event nobody is ever told about, which is the one failure this
++/// service's guarantee does not allow.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the deliveries cannot be written.
++pub(crate) async fn fan_out(
++    connection: &mut PgConnection,
++    event: Uuid,
++    tenant: TenantId,
++) -> Result<u64, Error> {
++    // `on conflict do nothing` against `unique (event_id, endpoint_id)`: a fan-out that happens
++    // twice — a retried request, a replay, two processes — writes no second debt.
++    let written = sqlx::query(
++        "insert into deliveries (id, event_id, endpoint_id) \
++         select gen_random_uuid(), $1, endpoints.id from endpoints where endpoints.tenant_id = $2 \
++         on conflict (event_id, endpoint_id) do nothing",
++    )
++    .bind(event)
++    .bind(tenant.as_uuid())
++    .execute(connection)
++    .await
++    .map_err(Error::Database)?;
++    Ok(written.rows_affected())
++}
++
++/// What one attempt came to, before it is written down.
++enum Outcome {
++    /// The subscriber took it.
++    Sent,
++    /// Another attempt may succeed, with this reason.
++    Retry(String),
++    /// Nothing more will be tried, with this reason.
++    Dead(String),
++}
++
++/// How many failed attempts a delivery is given before it is buried.
++///
++/// A constant, and a small one: what a *deployment* wants here is a setting (with per-tenant
++/// budgets and a breaker), which is step `relay/2.8-retry-budget`. What matters now is that the
++/// number exists at all — a retry policy with no end is a delivery that is never late, only
++/// forever.
++pub const MAX_ATTEMPTS: i32 = 5;
++
++/// The wait after the first failure; each further failure doubles it.
++const BACKOFF: Duration = Duration::from_secs(30);
++/// The longest a delivery may wait between attempts.
++const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60 * 6);
++/// How many times the wait may double before `MAX_BACKOFF` takes over.
++const MAX_DOUBLINGS: u32 = 32;
++
++/// When a delivery that has failed `attempts` times may be tried again.
++///
++/// Exponential, deterministic, and without jitter: a fleet of workers retrying a subscriber that
++/// just came back all wake up on the same second. Jitter and a budget are step
++/// `relay/2.8-retry-budget`; the shape is here because a claim needs an instant to write down.
++fn next_attempt(attempts: i32) -> DateTime<Utc> {
++    let doublings = u32::try_from(attempts.max(1) - 1)
++        .unwrap_or(MAX_DOUBLINGS)
++        .min(MAX_DOUBLINGS);
++    let wait = BACKOFF
++        .saturating_mul(1u32 << doublings.min(31))
++        .min(MAX_BACKOFF);
++    Utc::now() + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::Duration::zero())
+ }
+diff --git a/src/events.rs b/src/events.rs
+index eea4b5a..3b98a5c 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -10,6 +10,11 @@
+ //! The promise rests on one row of `migrations/0003_events.sql`: `unique (tenant_id,
+ //! idempotency_key)`. Everything in this module is written around that index, because the
+ //! alternative — read, decide, write — is a race that two retries of one request lose together.
++//!
++//! Accepting an event is also the instant the service starts owing it to every endpoint of its
++//! tenant (`relay/2.6-at-least-once`), and the two are one commit: an event that exists without the
++//! work it created is an event nobody is ever told about, which is the one failure the delivery
++//! guarantee does not allow.
+ 
+ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+@@ -92,6 +97,10 @@ pub async fn ingest(
+     payload: &serde_json::Value,
+ ) -> Result<Ingested, Error> {
+     let id = Uuid::new_v4();
++    // The event and the deliveries it owes are written in one transaction, and committed together:
++    // an accepted event that nobody is ever told about is the failure this service promises not to
++    // have (see `docs/adr/0001-at-least-once.md`, in the project).
++    let mut transaction = pool.begin().await.map_err(Error::Database)?;
+     let written: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+         "insert into events (id, tenant_id, idempotency_key, kind, payload) \
+          values ($1, $2, $3, $4, $5::jsonb) \
+@@ -103,22 +112,29 @@ pub async fn ingest(
+     .bind(idempotency_key)
+     .bind(kind)
+     .bind(payload.to_string())
+-    .fetch_optional(pool)
++    .fetch_optional(&mut *transaction)
+     .await
+     .map_err(Error::Database)?;
+ 
+     match written {
+-        Some((id, received_at)) => Ok(Ingested::Accepted(Event {
+-            id,
+-            tenant_id: tenant,
+-            kind: kind.to_owned(),
+-            payload: payload.clone(),
+-            received_at,
+-        })),
++        Some((id, received_at)) => {
++            crate::delivery::fan_out(&mut transaction, id, tenant).await?;
++            transaction.commit().await.map_err(Error::Database)?;
++            Ok(Ingested::Accepted(Event {
++                id,
++                tenant_id: tenant,
++                kind: kind.to_owned(),
++                payload: payload.clone(),
++                received_at,
++            }))
++        }
+         // The key was taken, so the event is there: read it back and answer with *that*, which is
+         // the difference between "this is the event you sent" and "this is what you sent me just
+         // now". A client retrying a request it is unsure about needs the first of those.
+         None => {
++            // Nothing this transaction did is worth keeping, and a request that wrote no event must
++            // not write deliveries either.
++            transaction.rollback().await.map_err(Error::Database)?;
+             let (id, kind, payload, received_at): (Uuid, String, String, DateTime<Utc>) =
+                 sqlx::query_as(
+                     "select id, kind, payload::text, received_at from events \
+diff --git a/src/lib.rs b/src/lib.rs
+index a892dff..384c4be 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,6 +12,7 @@ pub mod auth;
+ pub mod claim;
+ pub mod config;
+ pub mod db;
++pub mod delivery;
+ pub mod domain;
+ pub mod error;
+ pub mod events;

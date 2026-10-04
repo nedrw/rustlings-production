@@ -10,4 +10,5 @@ format_version = 1
 "spec/2.2/ingest.rs" = "sha256:630fb551ae2b1089a1360ece37fd580a71bf1b7823889221880b0498011d1010"
 "spec/2.3/contract.rs" = "sha256:8e5c359cbca23db80b707e1ead184c5ea8b0f0dff282c1dcd7c510abd580e2d5"
 "spec/2.4/pagination.rs" = "sha256:ff6a4d6602d3af5e9f0ff8ddeb3bb38b60af8a6a84ca1ebe60b898ea90381c7b"
-"spec/2.5/claim.rs" = "sha256:b0baca528349d40fbc0c531351eb6a65ac11da4ad127b36c15cf8f74fd772820"
+"spec/2.5/claim.rs" = "sha256:648a0b1486a2c6bac60c1af45e09d665c3f124a2f8175aad4acbbe1c214c8fcb"
+"spec/2.6/at_least_once.rs" = "sha256:d101d926db84441744f80e3394f6b177d108ec2813759dabcbdf0f691c632dd6"

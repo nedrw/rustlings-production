@@ -524,7 +524,12 @@ async fn an_outcome_is_recorded_against_a_claim() {
             .expect("the update runs"),
         "a worker gives up on a delivery it holds"
     );
-    assert_eq!(fixture.row(next.delivery), "dead|0|the subscriber is gone");
+    assert_eq!(
+        fixture.row(next.delivery),
+        "dead|1|the subscriber is gone",
+        "the attempt that buried it is counted like any other failure: `attempts` answers \"how \
+         many attempts did this delivery fail\", whichever state that left it in"
+    );
     assert!(
         claim::claim(&pool, "worker-b", BATCH, LEASE)
             .await

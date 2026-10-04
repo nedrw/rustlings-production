@@ -1,0 +1,340 @@
+diff --git a/src/delivery.rs b/src/delivery.rs
+new file mode 100644
+index 0000000..5e3c974
+--- /dev/null
++++ b/src/delivery.rs
+@@ -0,0 +1,140 @@
++//! Delivery: what this service owes a subscriber, and what it does about what it owes.
++//!
++//! An event is accepted, and from that instant every endpoint of its tenant is owed one delivery.
++//! This module is the other half of that promise: what one worker *does* with a piece of work, and
++//! what the service guarantees while it does it.
++//!
++//! The guarantee is **at least once**, and it is a decision with a price:
++//!
++//! * a delivery is forgotten only when the subscriber has taken it (`sent`) or when the worker has
++//!   given up on it (`dead`). Everything in between is still owed, and comes back until one of those
++//!   two is true;
++//! * between the instant a subscriber has taken a request and the instant the row says so there is a
++//!   window: the worker can die, the write can fail. A delivery that returns through that window is
++//!   sent **twice**, and that is allowed — the receiver deduplicates on the delivery id, which is
++//!   why every attempt carries one.
++//!
++//! The argument for that guarantee, and what it costs, is written down in
++//! `docs/adr/0001-at-least-once.md`: a decision a reader can disagree with is worth more than a
++//! sentence buried in a comment.
++//!
++//! Two shapes in this file are decisions rather than taste:
++//!
++//! * **the port is a trait, and its future is boxed.** The worker holds `&dyn Sender`, because what
++//!   a deployment talks to is not a compile-time parameter, and a trait's `async fn` is not
++//!   dispatchable through a trait object. One allocation per attempt is the price of the seam —
++//!   the same trade `mailer/1.13-email-port` made for email;
++//! * **an attempt has two outcomes, not a hundred status codes.** The worker decides between "try
++//!   again" and "stop" and nothing else. What a 404 or a refused connection means is the *adapter's*
++//!   judgement (`relay/2.7-outbound-client`), and it arrives here as [`SendError::Retryable`] or
++//!   [`SendError::Permanent`].
++
++use std::fmt;
++use std::future::Future;
++use std::pin::Pin;
++
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::EndpointUrl;
++use crate::error::Error;
++use crate::events::Event;
++
++/// One attempt: what a subscriber is sent, and what makes this attempt identifiable.
++#[derive(Debug, Clone, PartialEq)]
++pub struct SendRequest {
++    /// The delivery row this attempt is for. Stable across attempts, which is what makes it the
++    /// receiver's deduplication key.
++    pub delivery: Uuid,
++    /// The event the subscriber is being told about.
++    pub event: Event,
++    /// Which attempt this is, counting from 1.
++    pub attempt: i32,
++    /// Where it goes.
++    pub url: EndpointUrl,
++}
++
++/// What a subscriber answered when it took the delivery.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Receipt {
++    /// The status the subscriber answered with.
++    pub status: u16,
++}
++
++/// Why an attempt failed, in the only two categories the worker acts on.
++///
++/// The words are kept: they end up in `last_error`, and the sentence an operator reads at 3 a.m. is
++/// the difference between "the subscriber is gone" and "the subscriber was busy".
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum SendError {
++    /// Trying again cannot help (a subscriber that answered "never send this again", a target this
++    /// service is not allowed to talk to). The delivery is buried.
++    Permanent(String),
++    /// The attempt failed for a reason that may pass (a timeout, a connection refused, a 5xx). The
++    /// delivery is owed again, later.
++    Retryable(String),
++}
++
++impl SendError {
++    /// The reason, as it will be written down.
++    #[must_use]
++    pub fn reason(&self) -> &str {
++        match self {
++            SendError::Permanent(why) | SendError::Retryable(why) => why,
++        }
++    }
++}
++
++impl fmt::Display for SendError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            SendError::Permanent(why) => write!(f, "permanent: {why}"),
++            SendError::Retryable(why) => write!(f, "retryable: {why}"),
++        }
++    }
++}
++
++/// The port: everything this service needs from "something that can hand a request to a subscriber".
++///
++/// `Debug` is a supertrait so that a value holding one can still be printed; `Send + Sync + 'static`
++/// are what a trait object moved between threads and held across `await` points needs.
++pub trait Sender: Send + Sync + fmt::Debug + 'static {
++    /// Hand one attempt to the subscriber.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`SendError::Retryable`] when another attempt may succeed, and
++    /// [`SendError::Permanent`] when it may not. Which of the two an adapter reports is the
++    /// adapter's judgement; what the worker does about it is this module's.
++    fn send(
++        &self,
++        request: SendRequest,
++    ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>>;
++}
++
++/// What one turn of the worker did.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Tick {
++    /// How many deliveries the claim handed to this worker.
++    pub claimed: usize,
++    /// How many the subscriber took.
++    pub sent: usize,
++    /// How many failed in a way that is worth another attempt.
++    pub retried: usize,
++    /// How many this worker gave up on.
++    pub dead: usize,
++    /// How many attempts could not be written down because the row was no longer this worker's to
++    /// record. Not a failure of the delivery: a fact about the worker that has to be visible.
++    pub lost: usize,
++}
++
++/// One turn of the worker: claim a batch, attempt each delivery, write down what happened.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim or one of the records fails. A failure here is not a
++/// lost delivery: the row is wherever the last write left it, and the next turn finds it again.
++pub async fn tick(pool: &PgPool, sender: &dyn Sender, worker: &str) -> Result<Tick, Error> {
++    let _ = (pool, sender, worker);
++    todo!("step relay/2.6-at-least-once")
++}
+diff --git a/tests/support/sender.rs b/tests/support/sender.rs
+new file mode 100644
+index 0000000..90a2086
+--- /dev/null
++++ b/tests/support/sender.rs
+@@ -0,0 +1,188 @@
++//! A sender that remembers: the fixture a spec hands to the worker instead of an HTTP client.
++//!
++//! The worker talks to [`relay::delivery::Sender`], so a spec does not need a subscriber to judge
++//! what the worker does: it needs something that *records* what it was asked to send and answers
++//! what the test says. That is all this is — no mocking framework, no expectations language, and
++//! nothing about the service, so a test that wants to know what happened reads [`Recording`].
++//!
++//! Three answers cover every test in the step:
++//!
++//! * **it takes it** (`200`), which is what a healthy subscriber does;
++//! * **it fails**, permanently or in a way worth another attempt — the two categories the worker
++//!   decides between;
++//! * **it never answers**, after recording the request and telling the test. That one exists to
++//!   reproduce a window rather than a state: the subscriber has the request and the worker is about
++//!   to be dropped mid-flight, which is what a process that dies between the send and the record
++//!   leaves behind.
++//!
++//! The spec loads this file with `#[path = "support/sender.rs"] mod sender;` — it is the harness,
++//! not the course, and `tests/support/mod.rs` does not have to mention it.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::collections::VecDeque;
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Mutex;
++
++use relay::delivery::{Receipt, SendError, SendRequest, Sender};
++use tokio::sync::oneshot;
++use uuid::Uuid;
++
++/// A subscriber that answers what the test planned, and keeps every request it was handed.
++pub struct Recording {
++    state: Mutex<State>,
++}
++
++/// What the sender holds while a test is running.
++struct State {
++    /// Requests in the order they arrived.
++    requests: Vec<SendRequest>,
++    /// One planned failure per attempt; an empty script means "answer with `then`".
++    script: VecDeque<SendError>,
++    /// What every attempt after the script is answered with: `None` takes the request.
++    then: Option<SendError>,
++    /// Failures for one target, whatever the script says.
++    refusing: Vec<(String, SendError)>,
++    /// The next attempt records itself, tells the test, and never answers.
++    park: Option<oneshot::Sender<()>>,
++}
++
++impl Recording {
++    /// A subscriber that takes everything.
++    #[must_use]
++    pub fn new() -> Self {
++        Self {
++            state: Mutex::new(State {
++                requests: Vec::new(),
++                script: VecDeque::new(),
++                then: None,
++                refusing: Vec::new(),
++                park: None,
++            }),
++        }
++    }
++
++    /// A subscriber that fails every attempt with `error`.
++    #[must_use]
++    pub fn always(error: SendError) -> Self {
++        let recording = Self::new();
++        recording.state().then = Some(error);
++        recording
++    }
++
++    /// A subscriber that fails the first attempts with `script`, in order, and then takes everything.
++    #[must_use]
++    pub fn scripted(script: Vec<SendError>) -> Self {
++        let recording = Self::new();
++        recording.state().script = script.into();
++        recording
++    }
++
++    /// A subscriber that takes everything except what goes to `url`, which fails with `error`.
++    ///
++    /// By target rather than in order, because a batch of deliveries arrives in the order the
++    /// database chose: a test that said "the second one fails" would be testing the sort.
++    #[must_use]
++    pub fn refusing(url: &str, error: SendError) -> Self {
++        let recording = Self::new();
++        recording.state().refusing = vec![(url.to_owned(), error)];
++        recording
++    }
++
++    /// A subscriber that records the next attempt, tells `called`, and then never answers.
++    ///
++    /// The worker stays parked in this future until the test drops it, which is how a spec
++    /// reproduces "the subscriber has it and the process died before the row said so".
++    #[must_use]
++    pub fn stuck(called: oneshot::Sender<()>) -> Self {
++        let recording = Self::new();
++        recording.state().park = Some(called);
++        recording
++    }
++
++    /// The requests this sender was handed, in order.
++    pub fn requests(&self) -> Vec<SendRequest> {
++        self.state().requests.clone()
++    }
++
++    /// The deliveries it was asked about, in order: one entry per attempt.
++    pub fn deliveries(&self) -> Vec<Uuid> {
++        self.state()
++            .requests
++            .iter()
++            .map(|request| request.delivery)
++            .collect()
++    }
++
++    /// Which attempt each request was, in order.
++    pub fn attempts(&self) -> Vec<i32> {
++        self.state()
++            .requests
++            .iter()
++            .map(|request| request.attempt)
++            .collect()
++    }
++
++    /// The state, whether or not another thread panicked while holding it.
++    fn state(&self) -> std::sync::MutexGuard<'_, State> {
++        self.state
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}
++
++impl Default for Recording {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl std::fmt::Debug for Recording {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Recording")
++            .field("requests", &self.state().requests.len())
++            .finish()
++    }
++}
++
++impl Sender for Recording {
++    fn send(
++        &self,
++        request: SendRequest,
++    ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
++        Box::pin(async move {
++            // The lock is released before anything is awaited: a sender that held it across a parked
++            // attempt would deadlock the next one, and the fixture would be the bug.
++            let (parked, answer) = {
++                let mut state = self.state();
++                let url = request.url.as_str().to_owned();
++                state.requests.push(request);
++                let parked = state.park.take();
++                let answer = state.answer(&url);
++                (parked, answer)
++            };
++            if let Some(called) = parked {
++                let _ = called.send(());
++                return std::future::pending::<Result<Receipt, SendError>>().await;
++            }
++            answer.map(|status| Receipt { status })
++        })
++    }
++}
++
++impl State {
++    /// What this sender answers a request to `url`.
++    fn answer(&mut self, url: &str) -> Result<u16, SendError> {
++        if let Some((_, error)) = self.refusing.iter().find(|(target, _)| target == url) {
++            return Err(error.clone());
++        }
++        if let Some(error) = self.script.pop_front() {
++            return Err(error);
++        }
++        match &self.then {
++            Some(error) => Err(error.clone()),
++            None => Ok(200),
++        }
++    }
++}
