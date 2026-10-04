@@ -607,16 +607,3 @@ index 7b1e852..46c6708 100644
  
  /// One environment variable, as a fixture passes it to the process it starts.
  ///
-diff --git a/tests/support/postgres.rs b/tests/support/postgres.rs
-index f6de540..dab96b5 100644
---- a/tests/support/postgres.rs
-+++ b/tests/support/postgres.rs
-@@ -17,8 +17,6 @@
- //!   `docker.1ms.run/library/postgres:17-alpine`. [`is_declared_image`] is the same rule `kiln`'s
- //!   `images` gate uses; the tests cannot depend on `kiln`, so the rule is written down here too.
- 
--#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
--
- use std::process::{Child, Command, Stdio};
- use std::sync::atomic::{AtomicU32, Ordering};
- use std::time::{Duration, Instant};

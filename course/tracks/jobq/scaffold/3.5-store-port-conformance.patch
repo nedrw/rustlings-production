@@ -175,10 +175,10 @@ index 0000000..180d3f8
 +}
 diff --git a/tests/support/postgres.rs b/tests/support/postgres.rs
 new file mode 100644
-index 0000000..f6de540
+index 0000000..dab96b5
 --- /dev/null
 +++ b/tests/support/postgres.rs
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,437 @@
 +//! A Postgres container for one test.
 +//!
 +//! The specs that need a database get one of their own: a container, an *empty* `jobq` database, a
@@ -197,8 +197,6 @@ index 0000000..f6de540
 +//!   `postgres:17-alpine` also counts as present when it is cached as
 +//!   `docker.1ms.run/library/postgres:17-alpine`. [`is_declared_image`] is the same rule `kiln`'s
 +//!   `images` gate uses; the tests cannot depend on `kiln`, so the rule is written down here too.
-+
-+#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
 +
 +use std::process::{Child, Command, Stdio};
 +use std::sync::atomic::{AtomicU32, Ordering};
