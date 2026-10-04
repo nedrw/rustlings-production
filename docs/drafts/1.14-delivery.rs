@@ -1,10 +1,12 @@
-// DRAFT for step `mailer/1.14-worker` — not compiled by anything.
+// ARCHIVED DRAFT for step `mailer/1.14-worker` — not compiled by anything, and not needed to do
+// the step: the step landed in `32c5489` and `course/tracks/mailer/solutions/1.14-worker.patch`
+// is the reference solution. This file is the working file of the session that wrote it (the
+// bounded queue, its worker, the retry policy and their unit tests), kept as a worked example of
+// how the queue can be written; the wiring listed below was completed at commit time.
 //
-// This is the working tree's `app/mailer/src/delivery.rs` as of the eighth chunk: the bounded queue,
-// its worker, the retry policy and the unit tests are written and green, and what is left is the
-// wiring the handoff lists (permit into `subscribe`, the shutdown twins of `serve`/`serve_on`,
-// `main.rs`'s signal handling, the step's spec, patches and body). It lives here because `app/` is not
-// replicated between worktrees: copy it back to `app/mailer/src/delivery.rs` to continue.
+// The list that follows was true when the draft was saved: what was left was the wiring (permit
+// into `subscribe`, the shutdown twins of `serve`/`serve_on`, `main.rs`'s signal handling, the
+// step's spec, patches and body).
 //
 // The queue's `Cargo.toml` counterpart (already applied in the tree) is the `test-util` feature on
 // `tokio`, which is what makes the paused clock available to the retry tests.

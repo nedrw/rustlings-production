@@ -1,4 +1,10 @@
-# 1.21-container：一份能跑的镜像设计（2026-10 实测，未落地）
+# 1.21-container：一份能跑的镜像设计（2026-10 实测草稿，已归档）
+
+> **这一步已经落地**（`0a7e7da`）：正文在 `course/docs/steps/en/mailer/1.21-container.md`，参考解在
+> `course/tracks/mailer/solutions/1.21-container.patch`，不要再照本文件的「落地清单」执行——它只记录
+> 当时打算怎么做。下面的 16.5 MB 与热构建数字与落地版本一致；三处按实测改掉了：**基础镜像要显式选本机
+> 架构的那份**、**构建缓存是「可选」不是「强加」**（夹具传 `CARGO_TARGET_DIR`，Dockerfile 可以不认）、
+> **1.21 的截止时间写进 `run.timeout = 1800`**。详见 `handoff-m0-log.md` 第十四段。
 
 `app/` 不跨 worktree 复制，所以这一版放在这里：把四个文件拷回
 `app/mailer/{Dockerfile,.dockerignore,tests/spec_image.rs,tests/support/container.rs}` 即可复现下面的数字。
