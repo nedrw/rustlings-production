@@ -443,7 +443,11 @@ impl Worker {
                 // where it is: nothing was settled, so the lease will bring it back — to a worker
                 // whose handler does not panic, which is the point of a lease.
                 Some(Err(join)) => {
-                    tracing::error!(worker = %self.settings.name, error = %join, "a job's task did not finish")
+                    tracing::error!(
+                        worker = %self.settings.name,
+                        error = %join,
+                        "a job's task did not finish"
+                    );
                 }
                 Some(Ok(Err(error))) => return Err(error),
                 None => break,

@@ -241,7 +241,11 @@ impl Store for MemoryStore {
             };
             if !Ledger::holds(job, worker) {
                 return Err(Error::Invalid {
-                    detail: refused(job, worker, "only the worker that claimed it can complete it"),
+                    detail: refused(
+                        job,
+                        worker,
+                        "only the worker that claimed it can complete it",
+                    ),
                 });
             }
             let attempt = job.attempts;
@@ -374,7 +378,9 @@ impl Store for MemoryStore {
                 // The instant decides, not the owner: the worker that took this row may still be
                 // alive and merely stuck, and it is the lease — the promise it failed to keep —
                 // that says the row belongs to somebody else now.
-                if job.state == JobState::Running && job.lease_expires_at.is_some_and(|at| at <= now) {
+                if job.state == JobState::Running
+                    && job.lease_expires_at.is_some_and(|at| at <= now)
+                {
                     expired.push((*id, put_back(job, ABANDONED)));
                 }
             }

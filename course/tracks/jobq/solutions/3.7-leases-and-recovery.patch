@@ -1583,7 +1583,7 @@ index 1e27092..5f719ad 100644
      match url.split_once('@') {
          Some((credentials, host)) => {
 diff --git a/src/service/worker.rs b/src/service/worker.rs
-index c6fd4f8..c4eed4c 100644
+index c6fd4f8..91de070 100644
 --- a/src/service/worker.rs
 +++ b/src/service/worker.rs
 @@ -36,9 +36,12 @@ use std::sync::Arc;
@@ -1599,7 +1599,7 @@ index c6fd4f8..c4eed4c 100644
  use crate::engine::store::{BoxFuture, Store};
  
  /// What a worker does with a job it has claimed.
-@@ -316,7 +319,221 @@ impl Worker {
+@@ -316,7 +319,225 @@ impl Worker {
      /// cannot make, a reclaim it cannot complete. A job that fails is not an error here — it is
      /// [`Store::fail`], and the report counts it.
      pub async fn run(&self, shutdown: Shutdown) -> Result<Report, Error> {
@@ -1729,7 +1729,11 @@ index c6fd4f8..c4eed4c 100644
 +                // where it is: nothing was settled, so the lease will bring it back — to a worker
 +                // whose handler does not panic, which is the point of a lease.
 +                Some(Err(join)) => {
-+                    tracing::error!(worker = %self.settings.name, error = %join, "a job's task did not finish")
++                    tracing::error!(
++                        worker = %self.settings.name,
++                        error = %join,
++                        "a job's task did not finish"
++                    );
 +                }
 +                Some(Ok(Err(error))) => return Err(error),
 +                None => break,
