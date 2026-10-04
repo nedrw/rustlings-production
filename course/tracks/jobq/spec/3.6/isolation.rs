@@ -33,6 +33,13 @@
 //!   the trail, its idempotence, the retry loop's own mechanics — runs on both backends, which is
 //!   what the `conformance@2` gate re-runs.
 
+// A test may read the wall clock; the *library* may not, and `jobq/3.8-clock-injection` is where the
+// project's `clippy.toml` started refusing it — for every target, which is why the relaxation has to
+// be written down here rather than left to a reviewer to remember (authoring.md §7.4). This file
+// needs a real instant to say what a store that was *not* handed a clock does, and to compare a
+// lease against the process's own clock rather than against an injected one.
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use std::sync::Arc;

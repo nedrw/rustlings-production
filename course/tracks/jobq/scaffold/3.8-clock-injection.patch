@@ -1,0 +1,68 @@
+diff --git a/clippy.toml b/clippy.toml
+new file mode 100644
+index 0000000..e53e8d5
+--- /dev/null
++++ b/clippy.toml
+@@ -0,0 +1,12 @@
++# Reading the clock is a dependency, and dependencies are injected
++# (step `jobq/3.8-clock-injection`).
++#
++# `clippy@3` turns these into errors on library code, so what keeps the rule is the compiler rather
++# than a reviewer's memory. `SystemClock` is the one place allowed to read the wall clock; it says so
++# with an `#[allow]` and a reason, and every other instant in the crate comes through
++# `jobq::engine::Clock`.
++disallowed-methods = [
++    "chrono::Utc::now",
++    "chrono::Local::now",
++    "std::time::SystemTime::now",
++]
+diff --git a/src/engine/clock.rs b/src/engine/clock.rs
+new file mode 100644
+index 0000000..d8f2117
+--- /dev/null
++++ b/src/engine/clock.rs
+@@ -0,0 +1,44 @@
++//! The clock, as a dependency rather than a call.
++//!
++//! Two instants decide what this engine does — when a job becomes due, and when a claim stops being
++//! good — and both of them are read somewhere. Reading them from the operating system is the obvious
++//! thing to do, and it makes two promises impossible to keep:
++//!
++//! * **a test cannot move time.** The only way to watch a lease expire, or a job become due, is to
++//!   wait for it, and a suite that waits is slow on a good day and flaky on a bad one;
++//! * **a process has two clocks.** The row was stamped by one worker and is reclaimed by another; if
++//!   each reads its own wall clock, "the lease has expired" is an opinion rather than a fact.
++//!
++//! So the instant comes from a port. Step `jobq/3.8-clock-injection` is where the stores stop
++//! reading the clock themselves and start asking for it; this file is what they ask through.
++//!
++//! The port is deliberately *not* sealed (compare [`crate::engine::sealed`]): the engine certifies
++//! its own backends with the conformance suite, but a clock is a thing a caller has to be able to
++//! implement — a test with a clock it controls is exactly the caller this exists for.
++
++use chrono::{DateTime, Utc};
++
++/// What the engine asks when it needs to know what time it is.
++pub trait Clock: Send + Sync + std::fmt::Debug + 'static {
++    /// The current wall-clock instant, in UTC.
++    ///
++    /// Wall clock, not monotonic: this is the clock a job's `run_at` and a lease's expiry are written
++    /// in, and those have to mean the same thing to two processes. Measuring how long something took
++    /// is a different question with a different answer ([`std::time::Instant`]), and mixing the two
++    /// is how a leap second becomes a lost job.
++    fn now(&self) -> DateTime<Utc>;
++}
++
++/// The clock a process uses when nobody says otherwise.
++#[derive(Debug, Clone, Copy, Default)]
++pub struct SystemClock;
++
++impl Clock for SystemClock {
++    // The one place in this crate that may read the wall clock directly, which is the whole point of
++    // the port: `clippy.toml` refuses `Utc::now` everywhere else (`clippy@3`'s `disallowed_methods`),
++    // so this exception is the only one and it is the one whose file name says why.
++    #[allow(clippy::disallowed_methods)]
++    fn now(&self) -> DateTime<Utc> {
++        Utc::now()
++    }
++}

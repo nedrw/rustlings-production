@@ -1,0 +1,245 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index c601957..f1fd434 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -18,6 +18,7 @@
+ //! `pub(crate)` module and `retry` — the module — is too, while `retry`, the *function*, is
+ //! re-exported below), so the next release can move them without touching anybody.
+ 
++pub(crate) mod clock;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
+@@ -27,6 +28,7 @@ pub(crate) mod store;
+ 
+ mod sealed;
+ 
++pub use clock::{Clock, SystemClock};
+ pub use domain::{
+     DEFAULT_MAX_ATTEMPTS, Job, JobId, JobState, QUEUE_NAME_MAX, Queue, SubmitRequest, WorkerId,
+ };
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 4bed832..685e9dd 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -18,11 +18,12 @@
+ //! counts from the worker the row still names.
+ 
+ use std::collections::BTreeMap;
+-use std::sync::{Mutex, MutexGuard, PoisonError};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ 
++use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+@@ -98,6 +99,8 @@ pub struct MemoryStore {
+     ledger: Mutex<Ledger>,
+     /// How long a claim by this store is good for.
+     lease: Duration,
++    /// The clock every instant this store writes is read from.
++    clock: Arc<dyn Clock>,
+ }
+ 
+ impl Default for MemoryStore {
+@@ -105,6 +108,7 @@ impl Default for MemoryStore {
+         Self {
+             ledger: Mutex::default(),
+             lease: DEFAULT_LEASE,
++            clock: Arc::new(SystemClock),
+         }
+     }
+ }
+@@ -128,6 +132,16 @@ impl MemoryStore {
+         self
+     }
+ 
++    /// The same store, reading every instant from `clock` (`jobq/3.8-clock-injection`).
++    ///
++    /// A store built without one reads the system clock, which is what a process wants and what a
++    /// test that has to move time cannot use.
++    #[must_use]
++    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
++        self.clock = clock;
++        self
++    }
++
+     /// The store's contents, taken without a panic path: a poisoned mutex means some other thread
+     /// died holding it, and refusing to read the jobs after that would turn one thread's panic into
+     /// the whole process's.
+@@ -185,7 +199,7 @@ impl Store for MemoryStore {
+                 // instant: the caller's clock is not the store's, and only one of them is the
+                 // authority on when a job is due (step `jobq/3.8-clock-injection` moves this read
+                 // behind an injected clock).
+-                run_at: request.run_at.unwrap_or_else(Utc::now),
++                run_at: request.run_at.unwrap_or_else(|| self.clock.now()),
+                 attempts: 0,
+                 max_attempts: request.max_attempts,
+                 last_error: None,
+@@ -205,7 +219,7 @@ impl Store for MemoryStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            let now = Utc::now();
++            let now = self.clock.now();
+             // One lock, one decision: choosing the due jobs, stamping them running and leasing them
+             // happen in the same critical section, so a second claim on this store cannot read the
+             // same row as free while this one is on its way to marking it running.
+@@ -261,7 +275,7 @@ impl Store for MemoryStore {
+                 EventKind::Completed,
+                 attempt,
+                 None,
+-                Utc::now(),
++                self.clock.now(),
+             ));
+             Ok(())
+         })
+@@ -305,7 +319,7 @@ impl Store for MemoryStore {
+                 EventKind::AttemptFailed,
+                 attempt,
+                 Some(reason.to_owned()),
+-                Utc::now(),
++                self.clock.now(),
+             ));
+             Ok(state)
+         })
+@@ -331,7 +345,7 @@ impl Store for MemoryStore {
+ 
+     fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+         Box::pin(async move {
+-            let until = Utc::now() + self.lease;
++            let until = self.clock.now() + self.lease;
+             let mut ledger = self.ledger();
+             let mut renewed = 0;
+             for job in ledger.jobs.values_mut() {
+@@ -348,7 +362,7 @@ impl Store for MemoryStore {
+ 
+     fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
+         Box::pin(async move {
+-            let now = Utc::now();
++            let now = self.clock.now();
+             let mut ledger = self.ledger();
+             let mut handed_back = Vec::new();
+             for (id, job) in ledger.jobs.iter_mut() {
+@@ -371,7 +385,7 @@ impl Store for MemoryStore {
+ 
+     fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
+         Box::pin(async move {
+-            let now = Utc::now();
++            let now = self.clock.now();
+             let mut ledger = self.ledger();
+             let mut expired = Vec::new();
+             for (id, job) in ledger.jobs.iter_mut() {
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 2bc7d71..3d7d428 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -33,6 +33,7 @@
+ //! and the port's methods are the only place the column names appear: no other file in the crate
+ //! knows that jobs live in a table.
+ 
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+@@ -40,6 +41,7 @@ use sqlx::postgres::{PgConnection, PgPoolOptions};
+ use sqlx::{PgPool, Postgres, Transaction};
+ use uuid::Uuid;
+ 
++use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+@@ -65,6 +67,8 @@ pub struct PostgresStore {
+     pool: PgPool,
+     /// How long a claim by this store is good for.
+     lease: Duration,
++    /// The clock every instant this store writes is read from.
++    clock: Arc<dyn Clock>,
+ }
+ 
+ impl PostgresStore {
+@@ -83,6 +87,7 @@ impl PostgresStore {
+         Ok(Self {
+             pool,
+             lease: DEFAULT_LEASE,
++            clock: Arc::new(SystemClock),
+         })
+     }
+ 
+@@ -96,6 +101,18 @@ impl PostgresStore {
+         self.lease = lease;
+         self
+     }
++
++    /// The same store, reading every instant from `clock` (`jobq/3.8-clock-injection`).
++    ///
++    /// The instants this backend writes are the ones it *binds*, not the database's `now()`: two
++    /// processes have to agree on when a lease expires, and the only clock they can both be talking
++    /// about is the one they were handed (`jobq/3.5-store-port-conformance` made the same call for
++    /// `run_at`).
++    #[must_use]
++    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
++        self.clock = clock;
++        self
++    }
+ }
+ 
+ impl Sealed for PostgresStore {}
+@@ -145,7 +162,7 @@ impl Store for PostgresStore {
+             // engine's clock — the same one the in-memory backend reads (step
+             // `jobq/3.8-clock-injection` moves it behind an injected clock for both of them at
+             // once).
+-            .bind(request.run_at.unwrap_or_else(Utc::now))
++            .bind(request.run_at.unwrap_or_else(|| self.clock.now()))
+             // `i64::from(u32)` is total, which is why the budget column is a `bigint`: storing it
+             // as a 32-bit integer would make "the caller asked for more attempts than the table
+             // holds" a case this method has to answer, and there is no good answer to it.
+@@ -164,7 +181,7 @@ impl Store for PostgresStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            let now = Utc::now();
++            let now = self.clock.now();
+             // One statement, and the shape of it is the whole promise: the rows are chosen with
+             // `for update skip locked` *inside* the update that stamps them, so a second claim
+             // running at the same time either waits for nothing (the row is already taken and it
+@@ -274,7 +291,7 @@ impl Store for PostgresStore {
+             .bind(worker.as_str())
+             // The engine's clock again, bound in: a renewal measured against the database's clock
+             // would be a second authority on how long a lease is.
+-            .bind(Utc::now() + self.lease)
++            .bind(self.clock.now() + self.lease)
+             .execute(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -293,7 +310,7 @@ impl Store for PostgresStore {
+                 .bind(worker.as_str())
+                 .bind(HANDED_BACK)
+                 .bind(EventKind::Reclaimed.as_str())
+-                .bind(Utc::now())
++                .bind(self.clock.now())
+                 .execute(&self.pool)
+                 .await
+                 .map_err(refused)?;
+@@ -304,7 +321,7 @@ impl Store for PostgresStore {
+     fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
+         Box::pin(async move {
+             let written = sqlx::query(RECLAIM)
+-                .bind(Utc::now())
++                .bind(self.clock.now())
+                 .bind(RECLAIM_BATCH)
+                 .bind(ABANDONED)
+                 .bind(EventKind::Reclaimed.as_str())
+@@ -556,7 +573,7 @@ impl PostgresStore {
+                 change.kind(),
+                 count(attempts, "attempts")?,
+                 change.detail(),
+-                Utc::now(),
++                self.clock.now(),
+             ),
+         )
+         .await?;
