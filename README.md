@@ -83,12 +83,13 @@ working copy, judged by its step's own `links` gate).
   `97 capabilities · 134 slots · 118 ledger positions · 46 authored steps`, `kiln links` offline,
   `kiln probe --check` 19/19, and `kiln selftest` — last lines `22/22 step(s) hold the contract` and
   `xtask ci: all checks passed`. (Measured with libtest serialized to dodge the fixture collision
-  `bf9ac5f` fixes; that workaround is no longer needed.)
+  `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 today — six arrived
+  with the report-wording fix, not with a change to what is judged.)
 - `kiln selftest --track relay` — **476 s**, `24/24 step(s) hold the contract`: every T2 step's spec
   fails on its scaffold, passes on the reference solution, and every must gate is green.
 - `kiln verify relay` — **155 s**, `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without
   content`; `kiln caps --track relay` shows the six exit capabilities verified.
-- `kiln links` (offline, the repository's own markdown) — 57 pages, 369 links, 228 external targets,
+- `kiln links` (offline, the repository's own markdown) — 57 pages, 370 links, 228 external targets,
   0 findings; a learner's project under `app/` is skipped and named, so the number is the same on a
   fresh clone as on a machine mid-course. `kiln links --external` — **115 s** (M0 tree),
   `112 answered · 7 unclear · 0 gone` (the seven `?` are hosts that were unreachable from that

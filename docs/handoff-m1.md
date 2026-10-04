@@ -10,7 +10,7 @@
 | 验收项 | 判据 | 状态 |
 | --- | --- | --- |
 | `kiln lint-caps` 全仓通过 | R0–R6（含 R5 的 RECALL 真实性检查）零 issue | 见 §3 |
-| T2 的 7 个 deepen/transfer 步没有 WHY 段 | `lint-caps` R5：`origin = deepen/transfer` 的正文必须 RECALL + DELTA | 见 §3 |
+| T2 的 **6** 个 deepen/transfer 步（1 transfer + 5 deepen，见 `track.toml` 与 curriculum §7）没有 WHY 段 | `lint-caps` R5：`origin = deepen/transfer` 的正文必须 RECALL + DELTA | 见 §3 |
 | `kiln plan --fast` 能正确跳过 T1 已证明的能力 | 证据必须是**通过的 probe**，不是完成的步骤 | 见 §2.3 |
 | `kiln review --due` 有真实 probe 题 | `course/probes/` 里的题真的能失败、参考解真的能过 | 见 §2.2 |
 
@@ -41,7 +41,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
   `--solution` 把参考答案写进你的副本（只做对照，不记证据）、`--reset` 恢复原题；
 - `kiln probe --check`（在 `cargo xtask ci` 里跑）编译并运行每一份参考答案：题坏了不能悄悄躺着；
 - `kiln review [--due [DAYS]]`：按上表列出「证明过什么、多久以前」，默认 45 天窗口，最旧的先列，
-  每行给出重新抽查的命令。没有 probe 的槽位会说「no probe for this slot」，不编题。
+  每行给出重新抽查的命令。同深度的题没有时，**更浅的那道题会作为「更浅的抽查」被点名**（它抽查的是
+  手感，不是这一深度，只有重做步骤才能重抽这一层）；完全没有题的槽位说「no probe for this slot」，
+  不编题。
 - **aware 槽位不出题**（curriculum.md §11）；probe 只用 `std`、离线、秒级。
 
 ### 2.3 `kiln plan [--fast]` / `kiln skip`
@@ -53,6 +55,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
   编译不过），`state.skipped = true`；`kiln list` 显示 `»`，**不计入完成数**，
   `kiln reset <step>` 把它放回待办。`--all` 跳过整条 track 上所有够格的点，`--force` 无证据也跳
   （报告里会写明「forced」）。
+- **报告只点名题库里真有的题**：`plan --fast` 的 keep 理由与 `review --due` 的重抽查行走同一条判据
+  （`probe::exercise`）——同深度或更深 → 点名那道题；只有更浅的题 → 说明它抽查的是手感而不是这一
+  深度；完全没有 → 直说没有。没有这条规则时，报告会把学员送去一条必然报错的 `kiln probe` 命令。
 
 ## 3. T2 `relay`
 
