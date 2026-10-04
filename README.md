@@ -43,8 +43,11 @@ with stricter gates and fewer hints.
   repeated).
 - **[docs/authoring.md](docs/authoring.md)** — step templates, metadata rules, i18n, scaffold patches,
   checklists.
+- **[docs/t1-mailer.md](docs/t1-mailer.md)** — T1 `mailer` as delivered: the 22 steps, the gate
+  ladder, the project's final shape, the test fixtures, the patterns T2–T5 copy, and the measured
+  numbers.
 - **[docs/handoff-m0.md](docs/handoff-m0.md)** — the compressed M0 brief: scope, acceptance, verified
-  environment facts, what M0 deliberately does not do. Read this one first;
+  environment facts, conventions, and where everything else lives. Read this one first;
   [docs/handoff-m0-log.md](docs/handoff-m0-log.md) is the build log behind it (per-segment progress,
   measured facts, traps).
 - **[docs/drafts/](docs/drafts/)** — measured designs for steps whose decisions were expensive to

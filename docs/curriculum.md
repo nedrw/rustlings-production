@@ -226,16 +226,11 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `db/schema-online-evolution` | `apply` | T3·3.23 | expand → backfill → contract 全流程、回填的批处理与限速 | 迁移工具用法、offline 数据 |
 | `build/reproducibility` | `apply` | T4·4.22 | 迁移与可复现构建、破坏性变更的发布窗口 | 迁移本身 |
 
-> 实现时要记住的一处调整：**编译期校验的 `query!` 与 `.sqlx` offline 元数据不在 1.9**。`migrate!`
-> 不需要数据库就能编译，而 `query!`/`query_scalar!` 宏需要编译期能连库或 `.sqlx/query-<hash>.json`
-> （本机没有 `sqlx-cli`，`cargo sqlx prepare` 要先装）。因此 1.9 的第一条查询用运行时的
-> `sqlx::query(…).fetch_optional(…)`（课程要求「无 DB 环境下可编译」也由它保证），宏与离线元数据跟着
-> 1.11 的第一条真实查询一起上——那一步的 scaffold 发布 `.sqlx/`，正文讲清两者的取舍。
->
-> 落地结果（1.11，2026-10）：如上面所述，第一条真实查询就是 `query_scalar!`，`.sqlx/` 由一个跑着的空库
-> （`sqlx migrate run` 之后 `DATABASE_URL=… cargo sqlx prepare`）生成、作为 scaffold 内容发布，所以没有
-> 数据库的机器照样编译。一处与上面设想不同：**语句给在正文里，而不是 scaffold 的 `pub const`**——`sqlx`
-> 0.9 的宏按 `LitStr` 解析 `source`，常量表达式进不去（见 `docs/handoff-m0.md` 第六段）。
+> 落地结果（1.9 / 1.11，2026-10）：1.9 的第一条查询用运行时的 `sqlx::query(…)`（同时保证「无数据库也能
+> 编译」），编译期校验的 `query_scalar!` 与 `.sqlx/` 离线元数据跟着 1.11 的第一条真实查询一起上，
+> 由 scaffold 发布，所以没有数据库的机器照样编译。一处与规划不同：**语句写在正文里，而不是 scaffold 的
+> `pub const`**——`sqlx` 0.9 的宏按 `LitStr` 解析 `source`。过程见
+> [handoff-m0-log.md](handoff-m0-log.md) 第六段。
 
 ### 4.3 `sec/authz-tenant-isolation`
 
@@ -278,52 +273,58 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | T4 `lakelet` | T3 出口 + 性能入门 | WAL 恢复、列式与压缩、查询引擎、批处理、剖析与 soak | 编写时由 `lint-caps` 统计 |
 | T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 编写时由 `lint-caps` 统计 |
 
-## 6. T1 `mailer`：邮件订阅微服务（22 步）
+## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
 题材与推进顺序参考《Zero To Production in Rust》(Luca Palmieri)：订阅、确认、发布 newsletter。
 我们在此之上补上原书场景之外的生产砝码：带真实队列的后台投递与幂等、SLO、负载测试、变异测试、runbook 演练。
 
+**状态：22/22 已交付**（正文、规格、scaffold、参考解、闸门接线全部就位，验收冻结在 `c08f33a`）。
+逐步的交付物、门阶梯、项目最后的形状、可照抄到 T2–T5 的模式与实测数字见
+**[t1-mailer.md](t1-mailer.md)**；正文在 `course/docs/steps/en/mailer/`，元数据在
+`course/tracks/mailer/track.toml`。下面的表是**规划口径**，留作能力分布与检索用——每步的过关条件
+不再在这里重复，那是正文与规格的事。
+
 ### 阶段 A：骨架与工具链（1.1–1.6）
 
-| # | 步骤 | teaches | 过关条件（要点） |
-| --- | --- | --- | --- |
-| 1.1 | workspace 与 lib/bin 拆分（`main.rs` 只剩一层壳） | `repo/workspace-layout@apply` | `cargo check --lib` 断言有 library target、`--help` 冒烟测试 |
-| 1.2 | 工具链与风格锁定：`rust-toolchain.toml`、`rustfmt.toml`、`[workspace.lints]`、MSRV 政策 | `repo/toolchain-pinning@apply` | `fmt` + `clippy@1` 全绿 |
-| 1.3 | 一条命令跑通全部检查（`cargo xtask ci`）+ CI 落地 | `ci/pipeline@apply` | 本地与 CI 同源；故意破坏一次看 CI 变红 |
-| 1.4 | 类型化配置与启动：file/env/flag 覆盖顺序、`--check-config`、密钥不入库 | `cfg/layered-config@apply`、`sec/secrets-management@apply` | 覆盖顺序表测试；坏配置退出码非 0 |
-| 1.5 | 错误处理即 API：`thiserror` 领域错误、`anyhow` 仅在边界、`source` 链、退出码映射（同一套失败分类在 1.7 起映射到 HTTP 状态码） | `err/typed-errors@apply` | 断言错误类型/文案/`source` 链 |
-| 1.6 | 结构化日志与关联 id：JSON/pretty 双模式、`#[instrument]`、span 传播（此时的工作单位是「一次运行」，1.7 起用同一个机制包住每个 HTTP 请求） | `obs/structured-logs@apply`、`obs/tracing-propagation@aware` | 捕获 writer 断言字段与 span |
+| # | 步骤 | teaches |
+| --- | --- | --- |
+| 1.1 | workspace 与 lib/bin 拆分（`main.rs` 只剩一层壳） | `repo/workspace-layout@apply` |
+| 1.2 | 工具链与风格锁定：`rust-toolchain.toml`、`rustfmt.toml`、`[workspace.lints]`、MSRV 政策 | `repo/toolchain-pinning@apply` |
+| 1.3 | 一条命令跑通全部检查（`cargo xtask ci`）+ CI 落地 | `ci/pipeline@apply` |
+| 1.4 | 类型化配置与启动：file/env/flag 覆盖顺序、`--check-config`、密钥不入库 | `cfg/layered-config@apply`、`sec/secrets-management@apply` |
+| 1.5 | 错误处理即 API：`thiserror` 领域错误、`anyhow` 仅在边界、`source` 链、退出码映射（同一套失败分类在 1.7 起映射到 HTTP 状态码） | `err/typed-errors@apply` |
+| 1.6 | 结构化日志与关联 id：JSON/pretty 双模式、`#[instrument]`、span 传播（此时的工作单位是「一次运行」，1.7 起用同一个机制包住每个 HTTP 请求） | `obs/structured-logs@apply`、`obs/tracing-propagation@aware` |
 
 ### 阶段 B：服务与数据（1.7–1.13）
 
-| # | 步骤 | teaches | 过关条件（要点） |
-| --- | --- | --- | --- |
-| 1.7 | HTTP 骨架：axum 路由、extractor、`/healthz`、优雅的 404/405 | `http/service-skeleton@apply` | 路由矩阵测试 |
-| 1.8 | 端到端测试基建：app 工厂、随机端口、每测试独立 schema | `test/app-factory@apply` | 测试可并发跑、无共享状态 |
-| 1.9 | Postgres 与迁移：连接池、`sqlx::migrate!`（迁移内嵌进二进制）、启动顺序、`/readyz` 与 `/healthz` 之分 | `db/migrations@apply` | 空库→最新；无 DB 环境下仍可编译（`migrate!` 不需要库）；库配了却连不上必须退出 1 且不 bind |
-| 1.10 | 领域类型：`Email`/`SubscriberName`/`Password`，解析即校验 | `domain/parse-dont-validate@apply` | 往返 property 测试 + 拒绝样例 |
-| 1.11 | 注册流程：`argon2` 哈希、唯一约束当并发原语 | `sec/password-hash@apply`、`db/unique-as-concurrency@apply` | 并发重复注册只成功一次 |
-| 1.12 | 确认令牌：签发/校验/过期/一次性使用 | `sec/token-lifetime@apply` | 过期、重放、篡改三类测试 |
-| 1.13 | 邮件发送端口 + 假实现（依赖注入，不用 mock 框架） | `test/fake-external@apply` | 端口一致性测试 + 失败注入 |
+| # | 步骤 | teaches |
+| --- | --- | --- |
+| 1.7 | HTTP 骨架：axum 路由、extractor、`/healthz`、优雅的 404/405 | `http/service-skeleton@apply` |
+| 1.8 | 端到端测试基建：app 工厂、随机端口、每测试独立 schema | `test/app-factory@apply` |
+| 1.9 | Postgres 与迁移：连接池、`sqlx::migrate!`（迁移内嵌进二进制）、启动顺序、`/readyz` 与 `/healthz` 之分 | `db/migrations@apply` |
+| 1.10 | 领域类型：`Email`/`SubscriberName`/`Password`，解析即校验 | `domain/parse-dont-validate@apply` |
+| 1.11 | 注册流程：`argon2` 哈希、唯一约束当并发原语 | `sec/password-hash@apply`、`db/unique-as-concurrency@apply` |
+| 1.12 | 确认令牌：签发/校验/过期/一次性使用 | `sec/token-lifetime@apply` |
+| 1.13 | 邮件发送端口 + 假实现（依赖注入，不用 mock 框架） | `test/fake-external@apply` |
 
 ### 阶段 C：后台与边界（1.14–1.18）
 
-| # | 步骤 | teaches | 过关条件（要点） |
-| --- | --- | --- | --- |
-| 1.14 | 后台投递 worker：有界队列、重试与抖动、停机时排空 | `async/graceful-shutdown@apply`、`async/backpressure@aware` | 子进程收 SIGTERM 后在途任务完成、退出码 0 |
-| 1.15 | 幂等投递：同一封确认信不重复发（去重键 + 状态机） | `delivery/idempotency@apply` | 重复入队下副作用只发生一次 |
-| 1.16 | 会话与鉴权：cookie session vs API key 的取舍 | `sec/authn-session@apply` | 会话固定/过期/登出测试 |
-| 1.17 | 发布 newsletter：事务内批量写入 + 后台扇出 | `db/transactions@apply` | 部分失败不留半成品 |
-| 1.18 | 权限边界：订阅者只能读自己的数据（越权给 404） | `sec/authz-tenant-isolation@apply` | 越权矩阵测试 |
+| # | 步骤 | teaches |
+| --- | --- | --- |
+| 1.14 | 后台投递 worker：有界队列、重试与抖动、停机时排空 | `async/graceful-shutdown@apply`、`async/backpressure@aware` |
+| 1.15 | 幂等投递：同一封确认信不重复发（去重键 + 状态机） | `delivery/idempotency@apply` |
+| 1.16 | 会话与鉴权：cookie session vs API key 的取舍 | `sec/authn-session@apply` |
+| 1.17 | 发布 newsletter：事务内批量写入 + 后台扇出 | `db/transactions@apply` |
+| 1.18 | 权限边界：订阅者只能读自己的数据（越权给 404） | `sec/authz-tenant-isolation@apply` |
 
 ### 阶段 D：质量与交付（1.19–1.22）
 
-| # | 步骤 | teaches | 过关条件（要点） |
-| --- | --- | --- | --- |
-| 1.19 | 测试分层与真实外部依赖：mailpit 容器、故障注入的假实现 | `test/integration-layering@apply` | 随机顺序连跑 3 遍互不干扰 |
-| 1.20 | 指标与 SLO 基线：`/metrics`、黄金指标、告警草案 | `obs/metrics-slo@aware` | 指标快照 + 命名约定检查 |
-| 1.21 | 容器化与部署：多阶段镜像、探针、迁移与启动的顺序 | `release/container-image@apply` | 镜像内冒烟测试 + 体积预算 + `container-repro` |
-| 1.22 | runbook + 首次故障演练：DB 断连、邮件服务 500、迁移失败 | `ops/runbook-drill@apply` | 演练脚本断言可恢复、无丢单 |
+| # | 步骤 | teaches |
+| --- | --- | --- |
+| 1.19 | 测试分层与真实外部依赖：mailpit 容器、故障注入的假实现 | `test/integration-layering@apply` |
+| 1.20 | 指标与 SLO 基线：`/metrics`、黄金指标、告警草案 | `obs/metrics-slo@aware` |
+| 1.21 | 容器化与部署：多阶段镜像、探针、迁移与启动的顺序 | `release/container-image@apply` |
+| 1.22 | runbook + 首次故障演练：DB 断连、邮件服务 500、迁移失败 | `ops/runbook-drill@apply` |
 
 ### 配套 drill（可选插入）
 
@@ -471,7 +472,8 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 
 ## 12. 课程如何组装（给未来的作者/翻译者）
 
-1. 新 track 的起点是**能力缺口**：先看台账缺什么深度，再设计项目，而不是先想项目。
+1. 新 track 的起点是**能力缺口**：先看台账缺什么深度，再设计项目，而不是先想项目
+   （T1 是已交付的参考实现：[t1-mailer.md](t1-mailer.md) §5 列了可以照抄的模式）。
 2. 写第一步之前先跑 `kiln lint-caps`：`requires` 未覆盖就无法通过。
 3. 写完一步后跑 `kiln selftest <step>`：参考解必须过全部 must 闸门、规格必须能杀变异。
 4. 翻译只碰 `docs/steps/<locale>/`，带 `source_hash`；术语查 `glossary.toml`。

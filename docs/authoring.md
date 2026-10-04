@@ -239,6 +239,9 @@ track 骨架的规则与 patch 的规则一样）。
 
 ## 9. 作者检查清单
 
+先看 [t1-mailer.md](t1-mailer.md) §4「测试装置」与 §5「可以照抄的模式」——T1 是已交付的参考实现，
+夹具、探针 crate、design 步、`.sqlx` 元数据这些形状都有现成样本，不必重新发明。
+
 - [ ] 步骤只教 ≤3 个新概念，`time_hint` 在 30–120 分钟之间
 - [ ] `teaches`/`requires` 声明完整，`kiln lint-caps` 通过
 - [ ] 正文模板与 `origin` 匹配（teach 有 WHY；deepen/transfer 有 RECALL+DELTA，无 WHY）

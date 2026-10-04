@@ -1,12 +1,12 @@
-# M0 交接简报（开工用）
+# M0 交接简报（一条命令走通 T1）
 
-> 这份文件是**压缩后的上下文**：新的对话/session 只需要读本文件 + [plan.md](plan.md) §3–§6、§9、§11，
-> [curriculum.md](curriculum.md) §6（T1 逐步表），[authoring.md](authoring.md) §3–§7，就能直接开工，不必回看规划讨论。
-> 规划已经定稿并提交；除非发现设计错误，**不要再改机制设计**，直接落地。
-> 分段的进度、实测数字与踩过的坑在 [handoff-m0-log.md](handoff-m0-log.md)：读它是为了「别重踩」，不是必读；
-> 现状看本文件 §1 的验收清单与 §5 的交付清单。
+> M0 已结束。这份文件是**压缩后的上下文**：目标与验收、本机实测的环境事实、工作约定，以及去哪找细节。
+> T1 交付物本身的说明在 [t1-mailer.md](t1-mailer.md)；分段的进度、实测数字与踩过的坑在
+> [handoff-m0-log.md](handoff-m0-log.md)；机制与取舍在 [plan.md](plan.md) §3–§6、§9、§11；
+> 写作/翻译规范在 [authoring.md](authoring.md) §3–§7。规划已定稿并提交；除非发现设计错误，
+> **不要再改机制设计**，直接落地。
 
-## 1. M0 的目标
+## 1. M0 的目标与验收
 
 让一个新克隆的人能一条命令地从零走到 T1 结束：
 
@@ -40,27 +40,7 @@
 两条不算“人工干预”的准备动作，写在验收清单旁边以免被当成缺口：三个容器步先跑 `kiln images pull`（`images` 门与每个夹具都会直说）；
 `KILN_REGISTRY_MIRROR` 在 Docker Hub 不可达的机器上要设（`kiln doctor` 会提醒）。
 
-## 2. 构建顺序（先出内容，再补框架）
-
-1. 仓库骨架：`kiln/`（clap 子命令 + manifest 解析 + state）、`course/course.toml`、`course/tracks/mailer/track.toml`（先放 3 个步骤）、`xtask/`。
-2. `kiln list/run/check/reset` + state 文件；`run` 先支持 milestone（在 `app/<track>` 里跑 `cargo test --test <spec>`）。
-3. `spec-integrity`（哈希清单生成子命令）+ `fmt` + `clippy@N` + `no-todo` 三个闸门；闸门缺失工具时给安装指令。
-4. i18n：目录约定 + 回退链 + `i18n status`（**先做回退，译文可以不写**）。
-5. 容器运行时抽象 + `images` / `doctor`（podman 优先，见 §4）。
-6. `watch`（notify，沿用 rustlings 的触发与时间戳输出）。
-7. `selftest`（脚手架→期望失败→参考解→期望全绿）+ `verify --json`。
-8. **T1 22 步内容**：从 1.1 开始写，边写边把 format 补全（判据格式只有写真题时才定型）；
-   1.1–1.6 完成后跑一次 `selftest` 与 `verify`，再继续 1.7–1.22。
-
-硬规则（来自 authoring.md）：
-
-- 规格测试在 scaffold 上必须失败；参考解必须过全部 must 闸门；
-- scaffold patch 只新增文件 / 只在 `# kiln:scaffold:begin|end` 标记块内插入；
-- scaffold 决定函数签名，规格测试只依赖这些签名；
-- 快路径 `kiln run` < 60 秒；慢检查标 `slow`；
-- 闸门不得依赖 GNU userland（**本机没有 `timeout`**），超时在 Rust 侧实现。
-
-## 3. 本机已实测的环境事实（不要再假设）
+## 2. 本机已实测的环境事实（不要再假设）
 
 | 事实 | 影响 |
 | --- | --- |
@@ -78,37 +58,30 @@
 > 另外 `docker-compose` 单体版确实装上了并能 `config`。规则不变：**不写字面 `docker compose`**，
 > 由 `kiln/src/runtime.rs` 探测后选择可用命令。
 
-## 4. M0 不做的事（避免范围蔓延）
+## 3. M0 没做的事（留给后面的里程碑）
 
-- 不写 T2–T5 的任何内容（可留空目录与 `track.toml` 占位）。
-- 不做慢闸门：`mutants`/`coverage`/`bench-budget`/`loom`/`soak`/`sim`（M1–M4 才接）。
-- 不做能力去重的运行时部分：`plan --fast` / `probe` / `review --due` / 间隔重复（M1）；但 `caps` 闸门与 `lint-caps` 的元数据检查**要在 M0 就位**，读 `capabilities.toml` + `track.toml`。
-- 不做 `new-track` 生成器、不做文档站、不做中文翻译（只留接口与回退）。
+- 不写 T2–T5 的内容：台账里 96 个格位有计划，`course/tracks/` 里还没有第二条 track。
+- 不做慢门：`mutants` / `coverage` / `bench` / `loom` / `soak` / `sim`，以及目录里占位的 `conformance`（M1–M4）。
+- 不做能力去重的运行时部分：`kiln plan --fast` / `probe` / `review --due` / 间隔重复（M1）；台账检查
+  （`caps` 门与 `kiln lint-caps`）已在 M0 就位。
+- 不做 `new-track` 生成器、文档站、中文翻译（回退链与漂移检测已就位，无译文）。
 - 不做在线判题、不做防作弊。
 
-## 5. M0 交付了什么
+## 4. 去哪找什么
 
-口径：`course/` 是唯一真源；下面的路径都能在仓库里点到文件，数量取 `kiln lint-caps` / `kiln list` 的实际输出。
+| 要看的 | 在哪 |
+| --- | --- |
+| T1 交付物：22 步一览、门阶梯、项目最后的形状、测试装置、可照抄的模式、实测数字 | [t1-mailer.md](t1-mailer.md) |
+| 命令与闸门清单、安装/运行 | [../README.md](../README.md) 的 Status 段、`kiln --help` |
+| 每一步的施工过程、当时的实测数字与坑 | [handoff-m0-log.md](handoff-m0-log.md)（按段检索） |
+| 机制、门目录、里程碑、风险 | [plan.md](plan.md) |
+| 能力台账（97 能力 / 134 格位）与 T1–T5 的步骤表 | [curriculum.md](curriculum.md) |
+| 正文模板、scaffold 规则、规格规则、检查清单 | [authoring.md](authoring.md) |
+| 实测过的设计草稿（1.14 / 1.21） | [drafts/](drafts/) |
 
-- **命令**（`kiln/src/cmd/`）：`list` / `run` / `check` / `watch` / `hint` / `reset` / `solution` /
-  `verify`（`--json`，带诚实度标记）/ `selftest` / `caps` / `lint-caps` / `spec restore` /
-  `spec manifest` / `i18n status` / `images`（+ `pull`）/ `links`（+ `--external`）/ `doctor`。
-- **闸门**（`kiln/src/gates/`）：`spec-integrity`、`caps`、`fmt`、`clippy@N`、`no-todo`、`docs:public`、
-  `exit-code`、`i18n`、`images`、`container-repro`、`links` 已实现；`timeout` 刻意留成 runner 自己的
-  截止时间而不是逐步门（plan.md §6）。慢路径（`mutants`/`coverage`/`bench`/`loom`/`soak`/`sim`）留给 M1+。
-- **课程元数据**：`course/course.toml`；`course/capabilities.toml`（97 能力 / 134 格位）；
-  `course/tracks/mailer/track.toml`（22 步，逐步接好 `gates` / `hint` / `time_hint` / `requires`）。
-- **T1 内容**：正文 22 篇 `course/docs/steps/en/mailer/*.md`；规格 `course/tracks/mailer/spec/`
-  （22 步 + `manifest.toml` 哈希清单）；scaffold 19 个补丁 + 骨架 `course/tracks/mailer/skeleton/`
-  （1.1 用骨架、1.2 无 scaffold）；参考解 22 个 `course/tracks/mailer/solutions/*.patch`；
-  1.21 的实测草稿留在 `docs/drafts/1.21-container/`。
-- **工具**：`xtask`（`cargo xtask ci` 是 CI 的唯一入口）；`tools/lint-caps-md.py` 是 Rust 版
-  `lint-caps` 的原型，仍在（它对拍课程文档自己的表格，所以留着）。
+一个命令的入口是裸跑 `kiln`：它给出下一步的 id、正文路径、项目目录，以及该敲的两条命令。
 
-每一步的进度、实测数字与坑按时间顺序记在 [handoff-m0-log.md](handoff-m0-log.md)：第十四段是 1.21、
-第十五段是 1.22；要重做一个已经量过的决定，先去那里搜那一步的 id。
-
-## 6. 工作方式约定
+## 5. 工作方式约定
 
 - 提交粒度：一个步骤 = 一个提交（正文 + 规格 + scaffold + 参考解 + 接线），提交信息写清 `track/step`；框架改动单独提交。
 - 每完成 5–6 步把 `curriculum.md` 里对应步骤的状态（若新增了能力或深度）与 `plan.md` §11 的验收项同步一次。
