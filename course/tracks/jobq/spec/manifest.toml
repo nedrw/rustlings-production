@@ -9,3 +9,4 @@ format_version = 1
 "spec/3.1/engine_boundary.rs" = "sha256:d45a98784e283818f48d0e561f91f67bbab95afd21ed4148cfe9f9eea6a88eb2"
 "spec/3.2/public_api.rs" = "sha256:38d83ced75f4dad0aee0fb7873787c8b3698099f3868ee05bedb5b5f7dcab4e7"
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
+"spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"

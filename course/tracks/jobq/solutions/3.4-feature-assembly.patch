@@ -1,0 +1,96 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4fbe112..efc850a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,6 +23,21 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "fmt", "env-filte
+ uuid = { version = "1.18.1", features = ["v4", "serde"] }
+ # kiln:scaffold:end
+ 
++# The crate assembles two ways, and this table is the whole of it (step `jobq/3.4-feature-assembly`):
++# the in-memory engine is the floor every combination has, and `postgres` adds the durable backend on
++# top of it. Features are additive — enabling one never disables another — which is why nothing here
++# is spelled "without", and why the matrix of combinations is checked rather than the flags.
++#
++# `postgres` is a list rather than a bare name because `jobq/3.5-store-port-conformance` adds the
++# durable backend's dependency wiring to it, and a scaffold may only insert lines into a marked block
++# (docs/authoring.md §5): the block belongs here from the step that writes the table.
++[features]
++# kiln:scaffold:begin
++default = ["postgres"]
++postgres = [
++]
++# kiln:scaffold:end
++
+ # The crate's own lint policy. `jobq/3.24-unsafe-budget` is the step that argues for
+ # `unsafe_code = "deny"`, and the block below is where it lands.
+ [lints.rust]
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index fbc822c..6790dff 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -65,21 +65,56 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+ /// The backend the settings name.
+ ///
+ /// `memory` (and nothing at all) is the in-process store: honest for a demo, useful for a test, and
+-/// the only backend this build knows — the durable one arrives with
+-/// `jobq/3.5-store-port-conformance`.
++/// the one backend every *assembly* of this crate has (step `jobq/3.4-feature-assembly`). Anything
++/// else is the durable backend, which this function never opens itself — it hands the URL to
++/// [`open_durable`], the single place a durable store is reached from, and the place the `postgres`
++/// feature gate belongs.
+ fn open_store(config: &Config) -> Result<MemoryStore, Error> {
+     match config.store.url.as_deref() {
+         None | Some("memory") => Ok(MemoryStore::new()),
+-        Some(other) => Err(Error::Config {
+-            detail: format!(
+-                "`{}` is not a store this build can open: use `memory`, or wait for the durable \
+-                 backend of jobq/3.5-store-port-conformance",
+-                redact_url(other)
+-            ),
+-        }),
++        Some(other) => open_durable(other),
+     }
+ }
+ 
++/// Open the durable backend the settings name.
++///
++/// The durable backend arrives with `jobq/3.5-store-port-conformance` and lands **behind the
++/// `postgres` feature**, which is what step `jobq/3.4-feature-assembly` builds: until it does, this
++/// function is the seam, and what it can honestly do is refuse in the terms of *this* build — a
++/// message that says whether the operator is looking at a build that has the feature and not the
++/// backend yet, or at a build without the feature at all.
++///
++/// The gate is deliberately in one function with one call site: a feature whose `cfg` is sprinkled
++/// across the crate is a feature that is off in one code path and on in another, and the
++/// combination nobody tried is the one that breaks.
++fn open_durable(url: &str) -> Result<MemoryStore, Error> {
++    Err(Error::Config {
++        detail: format!(
++            "`{}` names a durable store: {}",
++            redact_url(url),
++            durable_backend()
++        ),
++    })
++}
++
++/// What this build knows about a durable store, which is a compile-time fact.
++///
++/// Two answers, because there are two different problems and only one of them is permanent: a build
++/// that has the feature is waiting for a step, and a build without it is waiting for a flag. Both
++/// name what to do next, because "use `memory`" tells an operator with a database nothing.
++#[cfg(feature = "postgres")]
++fn durable_backend() -> &'static str {
++    "this build has the `postgres` feature, and the backend itself arrives with \
++     `jobq/3.5-store-port-conformance`"
++}
++
++/// What this build knows about a durable store when the feature is off.
++#[cfg(not(feature = "postgres"))]
++fn durable_backend() -> &'static str {
++    "this build was compiled without the `postgres` feature, so the in-memory engine is all it \
++     has: rebuild with `--features postgres`"
++}
++
+ /// A connection string with the credentials taken out, for a message a person will read.
+ fn redact_url(url: &str) -> String {
+     match url.split_once('@') {
