@@ -1,0 +1,269 @@
+diff --git a/docs/capacity.md b/docs/capacity.md
+index ebfb376..04bcc3a 100644
+--- a/docs/capacity.md
++++ b/docs/capacity.md
+@@ -2,32 +2,114 @@
+ 
+ The page a person reads before they raise a limit, add a subscriber or promise a customer a
+ throughput number. Everything in it comes from a load run that can be repeated: the generator, the
+-percentiles and the curve are `relay/2.20-load-testing`, and the run is one command.
+-
+-This is the skeleton: the sections are the ones a capacity question needs, and every link is a
+-placeholder until the step's last task is done — `kiln check relay/2.20-load-testing` runs the
+-`links` gate over this file, and it fails while the targets are `TODO`.
++percentiles and the curve are [src/loadtest.rs](../src/loadtest.rs) (`relay/2.20-load-testing`), and
++the run is one command.
+ 
+ ## Method
+ 
+-How the numbers below were produced: [which command](TODO), on [what machine](TODO), with
+-[which settings](TODO). A number without its method is a rumour.
++```sh
++cargo test -p relay --test spec_load -- --nocapture
++```
++
++- **what is measured.** Two things, and they are measured in different places. The *ingest* path —
++  `POST /events`, which writes the event and fans it out to every subscriber in one transaction —
++  is measured by the producers themselves: each request is timed around the socket, and the numbers
++  below are percentiles of those observations. The *delivery* path is measured by draining the
++  queue the one above left behind with the worker of [src/concurrency.rs](../src/concurrency.rs),
++  against the fixture's subscriber (which answers immediately, on purpose: what a load test of the
++  queue may not do is measure the subscriber);
++- **the quantiles are nearest-rank**, so every number here is an observation rather than an
++  interpolation between two. The floor is the database round trip: one `POST /events` is a
++  transaction with a unique-index insert and a fan-out insert, on a container published on
++  `127.0.0.1`;
++- **what these numbers are not.** They are a **debug** build of `relay` (what `cargo test` compiles)
++  against a **single** Postgres container on the machine the run was made on, with the fixture's
++  in-process subscriber. A release build is faster, a real subscriber is slower, and a database that
++  is not on `127.0.0.1` is a different system. What travels between machines is the *shape* — see
++  [The slope](#the-slope) — not the milliseconds;
++- **how much load.** 200 events at 4 producers for the full run; three levels of 60 events for the
++  curve, each offering `60 events × 2 subscribers = 120` deliveries and draining one turn of its own
++  seats. The queue is bounded at its default (`relay/2.14-backpressure`), so a run that outruns the
++  bound is refused with `503` rather than accepted and forgotten.
+ 
+ ## Measurements
+ 
+-| concurrency | p99 | backlog | growth over the level below |
++One run on this machine (2026-10, `rustc 1.98.0`, debug), 60 events per level, 2 subscribers,
++one turn of the level's own seats after each level:
++
++| concurrency | p99 | p50 | backlog left |
+ | --- | --- | --- | --- |
+-| [from the run](TODO) | | | |
++| 1 producer | 8.8 ms | 4.3 ms | 119 |
++| 2 producers | 38.3 ms | 3.7 ms | 237 |
++| 4 producers | 43.4 ms | 5.1 ms | 353 |
++
++The same service, drained with eight seats in one worker, after 200 events at 4 producers:
++
++| what | value |
++| --- | --- |
++| ingest p50 / p95 / p99 | 4.7 ms / 5.7 ms / 43.6 ms |
++| 400 deliveries drained | 364 ms (≈1100 deliveries/s) |
++| queue left behind | 0 |
+ 
+ ## The slope
+ 
+-What the growth column means, and where the curve stops being a curve: [what the queue does
+-first](TODO).
++The queue is the column that never lies: every level offered 120 more deliveries and drained one
++turn of its own seats, so 119 → 237 → 353 is arithmetic rather than a clock, and it says what
++`relay/2.14-backpressure` says — the work this process *holds* is its seats, and the rest waits in
++the table.
++
++The p99 is the column that has to be read carefully. It rises 8.8 → 38.3 → 43.4 ms: the jump from
++one producer to two is contention appearing (two transactions in flight on one database, and the
++p99 of sixty observations is close to the slowest of them), and the step from two to four is small
++because by then the database is already the queue. It is *not* a smooth curve, and a load test that
++reported it as one would be reporting the machine's mood: on a shared machine one level's largest
++observation moves further than the load does. That is why the run's own spec asserts the bound and
++the backlog and *records* this column rather than asserting a trend — the shape check exists
++(`Curve::is_monotone_within`) and is proved against a rising and a collapsing curve, so that the
++page and the run agree about what "the curve broke" would look like.
++
++The practical reading: past two producers on this machine, adding producers buys queue depth, not
++latency. That is the signal to add capacity *behind* the queue (seats, workers, a faster database),
++not in front of it.
+ 
+ ## Workers and throughput
+ 
+-What adding a worker buys, and what it costs: [measured here](TODO).
++The same 400 deliveries, drained by the same **eight seats**, arranged differently (one run, one
++machine, debug build):
++
++| workers × seats | deliveries drained | throughput | per-seat |
++| --- | --- | --- | --- |
++| 1 × 2 | 400 in 523 ms | 765/s | 383/s |
++| 1 × 8 | 400 in 363 ms | 1101/s | 138/s |
++| 2 × 4 | 400 in 551 ms | 726/s | 91/s |
++| 4 × 2 | 400 in 944 ms | 424/s | 53/s |
++| 8 × 1 | 400 in 1.87 s | 214/s | 27/s |
++
++Two things are visible, and both are decisions this service already made:
++
++1. **seats buy concurrency inside one claim; workers buy parallelism and pay for it.** Every worker
++   runs the claim of [src/claim.rs](../src/claim.rs) — one `update … returning` statement — once per
++   turn. Eight workers with one seat each therefore pay that statement's fixed cost eight times per
++   eight deliveries, while one worker with eight seats pays it once. The query is not free: it is a
++   database round trip, and at this size it *is* the throughput;
++2. **throughput does not scale with seats either.** Four times the seats bought 1.4 times the
++   throughput (765 → 1101/s), because past a handful of attempts in flight the bottleneck is the
++   database's write path and the single connection pool, not the number of attempts. More seats
++   also mean more deliveries held invisibly if this process dies
++   ([adr/0001-at-least-once.md](adr/0001-at-least-once.md), `relay/2.15-shutdown-leases`), which is
++   the cost on the other side of the trade.
++
++So the shape to deploy is *few workers with several seats each*, and to add workers when the
++database is no longer the bottleneck — not to reach for a worker per core because cores exist.
+ 
+ ## What this is not
+ 
+-[what the run does not measure](TODO) — and the one level below it that would.
++- **not a soak.** Ten seconds of load says nothing about a leak, a growing table or a connection
++  pool that never returns one (`soak` is a later milestone's gate);
++- **not the retry path.** Every attempt here is against a subscriber that answers; the cost of a
++  `retrying` row, of the [backoff](../src/backoff.rs) of `relay/2.8-retry-budget` and of a dead
++  letter is measured by `relay/2.17-chaos-injection`'s fault proxy, not here;
++- **not a limit.** These are observations of *this machine at one moment*, and the honest use of
++  them is a ratio: if p99 is 43 ms here and the budget is 250 ms, there is room for about five times
++  this load before the queue is the only thing growing — which is exactly the number to re-measure
++  after any change to the fan-out or the database.
+diff --git a/src/lib.rs b/src/lib.rs
+index 02064f2..da1d134 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,6 +23,7 @@ pub mod error;
+ pub mod events;
+ pub mod http;
+ pub mod lease;
++pub mod loadtest;
+ pub mod logging;
+ pub mod metrics;
+ pub mod openapi;
+diff --git a/src/loadtest.rs b/src/loadtest.rs
+index edacd7b..d0767b1 100644
+--- a/src/loadtest.rs
++++ b/src/loadtest.rs
+@@ -42,8 +42,9 @@ pub fn keys(count: usize) -> Vec<String> {
+ /// `count` keys, starting at `first`, so consecutive levels of a curve offer different events.
+ #[must_use]
+ pub fn keys_from(first: usize, count: usize) -> Vec<String> {
+-    let _ = (first, count);
+-    todo!("step relay/2.20-load-testing")
++    (0..count)
++        .map(|offset| format!("{PREFIX}-{:05}", first + offset))
++        .collect()
+ }
+ 
+ /// The `q` quantile of `samples`, by nearest rank.
+@@ -52,8 +53,19 @@ pub fn keys_from(first: usize, count: usize) -> Vec<String> {
+ /// a percentile of nothing is nothing rather than a panic at three in the morning.
+ #[must_use]
+ pub fn percentile(samples: &[Duration], q: f64) -> Duration {
+-    let _ = (samples, q);
+-    todo!("step relay/2.20-load-testing")
++    if samples.is_empty() {
++        return Duration::ZERO;
++    }
++    let mut sorted = samples.to_vec();
++    sorted.sort_unstable();
++    let count = sorted.len();
++    // One-based rank, so the *observation* at `rank` is at index `rank - 1`. `ceil` rather than
++    // rounding, because a quantile of a sample is the smallest observation that is at least that
++    // far up it — and a floor at 1, so a quantile below the first observation is the first one
++    // rather than an index under the sample.
++    let rank = (q.clamp(0.0, 1.0) * count as f64).ceil() as usize;
++    let index = rank.saturating_sub(1).min(count - 1);
++    sorted.get(index).copied().unwrap_or(Duration::ZERO)
+ }
+ 
+ /// What a run cost, at the three quantiles a capacity page reports.
+@@ -71,14 +83,20 @@ impl Percentiles {
+     /// The three quantiles of one sample.
+     #[must_use]
+     pub fn of(samples: &[Duration]) -> Self {
+-        let _ = samples;
+-        todo!("step relay/2.20-load-testing")
++        Self {
++            p50: percentile(samples, 0.50),
++            p95: percentile(samples, 0.95),
++            p99: percentile(samples, 0.99),
++        }
+     }
+ 
+     /// How many samples a report is about — the caller's count, printed beside the numbers.
+     #[must_use]
+     pub fn one_line(&self) -> String {
+-        todo!("step relay/2.20-load-testing")
++        format!(
++            "p50 {:.1?} · p95 {:.1?} · p99 {:.1?}",
++            self.p50, self.p95, self.p99
++        )
+     }
+ }
+ 
+@@ -105,8 +123,13 @@ impl Point {
+     /// How much this level's p99 grew over the one under it, as a factor (`1.0` is no change).
+     #[must_use]
+     pub fn growth_from(&self, previous: &Self) -> f64 {
+-        let _ = previous;
+-        todo!("step relay/2.20-load-testing")
++        let before = previous.p99.as_secs_f64();
++        if before <= 0.0 {
++            // A level that cost nothing cannot be grown over, and dividing by it would answer
++            // infinity: "the same, as far as a ratio can say" is the honest answer.
++            return 1.0;
++        }
++        self.p99.as_secs_f64() / before
+     }
+ }
+ 
+@@ -125,8 +148,7 @@ impl Curve {
+ 
+     /// Add one level. Levels are recorded in the order they were run.
+     pub fn record(&mut self, point: Point) {
+-        let _ = point;
+-        todo!("step relay/2.20-load-testing")
++        self.points.push(point);
+     }
+ 
+     /// The levels, in the order they were run.
+@@ -142,14 +164,33 @@ impl Curve {
+     /// and it is the reason a curve can be reported as "flat, rising, or broken".
+     #[must_use]
+     pub fn is_monotone_within(&self, jitter: f64) -> bool {
+-        let _ = jitter;
+-        todo!("step relay/2.20-load-testing")
++        let allowed = 1.0 - jitter.clamp(0.0, 1.0);
++        self.points
++            .iter()
++            .zip(self.points.iter().skip(1))
++            .all(|(under, over)| over.p99.as_secs_f64() >= under.p99.as_secs_f64() * allowed)
+     }
+ 
+     /// The curve as the table a capacity page quotes: one line per level, with the p99's growth
+     /// over the level below it and the backlog it left.
+     #[must_use]
+     pub fn render(&self) -> String {
+-        todo!("step relay/2.20-load-testing")
++        let mut table = String::from("| concurrency | p99 | backlog | growth |\n");
++        table.push_str("| --- | --- | --- | --- |\n");
++        let mut previous: Option<Point> = None;
++        for point in &self.points {
++            let growth = match previous {
++                Some(previous) => format!("{:.2}x", point.growth_from(&previous)),
++                // The level under the first one is not a level: a growth of "over nothing" would be
++                // a number nobody can read, so the column says so.
++                None => "—".to_owned(),
++            };
++            table.push_str(&format!(
++                "| {} | {:?} | {} | {growth} |\n",
++                point.concurrency, point.p99, point.backlog
++            ));
++            previous = Some(*point);
++        }
++        table
+     }
+ }

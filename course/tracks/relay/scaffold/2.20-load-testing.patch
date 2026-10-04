@@ -1,0 +1,443 @@
+diff --git a/docs/capacity.md b/docs/capacity.md
+new file mode 100644
+index 0000000..ebfb376
+--- /dev/null
++++ b/docs/capacity.md
+@@ -0,0 +1,33 @@
++# Capacity: what this service costs, and what it stops doing first
++
++The page a person reads before they raise a limit, add a subscriber or promise a customer a
++throughput number. Everything in it comes from a load run that can be repeated: the generator, the
++percentiles and the curve are `relay/2.20-load-testing`, and the run is one command.
++
++This is the skeleton: the sections are the ones a capacity question needs, and every link is a
++placeholder until the step's last task is done — `kiln check relay/2.20-load-testing` runs the
++`links` gate over this file, and it fails while the targets are `TODO`.
++
++## Method
++
++How the numbers below were produced: [which command](TODO), on [what machine](TODO), with
++[which settings](TODO). A number without its method is a rumour.
++
++## Measurements
++
++| concurrency | p99 | backlog | growth over the level below |
++| --- | --- | --- | --- |
++| [from the run](TODO) | | | |
++
++## The slope
++
++What the growth column means, and where the curve stops being a curve: [what the queue does
++first](TODO).
++
++## Workers and throughput
++
++What adding a worker buys, and what it costs: [measured here](TODO).
++
++## What this is not
++
++[what the run does not measure](TODO) — and the one level below it that would.
+diff --git a/src/loadtest.rs b/src/loadtest.rs
+new file mode 100644
+index 0000000..edacd7b
+--- /dev/null
++++ b/src/loadtest.rs
+@@ -0,0 +1,155 @@
++//! What this service does under load, and the numbers that say something about it.
++//!
++//! Three things live here, and each one is a decision a load test is worth having:
++//!
++//! * **a generator that is a function.** [`keys`] hands out the same list on every machine, so a
++//!   run can be *repeated* and its ledger compared with the one before it. A generator seeded by the
++//!   clock produces a different run every time and a report nobody can diff;
++//! * **percentiles by nearest rank**, not by interpolating between two neighbours: with `n` samples
++//!   sorted ascending, the `q` quantile is the `ceil(q * n)`-th of them. Every number this module
++//!   reports is therefore *an observation* — never an average of two observations that never
++//!   happened — and a reader can recompute any of them from the sample by hand;
++//! * **a curve rather than a number.** [`Point`] records what one concurrency level cost: the p99 of
++//!   its requests and the backlog it left behind. [`Curve`] is the list of them, with the shape
++//!   check and the table the capacity page is written from. A p99 without the concurrency it was
++//!   measured at is a number nobody can act on.
++//!
++//! The module is deliberately free of clocks and I/O: it is arithmetic over samples that a test (or
++//! a person with `--nocapture`) hands in, which is why the shape of a curve can be *proved* here
++//! rather than hoped for in a run against a machine that is also doing something else.
++
++use std::fmt;
++use std::time::Duration;
++
++/// The prefix every key the generator hands out carries, so a load run's rows are recognisable in
++/// the ledger it created them in.
++const PREFIX: &str = "load";
++
++/// How much a level's p99 may fall below the level under it before the curve is not a curve.
++///
++/// Not zero, and the reason is the machine rather than this service: the p99 of a small sample is
++/// close to its largest observation, and a shared machine puts its one long request wherever it
++/// likes. What a tolerance this wide cannot hide is a curve whose levels *all* go the wrong way,
++/// which is the shape worth failing on.
++pub const JITTER: f64 = 0.5;
++
++/// The idempotency keys of one load run: `count` of them, unique, in a fixed order.
++#[must_use]
++pub fn keys(count: usize) -> Vec<String> {
++    keys_from(0, count)
++}
++
++/// `count` keys, starting at `first`, so consecutive levels of a curve offer different events.
++#[must_use]
++pub fn keys_from(first: usize, count: usize) -> Vec<String> {
++    let _ = (first, count);
++    todo!("step relay/2.20-load-testing")
++}
++
++/// The `q` quantile of `samples`, by nearest rank.
++///
++/// `samples` may be in any order; `q` is clamped to `[0, 1]`; an empty sample answers zero, because
++/// a percentile of nothing is nothing rather than a panic at three in the morning.
++#[must_use]
++pub fn percentile(samples: &[Duration], q: f64) -> Duration {
++    let _ = (samples, q);
++    todo!("step relay/2.20-load-testing")
++}
++
++/// What a run cost, at the three quantiles a capacity page reports.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Percentiles {
++    /// Half the requests were faster than this.
++    pub p50: Duration,
++    /// One in twenty was slower.
++    pub p95: Duration,
++    /// One in a hundred was slower: the number a budget is written against.
++    pub p99: Duration,
++}
++
++impl Percentiles {
++    /// The three quantiles of one sample.
++    #[must_use]
++    pub fn of(samples: &[Duration]) -> Self {
++        let _ = samples;
++        todo!("step relay/2.20-load-testing")
++    }
++
++    /// How many samples a report is about — the caller's count, printed beside the numbers.
++    #[must_use]
++    pub fn one_line(&self) -> String {
++        todo!("step relay/2.20-load-testing")
++    }
++}
++
++impl fmt::Display for Percentiles {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.one_line())
++    }
++}
++
++/// One level of a curve: what the service cost at `concurrency` producers, and what it still owed
++/// when the level stopped.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Point {
++    /// How many producers were offering events at once.
++    pub concurrency: usize,
++    /// The p99 of the requests they made, as they measured them.
++    pub p99: Duration,
++    /// The deliveries this service still owed at the end of the level: the queue's depth, which is
++    /// the half of the picture a latency number cannot show.
++    pub backlog: i64,
++}
++
++impl Point {
++    /// How much this level's p99 grew over the one under it, as a factor (`1.0` is no change).
++    #[must_use]
++    pub fn growth_from(&self, previous: &Self) -> f64 {
++        let _ = previous;
++        todo!("step relay/2.20-load-testing")
++    }
++}
++
++/// The record of a load run: one [`Point`] per concurrency level, in the order they were measured.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Curve {
++    points: Vec<Point>,
++}
++
++impl Curve {
++    /// An empty curve.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Add one level. Levels are recorded in the order they were run.
++    pub fn record(&mut self, point: Point) {
++        let _ = point;
++        todo!("step relay/2.20-load-testing")
++    }
++
++    /// The levels, in the order they were run.
++    #[must_use]
++    pub fn points(&self) -> &[Point] {
++        &self.points
++    }
++
++    /// Whether every level's p99 is at least `(1 - jitter)` of the level under it.
++    ///
++    /// This is a *shape* check and it is written down rather than imagined so that it can be argued
++    /// with: it says nothing about the absolute numbers (the caller checks those against a bound)
++    /// and it is the reason a curve can be reported as "flat, rising, or broken".
++    #[must_use]
++    pub fn is_monotone_within(&self, jitter: f64) -> bool {
++        let _ = jitter;
++        todo!("step relay/2.20-load-testing")
++    }
++
++    /// The curve as the table a capacity page quotes: one line per level, with the p99's growth
++    /// over the level below it and the backlog it left.
++    #[must_use]
++    pub fn render(&self) -> String {
++        todo!("step relay/2.20-load-testing")
++    }
++}
+diff --git a/tests/support/workload.rs b/tests/support/workload.rs
+new file mode 100644
+index 0000000..8523796
+--- /dev/null
++++ b/tests/support/workload.rs
+@@ -0,0 +1,237 @@
++//! A load harness: one service, one database, and producers that measure what they waited for.
++//!
++//! `tests/support/app.rs` starts the service in process and `tests/support/postgres.rs` starts a
++//! database; what neither of them has is *pressure*. This file is the shape a load run needs:
++//!
++//! * **the same load, twice.** The keys come from the caller (`relay::loadtest::keys`), so two runs
++//!   of this fixture offer the same events and the ledger they leave behind can be compared;
++//! * **producers rather than a loop.** `concurrency` blocking threads pull from one queue of keys,
++//!   and each one times its own request around the socket. A load "level" is therefore a number of
++//!   producers, which is what a [`relay::loadtest::Point`] is about;
++//! * **the ledger, not the adapter.** What a run accepted, replayed or refused is counted from the
++//!   answers the service gave (a 201, a 200 for a replay of a key it already holds, anything else),
++//!   and the queue's depth is a query. A harness that reported what it arranged to happen would be
++//!   testing itself.
++//!
++//! It pulls the fixtures it needs in by path, so a spec reaches it with one line and does not have
++//! to declare a harness of its own:
++//!
++//! ```text
++//! #[path = "support/workload.rs"]
++//! mod workload;
++//! ```
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++#[path = "load.rs"]
++mod load;
++#[path = "mod.rs"]
++mod support;
++
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::time::{Duration, Instant};
++
++use relay::db::Db;
++use serde_json::json;
++use sqlx::PgPool;
++
++use support::app::{self, App};
++use support::client::{Client, Request};
++use support::postgres::Postgres;
++use support::var;
++
++pub use load::Counted;
++
++/// The one tenant these fixtures seed, and the key it authenticates with.
++pub const ACME: (&str, &str) = ("acme", "key-acme-5f3d");
++
++/// The payload every offered event carries: the same body for every key, because what a load run
++/// varies is how many of them are in flight, not what is in them.
++pub fn payload() -> serde_json::Value {
++    json!({ "kind": "invoice.paid", "payload": { "n": 1 } })
++}
++
++/// The address of the `index`-th subscriber of the fixture.
++///
++/// On `127.0.0.1` and a port nothing listens on: no attempt in these specs reaches a real socket,
++/// because what is under test is the ingest path and the queue, and the fixture's subscriber is
++/// [`Counted`].
++pub fn subscriber(index: usize) -> String {
++    format!("http://127.0.0.1:9/load-{index}")
++}
++
++/// One load run: the service, the database, and the subscribers it was started with.
++pub struct Workload {
++    app: App,
++    postgres: Postgres,
++    endpoints: usize,
++}
++
++/// What one level of a load run came to, as the producers saw it.
++#[derive(Debug, Clone, Default)]
++pub struct Offer {
++    /// How many of the offered keys this service accepted for the first time (`201`).
++    pub accepted: usize,
++    /// How many it answered with the event it already held (`200`): a replay, which is what a
++    /// retrying producer gets and is not a second event.
++    pub replayed: usize,
++    /// How many it refused.
++    pub refused: usize,
++    /// How long each request took, in the order the producers finished — not in the order the
++    /// events were offered, because they overlapped.
++    pub samples: Vec<Duration>,
++}
++
++impl Offer {
++    /// How many keys this service answered at all, with an argument for each answer.
++    pub fn answered(&self) -> usize {
++        self.accepted + self.replayed + self.refused
++    }
++}
++
++impl Workload {
++    /// Start a service over a database of its own, with `endpoints` subscribers for one tenant.
++    ///
++    /// The rate limit is raised out of the way on purpose: this fixture exists to measure the
++    /// ingest path, and a run that spent `relay/2.13-rate-limit`'s quota would be measuring that
++    /// step instead. A spec that wants to measure the limiter passes its own settings.
++    pub fn start(endpoints: usize, settings: &[(&str, &str)]) -> Self {
++        let postgres = Postgres::start();
++        let mut vars = vec![
++            var(app::DATABASE_URL, postgres.url()),
++            var(app::BOOTSTRAP_TENANTS, format!("{}={}", ACME.0, ACME.1)),
++            // `relay/2.12-ssrf-defense`: the subscribers here are on this machine, and a deployment
++            // says so explicitly.
++            var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
++            var("RELAY__RATE_LIMIT__BURST", "100000"),
++            var("RELAY__RATE_LIMIT__PER_SECOND", "100000"),
++        ];
++        for (name, value) in settings {
++            vars.push(var(name, *value));
++        }
++        let app = App::start(app::config(&vars));
++        // The handshake the fixtures do before anything reads a table: the port is armed before the
++        // migrations run, so "the socket answers" is not "the schema is there".
++        let ready = app.client().get("/readyz");
++        assert_eq!(
++            ready.status, 200,
++            "the service has to be serving before this fixture asks its database anything: {}",
++            ready.body
++        );
++        for index in 0..endpoints {
++            let answer =
++                app.client()
++                    .post_json("/endpoints", ACME.1, &json!({ "url": subscriber(index) }));
++            assert_eq!(
++                answer.status, 201,
++                "the fixture registers subscriber {index}: {}",
++                answer.body
++            );
++        }
++        Self {
++            app,
++            postgres,
++            endpoints,
++        }
++    }
++
++    /// A client for the service.
++    #[must_use]
++    pub fn client(&self) -> Client {
++        self.app.client()
++    }
++
++    /// The database, for a spec that wants to ask the ledger itself.
++    #[must_use]
++    pub fn postgres(&self) -> &Postgres {
++        &self.postgres
++    }
++
++    /// How many subscribers the fixture registered: the fan-out factor of one event.
++    #[must_use]
++    pub fn endpoints(&self) -> usize {
++        self.endpoints
++    }
++
++    /// One number, as `psql` answers it.
++    pub fn count(&self, sql: &str) -> i64 {
++        self.postgres
++            .query(sql)
++            .trim()
++            .parse()
++            .unwrap_or_else(|error| panic!("`{sql}` answers a number: {error}"))
++    }
++
++    /// The delivery work this service still owes: the same three states the backlog gauge counts
++    /// (`relay/2.18-delivery-metrics`).
++    pub fn outstanding(&self) -> i64 {
++        self.count(
++            "select count(*) from deliveries where state in ('pending', 'claimed', 'retrying')",
++        )
++    }
++
++    /// Offer every key in `keys`, from `concurrency` producers at once, and report what happened.
++    ///
++    /// Each producer pulls the next key from one shared queue, so `keys` are offered exactly once
++    /// and the *order* they arrive in is the machine's business. Each one times its own request
++    /// around the socket, which is the only place the number in a [`relay::loadtest::Point`] can
++    /// honestly come from.
++    pub fn offer(&self, keys: &[String], concurrency: usize) -> Offer {
++        let next = AtomicUsize::new(0);
++        let samples = Mutex::new(Vec::with_capacity(keys.len()));
++        let answers = Mutex::new(Vec::with_capacity(keys.len()));
++        let producers = concurrency.clamp(1, keys.len().max(1));
++
++        std::thread::scope(|scope| {
++            for _ in 0..producers {
++                scope.spawn(|| {
++                    loop {
++                        let index = next.fetch_add(1, Ordering::Relaxed);
++                        let Some(key) = keys.get(index) else { break };
++                        let request = Request::post("/events", Vec::new())
++                            .bearer(ACME.1)
++                            .header("idempotency-key", key)
++                            .json(&payload());
++                        let started = Instant::now();
++                        let answer = self.app.client().send(request);
++                        let elapsed = started.elapsed();
++                        lock(&samples).push(elapsed);
++                        lock(&answers).push(answer.status);
++                    }
++                });
++            }
++        });
++
++        let answers = lock(&answers);
++        let mut offer = Offer {
++            samples: lock(&samples).clone(),
++            ..Offer::default()
++        };
++        for status in answers.iter() {
++            match status {
++                201 => offer.accepted += 1,
++                200 => offer.replayed += 1,
++                _ => offer.refused += 1,
++            }
++        }
++        offer
++    }
++
++    /// The pool the workers of this process run on: the service's own policy.
++    pub async fn pool(&self) -> PgPool {
++        Db::connect(&self.postgres.url())
++            .await
++            .expect("the fixture's pool connects")
++            .pool()
++            .clone()
++    }
++}
++
++/// The lock, poisoned or not: a fixture another producer panicked while holding is still a fixture
++/// this one can read, and refusing to report because of somebody else's panic hides the panic.
++fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
++    mutex
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner())
++}
