@@ -1,0 +1,111 @@
+diff --git a/deny.toml b/deny.toml
+index dd789d5..d4c4383 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -1,29 +1,58 @@
+ # The supply-chain policy of this service (step `relay/2.21-supply-policy`).
+ #
+-# `cargo deny check` reads this file. This is the skeleton: the three sections the checker reads are
+-# here, and every value a decision would go in is empty or a `TODO`. What reads this file before
+-# `cargo-deny` does is the step's spec — it parses the policy and checks the dependency tree against
+-# it, so the file is a policy on a machine where `cargo-deny` was never installed.
++# `cargo deny check` reads this file; the `?deny` gate runs it where the tool is installed, and
++# `tests/spec_policy.rs` judges the policy where it is not — offline, on this machine, over the
++# dependency tree the build already resolved.
+ 
+ [licenses]
+-# Every licence the dependency tree declares, and no others. A crate under a licence that is not
+-# here is a licence this project has not reasoned about, and the answer to that is a decision
+-# (add it deliberately, or drop the dependency) rather than a build that quietly ships it.
+-allow = []
++# Every licence this project has decided it accepts. The list is closed: the next dependency under
++# a licence that is not here is a decision (add it deliberately, or drop the crate), not a build
++# that quietly ships something nobody read.
++#
++# Read as an SPDX *expression* rather than as a word: `MIT OR Apache-2.0` is taken under either
++# licence, `A AND B` needs both, and `Apache-2.0 WITH LLVM-exception` is a licence of its own.
++# Entries this tree does not currently need are a warning from cargo-deny rather than a failure,
++# and they are here because they are the licences this project accepts — the next crate that needs
++# one of them is a decision already made.
++allow = [
++    "MIT",
++    "Apache-2.0",
++    "Apache-2.0 WITH LLVM-exception",
++    "BSD-3-Clause",
++    "ISC",
++    "Unicode-3.0",
++    "Zlib",
++    "BSL-1.0",
++    "Unlicense",
++]
+ # How sure the licence *text* has to be matched before it counts as that licence.
+ confidence-threshold = 0.9
++# This workspace is not published, so its own package expression is not the question: what is being
++# judged is the code this service depends on.
++private = { ignore = true }
+ 
+ [bans]
+-# Two versions of `syn` cost build time; they do not change what this service ships.
++# Two versions of `syn` in the lock file is a build-time cost, not a supply-chain risk: denying
++# duplicates would make every patch release of a dependency fail the check, and a check that fails
++# on a Tuesday for a reason nobody acts on is a check people stop reading.
+ multiple-versions = "warn"
+ # A `*` version requirement is a dependency nobody can review: whichever version was published last
+-# is what lands in the build.
+-wildcards = "TODO"
+-# The crates that must not appear in the tree, whatever brings them in.
+-deny = []
++# is what lands in this build.
++wildcards = "deny"
++# The crates that must not appear in this tree, whatever brings them in. Both of them are here for
++# the same reason: this service hand-writes its HTTP client (`relay/2.7-outbound-client`) and has no
++# TLS backend at all, so a system-linked TLS stack arriving through a transitive dependency is a
++# change that deserves a decision — the alternative is that a dependency silently makes this
++# service's TLS version the build machine's OpenSSL.
++deny = ["openssl-sys", "native-tls"]
+ 
+ [sources]
+-# A crate from a registry nobody named, or from a git URL nobody named, is a crate with no review
+-# process behind it.
+-unknown-registry = "TODO"
+-unknown-git = "TODO"
++# Only crates.io, and only through the registry cargo already has: a crate from a registry nobody
++# named is a crate with no review process behind it.
++unknown-registry = "deny"
++# And the same for a git URL. The 2 a.m. version of this rule is the one that matters: a dependency
++# added as `git = "…"` during an incident is a dependency nobody can review afterwards.
++unknown-git = "deny"
++# When a git source is unavoidable it has to be pinned to a revision: `branch = "main"` is a
++# dependency that changes under the build, and `any` is that with the specifier removed.
++required-git-spec = "rev"
+diff --git a/src/lib.rs b/src/lib.rs
+index da1d134..d035ccc 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,11 @@
+ //! they start doing something: the wiring is done and the behaviour is not. Read the specs — they
+ //! say what each module owes, from outside.
+ 
++// The `unsafe` budget of `relay/2.21-supply-policy`: a crate root is the only place the
++// compiler reads this from, and a library that cannot say it out loud is a library where an
++// `unsafe` block is a review comment instead of a compile error.
++#![forbid(unsafe_code)]
++
+ pub mod audit;
+ pub mod auth;
+ pub mod authz;
+diff --git a/src/main.rs b/src/main.rs
+index d3336c5..03421c3 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,6 +4,10 @@
+ //! then serves — in the order the service depends on. Everything a test can reach lives in the
+ //! library; this file only decides when each piece happens and which exit code ends the process.
+ 
++// The same budget the library states: `src/main.rs` is a second crate root, and `forbid` in one
++// root says nothing about the other.
++#![forbid(unsafe_code)]
++
+ use std::process::ExitCode;
+ use std::sync::Arc;
+ use std::time::Duration;
