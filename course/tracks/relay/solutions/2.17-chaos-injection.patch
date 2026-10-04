@@ -1,0 +1,392 @@
+diff --git a/tests/support/faults.rs b/tests/support/faults.rs
+index 0620f36..871d8c0 100644
+--- a/tests/support/faults.rs
++++ b/tests/support/faults.rs
+@@ -16,7 +16,7 @@
+ //!   registry. A proxy that has to be pulled is a spec that fails on the machine that has no network
+ //!   — and the failure looks like a broken step, not like a missing image;
+ //! * **a fault has to be reproducible.** This proxy is *deterministic*: `Delay(200ms)` delays for
+-//!   200ms, `Loss { every: 2 }` drops every second request. A loss rate drawn from a generator
++//!   200ms, `Loss { every: 2 }` drops every second connection. A loss rate drawn from a generator
+ //!   makes a test that fails one run in twenty, which is a test people learn to re-run instead of
+ //!   read — "a fault you cannot reproduce is a rumour" is the step's whole argument;
+ //! * **`kiln images` stays honest.** Every image a step declares is an image a learner has to pull
+@@ -26,7 +26,7 @@
+ //! What is deliberately *not* claimed: a container proxy can do things this cannot — inject on a
+ //! real network path, cut a route, corrupt a packet at a different layer. The *classes* of failure
+ //! that a delivery path has to survive are the same, and they are what this file injects: a slow
+-//! answer, a connection that ends without one, a connection that never ends, and a request that
++//! answer, a connection that ends without one, a connection that never ends, and a connection that
+ //! never arrives. The tests judge the service's behaviour, not the injection mechanism.
+ //!
+ //! ## The four faults, and what each one is a stand-in for
+@@ -36,7 +36,7 @@
+ //! | [`Fault::Delay`] | the answer, after a wait | a subscriber that is slow, or a network that is |
+ //! | [`Fault::Reset`] | the connection ends at once, with `RST` | a crashed process, a firewall, a load balancer with no backend |
+ //! | [`Fault::HalfOpen`] | a connection that is accepted and then silent | a machine that is up and not answering: the failure only a deadline catches |
+-//! | [`Fault::Loss`] | the request is never forwarded | a connection that goes away between two attempts |
++//! | [`Fault::Loss`] | the connection is never forwarded | a dropped packet, a target that has gone away between two attempts |
+ //!
+ //! `Delay` and `Reset` are the two a retry policy is judged by; `HalfOpen` is the one that
+ //! separates "has a timeout" from "has a deadline that is actually enforced"; `Loss` is what makes
+@@ -45,23 +45,27 @@
+ //! ## What this file does not know
+ //!
+ //! Nothing about the service: no route names, no JSON, no queue. It counts connections it accepted,
+-//! requests it forwarded and attempts it took, and a test reads those counters to see that the fault
+-//! it asked for is the fault that happened. A proxy that injected nothing would make every test in
+-//! `spec_chaos.rs` vacuously green, which is why the counter assertions are there.
+-//!
+-//! ## What the scaffold leaves to you
+-//!
+-//! The interface: a [`Fault`] to choose, a [`Proxy`] with a port of its own and three counters, and
+-//! the words `Fault::as_str` answers with. Everything between them — the listener, the threads, the
+-//! request framing, what each fault does to a connection, and the shared state the counters live in
+-//! — is the step.
++//! requests it forwarded and connections it took, and a test reads those counters to see that the
++//! fault it asked for is the fault that happened. A proxy that injected nothing would make every
++//! test in `spec_chaos.rs` vacuously green, which is why the counter assertions are there.
+ 
+ #![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
+ 
+-use std::net::SocketAddr;
+-use std::sync::Arc;
++use std::io::{Read, Write};
++use std::net::{SocketAddr, TcpListener, TcpStream};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++/// How long a half-open connection is held before the fixture stops caring.
++const PARK: Duration = Duration::from_secs(60);
++/// How long any one read in the proxy may take before it gives up on the peer.
++const IO: Duration = Duration::from_secs(30);
++/// The most of a request head this proxy will buffer.
++const MAX_HEAD: usize = 64 * 1024;
++/// How often the bytes of one half of a connection are shovelled to the other.
++const CHUNK: usize = 8 * 1024;
++
+ /// One failure to inject, chosen by the test.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Fault {
+@@ -80,9 +84,8 @@ pub enum Fault {
+     Reset,
+     /// Accept the request and then answer nothing at all, for ever.
+     ///
+-    /// The request *is* delivered — this is a subscriber that went quiet, not a connection that
+-    /// never arrived — and the connection stays open, so the only thing that ends it is the
+-    /// client's own read deadline.
++    /// The connection stays open, so this is not a failure `read` can report as "closed": the only
++    /// thing that ends it is the client's own deadline.
+     HalfOpen,
+     /// Forward everything except every `every`-th request, which is dropped: the connection is
+     /// closed before the request is forwarded, so the subscriber never sees it.
+@@ -113,17 +116,33 @@ impl Fault {
+             Self::Loss { .. } => "a dropped connection",
+         }
+     }
++
++    /// `true` when this fault drops the `number`-th request seen on one connection.
++    fn takes_request(self, number: usize) -> bool {
++        match self {
++            Self::Loss { every } => every > 1 && number.is_multiple_of(every),
++            Self::None | Self::Delay(_) | Self::HalfOpen | Self::Reset => false,
++        }
++    }
+ }
+ 
+-/// The state every connection thread of one proxy shares: where to forward, what to inject, and
+-/// what has happened. Fill it in with what the methods below need.
+-struct Shared {}
++/// Everything the connection threads share: where to forward, what to inject, what happened.
++struct Shared {
++    /// Where a forwarded request goes.
++    target: SocketAddr,
++    /// The fault in force, replaced by [`Proxy::inject`] and [`Proxy::heal`].
++    fault: Mutex<Fault>,
++    /// How many connections were accepted.
++    connections: AtomicUsize,
++    /// How many requests reached the target.
++    forwarded: AtomicUsize,
++    /// How many connections the fault took instead of forwarding.
++    dropped: AtomicUsize,
++}
+ 
+ /// A proxy in front of one target, with a fault the test controls.
+ pub struct Proxy {
+-    /// Where this proxy listens.
+     address: SocketAddr,
+-    /// What the connection threads share.
+     shared: Arc<Shared>,
+ }
+ 
+@@ -138,51 +157,75 @@ impl Proxy {
+     /// Panics when no port can be bound, which inside a test is a failure with a sentence.
+     #[must_use]
+     pub fn start(target: SocketAddr) -> Self {
+-        todo!("step relay/2.17-chaos-injection")
++        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port for the proxy");
++        let address = listener
++            .local_addr()
++            .expect("a bound listener has an address");
++        let shared = Arc::new(Shared {
++            target,
++            fault: Mutex::new(Fault::None),
++            connections: AtomicUsize::new(0),
++            forwarded: AtomicUsize::new(0),
++            dropped: AtomicUsize::new(0),
++        });
++        let accepting = Arc::clone(&shared);
++        std::thread::spawn(move || {
++            for connection in listener.incoming() {
++                let Ok(stream) = connection else {
++                    continue;
++                };
++                let shared = Arc::clone(&accepting);
++                let number = shared.connections.fetch_add(1, Ordering::SeqCst) + 1;
++                // Detached, like `tests/support/target.rs`: a connection a test walked away from
++                // must not keep the test process alive.
++                std::thread::spawn(move || serve(stream, number, &shared));
++            }
++        });
++        Self { address, shared }
+     }
+ 
+     /// Where this proxy listens.
+     #[must_use]
+     pub fn address(&self) -> SocketAddr {
+-        todo!("step relay/2.17-chaos-injection")
++        self.address
+     }
+ 
+     /// A URL on this proxy, e.g. `http://127.0.0.1:49152/hook`.
+     #[must_use]
+     pub fn url(&self, path: &str) -> String {
+-        todo!("step relay/2.17-chaos-injection")
++        format!("http://{}{path}", self.address)
+     }
+ 
+     /// Inject `fault` from now on. Connections already accepted keep the fault they started with.
+     pub fn inject(&self, fault: Fault) {
+-        todo!("step relay/2.17-chaos-injection")
++        *self.fault_lock() = fault;
+     }
+ 
+     /// Stop injecting: the same thing as [`Proxy::inject`] with [`Fault::None`], and the word a
+     /// test that is done with a fault should say.
+     pub fn heal(&self) {
+-        todo!("step relay/2.17-chaos-injection")
++        self.inject(Fault::None);
+     }
+ 
+     /// The fault in force.
+     #[must_use]
+     pub fn fault(&self) -> Fault {
+-        todo!("step relay/2.17-chaos-injection")
++        *self.fault_lock()
+     }
+ 
+     /// How many connections this proxy accepted.
+     #[must_use]
+     pub fn connections(&self) -> usize {
+-        todo!("step relay/2.17-chaos-injection")
++        self.shared.connections.load(Ordering::SeqCst)
+     }
+ 
+     /// How many requests reached the target.
+     ///
+     /// One per *attempt*: a request that was forwarded and answered counts, and a fault that took
+-    /// the attempt does not.
++    /// the connection does not.
+     #[must_use]
+     pub fn forwarded(&self) -> usize {
+-        todo!("step relay/2.17-chaos-injection")
++        self.shared.forwarded.load(Ordering::SeqCst)
+     }
+ 
+     /// How many attempts a fault took instead of forwarding.
+@@ -191,6 +234,183 @@ impl Proxy {
+     /// dropped request counts when it is read. Both are attempts the subscriber never saw.
+     #[must_use]
+     pub fn dropped(&self) -> usize {
+-        todo!("step relay/2.17-chaos-injection")
++        self.shared.dropped.load(Ordering::SeqCst)
++    }
++
++    /// The fault lock, poisoned or not: a proxy whose connection thread panicked is still a proxy
++    /// whose counters a test wants to read.
++    fn fault_lock(&self) -> std::sync::MutexGuard<'_, Fault> {
++        self.shared
++            .fault
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}
++
++/// Serve one connection: read a request, decide what the fault says about it, and act.
++///
++/// The fault in force is read once, when the connection is accepted: a test that heals a proxy
++/// while an attempt is in flight is testing the attempt that is in flight, and turning the fault
++/// off underneath it would make the outcome depend on the scheduler.
++fn serve(mut client: TcpStream, _number: usize, shared: &Shared) {
++    let _ = client.set_read_timeout(Some(IO));
++    let fault = {
++        *shared
++            .fault
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    };
++
++    if fault == Fault::Reset {
++        // The head is read **one byte at a time** and the body is left where it is: closing a socket
++        // with unread bytes in its receive buffer is what makes the kernel answer with `RST` rather
++        // than an orderly `FIN`. One byte at a time because a single `read` would take the body with
++        // it, and the test would be injecting a closed connection instead of a reset one.
++        let _ = read_head_byte_by_byte(&mut client);
++        shared.dropped.fetch_add(1, Ordering::SeqCst);
++        return;
++    }
++
++    // How many requests have arrived on this connection: what `Fault::Loss` counts.
++    let mut seen = 0usize;
++    loop {
++        let Some(request) = read_request(&mut client) else {
++            return;
++        };
++        seen += 1;
++        if let Fault::Delay(wait) = fault {
++            std::thread::sleep(wait);
++        }
++        if fault.takes_request(seen) {
++            shared.dropped.fetch_add(1, Ordering::SeqCst);
++            return;
++        }
++        // One upstream connection per request, deliberately: a pooled connection here would be the
++        // proxy's own policy to get wrong, and what a test is reading is the service's.
++        let Ok(mut upstream) = TcpStream::connect(shared.target) else {
++            return;
++        };
++        let _ = upstream.set_read_timeout(Some(IO));
++        if upstream.write_all(&request).is_err() {
++            return;
++        }
++        shared.forwarded.fetch_add(1, Ordering::SeqCst);
++        if fault == Fault::HalfOpen {
++            // The request is delivered and the answer is never passed back: the subscriber had it
++            // and said nothing, which is the one failure a client can only end with its own
++            // deadline. The connection stays open for longer than any deadline a test uses.
++            std::thread::sleep(PARK);
++            return;
++        }
++        if forward_answer(&mut upstream, &mut client).is_err() {
++            return;
++        }
++    }
++}
++
++/// Read one request — head and body — as bytes, so it can be forwarded verbatim.
++fn read_request(client: &mut TcpStream) -> Option<Vec<u8>> {
++    let mut raw = Vec::new();
++    let mut buffer = [0u8; 1024];
++    let end = loop {
++        if let Some(end) = find(&raw, b"\r\n\r\n") {
++            break end + 4;
++        }
++        if raw.len() > MAX_HEAD {
++            return None;
++        }
++        let read = client.read(&mut buffer).ok()?;
++        if read == 0 {
++            return None;
++        }
++        raw.extend_from_slice(&buffer[..read]);
++    };
++    // Whatever arrived past the head is the beginning of the body, and it is *kept*: a proxy that
++    // read a chunk and threw away what was in it would wait for bytes that have already arrived,
++    // which is a fixture bug that looks exactly like a slow subscriber.
++    let length = content_length(&String::from_utf8_lossy(&raw[..end]));
++    let mut request = raw[..end].to_vec();
++    let mut body = raw[end..].to_vec();
++    while body.len() < length {
++        let read = client.read(&mut buffer).ok()?;
++        if read == 0 {
++            break;
++        }
++        body.extend_from_slice(&buffer[..read]);
++    }
++    request.extend_from_slice(&body[..length.min(body.len())]);
++    Some(request)
++}
++
++/// Read a request head one byte at a time, and stop at the blank line that ends it.
++///
++/// Only [`Fault::Reset`] uses this, and it uses it for the reason written where it is called: the
++/// body has to stay unread in the socket for the close to be a reset.
++fn read_head_byte_by_byte(client: &mut TcpStream) -> Option<Vec<u8>> {
++    let mut raw = Vec::new();
++    let mut byte = [0u8; 1];
++    loop {
++        if raw.len() > MAX_HEAD {
++            return None;
++        }
++        let read = client.read(&mut byte).ok()?;
++        if read == 0 {
++            return None;
++        }
++        raw.push(byte[0]);
++        if raw.ends_with(b"\r\n\r\n") {
++            return Some(raw);
++        }
++    }
++}
++
++/// Copy one answer — head and body — from `upstream` to `client`.
++fn forward_answer(upstream: &mut TcpStream, client: &mut TcpStream) -> std::io::Result<()> {
++    let mut head = Vec::new();
++    let mut buffer = [0u8; 1024];
++    let end = loop {
++        if let Some(end) = find(&head, b"\r\n\r\n") {
++            break end + 4;
++        }
++        let read = upstream.read(&mut buffer)?;
++        if read == 0 {
++            // The target closed without a complete head: pass on what there was, and end the
++            // connection — the client's own client is the one that decides what that means.
++            client.write_all(&head)?;
++            client.flush()?;
++            return Ok(());
++        }
++        head.extend_from_slice(&buffer[..read]);
++    };
++    let length = content_length(&String::from_utf8_lossy(&head[..end]));
++    let body_start = end;
++    let mut body = head[body_start..].to_vec();
++    while body.len() < length {
++        let read = upstream.read(&mut buffer)?;
++        if read == 0 {
++            break;
++        }
++        body.extend_from_slice(&buffer[..read]);
++    }
++    client.write_all(&head[..body_start])?;
++    client.write_all(&body[..length.min(body.len())])?;
++    client.flush()
++}
++
++/// The `content-length` of a head, or `0` when it does not carry one.
++fn content_length(head: &str) -> usize {
++    head.lines()
++        .filter_map(|line| line.split_once(':'))
++        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
++        .and_then(|(_, value)| value.trim().parse().ok())
++        .unwrap_or(0)
++}
++
++/// Where `needle` sits in `haystack`.
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    if needle.is_empty() || haystack.len() < needle.len() {
++        return None;
+     }
++    (0..=haystack.len() - needle.len())
++        .find(|start| &haystack[*start..*start + needle.len()] == needle)
+ }

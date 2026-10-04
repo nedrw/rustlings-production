@@ -1,0 +1,202 @@
+diff --git a/tests/support/faults.rs b/tests/support/faults.rs
+new file mode 100644
+index 0000000..0620f36
+--- /dev/null
++++ b/tests/support/faults.rs
+@@ -0,0 +1,196 @@
++//! A fault proxy that lives inside the test: the failures you are afraid of, on demand.
++//!
++//! Every other fixture in this directory is a thing a *service* talks to. This one is a thing the
++//! test puts *between* the worker and its subscriber: it accepts a connection on a port of its own,
++//! reads the request, and either forwards it to the target or does something the target would never
++//! do — answer slowly, close the connection, never answer at all, drop it.
++//!
++//! ## Why this is not toxiproxy (or any other proxy container)
++//!
++//! The usual answer to "inject network faults" is a proxy sidecar: `toxiproxy`, Pumba, a `tc`
++//! netem. This course does not use one, and the reasons are the same three every time a decision
++//! like this comes up here (`docs/curriculum.md` §7 names toxiproxy in the tooling list, and this is
++//! a deliberate departure from it):
++//!
++//! * **it has to work offline.** The specs run on a laptop, in CI, and in a sandbox with no
++//!   registry. A proxy that has to be pulled is a spec that fails on the machine that has no network
++//!   — and the failure looks like a broken step, not like a missing image;
++//! * **a fault has to be reproducible.** This proxy is *deterministic*: `Delay(200ms)` delays for
++//!   200ms, `Loss { every: 2 }` drops every second request. A loss rate drawn from a generator
++//!   makes a test that fails one run in twenty, which is a test people learn to re-run instead of
++//!   read — "a fault you cannot reproduce is a rumour" is the step's whole argument;
++//! * **`kiln images` stays honest.** Every image a step declares is an image a learner has to pull
++//!   and keep. A proxy container would be a fourth one, for a fault that `std` can produce in a
++//!   hundred lines.
++//!
++//! What is deliberately *not* claimed: a container proxy can do things this cannot — inject on a
++//! real network path, cut a route, corrupt a packet at a different layer. The *classes* of failure
++//! that a delivery path has to survive are the same, and they are what this file injects: a slow
++//! answer, a connection that ends without one, a connection that never ends, and a request that
++//! never arrives. The tests judge the service's behaviour, not the injection mechanism.
++//!
++//! ## The four faults, and what each one is a stand-in for
++//!
++//! | fault | what the client sees | what it stands for in production |
++//! | --- | --- | --- |
++//! | [`Fault::Delay`] | the answer, after a wait | a subscriber that is slow, or a network that is |
++//! | [`Fault::Reset`] | the connection ends at once, with `RST` | a crashed process, a firewall, a load balancer with no backend |
++//! | [`Fault::HalfOpen`] | a connection that is accepted and then silent | a machine that is up and not answering: the failure only a deadline catches |
++//! | [`Fault::Loss`] | the request is never forwarded | a connection that goes away between two attempts |
++//!
++//! `Delay` and `Reset` are the two a retry policy is judged by; `HalfOpen` is the one that
++//! separates "has a timeout" from "has a deadline that is actually enforced"; `Loss` is what makes
++//! "nothing is lost" a statement about the *queue* rather than about one lucky attempt.
++//!
++//! ## What this file does not know
++//!
++//! Nothing about the service: no route names, no JSON, no queue. It counts connections it accepted,
++//! requests it forwarded and attempts it took, and a test reads those counters to see that the fault
++//! it asked for is the fault that happened. A proxy that injected nothing would make every test in
++//! `spec_chaos.rs` vacuously green, which is why the counter assertions are there.
++//!
++//! ## What the scaffold leaves to you
++//!
++//! The interface: a [`Fault`] to choose, a [`Proxy`] with a port of its own and three counters, and
++//! the words `Fault::as_str` answers with. Everything between them — the listener, the threads, the
++//! request framing, what each fault does to a connection, and the shared state the counters live in
++//! — is the step.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::net::SocketAddr;
++use std::sync::Arc;
++use std::time::Duration;
++
++/// One failure to inject, chosen by the test.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Fault {
++    /// Forward everything: the healthy path, and how a test heals a proxy.
++    None,
++    /// Hold every request this long before forwarding it.
++    ///
++    /// The answer still arrives, so an attempt inside its deadline succeeds — which is what makes
++    /// this the fault that tests a *budget* rather than a timeout.
++    Delay(Duration),
++    /// Close the connection as soon as the request has been read, with the body still unread.
++    ///
++    /// Unread bytes in a socket's receive buffer are what makes the kernel answer with `RST`
++    /// instead of an orderly `FIN`, and an `RST` is what a client sees when the process at the
++    /// other end has died — the failure a retry policy exists for.
++    Reset,
++    /// Accept the request and then answer nothing at all, for ever.
++    ///
++    /// The request *is* delivered — this is a subscriber that went quiet, not a connection that
++    /// never arrived — and the connection stays open, so the only thing that ends it is the
++    /// client's own read deadline.
++    HalfOpen,
++    /// Forward everything except every `every`-th request, which is dropped: the connection is
++    /// closed before the request is forwarded, so the subscriber never sees it.
++    ///
++    /// Deterministic loss, on purpose: `every = 2` drops every second request, and a test that
++    /// asserts exactly how many were dropped is asserting that the injection is reproducible.
++    ///
++    /// The period counts *requests* rather than connections, and it has to: this service reuses a
++    /// connection for the attempts that go to the same target, so a connection that is only
++    /// *sometimes* dropped would take the whole reuse with it and the fault would fire once and
++    /// then hide behind a live socket. Closing the connection is still part of the fault — a
++    /// request that is dropped has to be retried on a new one.
++    Loss {
++        /// The period: every `every`-th request is dropped. `0` and `1` mean none.
++        every: usize,
++    },
++}
++
++impl Fault {
++    /// The fault as text, for a failure message a reader can act on.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Self::None => "no fault",
++            Self::Delay(_) => "a delayed answer",
++            Self::Reset => "a reset connection",
++            Self::HalfOpen => "a half-open connection",
++            Self::Loss { .. } => "a dropped connection",
++        }
++    }
++}
++
++/// The state every connection thread of one proxy shares: where to forward, what to inject, and
++/// what has happened. Fill it in with what the methods below need.
++struct Shared {}
++
++/// A proxy in front of one target, with a fault the test controls.
++pub struct Proxy {
++    /// Where this proxy listens.
++    address: SocketAddr,
++    /// What the connection threads share.
++    shared: Arc<Shared>,
++}
++
++impl Proxy {
++    /// Start a proxy in front of `target`, on a port the kernel picks, injecting nothing.
++    ///
++    /// The port is the kernel's for the reason every fixture here says so: a test that picked one
++    /// would be racing every other test that picked the same one.
++    ///
++    /// # Panics
++    ///
++    /// Panics when no port can be bound, which inside a test is a failure with a sentence.
++    #[must_use]
++    pub fn start(target: SocketAddr) -> Self {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// Where this proxy listens.
++    #[must_use]
++    pub fn address(&self) -> SocketAddr {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// A URL on this proxy, e.g. `http://127.0.0.1:49152/hook`.
++    #[must_use]
++    pub fn url(&self, path: &str) -> String {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// Inject `fault` from now on. Connections already accepted keep the fault they started with.
++    pub fn inject(&self, fault: Fault) {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// Stop injecting: the same thing as [`Proxy::inject`] with [`Fault::None`], and the word a
++    /// test that is done with a fault should say.
++    pub fn heal(&self) {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// The fault in force.
++    #[must_use]
++    pub fn fault(&self) -> Fault {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// How many connections this proxy accepted.
++    #[must_use]
++    pub fn connections(&self) -> usize {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// How many requests reached the target.
++    ///
++    /// One per *attempt*: a request that was forwarded and answered counts, and a fault that took
++    /// the attempt does not.
++    #[must_use]
++    pub fn forwarded(&self) -> usize {
++        todo!("step relay/2.17-chaos-injection")
++    }
++
++    /// How many attempts a fault took instead of forwarding.
++    ///
++    /// One per attempt, whatever the fault: a reset connection counts when it is accepted, and a
++    /// dropped request counts when it is read. Both are attempts the subscriber never saw.
++    #[must_use]
++    pub fn dropped(&self) -> usize {
++        todo!("step relay/2.17-chaos-injection")
++    }
++}
