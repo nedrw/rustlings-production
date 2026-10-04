@@ -226,15 +226,15 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 | `exit-code` | 失败路径退出码非 0 且错误可读 | 子进程测试 | T1 步 4 |
 | `i18n` | 译文结构完整、哈希可追踪 | `kiln i18n status` | 全课程 |
 | `images` | 本步需要的镜像已就位 | 运行时探测 + 预拉检查 | T1 步 9 |
-| `conformance` | 同一套套件跑所有实现（内存/PG） | 两个测试目标复用同一套件 | T3 |
-| `mutants@阈值`（slow） | 规格测试能杀掉本步模块的变异 | `cargo-mutants`（限模块） | T3 |
-| `coverage@阈值` | 覆盖含错误分支 | `cargo-llvm-cov` | T3 |
-| `bench-budget`（slow） | 相对基线 ±10% | `divan` + 自存基线 | T3 |
+| `conformance@N` | 同一套套件跑所有实现（内存/PG） | `kiln/src/gates/conformance.rs`：按项目 `conformance.toml` 的后端列表用 `KILN_BACKEND` 逐后端重跑本步规格 | T3·3.5 |
+| `mutants@阈值`（slow） | 规格测试能杀掉本步模块的变异 | `kiln/src/gates/mutants.rs`（自研，限本步参考解碰过的模块，每步最多 6 个变异体） | T3·3.20 |
+| `?coverage@阈值`（slow, **should**） | 覆盖含错误分支 | `llvm-profdata`/`llvm-cov`（工具链组件）；缺失时 `blocked` + `rustup component add llvm-tools-preview` | T3·3.21 |
+| `bench-budget@P`（slow） | 计数预算在课程基线的 ±P% 内 | `kiln/src/gates/budget.rs` + `course/tracks/jobq/budget/<step>.toml`（判计数，不判墙钟） | T3·3.22 |
 | `sim@seed`（slow） | 确定性模拟下的分布式行为 | `turmoil` / `madsim` | T4/T5 |
 | `soak`（slow） | N 分钟无泄漏、无任务堆积 | 长跑脚本 + `tokio-console` | T4 |
-| `deny` | 许可/版本/来源策略 | `cargo-deny` | T2 末 |
-| `unsafe-budget` | 无未注明 unsafe | `deny(unsafe_code)` + `undocumented_unsafe_blocks` | T3 |
-| `semver` | 公开 API 与基线兼容 | `cargo-semver-checks` + 公开面快照 | T3 |
+| `?deny`（**should**） | 许可/版本/来源策略 | `cargo-deny`；未装时 `blocked` + `cargo install cargo-deny --locked` | T2 末 |
+| `unsafe-budget@N` | 无未注明 unsafe | `kiln/src/gates/unsafe_budget.rs`：源码里的 `unsafe` 计数 + 每处 `// SAFETY:` + `unsafe_code = "deny"` | T3·3.24 |
+| `semver@baseline` | 公开 API 与基线兼容 | `kiln/src/gates/semver.rs`：用 `rustc` 编译课程基线见证文件（`cargo-semver-checks` 是生产里的做法，不进闸门） | T3·3.2 |
 | `container-repro` | 镜像跑的是同一面二进制、且体积在预算内 | `kiln/src/gates/container_repro.rs`（重新构建 + `--check-config` 对照） | T1 步 21 |
 | `links` | 文档链接有效（离线：相对目标 / 锚点 / 占位符） | 内置检查器（`kiln links`） | 每条 track 末 |
 
@@ -334,6 +334,9 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 - **间隔重复**（自学场景的关键补丁）：118 步跨越数月，早先学的能力必然生疏。state 里为每个能力记录 `level` 与 `last_verified`，`kiln review --due`（默认 45 天）把这些能力变成 3–10 分钟的 `probe` 小题重新抽查，并更新 `last_verified`。
 - 工具链钉死 + 一条「依赖刷新」维护流程，避免课程随 crate 漂移腐烂。
 - **外部工具缺失当成一等公民**：本机只装了 `cargo clippy`/`fmt`/`watch`/`expand`，`nextest`/`llvm-cov`/`mutants`/`deny` 全未装。闸门必须先探测工具，缺失时报「跑 `cargo install cargo-mutants`」这类可执行指令，而不是抛退出码；`kiln doctor` 一次性列出全部缺失项与安装命令。
+- **`must` 慢闸门不许需要未安装的工具**（M2 定下，plan §6 的表按此实现）：`mutants`/`bench-budget`/`semver`/`unsafe-budget`/`conformance` 都由 `kiln` 自己用编译器、课程目录里的基线文件与确定性计数判定；`cargo-mutants`/`cargo-semver-checks`/`cargo-llvm-cov`/`cargo-deny` 是生产里的做法，写进正文与 `doctor`，但不是判据。缺口工具能改变的只有一件事：`coverage` 与 `deny` 是 `should`，缺工具时 `⚠ blocked` 并给出安装指令。
+  - 可复现性的三个来源：判据是**编译器与计数**（没有一项看墙钟时间或网络）；取样是**确定性**的（变异体按源序等距取前 6 个，预算基线是课程文件，后端列表是项目文件）；**工具缺失不改判**（`must` 不依赖外部工具，`should` 缺失时只警告）。
+- **慢闸门的分工与耗时**（M2 实测口径）：`mutants` 每步最多 6 次规格运行（在复用同一份沙箱复制品上增量重编）；`bench-budget` 一次 harness；`conformance` 每个后端一次规格运行；`coverage` 在工具链没有 llvm-tools 时零成本跳过。它们在 `kiln run`/`check` 这类快路径上**一次也不跑**（`slow:` 前缀由 runner 跳过），回归保护靠 `verify --slow` 与 `selftest`。
 
 ### 依赖版本基线（已核对 crates.io，2026-10）
 
