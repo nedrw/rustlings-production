@@ -309,4 +309,23 @@ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --
 
 ## 5. 缺口
 
+### 5.1 probe 覆盖（T3 新增槽位）
+
+题库从 19 道扩到 **35 道**（`probe --check` → `35 exercise(s) · 35 reference(s) passed`），
+T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题；**没出题的槽位与理由**（与
+handoff-m1-log.md 第七段同一口径：当单文件只能把机制换成假件时，那道题就是假证据，比没有更糟）：
+
+| 槽位 | 为什么没有题 |
+| --- | --- |
+| `api/library-design@aware`（3.1） | `aware` 按政策不出题（curriculum §11） |
+| `err/typed-errors@design`（3.3） | 增量（`#[non_exhaustive]`、Display 快照）已被 `api-library-design.apply` 从表面侧盖住 |
+| `cfg/layered-config@design`（3.4） | 机制是 cargo 编出一个 feature 矩阵，单文件只能给一组 feature 解出一个配置 |
+| `async/graceful-shutdown@operate`（3.7） | operate 的增量是跨进程（滚动升级下的 drain、双领窗口），单文件只能假装第二个进程 |
+| `http/rate-limit@design`（3.9） | 同一步的公平调度已有 `sched-fairness.design` |
+| `delivery/dlq@operate`（3.16） | 与 `ops-dlq-tooling.apply` 同一步同一件事 |
+| `ops/runbook-drill@design`（3.26） | 证据是一页文档 + 对它的评审，探针只能查步骤表的形状 |
+| `db/transactions@design` 等 | **可加**：注入序列化冲突 + 有界重试（与 `delivery-retry-budget.design` 重叠）、去重窗口边界、配额与归因计数、错误预算/告警噪声、追踪采样、expand→backfill→contract —— 这六项是「范围」而不是「诚实度」的取舍，留给收尾前补（每项的形状已写在子 agent 报告里）|
+
+### 5.2 其他
+
 （收尾时写。）
