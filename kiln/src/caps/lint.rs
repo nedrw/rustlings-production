@@ -266,12 +266,18 @@ fn check_ledger_conformance(
 
 /// R1 inside each track: the same (capability, depth) twice is a re-teach, and a deliberate one
 /// has to say so.
+///
+/// The key is the *slot*, not the capability: a track that establishes `api/library-design@aware`
+/// in its first step and `@apply` in its second is a track that walks a capability from "read it"
+/// to "write it", which is exactly what the depth ladder is for (curriculum.md §2.1). What R1
+/// refuses is teaching one slot twice; R2 is the rule that keeps the *order* honest across the whole
+/// path.
 fn check_tracks(course: &Course, report: &mut Report) {
     for track in course.tracks() {
-        let mut positions: BTreeMap<&CapabilityId, &Step> = BTreeMap::new();
+        let mut positions: BTreeMap<(&CapabilityId, Level), &Step> = BTreeMap::new();
         for step in &track.step {
             for requirement in &step.teaches {
-                if let Some(previous) = positions.insert(&requirement.id, step) {
+                if let Some(previous) = positions.insert((&requirement.id, requirement.level), step) {
                     match &step.reteach {
                         Some(reason) => {
                             report.reteaches.push((step.qualified_id(), reason.clone()))
@@ -730,6 +736,31 @@ mod tests {
             issues.iter().any(|issue| issue.contains("reteach")),
             "{issues:?}"
         );
+    }
+
+    #[test]
+    fn r1_keys_on_the_slot_and_not_on_the_capability() {
+        // Walking one capability from `aware` to `apply` inside a single track is what the depth
+        // ladder is for (curriculum.md §2.1), and the ledger plans it three times (`jobq/3.1` →
+        // `jobq/3.2` for `api/library-design`, T4's WAL pair, T5's consensus pair). Keying R1 on
+        // the capability alone would refuse all three.
+        let temp = TempDir::new("lint-r1-deeper");
+        let course = load_course(
+            temp.path(),
+            &one_track(
+                &[
+                    step_toml("mailer", "1.1-workspace", &["repo/workspace-layout@aware"]),
+                    step_toml("mailer", "1.2-toolchain", &["repo/workspace-layout@apply"]),
+                ],
+                &["repo/workspace-layout@apply"],
+            ),
+            &ledger_toml(&[
+                ("repo/workspace-layout", "aware", "mailer/1.1"),
+                ("repo/workspace-layout", "apply", "mailer/1.2"),
+            ]),
+        );
+        let report = lint(&course).unwrap();
+        assert!(report.is_clean(), "{:?}", report.issues);
     }
 
     #[test]
