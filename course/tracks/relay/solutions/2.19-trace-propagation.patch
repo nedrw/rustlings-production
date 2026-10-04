@@ -1,0 +1,615 @@
+diff --git a/migrations/0009_trace.sql b/migrations/0009_trace.sql
+new file mode 100644
+index 0000000..7ea8a24
+--- /dev/null
++++ b/migrations/0009_trace.sql
+@@ -0,0 +1,18 @@
++-- The trace a delivery belongs to (step relay/2.19-trace-propagation).
++--
++-- Written when the event was accepted, read when the delivery goes out: the two halves are minutes
++-- or hours apart and live in different processes, so the trace context travels with the work rather
++-- than with the process that created it. That is the whole reason these are columns.
++--
++-- Both are nullable, and that is a decision rather than an oversight: a delivery accepted before
++-- this service carried traces has none, and it goes out with no `traceparent` rather than with one
++-- invented at delivery time — an invented trace id is a link to a request nobody made.
++alter table deliveries
++    add column trace_id text,
++    add column tracestate text;
++
++-- A trace id this service would not have written is a row this service would not have written, and
++-- the shape is checked where the row is, not only where it is read.
++alter table deliveries
++    add constraint deliveries_trace_id_well_formed
++        check (trace_id is null or trace_id ~ '^[0-9a-f]{32}$');
+diff --git a/src/delivery.rs b/src/delivery.rs
+index db77673..f3a21eb 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -327,6 +327,11 @@ fn next_attempt(budget: &Budget, delivery: Uuid, attempt: i32) -> DateTime<Utc>
+ 
+ /// Write down what one accepted event owes: one delivery per endpoint of its tenant.
+ ///
++/// The trace context of the request is written on every row it creates, in the same transaction as
++/// the rows themselves: the request that accepted the event and the work it owes are one commit, and
++/// a delivery whose trace was written separately would be a delivery that is sometimes untraceable
++/// (`relay/2.19-trace-propagation`).
++///
+ /// Takes a connection rather than a pool because it runs **inside the transaction that accepted the
+ /// event** (`events::ingest`): an accepted event and the work it creates are one commit. A crash
+ /// between the two would be an event nobody is ever told about, which is the one failure this
+@@ -339,16 +344,20 @@ pub(crate) async fn fan_out(
+     connection: &mut PgConnection,
+     event: Uuid,
+     tenant: TenantId,
++    context: &crate::trace::Context,
+ ) -> Result<u64, Error> {
+     // `on conflict do nothing` against `unique (event_id, endpoint_id)`: a fan-out that happens
+     // twice — a retried request, a replay, two processes — writes no second debt.
+     let written = sqlx::query(
+-        "insert into deliveries (id, event_id, endpoint_id) \
+-         select gen_random_uuid(), $1, endpoints.id from endpoints where endpoints.tenant_id = $2 \
++        "insert into deliveries (id, event_id, endpoint_id, trace_id, tracestate) \
++         select gen_random_uuid(), $1, endpoints.id, $3, $4 from endpoints \
++          where endpoints.tenant_id = $2 \
+          on conflict (event_id, endpoint_id) do nothing",
+     )
+     .bind(event)
+     .bind(tenant.as_uuid())
++    .bind(context.trace.as_str())
++    .bind(context.state.as_deref())
+     .execute(connection)
+     .await
+     .map_err(Error::Database)?;
+diff --git a/src/events.rs b/src/events.rs
+index 9c3b5fd..77cc64f 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -82,6 +82,11 @@ pub fn decode_payload(stored: &str) -> Result<serde_json::Value, Error> {
+ 
+ /// Store one event, or answer with the one this tenant already stored under `idempotency_key`.
+ ///
++/// The trace context of the request is part of the answer rather than a separate write: the work
++/// this event creates carries the trace of the request that created it, which is what makes a
++/// delivery traceable back to a caller that is thousands of deliveries away
++/// (`relay/2.19-trace-propagation`).
++///
+ /// One statement decides it. `on conflict … do nothing` writes nothing when the key is taken, and
+ /// `returning` answers with the row exactly when this call is the one that wrote it — so a
+ /// concurrent retry does not get a "the key is mine now" error, it gets the event.
+@@ -97,6 +102,7 @@ pub async fn ingest(
+     kind: &str,
+     payload: &serde_json::Value,
+     limits: Limits,
++    context: &crate::trace::Context,
+ ) -> Result<Ingested, Error> {
+     let id = Uuid::new_v4();
+     // The event and the deliveries it owes are written in one transaction, and committed together:
+@@ -120,7 +126,7 @@ pub async fn ingest(
+ 
+     match written {
+         Some((id, received_at)) => {
+-            crate::delivery::fan_out(&mut transaction, id, tenant).await?;
++            crate::delivery::fan_out(&mut transaction, id, tenant, context).await?;
+             // The queue has a bottom (`relay/2.14-backpressure`), and this is where it is checked:
+             // in the transaction that writes the work, so a refusal writes nothing back — no event,
+             // no deliveries, and no promise this service cannot keep. The count sees what this
+diff --git a/src/http.rs b/src/http.rs
+index e891556..3522289 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -55,6 +55,7 @@ use crate::openapi;
+ use crate::pagination;
+ use crate::ratelimit::{self, Limiter, System, Verdict};
+ use crate::target;
++use crate::trace::{self, Traceparent};
+ use uuid::Uuid;
+ 
+ /// Everything a handler may need, built once per process.
+@@ -166,6 +167,7 @@ pub fn router(state: AppState) -> Router {
+         .layer(middleware::from_fn_with_state(state.clone(), identify))
+         .layer(middleware::from_fn_with_state(state.clone(), limit_calls))
+         .layer(middleware::from_fn_with_state(state.clone(), log_request))
++        .layer(middleware::from_fn(trace_context))
+         .layer(middleware::from_fn_with_state(state.clone(), request_id))
+         .with_state(state)
+ }
+@@ -240,6 +242,36 @@ async fn request_id(mut request: Request, next: Next) -> Response {
+     response
+ }
+ 
++/// Read the caller's trace, or start one.
++///
++/// The order matters and it is the reason this layer is outside the log: a line written before the
++/// trace is known cannot carry it, and a trace that appears on the delivery but not in the log of
++/// the request that created it is a link an operator can only follow in one direction.
++///
++/// A header this service cannot read is ignored *and the vendor state that came with it is dropped
++/// too*: a `tracestate` is only meaningful next to the trace id it arrived with, and keeping it
++/// while starting a new trace would hand the next hop somebody else's baggage under this service's
++/// trace id.
++async fn trace_context(mut request: Request, next: Next) -> Response {
++    let parent = request
++        .headers()
++        .get(trace::TRACEPARENT)
++        .and_then(|value| value.to_str().ok())
++        .and_then(|header| Traceparent::parse(header).ok());
++    let context = match &parent {
++        Some(parent) => {
++            let state = request
++                .headers()
++                .get(trace::TRACESTATE)
++                .and_then(|value| value.to_str().ok());
++            trace::Context::of(parent, state)
++        }
++        None => trace::Context::of(&Traceparent::generate(), None),
++    };
++    request.extensions_mut().insert(context);
++    next.run(request).await
++}
++
+ /// One line per request, written *after* the answer exists, so the status is the real one.
+ async fn log_request(request: Request, next: Next) -> Response {
+     let started = Instant::now();
+@@ -250,11 +282,20 @@ async fn log_request(request: Request, next: Next) -> Response {
+         .get::<RequestId>()
+         .map(|id| id.0.clone())
+         .unwrap_or_default();
++    let trace_id = request
++        .extensions()
++        .get::<trace::Context>()
++        .map(|context| context.trace.to_string())
++        .unwrap_or_default();
+     let response = next.run(request).await;
+     let status = response.status().as_u16();
+     let duration_ms = started.elapsed().as_millis();
++    // Two ids and not one: the request id is this service's own handle on one request, and the trace
++    // id is what it shares with the caller's system and with the subscriber it delivers to. An
++    // operator looking for a delivery that never arrived needs the second one.
+     tracing::info!(
+         request_id = %id,
++        trace_id = %trace_id,
+         method = %method,
+         path = %path,
+         status,
+@@ -565,6 +606,7 @@ struct CreateEvent {
+ async fn create_event(
+     State(state): State<AppState>,
+     Extension(principal): Extension<Principal>,
++    Extension(context): Extension<trace::Context>,
+     headers: HeaderMap,
+     body: Result<Json<CreateEvent>, axum::extract::rejection::JsonRejection>,
+ ) -> Response {
+@@ -593,6 +635,7 @@ async fn create_event(
+         kind,
+         &body.payload,
+         state.config().delivery.limits,
++        &context,
+     )
+     .await
+     {
+diff --git a/src/lib.rs b/src/lib.rs
+index 1c37a12..02064f2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -32,6 +32,7 @@ pub mod pagination;
+ pub mod ratelimit;
+ pub mod signing;
+ pub mod target;
++pub mod trace;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+ pub const USAGE: &str = "\
+diff --git a/src/main.rs b/src/main.rs
+index 301af07..d3336c5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -17,6 +17,7 @@ use relay::logging::{self, RunId};
+ use relay::ordering::Lanes;
+ use relay::outbound::{HttpSender, Policy};
+ use relay::signing::DbSecrets;
++use relay::trace::DbTraces;
+ use relay::{USAGE, error::Error};
+ use tokio::sync::watch;
+ 
+@@ -155,12 +156,15 @@ fn worker_of(
+     // process holds (`limits`), and how long its claims stay invisible if it stops answering
+     // (`lease`).
+     let secrets = Arc::new(DbSecrets::new(state.db().pool().clone()));
++    // Where a delivery's trace comes from: the columns the event's own transaction wrote
++    // (`relay/2.19-trace-propagation`).
++    let traces = Arc::new(DbTraces::new(state.db().pool().clone()));
+     // The registry the HTTP side renders and the worker writes into: one process, one set of
+     // numbers (`relay/2.18-delivery-metrics`).
+     let metrics = Arc::clone(state.metrics());
+     Worker::new(
+         state.db().pool().clone(),
+-        Arc::new(HttpSender::signing(policy, secrets)),
++        Arc::new(HttpSender::signing(policy, secrets).with_traces(traces)),
+         Arc::new(Gate::new(limits)),
+         Arc::new(Lanes::new()),
+         Budget::default(),
+diff --git a/src/openapi.rs b/src/openapi.rs
+index b7efc4b..a2bcdfa 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -146,15 +146,37 @@ pub fn document() -> Value {
+                 },
+                 "post": {
+                     "summary": "Accept one event for the calling tenant.",
+-                    "parameters": [{
+-                        "name": "Idempotency-Key",
+-                        "in": "header",
+-                        "required": true,
+-                        "description": "The caller's promise that two requests carrying this key \
+-                                        are one event. A key that has been used before is \
+-                                        answered with the event stored then.",
+-                        "schema": { "type": "string", "minLength": 1 },
+-                    }],
++                    "parameters": [
++                        {
++                            "name": "Idempotency-Key",
++                            "in": "header",
++                            "required": true,
++                            "description": "The caller's promise that two requests carrying this key \
++                                            are one event. A key that has been used before is \
++                                            answered with the event stored then.",
++                            "schema": { "type": "string", "minLength": 1 },
++                        },
++                        {
++                            "name": "traceparent",
++                            "in": "header",
++                            "required": false,
++                            "description": "The W3C trace context of the caller's request. The trace \
++                                            id is kept and carried to the subscriber with a span id \
++                                            of this service's own; a header that cannot be read is \
++                                            ignored and a new trace is started. Without it, a \
++                                            request is still traced — as a trace of its own.",
++                            "schema": { "type": "string" },
++                        },
++                        {
++                            "name": "tracestate",
++                            "in": "header",
++                            "required": false,
++                            "description": "Vendor state that travels with the trace, passed to the \
++                                            subscriber unchanged. It is only meaningful next to \
++                                            the `traceparent` it arrived with.",
++                            "schema": { "type": "string" },
++                        },
++                    ],
+                     "requestBody": {
+                         "required": true,
+                         "content": {
+diff --git a/src/outbound.rs b/src/outbound.rs
+index 75313a9..c8c0492 100644
+--- a/src/outbound.rs
++++ b/src/outbound.rs
+@@ -57,6 +57,7 @@ use crate::delivery::{Receipt, SendError, SendRequest, Sender};
+ use crate::domain::EndpointUrl;
+ use crate::signing::{self, Secrets};
+ use crate::target::{self, Host, Refusal, Resolver, Rules, System, Unreachable};
++use crate::trace::{self, Traces};
+ 
+ /// The most a response head may be before this client gives up on it. A head is a few hundred bytes;
+ /// a target that sends a megabyte of them is not answering, it is filling memory.
+@@ -595,6 +596,12 @@ pub struct HttpSender {
+     /// The store to sign with, or `None` for a sender that sends unsigned requests (a test, a
+     /// deployment that has not configured signing yet).
+     secrets: Option<Arc<dyn Secrets>>,
++    /// Where the trace of a delivery is read from, or `None` for a sender that does not trace.
++    ///
++    /// A second port rather than a field on the request, for the reason `secrets` is one
++    /// (`relay/2.19-trace-propagation`): the worker's request type does not grow for what an
++    /// adapter needs, and both of these are things only the adapter writes.
++    traces: Option<Arc<dyn Traces>>,
+ }
+ 
+ impl HttpSender {
+@@ -604,6 +611,7 @@ impl HttpSender {
+         Self {
+             client: Client::new(policy),
+             secrets: None,
++            traces: None,
+         }
+     }
+ 
+@@ -617,6 +625,20 @@ impl HttpSender {
+         Self {
+             client: Client::new(policy),
+             secrets: Some(secrets),
++            traces: None,
++        }
++    }
++
++    /// The same sender, carrying the trace of each delivery out of the queue.
++    ///
++    /// A delivery with no trace is sent without one, which is what an endpoint that was registered
++    /// before this service carried traces deserves: a header invented at delivery time is a link to
++    /// a request nobody made.
++    #[must_use]
++    pub fn with_traces(self, traces: Arc<dyn Traces>) -> Self {
++        Self {
++            traces: Some(traces),
++            ..self
+         }
+     }
+ 
+@@ -633,6 +655,7 @@ impl Sender for HttpSender {
+         request: SendRequest,
+     ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
+         let secrets = self.secrets.clone();
++        let traces = self.traces.clone();
+         Box::pin(async move {
+             // What the subscriber is handed: the event as the API answers with it, plus which
+             // attempt this is. The delivery id travels in a header of its own, because it is not
+@@ -679,6 +702,32 @@ impl Sender for HttpSender {
+                     .header(signing::SIGNATURE_HEADER, &signature);
+             }
+ 
++            // The trace of the request that accepted this event, and a span for *this* attempt: a
++            // hop of its own inside the same trace, which is what makes two attempts two things in
++            // whatever the subscriber is running.
++            let outbound = match &traces {
++                Some(traces) => match traces.context_for(request.delivery).await {
++                    Ok(Some(context)) => {
++                        let mut outbound =
++                            outbound.header(trace::TRACEPARENT, &context.child().to_string());
++                        if let Some(state) = context.state.as_deref() {
++                            outbound = outbound.header(trace::TRACESTATE, state);
++                        }
++                        outbound
++                    }
++                    // No trace on the row: a delivery accepted before this service carried traces,
++                    // or one written by a deployment that turned tracing off.
++                    Ok(None) => outbound,
++                    Err(error) => {
++                        return Err(SendError::Retryable(format!(
++                            "the trace of `{}` could not be read: {error}",
++                            request.url
++                        )));
++                    }
++                },
++                None => outbound,
++            };
++
+             let outbound = outbound
+                 .header("content-type", "application/json")
+                 .body(payload);
+diff --git a/src/trace.rs b/src/trace.rs
+index 89ac082..e003d95 100644
+--- a/src/trace.rs
++++ b/src/trace.rs
+@@ -70,12 +70,15 @@ pub struct TraceId(String);
+ 
+ impl TraceId {
+     /// A new trace id, from the operating system's randomness.
+-    ///
+-    /// Unpredictable rather than sequential: an id that can be guessed is an id a stranger can join
+-    /// a trace with.
+     #[must_use]
+     pub fn generate() -> Self {
+-        todo!("step relay/2.19-trace-propagation")
++        // Two UUIDv4s' worth of randomness, hex, cut to length: what this needs is unpredictability
++        // rather than a version or a variant bit, and a UUID is the random source this project
++        // already has (`getrandom` arrives with `uuid`).
++        let mut hex = uuid::Uuid::new_v4().simple().to_string();
++        hex.push_str(&uuid::Uuid::new_v4().simple().to_string());
++        hex.truncate(TRACE_HEX);
++        Self(hex)
+     }
+ 
+     /// Parse a trace id: exactly 32 lower-case hex characters, not all zeroes.
+@@ -84,7 +87,9 @@ impl TraceId {
+     ///
+     /// Returns [`ValueError`] when the text is not a trace id this service would generate.
+     pub fn parse(text: &str) -> Result<Self, ValueError> {
+-        todo!("step relay/2.19-trace-propagation")
++        hex_id(text, TRACE_HEX, "trace")
++            .map(Self)
++            .map_err(|why| ValueError::Invalid(format!("`{text}` is not a trace id: {why}")))
+     }
+ 
+     /// The id as text: what a header carries and what a row stores.
+@@ -111,7 +116,9 @@ impl SpanId {
+     /// A new span id, from the operating system's randomness.
+     #[must_use]
+     pub fn generate() -> Self {
+-        todo!("step relay/2.19-trace-propagation")
++        let mut hex = uuid::Uuid::new_v4().simple().to_string();
++        hex.truncate(SPAN_HEX);
++        Self(hex)
+     }
+ 
+     /// Parse a span id: exactly 16 lower-case hex characters, not all zeroes.
+@@ -120,7 +127,9 @@ impl SpanId {
+     ///
+     /// Returns [`ValueError`] when the text is not a span id this service would generate.
+     pub fn parse(text: &str) -> Result<Self, ValueError> {
+-        todo!("step relay/2.19-trace-propagation")
++        hex_id(text, SPAN_HEX, "span")
++            .map(Self)
++            .map_err(|why| ValueError::Invalid(format!("`{text}` is not a span id: {why}")))
+     }
+ 
+     /// The id as text.
+@@ -152,7 +161,11 @@ impl Traceparent {
+     /// Start a trace: a new id, a new span, and the decision to keep it.
+     #[must_use]
+     pub fn generate() -> Self {
+-        todo!("step relay/2.19-trace-propagation")
++        Self {
++            trace: TraceId::generate(),
++            span: SpanId::generate(),
++            sampled: true,
++        }
+     }
+ 
+     /// Read a `traceparent` header.
+@@ -163,38 +176,82 @@ impl Traceparent {
+     /// failure of the request: the caller is told the trace restarted, which is what
+     /// [`Traceparent::generate`] is for.
+     pub fn parse(header: &str) -> Result<Self, ValueError> {
+-        todo!("step relay/2.19-trace-propagation")
++        let mut parts = header.trim().split('-');
++        let (Some(version), Some(trace), Some(span), Some(flags)) =
++            (parts.next(), parts.next(), parts.next(), parts.next())
++        else {
++            return Err(ValueError::Invalid(format!(
++                "`{header}` is not a traceparent: expected `00-<trace>-<span>-<flags>`"
++            )));
++        };
++        // A fifth field exists in later versions of the format, and this service does not speak
++        // them: guessing at the shape of a version it does not know is how a service sends
++        // downstream a header nobody agreed on. The trace restarts instead.
++        if parts.next().is_some() {
++            return Err(ValueError::Invalid(format!(
++                "`{header}` has more fields than version {VERSION} has"
++            )));
++        }
++        if version != VERSION {
++            return Err(ValueError::Invalid(format!(
++                "`{version}` is not the version of traceparent this service speaks ({VERSION})"
++            )));
++        }
++        let trace = TraceId::parse(trace)?;
++        let span = SpanId::parse(span)?;
++        let flags = flags.trim();
++        if flags.len() != 2 || !flags.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++            return Err(ValueError::Invalid(format!(
++                "`{flags}` is not a two-character flag byte"
++            )));
++        }
++        let sampled = u8::from_str_radix(flags, 16).unwrap_or_default() & 0x01 == 0x01;
++        Ok(Self {
++            trace,
++            span,
++            sampled,
++        })
+     }
+ 
+     /// The next hop inside this trace: the same trace id, a span of its own, and the sampling
+     /// decision that was made before this service saw the request.
+     #[must_use]
+     pub fn child(&self) -> Self {
+-        todo!("step relay/2.19-trace-propagation")
++        Self {
++            trace: self.trace.clone(),
++            span: SpanId::generate(),
++            sampled: self.sampled,
++        }
+     }
+ 
+     /// The trace this hop belongs to: what every hop shares.
+     #[must_use]
+     pub fn trace(&self) -> &TraceId {
+-        todo!("step relay/2.19-trace-propagation")
++        &self.trace
+     }
+ 
+     /// This hop's span: what every hop does not share.
+     #[must_use]
+     pub fn span(&self) -> &SpanId {
+-        todo!("step relay/2.19-trace-propagation")
++        &self.span
+     }
+ 
+     /// `true` when the trace is being recorded.
+     #[must_use]
+     pub fn sampled(&self) -> bool {
+-        todo!("step relay/2.19-trace-propagation")
++        self.sampled
+     }
+ }
+ 
+ impl fmt::Display for Traceparent {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!("step relay/2.19-trace-propagation")
++        write!(
++            f,
++            "{VERSION}-{}-{}-{:02x}",
++            self.trace,
++            self.span,
++            u8::from(self.sampled)
++        )
+     }
+ }
+ 
+@@ -218,13 +275,21 @@ impl Context {
+     /// What a request brought: the trace of its `traceparent`, and its `tracestate`.
+     #[must_use]
+     pub fn of(parent: &Traceparent, state: Option<&str>) -> Self {
+-        todo!("step relay/2.19-trace-propagation")
++        Self {
++            trace: parent.trace().clone(),
++            sampled: parent.sampled(),
++            state: state.map(str::to_owned),
++        }
+     }
+ 
+     /// The next hop: a span of its own inside this trace.
+     #[must_use]
+     pub fn child(&self) -> Traceparent {
+-        todo!("step relay/2.19-trace-propagation")
++        Traceparent {
++            trace: self.trace.clone(),
++            span: SpanId::generate(),
++            sampled: self.sampled,
++        }
+     }
+ }
+ 
+@@ -270,6 +335,53 @@ impl Traces for DbTraces {
+         &self,
+         delivery: Uuid,
+     ) -> Pin<Box<dyn Future<Output = Result<Option<Context>, Error>> + Send + '_>> {
+-        todo!("step relay/2.19-trace-propagation")
++        Box::pin(async move {
++            let row: Option<(Option<String>, Option<String>)> =
++                sqlx::query_as("select trace_id, tracestate from deliveries where id = $1")
++                    .bind(delivery)
++                    .fetch_optional(&self.pool)
++                    .await
++                    .map_err(Error::Database)?;
++            let Some((trace, state)) = row else {
++                return Ok(None);
++            };
++            let Some(trace) = trace else {
++                return Ok(None);
++            };
++            // A trace id this service would not have written is a row this service would not have
++            // written: the honest answer is a failure, not a header built out of whatever is in the
++            // column.
++            let trace = TraceId::parse(&trace).map_err(|error| {
++                Error::Database(sqlx::Error::Protocol(format!(
++                    "delivery {delivery} carries a trace id this service would not have written: \
++                     {error}"
++                )))
++            })?;
++            Ok(Some(Context {
++                trace,
++                sampled: true,
++                state,
++            }))
++        })
++    }
++}
++
++/// A string of exactly `length` lower-case hex characters, and not all zeroes.
++fn hex_id(text: &str, length: usize, what: &str) -> Result<String, String> {
++    if text.len() != length {
++        return Err(format!(
++            "{what} ids are {length} hex characters and this one is {}",
++            text.len()
++        ));
++    }
++    if !text
++        .bytes()
++        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
++    {
++        return Err(format!("{what} ids are lower-case hex and `{text}` is not"));
++    }
++    if text.bytes().all(|byte| byte == b'0') {
++        return Err(format!("all-zero {what} ids are reserved"));
+     }
++    Ok(text.to_owned())
+ }

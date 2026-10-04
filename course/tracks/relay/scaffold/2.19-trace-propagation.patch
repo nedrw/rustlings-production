@@ -1,0 +1,281 @@
+diff --git a/src/trace.rs b/src/trace.rs
+new file mode 100644
+index 0000000..89ac082
+--- /dev/null
++++ b/src/trace.rs
+@@ -0,0 +1,275 @@
++//! Where a request came from, carried across the boundary to where its delivery goes.
++//!
++//! `mailer/1.6-logging` gave one *run* a correlation id and every log line carried it. That is
++//! enough to follow a request through one process, and it stops at the process boundary: the
++//! subscriber that receives a webhook is another system, and the thing an operator needs at three in
++//! the morning is the sentence "the event this subscriber says it never got is the request this
++//! caller says it sent". A trace is that sentence, and it only exists if the identifier survives
++//! every hop:
++//!
++//! ```text
++//! caller ──traceparent──▶ relay (POST /events) ──queue──▶ worker ──traceparent──▶ subscriber
++//!          1 trace id                              1 trace id
++//!          1 span id        2 span ids             1 new span id per attempt
++//! ```
++//!
++//! Three decisions are in this module, and each one is a shape rather than a line of code:
++//!
++//! * **the trace id travels with the work, not with the process.** A delivery is not made by the
++//!   request that accepted it: it is made minutes or hours later, by a worker that never saw the
++//!   request. So the trace id is written down with the work (a column on `deliveries`, kept when
++//!   the event was accepted) and read back when the delivery goes out. In-process propagation —
++//!   a task-local, a thread-local — is the version of this that works in every test and no
++//!   deployment;
++//! * **a hop gets a span of its own.** The trace id is the same end to end; the span id is not
++//!   shared, because a span is "this thing that took this long", and two attempts at one delivery
++//!   are two things. `Context::child` is the whole of that rule: same trace, new span, and the
++//!   sampling decision the caller made;
++//! * **the header is parsed, never forwarded.** [`Traceparent::parse`] accepts exactly the shape
++//!   `00-<32 hex>-<16 hex>-<2 hex>` and refuses everything else, and what this service sends
++//!   downstream is a header *it* generated from the trace id it stored. Passing a caller's header
++//!   through unread is how a service ends up as a relay for whatever anybody sends — and how a
++//!   trace whose parent is not a real trace id becomes a broken trace in somebody else's system.
++//!
++//! A header this service cannot read is not an error and not a reason to refuse a delivery: the
++//! trace restarts with a new trace id, and the delivery goes out normally. Losing a parent link is
++//! a worse trace; dropping an event is a worse service.
++//!
++//! The format is the W3C's [`traceparent`], which is what makes the trace survive systems this
++//! service knows nothing about.
++//!
++//! [`traceparent`]: https://www.w3.org/TR/trace-context/#traceparent-header
++
++use std::fmt;
++use std::future::Future;
++use std::pin::Pin;
++
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::ValueError;
++use crate::error::Error;
++
++/// The header that carries a hop's identity.
++pub const TRACEPARENT: &str = "traceparent";
++/// The header that carries what vendors along the way said about the trace.
++pub const TRACESTATE: &str = "tracestate";
++/// The version of the format this service speaks.
++const VERSION: &str = "00";
++/// How many hex characters a trace id has: sixteen bytes.
++const TRACE_HEX: usize = 32;
++/// How many hex characters a span id has: eight bytes.
++const SPAN_HEX: usize = 16;
++
++/// A trace: the identity every hop of one request shares.
++///
++/// Sixteen bytes, lower case, and never all zeroes — the format's one reserved value, because a
++/// trace id of zeroes is what a system that did not generate a trace sends.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct TraceId(String);
++
++impl TraceId {
++    /// A new trace id, from the operating system's randomness.
++    ///
++    /// Unpredictable rather than sequential: an id that can be guessed is an id a stranger can join
++    /// a trace with.
++    #[must_use]
++    pub fn generate() -> Self {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// Parse a trace id: exactly 32 lower-case hex characters, not all zeroes.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`ValueError`] when the text is not a trace id this service would generate.
++    pub fn parse(text: &str) -> Result<Self, ValueError> {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// The id as text: what a header carries and what a row stores.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for TraceId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++/// A span: this hop, and how long it took.
++///
++/// Eight bytes, lower case, never all zeroes. A span id is *not* shared: the caller has one, this
++/// service has one, the next hop has one, and they all sit inside one trace id.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct SpanId(String);
++
++impl SpanId {
++    /// A new span id, from the operating system's randomness.
++    #[must_use]
++    pub fn generate() -> Self {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// Parse a span id: exactly 16 lower-case hex characters, not all zeroes.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`ValueError`] when the text is not a span id this service would generate.
++    pub fn parse(text: &str) -> Result<Self, ValueError> {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// The id as text.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for SpanId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++/// One hop's identity, as the `traceparent` header carries it: `00-<trace>-<span>-<flags>`.
++///
++/// The flags are the low bit of a byte: `01` means the caller decided this trace is worth
++/// recording, `00` means it is not. This service propagates the decision rather than making one —
++/// a hop that has no sampler has no business overriding the sampler that started the trace.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Traceparent {
++    trace: TraceId,
++    span: SpanId,
++    sampled: bool,
++}
++
++impl Traceparent {
++    /// Start a trace: a new id, a new span, and the decision to keep it.
++    #[must_use]
++    pub fn generate() -> Self {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// Read a `traceparent` header.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`ValueError`] when the header is not one this service can read. That is not a
++    /// failure of the request: the caller is told the trace restarted, which is what
++    /// [`Traceparent::generate`] is for.
++    pub fn parse(header: &str) -> Result<Self, ValueError> {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// The next hop inside this trace: the same trace id, a span of its own, and the sampling
++    /// decision that was made before this service saw the request.
++    #[must_use]
++    pub fn child(&self) -> Self {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// The trace this hop belongs to: what every hop shares.
++    #[must_use]
++    pub fn trace(&self) -> &TraceId {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// This hop's span: what every hop does not share.
++    #[must_use]
++    pub fn span(&self) -> &SpanId {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// `true` when the trace is being recorded.
++    #[must_use]
++    pub fn sampled(&self) -> bool {
++        todo!("step relay/2.19-trace-propagation")
++    }
++}
++
++impl fmt::Display for Traceparent {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("step relay/2.19-trace-propagation")
++    }
++}
++
++/// What one delivery carries out of the request that created it.
++///
++/// The trace id and the vendor state, and deliberately *not* the span: a span is one hop's, and the
++/// delivery is a different hop from the request that accepted it. This is also exactly what a row
++/// can hold — two columns — which is what makes the seam between "the request" and "the work it
++/// created" the same thing as the seam between two processes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Context {
++    /// The trace this delivery belongs to.
++    pub trace: TraceId,
++    /// Whether the trace is being recorded, decided by whoever started it.
++    pub sampled: bool,
++    /// The vendor state that arrived with the trace, unchanged.
++    pub state: Option<String>,
++}
++
++impl Context {
++    /// What a request brought: the trace of its `traceparent`, and its `tracestate`.
++    #[must_use]
++    pub fn of(parent: &Traceparent, state: Option<&str>) -> Self {
++        todo!("step relay/2.19-trace-propagation")
++    }
++
++    /// The next hop: a span of its own inside this trace.
++    #[must_use]
++    pub fn child(&self) -> Traceparent {
++        todo!("step relay/2.19-trace-propagation")
++    }
++}
++
++/// Where an adapter finds the trace context of the delivery it is about to make.
++///
++/// A port rather than a field on the request, for the reason [`crate::signing::Secrets`] is one: the
++/// worker's request type is `relay/2.6-at-least-once`'s and does not grow fields for what an adapter
++/// needs, and the trace is something the *adapter* writes into a header. It costs a lookup per
++/// attempt, and what it buys is that the field never has to be added to a struct the worker passes
++/// around.
++pub trait Traces: Send + Sync + fmt::Debug + 'static {
++    /// The trace of `delivery`, or `None` when it has none.
++    ///
++    /// `Ok(None)` is a real answer: a delivery accepted before this service carried traces has no
++    /// trace id, and it is delivered without a `traceparent` rather than with an invented one.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::Database`] when the lookup cannot be made at all, which is a *retryable*
++    /// failure: the subscriber may be perfectly fine.
++    fn context_for(
++        &self,
++        delivery: Uuid,
++    ) -> Pin<Box<dyn Future<Output = Result<Option<Context>, Error>> + Send + '_>>;
++}
++
++/// The traces as this service stores them: the columns `fan_out` wrote on the delivery.
++#[derive(Debug)]
++pub struct DbTraces {
++    pool: PgPool,
++}
++
++impl DbTraces {
++    /// Read traces out of `pool`.
++    #[must_use]
++    pub fn new(pool: PgPool) -> Self {
++        Self { pool }
++    }
++}
++
++impl Traces for DbTraces {
++    fn context_for(
++        &self,
++        delivery: Uuid,
++    ) -> Pin<Box<dyn Future<Output = Result<Option<Context>, Error>> + Send + '_>> {
++        todo!("step relay/2.19-trace-propagation")
++    }
++}
