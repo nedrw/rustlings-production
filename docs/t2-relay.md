@@ -85,7 +85,7 @@ DLQ → 多租户与授权矩阵 → 限流与背压 → 观测 → 负载与容
 | `kiln lint-caps` | `97 capabilities · 134 slots · 118 ledger positions · 46 authored steps` → `no issues.`（46/46 篇正文齐、无 skipped） |
 | `kiln links`（全仓、跳过 `app/`） | `57 page(s) · 370 link(s) · 228 external target(s)` → 0 findings |
 | `i18n status` | `en (46/46) [source]`；structure 0 error、drift 0 warning |
-| course 下 rustfmt | 89 个 `.rs` 全绿（`--config skip_children=true --check`） |
+| course 下 rustfmt | 99 个 `.rs` 全绿（`course/tracks` + `course/probes` 递归全部 `.rs`，最终树；`--config skip_children=true --check`） |
 | 容器 | 每一步的 `images` 门在 pull 之后即绿；本机 Postgres 夹具 5 秒级 |
 | 负载（2.20 页面 `docs/capacity.md` 里） | debug 构建：曲线 8.8→38.3→43.4 ms（backlog 119→237→353）；400 投递排空 364 ms；同一组 8 个 seat：1 worker 363 ms / 2 workers 551 ms / 8 workers 1.87 s |
 
