@@ -1,8 +1,11 @@
 # rustlings-production 规划（v2）
 
-> 状态：规划稿已根据第一轮确认（§1）修订。下一步是 M0：判定器骨架 + 第一条 track 的完整内容。
-> 配套文档：[课程体系与能力模型](curriculum.md)、[编写规范](authoring.md)。
-> 环境基线（已实测，2026-10）：rustc/cargo 1.98.1、edition 2024；容器运行时是 **Podman 6.1.0 的 docker shim**，`docker compose` 插件不可用；无 `timeout`（无 coreutils）。
+> 状态：规划已定稿；**M0（判定器 + T1 全部 22 步）已交付**，当前在 M1。T1 交付物见
+> [t1-mailer.md](t1-mailer.md)，验收见 [handoff-m0.md](handoff-m0.md) §1。
+> 配套文档：[课程体系与能力模型](curriculum.md)、[编写规范](authoring.md)、[M0 构建日志](handoff-m0-log.md)。
+> 环境基线（已实测，2026-10）：rustc/cargo 1.98.1、edition 2024；容器运行时是 Podman 6.1.2 的 docker
+> shim，`docker compose` 插件不可用（本机另有可用的 `docker-compose` 单体版）；无 `timeout`（无 coreutils）。
+> 逐条实测事实以 [handoff-m0.md](handoff-m0.md) §2 为准。
 
 ## 0. 一句话
 
@@ -339,7 +342,8 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 `governor 0.10`、`moka 0.12`、`object_store 0.14`、`arrow`/`parquet 60`、`datafusion 55`、`openraft 0.9`、`turmoil 0.7`、`madsim 0.2`、
 `redis 1.7`、`opentelemetry 0.33`、`samply 0.13`；工具：`cargo-mutants 27.1`、`cargo-deny 0.20`、`cargo-llvm-cov 0.9`、
 `cargo-nextest 0.9`、`cargo-semver-checks 0.50`、`cargo-dist 0.32`、`cargo-fuzz 0.13`。
-M0 落地时钉一次精确版本并记录（不在此处写死小版本，避免规划阶段就过期）。
+T1 已按这份表钉过一次精确版本（在 `app/mailer/Cargo.toml` 里，每个依赖的注释写明「哪一步引的、为什么」；
+`Cargo.lock` 一并提交）。T2+ 新增依赖时照做：钉精确版本，注释写清引入它的那一步。
 
 ## 11. 里程碑（以内容完整度验收，不以工期压缩）
 
