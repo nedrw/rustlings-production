@@ -1,0 +1,574 @@
+diff --git a/migrations/0004_dedup_keys.sql b/migrations/0004_dedup_keys.sql
+index b5db2eb..ca95d5e 100644
+--- a/migrations/0004_dedup_keys.sql
++++ b/migrations/0004_dedup_keys.sql
+@@ -4,24 +4,38 @@
+ -- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease; `mailer` and `relay` number their own
+ -- files).
+ --
+--- The file is yours to write. A row is one key, and it has to answer two questions about it: which
+--- job did this key produce, and *until when* does it still answer. Three things about the file are
+--- decisions rather than transcription:
++-- One row per key, and three of the four decisions in this file are about what the row has to say
++-- rather than about the columns:
+ --
+--- 1. **a key belongs to a queue.** The same string asked in two queues is two keys, so the queue is
+---    part of what identifies the row (`relay/2.2-idempotent-ingest` made the same call for a tenant
+---    and an `Idempotency-Key`);
+--- 2. **the row carries the instant the key stops answering**, which is the whole reason the window
+---    is a store-side mechanism rather than a field on the job: an enqueue has to be able to tell a
+---    live key from a dead one *in the statement that writes*, without reading first
+---    (`jobq/3.6-transaction-isolation` is the step that argued why a read-then-write is a window
+---    two writers both pass through);
+--- 3. **the enqueue resets an expired row rather than refusing for ever.** That is one statement
+---    (`insert … on conflict … do update … where <the row has expired> returning …`), and
+---    PostgreSQL only accepts the `on conflict` half when a **unique constraint or index matches
+---    the columns named in it** — the same arbiter the append of `jobq/3.6-transaction-isolation`
+---    depends on.
++--   * **the key is a key of a queue.** `(queue, key)` is the primary key, and that is the arbiter
++--     the enqueue's `on conflict` names: the same string asked in two queues is two keys, which is
++--     the call `relay/2.2-idempotent-ingest` made for a tenant and an `Idempotency-Key`. A primary
++--     key rather than a unique index, because there is nothing about a key that is worth storing
++--     without it identifying the row.
++--   * **the row carries the instant the key stops answering.** `expires_at` is what a store compares
++--     the clock against, and comparing it *in the statement* is what makes a live key a request
++--     that writes nothing: `insert … on conflict (queue, key) do update … where expires_at <= $now`
++--     is a reset for an expired row and a no-op for a live one, in one statement, with no window a
++--     second writer could slip through (`jobq/3.6-transaction-isolation`).
++--   * **the boundary is half-open, in the row's own terms.** A key is live while
++--     `now < expires_at`; at exactly `expires_at` it is new again, which is the same line
++--     `Dedup::live` draws and the reason the statement above says `<=`.
++--   * **`job_id` cascades.** The key is a pointer at the work it named, and a pointer at a job
++--     nobody kept is not a fact about a request — it is a leak. `on delete cascade` is also what
++--     makes the enqueue's "the key is live, answer with its job" branch total: while the key row is
++--     there, the row it names is there.
+ --
+--- Two smaller ones, both worth one thought before the file is written: a key that is *gone* (the
+--- job it named was purged) must not make a request fail, and something has to sweep the rows whose
+--- window has passed — housekeeping, not correctness, which is what the step's body argues.
++-- The second index is the housekeeping one, and it is the only reason it exists: sweeping the rows
++-- whose window has passed (and only those — a live row that is swept is a duplicate that escapes)
++-- is a scan of this index rather than of the table. Nothing in the engine reads it, because expiry
++-- is not deletion: a dead row costs a row and changes no answer.
++
++create table dedup_keys (
++    queue text not null,
++    key text not null,
++    job_id uuid not null references jobs (id) on delete cascade,
++    expires_at timestamptz not null,
++    primary key (queue, key)
++);
++
++create index dedup_keys_expiring on dedup_keys (expires_at);
+diff --git a/src/engine/dedup.rs b/src/engine/dedup.rs
+index 07720e4..0bb56a4 100644
+--- a/src/engine/dedup.rs
++++ b/src/engine/dedup.rs
+@@ -29,7 +29,7 @@
+ 
+ use std::time::Duration;
+ 
+-use chrono::{DateTime, Utc};
++use chrono::{DateTime, TimeDelta, Utc};
+ 
+ use crate::engine::error::Error;
+ 
+@@ -64,22 +64,44 @@ impl Dedup {
+     /// [`Error::Invalid`] when the name is empty, longer than [`DEDUP_KEY_MAX`] bytes, or contains
+     /// an ASCII control character.
+     pub fn new(key: impl Into<String>, window: Duration) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.12-dedup-window: a key the stores can write down, and the window it answers for \
+-             — read the `# Errors` section above for what a name may not be"
+-        )
++        let key = key.into();
++        if key.is_empty() {
++            return Err(invalid(
++                "a deduplication key cannot be empty: an empty name is every \
++                                request that forgot to name one",
++            ));
++        }
++        if key.len() > DEDUP_KEY_MAX {
++            return Err(invalid(format!(
++                "a deduplication key is at most {DEDUP_KEY_MAX} bytes, and this one is {}: the \
++                 key is a column, an index entry and something a producer keeps in a variable",
++                key.len()
++            )));
++        }
++        // Control characters are refused rather than trimmed or escaped, because the key is
++        // compared byte for byte *and* printed: a name carrying a newline is a name that can
++        // forge a line wherever somebody reads it (`relay/2.2-idempotent-ingest` refuses an
++        // empty `Idempotency-Key` for the same reason).
++        if let Some(character) = key.chars().find(|character| character.is_control()) {
++            return Err(invalid(format!(
++                "a deduplication key may not contain control characters, and this one contains \
++                 {character:?}: the name is printed next to the work it named, and a name that \
++                 can end a line can forge one"
++            )));
++        }
++        Ok(Self { key, window })
+     }
+ 
+     /// The name, as the store binds it.
+     #[must_use]
+     pub fn key(&self) -> &str {
+-        todo!("jobq/3.12-dedup-window: the name this key was built with")
++        &self.key
+     }
+ 
+     /// How long the name answers, from the first request that used it.
+     #[must_use]
+     pub fn window(&self) -> Duration {
+-        todo!("jobq/3.12-dedup-window: the window this key was built with")
++        self.window
+     }
+ 
+     /// The instant a key first taken at `first_seen` stops answering.
+@@ -88,10 +110,13 @@ impl Dedup {
+     /// else could disagree with this one about the edge of the window.
+     #[must_use]
+     pub fn expiry(&self, first_seen: DateTime<Utc>) -> DateTime<Utc> {
+-        todo!(
+-            "jobq/3.12-dedup-window: the instant the window opened at {first_seen} closes — the \
+-             boundary itself is the decision this step is about"
+-        )
++        // A window wider than the calendar is not a special case: it is a key that answers for as
++        // long as this crate can measure, which is exactly what the producer asked for, and
++        // saturating keeps a nonsense number from becoming a panic in a store.
++        let window = TimeDelta::from_std(self.window).unwrap_or(TimeDelta::MAX);
++        first_seen
++            .checked_add_signed(window)
++            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+     }
+ 
+     /// Whether a key first taken at `first_seen` still answers a repeat at `now`.
+@@ -102,9 +127,18 @@ impl Dedup {
+     /// legitimate repeat (or execute a duplicate) for exactly one instant.
+     #[must_use]
+     pub fn live(&self, first_seen: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+-        todo!(
+-            "jobq/3.12-dedup-window: whether a key taken at {first_seen} still answers at {now} — \
+-             the same line `expiry` draws, asked from the other side"
+-        )
++        // The window is half-open, and this is the whole of the decision: a key taken at `t` is
++        // live while `now` is *before* `t + window`, and dead at `t + window` exactly. Written
++        // as `<` on the instant rather than as `<=` on the elapsed time, because the instant is
++        // what a store keeps and what two processes compare; the stores of this step ask the
++        // same question with `expires_at <= now`, which is this line from the other side.
++        now < self.expiry(first_seen)
++    }
++}
++
++/// The engine's refusal for a name it cannot keep, phrased at the call site that supplied it.
++fn invalid(detail: impl Into<String>) -> Error {
++    Error::Invalid {
++        detail: detail.into(),
+     }
+ }
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index b6a54a7..1d8e226 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -6,11 +6,13 @@
+ 
+ use std::fmt;
+ use std::str::FromStr;
++use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ use serde::{Deserialize, Serialize};
+ use uuid::Uuid;
+ 
++use crate::engine::dedup::Dedup;
+ use crate::engine::error::Error;
+ 
+ /// Longest queue name the engine accepts, in bytes.
+@@ -335,6 +337,12 @@ pub struct SubmitRequest {
+     pub(crate) run_at: Option<DateTime<Utc>>,
+     /// Attempts allowed in total.
+     pub(crate) max_attempts: u32,
++    /// The name this request may be answered from, when it carries one
++    /// (`jobq/3.12-dedup-window`).
++    pub(crate) dedup_key: Option<String>,
++    /// How long that name answers for, measured from this request. `None` beside a key is a
++    /// request the engine refuses: the window is part of the question.
++    pub(crate) dedup_window: Option<Duration>,
+ }
+ 
+ impl SubmitRequest {
+@@ -347,6 +355,8 @@ impl SubmitRequest {
+             priority: 0,
+             run_at: None,
+             max_attempts: DEFAULT_MAX_ATTEMPTS,
++            dedup_key: None,
++            dedup_window: None,
+         }
+     }
+ 
+@@ -372,6 +382,36 @@ impl SubmitRequest {
+         self
+     }
+ 
++    /// Name this request, so that a later request carrying the same key inside the window is
++    /// answered with the job this one produced instead of queuing a second job
++    /// (`jobq/3.12-dedup-window`).
++    ///
++    /// The name is the producer's own statement that two requests are one piece of work, and it
++    /// belongs to a queue: the same key in another queue is another name. What the engine owes a
++    /// caller for it is the answer, not a verdict — a repeat gets the job the first request
++    /// produced, which is the only thing a retrying producer can act on.
++    ///
++    /// A key on its own is refused when the request reaches a store: see
++    /// [`SubmitRequest::with_dedup_window`].
++    #[must_use]
++    pub fn with_dedup_key(mut self, key: impl Into<String>) -> Self {
++        self.dedup_key = Some(key.into());
++        self
++    }
++
++    /// How long the key this request carries answers for, measured from *this* request.
++    ///
++    /// Part of the question rather than a deployment setting, because the right window is the
++    /// sender's: it is the interval in which the producer's own retries live, and it is the value
++    /// a caller is told to expect when it asks the engine what a key buys it. A window of zero is
++    /// "do not remember this at all", which is a legitimate request; a key with no window is not,
++    /// because there is no honest number the engine could pick on the producer's behalf.
++    #[must_use]
++    pub fn with_dedup_window(mut self, window: Duration) -> Self {
++        self.dedup_window = Some(window);
++        self
++    }
++
+     /// Queue this request is for.
+     #[must_use]
+     pub fn queue(&self) -> &Queue {
+@@ -401,4 +441,29 @@ impl SubmitRequest {
+     pub fn max_attempts(&self) -> u32 {
+         self.max_attempts
+     }
++
++    /// The key and window this request asked to be answered under, when it asked for both.
++    ///
++    /// One value rather than two options, because the two fields are one question (`SubmitRequest`
++    /// keeps them apart so that the two setters stay independent; this is how a store reads them).
++    /// A window with no key is not an error and not a key either: there is nothing to remember, so
++    /// the request is an ordinary one.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the request carries a key the engine cannot keep, and when it
++    /// carries a key with no window.
++    pub(crate) fn dedup(&self) -> Result<Option<Dedup>, Error> {
++        match (&self.dedup_key, self.dedup_window) {
++            (None, _) => Ok(None),
++            (Some(key), Some(window)) => Dedup::new(key.clone(), window).map(Some),
++            (Some(key), None) => Err(Error::Invalid {
++                detail: format!(
++                    "the deduplication key `{key}` has no window: a key is remembered for a \
++                     duration and the engine will not pick one for the producer, so say how long \
++                     with `with_dedup_window`"
++                ),
++            }),
++        }
++    }
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 1316d0d..7ef1ded 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -20,6 +20,7 @@
+ 
+ pub(crate) mod clock;
+ pub(crate) mod cron;
++pub(crate) mod dedup;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
+@@ -33,6 +34,7 @@ mod sealed;
+ 
+ pub use clock::{Clock, SystemClock};
+ pub use cron::Schedule;
++pub use dedup::{DEDUP_KEY_MAX, Dedup};
+ pub use domain::{
+     DEFAULT_MAX_ATTEMPTS, Job, JobId, JobState, QUEUE_NAME_MAX, Queue, SubmitRequest, WorkerId,
+ };
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 272423b..89452f3 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -16,6 +16,12 @@
+ //! one, releases one and reclaims an expired one, and every one of those is the same decision the
+ //! durable backend makes in SQL — including the guard that matters most, which is that a settle only
+ //! counts from the worker the row still names.
++//!
++//! `jobq/3.12-dedup-window` adds the fourth: the deduplication key. It is a map beside the rows —
++//! one entry per key, holding the job the key produced and the instant it stops answering — and it
++//! is the same rule the durable backend writes as an upsert, asked under the lock this store
++//! already takes: a key that is still live answers the first request's job *before* anything is
++//! written, and a key whose window has passed is reset to this request.
+ 
+ use std::collections::BTreeMap;
+ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+@@ -44,6 +50,20 @@ struct Ledger {
+     jobs: BTreeMap<JobId, Job>,
+     /// Every job's trail, appended in the order things happened.
+     events: BTreeMap<JobId, Vec<JobEvent>>,
++    /// Every deduplication key this store is holding: which job it produced, and when it stops
++    /// answering (`jobq/3.12-dedup-window`). A row here is *not* deleted when its window closes —
++    /// the instant is what makes it dead, and the entry is overwritten the next time the key is
++    /// taken, which is memory management rather than correctness.
++    dedup: BTreeMap<(Queue, String), Held>,
++}
++
++/// One held deduplication key.
++#[derive(Debug, Clone)]
++struct Held {
++    /// The job this key produced: the row a repeat is answered with.
++    job_id: JobId,
++    /// The instant the key stops answering, as the store's clock measured it when it was taken.
++    expires_at: DateTime<Utc>,
+ }
+ 
+ impl Ledger {
+@@ -77,6 +97,23 @@ impl Ledger {
+         trail
+     }
+ 
++    /// The job a key still answers for at `now`, when it still answers for one.
++    ///
++    /// Three ways to get `None`, and they are deliberately the same answer, because a caller can do
++    /// the same thing about all of them — take the key: the key was never taken; its window has
++    /// passed (the row is still here, and it is dead because of the instant it carries, not because
++    /// somebody swept it); or the job it named is not in the map any more. The last one cannot
++    /// happen in this store (nothing removes a job) and cannot happen in the durable one either
++    /// (the cascade takes the key row with the job), so it is one answer for one promise rather
++    /// than a case either backend dresses up.
++    fn held(&self, queue: &Queue, key: &str, now: DateTime<Utc>) -> Option<Job> {
++        let held = self.dedup.get(&(queue.clone(), key.to_owned()))?;
++        if held.expires_at <= now {
++            return None;
++        }
++        self.jobs.get(&held.job_id).cloned()
++    }
++
+     /// Whether this row is this worker's to settle.
+     ///
+     /// The check the durable backend writes as `and lease_owner = $2` in its `where` clause, in the
+@@ -226,6 +263,18 @@ impl Store for MemoryStore {
+                         .to_owned(),
+                 });
+             }
++            let dedup = request.dedup()?;
++            let now = self.clock.now();
++            // One lock, one decision: the question a key asks and the writes that answer it are
++            // the same critical section, which is this store's version of the transaction the
++            // durable backend needs (`jobq/3.6-transaction-isolation`). A live key returns before
++            // either write, so a repeat is not a write that was rolled back — it is no write.
++            let mut ledger = self.ledger();
++            if let Some(dedup) = &dedup
++                && let Some(job) = ledger.held(&request.queue, dedup.key(), now)
++            {
++                return Ok(job);
++            }
+             let job = Job {
+                 id: JobId::new(),
+                 queue: request.queue,
+@@ -236,7 +285,7 @@ impl Store for MemoryStore {
+                 // instant: the caller's clock is not the store's, and only one of them is the
+                 // authority on when a job is due (step `jobq/3.8-clock-injection` moves this read
+                 // behind an injected clock).
+-                run_at: request.run_at.unwrap_or_else(|| self.clock.now()),
++                run_at: request.run_at.unwrap_or(now),
+                 attempts: 0,
+                 max_attempts: request.max_attempts,
+                 last_error: None,
+@@ -244,7 +293,19 @@ impl Store for MemoryStore {
+                 lease_owner: None,
+                 lease_expires_at: None,
+             };
+-            self.ledger().jobs.insert(job.id, job.clone());
++            if let Some(dedup) = &dedup {
++                // Taking the key, and taking it again when the row it finds has expired: the
++                // window of the new job starts *now*, from the request that reopened it, which is
++                // the rule the durable backend writes as `do update … where expires_at <= $now`.
++                ledger.dedup.insert(
++                    (job.queue.clone(), dedup.key().to_owned()),
++                    Held {
++                        job_id: job.id,
++                        expires_at: dedup.expiry(now),
++                    },
++                );
++            }
++            ledger.jobs.insert(job.id, job.clone());
+             Ok(job)
+         })
+     }
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 29c4e04..a3b0868 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -77,10 +77,25 @@ pub(crate) const ABANDONED: &str = "the worker holding this job stopped without
+ pub trait Store: Sealed + Send + Sync + 'static {
+     /// Write a job down and hand back the row, with its identity and its resolved `run_at`.
+     ///
++    /// When the request carries a **deduplication key** (`jobq/3.12-dedup-window`) this is a
++    /// question as much as a write: the answer is the job that key already produced, as long as
++    /// the key is still inside the window the request asked for. The row that comes back is that
++    /// first job — its identity, its payload, its state *now* — and a repeat writes nothing at
++    /// all, so `id()` is the same identity the first request got. A key whose window has passed
++    /// is not an error and not a refusal: it produces a new job, and the window of that new job
++    /// is stamped from the request that reopened it.
++    ///
++    /// The window is stamped from the first request and a duplicate does not move it, and the
++    /// boundary is half-open ([`crate::engine::Dedup::live`] is the line, written once, so that
++    /// two backends cannot disagree about the edge). Which row is *kept* for a key that has
++    /// expired is the backend's business: the promise is about the answers, and both backends
++    /// answer a repeat from the first job until the instant the window closes and never after it.
++    ///
+     /// # Errors
+     ///
+     /// [`Error::Invalid`] when the request could never run (an empty queue, an attempt budget of
+-    /// zero); [`Error::Store`] when the backend refused it.
++    /// zero, a deduplication key the engine cannot keep, a key with no window);
++    /// [`Error::Store`] when the backend refused it.
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>>;
+ 
+     /// Take up to `limit` due jobs for `worker`, mark them running, and lease them to that worker.
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 630e8e8..4a92e2f 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -129,6 +129,41 @@ impl PostgresStore {
+         self.policy = policy;
+         self
+     }
++
++    /// Write one job row that no deduplication key is involved in, and hand it back.
++    ///
++    /// Split out of [`Store::enqueue`] so that the statement a keyed request runs is the only thing
++    /// the keyed path is about: this is the write `jobq/3.5-store-port-conformance` certified,
++    /// unchanged, and a request that carries no key still costs exactly what it used to.
++    async fn write_job(
++        &self,
++        request: &SubmitRequest,
++        id: JobId,
++        payload: String,
++        run_at: DateTime<Utc>,
++    ) -> Result<Job, Error> {
++        let row: JobRow = sqlx::query_as(
++            "insert into jobs \
++                     (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
++                 values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
++                 returning id, queue, payload::text as payload, state, priority, run_at, \
++                           attempts, max_attempts, last_error, lease_owner, lease_expires_at",
++        )
++        .bind(id.as_uuid())
++        .bind(request.queue.as_str())
++        .bind(payload)
++        .bind(JobState::Queued.as_str())
++        .bind(request.priority)
++        .bind(run_at)
++        // `i64::from(u32)` is total, which is why the budget column is a `bigint`: storing it
++        // as a 32-bit integer would make "the caller asked for more attempts than the table
++        // holds" a case this method has to answer, and there is no good answer to it.
++        .bind(i64::from(request.max_attempts))
++        .fetch_one(&self.pool)
++        .await
++        .map_err(refused)?;
++        row.into_job()
++    }
+ }
+ 
+ impl Sealed for PostgresStore {}
+@@ -156,32 +191,77 @@ impl Store for PostgresStore {
+                         .to_owned(),
+                 });
+             }
++            let dedup = request.dedup()?;
+             let payload = serde_json::to_string(&request.payload)
+                 .map_err(|error| unreadable("payload", error.to_string()))?;
+             // The identity is the engine's, not the database's: a row whose key was invented by
+             // whichever backend happened to store it is a row whose key changes when the deployment
+             // moves it to the other one.
+             let id = JobId::new();
++            let now = self.clock.now();
++            let run_at = request.run_at.unwrap_or(now);
++            let Some(dedup) = dedup else {
++                // No key was asked for, so nothing has to be decided before the row is written and
++                // this is the statement `jobq/3.5-store-port-conformance` certified: one insert,
++                // one row back.
++                return self.write_job(&request, id, payload, run_at).await;
++            };
++            // A key was asked for, and the whole of it is one statement, because the question and
++            // the two writes that answer it have to be one decision (`jobq/3.6-transaction-
++            // isolation` argued why a read-then-write is a window two writers both pass through):
++            //
++            // * `taken` is the key table's half — insert the key, or *reset* the row whose window
++            //   has passed (`do update … where expires_at <= $5`), and hand back the job the key
++            //   now names. It answers nothing when the row it met is still live, and that is what
++            //   makes a repeat write nothing rather than rewrite a row with the values it already
++            //   had;
++            // * `fresh` writes the job, and only when `taken` says this request owns the key;
++            // * the second half of the `union all` is the repeat: the key is live, so the answer is
++            //   the job it already produced, read in the *same snapshot* as the statement that
++            //   found the key busy (`not exists (select 1 from taken)` is what keeps the two halves
++            //   from both answering when this request won).
++            //
++            // The statements all share one snapshot and the database decides who wins, so this
++            // cannot come back with two rows and cannot come back with none: one of the two halves
++            // always has an answer.
+             let row: JobRow = sqlx::query_as(
+-                "insert into jobs \
+-                     (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
+-                 values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
+-                 returning id, queue, payload::text as payload, state, priority, run_at, \
+-                           attempts, max_attempts, last_error, lease_owner, lease_expires_at",
++                "with taken as ( \
++                     insert into dedup_keys (queue, key, job_id, expires_at) \
++                     values ($1, $2, $3, $4) \
++                     on conflict (queue, key) do update \
++                         set job_id = excluded.job_id, expires_at = excluded.expires_at \
++                         where dedup_keys.expires_at <= $5 \
++                     returning job_id \
++                 ), fresh as ( \
++                     insert into jobs \
++                         (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
++                     select $3, $1, $6::jsonb, $7, $8, $9, 0, $10 \
++                     where exists (select 1 from taken) \
++                     returning id, queue, payload::text as payload, state, priority, run_at, \
++                               attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                 ) \
++                 select id, queue, payload, state, priority, run_at, attempts, max_attempts, \
++                        last_error, lease_owner, lease_expires_at from fresh \
++                 union all \
++                 select held.id, held.queue, held.payload::text as payload, held.state, \
++                        held.priority, held.run_at, held.attempts, held.max_attempts, \
++                        held.last_error, held.lease_owner, held.lease_expires_at \
++                 from jobs held join dedup_keys key on key.job_id = held.id \
++                 where key.queue = $1 and key.key = $2 and not exists (select 1 from taken)",
+             )
+-            .bind(id.as_uuid())
+             .bind(request.queue.as_str())
++            .bind(dedup.key())
++            .bind(id.as_uuid())
++            // The instant the key stops answering, computed by the engine's clock for the reason
++            // every other instant in this file is: a database clock is a second authority on time
++            // (`jobq/3.8-clock-injection`), and the boundary of a window is exactly the kind of
++            // decision two authorities would disagree about by one instant.
++            .bind(dedup.expiry(now))
++            .bind(now)
+             .bind(payload)
+             .bind(JobState::Queued.as_str())
+             .bind(request.priority)
+-            // `None` means "as soon as somebody looks", and the instant that becomes is the
+-            // engine's clock — the same one the in-memory backend reads (step
+-            // `jobq/3.8-clock-injection` moves it behind an injected clock for both of them at
+-            // once).
+-            .bind(request.run_at.unwrap_or_else(|| self.clock.now()))
+-            // `i64::from(u32)` is total, which is why the budget column is a `bigint`: storing it
+-            // as a 32-bit integer would make "the caller asked for more attempts than the table
+-            // holds" a case this method has to answer, and there is no good answer to it.
++            .bind(run_at)
+             .bind(i64::from(request.max_attempts))
+             .fetch_one(&self.pool)
+             .await

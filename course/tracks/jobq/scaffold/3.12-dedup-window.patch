@@ -1,0 +1,149 @@
+diff --git a/migrations/0004_dedup_keys.sql b/migrations/0004_dedup_keys.sql
+new file mode 100644
+index 0000000..b5db2eb
+--- /dev/null
++++ b/migrations/0004_dedup_keys.sql
+@@ -0,0 +1,27 @@
++-- The deduplication keys: which job a producer's key already produced, and until when.
++--
++-- Step `jobq/3.12-dedup-window`. This is the project's fourth migration, so it is `0004`
++-- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease; `mailer` and `relay` number their own
++-- files).
++--
++-- The file is yours to write. A row is one key, and it has to answer two questions about it: which
++-- job did this key produce, and *until when* does it still answer. Three things about the file are
++-- decisions rather than transcription:
++--
++-- 1. **a key belongs to a queue.** The same string asked in two queues is two keys, so the queue is
++--    part of what identifies the row (`relay/2.2-idempotent-ingest` made the same call for a tenant
++--    and an `Idempotency-Key`);
++-- 2. **the row carries the instant the key stops answering**, which is the whole reason the window
++--    is a store-side mechanism rather than a field on the job: an enqueue has to be able to tell a
++--    live key from a dead one *in the statement that writes*, without reading first
++--    (`jobq/3.6-transaction-isolation` is the step that argued why a read-then-write is a window
++--    two writers both pass through);
++-- 3. **the enqueue resets an expired row rather than refusing for ever.** That is one statement
++--    (`insert … on conflict … do update … where <the row has expired> returning …`), and
++--    PostgreSQL only accepts the `on conflict` half when a **unique constraint or index matches
++--    the columns named in it** — the same arbiter the append of `jobq/3.6-transaction-isolation`
++--    depends on.
++--
++-- Two smaller ones, both worth one thought before the file is written: a key that is *gone* (the
++-- job it named was purged) must not make a request fail, and something has to sweep the rows whose
++-- window has passed — housekeeping, not correctness, which is what the step's body argues.
+diff --git a/src/engine/dedup.rs b/src/engine/dedup.rs
+new file mode 100644
+index 0000000..07720e4
+--- /dev/null
++++ b/src/engine/dedup.rs
+@@ -0,0 +1,110 @@
++//! The deduplication key: what a producer names a piece of work with, and how long that name
++//! answers.
++//!
++//! A retry is a request the producer cannot tell apart from the first one — that is *why* it is
++//! retrying — so the producer is the only party that can name its intent, and the name is the whole
++//! of the protocol: two requests carrying one key are one piece of work. Step
++//! `jobq/3.12-dedup-window` is the half of that promise the key does not carry on its own: a name
++//! that answered for ever would be a table nobody may ever empty, and the *window* is the decision
++//! that makes it finite.
++//!
++//! Four decisions belong to this module rather than to either store, because both stores have to
++//! answer them the same way or the port has two meanings:
++//!
++//! * **what a key may be.** A name travels through a header, a table and a log line, and it is
++//!   compared byte for byte: so it is bounded, it is not empty, and it does not carry the control
++//!   characters that would let it forge a line wherever it is printed;
++//! * **where the boundary is.** The window starts at the *first* request and a duplicate does not
++//!   move it, so the instant a key is taken at is the instant the whole question is measured from;
++//! * **which side of the boundary is which.** "Stops answering" has to mean something at exactly
++//!   `first + window`, and the answer this crate gives is written once, here, so that two stores
++//!   cannot disagree about the edge by one instant;
++//! * **what a window of zero is.** It is not a mistake (an unkeyed request is the same thing), and
++//!   the arithmetic has to have an answer for it rather than a special case in a store.
++//!
++//! What is deliberately *not* here: the table, the statement, and whether an expired row is
++//! rewritten or swept. Those are the stores' business (`jobq/3.6-transaction-isolation` is where
++//! the argument for a single statement over a read-then-write lives), and this module is the value
++//! they both ask.
++
++use std::time::Duration;
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::error::Error;
++
++/// Longest deduplication key the engine accepts, in bytes.
++///
++/// A bound rather than a number to grow: the key is a column, an index entry and something a
++/// producer keeps in a variable, and an unbounded one makes all three somebody's problem.
++pub const DEDUP_KEY_MAX: usize = 128;
++
++/// A producer's name for one piece of work, and the window it answers for.
++///
++/// Built fallibly, like [`crate::engine::Queue`]: a name that the engine cannot keep is refused at
++/// the door rather than turned into a row somebody has to find later, and the shape of a request
++/// therefore never holds a key that could not be written.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Dedup {
++    /// The name, as the store binds it.
++    key: String,
++    /// How long the name answers, measured from the first request that used it.
++    window: Duration,
++}
++
++impl Dedup {
++    /// A key named `key`, answering for `window` from the first request that uses it.
++    ///
++    /// A window of zero is a legitimate request and it means no deduplication at all (the key is
++    /// dead the instant it is taken). Everything else this refuses is a name the engine cannot
++    /// write down.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the name is empty, longer than [`DEDUP_KEY_MAX`] bytes, or contains
++    /// an ASCII control character.
++    pub fn new(key: impl Into<String>, window: Duration) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.12-dedup-window: a key the stores can write down, and the window it answers for \
++             — read the `# Errors` section above for what a name may not be"
++        )
++    }
++
++    /// The name, as the store binds it.
++    #[must_use]
++    pub fn key(&self) -> &str {
++        todo!("jobq/3.12-dedup-window: the name this key was built with")
++    }
++
++    /// How long the name answers, from the first request that used it.
++    #[must_use]
++    pub fn window(&self) -> Duration {
++        todo!("jobq/3.12-dedup-window: the window this key was built with")
++    }
++
++    /// The instant a key first taken at `first_seen` stops answering.
++    ///
++    /// The store writes this instant into the row it keeps, and a store that computed it anywhere
++    /// else could disagree with this one about the edge of the window.
++    #[must_use]
++    pub fn expiry(&self, first_seen: DateTime<Utc>) -> DateTime<Utc> {
++        todo!(
++            "jobq/3.12-dedup-window: the instant the window opened at {first_seen} closes — the \
++             boundary itself is the decision this step is about"
++        )
++    }
++
++    /// Whether a key first taken at `first_seen` still answers a repeat at `now`.
++    ///
++    /// This is the question a store asks about the row it found, and it has to answer it the same
++    /// way [`Dedup::expiry`] draws the line: one of the two is read by a statement and the other by
++    /// a caller, and a crate whose two halves disagreed about the edge would deduplicate a
++    /// legitimate repeat (or execute a duplicate) for exactly one instant.
++    #[must_use]
++    pub fn live(&self, first_seen: DateTime<Utc>, now: DateTime<Utc>) -> bool {
++        todo!(
++            "jobq/3.12-dedup-window: whether a key taken at {first_seen} still answers at {now} — \
++             the same line `expiry` draws, asked from the other side"
++        )
++    }
++}
