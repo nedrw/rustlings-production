@@ -72,24 +72,30 @@ spaced-repetition loop. See [docs/t2-relay.md](docs/t2-relay.md) for what T2 del
 [docs/handoff-m1.md](docs/handoff-m1.md) for the mechanism, the acceptance lines and how to
 continue.
 
-**What the numbers below measure.** The timings and test counts were measured on the M0 tree
-(`62e7c5c`, re-verified at `dd47c11`); M1 has since added commands, tests, docs and 14 probe
-exercises, so a re-measurement is owed and will land with M1's close-out. The link counts were
-re-measured after CI gained the link step (`dd47c11`), which is why they are the smaller set: a
-repository-wide report counts the repository's own pages and says which directories it skipped.
+**What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
+(`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,
+re-verified at `dd47c11`) and say so. The link counts come from the repository-wide report, which
+counts the repository's own pages and names the directories it skipped (`app/<track>` is a learner's
+working copy, judged by its step's own `links` gate).
 
-- `cargo xtask ci` — **579 s**, last line `22/22 step(s) hold the contract` (fmt, clippy
-  `-D warnings`, workspace tests 184+15+1, spec integrity 22 pinned, `kiln lint-caps`
-  `97 capabilities · 134 slots · 118 ledger positions · 22 authored steps`, `kiln links` offline,
-  then `kiln selftest`).
-- `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0, `blocked`: 0,
-  "not_authored": 0`.
-- `kiln links` (offline, the repository's own markdown) — 30 pages, 200 links, 119 external
-  targets, 0 findings; a learner's project under `app/` is skipped and named, so the number is the
-  same on a fresh clone as on a machine mid-course. `kiln links --external` — 115 s,
+- `cargo xtask ci` — **761 s** on the M1 tree: fmt, `rustfmt --check` on the course's own files,
+  clippy `-D warnings`, 202 + 15 + 1 tests, spec integrity 46 pinned, `kiln lint-caps`
+  `97 capabilities · 134 slots · 118 ledger positions · 46 authored steps`, `kiln links` offline,
+  `kiln probe --check` 19/19, and `kiln selftest` — last lines `22/22 step(s) hold the contract` and
+  `xtask ci: all checks passed`. (Measured with libtest serialized to dodge the fixture collision
+  `bf9ac5f` fixes; that workaround is no longer needed.)
+- `kiln selftest --track relay` — **476 s**, `24/24 step(s) hold the contract`: every T2 step's spec
+  fails on its scaffold, passes on the reference solution, and every must gate is green.
+- `kiln verify relay` — **155 s**, `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without
+  content`; `kiln caps --track relay` shows the six exit capabilities verified.
+- `kiln links` (offline, the repository's own markdown) — 57 pages, 369 links, 228 external targets,
+  0 findings; a learner's project under `app/` is skipped and named, so the number is the same on a
+  fresh clone as on a machine mid-course. `kiln links --external` — **115 s** (M0 tree),
   `112 answered · 7 unclear · 0 gone` (the seven `?` are hosts that were unreachable from that
   network, not 404s).
-- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/22 step bodies, falling back through
+- M0 tree, for reference: `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0`;
+  `cargo xtask ci` — **579 s**.
+- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/46 step bodies, falling back through
   ja -> en`.
 - The three container steps (1.9 Postgres, 1.19 mailpit, 1.21 the image itself) run under local
   podman. `kiln images` says which images to pull first; `kiln doctor` warns when the machine needs
