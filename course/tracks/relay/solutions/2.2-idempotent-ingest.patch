@@ -1,0 +1,276 @@
+diff --git a/migrations/0003_events.sql b/migrations/0003_events.sql
+new file mode 100644
+index 0000000..0db4bf3
+--- /dev/null
++++ b/migrations/0003_events.sql
+@@ -0,0 +1,13 @@
++-- What a tenant sent, once. `idempotency_key` is the caller's promise that two requests carrying
++-- it are one event, and the unique constraint is what lets the database hold that promise: the
++-- second insert is refused by the index, not by a `select` that both requests can pass before
++-- either one writes.
++create table events (
++    id uuid primary key,
++    tenant_id uuid not null references tenants (id) on delete cascade,
++    idempotency_key text not null,
++    kind text not null,
++    payload jsonb not null,
++    received_at timestamptz not null default now(),
++    unique (tenant_id, idempotency_key)
++);
+diff --git a/src/events.rs b/src/events.rs
+index 70e54b2..eea4b5a 100644
+--- a/src/events.rs
++++ b/src/events.rs
+@@ -1,14 +1,15 @@
+ //! Events: what this service accepts, and the rule that accepting the same thing twice changes
+ //! nothing at all.
+ //!
+-//! Step `relay/2.2-idempotent-ingest` implements it. An event is a `kind` (what happened) and a
+-//! `payload` (the JSON a subscriber will be handed), and the caller's `Idempotency-Key` is a
+-//! promise: two requests carrying the same key are one event. The service holds the other half of
+-//! that promise — the event is stored once, and the caller that sends it again is answered with the
+-//! event it already sent, *as it sent it then*, rather than with an error or with a second row.
++//! An event is a `kind` (what happened) and a `payload` (the JSON a subscriber will be handed),
++//! and the caller's `Idempotency-Key` is a promise: two requests carrying the same key are one
++//! event. The service holds the other half of that promise — the event is stored once, and the
++//! caller that sends it again is answered with the event it already sent, *as it sent it then*,
++//! rather than with an error or with a second row.
+ //!
+-//! The table is yours to write (`migrations/0003_events.sql`); the step's body says what it has to
+-//! hold, and the spec asks the database itself, so how it is written down is judged too.
++//! The promise rests on one row of `migrations/0003_events.sql`: `unique (tenant_id,
++//! idempotency_key)`. Everything in this module is written around that index, because the
++//! alternative — read, decide, write — is a race that two retries of one request lose together.
+ 
+ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+@@ -58,8 +59,27 @@ impl Ingested {
+     }
+ }
+ 
++/// The JSON a `jsonb` column holds, as the value it is.
++///
++/// The column is JSON and [`Event::payload`] is JSON, so the text in between is an artifact of the
++/// binding: `serde_json::Value` is not a type sqlx encodes without its `json` feature, and the step
++/// that introduced this table chose not to turn that feature on (see the step's FURTHER section).
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the text is not JSON, which would mean a row this service did
++/// not write.
++pub fn decode_payload(stored: &str) -> Result<serde_json::Value, Error> {
++    serde_json::from_str(stored)
++        .map_err(|error| Error::Database(sqlx::Error::Decode(Box::new(error))))
++}
++
+ /// Store one event, or answer with the one this tenant already stored under `idempotency_key`.
+ ///
++/// One statement decides it. `on conflict … do nothing` writes nothing when the key is taken, and
++/// `returning` answers with the row exactly when this call is the one that wrote it — so a
++/// concurrent retry does not get a "the key is mine now" error, it gets the event.
++///
+ /// # Errors
+ ///
+ /// Returns [`Error::Database`] when the row cannot be written or read back. A key this tenant has
+@@ -71,6 +91,51 @@ pub async fn ingest(
+     kind: &str,
+     payload: &serde_json::Value,
+ ) -> Result<Ingested, Error> {
+-    let _ = (pool, tenant, idempotency_key, kind, payload);
+-    todo!("step relay/2.2-idempotent-ingest")
++    let id = Uuid::new_v4();
++    let written: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
++        "insert into events (id, tenant_id, idempotency_key, kind, payload) \
++         values ($1, $2, $3, $4, $5::jsonb) \
++         on conflict (tenant_id, idempotency_key) do nothing \
++         returning id, received_at",
++    )
++    .bind(id)
++    .bind(tenant.as_uuid())
++    .bind(idempotency_key)
++    .bind(kind)
++    .bind(payload.to_string())
++    .fetch_optional(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    match written {
++        Some((id, received_at)) => Ok(Ingested::Accepted(Event {
++            id,
++            tenant_id: tenant,
++            kind: kind.to_owned(),
++            payload: payload.clone(),
++            received_at,
++        })),
++        // The key was taken, so the event is there: read it back and answer with *that*, which is
++        // the difference between "this is the event you sent" and "this is what you sent me just
++        // now". A client retrying a request it is unsure about needs the first of those.
++        None => {
++            let (id, kind, payload, received_at): (Uuid, String, String, DateTime<Utc>) =
++                sqlx::query_as(
++                    "select id, kind, payload::text, received_at from events \
++                     where tenant_id = $1 and idempotency_key = $2",
++                )
++                .bind(tenant.as_uuid())
++                .bind(idempotency_key)
++                .fetch_one(pool)
++                .await
++                .map_err(Error::Database)?;
++            Ok(Ingested::Replayed(Event {
++                id,
++                tenant_id: tenant,
++                kind,
++                payload: decode_payload(&payload)?,
++                received_at,
++            }))
++        }
++    }
+ }
+diff --git a/src/http.rs b/src/http.rs
+index da5d9d9..0f4f83c 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -27,6 +27,7 @@ use crate::config::Config;
+ use crate::db::Db;
+ use crate::domain::{EndpointId, EndpointUrl};
+ use crate::error::Error;
++use crate::events;
+ use crate::logging::{self, RunId};
+ 
+ /// Everything a handler may need, built once per process.
+@@ -95,6 +96,7 @@ pub fn router(state: AppState) -> Router {
+     // id and the log line, so a refused request is still visible.
+     let tenant = Router::new()
+         .route("/endpoints", post(create_endpoint).get(list_endpoints))
++        .route("/events", post(create_event))
+         .layer(middleware::from_fn_with_state(
+             state.clone(),
+             require_principal,
+@@ -339,6 +341,115 @@ async fn list_endpoints(
+     }
+ }
+ 
++/// One event, as the API hands it to a caller.
++#[derive(Debug, serde::Serialize)]
++struct EventBody<'a> {
++    /// Identity of the event: what a caller quotes when it asks about this one.
++    id: String,
++    /// What the event is about.
++    kind: &'a str,
++    /// The JSON the tenant sent.
++    payload: &'a serde_json::Value,
++    /// When this service accepted it, RFC 3339.
++    received_at: String,
++}
++
++impl<'a> EventBody<'a> {
++    /// The body one event is answered with.
++    fn of(event: &'a events::Event) -> Self {
++        Self {
++            id: event.id.to_string(),
++            kind: &event.kind,
++            payload: &event.payload,
++            received_at: event.received_at.to_rfc3339(),
++        }
++    }
++}
++
++/// The answer to `POST /events`: the event, and whether this answer is a replay of an earlier one.
++#[derive(Debug, serde::Serialize)]
++struct IngestBody<'a> {
++    /// The event itself, spread into this object rather than nested: a caller that wants the id
++    /// should not have to know which route it asked.
++    #[serde(flatten)]
++    event: EventBody<'a>,
++    /// `true` when the tenant had already sent this key.
++    replayed: bool,
++}
++
++/// The body `POST /events` accepts.
++#[derive(Debug, Deserialize)]
++struct CreateEvent {
++    /// What the event is about.
++    kind: String,
++    /// The JSON the tenant wants delivered.
++    payload: serde_json::Value,
++}
++
++/// Accept one event for the calling tenant.
++///
++/// The answer is about the idempotency key, not about this request: a new key is 201 with the event
++/// that was just stored, a key that has been used before is 200 with the event stored *then*. Both
++/// carry the same identity, which is what makes a retry safe to send.
++async fn create_event(
++    State(state): State<AppState>,
++    Extension(principal): Extension<Principal>,
++    headers: HeaderMap,
++    body: Result<Json<CreateEvent>, axum::extract::rejection::JsonRejection>,
++) -> Response {
++    let Ok(Json(body)) = body else {
++        return Error::BadRequest("the body must be JSON with a `kind` and a `payload`".to_owned())
++            .into_response();
++    };
++    let kind = body.kind.trim();
++    if kind.is_empty() {
++        return Error::BadRequest("`kind` must not be empty".to_owned()).into_response();
++    }
++    if !body.payload.is_object() {
++        return Error::BadRequest("`payload` must be a JSON object".to_owned()).into_response();
++    }
++    let Some(key) = idempotency_key(&headers) else {
++        return Error::BadRequest(
++            "the `Idempotency-Key` header is required: two requests carrying it are one event"
++                .to_owned(),
++        )
++        .into_response();
++    };
++    match events::ingest(
++        state.db().pool(),
++        principal.tenant_id,
++        &key,
++        kind,
++        &body.payload,
++    )
++    .await
++    {
++        Err(error) => error.into_response(),
++        Ok(ingested) => {
++            let replayed = ingested.was_replayed();
++            let status = if replayed {
++                StatusCode::OK
++            } else {
++                StatusCode::CREATED
++            };
++            let answer = IngestBody {
++                event: EventBody::of(ingested.event()),
++                replayed,
++            };
++            (status, Json(answer)).into_response()
++        }
++    }
++}
++
++/// The `Idempotency-Key` header, when it carries something usable.
++///
++/// Header names are case-insensitive and so is this lookup; the value is trimmed, because `Key: `
++/// is a client that meant to send a key and did not.
++fn idempotency_key(headers: &HeaderMap) -> Option<String> {
++    let value = headers.get("idempotency-key")?.to_str().ok()?.trim();
++    (!value.is_empty()).then(|| value.to_owned())
++}
++
+ /// No route matched: an answer a client can read, not an empty one.
+ async fn not_found() -> Response {
+     Error::NotFound.into_response()
+diff --git a/src/lib.rs b/src/lib.rs
+index 1ee6b1e..599d73e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod config;
+ pub mod db;
+ pub mod domain;
+ pub mod error;
++pub mod events;
+ pub mod http;
+ pub mod logging;
+ 
