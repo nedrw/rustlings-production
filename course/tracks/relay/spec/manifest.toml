@@ -13,3 +13,4 @@ format_version = 1
 "spec/2.5/claim.rs" = "sha256:648a0b1486a2c6bac60c1af45e09d665c3f124a2f8175aad4acbbe1c214c8fcb"
 "spec/2.6/at_least_once.rs" = "sha256:d101d926db84441744f80e3394f6b177d108ec2813759dabcbdf0f691c632dd6"
 "spec/2.7/outbound.rs" = "sha256:b3e20e4e379facabceb9569c18f068f4cef22ac8d3e7aedd3faf9c8f1f32f45f"
+"spec/2.8/retry.rs" = "sha256:6f0e5a1a98d0c2dd357007aefbf063974d39a724ea1b79d5e2ab6d1893eff6e9"

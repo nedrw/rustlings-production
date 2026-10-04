@@ -1,0 +1,610 @@
+diff --git a/docs/adr/0002-retry-budget.md b/docs/adr/0002-retry-budget.md
+new file mode 100644
+index 0000000..e6e3903
+--- /dev/null
++++ b/docs/adr/0002-retry-budget.md
+@@ -0,0 +1,115 @@
++# 0002 — A failed attempt waits, and a broken endpoint is cut off
++
++- **Status:** accepted (step `relay/2.8-retry-budget`)
++- **Context:** the policy this decides lives in [src/backoff.rs](../../src/backoff.rs), the worker
++  that spends it in [src/delivery.rs](../../src/delivery.rs) and [src/claim.rs](../../src/claim.rs),
++  and the states it writes down are [migrations/0005_deliveries.sql](../../migrations/0005_deliveries.sql).
++  It is the other half of [0001 — a delivery is at least once](0001-at-least-once.md): that record
++  decided deliveries are retried, this one decides how.
++
++## Decision
++
++A failed attempt is retried under a **budget**, and the budget has three parts.
++
++**A wait that grows, spread across the fleet.** After the first failure a delivery waits somewhere
++in the upper half of `base` (30 seconds by default) and that window doubles with every further
++failure, up to a cap of six hours. Where in the window a delivery lands is a *jitter* derived from a
++hash of `(delivery id, attempt number)`: it is the same number on every worker, in every process,
++and on every rerun of a test, and it is different for deliveries that have nothing to do with each
++other. It is decorrelation, not secrecy.
++
++The window is `[base/2, base]` rather than the textbook `[0, base]` on purpose. Full jitter
++occasionally answers a wait of almost nothing, and a wait of nothing is a spin: the retry lands in
++the same millisecond as the failure it is retrying, the subscriber that just hiccuped gets the same
++request again, and — because the spec of `relay/2.6-at-least-once` asks a worker for a second turn
++*immediately* after a failure and expects the delivery to be waiting — the course's own earlier step
++turns red. Half of the window is a floor; the upper half is where the herd is broken up.
++
++**A bounded number of attempts.** A delivery is given at most `max_attempts` failures (5 by
++default, the constant `relay/2.6-at-least-once` wrote down), after which it is buried with the
++reason and the count on the row. This is what makes the guarantee "at least once, until given up
++on" instead of "forever".
++
++**A breaker per endpoint.** Consecutive *retryable* failures at one endpoint open a breaker for a
++cooldown (5 failures, 30 seconds by default). While it is open, attempts to that endpoint are
++**shed**: the delivery is not attempted, and — this is the whole point — it is not charged for the
++attempt it did not get. Its `attempts` does not move and it goes straight back to the queue. When
++the cooldown has passed the breaker is half open and lets exactly **one** probe through; a probe
++that is taken closes the breaker and forgets the failures, a probe that fails opens it again for a
++fresh cooldown, and a probe that is never reported (the worker died holding it) is presumed lost
++after another cooldown.
++
++The breaker counts failures a retry would have hit again, and nothing else: a `410 Gone` or a `404`
++is a statement about one delivery, not about the endpoint's health, and the deliveries behind a
++`410` still deserve their attempts.
++
++## Alternatives
++
++**No jitter, one wait per attempt number.** The simplest backoff, and the one that fails worst: a
++subscriber that restarts comes back to a fleet that has been retrying on a fixed schedule and is
++hit by every delivery at once, in the same second. The wait is also exactly predictable, so a
++subscriber that is down for an hour knows precisely when the next wave arrives. Rejected: the herd
++is the thing being avoided.
++
++**Random jitter from an `Rng` (full jitter, `[0, base]`).** The textbook recommendation, and it
++decorrelates as well as the hash does. Two costs, and both are real: a retry that fires immediately
++(the floor above), and the loss of reproducibility — a test, a log line and an operator's
++reconstruction of an incident all need to know *when* the next attempt is, and a number drawn from
++a generator inside the worker is not knowable to anybody else. Rejected in favour of the hash.
++
++**Decorrelated jitter** (`[base, 3 × previous delay]`). Spreads as well as anything here and needs
++per-delivery state to remember the previous delay. The state this service already keeps per
++delivery is `attempts`, so a delay that is a pure function of `(delivery, attempts)` needs no new
++column and cannot be corrupted by a partial write. Rejected for the state, not for the spread.
++
++**No breaker: retry each delivery until its own budget runs out.** What `relay/2.6-at-least-once`
++left in place, and honest for a queue that is mostly healthy. Against an endpoint that is gone,
++every delivery in the queue spends its whole budget — sixteen claimable rows cost eighty requests,
++and the queue drains at the speed of the failure rather than the speed of the successes. The
++breaker is what turns "the subscriber is down" into "the subscriber is down and the queue is
++waiting for it".
++
++**A breaker that opens on any failure, or on a rate of failures.** Opening on the first failure
++makes a single hiccup an outage; a rate over a window needs the window's state, its buckets and its
++clock, and it answers "is this endpoint broken" with a number an operator cannot reproduce by hand.
++Consecutive failures are the version a person can check in one query, and a success resets them.
++
++**Cutting off the endpoint in the claim** (skip a broken endpoint's rows in the `SELECT … FOR UPDATE
++SKIP LOCKED`) instead of releasing them afterwards. Fewer round trips, and the claim's signature —
++pinned by `relay/2.5-atomic-claim`, whose spec calls it — has no room for a set of endpoints to
++avoid. The release is the smaller change and it keeps the claim a claim about work, not about
++health.
++
++## Consequences
++
++- **The budget's numbers are one worker's opinions, and they are shared.** Everything that runs a
++  turn takes one `Budget`; the breaker's memory is in the clone, so a worker that builds a fresh
++  budget per turn has a breaker that resets per turn and protects nothing. `tick` — the one-shot
++  entry `relay/2.6-at-least-once` pinned — is the default policy with no memory: it is right for a
++  test and wrong for a loop.
++- **A shed delivery is invisible unless it is counted.** Nothing moved on the row, so the only
++  trace that the worker looked at it and decided not to try is `Tick::shed`. A deployment that
++  does not export that number reads an open breaker as "no work".
++- **The queue looks longer than it is.** Shed deliveries sit in `pending` next to deliveries that
++  have never been attempted, and the difference between "waiting for its turn" and "waiting for the
++  endpoint to come back" is only in the breaker. The metric that separates them belongs to
++  `relay/2.18-delivery-metrics`.
++- **The cooldown is the latency floor for a recovery.** An endpoint that comes back right after its
++  third failure waits out the rest of the cooldown before the probe finds it — thirty seconds by
++  default, and a longer one if the breaker keeps re-opening. That is the price of not hammering a
++  subscriber that is still starting.
++- **Half of every window is dead time.** Waiting at least `base/2` means a subscriber that was
++  briefly away still waits fifteen seconds before the first retry. The alternative is the spin
++  above, and a service that retries instantly is a service that cannot tell "not yet" from "no".
++- **Shedding is not free.** The turn still claimed the row and still wrote it back, so an open
++  breaker costs one claim and one update per delivery per turn. That is the cheap version of a
++  broken endpoint, not a free one.
++
++## What would make us revisit this
++
++A subscriber population where the recovery latency matters more than the load — a payment
++confirmation, say — would want a longer window and a shorter cooldown, per endpoint rather than one
++policy for the fleet. And if the queue ever runs as several processes, the breaker becomes a
++per-process opinion and needs either partitioning or shared state; the moment one endpoint is
++served by two processes, "consecutive failures" stops being a fact about the endpoint and starts
++being a fact about a process's half of it.
+diff --git a/src/backoff.rs b/src/backoff.rs
+index a309513..4a0a7de 100644
+--- a/src/backoff.rs
++++ b/src/backoff.rs
+@@ -20,17 +20,29 @@
+ //!   not to be unpredictable.
+ //!
+ //! What the numbers are and what they cost is argued in `docs/adr/0002-retry-budget.md`.
+-//!
+-//! **This file is the scaffold**: the types are here, and every function this step is about answers
+-//! `todo!()`, so the spec fails here until they are written.
+ 
+ use std::collections::HashMap;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, MutexGuard};
+ use std::time::Duration;
+ 
+-use chrono::{DateTime, Utc};
++use chrono::{DateTime, Duration as Chrono, Utc};
+ use uuid::Uuid;
+ 
++/// The most times the wait may double before the cap is the only thing left to decide it.
++///
++/// A doubling per failure, in a `u32`, runs out of bits long before a delivery runs out of
++/// attempts: this is where the multiplication stops, so that a large attempt number is a cap and
++/// not a wrap-around.
++const MAX_DOUBLINGS: u32 = 32;
++/// The shortest window a wait may be spread over.
++///
++/// Two nanoseconds, because half of a window is the floor a wait starts at: a budget configured
++/// with a base of zero would otherwise answer waits of zero, and a retry that fires in the same
++/// instant as the failure it is retrying is the spin this policy exists to prevent.
++const MINIMUM_WINDOW: Duration = Duration::from_nanos(2);
++/// The odd constant a splitmix64 step multiplies by.
++const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
++
+ /// What one worker's retries are allowed to spend.
+ ///
+ /// `Clone` shares the breaker: a worker that hands its budget to several turns hands them the *same*
+@@ -70,18 +82,60 @@ impl Budget {
+     /// `attempt` counts from 1 (the first failure). The answer is deterministic for one
+     /// `(delivery, attempt)` pair, is never longer than [`Budget::cap`], and is never zero: a retry
+     /// that fires in the same millisecond as the failure it is retrying is a spin, not a backoff.
++    ///
++    /// The wait is spread over the *upper half* of the window rather than the whole of it, which is
++    /// the one place this policy deliberately differs from the textbook full jitter: spreading over
++    /// the whole window means a delivery can answer a wait of almost nothing, and
++    /// `relay/2.6-at-least-once` asks a worker for a second turn immediately after a failure and
++    /// expects the delivery to be waiting. Half of the window is a floor, and the top half is where
++    /// the fleet is decorrelated.
+     #[must_use]
+     pub fn delay(&self, delivery: Uuid, attempt: i32) -> Duration {
+-        todo!("step relay/2.8-retry-budget: an exponential wait, jittered deterministically")
++        let window = self.window(attempt);
++        let floor = window / 2;
++        floor + (window - floor).mul_f64(fraction(delivery, attempt))
+     }
+ 
+     /// `true` when a delivery that has failed `attempt` times is not attempted again.
+     #[must_use]
+     pub fn gives_up(&self, attempt: i32) -> bool {
+-        todo!("step relay/2.8-retry-budget: the attempt budget, moved out of relay/2.6")
++        attempt >= self.max_attempts
++    }
++
++    /// The window the wait after `attempt` failures is spread over: `base` doubled once per
++    /// failure, and capped.
++    fn window(&self, attempt: i32) -> Duration {
++        let doublings = u32::try_from(attempt.max(1) - 1)
++            .unwrap_or(MAX_DOUBLINGS)
++            .min(MAX_DOUBLINGS);
++        self.base
++            .saturating_mul(1u32 << doublings.min(31))
++            .min(self.cap)
++            .max(MINIMUM_WINDOW)
+     }
+ }
+ 
++/// Where one `(delivery, attempt)` pair sits in its window, as a fraction in `[0, 1)`.
++///
++/// The same fraction every time, on every worker (`relay/2.8-retry-budget`): a hash of the
++/// delivery and the attempt, mixed so that neighbouring ids land far apart. This is decorrelation,
++/// not secrecy — a retry nobody can reproduce is a retry nobody can explain.
++fn fraction(delivery: Uuid, attempt: i32) -> f64 {
++    let (high, low) = delivery.as_u64_pair();
++    let mixed = mix(high ^ mix(low ^ (attempt as u64).wrapping_mul(GOLDEN)));
++    // The top 53 bits, so the conversion to `f64` is exact and every fraction is strictly below 1.
++    (mixed >> 11) as f64 / (1u64 << 53) as f64
++}
++
++/// The finalizer of splitmix64: one round of mixing, with every bit of the input deciding every bit
++/// of the output.
++fn mix(value: u64) -> u64 {
++    let mut z = value.wrapping_add(GOLDEN);
++    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
++    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
++    z ^ (z >> 31)
++}
++
+ /// What one endpoint's breaker remembers between attempts.
+ ///
+ /// Private, and the only place the answer to "is this endpoint answering?" is kept: nothing outside
+@@ -100,7 +154,8 @@ struct Health {
+ /// How a budget decides that an endpoint is broken.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct BreakerPolicy {
+-    /// How many attempts in a row may fail before the endpoint is cut off.
++    /// How many attempts in a row may fail before the endpoint is cut off. At least one: zero would
++    /// cut an endpoint off before it had failed at all.
+     pub failures: u32,
+     /// How long it stays cut off before one attempt is let through to find out whether it is back.
+     pub cooldown: Duration,
+@@ -174,22 +229,75 @@ impl Breaker {
+     /// cannot leave an endpoint cut off for good.
+     #[must_use]
+     pub fn admit(&self, endpoint: &str, now: DateTime<Utc>) -> Admission {
+-        todo!("step relay/2.8-retry-budget: the breaker's decision")
++        let mut endpoints = self.endpoints();
++        let health = endpoints.entry(endpoint.to_owned()).or_default();
++        if !health.probing && health.failures < self.policy.failures {
++            return Admission::Try;
++        }
++        // Cut off, or half open with the one probe still out. Both are the same window, and both
++        // end the same way: the next attempt through is a probe.
++        if now >= self.window_over(health.since.unwrap_or(now)) {
++            health.since = Some(now);
++            health.probing = true;
++            return Admission::Probe;
++        }
++        Admission::Shed
+     }
+ 
+     /// Record that an attempt to `endpoint` failed.
+     pub fn failed(&self, endpoint: &str, now: DateTime<Utc>) {
+-        todo!("step relay/2.8-retry-budget: a failure the breaker counts")
++        let mut endpoints = self.endpoints();
++        let threshold = self.policy.failures;
++        let health = endpoints.entry(endpoint.to_owned()).or_default();
++        if health.probing {
++            // The probe came back failing, so the endpoint is cut off again — for a fresh cooldown,
++            // counted from the probe rather than from the failure that opened the breaker first.
++            health.probing = false;
++            health.since = Some(now);
++            return;
++        }
++        health.failures += 1;
++        if health.failures >= threshold {
++            health.since = Some(now);
++        }
+     }
+ 
+     /// Record that an attempt to `endpoint` was taken: this forgets the endpoint's failures.
++    ///
++    /// A success on an endpoint that has no record does not create one: the map holds the endpoints
++    /// this worker is worried about, not every endpoint it has ever talked to.
+     pub fn succeeded(&self, endpoint: &str) {
+-        todo!("step relay/2.8-retry-budget: what a success tells the breaker")
++        let mut endpoints = self.endpoints();
++        if let Some(health) = endpoints.get_mut(endpoint) {
++            *health = Health::default();
++        }
+     }
+ 
+     /// What the breaker thinks of `endpoint` at `now`.
+     #[must_use]
+     pub fn state(&self, endpoint: &str, now: DateTime<Utc>) -> State {
+-        todo!("step relay/2.8-retry-budget: the state, read off the record")
++        let endpoints = self.endpoints();
++        let Some(health) = endpoints.get(endpoint) else {
++            return State::Closed;
++        };
++        if health.failures < self.policy.failures {
++            return State::Closed;
++        }
++        if health.probing || now >= self.window_over(health.since.unwrap_or(now)) {
++            return State::HalfOpen;
++        }
++        State::Open
++    }
++
++    /// When the window that started at `since` is over.
++    fn window_over(&self, since: DateTime<Utc>) -> DateTime<Utc> {
++        since + Chrono::from_std(self.policy.cooldown).unwrap_or(Chrono::MAX)
++    }
++
++    /// The records, whether or not another thread panicked while holding the lock.
++    fn endpoints(&self) -> MutexGuard<'_, HashMap<String, Health>> {
++        self.endpoints
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
+     }
+ }
+diff --git a/src/delivery.rs b/src/delivery.rs
+index cfe2c3d..8ecf486 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -32,14 +32,15 @@
+ use std::fmt;
+ use std::future::Future;
+ use std::pin::Pin;
+-use std::time::Duration;
++use std::sync::Arc;
+ 
+-use chrono::{DateTime, Utc};
++use chrono::{DateTime, Duration as Chrono, Utc};
+ use sqlx::PgPool;
+ use sqlx::postgres::PgConnection;
+ use uuid::Uuid;
+ 
+-use crate::claim;
++use crate::backoff::{Admission, Budget};
++use crate::claim::{self, Claimed};
+ use crate::domain::{EndpointUrl, TenantId};
+ use crate::error::Error;
+ use crate::events::Event;
+@@ -130,67 +131,177 @@ pub struct Tick {
+     /// How many attempts could not be written down because the row was no longer this worker's to
+     /// record. Not a failure of the delivery: a fact about the worker that has to be visible.
+     pub lost: usize,
++    /// How many deliveries this turn was handed and did *not* attempt, because the breaker of their
++    /// endpoint was open. Not a failure either: the delivery keeps its attempts and its place.
++    pub shed: usize,
+ }
+ 
+-/// One turn of the worker: claim a batch, attempt each delivery, write down what happened.
++impl Tick {
++    /// Count one attempt that was made.
++    fn count(&mut self, recorded: Recorded) {
++        match recorded {
++            Recorded::Sent => self.sent += 1,
++            Recorded::Retried => self.retried += 1,
++            Recorded::Dead => self.dead += 1,
++            Recorded::Lost => self.lost += 1,
++            Recorded::Shed => self.shed += 1,
++        }
++    }
++}
++
++/// One turn of the worker, with the default policy: claim a batch, attempt each delivery, write
++/// down what happened.
++///
++/// The one-shot entry point of `relay/2.6-at-least-once`, kept with its signature: a caller that
++/// runs a worker hands it an [`Arc`] and a policy instead (see [`tick_with_budget`]), because a
++/// breaker that is rebuilt for every turn is not a breaker.
+ ///
+ /// # Errors
+ ///
+ /// Returns [`Error::Database`] when the claim or one of the records fails. A failure here is not a
+ /// lost delivery: the row is wherever the last write left it, and the next turn finds it again.
+ pub async fn tick(pool: &PgPool, sender: &dyn Sender, worker: &str) -> Result<Tick, Error> {
++    turn(pool, sender, worker, &Budget::default()).await
++}
++
++/// One turn of the worker with the policy it runs with — the seam `mailer/1.13-email-port` calls an
++/// injected sender, for a budget.
++///
++/// The sender is owned rather than borrowed because a turn is allowed to run its attempts
++/// concurrently (`relay/2.9-ordering`), and a task has to own what it uses. The budget is cloned
++/// per attempt for the same reason, and the clone shares the breaker.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim or one of the records fails, on the same terms as
++/// [`tick`].
++pub async fn tick_with_budget(
++    pool: &PgPool,
++    sender: Arc<dyn Sender>,
++    worker: &str,
++    budget: &Budget,
++) -> Result<Tick, Error> {
++    turn(pool, sender.as_ref(), worker, budget).await
++}
++
++/// One turn, one attempt at a time: the body both entry points share.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim or one of the records fails.
++async fn turn(
++    pool: &PgPool,
++    sender: &dyn Sender,
++    worker: &str,
++    budget: &Budget,
++) -> Result<Tick, Error> {
+     let claimed = claim::claim(pool, worker, claim::BATCH, claim::LEASE).await?;
+     let mut report = Tick {
+         claimed: claimed.len(),
+         ..Tick::default()
+     };
+     for work in claimed {
+-        // One-based, and read off the row rather than remembered by the worker: the attempts that
+-        // failed before this one are a fact about the delivery, not about this process.
+-        let attempt = work.attempts.saturating_add(1);
+-        let request = SendRequest {
+-            delivery: work.delivery,
+-            event: work.event,
+-            attempt,
+-            url: work.url,
+-        };
++        report.count(attempt(pool, sender, budget, worker, work).await?);
++    }
++    Ok(report)
++}
++
++/// One delivery: ask the breaker, make the attempt, write down what happened.
++///
++/// This is the unit a turn repeats — and the unit `relay/2.9-ordering` runs one lane at a time per
++/// endpoint.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when a record cannot be written, and [`Error::Delivery`] when the
++/// row cannot even be handed back to the queue.
++async fn attempt(
++    pool: &PgPool,
++    sender: &dyn Sender,
++    budget: &Budget,
++    worker: &str,
++    work: Claimed,
++) -> Result<Recorded, Error> {
++    // The endpoint's name outlives the request that carries it: the breaker is asked about it
++    // before the attempt and told about it after, and the attempt takes the URL with it.
++    let endpoint = work.url.as_str().to_owned();
++    if budget.breaker.admit(&endpoint, Utc::now()) == Admission::Shed {
++        // Not this endpoint's turn. The row goes back to the queue exactly as it came — same
++        // failure count, same next attempt instant — so an attempt that was never made costs the
++        // delivery nothing, which is the whole point of a breaker.
++        return Ok(if claim::release(pool, work.delivery, worker).await? {
++            Recorded::Shed
++        } else {
++            Recorded::Lost
++        });
++    }
++
++    // One-based, and read off the row rather than remembered by the worker: the attempts that
++    // failed before this one are a fact about the delivery, not about this process.
++    let attempt = work.attempts.saturating_add(1);
++    let request = SendRequest {
++        delivery: work.delivery,
++        event: work.event,
++        attempt,
++        url: work.url,
++    };
+ 
+-        let outcome = match sender.send(request).await {
+-            Ok(_receipt) => Outcome::Sent,
+-            Err(SendError::Permanent(why)) => Outcome::Dead(why),
+-            // The budget, spent: a delivery that has failed `MAX_ATTEMPTS` times is not retried
++    let outcome = match sender.send(request).await {
++        Ok(_receipt) => {
++            budget.breaker.succeeded(&endpoint);
++            Outcome::Sent
++        }
++        // The subscriber said "do not send this again", which is not evidence about the endpoint's
++        // health: a `410 Gone` for one event says nothing about the next one. The breaker counts
++        // the failures that a retry would have hit again, and nothing else.
++        Err(SendError::Permanent(why)) => Outcome::Dead(why),
++        Err(SendError::Retryable(why)) => {
++            budget.breaker.failed(&endpoint, Utc::now());
++            // The budget, spent: a delivery that has failed `max_attempts` times is not retried
+             // again. Retrying forever is a subscriber that never learns the delivery is not coming,
+             // and a queue that never drains.
+-            Err(SendError::Retryable(why)) if attempt >= MAX_ATTEMPTS => {
++            if budget.gives_up(attempt) {
+                 Outcome::Dead(format!("gave up after {attempt} attempts: {why}"))
++            } else {
++                Outcome::Retry(why)
+             }
+-            Err(SendError::Retryable(why)) => Outcome::Retry(why),
+-        };
+-
+-        // Every branch writes the outcome down. Nothing here sends a request and moves on without
+-        // saying what happened to it: the gap between those two is the window this step's decision
+-        // record is about, and the only thing that closes it is recording what is known.
+-        let recorded = match &outcome {
+-            Outcome::Sent => claim::mark_sent(pool, work.delivery).await?,
+-            Outcome::Retry(why) => {
+-                claim::mark_retry(pool, work.delivery, why, next_attempt(attempt)).await?
+-            }
+-            Outcome::Dead(why) => claim::mark_dead(pool, work.delivery, why).await?,
+-        };
+-        if !recorded {
+-            // The row was not this worker's to record any more (its lease ran out and another worker
+-            // took it over). Counting this as an outcome would be a claim about a delivery this
+-            // worker does not know the end of.
+-            report.lost += 1;
+-            continue;
+         }
+-        match &outcome {
+-            Outcome::Sent => report.sent += 1,
+-            Outcome::Retry(_) => report.retried += 1,
+-            Outcome::Dead(_) => report.dead += 1,
++    };
++
++    // Every branch writes the outcome down. Nothing here sends a request and moves on without
++    // saying what happened to it: the gap between those two is the window `relay/2.6-at-least-once`
++    // is about, and the only thing that closes it is recording what is known.
++    let recorded = match &outcome {
++        Outcome::Sent => claim::mark_sent(pool, work.delivery).await?,
++        Outcome::Retry(why) => {
++            claim::mark_retry(
++                pool,
++                work.delivery,
++                why,
++                next_attempt(budget, work.delivery, attempt),
++            )
++            .await?
+         }
++        Outcome::Dead(why) => claim::mark_dead(pool, work.delivery, why).await?,
++    };
++    if !recorded {
++        // The row was not this worker's to record any more (its lease ran out and another worker
++        // took it over). Counting this as an outcome would be a claim about a delivery this worker
++        // does not know the end of.
++        return Ok(Recorded::Lost);
+     }
+-    Ok(report)
++    Ok(match outcome {
++        Outcome::Sent => Recorded::Sent,
++        Outcome::Retry(_) => Recorded::Retried,
++        Outcome::Dead(_) => Recorded::Dead,
++    })
++}
++
++/// When a delivery that has failed `attempt` times may be tried again: the wait this worker's
++/// budget answers for it, from now.
++fn next_attempt(budget: &Budget, delivery: Uuid, attempt: i32) -> DateTime<Utc> {
++    let wait = budget.delay(delivery, attempt);
++    Utc::now() + Chrono::from_std(wait).unwrap_or_else(|_| Chrono::zero())
+ }
+ 
+ /// Write down what one accepted event owes: one delivery per endpoint of its tenant.
+@@ -233,32 +344,16 @@ enum Outcome {
+     Dead(String),
+ }
+ 
+-/// How many failed attempts a delivery is given before it is buried.
+-///
+-/// A constant, and a small one: what a *deployment* wants here is a setting (with per-tenant
+-/// budgets and a breaker), which is step `relay/2.8-retry-budget`. What matters now is that the
+-/// number exists at all — a retry policy with no end is a delivery that is never late, only
+-/// forever.
+-pub const MAX_ATTEMPTS: i32 = 5;
+-
+-/// The wait after the first failure; each further failure doubles it.
+-const BACKOFF: Duration = Duration::from_secs(30);
+-/// The longest a delivery may wait between attempts.
+-const MAX_BACKOFF: Duration = Duration::from_secs(60 * 60 * 6);
+-/// How many times the wait may double before `MAX_BACKOFF` takes over.
+-const MAX_DOUBLINGS: u32 = 32;
+-
+-/// When a delivery that has failed `attempts` times may be tried again.
+-///
+-/// Exponential, deterministic, and without jitter: a fleet of workers retrying a subscriber that
+-/// just came back all wake up on the same second. Jitter and a budget are step
+-/// `relay/2.8-retry-budget`; the shape is here because a claim needs an instant to write down.
+-fn next_attempt(attempts: i32) -> DateTime<Utc> {
+-    let doublings = u32::try_from(attempts.max(1) - 1)
+-        .unwrap_or(MAX_DOUBLINGS)
+-        .min(MAX_DOUBLINGS);
+-    let wait = BACKOFF
+-        .saturating_mul(1u32 << doublings.min(31))
+-        .min(MAX_BACKOFF);
+-    Utc::now() + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::Duration::zero())
++/// What one attempt came to, after it is written down: what the turn counts.
++enum Recorded {
++    /// The subscriber took it.
++    Sent,
++    /// The failure is recorded and the delivery is owed again later.
++    Retried,
++    /// Nothing more will be tried.
++    Dead,
++    /// The outcome could not be recorded: the row was no longer this worker's.
++    Lost,
++    /// The attempt was not made, because the endpoint's breaker is open.
++    Shed,
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 7581426..4902bef 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,6 +9,7 @@
+ //! say what each module owes, from outside.
+ 
+ pub mod auth;
++pub mod backoff;
+ pub mod claim;
+ pub mod config;
+ pub mod db;

@@ -1,0 +1,201 @@
+diff --git a/src/backoff.rs b/src/backoff.rs
+new file mode 100644
+index 0000000..a309513
+--- /dev/null
++++ b/src/backoff.rs
+@@ -0,0 +1,195 @@
++//! The retry budget: how long a delivery waits before its next attempt, how many attempts it gets,
++//! and when this service stops talking to an endpoint that is not answering.
++//!
++//! Step `relay/2.6-at-least-once` decided *that* a failed attempt leaves a delivery owed, and wrote
++//! the count it gave up after down as a constant. This module is the policy that constant was
++//! standing in for: a wait that grows with the attempt and is spread across the fleet, and an
++//! endpoint that is not answering cut off before the whole queue is spent on it.
++//!
++//! Two shapes in this file are decisions rather than taste, and both are about being able to judge
++//! a retry policy at all:
++//!
++//! * **time is a parameter.** [`Budget::delay`] answers a `Duration` for one `(delivery, attempt)`
++//!   pair, and [`Breaker::admit`] is asked about one instant. Nothing in this module reads a clock:
++//!   the worker is the only component that knows what time it is, which is what lets the spec of
++//!   this step move time by *passing* it. (A worker loop whose `sleep`s are the subject — that is
++//!   `mailer/1.14-worker` — is the other case, and it uses tokio's paused clock instead.)
++//! * **the jitter is a hash, not a random number.** Two workers, two processes, and a rerun of a
++//!   test compute the same wait for the same delivery, which is what makes a retry reproducible in
++//!   a log and in a spec. What the mix has to do is *decorrelate* deliveries that failed together,
++//!   not to be unpredictable.
++//!
++//! What the numbers are and what they cost is argued in `docs/adr/0002-retry-budget.md`.
++//!
++//! **This file is the scaffold**: the types are here, and every function this step is about answers
++//! `todo!()`, so the spec fails here until they are written.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use chrono::{DateTime, Utc};
++use uuid::Uuid;
++
++/// What one worker's retries are allowed to spend.
++///
++/// `Clone` shares the breaker: a worker that hands its budget to several turns hands them the *same*
++/// breaker, which is the point of having one at all (see [`Breaker`]).
++#[derive(Debug, Clone)]
++pub struct Budget {
++    /// How many failed attempts one delivery is given before it is buried.
++    pub max_attempts: i32,
++    /// The window the wait after the first failed attempt is spread over; each further failure
++    /// doubles it.
++    pub base: Duration,
++    /// The longest a delivery may wait between attempts, however many it has burned.
++    pub cap: Duration,
++    /// When this worker stops talking to an endpoint that is not answering.
++    pub breaker: Breaker,
++}
++
++impl Default for Budget {
++    /// The budget a deployment gets when it configures nothing.
++    ///
++    /// The numbers are the ones `relay/2.6-at-least-once` wrote down as constants, kept on purpose:
++    /// what this step adds is the shape of the policy — a window to spread deliveries over, a cap,
++    /// and a breaker — and re-deciding the constants is not part of it.
++    fn default() -> Self {
++        Self {
++            max_attempts: 5,
++            base: Duration::from_secs(30),
++            cap: Duration::from_secs(6 * 60 * 60),
++            breaker: Breaker::new(BreakerPolicy::default()),
++        }
++    }
++}
++
++impl Budget {
++    /// How long to wait before the attempt that follows `attempt` failures of `delivery`.
++    ///
++    /// `attempt` counts from 1 (the first failure). The answer is deterministic for one
++    /// `(delivery, attempt)` pair, is never longer than [`Budget::cap`], and is never zero: a retry
++    /// that fires in the same millisecond as the failure it is retrying is a spin, not a backoff.
++    #[must_use]
++    pub fn delay(&self, delivery: Uuid, attempt: i32) -> Duration {
++        todo!("step relay/2.8-retry-budget: an exponential wait, jittered deterministically")
++    }
++
++    /// `true` when a delivery that has failed `attempt` times is not attempted again.
++    #[must_use]
++    pub fn gives_up(&self, attempt: i32) -> bool {
++        todo!("step relay/2.8-retry-budget: the attempt budget, moved out of relay/2.6")
++    }
++}
++
++/// What one endpoint's breaker remembers between attempts.
++///
++/// Private, and the only place the answer to "is this endpoint answering?" is kept: nothing outside
++/// this module reads it directly, and [`Breaker::state`] is the question to ask instead.
++#[derive(Debug, Clone, Copy, Default)]
++struct Health {
++    /// Failed attempts in a row, since the last successful one.
++    failures: u32,
++    /// When the current window started: the instant the breaker opened, or the instant the probe it
++    /// is waiting for was let through.
++    since: Option<DateTime<Utc>>,
++    /// `true` while the one attempt of a half-open breaker is out.
++    probing: bool,
++}
++
++/// How a budget decides that an endpoint is broken.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct BreakerPolicy {
++    /// How many attempts in a row may fail before the endpoint is cut off.
++    pub failures: u32,
++    /// How long it stays cut off before one attempt is let through to find out whether it is back.
++    pub cooldown: Duration,
++}
++
++impl Default for BreakerPolicy {
++    /// The policy a deployment gets when it configures nothing.
++    ///
++    /// The threshold is the delivery budget, not a smaller number: a breaker that opens before one
++    /// delivery has spent its own attempts turns `relay/2.6-at-least-once`'s
++    /// `a_delivery_that_keeps_failing_stops_being_tried` red, because that test counts *turns* and a
++    /// shed turn is a turn that got nowhere.
++    fn default() -> Self {
++        Self {
++            failures: 5,
++            cooldown: Duration::from_secs(30),
++        }
++    }
++}
++
++/// The breaker: one state per endpoint, shared by every turn of a worker.
++///
++/// `Clone` shares the state (it lives behind an `Arc`), so every copy a worker hands to a turn asks
++/// the same question. A breaker that is rebuilt for each attempt is not a breaker.
++#[derive(Debug, Clone)]
++pub struct Breaker {
++    policy: BreakerPolicy,
++    endpoints: Arc<Mutex<HashMap<String, Health>>>,
++}
++
++/// What the breaker answers about one attempt.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Admission {
++    /// Make the attempt: this endpoint is not being held back.
++    Try,
++    /// Make the attempt: it is the one probe a half-open breaker lets through, to find out whether
++    /// the endpoint is back.
++    Probe,
++    /// Do not make the attempt. The endpoint is cut off, and an attempt spent on it is an attempt
++    /// the deliveries behind it no longer have.
++    Shed,
++}
++
++/// What the breaker thinks of one endpoint, at one instant.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum State {
++    /// Attempts are made normally.
++    Closed,
++    /// The endpoint is cut off: attempts are shed until the cooldown has passed.
++    Open,
++    /// The cooldown has passed: this is the half-open breaker, waiting for its one probe to be let
++    /// through and then for that probe's answer.
++    HalfOpen,
++}
++
++impl Breaker {
++    /// A breaker with this policy, remembering nothing yet.
++    #[must_use]
++    pub fn new(policy: BreakerPolicy) -> Self {
++        Self {
++            policy,
++            endpoints: Arc::new(Mutex::new(HashMap::new())),
++        }
++    }
++
++    /// Whether an attempt to `endpoint` may be made at `now`, and which kind of attempt it is.
++    ///
++    /// Answers [`Admission::Shed`] while the endpoint is cut off. Once the cooldown has passed it
++    /// lets exactly one attempt through as [`Admission::Probe`]: a probe nobody ever reports — the
++    /// worker died holding it — is presumed lost after another cooldown, so a half-open breaker
++    /// cannot leave an endpoint cut off for good.
++    #[must_use]
++    pub fn admit(&self, endpoint: &str, now: DateTime<Utc>) -> Admission {
++        todo!("step relay/2.8-retry-budget: the breaker's decision")
++    }
++
++    /// Record that an attempt to `endpoint` failed.
++    pub fn failed(&self, endpoint: &str, now: DateTime<Utc>) {
++        todo!("step relay/2.8-retry-budget: a failure the breaker counts")
++    }
++
++    /// Record that an attempt to `endpoint` was taken: this forgets the endpoint's failures.
++    pub fn succeeded(&self, endpoint: &str) {
++        todo!("step relay/2.8-retry-budget: what a success tells the breaker")
++    }
++
++    /// What the breaker thinks of `endpoint` at `now`.
++    #[must_use]
++    pub fn state(&self, endpoint: &str, now: DateTime<Utc>) -> State {
++        todo!("step relay/2.8-retry-budget: the state, read off the record")
++    }
++}
