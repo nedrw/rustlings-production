@@ -93,7 +93,6 @@ teaches = ["api/library-design@apply"]
 requires = ["api/library-design@aware", "err/typed-errors@apply"]
 run = { cmd = "cargo test -p jobq --test spec_public_api" }
 spec = ["spec/3.2/public_api.rs"]
-scaffold = "scaffold/3.2-public-api-baseline.patch"
 solution = "solutions/3.2-public-api-baseline.patch"
 gates = [
     "spec-integrity",
@@ -120,7 +119,6 @@ teaches = ["err/typed-errors@design"]
 requires = ["err/typed-errors@apply", "api/library-design@apply"]
 run = { cmd = "cargo test -p jobq --test spec_library_errors" }
 spec = ["spec/3.3/library_errors.rs"]
-scaffold = "scaffold/3.3-library-errors.patch"
 solution = "solutions/3.3-library-errors.patch"
 gates = [
     "spec-integrity",
@@ -147,7 +145,6 @@ teaches = ["cfg/layered-config@design"]
 requires = ["cfg/layered-config@apply", "api/library-design@apply"]
 run = { cmd = "cargo test -p jobq --test spec_feature_assembly" }
 spec = ["spec/3.4/feature_assembly.rs"]
-scaffold = "scaffold/3.4-feature-assembly.patch"
 solution = "solutions/3.4-feature-assembly.patch"
 gates = [
     "spec-integrity",
