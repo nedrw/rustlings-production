@@ -1,0 +1,1843 @@
+diff --git a/migrations/0003_leases.sql b/migrations/0003_leases.sql
+index 992a45b..5b72bdf 100644
+--- a/migrations/0003_leases.sql
++++ b/migrations/0003_leases.sql
+@@ -2,20 +2,27 @@
+ --
+ -- Step `jobq/3.7-leases-and-recovery`. This is the project's third migration, so it is `0003`.
+ --
+--- The file is yours to write. Two columns go onto `jobs`:
++-- Two columns, and the two things that read them:
+ --
+ --   * `lease_owner` — who holds the row, as the name the worker calls itself (the same string the
+---     port already takes in every settle, and the one an operator greps for);
++--     port takes in every settle, and the one an operator greps for in `pg_stat_activity`);
+ --   * `lease_expires_at` — the instant after which the row is presumed abandoned.
+ --
+--- Both are `null` when nobody holds the job, and a claimed row carries both. Two things about this
+--- file are decisions rather than transcription:
++-- Both are `null` when nobody holds the job. A claimed row carries both, and the pair is what makes
++-- every write in this project's write path conditional:
+ --
+--- 1. **the reclaimer's predicate is `state = 'running'` and `lease_expires_at` past.** That is the
+---    query a worker runs when it starts, and every turn after — the cost of recovering from a crash
+---    grows with the table unless an index covers exactly it;
+--- 2. **the settle's guard widens.** A settle already refuses a job that is not running; from this
+---    step on it also refuses one whose lease somebody else holds, which is what stops a worker that
+---    was already declared dead (`kill -9` and a lease that ran out) from settling the attempt the
+---    *next* worker is running right now. That check is on `lease_owner`, so this is the column it
+---    reads.
++--   * a *settle* refuses a row whose `lease_owner` is not the worker that is settling it, which is
++--     what stops a worker that was killed, declared dead and replaced from settling the attempt its
++--     successor is running right now. (Both are named the same thing to the table: the row is the
++--     only place that can decide it.)
++--   * the *reclaimer* looks for `state = 'running' and lease_expires_at <= now()`, which is the one
++--     query every worker runs at the start of every turn: recovering from a crash must not get more
++--     expensive as the queue grows, so that predicate is what the index below covers.
++--
++-- The index is partial, like `jobs_claimable`: it covers the rows a reclaimer can see, not every row
++-- the table has ever held.
++
++alter table jobs add column lease_owner text;
++alter table jobs add column lease_expires_at timestamptz;
++
++create index jobs_expired_leases on jobs (lease_expires_at) where state = 'running';
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 87d65c7..b6a54a7 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -204,7 +204,9 @@ impl fmt::Display for JobState {
+ ///
+ /// `#[non_exhaustive]` writes that promise into the type (step `jobq/3.2-public-api-baseline`):
+ /// private fields already make the constructor the door, and this says out loud that the row is
+-/// going to grow rather than that it happens to look finished today.
++/// going to grow rather than that it happens to look finished today. It has grown once so far: the
++/// two lease fields of step `jobq/3.7-leases-and-recovery` arrived without any caller of `Job`
++/// having to be rebuilt, which is the promise being kept rather than described.
+ #[non_exhaustive]
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Job {
+@@ -226,6 +228,10 @@ pub struct Job {
+     pub(crate) max_attempts: u32,
+     /// Why the last attempt failed, when one did.
+     pub(crate) last_error: Option<String>,
++    /// Who holds it, when somebody does.
++    pub(crate) lease_owner: Option<WorkerId>,
++    /// When the claim runs out, when somebody holds it.
++    pub(crate) lease_expires_at: Option<DateTime<Utc>>,
+ }
+ 
+ impl Job {
+@@ -283,6 +289,26 @@ impl Job {
+         self.last_error.as_deref()
+     }
+ 
++    /// Who holds this job, when somebody does.
++    ///
++    /// `jobq/3.7-leases-and-recovery` is where this stops being `None` for a running job: a claim
++    /// stamps the worker that made it, `Store::renew` moves the instant next to it, and a *settle*
++    /// refuses a write from a worker the row no longer names — which is what stops a worker that
++    /// was already declared dead from settling the attempt its successor is running right now.
++    #[must_use]
++    pub fn lease_owner(&self) -> Option<&WorkerId> {
++        self.lease_owner.as_ref()
++    }
++
++    /// When the claim on this job runs out, when somebody holds it.
++    ///
++    /// After this instant the row is presumed abandoned and `Store::reclaim_expired` puts it back
++    /// in its queue: the owner is a hint, and this is the deadline that decides.
++    #[must_use]
++    pub fn lease_expires_at(&self) -> Option<DateTime<Utc>> {
++        self.lease_expires_at
++    }
++
+     /// `true` when another attempt is allowed after this one fails.
+     #[must_use]
+     pub fn may_retry(&self) -> bool {
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index f76b64c..4bed832 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -11,9 +11,15 @@
+ //! guard is alive, so a settle that is refused writes neither, and a settle that answers writes
+ //! both. The *idempotence* of an append is the same kind of translation: a unique index under a
+ //! table, and here the key of a map.
++//!
++//! `jobq/3.7-leases-and-recovery` adds the third: the lease. The in-memory store stamps one, renews
++//! one, releases one and reclaims an expired one, and every one of those is the same decision the
++//! durable backend makes in SQL — including the guard that matters most, which is that a settle only
++//! counts from the worker the row still names.
+ 
+ use std::collections::BTreeMap;
+ use std::sync::{Mutex, MutexGuard, PoisonError};
++use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ 
+@@ -21,7 +27,7 @@ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::sealed::Sealed;
+-use crate::engine::store::{BoxFuture, Store};
++use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ 
+ /// What this store knows, under one lock.
+ ///
+@@ -68,6 +74,16 @@ impl Ledger {
+         });
+         trail
+     }
++
++    /// Whether this row is this worker's to settle.
++    ///
++    /// The check the durable backend writes as `and lease_owner = $2` in its `where` clause, in the
++    /// shape a map can ask it: the row has to be running *and* still name this worker, because a
++    /// worker whose lease was reclaimed and handed to somebody else is a worker whose attempt is
++    /// over — whatever it thinks.
++    fn holds(job: &Job, worker: &WorkerId) -> bool {
++        job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker)
++    }
+ }
+ 
+ /// Jobs in a map, protected by a mutex. One process, no durability, honest about both.
+@@ -76,10 +92,21 @@ impl Ledger {
+ /// `jobq/3.2-public-api-baseline`): the conformance suite of step `jobq/3.5-store-port-conformance`
+ /// is written against it and against the durable one, which is the whole reason an outside
+ /// implementation is not welcome.
+-#[derive(Debug, Default)]
++#[derive(Debug)]
+ pub struct MemoryStore {
+     /// The rows and the trail behind one lock.
+     ledger: Mutex<Ledger>,
++    /// How long a claim by this store is good for.
++    lease: Duration,
++}
++
++impl Default for MemoryStore {
++    fn default() -> Self {
++        Self {
++            ledger: Mutex::default(),
++            lease: DEFAULT_LEASE,
++        }
++    }
+ }
+ 
+ impl MemoryStore {
+@@ -89,6 +116,18 @@ impl MemoryStore {
+         Self::default()
+     }
+ 
++    /// The same store, leasing claims for `lease`.
++    ///
++    /// The lease is a *setting* rather than a constant because the right value is the deployment's:
++    /// it has to be longer than the slowest attempt the operator is willing to wait for and shorter
++    /// than the recovery they are willing to accept, and a test that has to watch a lease run out
++    /// needs it in millimetres (`jobq/3.7-leases-and-recovery`).
++    #[must_use]
++    pub fn with_lease(mut self, lease: Duration) -> Self {
++        self.lease = lease;
++        self
++    }
++
+     /// The store's contents, taken without a panic path: a poisoned mutex means some other thread
+     /// died holding it, and refusing to read the jobs after that would turn one thread's panic into
+     /// the whole process's.
+@@ -150,6 +189,9 @@ impl Store for MemoryStore {
+                 attempts: 0,
+                 max_attempts: request.max_attempts,
+                 last_error: None,
++                // Nobody holds a job that has just been written: the lease arrives with the claim.
++                lease_owner: None,
++                lease_expires_at: None,
+             };
+             self.ledger().jobs.insert(job.id, job.clone());
+             Ok(job)
+@@ -163,15 +205,10 @@ impl Store for MemoryStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            // Nothing records who holds a job yet, so the worker is not written down here either —
+-            // the two backends have to answer the same questions, and an answer only this one can
+-            // give is not one the port may rely on (step `jobq/3.7-leases-and-recovery` gives both
+-            // of them the lease). The name is still the interface.
+-            let _ = worker;
+             let now = Utc::now();
+-            // One lock, one decision: choosing the due jobs and stamping them happen in the same
+-            // critical section, so a second claim on this store cannot read the same row as free
+-            // while this one is on its way to marking it running.
++            // One lock, one decision: choosing the due jobs, stamping them running and leasing them
++            // happen in the same critical section, so a second claim on this store cannot read the
++            // same row as free while this one is on its way to marking it running.
+             let mut ledger = self.ledger();
+             let due = Self::due(&ledger.jobs, queue, now);
+             let mut claimed = Vec::new();
+@@ -181,6 +218,10 @@ impl Store for MemoryStore {
+                     // An attempt starts when a worker takes the job, not when it finishes: a
+                     // worker that dies holding a job must still have spent one.
+                     job.attempts += 1;
++                    // And so does the lease: from here until somebody renews it, this row is this
++                    // worker's, and the row is the only place that says so.
++                    job.lease_owner = Some(worker.clone());
++                    job.lease_expires_at = Some(now + self.lease);
+                     claimed.push(job.clone());
+                 }
+             }
+@@ -194,23 +235,24 @@ impl Store for MemoryStore {
+         id: &'a JobId,
+     ) -> BoxFuture<'a, Result<(), Error>> {
+         Box::pin(async move {
+-            let _ = worker;
+             let mut ledger = self.ledger();
+             let Some(job) = ledger.jobs.get_mut(id) else {
+                 return Err(Error::NotFound { id: *id });
+             };
+-            if job.state != JobState::Running {
++            if !Ledger::holds(job, worker) {
+                 return Err(Error::Invalid {
+-                    detail: format!(
+-                        "job {id} is {}, not running: only the worker that claimed it can complete \
+-                         it",
+-                        job.state
++                    detail: refused(
++                        job,
++                        worker,
++                        "only the worker that claimed it can complete it",
+                     ),
+                 });
+             }
+             let attempt = job.attempts;
+             job.state = JobState::Succeeded;
+             job.last_error = None;
++            job.lease_owner = None;
++            job.lease_expires_at = None;
+             // The line goes in while the same guard is held: this store has no transaction to commit
+             // or roll back, so the lock *is* the transaction, and a refusal above returns before
+             // either write happens.
+@@ -232,17 +274,16 @@ impl Store for MemoryStore {
+         reason: &'a str,
+     ) -> BoxFuture<'a, Result<JobState, Error>> {
+         Box::pin(async move {
+-            let _ = worker;
+             let mut ledger = self.ledger();
+             let Some(job) = ledger.jobs.get_mut(id) else {
+                 return Err(Error::NotFound { id: *id });
+             };
+-            if job.state != JobState::Running {
++            if !Ledger::holds(job, worker) {
+                 return Err(Error::Invalid {
+-                    detail: format!(
+-                        "job {id} is {}, not running: a failure is only recorded against an \
+-                         attempt somebody actually started",
+-                        job.state
++                    detail: refused(
++                        job,
++                        worker,
++                        "a failure is only recorded against an attempt somebody actually started",
+                     ),
+                 });
+             }
+@@ -254,6 +295,8 @@ impl Store for MemoryStore {
+                 JobState::Failed
+             };
+             let state = job.state;
++            job.lease_owner = None;
++            job.lease_expires_at = None;
+             // The attempt the line names is the one the claim started, read off the row the same
+             // guard is holding: a trail built from a second read could name an attempt that had
+             // already moved on (step `jobq/3.6-transaction-isolation`).
+@@ -279,4 +322,113 @@ impl Store for MemoryStore {
+     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
+         Box::pin(async move { Ok(self.ledger().events_of(id)) })
+     }
++
++    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
++        // A store with no schema has nothing to prepare, and saying so is the whole answer: a
++        // caller that has to know which backend it is holding does not have a port.
++        Box::pin(async move { Ok(()) })
++    }
++
++    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            let until = Utc::now() + self.lease;
++            let mut ledger = self.ledger();
++            let mut renewed = 0;
++            for job in ledger.jobs.values_mut() {
++                // The filter is the safety property: a worker renews what it holds, not what
++                // it remembers holding.
++                if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
++                    job.lease_expires_at = Some(until);
++                    renewed += 1;
++                }
++            }
++            Ok(renewed)
++        })
++    }
++
++    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            let now = Utc::now();
++            let mut ledger = self.ledger();
++            let mut handed_back = Vec::new();
++            for (id, job) in ledger.jobs.iter_mut() {
++                if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
++                    handed_back.push((*id, put_back(job, HANDED_BACK)));
++                }
++            }
++            for (id, attempt) in &handed_back {
++                ledger.record(&JobEvent::new(
++                    *id,
++                    EventKind::Reclaimed,
++                    *attempt,
++                    Some(HANDED_BACK.to_owned()),
++                    now,
++                ));
++            }
++            Ok(u32::try_from(handed_back.len()).unwrap_or(u32::MAX))
++        })
++    }
++
++    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            let now = Utc::now();
++            let mut ledger = self.ledger();
++            let mut expired = Vec::new();
++            for (id, job) in ledger.jobs.iter_mut() {
++                // The instant decides, not the owner: the worker that took this row may still be
++                // alive and merely stuck, and it is the lease — the promise it failed to keep —
++                // that says the row belongs to somebody else now.
++                if job.state == JobState::Running
++                    && job.lease_expires_at.is_some_and(|at| at <= now)
++                {
++                    expired.push((*id, put_back(job, ABANDONED)));
++                }
++            }
++            for (id, attempt) in &expired {
++                ledger.record(&JobEvent::new(
++                    *id,
++                    EventKind::Reclaimed,
++                    *attempt,
++                    Some(ABANDONED.to_owned()),
++                    now,
++                ));
++            }
++            Ok(u32::try_from(expired.len()).unwrap_or(u32::MAX))
++        })
++    }
++}
++
++/// Put one row back in its queue, and answer which attempt the line it gets will name.
++///
++/// The two rules the whole recovery story rests on are in this function, and the durable backend
++/// writes them as one `case` expression:
++///
++/// * the attempt that was abandoned stays counted — it was started, whether or not anybody watched
++///   it end, and a count that forgave it would let one payload that kills its worker be retried for
++///   ever;
++/// * the job goes back to `queued` while the budget has a try left and to `failed` when it does
++///   not, which is what makes a poison payload die: nobody has to *fail* it for the queue to stop
++///   handing it out.
++fn put_back(job: &mut Job, reason: &str) -> u32 {
++    job.state = if job.attempts < job.max_attempts {
++        JobState::Queued
++    } else {
++        JobState::Failed
++    };
++    job.last_error = Some(reason.to_owned());
++    job.lease_owner = None;
++    job.lease_expires_at = None;
++    job.attempts
++}
++
++/// Why one worker may not settle this row, in the two cases that look alike and are not.
++fn refused(job: &Job, worker: &WorkerId, why: &str) -> String {
++    match &job.lease_owner {
++        Some(owner) if owner != worker => format!(
++            "{} is held by {owner}, not by {worker}: {why}, and a claim that was reclaimed belongs \
++             to whoever holds it now",
++            job.id
++        ),
++        _ => format!("{} is {}, not running: {why}", job.id, job.state),
++    }
+ }
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 400cf3d..978795f 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -31,6 +31,7 @@
+ 
+ use std::future::Future;
+ use std::pin::Pin;
++use std::time::Duration;
+ 
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+@@ -50,6 +51,23 @@ pub use postgres::PostgresStore;
+ /// A future that can cross a trait object.
+ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+ 
++/// How long a claim lasts when nobody says otherwise: a minute.
++///
++/// Long enough that a job which is merely slow is not handed to a second worker, short enough that a
++/// `kill -9` is a delay rather than a lost afternoon. Both backends start from it, and the daemon
++/// replaces it with `worker.lease_seconds` (`jobq/3.7-leases-and-recovery`).
++pub(crate) const DEFAULT_LEASE: Duration = Duration::from_secs(60);
++
++/// What a row's `last_error` says when a worker handed it back on its way out.
++///
++/// One string for both backends, because it is what an operator reads in the row (`jobq/3.7`): a
++/// job that went back to the queue because somebody stopped is a different story from one that
++/// failed, and the trail line next to it is the other half of that story.
++pub(crate) const HANDED_BACK: &str = "the worker holding this job stopped and handed it back";
++
++/// What a row's `last_error` says when its lease ran out.
++pub(crate) const ABANDONED: &str = "the worker holding this job stopped without finishing it";
++
+ /// Where jobs live.
+ ///
+ /// Implemented by this crate's own backends, and only by those: see the module documentation and
+@@ -63,7 +81,13 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// zero); [`Error::Store`] when the backend refused it.
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>>;
+ 
+-    /// Take up to `limit` due jobs for `worker`, and mark them running.
++    /// Take up to `limit` due jobs for `worker`, mark them running, and lease them to that worker.
++    ///
++    /// The claim is a **lease** from step `jobq/3.7-leases-and-recovery` on: the row carries the
++    /// name of the worker that took it and an instant after which the claim is presumed abandoned,
++    /// and the claimant extends that instant with [`Store::renew`] for as long as it is handling
++    /// the job. A claim that is only a state change is a row nobody can recover from a process that
++    /// was killed before it could hand anything back.
+     ///
+     /// Claim order is part of the port rather than a detail of one backend: the jobs that are due
+     /// come back highest priority first, then the one that has been due longest, then by ascending
+@@ -86,10 +110,15 @@ pub trait Store: Sealed + Send + Sync + 'static {
+ 
+     /// Finish a job this worker holds.
+     ///
++    /// "This worker" is the whole of the phrase from `jobq/3.7-leases-and-recovery` on: a settle is
++    /// refused unless the row still carries this worker's lease, so a worker whose claim was
++    /// already declared abandoned cannot settle the attempt its successor is running.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::NotFound`] when the job is gone, [`Error::Store`] when the backend refused the
+-    /// write.
++    /// [`Error::NotFound`] when the job is gone, [`Error::Invalid`] when the job is not running or
++    /// its lease belongs to somebody else, [`Error::Conflict`] when the backend refused the
++    /// transaction and a caller may try again, [`Error::Store`] when the backend refused the write.
+     fn complete<'a>(
+         &'a self,
+         worker: &'a WorkerId,
+@@ -99,10 +128,14 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// Record a failed attempt and decide where the job goes next: back to `queued` while the
+     /// attempt budget lasts, to `failed` when it does not.
+     ///
++    /// The lease guard is [`Store::complete`]'s, for the same reason: only the worker the row still
++    /// names may say what happened to the attempt.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::NotFound`] when the job is gone, [`Error::Store`] when the backend refused the
+-    /// write.
++    /// [`Error::NotFound`] when the job is gone, [`Error::Invalid`] when the job is not running or
++    /// its lease belongs to somebody else, [`Error::Conflict`] when the backend refused the
++    /// transaction and a caller may try again, [`Error::Store`] when the backend refused the write.
+     fn fail<'a>(
+         &'a self,
+         worker: &'a WorkerId,
+@@ -138,6 +171,71 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// [`Error::Store`] when the backend refused the write.
+     fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>>;
+ 
++    /// Bring this backend's schema up to date.
++    ///
++    /// Runs on every start of the daemon, against a store that is usually already current, so "the
++    /// second run changes nothing" is part of what this owes rather than a detail of how it is
++    /// written (`mailer/1.9-postgres` made the same promise for one service, and the store fixture
++    /// of `jobq/3.5-store-port-conformance` has been calling this method's implementation since
++    /// then). `jobq/3.7-leases-and-recovery` is where the *daemon* starts doing it too, and the
++    /// reason it belongs on the port rather than on one backend is that a store a process has to
++    /// prepare before it can use it is a store whose preparation every caller can ask for.
++    ///
++    /// A backend with no schema answers `Ok(())`: a no-op rather than a special case every caller
++    /// has to know about.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when a migration failed.
++    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>>;
++
++    /// Extend the leases this worker holds, and answer how many rows moved.
++    ///
++    /// One statement over the rows the *worker* holds — `lease_owner = this worker and state =
++    /// running` — because the filter is the safety property: a worker that could renew anybody's
++    /// lease could keep another worker's attempt alive for ever, or (worse, and much more likely by
++    /// accident) hand its own expired rows back as if they had never lapsed.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the write.
++    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>>;
++
++    /// Hand back every row this worker still holds, and answer how many rows moved.
++    ///
++    /// This is what a drain uses when its deadline passes, and what a stop that does not want to
++    /// wait out a lease uses at all: the same work the reclaimer does when a lease runs out, done
++    /// early because somebody knows it is not coming back. The job goes to `queued` (or to `failed`
++    /// when its attempts are spent, the rule [`Store::fail`] uses), with its attempt kept — the
++    /// attempt was started, whether or not anybody watched it end — its lease released, and a line
++    /// of the trail that says it was handed back rather than finished.
++    ///
++    /// The filter is the same `lease_owner = this worker`, and it is the whole safety property
++    /// again: handing back somebody else's claim puts an attempt that is running right now back in
++    /// the queue, which is a second worker on one job.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the write.
++    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>>;
++
++    /// Put back every row whose lease has run out, and answer how many rows moved.
++    ///
++    /// A row whose lease has run out belongs to nobody: the worker that took it is gone (that is
++    /// what a lease is for) or is so far behind that another worker finishing the job is the better
++    /// trade. It goes back to `queued` — or to `failed` when its attempts are spent, which is the
++    /// half that keeps a payload that kills its worker from being retried for ever — with its
++    /// attempt kept, its lease released, and a `reclaimed` line in its trail.
++    ///
++    /// The predicate is `state = 'running' and lease_expires_at <= now`: the instant, not the owner,
++    /// is what decides, because a clock that disagrees by a second must not be able to strand a row
++    /// (see the step body on the two clocks a lease puts side by side).
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the write.
++    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>>;
++
+     /// One job's trail: what has happened to it, oldest first.
+     ///
+     /// The order is a promise, for the reason `claim`'s order is one: an operator reads a story, and
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index aa2ae74..2bc7d71 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -33,6 +33,8 @@
+ //! and the port's methods are the only place the column names appear: no other file in the crate
+ //! knows that jobs live in a table.
+ 
++use std::time::Duration;
++
+ use chrono::{DateTime, Utc};
+ use sqlx::postgres::{PgConnection, PgPoolOptions};
+ use sqlx::{PgPool, Postgres, Transaction};
+@@ -42,7 +44,7 @@ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::sealed::Sealed;
+-use crate::engine::store::{BoxFuture, Store};
++use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ 
+ // Why the statements below are written out rather than assembled, and why they look the way they
+ // do: `sqlx` 0.9 takes a `&'static str` and nothing else (`SqlSafeStr`), so a query built with
+@@ -61,6 +63,8 @@ use crate::engine::store::{BoxFuture, Store};
+ pub struct PostgresStore {
+     /// The pool every statement in this file runs on.
+     pool: PgPool,
++    /// How long a claim by this store is good for.
++    lease: Duration,
+ }
+ 
+ impl PostgresStore {
+@@ -76,29 +80,40 @@ impl PostgresStore {
+         // pool of workers rather than to the store. `connect` waits for a real connection, so a URL
+         // that cannot be reached is refused here instead of at the first claim.
+         let pool = PgPoolOptions::new().connect(url).await.map_err(refused)?;
+-        Ok(Self { pool })
++        Ok(Self {
++            pool,
++            lease: DEFAULT_LEASE,
++        })
+     }
+ 
+-    /// Bring the schema up to date.
+-    ///
+-    /// Runs on every start of the daemon, against a database that is usually already current, so
+-    /// "the second run changes nothing" is part of what this method owes rather than a detail of
+-    /// how it is written (step `mailer/1.9-postgres` made the same promise for one service).
++    /// The same store, leasing claims for `lease`.
+     ///
+-    /// # Errors
+-    ///
+-    /// [`Error::Store`] when a migration fails.
+-    pub async fn migrate(&self) -> Result<(), Error> {
+-        sqlx::migrate!("./migrations")
+-            .run(&self.pool)
+-            .await
+-            .map_err(|error| refused(sqlx::Error::Migrate(Box::new(error))))
++    /// The lease is the deployment's number (`jobq/3.7-leases-and-recovery`): the daemon passes
++    /// `worker.lease_seconds`, a test passes millimetres, and the row is stamped with whichever one
++    /// the store it was claimed from was built with.
++    #[must_use]
++    pub fn with_lease(mut self, lease: Duration) -> Self {
++        self.lease = lease;
++        self
+     }
+ }
+ 
+ impl Sealed for PostgresStore {}
+ 
+ impl Store for PostgresStore {
++    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
++        Box::pin(async move {
++            // `jobq/3.7-leases-and-recovery` is where the daemon starts calling this on every start,
++            // so the promise the store fixture of `jobq/3.5-store-port-conformance` has been relying
++            // on — "the second run changes nothing" — is now a promise the port makes rather than one
++            // that fixture happens to keep.
++            sqlx::migrate!("./migrations")
++                .run(&self.pool)
++                .await
++                .map_err(|error| refused(sqlx::Error::Migrate(Box::new(error))))
++        })
++    }
++
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
+         Box::pin(async move {
+             if request.max_attempts == 0 {
+@@ -119,7 +134,7 @@ impl Store for PostgresStore {
+                      (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
+                  values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
+                  returning id, queue, payload::text as payload, state, priority, run_at, \
+-                           attempts, max_attempts, last_error",
++                           attempts, max_attempts, last_error, lease_owner, lease_expires_at",
+             )
+             .bind(id.as_uuid())
+             .bind(request.queue.as_str())
+@@ -149,11 +164,6 @@ impl Store for PostgresStore {
+         limit: usize,
+     ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
+         Box::pin(async move {
+-            // Nothing records who holds a job yet (step `jobq/3.7-leases-and-recovery` adds the
+-            // lease), so the worker is not written down here either — the two backends have to
+-            // answer the same questions, and an answer the in-memory store cannot give is not one
+-            // the port may rely on. The name is still the interface.
+-            let _ = worker;
+             let now = Utc::now();
+             // One statement, and the shape of it is the whole promise: the rows are chosen with
+             // `for update skip locked` *inside* the update that stamps them, so a second claim
+@@ -167,9 +177,14 @@ impl Store for PostgresStore {
+             // longest due, then identity): `returning` says which rows changed, not in which
+             // order, and an order that comes out of the database by accident is an order that
+             // changes the day an index does.
++            // The claim stamps the lease in the same statement that stamps the attempt, and that
++            // is the point of this step: a row that is running without an owner is a row nobody can
++            // recover, and a row whose owner is written in a second statement is a row that is
++            // unowned for as long as the second statement takes.
+             let rows: Vec<JobRow> = sqlx::query_as(
+                 "with taken as ( \
+-                     update jobs set state = 'running', attempts = jobs.attempts + 1 \
++                     update jobs set state = 'running', attempts = jobs.attempts + 1, \
++                                     lease_owner = $4, lease_expires_at = $5 \
+                      where id in ( \
+                          select id from jobs \
+                          where queue = $1 and state = 'queued' and run_at <= $2 \
+@@ -178,10 +193,10 @@ impl Store for PostgresStore {
+                          for update skip locked \
+                      ) \
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+-                               attempts, max_attempts, last_error \
++                               attempts, max_attempts, last_error, lease_owner, lease_expires_at \
+                  ) \
+                  select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+-                        max_attempts, last_error \
++                        max_attempts, last_error, lease_owner, lease_expires_at \
+                  from taken order by priority desc, run_at asc, id asc",
+             )
+             .bind(queue.as_str())
+@@ -190,6 +205,12 @@ impl Store for PostgresStore {
+             // queue no process could hold: saturating keeps that impossible case out of the port's
+             // error surface instead of adding a refusal nobody can reach.
+             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
++            .bind(worker.as_str())
++            // The lease's end is computed from the *engine's* clock and bound in, for the reason the
++            // claim's `run_at` comparison is: a database clock is a second authority on time, and two
++            // authorities disagree eventually (step `jobq/3.8-clock-injection` is where the engine's
++            // becomes injectable, and it must be the only one either backend reads).
++            .bind(now + self.lease)
+             .fetch_all(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -202,12 +223,7 @@ impl Store for PostgresStore {
+         worker: &'a WorkerId,
+         id: &'a JobId,
+     ) -> BoxFuture<'a, Result<(), Error>> {
+-        Box::pin(async move {
+-            let _ = worker;
+-            // The worker is not asked for a second time here either: the guard is the row's own
+-            // state, which is the only thing that can decide this once two workers disagree.
+-            self.settle(id, Change::Completed).await.map(|_| ())
+-        })
++        Box::pin(async move { self.settle(worker, id, Change::Completed).await.map(|_| ()) })
+     }
+ 
+     fn fail<'a>(
+@@ -216,17 +232,14 @@ impl Store for PostgresStore {
+         id: &'a JobId,
+         reason: &'a str,
+     ) -> BoxFuture<'a, Result<JobState, Error>> {
+-        Box::pin(async move {
+-            let _ = worker;
+-            self.settle(id, Change::Failed { reason }).await
+-        })
++        Box::pin(async move { self.settle(worker, id, Change::Failed { reason }).await })
+     }
+ 
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         Box::pin(async move {
+             let row: Option<JobRow> = sqlx::query_as(
+                 "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+-                        max_attempts, last_error \
++                        max_attempts, last_error, lease_owner, lease_expires_at \
+                  from jobs where id = $1",
+             )
+             .bind(id.as_uuid())
+@@ -250,6 +263,58 @@ impl Store for PostgresStore {
+         })
+     }
+ 
++    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            // One statement, so there is nothing to retry and nothing to isolate: either this worker
++            // still holds the row (and the instant moves) or it does not (and nothing happens).
++            let renewed = sqlx::query(
++                "update jobs set lease_expires_at = $2 \
++                 where lease_owner = $1 and state = 'running'",
++            )
++            .bind(worker.as_str())
++            // The engine's clock again, bound in: a renewal measured against the database's clock
++            // would be a second authority on how long a lease is.
++            .bind(Utc::now() + self.lease)
++            .execute(&self.pool)
++            .await
++            .map_err(refused)?;
++            Ok(u32::try_from(renewed.rows_affected()).unwrap_or(u32::MAX))
++        })
++    }
++
++    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            // One statement, and the reason it can be one: everything here is a decision the
++            // *database* can make from the rows it is already holding. The rows this worker holds
++            // are locked, the budget decides where each one goes, and the lines that say so are
++            // inserted in the same statement — so a worker that is handing back forty jobs either
++            // hands back forty or hands back none, and no reader ever sees the half of it.
++            let written = sqlx::query(GIVE_BACK)
++                .bind(worker.as_str())
++                .bind(HANDED_BACK)
++                .bind(EventKind::Reclaimed.as_str())
++                .bind(Utc::now())
++                .execute(&self.pool)
++                .await
++                .map_err(refused)?;
++            Ok(u32::try_from(written.rows_affected()).unwrap_or(u32::MAX))
++        })
++    }
++
++    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
++        Box::pin(async move {
++            let written = sqlx::query(RECLAIM)
++                .bind(Utc::now())
++                .bind(RECLAIM_BATCH)
++                .bind(ABANDONED)
++                .bind(EventKind::Reclaimed.as_str())
++                .execute(&self.pool)
++                .await
++                .map_err(refused)?;
++            Ok(u32::try_from(written.rows_affected()).unwrap_or(u32::MAX))
++        })
++    }
++
+     fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
+         Box::pin(async move {
+             // The order is the port's promise, so it is written here rather than left to whatever
+@@ -268,6 +333,71 @@ impl Store for PostgresStore {
+     }
+ }
+ 
++/// How many rows one run of the reclaimer may take back.
++///
++/// A bound rather than "everything that is expired": the rows a single worker can be holding when it
++/// dies are bounded by the batch it claimed, so a run that finds more than this is a run looking at
++/// a fleet that stopped — and the next turn, a moment later, is the right place to find that out
++/// rather than one transaction that locks a table's worth of rows while it writes them back.
++const RECLAIM_BATCH: i64 = 128;
++
++/// Put back everything this worker still holds, and write the line that says so.
++///
++/// Two `with` clauses and an insert: `held` takes the rows this worker holds (and nothing else — the
++/// filter is the whole safety property, see `Store::release`), `put_back` moves each one to the state
++/// its own budget leaves it in, and the insert writes one `reclaimed` line per row. One statement,
++/// so there is no window in which a row has moved and its line has not.
++///
++/// `gen_random_uuid()` mints the line's identity in the database rather than in the engine, which is
++/// the one place this file differs from `JobEvent::new` on purpose: the rows are being written by
++/// SQL, and asking Rust for forty of them would mean forty round trips through a statement that
++/// already has everything it needs.
++const GIVE_BACK: &str = "with held as ( \
++        select id, attempts, max_attempts from jobs \
++        where state = 'running' and lease_owner = $1 \
++        for update \
++    ), put_back as ( \
++        update jobs set \
++            state = case when held.attempts < held.max_attempts then 'queued' else 'failed' end, \
++            last_error = $2, \
++            lease_owner = null, \
++            lease_expires_at = null \
++        from held \
++        where jobs.id = held.id \
++        returning jobs.id as id, jobs.attempts as attempt \
++    ) \
++    insert into job_events (id, job_id, kind, attempt, detail, at) \
++    select gen_random_uuid(), id, $3, attempt, $2, $4 from put_back \
++    on conflict (job_id, kind, attempt) do nothing";
++
++/// Put back everything whose lease has run out, and write the line that says so.
++///
++/// The same statement as `GIVE_BACK` with the other predicate: `state = 'running' and
++/// lease_expires_at <= $1`, ordered by the instant and bounded by [`RECLAIM_BATCH`]. `for update skip
++/// locked` is what keeps a reclaimer from *waiting* for a worker that is right in the middle of
++/// settling one of these rows: a row somebody is writing is not abandoned, and a worker that stops
++/// on a lock that is about to be released would be a worker that stops exactly when a crash is being
++/// cleaned up.
++const RECLAIM: &str = "with expired as ( \
++        select id, attempts, max_attempts from jobs \
++        where state = 'running' and lease_expires_at <= $1 \
++        order by lease_expires_at asc, id asc \
++        limit $2 \
++        for update skip locked \
++    ), put_back as ( \
++        update jobs set \
++            state = case when expired.attempts < expired.max_attempts then 'queued' else 'failed' end, \
++            last_error = $3, \
++            lease_owner = null, \
++            lease_expires_at = null \
++        from expired \
++        where jobs.id = expired.id \
++        returning jobs.id as id, jobs.attempts as attempt \
++    ) \
++    insert into job_events (id, job_id, kind, attempt, detail, at) \
++    select gen_random_uuid(), id, $4, attempt, $3, $1 from put_back \
++    on conflict (job_id, kind, attempt) do nothing";
++
+ /// The statement a settle's transaction starts with.
+ ///
+ /// One line, and the step's whole isolation argument. At `repeatable read` a transaction's reads
+@@ -283,15 +413,23 @@ impl Store for PostgresStore {
+ const SETTLE: &str = "begin isolation level repeatable read";
+ 
+ /// The statement that records a success.
+-const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null \
+-                       where id = $1 and state = 'running' \
++///
++/// `and lease_owner = $2` is the guard `jobq/3.7-leases-and-recovery` adds to the one that was
++/// already there, and it closes the window a lease opens: a worker that was killed, whose row was
++/// reclaimed and claimed by somebody else, would otherwise settle *that* attempt — it holds the
++/// same job id, and "running" is still true. What it does not hold is the lease, and the row is the
++/// only place that can tell the two workers apart.
++const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null, \
++                               lease_owner = null, lease_expires_at = null \
++                       where id = $1 and state = 'running' and lease_owner = $2 \
+                        returning state, attempts";
+ 
+ /// The statement that records a failure: the row's own budget decides where the job goes, in the
+-/// same statement that writes the reason down.
+-const FAIL: &str = "update jobs set last_error = $2, \
+-                           state = case when attempts < max_attempts then 'queued' else 'failed' end \
+-                    where id = $1 and state = 'running' \
++/// same statement that writes the reason down — and the same lease guard.
++const FAIL: &str = "update jobs set last_error = $3, \
++                           state = case when attempts < max_attempts then 'queued' else 'failed' end, \
++                           lease_owner = null, lease_expires_at = null \
++                    where id = $1 and state = 'running' and lease_owner = $2 \
+                     returning state, attempts";
+ 
+ /// What a settle does to the row it touches.
+@@ -318,11 +456,17 @@ impl Change<'_> {
+     async fn apply(
+         &self,
+         transaction: &mut Transaction<'_, Postgres>,
++        worker: &WorkerId,
+         id: &JobId,
+     ) -> Result<Option<(String, i64)>, Error> {
+         let row = match self {
+-            Change::Completed => sqlx::query_as(COMPLETE).bind(id.as_uuid()),
+-            Change::Failed { reason } => sqlx::query_as(FAIL).bind(id.as_uuid()).bind(*reason),
++            Change::Completed => sqlx::query_as(COMPLETE)
++                .bind(id.as_uuid())
++                .bind(worker.as_str()),
++            Change::Failed { reason } => sqlx::query_as(FAIL)
++                .bind(id.as_uuid())
++                .bind(worker.as_str())
++                .bind(*reason),
+         }
+         .fetch_optional(&mut **transaction)
+         .await
+@@ -373,23 +517,31 @@ impl PostgresStore {
+     /// [`Error::NotFound`] when there is no such row, [`Error::Invalid`] when the row is not
+     /// running, [`Error::Conflict`] when a concurrent writer made the database refuse the
+     /// transaction, [`Error::Store`] for anything else the backend refused.
+-    async fn settle(&self, id: &JobId, change: Change<'_>) -> Result<JobState, Error> {
++    async fn settle(
++        &self,
++        worker: &WorkerId,
++        id: &JobId,
++        change: Change<'_>,
++    ) -> Result<JobState, Error> {
+         let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
+-        let Some((state, attempts)) = change.apply(&mut transaction, id).await? else {
+-            // Nothing moved, and there are two different reasons for that — which is why the
++        let Some((state, attempts)) = change.apply(&mut transaction, worker, id).await? else {
++            // Nothing moved, and there are three different reasons for that — which is why the
+             // refusal is a second question, asked through the transaction that just wrote, rather
+-            // than a message invented here.
+-            let unreadable = format!(
+-                "job {id} is {}, not running: {}",
+-                state_of(&mut transaction, id)
+-                    .await?
+-                    .as_deref()
+-                    .unwrap_or("gone"),
+-                change.refusal()
+-            );
+-            let refusal = match state_of(&mut transaction, id).await? {
+-                Some(_) => Error::Invalid { detail: unreadable },
++            // than a message invented here. The third one is the step: the row is running, and it
++            // is somebody else's.
++            let refusal = match state_and_holder(&mut transaction, id).await? {
+                 None => Error::NotFound { id: *id },
++                Some((state, Some(owner))) if owner != worker.as_str() => Error::Invalid {
++                    detail: format!(
++                        "job {id} is {state} and held by {owner}, not by {worker}: {}. A claim that \
++                         was reclaimed belongs to whoever holds it now, and a worker that comes back \
++                         to settle it would be settling somebody else's attempt",
++                        change.refusal()
++                    ),
++                },
++                Some((state, _)) => Error::Invalid {
++                    detail: format!("job {id} is {state}, not running: {}", change.refusal()),
++                },
+             };
+             // Nothing was written (the update matched no row), so there is nothing to undo; the
+             // rollback is what says so out loud, and it releases the snapshot and the locks the
+@@ -443,19 +595,24 @@ async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool,
+     Ok(written.rows_affected() > 0)
+ }
+ 
+-/// What the `state` column says about one job, or `None` when there is no such row.
++/// What the `state` column says about one job, and who holds it, or `None` when there is no row.
+ ///
+-/// Asked only after a write that changed nothing, to tell "this job is gone" from "this job is not
+-/// running" — the two refusals the port separates and the two a caller acts on differently. It is
+-/// asked *through the transaction that just wrote*, so the answer belongs to the same snapshot as
+-/// the refusal it explains.
+-async fn state_of(connection: &mut PgConnection, id: &JobId) -> Result<Option<String>, Error> {
+-    let row: Option<(String,)> = sqlx::query_as("select state from jobs where id = $1")
+-        .bind(id.as_uuid())
+-        .fetch_optional(connection)
+-        .await
+-        .map_err(refused)?;
+-    Ok(row.map(|(state,)| state))
++/// Asked only after a write that changed nothing, to tell the three refusals apart: this job is
++/// gone, this job is not running, and this job is running but it is not this worker's. It is asked
++/// *through the transaction that just wrote*, so the answer belongs to the same snapshot as the
++/// refusal it explains — and the third of those is what the lease guard needs to explain itself
++/// (`jobq/3.7-leases-and-recovery`).
++async fn state_and_holder(
++    connection: &mut PgConnection,
++    id: &JobId,
++) -> Result<Option<(String, Option<String>)>, Error> {
++    let row: Option<(String, Option<String>)> =
++        sqlx::query_as("select state, lease_owner from jobs where id = $1")
++            .bind(id.as_uuid())
++            .fetch_optional(connection)
++            .await
++            .map_err(refused)?;
++    Ok(row)
+ }
+ 
+ /// One row of `jobs`, in the shape the driver decodes it.
+@@ -485,6 +642,10 @@ struct JobRow {
+     max_attempts: i64,
+     /// Why the last attempt failed, when one did.
+     last_error: Option<String>,
++    /// Who holds it, as a name, when somebody does.
++    lease_owner: Option<String>,
++    /// When the claim runs out, when somebody holds it.
++    lease_expires_at: Option<DateTime<Utc>>,
+ }
+ 
+ impl JobRow {
+@@ -504,6 +665,11 @@ impl JobRow {
+             attempts: count(self.attempts, "attempts")?,
+             max_attempts: count(self.max_attempts, "max_attempts")?,
+             last_error: self.last_error,
++            // The owner travels as the string the column holds and is parsed on the way in, so that
++            // a row the engine wrote and cannot read back is reported here rather than becoming a
++            // job whose lease belongs to a name nobody can use.
++            lease_owner: self.lease_owner.map(WorkerId::new),
++            lease_expires_at: self.lease_expires_at,
+         })
+     }
+ }
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 343f0d2..1f5aad7 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -106,6 +106,19 @@ pub struct WorkerSettings {
+     pub poll_interval_ms: u64,
+     /// How long the drain may take after a stop signal before the process ends anyway.
+     pub shutdown_seconds: u64,
++    /// How long a claim by this process is good for.
++    ///
++    /// `jobq/3.7-leases-and-recovery`'s number, and it is a trade rather than a default: longer than
++    /// the slowest attempt the operator is willing to wait for (or the row's own lease runs out
++    /// underneath the worker holding it, and two workers run one job) and shorter than the recovery
++    /// they are willing to accept (because that is how long a `kill -9` makes work invisible).
++    pub lease_seconds: u64,
++    /// The program to run for each job, as a program and its arguments.
++    ///
++    /// `None` means the daemon records the jobs it takes rather than running anything: a queue with
++    /// no application handler is still a queue, and failing every job because a setting is missing
++    /// would spend the queue's attempt budgets on a misconfiguration.
++    pub handler: Option<String>,
+ }
+ 
+ /// The effective settings: every layer already applied.
+@@ -193,6 +206,12 @@ struct FileWorker {
+     /// How long the drain may take after a stop signal.
+     #[serde(default)]
+     shutdown_seconds: Option<u64>,
++    /// How long a claim is good for.
++    #[serde(default)]
++    lease_seconds: Option<u64>,
++    /// The program to run for each job.
++    #[serde(default)]
++    handler: Option<String>,
+ }
+ 
+ /// `[log]` in a file.
+@@ -220,6 +239,8 @@ impl Default for Config {
+                 batch: 8,
+                 poll_interval_ms: 250,
+                 shutdown_seconds: 10,
++                lease_seconds: 60,
++                handler: None,
+             },
+             log: LogSettings {
+                 level: "info".to_owned(),
+@@ -293,6 +314,12 @@ impl Config {
+         if let Some(seconds) = file.worker.shutdown_seconds {
+             self.worker.shutdown_seconds = seconds;
+         }
++        if let Some(seconds) = file.worker.lease_seconds {
++            self.worker.lease_seconds = seconds;
++        }
++        if let Some(handler) = file.worker.handler {
++            self.worker.handler = Some(handler);
++        }
+         if let Some(level) = file.log.level {
+             self.log.level = level;
+         }
+@@ -333,6 +360,12 @@ impl Config {
+                 (Some("WORKER"), Some("SHUTDOWN_SECONDS"), None) => {
+                     self.worker.shutdown_seconds = parse_number(name, value)?;
+                 }
++                (Some("WORKER"), Some("LEASE_SECONDS"), None) => {
++                    self.worker.lease_seconds = parse_number(name, value)?;
++                }
++                (Some("WORKER"), Some("HANDLER"), None) => {
++                    self.worker.handler = Some(value.clone());
++                }
+                 (Some("LOG"), Some("LEVEL"), None) => self.log.level = value.clone(),
+                 (Some("LOG"), Some("FORMAT"), None) => {
+                     self.log.format = LogFormat::parse(value)?;
+@@ -375,6 +408,26 @@ impl Config {
+                 detail: "worker.shutdown_seconds must be at least 1".to_owned(),
+             });
+         }
++        if self.worker.lease_seconds == 0 {
++            return Err(Error::Invalid {
++                detail: "worker.lease_seconds must be at least 1: a lease of zero is a claim that \
++                         has already run out, and every row this worker takes would be reclaimed \
++                         from under it"
++                    .to_owned(),
++            });
++        }
++        if self
++            .worker
++            .handler
++            .as_deref()
++            .is_some_and(|handler| handler.trim().is_empty())
++        {
++            return Err(Error::Invalid {
++                detail: "worker.handler cannot be empty: name the program to run for each job, or \
++                         leave the setting out and let the daemon record the jobs it takes"
++                    .to_owned(),
++            });
++        }
+         if self.log.level.trim().is_empty() {
+             return Err(Error::Invalid {
+                 detail: "log.level cannot be empty".to_owned(),
+@@ -401,6 +454,11 @@ impl Config {
+             format!("worker.batch = {}", self.worker.batch),
+             format!("worker.poll_interval_ms = {}", self.worker.poll_interval_ms),
+             format!("worker.shutdown_seconds = {}", self.worker.shutdown_seconds),
++            format!("worker.lease_seconds = {}", self.worker.lease_seconds),
++            format!(
++                "worker.handler = {}",
++                self.worker.handler.as_deref().unwrap_or("none")
++            ),
+             format!("log.level = {}", self.log.level),
+             format!("log.format = {}", self.log.format.as_str()),
+         ]
+diff --git a/src/service/handler.rs b/src/service/handler.rs
+new file mode 100644
+index 0000000..12d44b8
+--- /dev/null
++++ b/src/service/handler.rs
+@@ -0,0 +1,217 @@
++//! What the daemon does with a job: the two handlers it can run, and the rule that picks one.
++//!
++//! A queue engine cannot know what a job *does*. That is the application's business, and this crate
++//! is the engine — so the worker takes a [`Handler`] (`crate::service::worker`) and this module is
++//! the daemon's answer to "which one": the program the configuration names, or the one that records
++//! the job and takes it as done.
++//!
++//! Two decisions are worth the paragraphs:
++//!
++//! * **no handler is a recording handler, not a failing one.** A daemon that has been started
++//!   without a `worker.handler` still drains its queue: it logs each job and settles it as
++//!   succeeded. The alternative — failing every job — would spend a queue's attempt budgets on a
++//!   misconfiguration, and the first thing a deployment does with a wrong setting is start it
++//!   again. What is *not* offered is silence: the reference handler says what it took, and the
++//!   step body says so where an operator will read it.
++//! * **a handler is one program, its payload on standard input.** The program and its arguments are
++//!   whitespace-separated in one setting and are never interpreted by a shell: a payload that
++//!   contains `; rm -rf /` is a payload, not a command line. The exit status is the verdict —
++//!   zero means the job is done, anything else is an attempt that failed, with the status as the
++//!   reason the row keeps.
++
++use std::io::Write;
++use std::path::PathBuf;
++use std::process::{Child, Command, ExitStatus, Stdio};
++use std::time::Duration;
++
++use crate::engine::domain::Job;
++use crate::engine::error::Error;
++use crate::engine::store::BoxFuture;
++use crate::service::config::Config;
++use crate::service::worker::Handler;
++
++/// How often the daemon looks at a handler's child process.
++///
++/// The daemon polls rather than waits for a signal, because the wait has to be *interruptible*: the
++/// drain deadline has to be able to give up on a program that will not finish, and a future that is
++/// blocked inside a wait cannot be. The interval is short enough that a handler's real work dominates
++/// it by orders of magnitude, and long enough that an idle worker with one job is not a busy loop.
++const POLL: Duration = Duration::from_millis(20);
++
++/// The handler the configuration asks for.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when `worker.handler` is not a program the daemon can name (an empty setting,
++/// or one whose program is not there): this is a start-up decision, so it is refused before the
++/// first claim rather than discovered by the first job.
++pub fn for_config(config: &Config) -> Result<Box<dyn Handler>, Error> {
++    match config.worker.handler.as_deref() {
++        Some(command) => Ok(Box::new(CommandHandler::parse(command)?)),
++        None => Ok(Box::new(LogHandler)),
++    }
++}
++
++/// The handler a deployment gets when it names no program: it records the job and takes it as done.
++#[derive(Debug, Default)]
++pub struct LogHandler;
++
++impl Handler for LogHandler {
++    fn handle<'a>(&'a self, job: &'a Job) -> BoxFuture<'a, Result<(), Error>> {
++        Box::pin(async move {
++            tracing::info!(
++                job = %job.id(),
++                queue = %job.queue(),
++                attempt = job.attempts(),
++                payload = %job.payload(),
++                "handled"
++            );
++            Ok(())
++        })
++    }
++}
++
++/// The handler that runs a program: one process per attempt, the payload on its standard input.
++///
++/// The program's own output is *inherited* rather than captured — it lands in the daemon's streams,
++/// next to the log lines that name the job it belongs to, which is where an operator looks for it.
++/// That is also what keeps this handler from deadlocking: nothing here reads a pipe after the child,
++/// so a program that prints more than a pipe buffer of output is a program whose output goes
++/// straight out rather than a daemon that stops.
++#[derive(Debug, Clone)]
++pub struct CommandHandler {
++    /// The program to run.
++    program: PathBuf,
++    /// What to run it with.
++    arguments: Vec<String>,
++}
++
++impl CommandHandler {
++    /// Parse a `worker.handler` setting: a program, then its arguments, separated by whitespace.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the setting names no program, or names one that cannot be found: a
++    /// handler that does not exist is a deployment mistake, and finding out at the first job means
++    /// finding out after the job has been claimed.
++    pub fn parse(command: &str) -> Result<Self, Error> {
++        let mut words = command.split_whitespace();
++        let Some(program) = words.next() else {
++            return Err(Error::Invalid {
++                detail:
++                    "`worker.handler` is empty: name the program to run for each job, or leave \
++                         the setting out and let the daemon record the jobs it takes"
++                        .to_owned(),
++            });
++        };
++        let program = PathBuf::from(program);
++        // `which` is not a dependency and not a shell builtin: the check a daemon can honestly make
++        // without one is that the *path* is a file, which covers the common mistake (a name that is
++        // not on the PATH) with a sentence the operator can act on.
++        if program.components().count() > 1 && !program.is_file() {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "`worker.handler` names `{}`, which is not a file: a program without a path is \
++                     looked up in the daemon's PATH by the operating system, and a path has to be \
++                     right",
++                    program.display()
++                ),
++            });
++        }
++        Ok(Self {
++            program,
++            arguments: words.map(str::to_owned).collect(),
++        })
++    }
++}
++
++impl Handler for CommandHandler {
++    fn handle<'a>(&'a self, job: &'a Job) -> BoxFuture<'a, Result<(), Error>> {
++        Box::pin(async move {
++            let payload = serde_json::to_vec(job.payload()).map_err(|error| Error::Invalid {
++                detail: format!("this job's payload cannot be written out: {error}"),
++            })?;
++            let mut child = Started::spawn(self, &payload)?;
++            let status = child.wait().await?;
++            if status.success() {
++                return Ok(());
++            }
++            Err(Error::Io {
++                source: std::io::Error::other(format!(
++                    "`{}` exited {}",
++                    self.program.display(),
++                    describe(status)
++                )),
++            })
++        })
++    }
++}
++
++/// How a child process ended, for the reason a failed attempt keeps.
++fn describe(status: ExitStatus) -> String {
++    match status.code() {
++        Some(code) => format!("with status {code}"),
++        None => "before it could exit: the signal it was sent ended it".to_owned(),
++    }
++}
++
++/// A child process that is ended when this value goes away.
++///
++/// The drain deadline aborts the task of a job that is taking too long, and dropping a future runs no
++/// code of the future's own — so the kill has to be in a `Drop`, or the daemon leaves a program
++/// running after it has decided to stop waiting for it. (`tokio::process::Command` has the same
++/// feature under the name `kill_on_drop`; this crate does not have that feature turned on, and a
++/// `Drop` is the whole of what it does.)
++struct Started {
++    /// The child, reaped by `Drop`.
++    child: Child,
++}
++
++impl Started {
++    /// Start the handler's program and offer it the payload.
++    fn spawn(handler: &CommandHandler, payload: &[u8]) -> Result<Self, Error> {
++        let mut child = Command::new(&handler.program)
++            .args(&handler.arguments)
++            .stdin(Stdio::piped())
++            // Inherited, so the program's own output goes where the daemon's log goes rather than
++            // into a pipe nobody is reading.
++            .stdout(Stdio::inherit())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|source| Error::Io { source })?;
++        if let Some(mut stdin) = child.stdin.take() {
++            // A handler that answers before it reads its input has decided not to read it, and the
++            // broken pipe that follows is not a job failure: the payload was offered.
++            let _ = stdin.write_all(payload);
++        }
++        Ok(Self { child })
++    }
++
++    /// Wait for the program to end, without blocking the thread it is running on.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Io`] when the operating system cannot be asked about the child at all.
++    async fn wait(&mut self) -> Result<ExitStatus, Error> {
++        loop {
++            if let Some(status) = self
++                .child
++                .try_wait()
++                .map_err(|source| Error::Io { source })?
++            {
++                return Ok(status);
++            }
++            tokio::time::sleep(POLL).await;
++        }
++    }
++}
++
++impl Drop for Started {
++    fn drop(&mut self) {
++        // The `wait` is not politeness: a killed child that is never reaped stays a zombie until the
++        // daemon exits, and a worker that hands back a job every few seconds would leave one behind
++        // every time.
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 1e27092..5f719ad 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -20,30 +20,64 @@ setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`).
+ ";
+ 
+ pub mod config;
++pub mod handler;
+ pub mod logging;
++pub mod worker;
+ 
+-use crate::engine::{Error, MemoryStore, Queue};
++use std::sync::Arc;
++use std::time::Duration;
++
++use crate::engine::{Error, MemoryStore, Queue, Store};
+ pub use config::{Config, Flags};
+ pub use logging::RunId;
++use worker::{Shutdown, Worker, WorkerSettings};
+ 
+-/// Build the store the settings name, announce that this process is draining, and wait for a
+-/// signal.
++/// Build the store the settings name, bring its schema up to date, announce that this process is
++/// draining, and run the worker until a signal arrives.
++///
++/// The order is the point, and it is the same one `mailer/1.9-postgres` established: everything the
++/// process needs is in place *before* it says it is running, because a process that announces first
++/// and fails later is one an orchestrator routes work to. `jobq/3.7-leases-and-recovery` is where
++/// the last piece of that order lands — the loop that actually claims, handles and settles — and
++/// where the store stops being a seam: a durable URL is now opened, migrated and drained.
+ ///
+-/// The order is the point, and it is the same one `mailer/1.9-postgres` established: everything
+-/// the process needs is in place *before* it says it is running, because a process that announces
+-/// first and fails later is one an orchestrator routes work to.
++/// The signal does one thing: it stops the worker claiming. What is in flight gets
++/// `worker.shutdown_seconds` to finish, what the deadline cuts is handed back, and the process exits
++/// `0` — the contract `jobq/3.1-engine-boundary` pinned for the line below and for the exit code.
+ ///
+ /// # Errors
+ ///
+-/// [`Error::Config`] when the settings do not name a store this build knows
+-/// how to open.
++/// [`Error::Config`] when the settings do not name a store this build knows how to open, or name a
++/// handler that is not there; [`Error::Store`] when the store cannot be opened or migrated;
++/// whatever the worker itself fails at.
+ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+-    // The store is opened here rather than inside the drain loop: from step
+-    // `jobq/3.5-store-port-conformance` on this is a connection pool, and a pool that cannot be
+-    // opened must stop the process before it claims anything.
+-    let store = open_store(&config)?;
++    let store: Arc<dyn Store> = open_store(&config).await?;
++    // Every start, against a database that is usually already current: the second run has to change
++    // nothing, which is the promise `mailer/1.9-postgres` made and this is where the daemon starts
++    // relying on it.
++    if config.store.migrate {
++        store.migrate().await?;
++    }
++    let handler = handler::for_config(&config)?;
++    let settings = worker_settings(&config);
+     let queues: Vec<&str> = config.worker.queues.iter().map(Queue::as_str).collect();
++    let worker = Worker::new(store, handler, settings);
++    let shutdown = Shutdown::new();
++
++    // The signal becomes the worker's own signal: one shape for "stop claiming", whoever sent it,
++    // which is what lets the loop be tested without a process to send anything to.
++    let signalling = tokio::spawn({
++        let shutdown = shutdown.clone();
++        async move {
++            shutdown_signal().await;
++            shutdown.trigger();
++        }
++    });
+ 
++    let draining = tokio::spawn(async move { worker.run(shutdown).await });
++
++    // Announced *after* the worker is running, so that the line a supervisor waits for means what it
++    // says: a process that has said this claims work.
+     tracing::info!(
+         run = %run,
+         queues = %queues.join(","),
+@@ -52,73 +86,99 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+         "draining"
+     );
+ 
+-    shutdown_signal().await;
+-    tracing::info!(run = %run, "stopped");
+-
+-    // Nothing drains yet: the loop that claims, handles and settles arrives with the step that
+-    // gives it a handler and a lease (`jobq/3.7-leases-and-recovery`). What this step owns is the
+-    // shape of the process — what it was told to do, what it says, and how it stops.
+-    drop(store);
++    let report = match draining.await {
++        Ok(Ok(report)) => report,
++        Ok(Err(error)) => return Err(error),
++        Err(join) => {
++            return Err(Error::Io {
++                source: std::io::Error::other(format!("the worker did not finish: {join}")),
++            });
++        }
++    };
++    signalling.abort();
++    tracing::info!(
++        run = %run,
++        claimed = report.claimed(),
++        succeeded = report.succeeded(),
++        failed = report.failed(),
++        reclaimed = report.reclaimed(),
++        handed_back = report.handed_back(),
++        "stopped"
++    );
+     Ok(())
+ }
+ 
+-/// The backend the settings name.
++/// The worker settings the configuration describes.
++///
++/// One place where the configuration becomes the loop's own vocabulary, including the lease: the
++/// store is built with the same number (see [`open_store`]) because the two have to agree — the
++/// store stamps the instant and the worker renews before it, and a deployment that set them
++/// separately would be a deployment whose renewals come too late.
++fn worker_settings(config: &Config) -> WorkerSettings {
++    WorkerSettings::new(
++        crate::engine::WorkerId::new(config.worker.name.clone()),
++        config.worker.queues.clone(),
++    )
++    .with_batch(config.worker.batch)
++    .with_poll_interval(Duration::from_millis(config.worker.poll_interval_ms))
++    .with_shutdown(Duration::from_secs(config.worker.shutdown_seconds))
++    .with_lease(Duration::from_secs(config.worker.lease_seconds))
++}
++
++/// The backend the settings name, with the lease they name.
+ ///
+ /// `memory` (and nothing at all) is the in-process store: honest for a demo, useful for a test, and
+ /// the one backend every *assembly* of this crate has (step `jobq/3.4-feature-assembly`). Anything
+ /// else is the durable backend, which this function never opens itself — it hands the URL to
+ /// [`open_durable`], the single place a durable store is reached from, and the place the `postgres`
+ /// feature gate belongs.
+-fn open_store(config: &Config) -> Result<MemoryStore, Error> {
++async fn open_store(config: &Config) -> Result<Arc<dyn Store>, Error> {
++    let lease = Duration::from_secs(config.worker.lease_seconds);
+     match config.store.url.as_deref() {
+-        None | Some("memory") => Ok(MemoryStore::new()),
+-        Some(other) => open_durable(other),
++        None | Some("memory") => Ok(Arc::new(MemoryStore::new().with_lease(lease))),
++        Some(other) => open_durable(other, lease).await,
+     }
+ }
+ 
+ /// Open the durable backend the settings name.
+ ///
+ /// The durable backend landed with `jobq/3.5-store-port-conformance`, behind the `postgres` feature
+-/// that step `jobq/3.4-feature-assembly` builds — and this function is still a seam rather than the
+-/// place a pool is opened, because what this process does with a store is drain it, and the loop
+-/// that would arrives with `jobq/3.7-leases-and-recovery`. So what it can honestly do today is
+-/// refuse in the terms of *this* build: a message that says whether the operator is looking at a
+-/// build that has the feature and no drain loop, or at a build without the feature at all.
++/// that step `jobq/3.4-feature-assembly` builds, and `jobq/3.7-leases-and-recovery` is the step that
++/// finally opens one: the pool is handed the URL the settings named and the lease they named, and
++/// the worker drains it like any other store.
+ ///
+ /// The gate is deliberately in one function with one call site: a feature whose `cfg` is sprinkled
+ /// across the crate is a feature that is off in one code path and on in another, and the
+ /// combination nobody tried is the one that breaks.
+-fn open_durable(url: &str) -> Result<MemoryStore, Error> {
++#[cfg(feature = "postgres")]
++async fn open_durable(url: &str, lease: Duration) -> Result<Arc<dyn Store>, Error> {
++    let store = crate::engine::PostgresStore::connect(url)
++        .await?
++        .with_lease(lease);
++    Ok(Arc::new(store))
++}
++
++/// What a build without the durable backend says when it is asked for one.
++///
++/// One sentence, and it names the *feature* rather than the URL: an operator with a database needs to
++/// know which flag to rebuild with, and "use `memory`" tells them nothing they did not already know
++/// (the probe of `jobq/3.4-feature-assembly` reads this sentence for exactly that reason).
++#[cfg(not(feature = "postgres"))]
++async fn open_durable(url: &str, _lease: Duration) -> Result<Arc<dyn Store>, Error> {
+     Err(Error::Config {
+         detail: format!(
+-            "`{}` names a durable store: {}",
+-            redact_url(url),
+-            durable_backend()
++            "`{}` names a durable store and this build has no `postgres` feature: rebuild with \
++             `--features postgres`",
++            redact_url(url)
+         ),
+     })
+ }
+ 
+-/// What this build knows about a durable store, which is a compile-time fact.
++/// A connection string with the credentials taken out, for a message a person will read.
+ ///
+-/// Two answers, because there are two different problems and only one of them is permanent: a build
+-/// that has the feature has a store and no loop to drain with it, and a build without the feature is
+-/// waiting for a flag. Both name what to do next, because "use `memory`" tells an operator with a
+-/// database nothing.
+-#[cfg(feature = "postgres")]
+-fn durable_backend() -> &'static str {
+-    "this build has the `postgres` feature and the store it names — \
+-     `jobq/3.5-store-port-conformance` ships that — and what this process is still missing is the \
+-     worker loop that would drain one, which arrives with `jobq/3.7-leases-and-recovery`"
+-}
+-
+-/// What this build knows about a durable store when the feature is off.
++/// Only a build *without* the durable backend has anything to say about a durable URL, so this is
++/// where it lives: the build that can open one never prints it.
+ #[cfg(not(feature = "postgres"))]
+-fn durable_backend() -> &'static str {
+-    "this build was compiled without the `postgres` feature, so the in-memory engine is all it \
+-     has: rebuild with `--features postgres`"
+-}
+-
+-/// A connection string with the credentials taken out, for a message a person will read.
+ fn redact_url(url: &str) -> String {
+     match url.split_once('@') {
+         Some((credentials, host)) => {
+diff --git a/src/service/worker.rs b/src/service/worker.rs
+index c6fd4f8..c4eed4c 100644
+--- a/src/service/worker.rs
++++ b/src/service/worker.rs
+@@ -36,9 +36,12 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use tokio::sync::watch;
++use tokio::task::JoinSet;
++use tokio::time::{Instant, sleep, timeout_at};
+ 
+ use crate::engine::domain::{Job, Queue, WorkerId};
+ use crate::engine::error::Error;
++use crate::engine::retry::{DEFAULT_ATTEMPTS, retry};
+ use crate::engine::store::{BoxFuture, Store};
+ 
+ /// What a worker does with a job it has claimed.
+@@ -316,7 +319,221 @@ impl Worker {
+     /// cannot make, a reclaim it cannot complete. A job that fails is not an error here — it is
+     /// [`Store::fail`], and the report counts it.
+     pub async fn run(&self, shutdown: Shutdown) -> Result<Report, Error> {
+-        let _ = (shutdown, &self.store, &self.handler, &self.settings);
+-        todo!("jobq/3.7-leases-and-recovery: claim, handle, settle, renew — and drain when told")
++        let mut report = Report::default();
++        // The renewals run *beside* the work rather than inside it, because the thing that has to be
++        // renewed knows nothing about the thing that is running: a handler that takes longer than a
++        // lease has no way to say "still here", and the row would quietly become claimable by
++        // somebody else in the middle of the attempt it is describing.
++        let renewing = tokio::spawn(renewing(
++            Arc::clone(&self.store),
++            self.settings.name.clone(),
++            self.settings.lease,
++            shutdown.clone(),
++        ));
++
++        while !shutdown.triggered() {
++            // Every turn starts here: a row whose lease ran out belongs to nobody, and the worker
++            // that finds it is the one that recovers it. One statement that writes nothing when
++            // there is nothing to write (see `Store::reclaim_expired`), so a worker that has just
++            // started — the replica that is supposed to pick up after a crash — does not have to
++            // wait for its first turn to find out.
++            report.reclaimed = report
++                .reclaimed
++                .saturating_add(self.store.reclaim_expired().await?);
++
++            let turn = self.claim_a_turn(&mut report).await?;
++            if turn.is_empty() {
++                self.wait_for_work(&shutdown).await;
++                continue;
++            }
++
++            // One task per job is what the batch buys, and the reason every row carries a lease of
++            // its own: several attempts really are in flight at the same instant.
++            let mut jobs: JoinSet<Result<Settled, Error>> = JoinSet::new();
++            for job in turn {
++                self.spawn_job(&mut jobs, job);
++            }
++            self.finish_turn(&mut jobs, &shutdown, &mut report).await?;
++        }
++
++        // The signal has ended the claiming. Whatever is still in flight gets the drain deadline,
++        // and what the deadline cuts is handed back rather than waited for: a rollout that gives the
++        // row back costs seconds, one that waits out a lease costs the lease.
++        renewing.abort();
++        tracing::info!(
++            worker = %self.settings.name,
++            claimed = report.claimed,
++            succeeded = report.succeeded,
++            failed = report.failed,
++            reclaimed = report.reclaimed,
++            handed_back = report.handed_back,
++            "drained"
++        );
++        Ok(report)
++    }
++
++    /// Ask every queue for the next batch, and count what came back.
++    async fn claim_a_turn(&self, report: &mut Report) -> Result<Vec<Job>, Error> {
++        let mut turn = Vec::new();
++        for queue in &self.settings.queues {
++            let claimed = self
++                .store
++                .claim(&self.settings.name, queue, self.settings.batch)
++                .await?;
++            report.claimed = report
++                .claimed
++                .saturating_add(u32::try_from(claimed.len()).unwrap_or(u32::MAX));
++            turn.extend(claimed);
++        }
++        Ok(turn)
++    }
++
++    /// Wait out an empty turn, without making a stop wait for the pause.
++    async fn wait_for_work(&self, shutdown: &Shutdown) {
++        tokio::select! {
++            () = shutdown.wait() => {}
++            () = sleep(self.settings.poll_interval) => {}
++        }
++    }
++
++    /// Hand one job to the handler in a task of its own.
++    ///
++    /// The task owns clones rather than borrows (`Arc<dyn Store>`, `Arc<dyn Handler>`) because a
++    /// spawned task has to outlive the call that made it: that is what lets several jobs be handled
++    /// at once, and it is why the store the worker holds is shared rather than borrowed.
++    fn spawn_job(&self, jobs: &mut JoinSet<Result<Settled, Error>>, job: Job) {
++        let store = Arc::clone(&self.store);
++        let handler = Arc::clone(&self.handler);
++        let worker = self.settings.name.clone();
++        jobs.spawn(async move { handle_one(store, handler, worker, job).await });
+     }
++
++    /// Collect what a turn's tasks came to, and drain when the signal says so.
++    ///
++    /// The shape is the promise: while there is no signal, this waits for the work; once there is
++    /// one, the wait gets [`WorkerSettings::shutdown`] and then stops. What it stops *on* is handed
++    /// back — the tasks are aborted (which drops each handler's child, see `service::handler`) and
++    /// the rows this worker still holds go back to the queue with their leases released.
++    async fn finish_turn(
++        &self,
++        jobs: &mut JoinSet<Result<Settled, Error>>,
++        shutdown: &Shutdown,
++        report: &mut Report,
++    ) -> Result<(), Error> {
++        let mut deadline: Option<Instant> = None;
++        while !jobs.is_empty() {
++            let joined = match deadline {
++                Some(deadline) => match timeout_at(deadline, jobs.join_next()).await {
++                    Ok(joined) => joined,
++                    // The deadline bound the drain: stop waiting for what is left.
++                    Err(_) => break,
++                },
++                None => tokio::select! {
++                    joined = jobs.join_next() => joined,
++                    () = shutdown.wait() => {
++                        deadline = Some(Instant::now() + self.settings.shutdown);
++                        continue;
++                    }
++                },
++            };
++            match joined {
++                Some(Ok(Ok(Settled::Succeeded))) => report.succeeded += 1,
++                Some(Ok(Ok(Settled::Failed))) => report.failed += 1,
++                // A handler that panicked is a handler's bug, and the row is deliberately left
++                // where it is: nothing was settled, so the lease will bring it back — to a worker
++                // whose handler does not panic, which is the point of a lease.
++                Some(Err(join)) => {
++                    tracing::error!(worker = %self.settings.name, error = %join, "a job's task did not finish")
++                }
++                Some(Ok(Err(error))) => return Err(error),
++                None => break,
++            }
++        }
++
++        if jobs.is_empty() {
++            return Ok(());
++        }
++        jobs.abort_all();
++        while jobs.join_next().await.is_some() {}
++        report.handed_back = report
++            .handed_back
++            .saturating_add(self.store.release(&self.settings.name).await?);
++        tracing::warn!(
++            worker = %self.settings.name,
++            handed_back = report.handed_back,
++            "the drain deadline passed with work still in flight"
++        );
++        Ok(())
++    }
++}
++
++/// What one task's settle came to, for the report.
++enum Settled {
++    /// The attempt finished the job.
++    Succeeded,
++    /// The attempt failed: the job went back to the queue, or out of it.
++    Failed,
++}
++
++/// One job, from the handler to the settle: the whole of what a worker does with a claim.
++///
++/// The settle is retried with the engine's own bound, because a settle is a transaction the database
++/// can refuse for concurrency (`jobq/3.6-transaction-isolation`): the first attempt losing a race is
++/// a second attempt, not a failed job, and the store is the layer that reports the difference.
++async fn handle_one(
++    store: Arc<dyn Store>,
++    handler: Arc<dyn Handler>,
++    worker: WorkerId,
++    job: Job,
++) -> Result<Settled, Error> {
++    let id = job.id();
++    let started = Instant::now();
++    match handler.handle(&job).await {
++        Ok(()) => {
++            retry(DEFAULT_ATTEMPTS, || store.complete(&worker, &id)).await?;
++            tracing::info!(job = %id, worker = %worker, took = ?started.elapsed(), "succeeded");
++            Ok(Settled::Succeeded)
++        }
++        Err(error) => {
++            // The handler's failure is the *job's* failure: it is written on the row as the reason,
++            // and the budget decides whether another attempt is allowed.
++            let reason = error.to_string();
++            let state = retry(DEFAULT_ATTEMPTS, || store.fail(&worker, &id, &reason)).await?;
++            tracing::warn!(job = %id, worker = %worker, reason = %reason, "attempt failed");
++            let _ = state.value();
++            Ok(Settled::Failed)
++        }
++    }
++}
++
++/// Keep telling the store that the claims this worker holds are still alive.
++///
++/// A renewal is not a settle: it moves an instant, not a state, and it is not retried. It must not
++/// be silent either — a renewal that keeps failing is a job that is about to be handed to somebody
++/// else while this worker is still running it, and the log line is the only warning an operator
++/// gets before the duplicate work starts.
++async fn renewing(store: Arc<dyn Store>, worker: WorkerId, lease: Duration, shutdown: Shutdown) {
++    let interval = renewal_interval(lease);
++    while !shutdown.triggered() {
++        tokio::select! {
++            () = shutdown.wait() => break,
++            () = sleep(interval) => {}
++        }
++        match store.renew(&worker).await {
++            Ok(0) => {}
++            Ok(renewed) => tracing::debug!(worker = %worker, renewed, "leases renewed"),
++            Err(error) => tracing::warn!(
++                worker = %worker,
++                error = %error,
++                "the lease could not be renewed: what this worker holds is one missed renewal away \
++                 from being handed to another worker"
++            ),
++        }
++    }
++}
++
++/// When to renew: halfway through the lease, so that two renewals may be lost before the claim
++/// lapses — and never at a zero interval, which would be a renewal loop with no pause in it.
++fn renewal_interval(lease: Duration) -> Duration {
++    (lease / 2).max(Duration::from_millis(1))
+ }
+diff --git a/tests/support/store.rs b/tests/support/store.rs
+index d00ad10..5bf4d9a 100644
+--- a/tests/support/store.rs
++++ b/tests/support/store.rs
+@@ -82,10 +82,9 @@ impl Backend {
+     ///
+     /// [`Error::Store`] when the backend refused to apply its schema.
+     pub async fn migrate(&self) -> Result<(), Error> {
+-        match self {
+-            Backend::Memory(_) => Ok(()),
+-            Backend::Postgres { store, .. } => store.migrate().await,
+-        }
++        // One call, because `jobq/3.7-leases-and-recovery` put the step on the port: a backend with
++        // no schema answers `Ok(())`, which is the answer this match used to spell out by hand.
++        self.store().migrate().await
+     }
+ }
+ 

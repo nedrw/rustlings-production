@@ -98,9 +98,10 @@ impl CommandHandler {
         let mut words = command.split_whitespace();
         let Some(program) = words.next() else {
             return Err(Error::Invalid {
-                detail: "`worker.handler` is empty: name the program to run for each job, or leave \
+                detail:
+                    "`worker.handler` is empty: name the program to run for each job, or leave \
                          the setting out and let the daemon record the jobs it takes"
-                    .to_owned(),
+                        .to_owned(),
             });
         };
         let program = PathBuf::from(program);
@@ -193,7 +194,11 @@ impl Started {
     /// [`Error::Io`] when the operating system cannot be asked about the child at all.
     async fn wait(&mut self) -> Result<ExitStatus, Error> {
         loop {
-            if let Some(status) = self.child.try_wait().map_err(|source| Error::Io { source })? {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|source| Error::Io { source })?
+            {
                 return Ok(status);
             }
             tokio::time::sleep(POLL).await;

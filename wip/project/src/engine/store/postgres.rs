@@ -96,7 +96,6 @@ impl PostgresStore {
         self.lease = lease;
         self
     }
-
 }
 
 impl Sealed for PostgresStore {}
@@ -224,9 +223,7 @@ impl Store for PostgresStore {
         worker: &'a WorkerId,
         id: &'a JobId,
     ) -> BoxFuture<'a, Result<(), Error>> {
-        Box::pin(async move {
-            self.settle(worker, id, Change::Completed).await.map(|_| ())
-        })
+        Box::pin(async move { self.settle(worker, id, Change::Completed).await.map(|_| ()) })
     }
 
     fn fail<'a>(
@@ -235,9 +232,7 @@ impl Store for PostgresStore {
         id: &'a JobId,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<JobState, Error>> {
-        Box::pin(async move {
-            self.settle(worker, id, Change::Failed { reason }).await
-        })
+        Box::pin(async move { self.settle(worker, id, Change::Failed { reason }).await })
     }
 
     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
@@ -465,7 +460,9 @@ impl Change<'_> {
         id: &JobId,
     ) -> Result<Option<(String, i64)>, Error> {
         let row = match self {
-            Change::Completed => sqlx::query_as(COMPLETE).bind(id.as_uuid()).bind(worker.as_str()),
+            Change::Completed => sqlx::query_as(COMPLETE)
+                .bind(id.as_uuid())
+                .bind(worker.as_str()),
             Change::Failed { reason } => sqlx::query_as(FAIL)
                 .bind(id.as_uuid())
                 .bind(worker.as_str())
@@ -543,10 +540,7 @@ impl PostgresStore {
                     ),
                 },
                 Some((state, _)) => Error::Invalid {
-                    detail: format!(
-                        "job {id} is {state}, not running: {}",
-                        change.refusal()
-                    ),
+                    detail: format!("job {id} is {state}, not running: {}", change.refusal()),
                 },
             };
             // Nothing was written (the update matched no row), so there is nothing to undo; the
