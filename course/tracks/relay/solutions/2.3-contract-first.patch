@@ -1,0 +1,329 @@
+diff --git a/src/http.rs b/src/http.rs
+index 0f4f83c..bc0497e 100644
+--- a/src/http.rs
++++ b/src/http.rs
+@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use axum::{Json, Router};
+ use serde::Deserialize;
+-use serde_json::json;
++use serde_json::{Value, json};
+ use tokio::net::TcpListener;
+ 
+ use crate::auth::{self, Principal};
+@@ -29,6 +29,7 @@ use crate::domain::{EndpointId, EndpointUrl};
+ use crate::error::Error;
+ use crate::events;
+ use crate::logging::{self, RunId};
++use crate::openapi;
+ 
+ /// Everything a handler may need, built once per process.
+ #[derive(Debug, Clone)]
+@@ -89,7 +90,10 @@ pub fn router(state: AppState) -> Router {
+     // Public routes: an orchestrator asking about this process has no API key and must not need one.
+     let public = Router::new()
+         .route("/healthz", get(healthz))
+-        .route("/readyz", get(readyz));
++        .route("/readyz", get(readyz))
++        // The contract is public: a client reads what this service promises before it has a
++        // key, and a document that needs one to be fetched is a document nobody fetches.
++        .route("/openapi.json", get(openapi_document));
+ 
+     // Everything a tenant owns is behind the authentication layer. Applying it to a *sub-router*
+     // rather than inside each handler is what keeps the order above: the refusal happens after the
+@@ -251,6 +255,11 @@ fn new_request_id() -> String {
+     uuid::Uuid::new_v4().simple().to_string()
+ }
+ 
++/// The contract this service publishes: what a client may rely on, in one document.
++async fn openapi_document() -> Json<Value> {
++    Json(openapi::document())
++}
++
+ /// Liveness: this process is running. It must not depend on anything else.
+ async fn healthz() -> impl IntoResponse {
+     (StatusCode::OK, Json(json!({ "status": "ok" })))
+@@ -266,7 +275,12 @@ async fn readyz(State(state): State<AppState>) -> Response {
+ }
+ 
+ /// The body `POST /endpoints` accepts.
++///
++/// `deny_unknown_fields` is what makes the document's `additionalProperties: false` true of the
++/// code as well: without it a field the caller misspelled is dropped in silence, and the document
++/// promised otherwise.
+ #[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
+ struct CreateEndpoint {
+     /// Where this tenant wants their events delivered.
+     url: String,
+@@ -379,6 +393,7 @@ struct IngestBody<'a> {
+ 
+ /// The body `POST /events` accepts.
+ #[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
+ struct CreateEvent {
+     /// What the event is about.
+     kind: String,
+diff --git a/src/lib.rs b/src/lib.rs
+index 599d73e..ca13f9d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod error;
+ pub mod events;
+ pub mod http;
+ pub mod logging;
++pub mod openapi;
+ 
+ /// Usage text, printed by `--help` and after a bad argument.
+ pub const USAGE: &str = "\
+diff --git a/src/openapi.rs b/src/openapi.rs
+index 3852b3c..b9d9ee1 100644
+--- a/src/openapi.rs
++++ b/src/openapi.rs
+@@ -1,24 +1,233 @@
+ //! The API as a contract: one document, published by the service, that says what every route takes
+ //! and answers.
+ //!
+-//! Step `relay/2.3-contract-first` implements it. "Hand-written" means written here, once, by a
+-//! function that returns the same value every time it is called — not typed twice, and not pasted
+-//! from a wiki. The service publishes it at `GET /openapi.json`, so a client reads what this
+-//! service promises instead of reading its source.
++//! "Hand-written" means written here, once, by a function that returns the same value every time it
++//! is called — not typed twice, and not pasted from a wiki. The service publishes it at
++//! `GET /openapi.json`, so a client reads what this service promises instead of reading its source.
+ //!
+-//! What makes it a contract rather than decoration is where the spec looks: the routes it declares
+-//! have to be the routes the router serves, the fields it calls `required` have to be the fields
+-//! the handlers demand, every schema has to declare its `type`, and every `$ref` has to land on a
+-//! schema the document declares.
++//! The document is *built*, not spelled out: a route names the schema it answers with
++//! ([`answer`]), the schemas are built from the field maps they share, and the only thing written
++//! more than once is a sentence of prose. That is the difference between a contract that can be
++//! kept in step with the code and one that has to be remembered.
+ //!
+-//! One decision is yours before you write a line of it: where the *names* live. A route, a schema
+-//! and the field lists they share can be spelled once and referred to, or spelled three times and
+-//! kept in step by hand — and the step's TRAP is what happens to the second one.
++//! Two rules the document keeps, because the spec reads it as a client would:
++//!
++//! * every object with fields is *closed* (`additionalProperties: false`) and names its `required`
++//!   fields — an object that accepts anything documents nothing;
++//! * a `payload` is the caller's JSON, and is declared as a free-form object on purpose: that is
++//!   the difference between "these fields are the contract" and "whatever you sent comes back".
+ 
+-use serde_json::Value;
++use serde_json::{Map, Value, json};
+ 
+ /// The OpenAPI document for this service.
+ #[must_use]
+ pub fn document() -> Value {
+-    todo!("step relay/2.3-contract-first")
++    json!({
++        "openapi": "3.1.0",
++        "info": {
++            "title": "relay",
++            "version": env!("CARGO_PKG_VERSION"),
++            "description": "Accept events for a tenant and hand them to the endpoints that \
++                             subscribed to them.",
++        },
++        "paths": {
++            "/healthz": {
++                "get": {
++                    "summary": "Liveness: this process is running.",
++                    "responses": { "200": answer("Status", "This process is up.") },
++                },
++            },
++            "/readyz": {
++                "get": {
++                    "summary": "Readiness: this process can take traffic.",
++                    "responses": {
++                        "200": answer("Status", "The database answers, so this process can serve."),
++                        "503": answer("Error", "The database is not answering."),
++                    },
++                },
++            },
++            "/openapi.json": {
++                "get": {
++                    "summary": "This document.",
++                    "responses": {
++                        "200": {
++                            "description": "The contract this service publishes.",
++                            "content": {
++                                "application/json": { "schema": { "type": "object" } },
++                            },
++                        },
++                    },
++                },
++            },
++            "/endpoints": {
++                "get": {
++                    "summary": "The endpoints the calling tenant owns.",
++                    "responses": {
++                        "200": answer(
++                            "EndpointList",
++                            "Every endpoint of this tenant, never its signing secret.",
++                        ),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                    },
++                },
++                "post": {
++                    "summary": "Register an endpoint for the calling tenant.",
++                    "requestBody": {
++                        "required": true,
++                        "content": {
++                            "application/json": {
++                                "schema": { "$ref": "#/components/schemas/CreateEndpoint" },
++                            },
++                        },
++                    },
++                    "responses": {
++                        "201": answer(
++                            "Endpoint",
++                            "The endpoint that was registered, with the signing secret it was \
++                             given. The secret is answered once and never listed again.",
++                        ),
++                        "400": answer("Error", "The body is not a usable endpoint."),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                    },
++                },
++            },
++            "/events": {
++                "post": {
++                    "summary": "Accept one event for the calling tenant.",
++                    "parameters": [{
++                        "name": "Idempotency-Key",
++                        "in": "header",
++                        "required": true,
++                        "description": "The caller's promise that two requests carrying this key \
++                                        are one event. A key that has been used before is \
++                                        answered with the event stored then.",
++                        "schema": { "type": "string", "minLength": 1 },
++                    }],
++                    "requestBody": {
++                        "required": true,
++                        "content": {
++                            "application/json": {
++                                "schema": { "$ref": "#/components/schemas/CreateEvent" },
++                            },
++                        },
++                    },
++                    "responses": {
++                        "201": answer("IngestedEvent", "The event was stored."),
++                        "200": answer(
++                            "IngestedEvent",
++                            "This tenant had already sent this Idempotency-Key: the answer is the \
++                             event it stored then, unchanged.",
++                        ),
++                        "400": answer("Error", "The body, or the Idempotency-Key header, is not \
++                                        usable."),
++                        "401": answer("Error", "The API key is missing or belongs to no tenant."),
++                    },
++                },
++            },
++        },
++        "components": {
++            "schemas": {
++                "Status": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["status"],
++                    "properties": { "status": { "type": "string" } },
++                },
++                "Error": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["error", "message", "retryable"],
++                    "properties": {
++                        "error": {
++                            "type": "string",
++                            "description": "A stable token a caller may switch on; never a sentence.",
++                        },
++                        "message": { "type": "string", "description": "What happened, for a human." },
++                        "retryable": {
++                            "type": "boolean",
++                            "description": "Whether the same request could succeed later.",
++                        },
++                    },
++                },
++                "Endpoint": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["id", "url"],
++                    "properties": {
++                        "id": { "type": "string", "format": "uuid" },
++                        "url": { "type": "string", "format": "uri" },
++                    },
++                },
++                "CreateEndpoint": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["url"],
++                    "properties": { "url": { "type": "string", "format": "uri" } },
++                },
++                "EndpointList": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["endpoints"],
++                    "properties": {
++                        "endpoints": {
++                            "type": "array",
++                            "items": { "$ref": "#/components/schemas/Endpoint" },
++                        },
++                    },
++                },
++                "CreateEvent": {
++                    "type": "object",
++                    "additionalProperties": false,
++                    "required": ["kind", "payload"],
++                    "properties": {
++                        "kind": { "type": "string", "minLength": 1 },
++                        "payload": { "type": "object" },
++                    },
++                },
++                "IngestedEvent": event_schema(true),
++            },
++        },
++    })
++}
++
++/// One JSON answer: the schema a caller gets, and what the status means.
++fn answer(schema: &str, description: &str) -> Value {
++    json!({
++        "description": description,
++        "content": {
++            "application/json": {
++                "schema": { "$ref": format!("#/components/schemas/{schema}") },
++            },
++        },
++    })
++}
++
++/// One event as a caller sees it, with or without the field that says the answer is a replay.
++///
++/// One function for both shapes on purpose: `POST /events` answers with the event and whether it
++/// was already there, and the listing answers with the events alone. A field renamed in one of them
++/// and not the other is the kind of drift a document is supposed to make impossible.
++fn event_schema(replayed: bool) -> Value {
++    let mut properties = Map::new();
++    properties.insert(
++        "id".to_owned(),
++        json!({ "type": "string", "format": "uuid" }),
++    );
++    properties.insert("kind".to_owned(), json!({ "type": "string" }));
++    properties.insert("payload".to_owned(), json!({ "type": "object" }));
++    properties.insert(
++        "received_at".to_owned(),
++        json!({ "type": "string", "format": "date-time" }),
++    );
++    let mut required = vec!["id", "kind", "payload", "received_at"];
++    if replayed {
++        properties.insert("replayed".to_owned(), json!({ "type": "boolean" }));
++        required.push("replayed");
++    }
++    json!({
++        "type": "object",
++        "additionalProperties": false,
++        "required": required,
++        "properties": properties,
++    })
+ }

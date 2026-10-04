@@ -1,0 +1,30 @@
+diff --git a/src/openapi.rs b/src/openapi.rs
+new file mode 100644
+index 0000000..3852b3c
+--- /dev/null
++++ b/src/openapi.rs
+@@ -0,0 +1,24 @@
++//! The API as a contract: one document, published by the service, that says what every route takes
++//! and answers.
++//!
++//! Step `relay/2.3-contract-first` implements it. "Hand-written" means written here, once, by a
++//! function that returns the same value every time it is called — not typed twice, and not pasted
++//! from a wiki. The service publishes it at `GET /openapi.json`, so a client reads what this
++//! service promises instead of reading its source.
++//!
++//! What makes it a contract rather than decoration is where the spec looks: the routes it declares
++//! have to be the routes the router serves, the fields it calls `required` have to be the fields
++//! the handlers demand, every schema has to declare its `type`, and every `$ref` has to land on a
++//! schema the document declares.
++//!
++//! One decision is yours before you write a line of it: where the *names* live. A route, a schema
++//! and the field lists they share can be spelled once and referred to, or spelled three times and
++//! kept in step by hand — and the step's TRAP is what happens to the second one.
++
++use serde_json::Value;
++
++/// The OpenAPI document for this service.
++#[must_use]
++pub fn document() -> Value {
++    todo!("step relay/2.3-contract-first")
++}
