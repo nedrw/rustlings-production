@@ -1,0 +1,344 @@
+diff --git a/src/claim.rs b/src/claim.rs
+index 00473b2..c488887 100644
+--- a/src/claim.rs
++++ b/src/claim.rs
+@@ -38,8 +38,18 @@ pub const BATCH: i64 = 16;
+ pub const LEASE: Duration = Duration::from_secs(60);
+ 
+ /// One row of the claim's `returning` clause, in the order the statement writes it: the delivery,
+-/// its failure count, the target, and the event the subscriber is handed.
+-type Row = (Uuid, i32, String, Uuid, Uuid, String, String, DateTime<Utc>);
++/// its failure count, when it became due, the target, and the event the subscriber is handed.
++type Row = (
++    Uuid,
++    i32,
++    DateTime<Utc>,
++    String,
++    Uuid,
++    Uuid,
++    String,
++    String,
++    DateTime<Utc>,
++);
+ 
+ /// One piece of work a worker has claimed and may now act on.
+ #[derive(Debug, Clone, PartialEq)]
+@@ -49,6 +59,12 @@ pub struct Claimed {
+     pub delivery: Uuid,
+     /// How many attempts have already failed. `0` means this claim is the first attempt.
+     pub attempts: i32,
++    /// When this delivery became due.
++    ///
++    /// The queue's position, and the reason it travels with the work: an `update … returning`
++    /// answers a *set*, so the rows come back in whatever order the plan produced them in, and a
++    /// worker that wants the queue's order has to impose it (`relay/2.9-ordering`).
++    pub due_at: DateTime<Utc>,
+     /// Where the delivery goes: the endpoint's URL, from the claim's own join.
+     pub url: EndpointUrl,
+     /// What happened, with the payload the subscriber is handed.
+@@ -87,8 +103,8 @@ pub async fn claim(
+                           order by next_attempt_at, id \
+                           for update skip locked \
+                           limit $2) \
+-         returning d.id, d.attempts, e.url, v.id, v.tenant_id, v.kind, v.payload::text, \
+-                   v.received_at",
++         returning d.id, d.attempts, d.next_attempt_at, e.url, v.id, v.tenant_id, v.kind, \
++                   v.payload::text, v.received_at",
+     )
+     .bind(worker)
+     .bind(limit)
+@@ -99,10 +115,11 @@ pub async fn claim(
+ 
+     rows.into_iter()
+         .map(
+-            |(delivery, attempts, url, event, tenant, kind, payload, received_at)| {
++            |(delivery, attempts, due_at, url, event, tenant, kind, payload, received_at)| {
+                 Ok(Claimed {
+                     delivery,
+                     attempts,
++                    due_at,
+                     url: url.parse().map_err(Error::Endpoint)?,
+                     event: Event {
+                         id: event,
+diff --git a/src/delivery.rs b/src/delivery.rs
+index 8ecf486..db77673 100644
+--- a/src/delivery.rs
++++ b/src/delivery.rs
+@@ -44,6 +44,7 @@ use crate::claim::{self, Claimed};
+ use crate::domain::{EndpointUrl, TenantId};
+ use crate::error::Error;
+ use crate::events::Event;
++use crate::ordering::Lanes;
+ 
+ /// One attempt: what a subscriber is sent, and what makes this attempt identifiable.
+ #[derive(Debug, Clone, PartialEq)]
+@@ -137,8 +138,16 @@ pub struct Tick {
+ }
+ 
+ impl Tick {
++    /// An empty report for a turn that claimed `claimed` deliveries.
++    pub(crate) fn of(claimed: usize) -> Self {
++        Self {
++            claimed,
++            ..Self::default()
++        }
++    }
++
+     /// Count one attempt that was made.
+-    fn count(&mut self, recorded: Recorded) {
++    pub(crate) fn count(&mut self, recorded: Recorded) {
+         match recorded {
+             Recorded::Sent => self.sent += 1,
+             Recorded::Retried => self.retried += 1,
+@@ -167,9 +176,10 @@ pub async fn tick(pool: &PgPool, sender: &dyn Sender, worker: &str) -> Result<Ti
+ /// One turn of the worker with the policy it runs with — the seam `mailer/1.13-email-port` calls an
+ /// injected sender, for a budget.
+ ///
+-/// The sender is owned rather than borrowed because a turn is allowed to run its attempts
+-/// concurrently (`relay/2.9-ordering`), and a task has to own what it uses. The budget is cloned
+-/// per attempt for the same reason, and the clone shares the breaker.
++/// One turn, with lanes of its own: it is right for a caller that runs a turn and waits for it
++/// (a tool, a drill, a test), and wrong for a worker that runs several — two of those would have
++/// two sets of lanes and could be in one endpoint at once. A worker shares one set of lanes and
++/// calls [`crate::ordering::spread`].
+ ///
+ /// # Errors
+ ///
+@@ -181,7 +191,7 @@ pub async fn tick_with_budget(
+     worker: &str,
+     budget: &Budget,
+ ) -> Result<Tick, Error> {
+-    turn(pool, sender.as_ref(), worker, budget).await
++    crate::ordering::spread(pool, sender, worker, Arc::new(Lanes::new()), budget).await
+ }
+ 
+ /// One turn, one attempt at a time: the body both entry points share.
+@@ -195,36 +205,47 @@ async fn turn(
+     worker: &str,
+     budget: &Budget,
+ ) -> Result<Tick, Error> {
+-    let claimed = claim::claim(pool, worker, claim::BATCH, claim::LEASE).await?;
+-    let mut report = Tick {
+-        claimed: claimed.len(),
+-        ..Tick::default()
+-    };
++    let claimed = crate::ordering::in_queue_order(
++        claim::claim(pool, worker, claim::BATCH, claim::LEASE).await?,
++    );
++    // The lanes of a one-shot turn: they order this turn's attempts against nothing but itself,
++    // which is all a caller that runs one turn needs. A worker that runs turns in parallel shares
++    // one set of lanes and calls [`crate::ordering::spread`].
++    let lanes = Lanes::new();
++    let mut report = Tick::of(claimed.len());
+     for work in claimed {
+-        report.count(attempt(pool, sender, budget, worker, work).await?);
++        report.count(attempt(pool, sender, &lanes, budget, worker, work).await?);
+     }
+     Ok(report)
+ }
+ 
+-/// One delivery: ask the breaker, make the attempt, write down what happened.
++/// One delivery: take its endpoint's lane, ask the breaker, make the attempt, write down what
++/// happened.
+ ///
+-/// This is the unit a turn repeats — and the unit `relay/2.9-ordering` runs one lane at a time per
+-/// endpoint.
++/// This is the unit a turn repeats — `relay/2.9-ordering` runs one task per delivery, so the lane
++/// taken here is what keeps two attempts to one endpoint from being in flight at once.
+ ///
+ /// # Errors
+ ///
+ /// Returns [`Error::Database`] when a record cannot be written, and [`Error::Delivery`] when the
+ /// row cannot even be handed back to the queue.
+-async fn attempt(
++pub(crate) async fn attempt(
+     pool: &PgPool,
+     sender: &dyn Sender,
++    lanes: &Lanes,
+     budget: &Budget,
+     worker: &str,
+     work: Claimed,
+ ) -> Result<Recorded, Error> {
+-    // The endpoint's name outlives the request that carries it: the breaker is asked about it
+-    // before the attempt and told about it after, and the attempt takes the URL with it.
++    // The endpoint's name outlives the request that carries it: the lane, the breaker and the
++    // record are all told about it, and the attempt takes the URL with it.
+     let endpoint = work.url.as_str().to_owned();
++
++    // The lane is taken before the breaker is asked, and held until the record is written: an
++    // endpoint is one server, and the half-open breaker's "exactly one probe" is only exact if the
++    // attempts to that endpoint are serialized on the way in. The guard is dropped on every path
++    // out of this function, including the ones that return early.
++    let _lane = lanes.enter(&endpoint).await;
+     if budget.breaker.admit(&endpoint, Utc::now()) == Admission::Shed {
+         // Not this endpoint's turn. The row goes back to the queue exactly as it came — same
+         // failure count, same next attempt instant — so an attempt that was never made costs the
+@@ -345,7 +366,7 @@ enum Outcome {
+ }
+ 
+ /// What one attempt came to, after it is written down: what the turn counts.
+-enum Recorded {
++pub(crate) enum Recorded {
+     /// The subscriber took it.
+     Sent,
+     /// The failure is recorded and the delivery is owed again later.
+diff --git a/src/lib.rs b/src/lib.rs
+index 4902bef..ce75f52 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@ pub mod events;
+ pub mod http;
+ pub mod logging;
+ pub mod openapi;
++pub mod ordering;
+ pub mod outbound;
+ pub mod pagination;
+ 
+diff --git a/src/ordering.rs b/src/ordering.rs
+index 2fb2e24..1424de0 100644
+--- a/src/ordering.rs
++++ b/src/ordering.rs
+@@ -25,16 +25,15 @@
+ //! therefore in flight before any endpoint's second one starts, which is what keeps a slow endpoint
+ //! from eating a turn.
+ //!
+-//! **This file is the scaffold**: the types are here, and the two functions this step is about
+-//! answer `todo!()`, so the spec fails here until they are written.
+ 
+ use std::collections::HashMap;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, MutexGuard};
+ 
+ use sqlx::PgPool;
+ 
+ use crate::backoff::Budget;
+-use crate::delivery::{Sender, Tick};
++use crate::claim::{self, Claimed};
++use crate::delivery::{self, Sender, Tick};
+ use crate::error::Error;
+ 
+ /// One lane per endpoint, shared by every turn every worker in this process runs.
+@@ -61,7 +60,23 @@ impl Lanes {
+     /// another endpoint's lane is not affected by this one, which is the whole reason this is a map
+     /// of mutexes rather than a mutex.
+     pub async fn enter(&self, endpoint: &str) -> Lane<'_> {
+-        todo!("step relay/2.9-ordering: one lane per endpoint, first come first served")
++        // The set is locked only long enough to find (or create) this endpoint's gate. Holding it
++        // across the wait would serialize every endpoint in the process behind one attempt, which
++        // is the one thing this module is not allowed to do.
++        let gate = {
++            let mut gates = self.gates();
++            Arc::clone(gates.entry(endpoint.to_owned()).or_default())
++        };
++        // Taking the gate by value rather than by reference is what lets the lane outlive the
++        // borrow of the set it came from, and what lets a waiter keep the gate it is waiting on
++        // alive while it waits.
++        let held = Arc::clone(&gate).lock_owned().await;
++        Lane {
++            lanes: self,
++            endpoint: endpoint.to_owned(),
++            gate,
++            _held: held,
++        }
+     }
+ 
+     /// How many endpoints have a gate right now.
+@@ -70,7 +85,31 @@ impl Lanes {
+     /// ever talked to grows with its tenants' URL history, and a spec of this step checks that it
+     /// does not.
+     pub fn known(&self) -> usize {
+-        todo!("step relay/2.9-ordering: how many endpoints are being kept apart right now")
++        self.gates().len()
++    }
++
++    /// The gates, whether or not another thread panicked while holding the lock.
++    fn gates(&self) -> MutexGuard<'_, HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
++        self.gates
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}
++
++impl Drop for Lane<'_> {
++    fn drop(&mut self) {
++        // A lane nobody holds is forgotten: this is a set of gates in use, not a list of every
++        // endpoint this worker has ever seen, and a process that keeps one per URL it has talked to
++        // grows with its tenants' history.
++        //
++        // Three references at this point — the set's, this lane's own, and the one the permit is
++        // holding. A fourth is a delivery that is waiting for this lane: it has already been handed
++        // this gate, so the entry has to stay, or the waiter would hold one gate while the next
++        // arrival creates another and both would be in the lane at once.
++        let mut gates = self.lanes.gates();
++        if Arc::strong_count(&self.gate) == 3 {
++            gates.remove(&self.endpoint);
++        }
+     }
+ }
+ 
+@@ -91,6 +130,21 @@ pub struct Lane<'a> {
+     _held: tokio::sync::OwnedMutexGuard<()>,
+ }
+ 
++/// The claimed batch, in the order the queue kept it.
++///
++/// The claim's answer is a *set*: an `update … returning` has no order, so the rows come back in
++/// whatever order the plan walked them in. The queue's order is `(next_attempt_at, id)` — the key
++/// the claim's own subquery reads its rows in — and this is where it is put back, before any task
++/// is spawned and therefore before any lane is asked for.
++///
++/// Skipping this would give a lane that is fair and meaningless at the same time: it would serve
++/// whoever asked for it first, and the first to ask would be the plan's order. One subscriber's
++/// events would arrive in an order nobody chose.
++pub(crate) fn in_queue_order(mut claimed: Vec<Claimed>) -> Vec<Claimed> {
++    claimed.sort_by_key(|work| (work.due_at, work.delivery));
++    claimed
++}
++
+ /// One turn of the worker across every endpoint at once.
+ ///
+ /// The claim is `relay/2.5-atomic-claim`'s, one attempt per delivery is `relay/2.8-retry-budget`'s,
+@@ -108,5 +162,42 @@ pub async fn spread(
+     lanes: Arc<Lanes>,
+     budget: &Budget,
+ ) -> Result<Tick, Error> {
+-    todo!("step relay/2.9-ordering: a turn with one lane per endpoint")
++    let claimed = in_queue_order(claim::claim(pool, worker, claim::BATCH, claim::LEASE).await?);
++
++    // One task per claimed delivery, spawned before any of them is awaited: the batch is the unit
++    // of a claim, and the lanes — not the order of this loop — are what decide who runs when. Every
++    // task gets owned handles, because a task outlives this function's stack.
++    let mut report = Tick::of(claimed.len());
++    let mut running = Vec::with_capacity(claimed.len());
++    for work in claimed {
++        let pool = pool.clone();
++        let sender = Arc::clone(&sender);
++        let lanes = Arc::clone(&lanes);
++        // The budget is cloned per task on purpose: the clone shares the breaker, so two attempts
++        // to one endpoint see one history of failures rather than two.
++        let budget = budget.clone();
++        let worker = worker.to_owned();
++        running.push(tokio::spawn(async move {
++            delivery::attempt(&pool, sender.as_ref(), &lanes, &budget, &worker, work).await
++        }));
++    }
++
++    // Every task is joined, including the ones after a failure: a turn that walked away from its
++    // own attempts would report on rows that are still being written.
++    let mut failure = None;
++    for handle in running {
++        match handle.await {
++            Ok(Ok(recorded)) => report.count(recorded),
++            Ok(Err(error)) => failure = failure.or(Some(error)),
++            Err(join) => {
++                failure = failure.or(Some(Error::Delivery(format!(
++                    "an attempt ended without an answer: {join}"
++                ))));
++            }
++        }
++    }
++    match failure {
++        Some(error) => Err(error),
++        None => Ok(report),
++    }
+ }

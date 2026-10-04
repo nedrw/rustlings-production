@@ -1,0 +1,422 @@
+diff --git a/src/ordering.rs b/src/ordering.rs
+new file mode 100644
+index 0000000..2fb2e24
+--- /dev/null
++++ b/src/ordering.rs
+@@ -0,0 +1,112 @@
++//! Ordering: one delivery at a time per endpoint, and every other endpoint in parallel.
++//!
++//! A subscriber that is handed two events of the same kind in the wrong order has to sort them
++//! itself, and most of them cannot. A worker that serializes its whole queue to keep one
++//! subscriber's events in order gives that subscriber's slowness to every other subscriber, and one
++//! that runs everything at once turns a burst of retries into a burst of requests at a target that
++//! just came back. This module is the middle: **a lane per endpoint**.
++//!
++//! Three shapes in this file are decisions rather than taste:
++//!
++//! * **the key is the endpoint, not the tenant.** A tenant's endpoints are independent receivers
++//!   (a tenant with two webhooks is two integrations), and the thing that must not be asked twice at
++//!   once is the endpoint's server;
++//! * **a lane is held for the attempt, not for the turn.** The hold ends when the attempt answers —
++//!   including when it fails, times out, or the task that held it is dropped. Anything longer is a
++//!   lock, and a lock held by a request that never answers is the whole queue waiting on one
++//!   subscriber;
++//! * **the lanes are per process.** Two processes delivering to the same endpoint do not see each
++//!   other's lanes, so what this guarantees is *one worker per endpoint at a time*. Across
++//!   processes, ordering is a question of partitioning (which worker owns which endpoint) or of a
++//!   lock in the database, and that is a decision for `relay/2.15-shutdown-leases` and beyond.
++//!
++//! The lane is where fairness comes from as well: a turn hands one task to *every* delivery it
++//! claimed, and each task waits for its own endpoint's lane. The first attempt of every endpoint is
++//! therefore in flight before any endpoint's second one starts, which is what keeps a slow endpoint
++//! from eating a turn.
++//!
++//! **This file is the scaffold**: the types are here, and the two functions this step is about
++//! answer `todo!()`, so the spec fails here until they are written.
++
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex};
++
++use sqlx::PgPool;
++
++use crate::backoff::Budget;
++use crate::delivery::{Sender, Tick};
++use crate::error::Error;
++
++/// One lane per endpoint, shared by every turn every worker in this process runs.
++///
++/// `Clone` is not implemented on purpose: a lane set is one per process (or one per worker that
++/// means to be ordered against itself), and copying it would quietly give two halves of a worker
++/// their own lanes and no ordering at all.
++#[derive(Debug, Default)]
++pub struct Lanes {
++    /// One gate per endpoint somebody is holding or waiting for.
++    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
++}
++
++impl Lanes {
++    /// No lanes, nobody holding anything.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Wait for this endpoint's lane, and hold it for as long as the answer takes.
++    ///
++    /// The wait is fair (whoever asked first gets the lane first), and it is a wait on a *lane*:
++    /// another endpoint's lane is not affected by this one, which is the whole reason this is a map
++    /// of mutexes rather than a mutex.
++    pub async fn enter(&self, endpoint: &str) -> Lane<'_> {
++        todo!("step relay/2.9-ordering: one lane per endpoint, first come first served")
++    }
++
++    /// How many endpoints have a gate right now.
++    ///
++    /// A number that has to come back down: a worker that keeps a gate for every endpoint it has
++    /// ever talked to grows with its tenants' URL history, and a spec of this step checks that it
++    /// does not.
++    pub fn known(&self) -> usize {
++        todo!("step relay/2.9-ordering: how many endpoints are being kept apart right now")
++    }
++}
++
++/// One endpoint's lane, held for as long as this value lives.
++///
++/// Dropping it lets the next attempt to that endpoint in — and a lane nobody holds is not worth an
++/// entry in [`Lanes`], which is what the gate here is for: the set has to be able to ask whether
++/// this lane is the only thing left keeping its gate alive.
++#[derive(Debug)]
++pub struct Lane<'a> {
++    /// The set this lane came from.
++    lanes: &'a Lanes,
++    /// Which endpoint this lane is.
++    endpoint: String,
++    /// The gate itself, held here as well as in the set.
++    gate: Arc<tokio::sync::Mutex<()>>,
++    /// The permit, held but never read: dropping it is what lets the next attempt in.
++    _held: tokio::sync::OwnedMutexGuard<()>,
++}
++
++/// One turn of the worker across every endpoint at once.
++///
++/// The claim is `relay/2.5-atomic-claim`'s, one attempt per delivery is `relay/2.8-retry-budget`'s,
++/// and what this function adds is the schedule: a task per claimed delivery, every task waiting for
++/// its own endpoint's lane.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim or a record fails, and [`Error::Delivery`] when a
++/// task ends without an answer (a panic, or a runtime that is shutting down).
++pub async fn spread(
++    pool: &PgPool,
++    sender: Arc<dyn Sender>,
++    worker: &str,
++    lanes: Arc<Lanes>,
++    budget: &Budget,
++) -> Result<Tick, Error> {
++    todo!("step relay/2.9-ordering: a turn with one lane per endpoint")
++}
+diff --git a/tests/support/lanes.rs b/tests/support/lanes.rs
+new file mode 100644
+index 0000000..bbc7d16
+--- /dev/null
++++ b/tests/support/lanes.rs
+@@ -0,0 +1,298 @@
++//! A subscriber that answers at once, unless the test is holding the endpoint.
++//!
++//! The spec of `relay/2.9-ordering` is about *overlap*: how many attempts to one endpoint are in
++//! flight at the same moment, and in which order they were let through. Neither question can be
++//! asked of a real HTTP target (`tests/support/target.rs` records what arrived, not what is still
++//! waiting), and neither can be answered by how long something took. So this fixture is a
++//! [`Sender`] that counts: every attempt that starts increments a counter for its endpoint, every
++//! attempt that finishes decrements it, and the fixture remembers the highest the counter ever was.
++//!
++//! An endpoint can be **held**. A held endpoint's attempt parks inside the fixture until the test
++//! releases it, which is how a test says "this subscriber is slow" without sleeping: the test waits
++//! for the events it needs (an attempt started, an attempt finished, an endpoint released) and the
++//! fixture wakes it. `release` is a pulse — it lets the attempts that are parked *now* through, and
++//! the next one to arrive parks again — so a test can walk a queue one attempt at a time.
++//!
++//! Both kinds of wait here are bounded by a deadline and report what they were waiting for: a test
++//! that never sees the event it wanted fails with the counters, not with a hang.
++//!
++//! The spec loads this file with `#[path = "support/lanes.rs"] mod lanes;` — it is the harness, not
++//! the course, and `tests/support/mod.rs` does not have to mention it.
++
++#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
++
++use std::collections::{HashMap, HashSet};
++use std::future::Future;
++use std::pin::Pin;
++use std::sync::Mutex;
++use std::time::{Duration, Instant};
++
++use relay::delivery::{Receipt, SendError, SendRequest, Sender};
++use uuid::Uuid;
++
++/// How long a parked attempt waits before the fixture decides the test is never going to release
++/// it. Long enough that a loaded machine is not the reason, short enough to end a broken spec.
++const PARK: Duration = Duration::from_secs(30);
++/// How long a `wait_for_…` watches for its event.
++const WATCH: Duration = Duration::from_secs(30);
++/// How often a wait looks again. A condition with a deadline, polled — the alternative is a
++/// notification per event, and then the fixture's own bookkeeping would be the thing under test.
++const TICK: Duration = Duration::from_millis(1);
++
++/// A subscriber that keeps every attempt, and can be told to hold one endpoint at a time.
++pub struct Gated {
++    state: Mutex<State>,
++}
++
++/// What the fixture remembers between attempts.
++#[derive(Default)]
++struct State {
++    /// Endpoints whose attempts park instead of answering.
++    held: HashSet<String>,
++    /// How many times each endpoint has been released; an attempt parks until this changes.
++    releases: HashMap<String, u64>,
++    /// How many attempts this endpoint has started.
++    started: HashMap<String, usize>,
++    /// How many of them have finished.
++    finished: HashMap<String, usize>,
++    /// The most that were in flight at one moment.
++    peak: HashMap<String, usize>,
++    /// Delivery ids, in the order the attempts started.
++    order: Vec<Uuid>,
++}
++
++impl Gated {
++    /// A subscriber that takes everything, immediately.
++    #[must_use]
++    pub fn new() -> Self {
++        Self {
++            state: Mutex::new(State::default()),
++        }
++    }
++
++    /// Hold `url`: attempts to it park until the next [`Gated::release`].
++    pub fn hold(&self, url: &str) {
++        self.state().held.insert(url.to_owned());
++    }
++
++    /// Let the attempts to `url` that are parked right now through, and keep holding what arrives
++    /// next.
++    pub fn release(&self, url: &str) {
++        let mut state = self.state();
++        *state.releases.entry(url.to_owned()).or_default() += 1;
++    }
++
++    /// Let everything through, now and from here on.
++    pub fn release_all(&self) {
++        let mut state = self.state();
++        let held: Vec<String> = state.held.drain().collect();
++        for url in held {
++            *state.releases.entry(url).or_default() += 1;
++        }
++    }
++
++    /// How many attempts to `url` have started.
++    pub fn started(&self, url: &str) -> usize {
++        self.state().started.get(url).copied().unwrap_or(0)
++    }
++
++    /// How many of them have finished.
++    pub fn finished(&self, url: &str) -> usize {
++        self.state().finished.get(url).copied().unwrap_or(0)
++    }
++
++    /// The most attempts to `url` that were in flight at one moment.
++    ///
++    /// This is the number the whole step is about: one endpoint, one lane, so never more than one.
++    pub fn peak(&self, url: &str) -> usize {
++        self.state().peak.get(url).copied().unwrap_or(0)
++    }
++
++    /// How many attempts have started, over every endpoint.
++    pub fn started_total(&self) -> usize {
++        self.state().started.values().sum()
++    }
++
++    /// How many attempts have finished, over every endpoint.
++    pub fn finished_total(&self) -> usize {
++        self.state().finished.values().sum()
++    }
++
++    /// The deliveries that were attempted, in the order the attempts started.
++    pub fn order(&self) -> Vec<Uuid> {
++        self.state().order.clone()
++    }
++
++    /// Wait until `url` has started `wanted` attempts.
++    pub async fn wait_for_started(&self, url: &str, wanted: usize) {
++        self.watch(
++            &format!("{wanted} attempt(s) to start for {url}"),
++            |state| state.started.get(url).copied().unwrap_or(0) >= wanted,
++        )
++        .await;
++    }
++
++    /// Wait until `url` has finished `wanted` attempts.
++    pub async fn wait_for_finished(&self, url: &str, wanted: usize) {
++        self.watch(
++            &format!("{wanted} attempt(s) to finish for {url}"),
++            |state| state.finished.get(url).copied().unwrap_or(0) >= wanted,
++        )
++        .await;
++    }
++
++    /// Wait until every endpoint has started `wanted` attempts.
++    pub async fn wait_for_each_endpoint_started(&self, endpoints: &[String], wanted: usize) {
++        let described = format!(
++            "{wanted} attempt(s) for each of {} endpoints",
++            endpoints.len()
++        );
++        self.watch(&described, |state| {
++            endpoints
++                .iter()
++                .all(|url| state.started.get(url).copied().unwrap_or(0) >= wanted)
++        })
++        .await;
++    }
++
++    /// Wait until `wanted` attempts have started, over every endpoint.
++    pub async fn wait_for_started_total(&self, wanted: usize) {
++        self.watch(&format!("{wanted} attempt(s) to start"), |state| {
++            state.started.values().sum::<usize>() >= wanted
++        })
++        .await;
++    }
++
++    /// Wait until `wanted` attempts have finished, over every endpoint.
++    pub async fn wait_for_finished_total(&self, wanted: usize) {
++        self.watch(&format!("{wanted} attempt(s) to finish"), |state| {
++            state.finished.values().sum::<usize>() >= wanted
++        })
++        .await;
++    }
++
++    /// Wait for a condition on the counters, with a deadline and a sentence when it does not come.
++    async fn watch(&self, what: &str, condition: impl Fn(&State) -> bool) {
++        let deadline = Instant::now() + WATCH;
++        while !condition(&self.state()) {
++            assert!(
++                Instant::now() < deadline,
++                "this test waited {WATCH:?} for {what} and the fixture never saw it: {} \
++                 attempt(s) started, {} finished, per endpoint {:?}",
++                self.started_total(),
++                self.finished_total(),
++                self.per_endpoint()
++            );
++            tokio::time::sleep(TICK).await;
++        }
++    }
++
++    /// The counters, for a failure message.
++    fn per_endpoint(&self) -> Vec<(String, usize, usize)> {
++        let state = self.state();
++        let mut rows: Vec<(String, usize, usize)> = state
++            .started
++            .keys()
++            .map(|url| {
++                (
++                    url.clone(),
++                    state.started.get(url).copied().unwrap_or(0),
++                    state.finished.get(url).copied().unwrap_or(0),
++                )
++            })
++            .collect();
++        rows.sort();
++        rows
++    }
++
++    /// How many times `url` has been released.
++    fn releases(&self, url: &str) -> u64 {
++        self.state().releases.get(url).copied().unwrap_or(0)
++    }
++
++    /// Wait until `url` has been released again since this attempt arrived.
++    async fn park(&self, url: &str, arrival: u64) {
++        let deadline = Instant::now() + PARK;
++        while self.releases(url) == arrival {
++            assert!(
++                Instant::now() < deadline,
++                "`{url}` was held for {PARK:?} and never released: this test wanted to walk the \
++                 queue one attempt at a time and the attempt is still parked"
++            );
++            tokio::time::sleep(TICK).await;
++        }
++    }
++
++    /// The counters, on one line, for a failure message.
++    pub fn describe(&self) -> String {
++        let state = self.state();
++        let mut rows: Vec<String> = state
++            .started
++            .keys()
++            .map(|url| {
++                format!(
++                    "{url}: {} started, {} finished, peak {}",
++                    state.started.get(url).copied().unwrap_or(0),
++                    state.finished.get(url).copied().unwrap_or(0),
++                    state.peak.get(url).copied().unwrap_or(0),
++                )
++            })
++            .collect();
++        rows.sort();
++        rows.join("; ")
++    }
++
++    /// The state, whether or not another thread panicked while holding it.
++    fn state(&self) -> std::sync::MutexGuard<'_, State> {
++        self.state
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++    }
++}
++
++impl Default for Gated {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl std::fmt::Debug for Gated {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Gated")
++            .field("started", &self.started_total())
++            .field("finished", &self.finished_total())
++            .finish()
++    }
++}
++
++impl Sender for Gated {
++    fn send(
++        &self,
++        request: SendRequest,
++    ) -> Pin<Box<dyn Future<Output = Result<Receipt, SendError>> + Send + '_>> {
++        Box::pin(async move {
++            let url = request.url.as_str().to_owned();
++            let parked = {
++                // The lock is released before anything is awaited: a fixture that held its state
++                // across a parked attempt would park every other attempt with it.
++                let mut state = self.state();
++                let started = state.started.entry(url.clone()).or_default();
++                *started += 1;
++                let finished = state.finished.get(&url).copied().unwrap_or(0);
++                let in_flight = state.started.get(&url).copied().unwrap_or(0) - finished;
++                let peak = state.peak.entry(url.clone()).or_default();
++                *peak = (*peak).max(in_flight);
++                state.order.push(request.delivery);
++                state
++                    .held
++                    .contains(&url)
++                    .then(|| state.releases.get(&url).copied().unwrap_or(0))
++            };
++            if let Some(arrival) = parked {
++                self.park(&url, arrival).await;
++            }
++            *self.state().finished.entry(url).or_default() += 1;
++            Ok(Receipt { status: 200 })
++        })
++    }
++}

@@ -14,3 +14,4 @@ format_version = 1
 "spec/2.6/at_least_once.rs" = "sha256:d101d926db84441744f80e3394f6b177d108ec2813759dabcbdf0f691c632dd6"
 "spec/2.7/outbound.rs" = "sha256:b3e20e4e379facabceb9569c18f068f4cef22ac8d3e7aedd3faf9c8f1f32f45f"
 "spec/2.8/retry.rs" = "sha256:6f0e5a1a98d0c2dd357007aefbf063974d39a724ea1b79d5e2ab6d1893eff6e9"
+"spec/2.9/ordering.rs" = "sha256:a697f9cd79eafd0939b9c1e0355c7e633d73a8bfa0801e42af4d063d7819023f"
