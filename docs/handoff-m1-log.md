@@ -155,3 +155,34 @@ agent 正在同一台机器上编译，并发使用让某一步拿到不属于�
 - **2.6 的重试上限没钉常量**（规格只要求「12 轮内到 `dead`」且 `attempts >= 2`）：谁把它搬进配置，默认值必须 ≤ 12。
 - **2.12 与 2.7 的已知张力**（写给 2.12 的作者）：2.7 的规格必须打 `127.0.0.1`（离线要求）。SSRF 的拒绝应当来自**配置层**（默认 `delivery.allow_private_targets = false`），而不是改 `Policy::default()`；若要改默认，必须在同一个提交里改 2.7 的规格并重钉 manifest。
 - **2.3 的契约检查是一条持续性约束**：新路由必须进 `document()`，且它可能返回的每个状态都要有 schema——2.10 的 DLQ 路由是第一个撞上它的。
+
+## 第五段 · 2026-10 · T2 2.8–2.11（重试预算、顺序、DLQ、签名）
+
+### 数字
+
+| 步 | 规格测试 | `selftest` 结论（原样） | must 门 |
+| --- | --- | --- | --- |
+| 2.8 重试预算 | 10 | `scaffold ✓ … (unresolved import relay::backoff)` / `solution ✓ the spec passes` / `9/9 must green` | 9 |
+| 2.9 顺序与并发 | 5 | `scaffold ✓ … (unresolved import relay::ordering)` / `9/9 must green` | 9 |
+| 2.10 DLQ | 6 | `scaffold ✓ the spec fails as it must (exit code 101: test a_replay_does_nothing_to_a_delivery_that_is_not_dead … FAILED)` / `9/9 must green` | 9 |
+| 2.11 签名 | 9 | `scaffold ✓ … (unresolved import relay::signing)` / `9/9 must green` | 9 |
+
+- `kiln verify relay` → **`11/11 judged step(s) pass · 0 failed · 0 not prepared · 13 without content`**（81 s）
+  —— 2.1–2.7 的规格一个字节未改（`git diff` 为空），2.5–2.7 的契约签名（`Sender`/`SendRequest`/`claim::*`）保持不变。
+- `lint-caps` `no issues`；`kiln links` 全仓 `45 page(s) · 295 link(s)` ✓；四个新规格与新装置（`tests/support/lanes.rs`、`keys.rs`）显式 rustfmt 干净。
+
+### 施工中钉下来的决定
+
+- **抖动退避取窗口上半段（equal jitter），不是教科书 full jitter**：full jitter 会答出近似 0 的等待，
+  而 2.6 的规格在失败后**立刻**再跑一轮并断言「没到期就不能领」——那一步会在最终树上红。ADR 的
+  `## Alternatives` 逐条论证了三种植；`delay` 仍由 `(uuid.as_u64_pair(), attempt)` 的 splitmix64 决定
+  （确定性、无 rand）。
+- **`hmac = "0.12"` 而不是 0.13**：0.13 要 `digest 0.11`（即 `sha2 0.11`），而项目里 `sha2 = "0.10"`
+  那一行 scaffold 不能改写、且正被 API key 哈希使用。0.12 + sha2 0.10 + subtle 2.6 是自洽的一组。
+- **签名密钥走端口（`signing::Secrets` + `DbSecrets`），不给 `SendRequest` 加字段**：2.7 的规格用**结构体字面量**构造它，加字段会让那份规格在自己那棵树上编译不过（2.11 的正文与 rustdoc 都写了这条；
+  产品理由同样成立：密钥不进队列、不进触碰投递的结构体的 `Debug`）。
+- **顺序是「lane」**：2.9 在 worker 内为每个 endpoint 建一条 lane（`Claimed::due_at` 带上
+  `next_attempt_at`，两条 turn 路径都先按 `(due_at, delivery)` 排序再尝试），跨进程的顺序留给 2.15。
+- **2.9 的正文是 teach 模板 + 额外的 `RECALL`/`DELTA` 路标**：`origin = teach`（ordering 首次教），
+  五段必需项齐全；多出来的两段指向 2.6/2.7 与 `mailer/1.14`——`lint-caps` R5 接受，且这正是
+  「相邻能力要写边界」那条清单规则的样本。authoring.md §4.1 记了这一点。

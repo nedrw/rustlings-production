@@ -87,7 +87,11 @@ A signup confirmation that never arrives is indistinguishable from a broken serv
 - Kubernetes `terminationGracePeriodSeconds` — the deadline you are racing
 ```
 
-### 4.2 `origin = "deepen"`
+#`teach` 步可以**额外**带 `## RECALL`/`## DELTA` 段（R5 只看必需段是否齐全、以及非 teach 不许有 WHY）：
+当这一步的能力与更早的某项能力名字相近或相邻时，用两段短路标点名那一项与那个步骤，比塞进 WHY 更好读。
+`relay/2.9-ordering` 是样本（它同时指向 `relay/2.6`、`relay/2.7` 与 `mailer/1.14`）。
+
+## 4.2 `origin = "deepen"`
 
 ```md
 # Shutdown with in-flight leases
