@@ -1,0 +1,210 @@
+diff --git a/migrations/0005_deliveries.sql b/migrations/0005_deliveries.sql
+new file mode 100644
+index 0000000..a5b17aa
+--- /dev/null
++++ b/migrations/0005_deliveries.sql
+@@ -0,0 +1,31 @@
++-- The work this service owes a subscriber: one row per (event, endpoint).
++--
++-- The row is the unit of a claim (step relay/2.5-atomic-claim) and the unit of an attempt: it holds
++-- the state machine, the failure count, the instant the next attempt may happen, and the lease of
++-- whoever is working on it. `unique (event_id, endpoint_id)` is what makes "one event, one delivery
++-- to this endpoint" a fact rather than a hope: a fan-out that runs twice — a retried request, a
++-- replayed event, two workers racing — must not create a second debt.
++create table deliveries (
++    id uuid primary key,
++    event_id uuid not null references events (id) on delete cascade,
++    endpoint_id uuid not null references endpoints (id) on delete cascade,
++    state text not null default 'pending',
++    attempts integer not null default 0,
++    next_attempt_at timestamptz not null default now(),
++    locked_by text,
++    locked_at timestamptz,
++    lease_expires_at timestamptz,
++    last_error text,
++    created_at timestamptz not null default now(),
++    constraint deliveries_one_per_target unique (event_id, endpoint_id),
++    constraint deliveries_state_known
++        check (state in ('pending', 'claimed', 'sent', 'retrying', 'dead'))
++);
++
++-- The claim runs once per tick and reads the oldest work that is due: this index is in exactly that
++-- order, so a claim is a range scan that stops after `limit` rows. Without it every tick sorts
++-- every delivery this service has ever owed, and the cost of a claim grows with the tenant's
++-- history instead of with the batch.
++create index deliveries_claimable_idx
++    on deliveries (next_attempt_at, id)
++    where state in ('pending', 'retrying');
+diff --git a/src/claim.rs b/src/claim.rs
+index ef7f182..a90fc98 100644
+--- a/src/claim.rs
++++ b/src/claim.rs
+@@ -28,15 +28,19 @@ use chrono::{DateTime, Utc};
+ use sqlx::PgPool;
+ use uuid::Uuid;
+ 
+-use crate::domain::EndpointUrl;
++use crate::domain::{EndpointUrl, TenantId};
+ use crate::error::Error;
+-use crate::events::Event;
++use crate::events::{self, Event};
+ 
+ /// How many rows one claim takes when the caller does not ask for a size.
+ pub const BATCH: i64 = 16;
+ /// How long a claim is held before the worker holding it is presumed gone.
+ pub const LEASE: Duration = Duration::from_secs(60);
+ 
++/// One row of the claim's `returning` clause, in the order the statement writes it: the delivery,
++/// its failure count, the target, and the event the subscriber is handed.
++type Row = (Uuid, i32, String, Uuid, Uuid, String, String, DateTime<Utc>);
++
+ /// One piece of work a worker has claimed and may now act on.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Claimed {
+@@ -67,8 +71,50 @@ pub async fn claim(
+     limit: i64,
+     lease: Duration,
+ ) -> Result<Vec<Claimed>, Error> {
+-    let _ = (pool, worker, limit, lease);
+-    todo!("step relay/2.5-atomic-claim")
++    // One statement, and the whole decision in it: the `select` locks the rows it is about to stamp
++    // (`for update skip locked` leaves another worker's rows alone instead of queueing behind
++    // them), the `update` moves them out of the claimable states, and the `returning` clause brings
++    // back the work — the target and the event are joined here rather than looked up per row.
++    let rows: Vec<Row> = sqlx::query_as(
++        "update deliveries as d \
++            set state = 'claimed', locked_by = $1, locked_at = now(), \
++                lease_expires_at = now() + make_interval(secs => $3::double precision) \
++           from endpoints as e, events as v \
++          where d.endpoint_id = e.id and d.event_id = v.id \
++            and d.id in (select id from deliveries \
++                          where state in ('pending', 'retrying') \
++                            and next_attempt_at <= now() \
++                          order by next_attempt_at, id \
++                          for update skip locked \
++                          limit $2) \
++         returning d.id, d.attempts, e.url, v.id, v.tenant_id, v.kind, v.payload::text, \
++                   v.received_at",
++    )
++    .bind(worker)
++    .bind(limit)
++    .bind(lease.as_secs_f64())
++    .fetch_all(pool)
++    .await
++    .map_err(Error::Database)?;
++
++    rows.into_iter()
++        .map(
++            |(delivery, attempts, url, event, tenant, kind, payload, received_at)| {
++                Ok(Claimed {
++                    delivery,
++                    attempts,
++                    url: url.parse().map_err(Error::Endpoint)?,
++                    event: Event {
++                        id: event,
++                        tenant_id: TenantId::from_uuid(tenant),
++                        kind,
++                        payload: events::decode_payload(&payload)?,
++                        received_at,
++                    },
++                })
++            },
++        )
++        .collect()
+ }
+ 
+ /// Hand a claim back, so whoever comes next can take it.
+@@ -81,8 +127,17 @@ pub async fn claim(
+ ///
+ /// Returns [`Error::Database`] when the update fails.
+ pub async fn release(pool: &PgPool, delivery: Uuid, worker: &str) -> Result<bool, Error> {
+-    let _ = (pool, delivery, worker);
+-    todo!("step relay/2.5-atomic-claim")
++    let ran = sqlx::query(
++        "update deliveries \
++            set state = 'pending', locked_by = null, locked_at = null, lease_expires_at = null \
++          where id = $1 and locked_by = $2 and state = 'claimed'",
++    )
++    .bind(delivery)
++    .bind(worker)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(ran.rows_affected() == 1)
+ }
+ 
+ /// Record that the subscriber took the delivery: the row is done and is never handed out again.
+@@ -94,8 +149,17 @@ pub async fn release(pool: &PgPool, delivery: Uuid, worker: &str) -> Result<bool
+ ///
+ /// Returns [`Error::Database`] when the update fails.
+ pub async fn mark_sent(pool: &PgPool, delivery: Uuid) -> Result<bool, Error> {
+-    let _ = (pool, delivery);
+-    todo!("step relay/2.5-atomic-claim")
++    let ran = sqlx::query(
++        "update deliveries \
++            set state = 'sent', locked_by = null, locked_at = null, lease_expires_at = null, \
++                last_error = null \
++          where id = $1 and state = 'claimed'",
++    )
++    .bind(delivery)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(ran.rows_affected() == 1)
+ }
+ 
+ /// Record a failed attempt: the row is owed again at `next_attempt_at`, and `attempts` grows.
+@@ -113,8 +177,20 @@ pub async fn mark_retry(
+     why: &str,
+     next_attempt_at: DateTime<Utc>,
+ ) -> Result<bool, Error> {
+-    let _ = (pool, delivery, why, next_attempt_at);
+-    todo!("step relay/2.5-atomic-claim")
++    let ran = sqlx::query(
++        "update deliveries \
++            set state = 'retrying', attempts = attempts + 1, last_error = $2, \
++                next_attempt_at = $3, locked_by = null, locked_at = null, \
++                lease_expires_at = null \
++          where id = $1 and state = 'claimed'",
++    )
++    .bind(delivery)
++    .bind(why)
++    .bind(next_attempt_at)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(ran.rows_affected() == 1)
+ }
+ 
+ /// Give up on a delivery: it will not be attempted again, and `why` is what an operator reads.
+@@ -123,6 +199,16 @@ pub async fn mark_retry(
+ ///
+ /// Returns [`Error::Database`] when the update fails.
+ pub async fn mark_dead(pool: &PgPool, delivery: Uuid, why: &str) -> Result<bool, Error> {
+-    let _ = (pool, delivery, why);
+-    todo!("step relay/2.5-atomic-claim")
++    let ran = sqlx::query(
++        "update deliveries \
++            set state = 'dead', last_error = $2, locked_by = null, locked_at = null, \
++                lease_expires_at = null \
++          where id = $1 and state = 'claimed'",
++    )
++    .bind(delivery)
++    .bind(why)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(ran.rows_affected() == 1)
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index cf5bc34..a892dff 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,6 +9,7 @@
+ //! say what each module owes, from outside.
+ 
+ pub mod auth;
++pub mod claim;
+ pub mod config;
+ pub mod db;
+ pub mod domain;

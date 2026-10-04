@@ -1,0 +1,134 @@
+diff --git a/src/claim.rs b/src/claim.rs
+new file mode 100644
+index 0000000..ef7f182
+--- /dev/null
++++ b/src/claim.rs
+@@ -0,0 +1,128 @@
++//! Claims: how one worker takes a piece of the delivery work, and how it hands it back.
++//!
++//! An accepted event is owed to every endpoint its tenant registered, and that debt is a row of
++//! `migrations/0004_deliveries.sql`. Somebody has to decide *which* rows a worker may work on, and
++//! the decision belongs to the database: two workers that read the same pending rows and then
++//! update them have both decided, and both of them are wrong. One statement does it instead — it
++//! picks the oldest work nobody holds, stamps the claim, and answers with what it took.
++//!
++//! Three shapes in this file are decisions rather than taste:
++//!
++//! * **the claim is one statement.** The rows are chosen with `for update skip locked` inside the
++//!   `update` that stamps them, so there is no instant where a worker holds an id it does not own;
++//! * **a claim comes back with the work in it.** Answering with ids alone would cost a second query
++//!   per row, and give the row a second chance to change: the target and the event are joined in
++//!   the same statement, so one tick is one claim plus one write per outcome;
++//! * **a claim is a lease, not a lock.** `lease_expires_at` says when a worker that stopped
++//!   answering loses its rows, so a dead process does not make work invisible forever. Recovering
++//!   an expired lease is step `relay/2.15-shutdown-leases`.
++//!
++//! The state machine is written down once, here: `pending` and `retrying` are claimable (`retrying`
++//! once `next_attempt_at` has passed), `claimed` is held by one worker, and `sent` and `dead` are
++//! terminal. Every write that moves a row lives in this module, so no other file has to know the
++//! column names.
++
++use std::time::Duration;
++
++use chrono::{DateTime, Utc};
++use sqlx::PgPool;
++use uuid::Uuid;
++
++use crate::domain::EndpointUrl;
++use crate::error::Error;
++use crate::events::Event;
++
++/// How many rows one claim takes when the caller does not ask for a size.
++pub const BATCH: i64 = 16;
++/// How long a claim is held before the worker holding it is presumed gone.
++pub const LEASE: Duration = Duration::from_secs(60);
++
++/// One piece of work a worker has claimed and may now act on.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Claimed {
++    /// The delivery row: what an outcome is recorded against, and the identity a subscriber
++    /// deduplicates a repeated attempt on.
++    pub delivery: Uuid,
++    /// How many attempts have already failed. `0` means this claim is the first attempt.
++    pub attempts: i32,
++    /// Where the delivery goes: the endpoint's URL, from the claim's own join.
++    pub url: EndpointUrl,
++    /// What happened, with the payload the subscriber is handed.
++    pub event: Event,
++}
++
++/// Take up to `limit` pieces of work this worker may now do.
++///
++/// Claimable work is what is in `pending` or `retrying` with a `next_attempt_at` that has passed,
++/// oldest first, never a row another worker holds. The claim is stamped with `worker` and with the
++/// instant the lease ends, and the answer carries the work itself.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the claim cannot be written or read back, and
++/// [`Error::Endpoint`] when a claimed row's target is no longer a URL this service accepts.
++pub async fn claim(
++    pool: &PgPool,
++    worker: &str,
++    limit: i64,
++    lease: Duration,
++) -> Result<Vec<Claimed>, Error> {
++    let _ = (pool, worker, limit, lease);
++    todo!("step relay/2.5-atomic-claim")
++}
++
++/// Hand a claim back, so whoever comes next can take it.
++///
++/// Only the worker holding the row can do this: the claim records who holds it, so one worker
++/// cannot make another worker's work claimable. A worker that stopped answering is the lease's
++/// business, not this function's.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update fails.
++pub async fn release(pool: &PgPool, delivery: Uuid, worker: &str) -> Result<bool, Error> {
++    let _ = (pool, delivery, worker);
++    todo!("step relay/2.5-atomic-claim")
++}
++
++/// Record that the subscriber took the delivery: the row is done and is never handed out again.
++///
++/// Only a claimed row moves. A delivery that is already `sent` stays sent, so a worker that lost
++/// its claim and answered late cannot resurrect work somebody else finished.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update fails.
++pub async fn mark_sent(pool: &PgPool, delivery: Uuid) -> Result<bool, Error> {
++    let _ = (pool, delivery);
++    todo!("step relay/2.5-atomic-claim")
++}
++
++/// Record a failed attempt: the row is owed again at `next_attempt_at`, and `attempts` grows.
++///
++/// The instant is a parameter rather than `now()` plus something: how long to wait is the worker's
++/// retry policy (step `relay/2.8-retry-budget`), and a test can put the instant in the past instead
++/// of waiting for it.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update fails.
++pub async fn mark_retry(
++    pool: &PgPool,
++    delivery: Uuid,
++    why: &str,
++    next_attempt_at: DateTime<Utc>,
++) -> Result<bool, Error> {
++    let _ = (pool, delivery, why, next_attempt_at);
++    todo!("step relay/2.5-atomic-claim")
++}
++
++/// Give up on a delivery: it will not be attempted again, and `why` is what an operator reads.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update fails.
++pub async fn mark_dead(pool: &PgPool, delivery: Uuid, why: &str) -> Result<bool, Error> {
++    let _ = (pool, delivery, why);
++    todo!("step relay/2.5-atomic-claim")
++}
