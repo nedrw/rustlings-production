@@ -339,11 +339,17 @@ fn engine_root(sources: &Sources) -> &Source {
 }
 
 /// The one source file that declares `declaration`, or a failure naming what was looked at.
+///
+/// The match is [`declares`] — the same whole-name comparison the attribute check below uses, and
+/// the reason is the one written on that function: `contains` would let the line declaring
+/// `JobEvent` answer for the line declaring `Job`, and the day a later step adds a type whose name
+/// starts with an earlier one's, this assertion would fail while the promise it checks still held
+/// (step `jobq/3.6-transaction-isolation` is where that happened, with a trail row next to the job).
 fn file_declaring<'a>(sources: &'a Sources, declaration: &str) -> &'a Source {
     let found: Vec<&Source> = sources
         .all
         .iter()
-        .filter(|source| source.text.contains(declaration))
+        .filter(|source| source.text.lines().any(|line| declares(line, declaration)))
         .collect();
     assert!(
         found.len() == 1,
