@@ -350,7 +350,7 @@ T1 已按这份表钉过一次精确版本（在 `app/mailer/Cargo.toml` 里，�
 | 里程碑 | 内容 | 验收标准 |
 | --- | --- | --- |
 | **M0 垂直切片** | `kiln` 骨架（list/run/check/watch/hint/state/verify + i18n 回退 + images/doctor）+ 12 个闸门 + **T1 `mailer` 全部 22 步真实内容** | 新克隆一条 `kiln` 能一路做完 T1；`selftest` 对 T1 全绿；`kiln --lang ja` 优雅回退；watch 存盘重跑；容器步骤在 podman 下跑通 |
-| **M1 去重机制 + T2** | 能力台账、`lint-caps`（§3 D4 六条规则）、deepen/transfer 模板与 RECALL 卡片、`kiln plan --fast`/`probe`、间隔重复；**T2 `relay` 全部 24 步** | `lint-caps` 全仓通过；T2 的 7 个 deepen/transfer 步无 WHY 段；`plan --fast` 能正确跳过 T1 已证明能力；`review --due` 有真实 probe 题 |
+| **M1 去重机制 + T2** | 能力台账、`lint-caps`（§3 D4 六条规则）、deepen/transfer 模板与 RECALL 卡片、`kiln plan --fast`/`probe`、间隔重复；**T2 `relay` 全部 24 步** | `lint-caps` 全仓通过；T2 的**6** 个 deepen/transfer 步（1 transfer + 5 deepen，见 `track.toml` 与 curriculum §7）无 WHY 段、RECALL 点名真实存在的更早步骤；`plan --fast` 能正确跳过 T1 已证明能力；`review --due` 有真实 probe 题 |
 | **M2 T3 + 慢闸门** | **T3 `jobq` 26 步**；mutants/coverage/bench/semver/unsafe 接入；conformance 套件 | 故意引入的劣化能被 mutants 与 bench-budget 抓到；`semver` 能拦住破坏性改动 |
 | **M3 T4 + 容器与性能基建** | **T4 `lakelet` 24 步**；镜像预拉与运行时抽象打磨；soak/剖析流程 | 无网环境（镜像已预拉）能跑完 T4 的快路径；soak 能发现故意注入的任务泄漏 |
 | **M4 T5 + 分布式基建** | **T5 `meshkv` 22 步**（可选 track）；`turmoil`/`madsim` 确定性模拟；集群故障演练 | 同一 seed 重复跑结果一致；注入网络分区后系统行为可预测且断言明确 |
@@ -360,11 +360,13 @@ T1 已按这份表钉过一次精确版本（在 `app/mailer/Cargo.toml` 里，�
 `cargo xtask ci` 486s / 最后一行 `22/22 step(s) hold the contract`、`kiln verify --json mailer`
 205s / 22 passed，逐条证据在 [handoff-m0.md](handoff-m0.md) §1。里程碑表里 M0 那一行自此是「已完成」。
 
-**M1 进行中**：去重机制的运行时部分已经落地——`state.toml` 为每个能力记 `level`/`last_verified`/
+**M1 已交付**（2026-10）：去重机制的运行时部分已经落地——`state.toml` 为每个能力记 `level`/`last_verified`/
 `evidence`，`kiln probe`（`course/probes/`，`--check` 进 CI）、`kiln review --due`、`kiln plan --fast`
 与 `kiln skip`（跳过只认**通过的 probe**），`lint-caps` R5 增加「RECALL 必须点名真实存在的更早步骤」。
-T2 `relay` 的 24 步元数据与骨架已就位，`2.1`–`2.4` 已交付（骨架与装置、幂等接收、契约优先、游标分页），
-其余步骤按链式继续；怎么接手、验收怎么跑、这批实测数字在哪，都在 [handoff-m1.md](handoff-m1.md)。
+T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解、闸门接线；`kiln verify relay` 在最终树上
+`24/24 pass`，6 个 exit 能力全部 verified），另有 19 道 probe 题支撑 `review --due` 与 `plan --fast`。
+交付物一览与实测数字在 [t2-relay.md](t2-relay.md)，机制、命令与继续往下做的约定在
+[handoff-m1.md](handoff-m1.md)。
 
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。

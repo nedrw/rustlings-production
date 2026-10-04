@@ -33,7 +33,7 @@ with stricter gates and fewer hints.
 | track | project | difficulty | steps |
 | --- | --- | --- | --- |
 | T1 | `mailer` — subscription microservice (inspired by *Zero To Production in Rust*) **delivered** | intro → mid | 22 |
-| T2 | `relay` — webhook delivery service **in progress (M1)** | mid | 24 |
+| T2 | `relay` — webhook delivery service **delivered** | mid | 24 |
 | T3 | `jobq` — job queue engine (library + worker + CLI) | mid-high | 26 |
 | T4 | `lakelet` — telemetry ingest and query | high | 24 |
 | T5 | `meskv` — distributed KV / scheduler (optional) | highest | 22 |
@@ -62,13 +62,15 @@ locale fallback and translation-drift detection, so other languages can be added
 
 ## Status
 
-**M0 is closed; M1 is in progress.** The metadata layer, the capability lint, the gates and the
+**M0 and M1 are closed.** The metadata layer, the capability lint, the gates and the
 runner are in, and T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec
 tests, a scaffold, a reference solution and gate wiring. M1 adds the runtime half of the
-de-duplication mechanism — `kiln plan --fast`, `kiln skip`, `kiln probe`, `kiln review --due` and one
-capability record per learner per capability — and authors T2 `relay` step by step (its 24 steps have
-metadata and a skeleton; the steps themselves land one commit at a time). See
-[docs/handoff-m1.md](docs/handoff-m1.md) for the state, the acceptance lines and how to continue.
+de-duplication mechanism (`kiln plan --fast` / `skip` / `probe` / `review --due`, one capability
+record per learner per capability) and authors T2 `relay` end to end: 24 steps, 18 teach + 1
+transfer + 5 deepen, `kiln verify relay` 24/24 on the final tree, and 19 probe exercises behind the
+spaced-repetition loop. See [docs/t2-relay.md](docs/t2-relay.md) for what T2 delivers and
+[docs/handoff-m1.md](docs/handoff-m1.md) for the mechanism, the acceptance lines and how to
+continue.
 
 **What the numbers below measure.** The timings and test counts were measured on the M0 tree
 (`62e7c5c`, re-verified at `dd47c11`); M1 has since added commands, tests, docs and 14 probe

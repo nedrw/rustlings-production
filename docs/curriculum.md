@@ -336,8 +336,9 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 
 ## 7. T2 `relay`：Webhook 投递服务（24 步）
 
-**状态：M1 进行中。** 24 步的元数据（`course/tracks/relay/track.toml`）与骨架已就位，正文、规格、
-scaffold、参考解逐步落地；每一步的实测结论记在 [handoff-m1.md](handoff-m1.md)。下面的表是**规划口径**。
+**状态：24/24 已交付**（正文、规格、scaffold、参考解、闸门接线全部就位；`kiln verify relay` 在最终树上
+`24/24 judged pass`）。交付物一览、门阶梯、项目最终形状与实测数字见 **[t2-relay.md](t2-relay.md)**；
+逐步的施工过程与两次红的判读见 [handoff-m1-log.md](handoff-m1-log.md)。下面的表是**规划口径**。
 
 题材：接收事件 → 持久化 → 按订阅者投递（HTTP POST + HMAC 签名）→ 重试/退避 → DLQ → 多租户 → 限流。
 它是「至少一次投递」这一类问题的标准现场，且把 T1 的每个能力都换到更难的环境里迁移一遍。

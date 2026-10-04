@@ -56,10 +56,11 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 
 ## 3. T2 `relay`
 
-- 进度（2026-10）：**2.1–2.11 已交付**（骨架与装置、幂等接收、契约优先、游标分页、原子领取、至少一次、
-  出站客户端、重试预算、顺序、DLQ、签名），每步都过了 `kiln selftest relay/<id> --track relay`；
-  `kiln verify relay` 会把早期步骤放在最终树上重判（在 2.11 的树上为 `11/11 judged pass`）。
-  剩余步骤见 `kiln plan relay`。
+- 进度（2026-10）：**24/24 已交付**。`kiln verify relay` → `24/24 judged step(s) pass · 0 failed ·
+  0 not prepared · 0 without content`（2m34.8s）；`kiln selftest --track relay` 逐步为
+  `scaffold ✓ the spec fails as it must / solution ✓ the spec passes / gates ✓ N/N must green`。
+  交付物、门阶梯、项目最终形状、装置与模式、实测数字、剩余缺口见 **[t2-relay.md](t2-relay.md)**；
+  施工过程与两次红（一次假红、一次真红）的判读见 [handoff-m1-log.md](handoff-m1-log.md) 第八段。
 - 元数据：`course/tracks/relay/track.toml`（24 步，`exit` 能力 6 条，`clippy@2` 起、无提示）。
 - 骨架与装置：`course/tracks/relay/skeleton/`（模块签名 + `todo!()`、`tests/support/{client,app,service,postgres}.rs`）。
 - 步骤交付物与 T1 同构：正文 `course/docs/steps/en/relay/<id>.md`、规格 `course/tracks/relay/spec/<n>/<name>.rs`、

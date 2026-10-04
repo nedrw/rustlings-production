@@ -254,3 +254,29 @@ var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
 
 - `test/chaos-injection@apply`：那一步的机制是「测试自己拥有一个故障代理」（独立端口、注入三类故障）。单文件 std 题只能把代理换成假对象，那时被检查的就不是注入；**查不出代理是否真的在中间的 probe 是假证据**，比没有更糟。
 - `delivery/at-least-once@design`：design 深度的证据是 ADR + 系统级崩溃测试（断在中间、行必须回来）。单文件的状态机只能证明三轮顺序对，证明不了「崩溃后不丢单」——而后者才是这个格位。第二轮能收窄成单文件，是因为它的证据是**策略**（窗口/熔断状态机），不是进程被杀时的持久化。
+
+## 第八段 · 2026-10 · T2 2.20–2.24：24/24
+
+| 步 | 规格测试 | `selftest` 结论（原样） | must 门 |
+| --- | --- | --- | --- |
+| 2.20 负载测试 | 6 | `scaffold ✓ … (unresolved import relay::loadtest)` / `solution ✓ the spec passes` / `10/10 must green` | 10 |
+| 2.21 供应链政策 | 5 | `scaffold ✓ the spec fails as it must (test the_unsafe_budget_is_stated_and_empty … FAILED)` / `8/8 must green` | 8 |
+| 2.22 滚动升级 | 6 | `scaffold ✓ … (unresolved import relay::readiness)` / `9/9 must green` | 9 |
+| 2.23 在线 schema | 5 | `scaffold ✓ … (unresolved import relay::backfill)` / `9/9 must green` | 9 |
+| 2.24 降级演练（deepen, design） | 7 | `scaffold ✓ … (test the_runbook_names_its_sections … FAILED)` / `10/10 must green` | 10 |
+
+- 合并 selftest：`5/5 step(s) hold the contract`（1m45s）。**`kiln verify relay` → `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without content`**（2m34.8s）。
+- `caps --track relay`：**6 个 exit 能力全部 verified**（`delivery/at-least-once@design`、`delivery/dlq@apply`、`http/rate-limit@apply`、`ops/degradation-modes@apply`、`sec/hmac-signing@apply`、`sec/ssrf-defense@apply`）；`25 slots in relay · 6 verified`。
+- `lint-caps` 无 skipped（46/46 篇正文）；`links` `56 page(s) · 361 link(s)` ✓；course 89 个 `.rs` rustfmt 绿；`i18n status` 结构 0 错、漂移 0 警告。
+
+### 两次「红」的判读（一次假红、一次真红）
+
+- **假红**：第一次 `verify relay` 报 `2.18 the_contract_declares_the_metrics_route FAILED`；该规格在最终树上单跑 → `8 passed`，同树同缓存再跑完整 `verify` → 2.18 `9/9`。两次结论不一致 ⇒ 按第三段的规则判为环境假红（该测试只读 `/openapi.json`，与本批改动无关）。
+- **真红**：第一次 `verify` 还报 `2.22 the_migration_that_grew_the_schema_was_applied_online FAILED` —— 2.22 的规格用「目录里最新的迁移」判断线上建索引，而 2.23 的 `0011` 成为最新文件后这条断言在最终树上不再成立（正是 authoring §6.8 那条规则）。改成**按内容找建出该索引的迁移**后，2.22 在自己的树上与最终树上都绿，规格重钉。
+
+### 施工中钉下来的决定
+
+- **2.20 的 p99 趋势「记录」而不「断言」**：60 个样本的 p99 就是该档最大值，共享机器上一条长观测就会让相邻档倒挂；断言它会得到一个「为了变绿而被删掉」的规格。规格断言算术（backlog 严格递增）与上限（p99 < 5 s），形状检查用两条合成曲线证明「能通过上升的、能拒绝塌陷的」。
+- **2.21 的 source 策略放 `[sources]`**（cargo-deny 0.14 起 `unknown-registry`/`unknown-git` 属于那里），并离线判策略与依赖树（本机没装 cargo-deny，`?deny` 只是 should 门）。
+- **2.22 不把迁移放后台**（那会让早期规格进入竞态，而装置不许改）：改判三条确定性观测——探针每次问 schema、启动日志顺序（schema 行先于 listening 行）、进不了 schema 的进程退 1 且从不宣告端口。`Ahead` 是 ready（滚动升级成立的前提，安全来自 2.23 的加法纪律）。
+- **2.23 的列值由数据库算**（`octet_length($5::jsonb::text)`）：jsonb 会规范化，Rust 侧算长度必然在个别 payload 上差 1 字节。
