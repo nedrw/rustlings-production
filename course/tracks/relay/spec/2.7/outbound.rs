@@ -19,6 +19,13 @@
 //! A note for whoever authors the next step: this file builds `Request`s, builds a `SendRequest` for
 //! the port test, and reads `Response`'s fields. Adding a field to `SendRequest` (a signing secret,
 //! say) means updating this file as well, and re-pinning it with `kiln spec manifest`.
+//!
+//! The targets here are on `127.0.0.1`, and they have to be: a spec may not dial the network. A step
+//! that makes the client refuse the addresses a service should not deliver to
+//! (`relay/2.12-ssrf-defense`) therefore has to leave a way for *these* targets to be reachable —
+//! a policy knob, set to "loopback is fine" in [`policy`] below — or it has to change this file
+//! with them. A client that refuses loopback out of the box turns this file red on the final tree,
+//! and the failure will look like a broken client rather than a security decision.
 
 #[path = "support/target.rs"]
 mod target;
