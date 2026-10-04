@@ -1199,24 +1199,32 @@ mod tests {
         assert_eq!(report.capabilities, 97);
         assert_eq!(report.slots, 134);
         assert_eq!(report.ledger_positions, 118);
-        assert_eq!(report.authored_steps, 22, "T1 metadata only, so far");
+        // Every track the ledger plans has metadata now (T1 22 steps + T2 24); the bodies inside
+        // those steps arrive one at a time, which is what the R5 notice below reports.
+        assert_eq!(report.authored_steps, 46, "T1 and T2 metadata");
         assert!(report.is_clean(), "{:?}", report.issues);
         assert!(report.reteaches.is_empty());
         // R5 checks the bodies that exist and reports how many are still missing. Both numbers move
-        // as T1 gets authored, so the notice is checked against the report that produced it.
+        // as the course gets authored, so the notice is checked against the report that produced it.
         match report.skipped.first() {
             Some(notice) => {
                 assert!(
-                    report.bodies < 22,
+                    report.bodies < report.authored_steps,
                     "a skip notice with every body authored?"
                 );
                 assert!(
-                    notice.contains(&format!("checked {} of 22 step bodies", report.bodies)),
+                    notice.contains(&format!(
+                        "checked {} of {} step bodies",
+                        report.bodies, report.authored_steps
+                    )),
                     "{:?}",
                     report.skipped
                 );
             }
-            None => assert_eq!(report.bodies, 22, "no skip notice means every body exists"),
+            None => assert_eq!(
+                report.bodies, report.authored_steps,
+                "no skip notice means every body exists"
+            ),
         }
     }
 }

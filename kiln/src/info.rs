@@ -796,7 +796,15 @@ mod tests {
         let course = Course::load(root).unwrap();
 
         assert_eq!(course.manifest().default_track, "mailer");
-        assert_eq!(course.tracks().len(), 1, "only T1 is authored in M0");
+        assert_eq!(
+            course.tracks().len(),
+            2,
+            "T1 and T2 have metadata; T3-T5 are ledger-only"
+        );
+
+        let relay = course.track("relay").unwrap();
+        assert_eq!(relay.step.len(), 24);
+        assert_eq!(relay.project, "app/relay");
 
         let mailer = course.default_track().unwrap();
         assert_eq!(mailer.step.len(), 22);

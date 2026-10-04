@@ -405,6 +405,18 @@ pub fn expected_slug(requirement: &CapRequirement) -> String {
     )
 }
 
+/// File stem one probe's test target gets in the throwaway crate of [`verify_references`].
+///
+/// Cargo names a test target after the file it is discovered from, and that name has to be a valid
+/// crate name — a probe slug carries its depth after a dot (`delivery-idempotency.apply`) and rustc
+/// refuses one (`error: invalid character '.' in crate name`). The learner's copy of the same
+/// exercise carries the same normalisation in [`Probe::scratch_manifest`], which replaces the dot
+/// with `-` because there the slug becomes a package name; this half is a file, so it is `_`.
+#[must_use]
+fn test_target_stem(slug: &str) -> String {
+    slug.replace('.', "_")
+}
+
 /// What `kiln probe --check` found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckReport {
@@ -464,7 +476,10 @@ pub fn verify_references(
         };
         // The reference is a `lib.rs`; as its own test target it gets the same `cfg(test)` compile
         // it would have in the learner's crate, which is where its `#[cfg(test)] mod tests` lives.
-        write_file(&tests.join(format!("{}.rs", probe.slug)), &text)?;
+        write_file(
+            &tests.join(format!("{}.rs", test_target_stem(&probe.slug))),
+            &text,
+        )?;
     }
     if !missing.is_empty() {
         return Ok(CheckReport {
@@ -486,7 +501,7 @@ pub fn verify_references(
     let output = format!("{}\n{}", ran.stdout, ran.stderr);
     let failed = probes
         .iter()
-        .filter(|probe| output.contains(&format!("tests/{}.rs", probe.slug)))
+        .filter(|probe| output.contains(&format!("tests/{}.rs", test_target_stem(&probe.slug))))
         .map(|probe| {
             (
                 probe.slug.clone(),
@@ -691,6 +706,21 @@ mod tests {
         // And `--reset` is the way back to the exercise.
         probe.reset(&course, temp.path()).expect("reset");
         assert_eq!(std::fs::read_to_string(&lib).unwrap(), EXERCISE);
+    }
+
+    #[test]
+    fn a_check_target_name_is_a_crate_name_cargo_accepts() {
+        // Every probe slug carries its depth after a dot (`delivery-idempotency.apply`), and cargo
+        // discovers a test target by the name of its file: without this, `probe --check` answered
+        // `error: invalid character '.' in crate name` for every reference in the catalogue.
+        let stem = test_target_stem("delivery-idempotency.apply");
+        assert_eq!(stem, "delivery-idempotency_apply");
+        assert!(!stem.contains('.'), "{stem}");
+        assert!(
+            stem.chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character)),
+            "a test target's name has to be a valid crate name: {stem}"
+        );
     }
 
     #[test]
