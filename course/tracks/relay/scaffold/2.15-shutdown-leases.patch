@@ -1,0 +1,145 @@
+diff --git a/src/lease.rs b/src/lease.rs
+new file mode 100644
+index 0000000..f4041bd
+--- /dev/null
++++ b/src/lease.rs
+@@ -0,0 +1,139 @@
++//! Leases: what a claim costs when the worker holding it goes away.
++//!
++//! `relay/2.5-atomic-claim` made a claim a *lease* — `lease_expires_at` says when a worker that
++//! stopped answering loses its rows — and this step is the other half of that sentence: who reads
++//! that instant, and what a worker that is stopping on purpose does instead of waiting for it.
++//!
++//! There are three ways a row in `claimed` stops being worked on, and they are not the same:
++//!
++//! | how it ended | what the row holds | what this module does |
++//! | --- | --- | --- |
++//! | the attempt answered | a record, written by the worker | nothing: the row is `sent` or `owed` |
++//! | the process was killed | nobody, until the lease runs out | [`reclaim_expired`] gives it back |
++//! | the process was asked to stop | an attempt cut short by the drain deadline | [`release_held`] gives it back |
++//!
++//! The middle row is why a claim is a lease and not a lock: `kill -9` cannot be handled, so the only
++//! thing that can recover the row is the instant written on it. The bottom row is why a lease is not
++//! the *only* thing that can recover a row: a worker that is stopping knows it is stopping, and it
++//! knows which rows it holds — so a rollout costs seconds rather than a lease, and the difference is
++//! the difference between a deploy that looks like an outage and one nobody notices.
++//!
++//! Three shapes here are decisions rather than taste:
++//!
++//! * **stopping is a sequence, and the sequence is the point.** Stop *claiming* first (a worker that
++//!   claims while it is draining is a worker that takes on work it will not finish), then give the
++//!   attempts in flight a deadline to answer ([`crate::concurrency::Gate::quiesce`]), then hand back
++//!   whatever is left. Each step is observable, and each one can be got wrong on its own;
++//! * **the drain deadline is a budget, not a hope.** The subscriber on the other side may answer in
++//!   a second or in a minute, and the orchestrator that sent `SIGTERM` has a `SIGKILL` for the
++//!   process that will not stop — the deadline has to be shorter than that, and the work it cuts has
++//!   to be *given back* rather than left to expire;
++//! * **a reclaimed row is not a lease that was given back.** They differ in exactly one number:
++//!   [`reclaim_expired`] counts the attempt, because nobody knows whether the subscriber was reached,
++//!   and [`release_held`] does not, because the attempt it interrupts was never allowed to finish
++//!   *and* because the row is going back to the queue deliberately. Counting nothing in the first
++//!   case is how a delivery whose worker keeps dying is retried for ever; counting in the second is
++//!   how a rollout makes a delivery look like it failed.
++//!
++//! **And the boundary that has to be said out loud**: this is `async/graceful-shutdown@apply` —
++//! `mailer/1.14-worker` — carried one level down. There, stopping was "stop accepting, drain what is
++//! in memory, exit inside a deadline", and the thing at risk was a message in a `VecDeque`: dropping
++//! it lost a confirmation email for ever. Here the same sequence is run over work that is *claimed in
++//! a database*, and the cost of dropping a task has changed shape: the delivery is not lost, it
++//! becomes **invisible for the length of the lease** — the row is `claimed` by a process that no
++//! longer exists, and only the instant on it can say when the work comes back. That is why the drain
++//! deadline and the lease are two numbers and not one: the first decides how much work this process
++//! abandons, the second decides how long the queue hides the damage.
++
++use std::future::Future;
++use std::pin::pin;
++use std::time::Duration;
++
++use sqlx::PgPool;
++
++use crate::concurrency::{Report, Worker};
++use crate::error::Error;
++
++/// How long a worker that has nothing to do waits before asking the queue again.
++///
++/// A worker that claims as fast as the database can answer is a worker that spends a core on an empty
++/// queue, and the queue's own answer to "nothing" is already a query. The wait is short enough that a
++/// delivery that arrives during it is attempted promptly, and long enough that an idle process is
++/// idle.
++const IDLE: Duration = Duration::from_millis(200);
++
++/// Give back every row whose lease has run out, so the work it holds is claimable again.
++///
++/// This is the recovery `kill -9` needs and cannot ask for: the process is gone, nothing will write
++/// its rows down, and the only record of it that survives is `lease_expires_at`. The row goes back to
++/// `pending`, due now, with the delivery id, the event and the attempt count it had — so the
++/// subscriber is told about it again, which is a duplicate, which is what
++/// `relay/2.6-at-least-once` says this service pays for a crash in the window between sending and
++/// recording.
++///
++/// The attempt is counted. Nobody observed what happened to it: it may have been sent, it may never
++/// have left. Not counting it would mean a delivery whose worker keeps dying is attempted for ever
++/// (the failure count is the only thing that ends a delivery), and counting it is the reading that
++/// keeps the retry budget honest — `relay/2.10-dlq` is where a delivery that kills its worker
++/// belongs, and it can only get there if this is counted.
++///
++/// The statement is one `update` over the rows a partial index holds
++/// (`migrations/0007_lease_reclaim.sql`), and it writes nothing when there is nothing to reclaim.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update cannot be made.
++pub async fn reclaim_expired(pool: &PgPool) -> Result<u64, Error> {
++    let _ = pool;
++    todo!("step relay/2.15-shutdown-leases")
++}
++
++/// Give back every lease this worker still holds.
++///
++/// The rows keep their failure count and their instant: nothing about them failed. What is released
++/// is a claim whose attempt was cut short by the drain deadline, or a claim that was taken and never
++/// attempted because the signal arrived in between.
++///
++/// Only this worker's rows move, and the filter is the whole safety property: a worker that could
++/// release *anybody's* lease could hand another worker's in-flight attempt to a third one, which is
++/// two attempts at one delivery with nobody to blame.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when the update cannot be made.
++pub async fn release_held(pool: &PgPool, worker: &str) -> Result<u64, Error> {
++    let _ = (pool, worker);
++    todo!("step relay/2.15-shutdown-leases")
++}
++
++/// Run the worker until `shutdown` resolves: stop claiming, drain what is in flight, give back what
++/// the deadline cut short.
++///
++/// The order is the step, and every part of it is observable:
++///
++/// 1. **the signal ends the claiming.** The turn that is already running is not cancelled *by*
++///    stopping — it runs until it is either finished or cut by the deadline — and no new turn starts,
++///    so a worker that is stopping takes on no new work;
++/// 2. **the attempts in flight get `drain` to answer.** The wait is on the gate's seats, so it is
++///    exactly "is anything still in flight", and a subscriber that answers in time has its delivery
++///    recorded as delivered — the one thing this sequence is for;
++/// 3. **whatever is left is given back now.** A lease left to expire is a delivery that is invisible
++///    for as long as the lease says; a lease given back is claimable by the next worker to ask. A
++///    stop is the one moment this service knows its rows are free;
++/// 4. **the turns that never happened are not a loss.** A row claimed by a turn whose future was
++///    dropped is a row this function's [`release_held`] put back, and a row whose attempt was cut
++///    mid-request is a duplicate the receiver deduplicates on the delivery id.
++///
++/// # Errors
++///
++/// Returns [`Error::Database`] when a claim, a record, the reclaim or the release fails. A failure
++/// here is not a lost delivery: the row is wherever the last write left it, and its lease says when
++/// it comes back.
++pub async fn serve(
++    worker: &Worker,
++    drain: Duration,
++    shutdown: impl Future<Output = ()> + Send,
++) -> Result<Report, Error> {
++    let _ = (worker, drain, shutdown);
++    todo!("step relay/2.15-shutdown-leases")
++}

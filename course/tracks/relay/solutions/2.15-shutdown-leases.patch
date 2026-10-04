@@ -1,0 +1,434 @@
+diff --git a/migrations/0007_lease_reclaim.sql b/migrations/0007_lease_reclaim.sql
+new file mode 100644
+index 0000000..d2a4834
+--- /dev/null
++++ b/migrations/0007_lease_reclaim.sql
+@@ -0,0 +1,11 @@
++-- A worker that is killed leaves its rows in `claimed`, and the only thing that brings them back is
++-- `lease_expires_at` (step relay/2.15-shutdown-leases). Recovering them is one `update` over exactly
++-- those rows, so this index is in exactly that shape: partial on `claimed`, keyed on the instant the
++-- lease ends.
++--
++-- Without it that statement walks every delivery this service has ever owed — once per worker, per
++-- turn — and the cost of *recovering* from a crash grows with the tenant's history. With it, the
++-- statement reads the rows that have expired and nothing else.
++create index deliveries_expired_lease_idx
++    on deliveries (lease_expires_at)
++    where state = 'claimed';
+diff --git a/src/concurrency.rs b/src/concurrency.rs
+index 8b60c15..7d26944 100644
+--- a/src/concurrency.rs
++++ b/src/concurrency.rs
+@@ -254,7 +254,7 @@ pub struct Report {
+ 
+ impl Report {
+     /// An empty report for a run of `turns` turns.
+-    fn of(turns: usize) -> Self {
++    pub(crate) fn of(turns: usize) -> Self {
+         Self {
+             turns,
+             ..Self::default()
+@@ -262,7 +262,7 @@ impl Report {
+     }
+ 
+     /// Add one turn's counts.
+-    fn count(&mut self, tick: Tick) {
++    pub(crate) fn count(&mut self, tick: Tick) {
+         self.claimed += tick.claimed;
+         self.sent += tick.sent;
+         self.retried += tick.retried;
+@@ -295,6 +295,8 @@ pub struct Worker {
+     limits: Limits,
+     /// The name its claims are stamped with, so a row can say who took it.
+     name: String,
++    /// How long its claims stay invisible if it stops answering.
++    lease: Duration,
+ }
+ 
+ impl Worker {
+@@ -317,9 +319,28 @@ impl Worker {
+             budget,
+             limits,
+             name: name.to_owned(),
++            lease: claim::LEASE,
+         }
+     }
+ 
++    /// The same worker, holding its claims for `lease`.
++    ///
++    /// `relay/2.5-atomic-claim` fixed the lease at a minute, and `relay/2.15-shutdown-leases` is
++    /// where that stops being a constant: the number is the trade between how long a *crashed*
++    /// worker's deliveries are invisible and how often a worker that is merely slow loses rows it is
++    /// still working on. It has to be longer than the slowest attempt a deployment is willing to
++    /// wait for (`Policy::deadline`), or the worker's own rows expire underneath it.
++    #[must_use]
++    pub fn leasing(self, lease: Duration) -> Self {
++        Self { lease, ..self }
++    }
++
++    /// The pool this worker claims from.
++    #[must_use]
++    pub fn pool(&self) -> &PgPool {
++        &self.pool
++    }
++
+     /// The seats this worker holds work in.
+     #[must_use]
+     pub fn gate(&self) -> &Gate {
+@@ -348,7 +369,7 @@ impl Worker {
+             &self.pool,
+             &self.name,
+             i64::from(self.limits.in_flight()),
+-            claim::LEASE,
++            self.lease,
+         )
+         .await?;
+         let claimed = ordering::in_queue_order(claimed);
+diff --git a/src/config.rs b/src/config.rs
+index 57938d6..a1507e5 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -10,6 +10,7 @@
+ //! rather than each setting reading whichever source it likes.
+ 
+ use std::path::PathBuf;
++use std::time::Duration;
+ 
+ use crate::concurrency::Limits;
+ use crate::error::Error;
+@@ -96,6 +97,13 @@ pub struct Delivery {
+     /// [`Limits`] rather than two loose numbers, for the reason [`Quota`] is the rate limit's own
+     /// type: a bound of zero is a service that does nothing, and the type is what cannot hold one.
+     pub limits: Limits,
++    /// How long a claim stays invisible when the worker holding it stops answering: what a crash
++    /// costs, and the number that has to be longer than the slowest attempt a deployment waits for.
++    pub lease: Duration,
++    /// How long a worker that is stopping waits for the attempts it has in flight, before it gives
++    /// their leases back. This is the number an orchestrator's `terminationGracePeriodSeconds` has to
++    /// be larger than (`relay/2.15-shutdown-leases`).
++    pub drain: Duration,
+ }
+ 
+ /// How much one caller may ask for.
+@@ -257,6 +265,10 @@ impl Config {
+             read_count(&env_layer, file.as_ref(), "delivery.max_in_flight")?.unwrap_or(4);
+         let max_backlog =
+             read_count(&env_layer, file.as_ref(), "delivery.max_backlog")?.unwrap_or(10_000);
++        let lease = read_seconds(&env_layer, file.as_ref(), "delivery.lease_seconds")?
++            .unwrap_or(Duration::from_secs(60));
++        let drain = read_seconds(&env_layer, file.as_ref(), "delivery.drain_seconds")?
++            .unwrap_or(Duration::from_secs(10));
+         let burst = read_count(&env_layer, file.as_ref(), "rate_limit.burst")?.unwrap_or(32);
+         let per_second =
+             read_count(&env_layer, file.as_ref(), "rate_limit.per_second")?.unwrap_or(16);
+@@ -274,6 +286,8 @@ impl Config {
+             delivery: Delivery {
+                 allow_private_targets,
+                 limits: Limits::new(max_in_flight, max_backlog)?,
++                lease,
++                drain,
+             },
+             rate_limit: Quota::new(burst, per_second)?,
+             bootstrap: Bootstrap {
+@@ -315,6 +329,14 @@ impl Config {
+             "  delivery.max_backlog = {}",
+             self.delivery.limits.backlog()
+         ));
++        lines.push(format!(
++            "  delivery.lease_seconds = {}",
++            self.delivery.lease.as_secs()
++        ));
++        lines.push(format!(
++            "  delivery.drain_seconds = {}",
++            self.delivery.drain.as_secs()
++        ));
+         lines.push(format!("  rate_limit.burst = {}", self.rate_limit.burst()));
+         lines.push(format!(
+             "  rate_limit.per_second = {}",
+@@ -450,6 +472,25 @@ fn read_count(
+     })
+ }
+ 
++/// One whole number of seconds, as a duration, refusing zero and text that is not a number.
++///
++/// The zero is refused here rather than at the use site because there is no use for it: a lease of
++/// nothing expires under the worker that holds the row, and a drain of nothing refuses to let an
++/// attempt answer, so both are a deployment turning its own service off in a way it did not mean.
++fn read_seconds(
++    env_layer: &EnvLayer,
++    file: Option<&FileLayer>,
++    name: &str,
++) -> Result<Option<Duration>, Error> {
++    match read_count(env_layer, file, name)? {
++        None => Ok(None),
++        Some(0) => Err(Error::Config(format!(
++            "`{name}` cannot be zero: that is a lease that expires at once, or a drain that lets              nothing finish"
++        ))),
++        Some(seconds) => Ok(Some(Duration::from_secs(u64::from(seconds)))),
++    }
++}
++
+ /// Read a boolean setting, refusing text that is neither.
+ ///
+ /// A setting that is silently false because it was spelled `true `, `TRUE` or `1n` is the kind of
+@@ -567,6 +608,32 @@ mod tests {
+         assert!(!report.contains("key-acme-123"), "{report}");
+     }
+ 
++    #[test]
++    fn the_lease_and_the_drain_are_read_and_zero_is_refused() {
++        let configured = Config::load(
++            &Flags::default(),
++            &env(&[
++                ("RELAY__DELIVERY__LEASE_SECONDS", "90"),
++                ("RELAY__DELIVERY__DRAIN_SECONDS", "5"),
++            ]),
++        )
++        .expect("the settings load");
++        assert_eq!(
++            (configured.delivery.lease, configured.delivery.drain),
++            (Duration::from_secs(90), Duration::from_secs(5))
++        );
++        for name in [
++            "RELAY__DELIVERY__LEASE_SECONDS",
++            "RELAY__DELIVERY__DRAIN_SECONDS",
++        ] {
++            assert!(
++                Config::load(&Flags::default(), &env(&[(name, "0")])).is_err(),
++                "`{name} = 0` is not a lease and not a deadline"
++            );
++            assert!(Config::load(&Flags::default(), &env(&[(name, "later")])).is_err());
++        }
++    }
++
+     #[test]
+     fn a_bound_is_read_and_a_bound_of_nothing_is_refused() {
+         let configured = Config::load(
+diff --git a/src/lease.rs b/src/lease.rs
+index f4041bd..c40a7a2 100644
+--- a/src/lease.rs
++++ b/src/lease.rs
+@@ -84,8 +84,17 @@ const IDLE: Duration = Duration::from_millis(200);
+ ///
+ /// Returns [`Error::Database`] when the update cannot be made.
+ pub async fn reclaim_expired(pool: &PgPool) -> Result<u64, Error> {
+-    let _ = pool;
+-    todo!("step relay/2.15-shutdown-leases")
++    let reclaimed = sqlx::query(
++        "update deliveries \
++            set state = 'pending', attempts = attempts + 1, next_attempt_at = now(), \
++                locked_by = null, locked_at = null, lease_expires_at = null, \
++                last_error = coalesce(last_error, 'the worker holding this delivery stopped') \
++          where state = 'claimed' and lease_expires_at is not null and lease_expires_at <= now()",
++    )
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(reclaimed.rows_affected())
+ }
+ 
+ /// Give back every lease this worker still holds.
+@@ -102,8 +111,16 @@ pub async fn reclaim_expired(pool: &PgPool) -> Result<u64, Error> {
+ ///
+ /// Returns [`Error::Database`] when the update cannot be made.
+ pub async fn release_held(pool: &PgPool, worker: &str) -> Result<u64, Error> {
+-    let _ = (pool, worker);
+-    todo!("step relay/2.15-shutdown-leases")
++    let released = sqlx::query(
++        "update deliveries \
++            set state = 'pending', locked_by = null, locked_at = null, lease_expires_at = null \
++          where state = 'claimed' and locked_by = $1",
++    )
++    .bind(worker)
++    .execute(pool)
++    .await
++    .map_err(Error::Database)?;
++    Ok(released.rows_affected())
+ }
+ 
+ /// Run the worker until `shutdown` resolves: stop claiming, drain what is in flight, give back what
+@@ -134,6 +151,36 @@ pub async fn serve(
+     drain: Duration,
+     shutdown: impl Future<Output = ()> + Send,
+ ) -> Result<Report, Error> {
+-    let _ = (worker, drain, shutdown);
+-    todo!("step relay/2.15-shutdown-leases")
++    let mut report = Report::default();
++    let mut shutdown = pin!(shutdown);
++
++    loop {
++        // Before asking for work, take back the work of whoever stopped answering: a worker that never
++        // looks at expired leases leaves them invisible for ever, and looking is one statement that
++        // writes nothing when there is nothing to write.
++        reclaim_expired(worker.pool()).await?;
++
++        tokio::select! {
++            biased;
++            () = &mut shutdown => break,
++            tick = worker.turn() => {
++                let tick = tick?;
++                report.turns += 1;
++                report.count(tick);
++                if tick.claimed == 0 {
++                    // An empty queue is not a reason to ask again at once.
++                    tokio::select! {
++                        biased;
++                        () = &mut shutdown => break,
++                        () = tokio::time::sleep(IDLE) => {}
++                    }
++                }
++            }
++        }
++    }
++
++    // What is in flight gets the deadline, and what the deadline cuts is given back.
++    worker.gate().quiesce(drain).await;
++    release_held(worker.pool(), worker.name()).await?;
++    Ok(report)
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 3a0fcfd..08767d5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@ pub mod domain;
+ pub mod error;
+ pub mod events;
+ pub mod http;
++pub mod lease;
+ pub mod logging;
+ pub mod openapi;
+ pub mod ordering;
+diff --git a/src/main.rs b/src/main.rs
+index a443ee3..654c2b8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -5,11 +5,20 @@
+ //! library; this file only decides when each piece happens and which exit code ends the process.
+ 
+ use std::process::ExitCode;
++use std::sync::Arc;
++use std::time::Duration;
+ 
++use relay::backoff::Budget;
++use relay::concurrency::{Gate, Worker};
+ use relay::config::{Config, Flags};
+ use relay::http;
++use relay::lease;
+ use relay::logging::{self, RunId};
++use relay::ordering::Lanes;
++use relay::outbound::{HttpSender, Policy};
++use relay::signing::DbSecrets;
+ use relay::{USAGE, error::Error};
++use tokio::sync::watch;
+ 
+ fn main() -> ExitCode {
+     let flags = match Flags::from_args(std::env::args()) {
+@@ -72,11 +81,107 @@ fn serve(config: Config, run: RunId) -> Result<(), Error> {
+         let listener = tokio::net::TcpListener::bind(&address)
+             .await
+             .map_err(|error| Error::Config(format!("cannot bind {address}: {error}")))?;
++        // What the worker needs out of the configuration, read before the configuration is handed to
++        // the HTTP state: the delivery policy is the deployment's (`relay/2.12-ssrf-defense`), the
++        // bound is its (`relay/2.14-backpressure`), and the lease is its
++        // (`relay/2.15-shutdown-leases`).
++        let policy = Policy::of(&config);
++        let limits = config.delivery.limits;
++        let lease = config.delivery.lease;
++        let drain = config.delivery.drain;
+         let state = http::AppState::start(config, &run).await?;
+-        http::serve_with_shutdown(listener, state, &run, shutdown_signal()).await
++        let worker = worker_of(&state, policy, limits, lease, &run);
++
++        // One signal, two things that have to stop: the server stops accepting, and the worker stops
++        // claiming, drains what is in flight and gives its leases back. They are separate because
++        // they are separate promises — a request in flight is not a delivery in flight — and both
++        // get the signal.
++        let stopping = stopping_signal();
++        let http_stops = stopping_when(stopping.clone());
++        let worker_stops = stopping_when(stopping);
++        let mut serving = std::pin::pin!(http::serve_with_shutdown(
++            listener, state, &run, http_stops
++        ));
++        let mut working = std::pin::pin!(lease::serve(&worker, drain, worker_stops));
++
++        // Both halves are awaited, and neither is dropped on the way out. `select!` alone would
++        // return as soon as the *first* of them finished and drop the other one's future — which is
++        // how an in-flight delivery vanishes with no line in the log, and it is the trap
++        // `mailer/1.14-worker` names. The signal stops both, they stop at their own pace (the worker
++        // takes up to `drain`), and the process leaves when the slower one is done.
++        let mut failure = None;
++        let mut served = false;
++        let mut worked = false;
++        while !(served && worked) {
++            tokio::select! {
++                result = &mut serving, if !served => {
++                    served = true;
++                    failure = failure.or(result.err());
++                }
++                result = &mut working, if !worked => {
++                    worked = true;
++                    match result {
++                        Ok(report) => tracing::info!(
++                            turns = report.turns,
++                            sent = report.sent,
++                            "the delivery worker stopped"
++                        ),
++                        Err(error) => failure = failure.or(Some(error)),
++                    }
++                }
++            }
++        }
++        match failure {
++            Some(error) => Err(error),
++            None => Ok(()),
++        }
+     })
+ }
+ 
++/// The worker this process runs: one of them, as many seats as the deployment allows, and a name
++/// that is unique to this run.
++///
++/// The name matters more than it looks: it is what a claim is stamped with, and what a stopping
++/// worker uses to give back *its own* leases. Two processes sharing a name would release each
++/// other's rows (`relay/2.15-shutdown-leases`).
++fn worker_of(
++    state: &http::AppState,
++    policy: Policy,
++    limits: relay::concurrency::Limits,
++    lease: Duration,
++    run: &RunId,
++) -> Worker {
++    // Three deployment decisions meet here: where a delivery may go (`policy`), how much of it this
++    // process holds (`limits`), and how long its claims stay invisible if it stops answering
++    // (`lease`).
++    let secrets = Arc::new(DbSecrets::new(state.db().pool().clone()));
++    Worker::new(
++        state.db().pool().clone(),
++        Arc::new(HttpSender::signing(policy, secrets)),
++        Arc::new(Gate::new(limits)),
++        Arc::new(Lanes::new()),
++        Budget::default(),
++        limits,
++        &format!("relay-{}", run.as_str()),
++    )
++    .leasing(lease)
++}
++
++/// Resolve when the process is asked to stop, and tell both halves of it.
++fn stopping_signal() -> watch::Receiver<bool> {
++    let (sender, receiver) = watch::channel(false);
++    tokio::spawn(async move {
++        shutdown_signal().await;
++        let _ = sender.send(true);
++    });
++    receiver
++}
++
++/// A future that resolves when the process is stopping.
++async fn stopping_when(mut receiver: watch::Receiver<bool>) {
++    let _ = receiver.wait_for(|stopping| *stopping).await;
++}
++
+ /// Resolve when the process is asked to stop: `SIGTERM` (an orchestrator) or `Ctrl-C` (a person).
+ async fn shutdown_signal() {
+     let ctrl_c = async {
