@@ -847,3 +847,15 @@ podman VM 上跑 6–11 个 `kiln-relay-pg-*` 容器**，`load average` 6–12�
 新文件，`@@ -0,0 +1,N @@` 的 N 随之更新），证据：`kiln selftest` 1.9 / 1.19 / 1.21 全绿（57s / 85s / 87s，
 门分别 9/9、9/9、10/10），三个夹具过 `rustfmt --check`。原碰撞只观测到一次（上面那次 ci），复现依赖
 「另一个进程同时在起容器」，所以这里能给的证据是代码上的规则与三条契约，不是「再也没红过」。
+
+### 复测
+
+在 `fd986a6` 上（改了夹具之后的冻结树），同一台机器、另一个 thread 的容器还在跑（`load average` 4.6–6.8）：
+
+| 检查 | 结果 | 数字 | 耗时 |
+| --- | --- | --- | --- |
+| `cargo xtask ci` | **绿** | `22/22 step(s) hold the contract`；workspace 184+15+1 全过（184 里含新增的那条 links 单测）；`22 spec file(s) pinned`；lint-caps `97 · 134 · 118 · 22`；新步骤 `30 page(s) · 200 link(s) · 119 external target(s)` + `skipped app/` | **941.6s** |
+| `kiln selftest mailer/1.9-postgres` / `1.19-test-layering` / `1.21-container` | **绿** | 各 `1/1 step(s) hold the contract`（门 9/9、9/9、10/10） | 57.1s / 84.9s / 86.7s |
+
+941.6s 比第十六段的 579s 长，原因就是上面那两段：机器上还有另一个 thread 的容器在跑。README 的计时仍写
+`62e7c5c` 的 579s（安静机器上的读数），只把链接数字与新步骤写进清单。
