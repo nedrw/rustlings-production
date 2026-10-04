@@ -1,0 +1,735 @@
+# T2 `relay` — webhook delivery service (24 steps), see `docs/curriculum.md` §7.
+#
+# Same conventions as `course/tracks/mailer/track.toml` (they are enforced by `kiln lint-caps`):
+# `teaches` matches the capability ledger slot by slot, `requires` lists what this step provably
+# builds on, `entry`/`spec`/`scaffold`/`solution` are relative to this track directory, `run.cmd`
+# runs in `project` below and never through a shell, and the gate ladder only ever tightens.
+#
+# The ladder starts at `clippy@2` (curriculum.md §7: the transfer step arrives with stricter lints
+# and no hints) and keeps every rung T1 established: `spec-integrity`, `caps`, `i18n`, `fmt`,
+# `no-todo`, `docs:public`, `exit-code`. `images` is step-scoped (the Postgres steps), `links` sits
+# on the steps that ship a page, and `?deny` is a *should* gate until T3 — `cargo-deny` is not
+# installed on every machine, and a gate that cannot run must never turn a good step red
+# (plan.md §6, authoring.md §7.2).
+#
+# The first step of the track is a `transfer` step: the learner has done every one of these things
+# in `mailer`, so the body is a RECALL/DELTA, the scaffold is the project skeleton, and the spec
+# judges the rebuilt service rather than a new idea.
+
+format_version = 1
+id = "relay"
+index = 2
+title = "Relay — webhook delivery service"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/relay"
+
+# Exit capabilities (curriculum.md §5): what this track has to have established by its last step.
+exit = [
+    "delivery/at-least-once@design",
+    "delivery/dlq@apply",
+    "http/rate-limit@apply",
+    "ops/degradation-modes@apply",
+    "sec/hmac-signing@apply",
+    "sec/ssrf-defense@apply",
+]
+
+# ---------------------------------------------------------------------------------------
+# Phase A — the service and its boundaries (2.1-2.6): a multi-tenant ingest path that keeps
+# what it accepted, at least once.
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "2.1-project-skeleton"
+title = "Rebuild the service shape: typed config, logs, migrations, middleware"
+kind = "milestone"
+origin = "transfer"
+entry = "docs/steps/en/relay/2.1-project-skeleton.md"
+time_hint = "120m"
+concepts = ["layered middleware", "multi-tenant schema", "startup order"]
+teaches = ["http/middleware-layering@apply"]
+requires = [
+    "repo/workspace-layout@apply",
+    "cfg/layered-config@apply",
+    "obs/structured-logs@apply",
+    "db/migrations@apply",
+]
+run = { cmd = "cargo test -p relay --test spec_skeleton" }
+spec = ["spec/2.1/skeleton.rs"]
+scaffold = "skeleton"
+solution = "solutions/2.1-project-skeleton.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "Middleware order is the interface: correlation id outermost, then request logging, then auth (so a rejected request is still logged with its id), then the handler."
+
+[[step]]
+id = "2.2-idempotent-ingest"
+title = "Accept an event once, however many times it is posted"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.2-idempotent-ingest.md"
+time_hint = "90m"
+concepts = ["idempotency key", "unique constraint", "replay vs retry"]
+teaches = ["api/idempotency-key@apply"]
+requires = [
+    "http/middleware-layering@apply",
+    "db/unique-as-concurrency@apply",
+    "db/migrations@apply",
+]
+run = { cmd = "cargo test -p relay --test spec_ingest" }
+spec = ["spec/2.2/ingest.rs"]
+scaffold = "scaffold/2.2-idempotent-ingest.patch"
+solution = "solutions/2.2-idempotent-ingest.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "The unique index on (tenant, idempotency key) is the whole mechanism; the second POST has to answer with the *first* event, not with an error."
+
+[[step]]
+id = "2.3-contract-first"
+title = "The API as a contract: generated document, snapshot, compatibility"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.3-contract-first.md"
+time_hint = "90m"
+concepts = ["generated OpenAPI", "contract snapshot", "backwards compatibility"]
+teaches = ["api/contract-testing@apply"]
+requires = ["api/idempotency-key@apply", "http/service-skeleton@apply"]
+run = { cmd = "cargo test -p relay --test spec_contract" }
+spec = ["spec/2.3/contract.rs"]
+scaffold = "scaffold/2.3-contract-first.patch"
+solution = "solutions/2.3-contract-first.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "A snapshot nobody compares is decoration: the test has to fail when a field is renamed, and the old client's payload has to keep parsing."
+
+[[step]]
+id = "2.4-cursor-pagination"
+title = "Cursor pagination that never skips or repeats a row"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.4-cursor-pagination.md"
+time_hint = "90m"
+concepts = ["cursor pagination", "stable ordering", "index for the sort"]
+teaches = ["api/pagination@apply"]
+requires = ["api/idempotency-key@apply", "db/migrations@apply"]
+run = { cmd = "cargo test -p relay --test spec_pagination" }
+spec = ["spec/2.4/pagination.rs"]
+scaffold = "scaffold/2.4-cursor-pagination.patch"
+solution = "solutions/2.4-cursor-pagination.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "A cursor is a position, not an offset: `(created_at, id)` with a strict `>` in both columns, and the ORDER BY has to match the index."
+
+[[step]]
+id = "2.5-atomic-claim"
+title = "Claim work atomically: FOR UPDATE SKIP LOCKED"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.5-atomic-claim.md"
+time_hint = "90m"
+concepts = ["row locking", "SKIP LOCKED", "claim batch"]
+teaches = ["db/atomic-claim@apply"]
+requires = ["db/migrations@apply", "db/transactions@apply"]
+run = { cmd = "cargo test -p relay --test spec_claim" }
+spec = ["spec/2.5/claim.rs"]
+scaffold = "scaffold/2.5-atomic-claim.patch"
+solution = "solutions/2.5-atomic-claim.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "`SELECT … FOR UPDATE SKIP LOCKED` inside one statement that also stamps the claim; two workers running it at the same time must come back with disjoint sets."
+
+[[step]]
+id = "2.6-at-least-once"
+title = "At-least-once: write down what the delivery guarantees, and test it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.6-at-least-once.md"
+time_hint = "120m"
+concepts = ["delivery semantics", "decision record", "crash window"]
+teaches = ["delivery/at-least-once@design"]
+requires = ["db/atomic-claim@apply", "delivery/idempotency@apply", "db/transactions@apply"]
+run = { cmd = "cargo test -p relay --test spec_at_least_once" }
+spec = ["spec/2.6/at_least_once.rs"]
+scaffold = "scaffold/2.6-at-least-once.patch"
+solution = "solutions/2.6-at-least-once.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "The gap between `sent` and `recorded` is the duplicate window; the ADR has to name it and the test has to prove the row comes back after a crash."
+
+# ---------------------------------------------------------------------------------------
+# Phase B — reaching the subscriber (2.7-2.12): the outbound client, the retry budget, order,
+# poison pills, the signature and who we are willing to talk to.
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "2.7-outbound-client"
+title = "An outbound client you can reason about: deadlines, keep-alive, redirects"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.7-outbound-client.md"
+time_hint = "120m"
+concepts = ["layered timeouts", "keep-alive", "redirect policy"]
+teaches = ["outbound/http-client@apply"]
+requires = ["err/typed-errors@apply", "http/service-skeleton@apply", "cfg/layered-config@apply"]
+run = { cmd = "cargo test -p relay --test spec_outbound" }
+spec = ["spec/2.7/outbound.rs"]
+scaffold = "scaffold/2.7-outbound-client.patch"
+solution = "solutions/2.7-outbound-client.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "Three deadlines, not one: connect, per-read, and the whole attempt — plus a redirect policy that counts hops and refuses a loop instead of following it forever."
+
+[[step]]
+id = "2.8-retry-budget"
+title = "Retry with a budget: jitter, caps, and a breaker"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.8-retry-budget.md"
+time_hint = "120m"
+concepts = ["exponential backoff", "full jitter", "circuit breaker"]
+teaches = ["delivery/retry-budget@design"]
+requires = ["outbound/http-client@apply", "delivery/idempotency@apply"]
+run = { cmd = "cargo test -p relay --test spec_retry" }
+spec = ["spec/2.8/retry.rs"]
+scaffold = "scaffold/2.8-retry-budget.patch"
+solution = "solutions/2.8-retry-budget.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+]
+hint = "The budget is the thing that stops a dead endpoint from eating the worker: after N failures the breaker opens, and the deliveries stay queued instead of burning attempts."
+
+[[step]]
+id = "2.9-ordering"
+title = "Order per subscriber, concurrency for everyone else"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.9-ordering.md"
+time_hint = "90m"
+concepts = ["per-key serialization", "in-flight map", "fairness"]
+teaches = ["delivery/ordering@apply"]
+requires = [
+    "outbound/http-client@apply",
+    "delivery/at-least-once@design",
+    "async/graceful-shutdown@apply",
+]
+run = { cmd = "cargo test -p relay --test spec_ordering" }
+spec = ["spec/2.9/ordering.rs"]
+scaffold = "scaffold/2.9-ordering.patch"
+solution = "solutions/2.9-ordering.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "A keyed mutex, not a big lock: one in-flight delivery per endpoint, and a second endpoint that must not wait behind the first one's slow subscriber."
+
+[[step]]
+id = "2.10-dlq"
+title = "Poison pills do not block the queue: give up, isolate, replay"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.10-dlq.md"
+time_hint = "90m"
+concepts = ["dead letter queue", "terminal failure", "replay"]
+teaches = ["delivery/dlq@apply"]
+requires = ["delivery/retry-budget@design", "delivery/ordering@apply"]
+run = { cmd = "cargo test -p relay --test spec_dlq" }
+spec = ["spec/2.10/dlq.rs"]
+scaffold = "scaffold/2.10-dlq.patch"
+solution = "solutions/2.10-dlq.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "Two terminal states, not one: a 4xx that will never work, and attempts that ran out. Both leave the queue, both stay queryable, and replay puts one back without losing its history."
+
+[[step]]
+id = "2.11-hmac-signing"
+title = "Sign what you send: HMAC, a timestamp, and a constant-time check"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.11-hmac-signing.md"
+time_hint = "90m"
+concepts = ["HMAC-SHA256", "timestamped signature", "replay window"]
+teaches = ["sec/hmac-signing@apply"]
+requires = ["outbound/http-client@apply", "sec/secrets-management@apply"]
+run = { cmd = "cargo test -p relay --test spec_signing" }
+spec = ["spec/2.11/signing.rs"]
+scaffold = "scaffold/2.11-hmac-signing.patch"
+solution = "solutions/2.11-hmac-signing.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "Sign the exact bytes you send, include a timestamp and the delivery id, and compare with `subtle` — a `==` on a tag leaks where it diverges."
+
+[[step]]
+id = "2.12-ssrf-defense"
+title = "Only deliver where we are allowed to: target validation"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.12-ssrf-defense.md"
+time_hint = "90m"
+concepts = ["address allowlist", "DNS rebinding", "redirect re-validation"]
+teaches = ["sec/ssrf-defense@apply"]
+requires = ["outbound/http-client@apply", "http/middleware-layering@apply"]
+run = { cmd = "cargo test -p relay --test spec_ssrf" }
+spec = ["spec/2.12/ssrf.rs"]
+scaffold = "scaffold/2.12-ssrf-defense.patch"
+solution = "solutions/2.12-ssrf-defense.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "Resolve once, check the address you resolved, and connect to that address — checking the hostname and then letting the client resolve it again is the rebinding hole."
+
+# ---------------------------------------------------------------------------------------
+# Phase C — load, limits and leases (2.13-2.16): what happens when the queue is under pressure.
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "2.13-rate-limit"
+title = "Per-tenant rate limits that cannot starve each other"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.13-rate-limit.md"
+time_hint = "90m"
+concepts = ["token bucket", "per-tenant quota", "Retry-After"]
+teaches = ["http/rate-limit@apply"]
+requires = ["http/middleware-layering@apply", "api/idempotency-key@apply"]
+run = { cmd = "cargo test -p relay --test spec_ratelimit" }
+spec = ["spec/2.13/ratelimit.rs"]
+scaffold = "scaffold/2.13-rate-limit.patch"
+solution = "solutions/2.13-rate-limit.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+hint = "A shared bucket is a shared fate: one bucket per tenant (plus one for unauthenticated callers), and 429 has to say when to come back."
+
+[[step]]
+id = "2.14-backpressure"
+title = "Bounded concurrency: the queue has a bottom"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.14-backpressure.md"
+time_hint = "120m"
+concepts = ["semaphore", "bounded work", "starvation"]
+teaches = ["async/backpressure@apply"]
+requires = ["async/backpressure@aware", "http/rate-limit@apply", "db/atomic-claim@apply"]
+run = { cmd = "cargo test -p relay --test spec_backpressure" }
+spec = ["spec/2.14/backpressure.rs"]
+scaffold = "scaffold/2.14-backpressure.patch"
+solution = "solutions/2.14-backpressure.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "A permit per in-flight delivery and a hard cap on how much is claimed at once: when the target is slow, the number that grows is `backlog`, not memory."
+
+[[step]]
+id = "2.15-shutdown-leases"
+title = "Shutdown with in-flight leases: recovery without a stuck row"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/relay/2.15-shutdown-leases.md"
+time_hint = "120m"
+concepts = ["claim lease", "crash recovery", "drain deadline"]
+teaches = ["async/graceful-shutdown@design"]
+requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
+run = { cmd = "cargo test -p relay --test spec_leases" }
+spec = ["spec/2.15/leases.rs"]
+scaffold = "scaffold/2.15-shutdown-leases.patch"
+solution = "solutions/2.15-shutdown-leases.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "A claim is a lease with an expiry, not a lock: a clean stop releases it early, a `kill -9` lets it expire, and the deadline you pick decides how long a delivery is invisible."
+
+[[step]]
+id = "2.16-authz-audit"
+title = "The authorization matrix, and the audit trail behind it"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/relay/2.16-authz-audit.md"
+time_hint = "120m"
+concepts = ["authorization matrix", "audit log", "no backdoor"]
+teaches = ["sec/authz-tenant-isolation@design"]
+requires = ["sec/authz-tenant-isolation@apply", "http/middleware-layering@apply"]
+run = { cmd = "cargo test -p relay --test spec_authz" }
+spec = ["spec/2.16/authz.rs"]
+scaffold = "scaffold/2.16-authz-audit.patch"
+solution = "solutions/2.16-authz-audit.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "Write the matrix down as data and test it as a matrix — every route × every tenant — and log privileged actions with enough context to answer \"who did what, and what did we decide\"."
+
+# ---------------------------------------------------------------------------------------
+# Phase D — proof (2.17-2.21), then shipping it (2.22-2.24).
+# ---------------------------------------------------------------------------------------
+
+[[step]]
+id = "2.17-chaos-injection"
+title = "Inject the failures you are afraid of: delay, reset, half-open"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.17-chaos-injection.md"
+time_hint = "120m"
+concepts = ["fault proxy", "deterministic injection", "self-healing"]
+teaches = ["test/chaos-injection@apply"]
+requires = ["outbound/http-client@apply", "delivery/retry-budget@design", "test/fake-external@apply"]
+run = { cmd = "cargo test -p relay --test spec_chaos" }
+spec = ["spec/2.17/chaos.rs"]
+scaffold = "scaffold/2.17-chaos-injection.patch"
+solution = "solutions/2.17-chaos-injection.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "The proxy belongs to the test: it sits between the worker and the target, takes orders over its own port, and is deterministic — a fault injection you cannot reproduce is a rumour."
+
+[[step]]
+id = "2.18-delivery-metrics"
+title = "Delivery observability: latency, backlog, and which tenant is slow"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/relay/2.18-delivery-metrics.md"
+time_hint = "90m"
+concepts = ["latency histogram", "backlog gauge", "per-tenant label"]
+teaches = ["obs/metrics-slo@apply"]
+requires = ["obs/metrics-slo@aware", "delivery/dlq@apply", "delivery/ordering@apply"]
+run = { cmd = "cargo test -p relay --test spec_metrics" }
+spec = ["spec/2.18/metrics.rs"]
+scaffold = "scaffold/2.18-delivery-metrics.patch"
+solution = "solutions/2.18-delivery-metrics.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "A p99 without a backlog depth tells you something is slow but not why: export both, label the gauge by tenant, and keep the label set small enough to stay affordable."
+
+[[step]]
+id = "2.19-trace-propagation"
+title = "Carry the trace across the boundary: W3C traceparent"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/relay/2.19-trace-propagation.md"
+time_hint = "90m"
+concepts = ["traceparent", "trace id vs span id", "context across a process"]
+teaches = ["obs/tracing-propagation@apply"]
+requires = ["obs/tracing-propagation@aware", "outbound/http-client@apply"]
+run = { cmd = "cargo test -p relay --test spec_tracing" }
+spec = ["spec/2.19/tracing.rs"]
+scaffold = "scaffold/2.19-trace-propagation.patch"
+solution = "solutions/2.19-trace-propagation.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "The trace id comes in with the request and leaves with the delivery: a new span id at each hop, the same trace id end to end, and the header the downstream sees has to be one you generated, not one you forwarded blindly."
+
+[[step]]
+id = "2.20-load-testing"
+title = "Load test the thing you built, and write down the capacity"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.20-load-testing.md"
+time_hint = "120m"
+concepts = ["load generator", "p99 and queue depth", "capacity estimate"]
+teaches = ["perf/load-testing@apply"]
+requires = ["async/backpressure@apply", "delivery/ordering@apply", "delivery/dlq@apply"]
+run = { cmd = "cargo test -p relay --test spec_load" , timeout = 600 }
+spec = ["spec/2.20/load.rs"]
+scaffold = "scaffold/2.20-load-testing.patch"
+solution = "solutions/2.20-load-testing.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "The number that matters is not throughput but the shape: p99 against concurrent producers, and where the queue depth grows faster than the workers drain it."
+
+[[step]]
+id = "2.21-supply-policy"
+title = "Supply chain policy: licence allowlist and a default-deny unsafe budget"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.21-supply-policy.md"
+time_hint = "90m"
+concepts = ["licence policy", "dependency policy", "unsafe budget"]
+teaches = ["supply/deny-policy@apply", "unsafe/budget@aware"]
+requires = ["repo/toolchain-pinning@apply", "ci/pipeline@apply"]
+run = { cmd = "cargo test -p relay --test spec_policy" }
+spec = ["spec/2.21/policy.rs"]
+scaffold = "scaffold/2.21-supply-policy.patch"
+solution = "solutions/2.21-supply-policy.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "?deny",
+]
+hint = "Write the policy as a file the tool reads (`deny.toml`), not as a paragraph: an allowlist of licences, a ban on unknown sources, and `unsafe` denied at the crate root unless a step can argue for it."
+
+[[step]]
+id = "2.22-rolling-upgrade"
+title = "Ship it without dropping an event: probes and migration order"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.22-rolling-upgrade.md"
+time_hint = "120m"
+concepts = ["liveness vs readiness", "migrate before serving", "dual-version window"]
+teaches = ["ops/rolling-upgrade@apply"]
+requires = ["release/container-image@apply", "db/migrations@apply", "ops/runbook-drill@apply"]
+run = { cmd = "cargo test -p relay --test spec_rolling" }
+spec = ["spec/2.22/rolling.rs"]
+scaffold = "scaffold/2.22-rolling-upgrade.patch"
+solution = "solutions/2.22-rolling-upgrade.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "`/healthz` answers \"alive\", `/readyz` answers \"ready to take traffic\", and the difference is the migration: a second instance starts, migrates, becomes ready, and only then does the first one stop."
+
+[[step]]
+id = "2.23-online-schema"
+title = "Change the schema while both versions are running"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/relay/2.23-online-schema.md"
+time_hint = "90m"
+concepts = ["expand and contract", "nullable first", "backfill"]
+teaches = ["db/schema-online-evolution@aware"]
+requires = ["db/migrations@apply", "ops/rolling-upgrade@apply"]
+run = { cmd = "cargo test -p relay --test spec_schema" }
+spec = ["spec/2.23/schema.rs"]
+scaffold = "scaffold/2.23-online-schema.patch"
+solution = "solutions/2.23-online-schema.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "Add the column nullable with a default, backfill in batches, and only then let the new code depend on it — a migration that rewrites every row while the old binary is serving is an outage with a changelog entry."
+
+[[step]]
+id = "2.24-degradation-drill"
+title = "Runbook v2 and the drills that make it evidence"
+kind = "design"
+origin = "deepen"
+entry = "docs/steps/en/relay/2.24-degradation-drill.md"
+time_hint = "120m"
+concepts = ["degradation modes", "replayable drill", "no lost delivery"]
+teaches = ["ops/degradation-modes@apply"]
+requires = [
+    "ops/runbook-drill@apply",
+    "ops/rolling-upgrade@apply",
+    "delivery/dlq@apply",
+    "delivery/ordering@apply",
+]
+run = { cmd = "cargo test -p relay --test spec_degradation_drill", timeout = 600 }
+spec = ["spec/2.24/degradation_drill.rs"]
+scaffold = "scaffold/2.24-degradation-drill.patch"
+solution = "solutions/2.24-degradation-drill.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@2",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "images",
+]
+images = ["postgres:17-alpine"]
+hint = "Three drills, one command each: the database goes away, the subscriber goes slow, one tenant floods — and after each of them the count of deliveries that were accepted but never delivered is zero."

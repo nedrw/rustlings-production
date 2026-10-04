@@ -1,0 +1,34 @@
+# The `relay` service, as it comes out of the box: modules that do nothing yet, a harness that
+# already works, and the dependencies the first steps need.
+#
+# T2 step 1 (`relay/2.1-project-skeleton`) fills the modules in. Later scaffolds add dependencies
+# and modules *inside the marked blocks* — that rule is what keeps your own edits safe
+# (docs/authoring.md §5).
+
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# kiln:scaffold:begin
+axum = "0.8.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "chrono"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+toml = "0.9.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "fmt", "env-filter"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+# kiln:scaffold:end
+
+# This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+[workspace]
+members = [
+    # kiln:scaffold:begin
+    # kiln:scaffold:end
+]

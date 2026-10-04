@@ -1,0 +1,439 @@
+//! A Postgres container for one test.
+//!
+//! The specs that need a database pull this file in with
+//! `#[path = "support/postgres.rs"] mod postgres;` and get: a container of its own, an *empty*
+//! `relay` database, a connection string, and `psql` for asking questions. Dropping the value
+//! takes the container away, so nothing is shared between tests — no container, no database, no
+//! port, no rows.
+//!
+//! Three course rules decide how this is written, and this module is where they are visible to a
+//! test:
+//!
+//! * **the engine is probed, not assumed** — `podman` first, then `docker` (plan §9.1): on this
+//!   machine `docker` is a shim over Podman, and a version string proves nothing;
+//! * **no `timeout(1)`, no clock, no network** — every command this module starts has a deadline it
+//!   enforces itself ([`run_bounded`]), and `--pull=never` turns "the image is missing" into a
+//!   sentence a learner can act on instead of a registry wait;
+//! * **the image is looked up, not guessed** — the engine stores what it was pulled under, so
+//!   `postgres:17-alpine` also counts as present when it is cached as
+//!   `docker.1ms.run/library/postgres:17-alpine`. [`is_declared_image`] is the same rule
+//!   `kiln`'s `images` gate uses; the tests cannot depend on `kiln`, so the rule is written down
+//!   here as well.
+
+#![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
+
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+/// The image the tests run, written the way a step's metadata writes it.
+const IMAGE: &str = "postgres:17-alpine";
+/// The password the container is started with; the database is thrown away with the container.
+const PASSWORD: &str = "postgres";
+/// The database every test gets, created empty so the migrations have somewhere to start.
+const DATABASE: &str = "relay";
+/// How long the container is given to accept queries.
+const READY_DEADLINE: Duration = Duration::from_secs(30);
+/// How long any one engine command may take.
+const COMMAND_DEADLINE: Duration = Duration::from_secs(30);
+/// How often a wait looks again.
+const RETRY: Duration = Duration::from_millis(100);
+/// How often `run_bounded` looks at its child.
+const POLL: Duration = Duration::from_millis(20);
+
+/// One Postgres container, with one empty database, for the length of one test.
+pub struct Postgres {
+    engine: &'static str,
+    name: String,
+    port: u16,
+}
+
+impl Postgres {
+    /// Start a container and wait until it answers queries.
+    ///
+    /// Panics when no engine answers, when the image is not in the local store, or when the server
+    /// never comes up. Inside a test, a fixture that cannot start is a failure with a sentence —
+    /// and the sentence names the command that fixes it, which is `kiln images pull` in the common
+    /// case.
+    pub fn start() -> Self {
+        let engine = engine();
+        let image = local_image(engine);
+        let name = format!(
+            "kiln-relay-pg-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let password = format!("POSTGRES_PASSWORD={PASSWORD}");
+        let started = run_or_panic(
+            engine,
+            &[
+                // The host port is whatever is free (`127.0.0.1::5432`), so two tests never meet on
+                // one port; `port` below is how this module learns which one it got.
+                "run",
+                "-d",
+                "--name",
+                &name,
+                "-e",
+                &password,
+                "-p",
+                "127.0.0.1::5432",
+                "--pull=never",
+                &image,
+            ],
+            COMMAND_DEADLINE,
+        );
+        if !started.success() {
+            panic!(
+                "`{engine} run` could not start {image}: {}",
+                started.message()
+            );
+        }
+
+        let port = bound_port(engine, &name);
+        let postgres = Self { engine, name, port };
+        postgres.wait_until_ready();
+        // An *empty* database, so "an empty database reaches the current schema" is something a
+        // test can actually watch happen.
+        postgres.execute_in("postgres", &format!("CREATE DATABASE {DATABASE}"));
+        postgres
+    }
+
+    /// Connection string of this container's `relay` database.
+    pub fn url(&self) -> String {
+        format!(
+            "postgres://postgres:{PASSWORD}@127.0.0.1:{}/{DATABASE}",
+            self.port
+        )
+    }
+
+    /// One query, answered as one line: what `psql -t -A` prints, trimmed.
+    pub fn query(&self, sql: &str) -> String {
+        self.psql(DATABASE, &["-t", "-A", "-c", sql])
+            .trim()
+            .to_owned()
+    }
+
+    /// One statement, with its result ignored.
+    pub fn execute(&self, sql: &str) {
+        self.execute_in(DATABASE, sql);
+    }
+
+    /// One statement, answering what the server said: `Err(message)` when it refused.
+    ///
+    /// A spec needs both: a constraint is only really there if inserting into it is *refused*.
+    pub fn try_execute(&self, sql: &str) -> Result<(), String> {
+        let ran = run_or_panic(
+            self.engine,
+            &psql_args(DATABASE, &["-c", sql], &self.name),
+            COMMAND_DEADLINE,
+        );
+        if ran.success() {
+            Ok(())
+        } else {
+            Err(ran.message())
+        }
+    }
+
+    /// Stop the server, so a test can watch the service lose its database.
+    ///
+    /// The container stays until the value is dropped, so a test can still ask it what it holds.
+    pub fn stop(&self) {
+        let ran = run_or_panic(
+            self.engine,
+            &["stop", "-t", "2", &self.name],
+            COMMAND_DEADLINE,
+        );
+        if !ran.success() {
+            panic!(
+                "`{} stop {}` failed: {}",
+                self.engine,
+                self.name,
+                ran.message()
+            );
+        }
+    }
+
+    /// Run one statement in one database of this container.
+    fn execute_in(&self, database: &str, sql: &str) {
+        let ran = run_or_panic(
+            self.engine,
+            &psql_args(database, &["-c", sql], &self.name),
+            COMMAND_DEADLINE,
+        );
+        if !ran.success() {
+            panic!("the database refused `{sql}`: {}", ran.message());
+        }
+    }
+
+    /// One `psql` invocation inside the container, with its output.
+    fn psql(&self, database: &str, args: &[&str]) -> String {
+        let ran = run_or_panic(
+            self.engine,
+            &psql_args(database, args, &self.name),
+            COMMAND_DEADLINE,
+        );
+        if !ran.success() {
+            panic!("`psql {args:?}` failed: {}", ran.message());
+        }
+        ran.stdout
+    }
+
+    /// Ask until the server answers a query, or give up loudly.
+    ///
+    /// A query, not a TCP probe: `pg_isready` would be happy with a socket the tests cannot use,
+    /// and what every test below needs is a database that *answers*.
+    fn wait_until_ready(&self) {
+        let deadline = Instant::now() + READY_DEADLINE;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let ran = run_or_panic(
+                self.engine,
+                &psql_args("postgres", &["-t", "-A", "-c", "SELECT 1"], &self.name),
+                COMMAND_DEADLINE,
+            );
+            if ran.success() {
+                return;
+            }
+            last = ran.message();
+            std::thread::sleep(RETRY);
+        }
+        let logs = run_or_panic(
+            self.engine,
+            &["logs", "--tail", "10", &self.name],
+            COMMAND_DEADLINE,
+        );
+        panic!(
+            "the {IMAGE} container never accepted a query within {READY_DEADLINE:?} ({last}); the last \
+             lines it printed:\n{}",
+            logs.stdout.trim_end()
+        );
+    }
+}
+
+impl Drop for Postgres {
+    /// Take the container away, whether the test passed, failed or panicked.
+    fn drop(&mut self) {
+        // `-v` matters more than it looks: the image declares its data directory as a volume, so
+        // every container this fixture starts creates an anonymous one, and `rm -f` on its own
+        // leaves it behind. A few thousand specs later the engine runs out of locks and *every*
+        // container test starts failing at once — which is a long way from the line that caused it.
+        let _ = try_run(
+            self.engine,
+            &["rm", "-f", "-v", &self.name],
+            COMMAND_DEADLINE,
+        );
+    }
+}
+
+/// Names the containers of this test binary, so two of them cannot collide.
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// The `psql` invocation for one database, as `podman`/`docker` arguments.
+fn psql_args<'a>(database: &'a str, sql: &'a [&'a str], name: &'a str) -> Vec<&'a str> {
+    let mut args = vec![
+        "exec",
+        name,
+        "psql",
+        // The container's own TCP listener, not its unix socket: the address the tests use.
+        "-h",
+        "127.0.0.1",
+        "-U",
+        "postgres",
+        "-d",
+        database,
+    ];
+    args.extend_from_slice(sql);
+    args
+}
+
+/// The host port the container's 5432 was published on.
+fn bound_port(engine: &str, name: &str) -> u16 {
+    let ran = run_or_panic(engine, &["port", name, "5432/tcp"], COMMAND_DEADLINE);
+    if !ran.success() {
+        panic!("`{engine} port {name}` failed: {}", ran.message());
+    }
+    ran.stdout
+        .trim()
+        .lines()
+        .find_map(|line| {
+            line.rsplit_once(':')
+                .map(|(_, port)| port.trim().to_owned())
+        })
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("`{engine} port {name}` printed `{}`", ran.stdout.trim()))
+}
+
+/// The engine to drive: `podman` first, then `docker` (plan §9.1).
+fn engine() -> &'static str {
+    ["podman", "docker"]
+        .into_iter()
+        .find(|engine| {
+            try_run(engine, &["info"], COMMAND_DEADLINE).is_some_and(|ran| ran.success())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no container engine answered: install podman (or docker), or check what `kiln \
+                 doctor` found"
+            )
+        })
+}
+
+/// The reference to run this machine's engine with.
+///
+/// The image has to be *there*: the tests never pull (that would make them need a network and a
+/// working mirror), so a missing image is a sentence pointing at the command that fetches it.
+fn local_image(engine: &str) -> String {
+    let ran = run_or_panic(
+        engine,
+        &["images", "--format", "{{.Repository}}:{{.Tag}}"],
+        COMMAND_DEADLINE,
+    );
+    if !ran.success() {
+        panic!("`{engine} images` failed: {}", ran.message());
+    }
+    ran.stdout
+        .lines()
+        .map(str::trim)
+        .find(|name| !name.is_empty() && *name != "<none>:<none>" && is_declared_image(name, IMAGE))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            panic!(
+                "{IMAGE} is not in the local image store: run `kiln images pull`, or `{engine} pull \
+                 {}` if you are not using kiln",
+                resolved_image(engine)
+            )
+        })
+}
+
+/// Whether a name the engine reports is the image a step declared.
+///
+/// The same rule as `kiln`'s `images` gate (`kiln/src/runtime.rs`): the *repository path* has to be
+/// the same, because the engine answers with the name it was pulled under — `postgres:17-alpine` is
+/// here as `docker.1ms.run/library/postgres:17-alpine` — while `myorg/postgres:17-alpine` is a
+/// different image that only ends the same way.
+fn is_declared_image(local: &str, declared: &str) -> bool {
+    if local == declared {
+        return true;
+    }
+    let repository = match local.split_once('/') {
+        Some((first, rest))
+            if first == "localhost" || first.contains('.') || first.contains(':') =>
+        {
+            rest
+        }
+        _ => local,
+    };
+    repository == declared
+        || (!declared.contains('/') && repository == format!("library/{declared}"))
+}
+
+/// The reference a pull would use, mirror-aware (`KILN_REGISTRY_MIRROR`): an official image lives
+/// under `library/` in a registry, and a reference that names its own registry is left alone.
+fn resolved_image(_engine: &str) -> String {
+    let declared = IMAGE;
+    let Some(mirror) = std::env::var("KILN_REGISTRY_MIRROR").ok() else {
+        return declared.to_owned();
+    };
+    let mirror = mirror.trim().trim_end_matches('/');
+    if mirror.is_empty() {
+        return declared.to_owned();
+    }
+    if let Some((first, _)) = declared.split_once('/')
+        && (first == "localhost" || first.contains('.') || first.contains(':'))
+    {
+        return declared.to_owned();
+    }
+    if declared.contains('/') {
+        format!("{mirror}/{declared}")
+    } else {
+        format!("{mirror}/library/{declared}")
+    }
+}
+
+/// What one command answered.
+struct Ran {
+    /// Exit code, `None` when the deadline killed it.
+    code: Option<i32>,
+    /// Everything it printed.
+    stdout: String,
+    /// Everything it complained about.
+    stderr: String,
+    /// `true` when the deadline ran out and the child was killed.
+    timed_out: bool,
+}
+
+impl Ran {
+    /// `true` when it exited successfully.
+    fn success(&self) -> bool {
+        !self.timed_out && self.code == Some(0)
+    }
+
+    /// One line for a message about it: the first thing it complained about, or the deadline.
+    fn message(&self) -> String {
+        if self.timed_out {
+            return format!("still running after {COMMAND_DEADLINE:?}");
+        }
+        self.stderr
+            .lines()
+            .chain(self.stdout.lines())
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("no output")
+            .to_owned()
+    }
+}
+
+/// Run a command the module has already proved exists.
+fn run_or_panic(program: &str, args: &[&str], deadline: Duration) -> Ran {
+    try_run(program, args, deadline)
+        .unwrap_or_else(|| panic!("`{program}` is not on PATH, and this module needs it"))
+}
+
+/// Run a command, or `None` when the program is not there at all.
+///
+/// The deadline is the module's own: the course does not depend on `timeout(1)` being installed,
+/// and a command that hangs has to become a failed test rather than a hung run. The pipes are read
+/// after the child ends — the engine's answers here are a few lines, far below what a pipe buffers.
+fn try_run(program: &str, args: &[&str], deadline: Duration) -> Option<Ran> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() >= deadline => {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            Ok(None) => std::thread::sleep(POLL),
+            Err(error) => panic!("`{program}` could not be waited for: {error}"),
+        }
+    }
+    let output = collect(child);
+    Some(Ran {
+        code: output.0,
+        stdout: output.1,
+        stderr: output.2,
+        timed_out,
+    })
+}
+
+/// Reap a child and answer `(code, stdout, stderr)`.
+fn collect(child: Child) -> (Option<i32>, String, String) {
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("the output of a finished command can be read: {error}"));
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
