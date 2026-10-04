@@ -186,3 +186,38 @@ agent 正在同一台机器上编译，并发使用让某一步拿到不属于�
 - **2.9 的正文是 teach 模板 + 额外的 `RECALL`/`DELTA` 路标**：`origin = teach`（ordering 首次教），
   五段必需项齐全；多出来的两段指向 2.6/2.7 与 `mailer/1.14`——`lint-caps` R5 接受，且这正是
   「相邻能力要写边界」那条清单规则的样本。authoring.md §4.1 记了这一点。
+
+## 第六段 · 2026-10 · T2 2.12–2.15（SSRF、限流、背压、停机租约），与一次跨步骤的同步改动
+
+### 数字
+
+| 步 | 规格测试 | `selftest` 结论（原样） | must 门 |
+| --- | --- | --- | --- |
+| 2.12 SSRF 防护 | 9 | `scaffold ✓ … (unresolved import relay::target)` / `solution ✓ the spec passes` / `9/9 must green` | 9 |
+| 2.13 限流 | 7 | 同上（`unresolved import relay::ratelimit`）/ `9/9 must green` | 9 |
+| 2.14 背压 | 6 | 同上（`unresolved import relay::concurrency`）/ `9/9 must green` | 9 |
+| 2.15 停机租约（deepen） | 8 | 同上（`unresolved import relay::lease`）/ `9/9 must green` | 9 |
+
+- 合并 `4/4 step(s) hold the contract`；`kiln verify relay` → **`15/15 judged step(s) pass · 0 failed · 0 not prepared · 9 without content`**。
+- `lint-caps` `no issues`（R5 只跳 9 篇未写正文）；course 下 80 个 `.rs` rustfmt 干净；`kiln links` `49 page(s) · 319 link(s) · 199 external` ✓；`i18n status` 结构 0 错、漂移 0 警告。
+
+### 一次必要的跨步骤同步改动（记下来，因为它是「规格必须在每棵树上成立」的代价）
+
+2.12 让**默认配置**的服务在**注册**与**投递**两处都拒掉私网/回环目标（这是 SSRF 的正确默认），而 2.5/2.6/2.8/2.9/2.10/2.11 的规格都用 `POST /endpoints` 注册 `http://127.0.0.1:9/...`。
+不改它们，这 6 步会在最终树上红——所以那 6 份规格各加了一行显式放行：
+
+```rust
+var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
+```
+
+用**字符串字面量**而不是 `tests/support/app.rs` 的常量：那个常量在 2.5 那棵树里还不存在，用它会让 2.5 的 scaffold 态因为错误的理由编译失败。这 6 份规格在各自的树上行为不变（未知环境变量被忽略），在最终树上由 `verify` 判过（全 `passed`），manifest 已重钉。
+
+### 施工中钉下来的决定
+
+- **`Policy::default()` 保持宽松，规则来自配置层**（2.7 的规格打 `127.0.0.1`，这是当初 2.7 交接里点名的张力，按预定方案解决）。
+- **`target.rs` 不复述 scheme 白名单**：`http`/`https` 是 `domain::EndpointUrl`（2.1）的规则——第二份会忘记的地方不要有。
+- **限流层放在认证之外**、匿名请求共享一个桶、桶表有上限（`SWEEP_AT = 64`，否则桶数随攻击者编造的 key 增长）。
+- **2.14 的 503 来自「队列有底」**：`delivery.max_backlog`（默认 10000），检查放在 `events::ingest` 接受事件的那个事务里（拒绝时什么都不写、重放不会被 503）。
+- **公平 claim 只能「每租户一条语句」**：PostgreSQL 不允许 `FOR UPDATE` 与窗口函数同用（容器里实测 `ERROR: FOR UPDATE is not allowed with window functions`），所以按队列位置排名的单语句写法不存在。
+- **2.15 的停机是两条流都被 await**：第一版写成 `select!`，规格立刻抓到（服务端先返回 → 进程退出 → drain 被丢 → `claimed` 还剩 1 行）——正是 `mailer/1.14` 点名的 TRAP；`delivery.lease_seconds` 与 `delivery.drain_seconds` 进了配置。
+- **`reclaim_expired` 计数、`release_held` 不计数**：无人旁观的那次尝试必须计数，否则反复崩溃的 worker 会让投递永远重试（计数是唯一能把它送进 DLQ 的东西）；主动交回的行没失败。
