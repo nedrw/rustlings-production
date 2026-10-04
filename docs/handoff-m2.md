@@ -331,6 +331,14 @@ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --
   `fail` 按预算决定 `queued`/`failed` 并把原因写进 `last_error`；`get` 找不到返回 `Ok(None)`，
   而 `Engine::inspect` 把它翻成 `Error::NotFound`。
 - `Store` 端口是密封的（3.2 起）：新增方法只能加在 trait 上（crate 内实现），不要在外部类型上实现它。
+- **`src/engine/**` 里不得出现 `pub mod`**（3.2 的规格按声明查，不按名字查）：新增模块写成
+  `pub(crate) mod <x>;`，需要公开的东西在 `src/engine/store/mod.rs` / `src/engine/mod.rs` 重导出
+  （3.5 的 Postgres 后端就是这么加的）。
+- **公开枚举的变体字段也是接口**：`#[non_exhaustive]` 只买到「加变体」，买不到「给已有变体加字段」。
+  3.3 的规格会构造 `Error::Store { source: … }` 这类值并钉住 Display 文案，所以后续要带更多信息时
+  **加变体**（如 3.6 的 `Conflict`、3.13 的 `Forbidden`），不要改已有变体的字段或文案。
+- `Job` / `SubmitRequest` 是 `#[non_exhaustive]` 结构体：可以加私有字段（加租约、加去重键都行），
+  但 3.2 见证文件钉住的访问器签名不能改；新访问器只会在更晚的见证文件里出现。
 
 ## 4. 实测数字与验收证据
 
