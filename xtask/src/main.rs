@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+
 fn main() -> ExitCode {
     let task = match std::env::args().nth(1) {
         Some(task) => task,
@@ -235,6 +236,7 @@ fn links(root: &Path) -> Result<(), String> {
         scan.findings().len()
     ))
 }
+
 /// Repository root, derived from this crate's location so the task works from anywhere.
 fn workspace_root() -> Result<PathBuf, String> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
