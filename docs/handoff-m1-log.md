@@ -340,3 +340,48 @@ $ cargo run -q -p kiln -- selftest --track relay
 $ cargo run -q -p kiln -- lint-caps                                      exit=0   0 s   no issues.
 $ cargo run -q -p kiln -- links                                           exit=0   1 s   57 pages · 369 links · 0 findings
 ```
+
+## 第十段 · 2026-10 · 独立复验评审的四条修复，与它查出的两处真缺陷
+
+M1 评审的修复合并进主线后（`903865a`），派一个**独立 reviewer**（隔离 worktree、无写权限）冻结在那棵树上做反证。
+它先逐条核评审项，再跑回归，最后给出「成立 / 部分成立 / 不成立」。结论与它查出的问题都记在这里，因为它改了下一个人会读的文件。
+
+### 复验的结论（原样数字）
+
+- 跳过资格**确无**年龄判据：`plan.rs` 只看 `level.rank()` + `from_probe()`，年龄只进打印文字；决定写在
+  `plan.md` §3 D4 与 `handoff-m1.md` §2.3。
+- 死链命令的修复前口径被它校正：`plan --fast` 在空 state 下，relay **12 步**、mailer **15 步**点名了会 `exit 2`
+  的命令（评审当时说「relay 13 步」，那是 13 个**槽位**、12 个**步**）；修复后 relay 13 条 + mailer 8 条
+  点名命令**全部可解析**，`review --due` 的三分支用合成 state 实测（「更浅」分支取**最深**的那道）。
+- 判定未变：同一份 19 条 probe 证据的 state，在 `73315fd` 与 `903865a` 上 `plan --fast` 的 `»`/`·` 标记集合
+  逐字相同（mailer 6/6、relay 11/11 可跳），只有 keep 行的措辞变了。
+- 回归（同一棵冻结树、全程私有 `XDG_CACHE_HOME=/private/tmp/…`，无假红）：`cargo xtask ci` **8m33.9s** 全绿
+  （`208 + 15 + 1` tests、`46 spec file(s) pinned`、`97 capabilities · 134 slots · 118 ledger positions · 46 authored steps`、
+  `57 page(s) · 370 link(s) · 228 external target(s)`、`probe --check` 19/19）；`selftest --track relay`
+  **8m10.5s** → `24/24 step(s) hold the contract`。
+
+### 它查出的两处真缺陷（已修，落在随后的小提交里）
+
+1. **题库坏了，命令就拒绝运行**（修复引入的新失败模式，之前没写进任何文档）：`plan`（含不带 `--fast`）、`skip`、
+   `review` 现在都读 `course/probes/`，任一文件「名字 ≠ 头部 `probe = …`」会让它们 `exit 2`；修复前
+   `plan --fast` 完全不受影响。代价可接受（`probe --check` 在 CI 里兜底），已补进 `handoff-m1.md` §2.2。
+2. **`skip` 被拒时第二行自相矛盾**：完全没有题时，第一行说 `this step cannot be skipped on proof`，第二行却说
+   「上面那条判决说了什么能证明它」。第二行已改成只讲 `--force`——判决行自己在有题时才点名那条命令。
+
+### 同时校正的文档口径
+
+- `t2-relay.md` §4：「`authoring.md` §9 新增三条」实为**四条**（「RECALL 段」与「probe 题」是两项）。
+- `t2-relay.md` §6：「2.15/2.22 的正文 TRAP 点名了这个张力」只对 **2.15** 成立（TRAP 6：`lease_seconds = 1` 配
+  `Policy::deadline = 30s`）；2.22 只在正文里引用 2.15，没有重复它。补规格的落点也因此只写 2.15。
+- `plan.rs` 里那条测试注释的「13 of T2's 24 steps」实测是 **11 步**（空 state 下首槽就没有题的那 11 步）。
+
+### 顺带的加严（不改输出）
+
+`probe::exercise` 原来返回「`load` 排序后第一个够深的题」，现在写成显式规则：**按深度距离取最近的**，同深度按 slug
+定序。输出与今天逐字相同（19 道题里没有一个能力有第二道题），但它不再依赖「文件名序恰好等于深度序」这个隐式前提
+——将来加深度名或改 `expected_slug` 都不会让报告换一道题。
+
+### 这次没做的
+
+- `73315fd` 上没重跑 CI/relay selftest（「判定未变」只要标记集合比对）；`kiln skip --all` 的整体副作用没有端到端跑；
+  `kiln verify relay` 没有重跑（`selftest --track relay` 是更强的证据）。

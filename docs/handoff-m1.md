@@ -35,7 +35,8 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 
 - `course/probes/<domain>-<name>.<level>.rs` 是题目，`course/probes/solutions/<slug>.rs` 是参考答案。
   头部三行是元数据：`//! probe = "<能力>@<深度>"` / `title` / `hint`（解析在
-  [probe.rs](../kiln/src/probe.rs)，文件名必须与头部一致）；
+  [probe.rs](../kiln/src/probe.rs)，文件名必须与头部一致 —— **不一致时 `plan`/`skip`/`review` 会拒绝
+  运行**：它们读题库是为了不点名死链，所以题库坏了就宁可报错；`kiln probe --check`（在 CI 里）是兜底）；
 - `kiln probe` 列出题库；`kiln probe <能力>[@深度]` 在 `.kiln/probes/<slug>/` 建一份**你的**副本
   （只写一次，永不覆盖），`cargo test` 跑它，通过才写 `last_verified`；
   `--solution` 把参考答案写进你的副本（只做对照，不记证据）、`--reset` 恢复原题；
@@ -43,7 +44,8 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 - `kiln review [--due [DAYS]]`：按上表列出「证明过什么、多久以前」，默认 45 天窗口，最旧的先列，
   每行给出重新抽查的命令。同深度的题没有时，**更浅的那道题会作为「更浅的抽查」被点名**（它抽查的是
   手感，不是这一深度，只有重做步骤才能重抽这一层）；完全没有题的槽位说「no probe for this slot」，
-  不编题。
+  不编题。同一侧有多道题时点最接近这个深度的那道（够用里最浅、更浅里最深），判据只有
+  `probe::exercise` 一处。
 - **aware 槽位不出题**（curriculum.md §11）；probe 只用 `std`、离线、秒级。
 
 ### 2.3 `kiln plan [--fast]` / `kiln skip`

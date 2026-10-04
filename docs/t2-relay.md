@@ -71,7 +71,7 @@ DLQ → 多租户与授权矩阵 → 限流与背压 → 观测 → 负载与容
 - **步骤新增**：`target.rs`（脚本化目标服务器）、`sender.rs`（记录型假发送器）、`lanes.rs`、`keys.rs`、`faults.rs`（进程内故障代理）、`load.rs`/`workload.rs`（负载）、`drill.rs`（三类降级演练）。
 - T1 的模式在这里的落法：加性 scaffold + 标记块（`src/lib.rs` 没有标记块，所以「声明新模块」由参考解做，scaffold 态是**编译红**，kiln 会加注 `does not compile on the scaffold …`）；注入缝（`Sender`/`Secrets`/`Traces`/`Clock`）；容器夹具 `rm -f -v`；不需要 `.sqlx`（全用运行时 `query`/`query_as`）。
 - **T2 新增的三条模式**（记在 [handoff-m1-log.md](handoff-m1-log.md) 第四/六段与本文 §4；
-  `docs/authoring.md` §9 的清单同步新增了「先查台账」「相邻能力边界」「RECALL 与 probe」三条）：
+  `docs/authoring.md` §9 的清单同步新增了「先查台账」「相邻能力边界」「RECALL 段」「probe 题」四条）：
   1. **跨步骤的契约面**：改 `claim::*`/`SendRequest`/`outbound::*` 的签名要同步改早期规格并重钉 `spec manifest`（2.11 为此把密钥做成端口，2.19 同理）；
   2. **配置层的安全默认**：2.12 之后默认拒私网/回环，所有打 `127.0.0.1` 的规格显式放行（`RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS=true`），且用**字符串字面量**而不是装置常量（早期树里没有那个常量）；
   3. **规格必须在每棵树上成立**：2.22 的规格按「哪个迁移建出了这个索引」而不是「目录里最新的迁移」来找目标（2.23 落地后前者才会在最终树上成立）。
@@ -92,8 +92,7 @@ DLQ → 多租户与授权矩阵 → 限流与背压 → 观测 → 负载与容
 ## 6. T2 范围内剩下的缺口
 
 - `test/chaos-injection@apply` 与 `delivery/at-least-once@design` 没有 probe 题（理由写在 handoff-m1-log.md 第七段：单文件 std 题会变成假证据）。
-- `delivery.lease_seconds` 与 `outbound::Policy.deadline` 之间没有交叉校验（2.15/2.22 的正文 TRAP 点名了这个张力）。**决定：接受，不补规格** —— 首先，契约本身就是「至少一次」（2.6），过期租约造成的重复投递在承诺之内；其次，要做成断言就得把配置值和一
-个代码常量交叉校验，并且重开 2.15/2.22 两个已验证步骤的规格与参考解（所有产物要重钉、重新 verify）。若以后要补，落点是在 2.15 的规格里断言「租约短于尝试上限时启动/`--check-config` 必须拒绝」。
+- `delivery.lease_seconds` 与 `outbound::Policy.deadline` 之间没有交叉校验（2.15 的 TRAP 6 点名了这个张力：`lease_seconds = 1` 配 `Policy::deadline = 30s`；2.22 只在正文里引用 2.15，没有重复它）。**决定：接受，不补规格** —— 首先，契约本身就是「至少一次」（2.6），过期租约造成的重复投递在承诺之内；其次，要做成断言就得把配置值和一个代码常量交叉校验，并且重开 2.15 这个已验证步骤的规格与参考解（所有产物要重钉、重新 verify）。若以后要补，落点是在 2.15 的规格里断言「租约短于尝试上限时启动/`--check-config` 必须拒绝」。
 - `serve` 的 `Report` 只讲轮次、不讲投递数（2.18 的指标不依赖它，正文写明）。
 - toxiproxy 被进程内故障代理替代（2.17 正文说明：离线、确定性、少一个镜像）。
 - `?deny` 仍是 should 门（本机没装 `cargo-deny`）：2.21 的规格离线判策略与依赖树，`kiln doctor` 给安装命令。
