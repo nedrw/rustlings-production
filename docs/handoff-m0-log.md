@@ -749,7 +749,14 @@ harness 里另一处真缺陷（会让测试连到别人的服务上），一并
 
 ### 复测
 
-`kiln verify --json mailer`（`62e7c5c`，3m01s）：`passed 22 · failed 0 · blocked 0 · not_authored 0 ·
-clean true`。`kiln selftest mailer/1.18-authz-boundary`：1/1 满契约。三路并行的 spec 二进制连跑四轮
-（含 `spec_authz`）全绿——同一负载此前的失败率是两次一红。`kiln links` 31 页 / 206 链 / 0 findings；
-`kiln --lang ja list` 正常回退。`cargo xtask ci` 在 `62e7c5c` 上的结果：见下一条更新。
+在 `62e7c5c` 上（`95bc7b2` 只改了本文件，两者对所有检查的输入相同）：
+
+| 检查 | 结果 | 数字 | 耗时 |
+| --- | --- | --- | --- |
+| `cargo xtask ci` | **绿** | `22/22 step(s) hold the contract`；测试 183+15+1 全过；`22 spec file(s) pinned`；lint-caps `97 · 134 · 118 · 22` | **579.16s** |
+| `kiln verify --json mailer` | **绿** | `passed 22 · failed 0 · blocked 0 · not_authored 0 · clean true` | 181.19s |
+| 三路并行 spec（`authz` / `sessions` / `newsletter`）× 2 轮 | **绿** | 6 个目标全过（authz 4、sessions 7、newsletter 4） | 每目标 15–17s |
+| `kiln links` / `--lang ja list` | **绿** | 31 页 · 208 链 · 0 findings；回退行照旧 | 0.46s / 0.40s |
+
+同一三路负载此前两次里红一次（`spec_authz`）；现在是零，且容器与卷的数量在两轮前后都回到基线
+（不再有 VM 耗尽）。跑完之后又清掉了 2 个早先被杀死的进程留下的 `kiln-pg-*` 容器。
