@@ -7,6 +7,7 @@
 
 - [第一段 · 2026-10 · 去重机制的运行时部分](#第一段--2026-10--去重机制的运行时部分) — 能力记录、probe、`review --due`、`plan --fast`、`skip`、lint R5 的 RECALL 检查
 - [第二段 · 2026-10 · T2 `relay` 的元数据、骨架与第一步](#第二段--2026-10--t2-relay-的元数据骨架与第一步)
+- [第三段 · 2026-10 · probe 题库第一批，与一次「假红」的真因](#第三段--2026-10--probe-题库第一批与一次假红的真因)
 
 ## 第一段 · 2026-10 · 去重机制的运行时部分
 
@@ -81,3 +82,46 @@ M1 的一半是「让 plan.md §3 D4 的规则真的可运行」。落地顺序�
    必须一并格式化，否则第一步的 `fmt` 门就红。
 4. **`--check-config` 的规约要给死**：`database.url = set` / `not set`、`bootstrap.tenants = <n> (名字)`——
    规格是只读的，学员必须从正文读到这个形状。写进 2.1 的正文与 `Config::report` 的文档里。
+
+## 第三段 · 2026-10 · probe 题库第一批，与一次「假红」的真因
+
+### 做了什么
+
+- `course/probes/`：8 道 (能力, 深度) 抽查题 + 参考答案（`course/probes/solutions/`），全部单文件、纯 `std`、
+  离线、秒级；35 个测试，逐题验证「练习副本必失败 / 参考答案必通过 / `--reset` 可回滚」。
+  覆盖 `err/typed-errors`、`cfg/layered-config`、`domain/parse-dont-validate`、`sec/token-lifetime`、
+  `db/unique-as-concurrency`、`delivery/idempotency`、`sec/authz-tenant-isolation`、`http/rate-limit`（都是 `apply`）。
+- 每道题的正文里写清**这道题诚实地收窄在哪**：单文件、无依赖的前提下，CSPRNG（token 的不可猜性）、
+  Postgres 的唯一约束、真实队列、HTTP 栈都用「注入的假件 + 形状断言」替代——这正是 probe 机制的规则
+  （只考形状，不考 API），写出来是为了让学员知道这个替代是有意的。
+- 顺带修了 `kiln` 的一个真缺陷（worker 发现的）：`verify_references` 把参考答案写成 `tests/<slug>.rs`，
+  而 slug 的深度后缀必是点，rustc 拒绝带点的 crate name（`error: invalid character '.' in crate name`），
+  于是 **`probe --check` 对任何题都不通过**。修法是一处归一化 `test_target_stem`（`.` → `_`）+ 回归单测；
+  学员副本那半（`scratch_manifest`）本来就把 `.` 换成 `-`，所以只有 `--check` 这半坏了。
+
+### 数字
+
+| 项 | 值 |
+| --- | --- |
+| `kiln probe --check` | `8 exercise(s) · 8 reference(s) passed` |
+| 逐题 `kiln probe <slot>` / `--solution` | 8/8 在练习副本上失败（`not yet implemented`，0 编译错误）、8/8 参考答案通过 |
+| probe 的测试总数 | 35 |
+| `review --due`（带一份 406 天前的 probe 记录） | 列出 `delivery/idempotency … re-check: kiln probe delivery-idempotency.apply`；没有 probe 的槽位直说 |
+| `plan --fast`（`delivery/idempotency@apply` 有 probe 证据） | `22 steps · 20 to work on, 2 skippable by probe`，`» mailer/1.15-idempotent-delivery … proved by probe:delivery-idempotency.apply, 406 days ago` |
+
+### 「假红」的真因（重要，以后别再踩）
+
+全量回归在一棵内容正确的树上红了 3 步（`mailer/1.18-authz-boundary`、`1.19-test-layering`、`1.20-metrics`），
+症状是 `the service stopped before it said where it listens: []` 与 `BROKEN STEP: the spec passes on the scaffold` ——
+两种**相反**的假症状，同一棵树上不同时刻各出现一次。
+
+归属验证：单跑那一步仍红 → `XDG_CACHE_HOME=$DELTA_SCRATCH_DIR/xdg`（换掉共享的
+`~/.cache/kiln/target`）再跑 → **✓ 通过**。
+
+真因：**本机所有 `kiln` 沙箱共用同一个 `CARGO_TARGET_DIR`**（`scratch::shared_target_dir`），当时外部
+agent 正在同一台机器上编译，并发使用让某一步拿到不属于它的构建产物。**不是内容缺陷、也不该改判据。**
+
+规则（写进 handoff-m1 的约定）：
+- 跑 `kiln selftest` / `kiln verify` 时，本机不要同时跑别的 cargo；
+- 报出的红如果与实现无关，先单跑那一步、再换干净 `XDG_CACHE_HOME` 复跑，两次一致才算真红；
+- 长验证（`xtask ci` 约 10–20 分钟）交给子 agent 在**冻结的 commit** 上跑，跑的时候谁都不碰这棵树。

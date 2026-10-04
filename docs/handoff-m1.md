@@ -56,6 +56,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 
 ## 3. T2 `relay`
 
+- 进度（2026-10）：**2.1–2.4 已交付**（骨架与装置、幂等接收、契约优先、游标分页），每步都过了
+  `kiln selftest relay/<id> --track relay`；`kiln verify relay` 会把早期步骤放在最终树上重判。
+  剩余步骤见 `kiln plan relay`。
 - 元数据：`course/tracks/relay/track.toml`（24 步，`exit` 能力 6 条，`clippy@2` 起、无提示）。
 - 骨架与装置：`course/tracks/relay/skeleton/`（模块签名 + `todo!()`、`tests/support/{client,app,service,postgres}.rs`）。
 - 步骤交付物与 T1 同构：正文 `course/docs/steps/en/relay/<id>.md`、规格 `course/tracks/relay/spec/<n>/<name>.rs`、
@@ -70,6 +73,9 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
 | `kiln selftest --track <TRACK>` | 走非默认 track；沙箱里重新解析同一条 track |
 | probe 副本放在 `.kiln/probes/` | 个人状态，git-ignored，不进任何 patch |
 | 课程 patch 的生成 | 在**临时 git 仓库**里做 base/solution 两次 diff，`git diff --cached --no-renames --binary`；**不要**在工作树里 `rm -rf`（这是 M1 踩过的坑） |
+| 共享构建目录会造**假红** | 所有 `kiln` 沙箱共用 `~/.cache/kiln/target`；与别的 cargo 并发时 `selftest` 会报「服务没起来」或反直觉的「scaffold 上就通过」。跑 selftest/verify 时旁边不要跑别的 cargo；可疑的红先单跑、再换干净 `XDG_CACHE_HOME` 复跑，两次一致才算真红（handoff-m1-log.md 第三段） |
+| `App::start` 的就绪判据是端口连得上 | 而绑定发生在 migrate/seed **之前**，所以**直接读库**的规格必须先做一次 HTTP 往返握手（2.4 的 `Fixture::start` 是样本），否则可能读到空表 |
+| proptest 的教学位置在 T4·4.13 | T2 的规格需要随机性时用确定性的小生成器（2.4 的做法），不引入 `proptest`，也不给骨架加 `[dev-dependencies]` 标记块 |
 
 ## 5. 继续往下做的约定
 
