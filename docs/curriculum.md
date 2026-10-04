@@ -287,7 +287,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 
 | # | 步骤 | teaches | 过关条件（要点） |
 | --- | --- | --- | --- |
-| 1.1 | workspace 与 lib/bin 拆分（`main.rs` 只剩一层壳） | `repo/workspace-layout@apply` | `cargo metadata` 断言布局、`--help` 冒烟测试 |
+| 1.1 | workspace 与 lib/bin 拆分（`main.rs` 只剩一层壳） | `repo/workspace-layout@apply` | `cargo check --lib` 断言有 library target、`--help` 冒烟测试 |
 | 1.2 | 工具链与风格锁定：`rust-toolchain.toml`、`rustfmt.toml`、`[workspace.lints]`、MSRV 政策 | `repo/toolchain-pinning@apply` | `fmt` + `clippy@1` 全绿 |
 | 1.3 | 一条命令跑通全部检查（`cargo xtask ci`）+ CI 落地 | `ci/pipeline@apply` | 本地与 CI 同源；故意破坏一次看 CI 变红 |
 | 1.4 | 类型化配置与启动：file/env/flag 覆盖顺序、`--check-config`、密钥不入库 | `cfg/layered-config@apply`、`sec/secrets-management@apply` | 覆盖顺序表测试；坏配置退出码非 0 |
