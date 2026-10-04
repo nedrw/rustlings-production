@@ -1,0 +1,35 @@
+diff --git a/deny.toml b/deny.toml
+new file mode 100644
+index 0000000..dd789d5
+--- /dev/null
++++ b/deny.toml
+@@ -0,0 +1,29 @@
++# The supply-chain policy of this service (step `relay/2.21-supply-policy`).
++#
++# `cargo deny check` reads this file. This is the skeleton: the three sections the checker reads are
++# here, and every value a decision would go in is empty or a `TODO`. What reads this file before
++# `cargo-deny` does is the step's spec — it parses the policy and checks the dependency tree against
++# it, so the file is a policy on a machine where `cargo-deny` was never installed.
++
++[licenses]
++# Every licence the dependency tree declares, and no others. A crate under a licence that is not
++# here is a licence this project has not reasoned about, and the answer to that is a decision
++# (add it deliberately, or drop the dependency) rather than a build that quietly ships it.
++allow = []
++# How sure the licence *text* has to be matched before it counts as that licence.
++confidence-threshold = 0.9
++
++[bans]
++# Two versions of `syn` cost build time; they do not change what this service ships.
++multiple-versions = "warn"
++# A `*` version requirement is a dependency nobody can review: whichever version was published last
++# is what lands in the build.
++wildcards = "TODO"
++# The crates that must not appear in the tree, whatever brings them in.
++deny = []
++
++[sources]
++# A crate from a registry nobody named, or from a git URL nobody named, is a crate with no review
++# process behind it.
++unknown-registry = "TODO"
++unknown-git = "TODO"
