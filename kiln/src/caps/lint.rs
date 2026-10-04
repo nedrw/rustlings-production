@@ -277,7 +277,8 @@ fn check_tracks(course: &Course, report: &mut Report) {
         let mut positions: BTreeMap<(&CapabilityId, Level), &Step> = BTreeMap::new();
         for step in &track.step {
             for requirement in &step.teaches {
-                if let Some(previous) = positions.insert((&requirement.id, requirement.level), step) {
+                if let Some(previous) = positions.insert((&requirement.id, requirement.level), step)
+                {
                     match &step.reteach {
                         Some(reason) => {
                             report.reteaches.push((step.qualified_id(), reason.clone()))
@@ -1234,7 +1235,11 @@ mod tests {
         // bodies inside those steps arrive one at a time, which is what the R5 notice below
         // reports. T4 and T5 are still ledger-only, so this number moves again when their metadata
         // lands — that is the point of asserting it here.
-        assert_eq!(report.authored_steps, 22 + 24 + 26, "T1, T2 and T3 metadata");
+        assert_eq!(
+            report.authored_steps,
+            22 + 24 + 26,
+            "T1, T2 and T3 metadata"
+        );
         assert!(report.is_clean(), "{:?}", report.issues);
         assert!(report.reteaches.is_empty());
         // R5 checks the bodies that exist and reports how many are still missing. Both numbers move
