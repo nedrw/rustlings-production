@@ -7,3 +7,4 @@ format_version = 1
 
 [spec]
 "spec/3.1/engine_boundary.rs" = "sha256:d45a98784e283818f48d0e561f91f67bbab95afd21ed4148cfe9f9eea6a88eb2"
+"spec/3.2/public_api.rs" = "sha256:38d83ced75f4dad0aee0fb7873787c8b3698099f3868ee05bedb5b5f7dcab4e7"

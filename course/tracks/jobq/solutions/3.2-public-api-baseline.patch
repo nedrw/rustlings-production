@@ -1,0 +1,289 @@
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index a16f92f..87d65c7 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -153,6 +153,12 @@ impl fmt::Display for WorkerId {
+ 
+ /// Where a job is in its life. The row's `state` column is this enum's encoding, never the model
+ /// itself (step `jobq/3.14-job-state-machine` is where the legal moves get written down).
++///
++/// `#[non_exhaustive]`, because this list grows: a lease that ran out and a cancellation are states
++/// this engine will have before the track is over, and a caller that wrote a wildcard arm on day
++/// one does not have to be rebuilt the day one of them arrives (step
++/// `jobq/3.2-public-api-baseline`).
++#[non_exhaustive]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum JobState {
+     /// Waiting to be claimed.
+@@ -195,6 +201,11 @@ impl fmt::Display for JobState {
+ /// Fields are private and read through accessors: a job is written by the store and read by
+ /// everyone else, and later steps add to it (a lease, a schedule, a deduplication key) without
+ /// every caller having to be rebuilt.
++///
++/// `#[non_exhaustive]` writes that promise into the type (step `jobq/3.2-public-api-baseline`):
++/// private fields already make the constructor the door, and this says out loud that the row is
++/// going to grow rather than that it happens to look finished today.
++#[non_exhaustive]
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Job {
+     /// Identity.
+@@ -282,7 +293,10 @@ impl Job {
+ /// What a caller says when it wants a job queued.
+ ///
+ /// Built rather than written as a struct literal, so that a default (priority 0, as soon as
+-/// possible, [`DEFAULT_MAX_ATTEMPTS`] attempts) stays one place in the code.
++/// possible, [`DEFAULT_MAX_ATTEMPTS`] attempts) stays one place in the code — and
++/// `#[non_exhaustive]` keeps it that way when a request grows a field (step
++/// `jobq/3.2-public-api-baseline`).
++#[non_exhaustive]
+ #[derive(Debug, Clone)]
+ pub struct SubmitRequest {
+     /// Queue to put it in.
+diff --git a/src/engine/error.rs b/src/engine/error.rs
+index b2aae7f..9cede20 100644
+--- a/src/engine/error.rs
++++ b/src/engine/error.rs
+@@ -10,6 +10,11 @@ use thiserror::Error as ThisError;
+ use crate::engine::domain::JobId;
+ 
+ /// Everything the engine and its service can fail at.
++///
++/// `#[non_exhaustive]` (step `jobq/3.2-public-api-baseline`): the enum's whole job is to grow — the
++/// next step gives it a `#[source]` chain and a retry decision, and the one after that gives it a
++/// backend it has never opened. A caller that wrote `_ =>` on day one keeps compiling.
++#[non_exhaustive]
+ #[derive(Debug, ThisError)]
+ pub enum Error {
+     /// The caller's input was rejected before anything was written.
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 22288d9..f7606d8 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -1,16 +1,29 @@
+ //! The engine: the part of this project another program could depend on.
+ //!
+-//! Four modules and one direction. [`domain`] is the vocabulary, [`error`] is what can go wrong,
+-//! [`store`] is where jobs live, and [`scheduler`] is the front door. Nothing here knows about
++//! Four modules and one direction. `domain` is the vocabulary, `error` is what can go wrong,
++//! `store` is where jobs live, and `scheduler` is the front door. Nothing here knows about
+ //! configuration files, log formats or command lines — that is the service's business, and the
+ //! arrow only points this way.
++//!
++//! The modules are `pub(crate)` on purpose (step `jobq/3.2-public-api-baseline`): **what a caller
++//! can name is what this module re-exports, and nothing else.** Moving `Job` between modules, or
++//! splitting `scheduler` in two, is then a refactor inside the crate rather than a breaking change
++//! for whoever depends on it — and the whole promise fits in one file a witness can compile
++//! (`course/tracks/jobq/api/3.2-public-api-baseline.rs`, the `semver@baseline` gate).
++//!
++//! Everything that was reachable at `engine::<module>::…` before this step is reachable here now:
++//! a path may move, but a name may not disappear silently.
++
++pub(crate) mod domain;
++pub(crate) mod error;
++pub(crate) mod scheduler;
++pub(crate) mod store;
+ 
+-pub mod domain;
+-pub mod error;
+-pub mod scheduler;
+-pub mod store;
++mod sealed;
+ 
+-pub use domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
++pub use domain::{
++    DEFAULT_MAX_ATTEMPTS, Job, JobId, JobState, QUEUE_NAME_MAX, Queue, SubmitRequest, WorkerId,
++};
+ pub use error::Error;
+ pub use scheduler::Engine;
+-pub use store::{MemoryStore, Store};
++pub use store::{BoxFuture, MemoryStore, Store};
+diff --git a/src/engine/sealed.rs b/src/engine/sealed.rs
+new file mode 100644
+index 0000000..0dbcf4b
+--- /dev/null
++++ b/src/engine/sealed.rs
+@@ -0,0 +1,21 @@
++//! The seal that keeps the store port the engine's own.
++//!
++//! `Store` is a promise in two directions (see the port's own documentation): the engine promises to
++//! use nothing but those five methods, and a backend promises the behaviour the conformance suite
++//! asserts (step `jobq/3.5-store-port-conformance`). The engine can only certify the backends it
++//! ships — `memory` today, `postgres` next — so it must be impossible for a program outside this
++//! crate to hand the engine a backend nobody has held to that suite. That is what this module is
++//! for.
++//!
++//! This is the sealed-trait pattern: `Store` has `Sealed` as a supertrait, `Sealed` is `pub` so the
++//! port may name it, and this module is private so no other crate can reach the name, let alone
++//! implement it. A tool that diffs two releases cannot see the difference — it is a bound, not a
++//! name — but a program that tries to implement `Store` finds out at compile time.
++
++/// Implemented by every backend this crate certifies.
++///
++/// Naming it is not possible outside `jobq`, and that is the point: `impl Store for MyStore` is
++/// refused with "the trait bound `MyStore: sealed::Sealed` is not satisfied", which is the compiler
++/// saying what the port's documentation says in prose — a backend the suite has not seen is not a
++/// backend the engine will run.
++pub trait Sealed {}
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 2113e73..ec5f929 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -10,9 +10,15 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
+ 
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
++use crate::engine::sealed::Sealed;
+ use crate::engine::store::{BoxFuture, Store};
+ 
+ /// Jobs in a map, protected by a mutex. One process, no durability, honest about both.
++///
++/// It is a backend this crate certifies, so it carries the seal that lets the port accept it (step
++/// `jobq/3.2-public-api-baseline`): the conformance suite of step `jobq/3.5-store-port-conformance`
++/// is written against it and against the durable one, which is the whole reason an outside
++/// implementation is not welcome.
+ #[derive(Debug, Default)]
+ pub struct MemoryStore {
+     /// Every job this store knows, keyed by identity so two writes to one job cannot both win.
+@@ -55,6 +61,10 @@ impl MemoryStore {
+     }
+ }
+ 
++// The seal the port requires (step `jobq/3.2-public-api-baseline`): this backend is the one the
++// crate certifies with its own suite, and no outside implementation can say the same about itself.
++impl Sealed for MemoryStore {}
++
+ impl Store for MemoryStore {
+     fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
+         Box::pin(async move {
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 2f58f7b..3550fcb 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -8,14 +8,21 @@
+ //! The methods return boxed futures rather than being `async fn`: a trait with an `async fn` is not
+ //! dyn-compatible (rustc E0038, docs/handoff-m0.md §2), and the worker holds its store behind a
+ //! reference. One box a call is the price of that, and it is paid once per claim, not per job.
++//!
++//! The port is **sealed** (step `jobq/3.2-public-api-baseline`): `Sealed` is a supertrait, so the
++//! two promises above are made by the crate and by the backends it ships, not by anyone who happens
++//! to implement five methods. A third-party backend could not keep the second promise — this crate
++//! cannot run its suite for code it does not have — so it is refused at the point where the promise
++//! would have to be kept, which is the `impl`.
+ 
+ use std::future::Future;
+ use std::pin::Pin;
+ 
+ use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
++use crate::engine::sealed::Sealed;
+ 
+-pub mod memory;
++pub(crate) mod memory;
+ 
+ pub use memory::MemoryStore;
+ 
+@@ -23,7 +30,10 @@ pub use memory::MemoryStore;
+ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+ 
+ /// Where jobs live.
+-pub trait Store: Send + Sync + 'static {
++///
++/// Implemented by this crate's own backends, and only by those: see the module documentation and
++/// `crate::engine::sealed`.
++pub trait Store: Sealed + Send + Sync + 'static {
+     /// Write a job down and hand back the row, with its identity and its resolved `run_at`.
+     ///
+     /// # Errors
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 1c4a26c..3e4dc97 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -8,8 +8,9 @@
+ 
+ use std::path::PathBuf;
+ 
+-use crate::engine::domain::Queue;
+-use crate::engine::error::Error;
++// The names a caller has to work with are the engine's re-exports (step
++// `jobq/3.2-public-api-baseline`), so the service spells them the way its own callers do.
++use crate::engine::{Error, Queue};
+ 
+ /// Environment prefix every setting is spelled with (`JOBQ__STORE__URL`).
+ pub const ENV_PREFIX: &str = "JOBQ__";
+diff --git a/src/service/logging.rs b/src/service/logging.rs
+index 27263db..a84e748 100644
+--- a/src/service/logging.rs
++++ b/src/service/logging.rs
+@@ -7,6 +7,8 @@
+ 
+ use std::fmt;
+ 
++use crate::engine::Error;
++
+ /// One process, one run: the value that ties every line of this process together.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct RunId(String);
+@@ -55,19 +57,18 @@ impl fmt::Display for RunId {
+ ///
+ /// # Errors
+ ///
+-/// [`crate::engine::error::Error::Config`] when the level filter cannot be parsed — a typo in a
++/// [`Error::Config`] when the level filter cannot be parsed — a typo in a
+ /// filter is worth a sentence, not a silently ignored log line.
+ pub fn init(
+     format: crate::service::config::LogFormat,
+     level: &str,
+     run: &RunId,
+-) -> Result<(), crate::engine::error::Error> {
++) -> Result<(), Error> {
+     use tracing_subscriber::EnvFilter;
+ 
+-    let filter =
+-        EnvFilter::try_new(level).map_err(|error| crate::engine::error::Error::Config {
+-            detail: format!("log level `{level}`: {error}"),
+-        })?;
++    let filter = EnvFilter::try_new(level).map_err(|error| Error::Config {
++        detail: format!("log level `{level}`: {error}"),
++    })?;
+     let builder = tracing_subscriber::fmt()
+         .with_env_filter(filter)
+         // stdout, because the harness (and an operator's `kubectl logs`) reads where the daemon was
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 8d49ba7..fbc822c 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -22,8 +22,7 @@ setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`).
+ pub mod config;
+ pub mod logging;
+ 
+-use crate::engine::domain::Queue;
+-use crate::engine::store::MemoryStore;
++use crate::engine::{Error, MemoryStore, Queue};
+ pub use config::{Config, Flags};
+ pub use logging::RunId;
+ 
+@@ -36,9 +35,9 @@ pub use logging::RunId;
+ ///
+ /// # Errors
+ ///
+-/// [`crate::engine::error::Error::Config`] when the settings do not name a store this build knows
++/// [`Error::Config`] when the settings do not name a store this build knows
+ /// how to open.
+-pub async fn serve(config: Config, run: RunId) -> Result<(), crate::engine::error::Error> {
++pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+     // The store is opened here rather than inside the drain loop: from step
+     // `jobq/3.5-store-port-conformance` on this is a connection pool, and a pool that cannot be
+     // opened must stop the process before it claims anything.
+@@ -68,10 +67,10 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), crate::engine::erro
+ /// `memory` (and nothing at all) is the in-process store: honest for a demo, useful for a test, and
+ /// the only backend this build knows — the durable one arrives with
+ /// `jobq/3.5-store-port-conformance`.
+-fn open_store(config: &Config) -> Result<MemoryStore, crate::engine::error::Error> {
++fn open_store(config: &Config) -> Result<MemoryStore, Error> {
+     match config.store.url.as_deref() {
+         None | Some("memory") => Ok(MemoryStore::new()),
+-        Some(other) => Err(crate::engine::error::Error::Config {
++        Some(other) => Err(Error::Config {
+             detail: format!(
+                 "`{}` is not a store this build can open: use `memory`, or wait for the durable \
+                  backend of jobq/3.5-store-port-conformance",
