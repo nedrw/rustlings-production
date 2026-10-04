@@ -258,4 +258,45 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 - **`jobq/3.6-isolation` 不是步骤 id**（真实 id 是 `3.6-transaction-isolation`），作业书里我写错了引用；
   作业者按原样跑了一遍并报了 `unknown step`，再用真 id 继续。教训：作业书里的步骤 id 也要过一遍扫描。
 
-## 第七段（待写）
+## 第七段 · 2026-10 · 3.8–3.11（时钟注入、公平策略、cron、延迟定时器）
+
+### 做了什么
+
+- **3.8 时钟注入**（提交 `course(jobq/3.8)`）：`Clock` 端口（**故意不密封**，调用方必须能实现它）+ `SystemClock`；
+  两个后端用 `with_clock` 构造注入，十三个直接读时钟的点位全部改走端口；项目 `clippy.toml` 禁 `Utc::now`/`Local::now`
+  /`SystemTime::now`，`SystemClock` 是唯一带 `#[allow]` 的地方。规格的假时钟停在 **2030 年**：读系统时钟的实现会在
+  “还没到期”处答“可领取”，用例因此有牙。
+- **3.9 优先级与公平**（提交 `course(jobq/3.9)`）：`Policy`（aging + 每队列在途上限）构造注入，**默认等于这一步之前的行为**；
+  ranking 放进**领取语句自身的排序**（`for update skip locked` 下事后排序只会改变报告）；守护进程接线两个旋钮并写进
+  `--check-config`（默认 aging 300s、上限 0）。
+- **3.10 cron**（提交 `course(jobq/3.10)`）：`chrono-tz` + `Schedule::next_after()` 一个问题；DST 语义与已交付的探针
+  `sched-cron.apply` 对齐（时钟跳过的那次当天不发生、重复的那次发生两次）；错过执行的政策留给调用方，不提供
+  catch-up 助手。
+- **3.11 延迟定时器**（提交 `course(jobq/3.11)`）：`ReadySet`（“等待的代价是队列数而不是作业数”）+ 端口新增
+  `Store::next_due(queue)`（两个后端都实现）+ worker 的等待改为“到下一个到期时刻，`poll_interval` 是下限”。
+- 两处**跨步骤真缺陷**（都是“在最终树上重跑早期规格”抓到的，不是猜的）：
+  ① 作业者发现 **3.9 的参考解** 给 `open_durable` 加了第三个参数（policy），却漏了 `#[cfg(not(feature = "postgres"))]`
+  的孪生函数，于是 3.9 一应用，`cargo check --no-default-features` 就是 `E0061`——3.4 的 feature 矩阵规格在最终树上
+  弄红才暴露（提交 `jobq(3.9): the assembly without postgres takes the policy…`）；
+  ② 同一轮里我自己的 3.8 把 `clippy.toml` 一列出来，`disallowed_methods` 对**所有 target** 生效，于是 3.5/3.6/3.7
+  三份需要真实时刻的规格加了 `#![allow]` 并写明理由（authoring §7.4）。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest` | 3.8 `gates ✓ 9/9`；3.9 `gates ✓ 11/11`（含两后端的 `slow:conformance@2`）；3.10 `9/9`；3.11 `11/11`；两两各跑两遍（含全新缓存）一致 |
+| 最终树上的早期规格 | `spec_clock 5 · spec_cron 12 · spec_engine_boundary 6 · spec_fairness 4 · spec_feature_assembly 2 · spec_isolation 7 · spec_leases 11 · spec_library_errors 4 · spec_port_conformance 8 · spec_public_api 4 · spec_timers 6` → 两后端各 `69 passed · 0 failed` |
+| 课程自己的工具（`kiln verify jobq --slow`） | `11/11 judged step(s) pass · 0 failed · 0 not prepared · 15 without content`；逐步 3.1 8/8、3.2 9/9、3.3 9/9、3.4 9/9、3.5 11/11、3.6 11/11、3.7 11/11、3.8 9/9、3.9 11/11、3.10 9/9、3.11 11/11 |
+| 有牙（故意回退） | 3.11：忽略 ready set → 只有“比下一次 poll 更早到期”那例红；`wait` 去掉下限 → 表格与“远处到期不变成长时间睡眠”两例红；已到期的 deadline 等零 → 表格红。两个端到端用例连跑 30 次（内存）/6 次（postgres）无失败 |
+| `lint-caps` | `no issues.`（`checked 57 of 72 step bodies`）|
+
+### 坑与判读
+
+- **cargo 会复用同名同版本的测试二进制**（`CARGO_TARGET_DIR` 共享时）：作业者中途见过一次“20/20 失败”，实际是回归探针留下的
+  陈旧二进制；所有数字都用**每棵树私有 target dir** 重取过一遍。这正是 `mutants` 门要 `make_fresh` 的同一个坑。
+- **scaffold 不能“接线 worker”**：scaffold 只能新增文件或往标记块插行，而 `src/service/worker.rs` 没有标记块——所以 3.11 的
+  scaffold 只给 `src/engine/timers.rs`，模块声明与端口方法由参考解做（规格在 scaffold 态因此是 `E0432`，与 3.9 同形）。
+- **`chrono-tz = "0.10.4"`** 沿用文件自己的惯用法（精确版本在 `Cargo.lock` 里），不写成 `= 0.10.4`。
+
+## 第八段（待写）
