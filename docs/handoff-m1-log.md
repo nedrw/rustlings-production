@@ -125,3 +125,33 @@ agent 正在同一台机器上编译，并发使用让某一步拿到不属于�
 - 跑 `kiln selftest` / `kiln verify` 时，本机不要同时跑别的 cargo；
 - 报出的红如果与实现无关，先单跑那一步、再换干净 `XDG_CACHE_HOME` 复跑，两次一致才算真红；
 - 长验证（`xtask ci` 约 10–20 分钟）交给子 agent 在**冻结的 commit** 上跑，跑的时候谁都不碰这棵树。
+
+## 第四段 · 2026-10 · T2 2.2–2.7，与 probe 第二批
+
+### 交付与数字
+
+| 步 | 规格测试 | `selftest --track relay` 结论（原样） | must 门 |
+| --- | --- | --- | --- |
+| 2.2 幂等接收 | 5 | `scaffold ✓ the spec fails as it must` / `solution ✓ the spec passes` / `9/9 must green` | 9 |
+| 2.3 契约优先 | 6 | 同上 / `8/8 must green`（本轮补齐 `images` 门） | 9 |
+| 2.4 游标分页 | 7 | 同上 / `9/9 must green` | 9 |
+| 2.5 原子领取 | 7 | `scaffold ✓ … (unresolved import relay::claim) — note: it does not compile on the scaffold` / `9/9 must green` | 9 |
+| 2.6 至少一次 | 7 | 同上（`unresolved import relay::delivery`）/ `10/10 must green`（含 `links`） | 10 |
+| 2.7 出站客户端 | 10 | 同上（`unresolved import relay::outbound`）/ `8/8 must green` | 8 |
+
+- 合并验证：`selftest relay/2.5 relay/2.6 relay/2.7 --track relay` → `3/3 step(s) hold the contract`；`kiln verify relay` 在 2.4 那棵树上把 2.1–2.4 全判通过（早期步骤在最终树上复判成立）。
+- probe 第二批 6 道（`db/atomic-claim`、`delivery/ordering`、`delivery/retry-budget`、`delivery/dlq`、`sec/ssrf-defense`、`obs/metrics-slo`），33 个测试；全库 `probe --check` → `14 exercise(s) · 14 reference(s) passed`。
+- 并发相关的两题（`db-atomic-claim`、`delivery-ordering`）参考答案各连跑 40 次 `cargo test`，0 次失败（不靠 sleep 同步：Condvar 门 + 通道 + `Barrier`）。
+
+### 施工中钉下来的决定（后续步骤要么遵守、要么同步改并重钉）
+
+- **迁移号**：`0004` 被 2.4 占了，2.5 用 `0005`；两个同号迁移会让 sqlx 拒绝**全部**迁移（`duplicate key value violates unique constraint "_sqlx_migrations_pkey"`，实测踩到）。
+- **`mark_dead` 也把 `attempts` +1**，否则「超过上限 → dead」与「重试计数」对不上。
+- **`claim` 的 `RETURNING` 直接 join 出 target 与 event**：一个 tick 一条语句，也去掉两次查询之间的窗口。
+- **fan-out 在 `delivery::fan_out(&mut PgConnection, …)`**，由 `events::ingest` 在同一个事务里调用。
+- **崩溃窗口的模拟**：parked 假 sender + 丢弃 tick future（= 发出去了、记账前进程消失），再用 `claim::release` 把行交回来（租约回收属于 2.15）。好处是后续给 `SendRequest` 加字段不会弄红 2.6。
+- **重定向语义**：301/302 保留方法与 body，只有 303 变 GET（webhook 的 payload 不能在路上被丢掉）。
+- **契约面**（改签名要同步改 2.5/2.6/2.7 的规格并重钉 manifest）：`claim::{claim,release,mark_sent,mark_retry,mark_dead}`、`delivery::{tick,Sender,SendRequest,SendError,Receipt}`、`outbound::{Client,Policy,Outcome,HttpSender,Request,Response}`；2.7 的规格用 `..Policy::default()`，加字段不破。
+- **2.6 的重试上限没钉常量**（规格只要求「12 轮内到 `dead`」且 `attempts >= 2`）：谁把它搬进配置，默认值必须 ≤ 12。
+- **2.12 与 2.7 的已知张力**（写给 2.12 的作者）：2.7 的规格必须打 `127.0.0.1`（离线要求）。SSRF 的拒绝应当来自**配置层**（默认 `delivery.allow_private_targets = false`），而不是改 `Policy::default()`；若要改默认，必须在同一个提交里改 2.7 的规格并重钉 manifest。
+- **2.3 的契约检查是一条持续性约束**：新路由必须进 `document()`，且它可能返回的每个状态都要有 schema——2.10 的 DLQ 路由是第一个撞上它的。
