@@ -221,3 +221,36 @@ var("RELAY__DELIVERY__ALLOW_PRIVATE_TARGETS", "true"),
 - **公平 claim 只能「每租户一条语句」**：PostgreSQL 不允许 `FOR UPDATE` 与窗口函数同用（容器里实测 `ERROR: FOR UPDATE is not allowed with window functions`），所以按队列位置排名的单语句写法不存在。
 - **2.15 的停机是两条流都被 await**：第一版写成 `select!`，规格立刻抓到（服务端先返回 → 进程退出 → drain 被丢 → `claimed` 还剩 1 行）——正是 `mailer/1.14` 点名的 TRAP；`delivery.lease_seconds` 与 `delivery.drain_seconds` 进了配置。
 - **`reclaim_expired` 计数、`release_held` 不计数**：无人旁观的那次尝试必须计数，否则反复崩溃的 worker 会让投递永远重试（计数是唯一能把它送进 DLQ 的东西）；主动交回的行没失败。
+
+## 第七段 · 2026-10 · T2 2.16–2.19 与 probe 第三批
+
+### 数字
+
+| 步 | 规格测试 | `selftest` 结论（原样） | must 门 |
+| --- | --- | --- | --- |
+| 2.16 授权矩阵与审计（deepen） | 11 | `scaffold ✓ … (unresolved import relay::authz)` / `solution ✓ the spec passes` / `10/10 must green`（含 `links`） | 10 |
+| 2.17 故障注入 | 7 | `scaffold ✓ the spec fails as it must (test nothing_is_lost_under_any_fault_in_the_matrix … FAILED)` / `9/9 must green` | 9 |
+| 2.18 投递可观测（deepen） | 8 | `scaffold ✓ … (unresolved import relay::metrics)` / `9/9 must green` | 9 |
+| 2.19 追踪传播（deepen） | 7 | `scaffold ✓ … (unresolved import relay::trace)` / `9/9 must green` | 9 |
+
+- 合并 `4/4 step(s) hold the contract`；`kiln verify relay` → **`19/19 judged step(s) pass · 0 failed · 0 not prepared · 5 without content`**（2m20s）；项目内 `cargo test -p relay` 22 个目标 / **152 个测试**全绿。
+- `lint-caps` `no issues`；`kiln links` `51 page(s) · 333 link(s) · 211 external` ✓。
+- **对早期步骤零同步改动**：新增的契约面全是加性的（`Claimed` 加 `tenant` 字段、`Worker::metered(...)`、`HttpSender::with_traces(...)`、`events::ingest` 加一个 context 参数、`Error::Forbidden`），2.5–2.15 的规格与 manifest 哈希一字未改，最终树复判 19/19。
+
+### 施工中钉下来的决定
+
+- **2.16 把「这条路由是否计费」写成路由表的数据**：矩阵化之后公共路由不能再靠挂在另一个 sub-router 上获得豁免；若配额层跟着变成全局，`/readyz` 会占掉匿名桶，已交付的 2.13 规格（拿 `/readyz` 做握手再数匿名 401）会红。三条进程路由不计费。
+- **2.17 的交付物是测试装置**：进程内 `std` 故障代理（延迟 / RST / 半开 / **周期性**丢包——确定性，「不可复现的故障是谣言」），按**请求**计数而不是按连接（本服务复用 keep-alive，按连接计的丢包只会触发一次然后藏在活套接字后面）。toxiproxy 的偏离写在装置文档与正文里。
+- **2.18 的积压 gauge 在抓取时读队列**（准确，每次抓取一个查询），标签用租户名且 `/metrics` 只给 `tenant-admin`；`tick_with_budget` 那种一次性 turn 没有注册表可写，正文写明。
+- **2.19 用端口 `trace::Traces`/`DbTraces` 而不是给 `SendRequest` 加字段**（与 2.11 的 `Secrets` 同形）；trace id 在接收事件的事务里落到投递行（迁移加两列 + 格式 CHECK）。
+- **审计先写行再执行**：特权动作先落一行（含决定），写不进去就拒绝执行。
+
+### probe 第三批（5 道 / 41 个测试，题库共 19 道）
+
+`obs/tracing-propagation`、`perf/load-testing`、`supply/deny-policy`、`outbound/http-client`、`sec/hmac-signing`；
+全库 `probe --check` → `19 exercise(s) · 19 reference(s) passed`。
+
+**两个槽位不硬写，理由是内容性而非工作量**（与作者清单的「没有 probe 要写明理由」一致）：
+
+- `test/chaos-injection@apply`：那一步的机制是「测试自己拥有一个故障代理」（独立端口、注入三类故障）。单文件 std 题只能把代理换成假对象，那时被检查的就不是注入；**查不出代理是否真的在中间的 probe 是假证据**，比没有更糟。
+- `delivery/at-least-once@design`：design 深度的证据是 ADR + 系统级崩溃测试（断在中间、行必须回来）。单文件的状态机只能证明三轮顺序对，证明不了「崩溃后不丢单」——而后者才是这个格位。第二轮能收窄成单文件，是因为它的证据是**策略**（窗口/熔断状态机），不是进程被杀时的持久化。
