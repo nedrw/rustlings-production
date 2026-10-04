@@ -18,9 +18,9 @@
 //! * **the order is a promise, not a habit.** The port's `claim` documentation fixes the order
 //!   (priority, then the job that has been due longest, then identity) precisely so that a caller
 //!   can have a policy at all; a backend that hands rows back in its own order is a backend that
-//!   changes what the queue does. What this file deliberately does *not* assert is anything the
-//!   port leaves open — how rows are stored, when a tie on priority and time is settled by
-//!   anything other than identity, what a backend does under the hood.
+//!   changes what the queue does. What this file deliberately does *not* assert is anything the port
+//!   leaves open: how a backend stores its rows, what it does under the hood, what an index makes
+//!   fast.
 //! * **concurrency is one of the promises.** Two claims that run at the same instant may not
 //!   overlap, and no single-threaded assertion can see that: the case at the bottom of this file
 //!   starts several claims at once, which is the only way the read-then-write backend differs from
