@@ -1,0 +1,466 @@
+diff --git a/src/engine/cron.rs b/src/engine/cron.rs
+index d927746..d54befa 100644
+--- a/src/engine/cron.rs
++++ b/src/engine/cron.rs
+@@ -1,84 +1,399 @@
+ //! Cron expressions: what a schedule is, and the one question worth asking it.
+ //!
+ //! A schedule is data — five fields a person writes once and an engine reads for years — and the
+-//! question this module answers is "when is the next run after this instant?". Step
+-//! `jobq/3.10-cron-schedules` is about where that question stops: everything else an operator could
+-//! want (which runs did I miss? should the job run twice on the day the clock goes back?) is a
+-//! *policy*, and a library that answers a policy question has taken a decision away from the process
+-//! that has the context to make it.
++//! only question this file answers is "when is the next run after this instant?". Everything else
++//! an operator could want (which runs did I miss? should the job run twice on the day the clock
++//! goes back?) is a *policy*, and a library that answers a policy question has taken a decision away
++//! from the process that has the context to make it. Step `jobq/3.10-cron-schedules` is where that
++//! line is drawn; the arithmetic below is what stays on this side of it.
+ //!
+-//! Four decisions are this step's, and the body argues each of them:
++//! Four decisions are worth reading before the code.
+ //!
+-//! * **what a field is allowed to say.** `minute hour day-of-month month day-of-week`, each a
+-//!   comma-separated list of `*`, `N`, `N-M`, `*/S` and `N-M/S` — and the answer has to include what
+-//!   is *refused* (a second, a year, `JAN`, `MONDAY`, `1-`, `*/0`) and why a refusal beats a guess;
+-//! * **what the two day fields mean together.** `0 0 1 * 1` is not "the first of the month *and* a
+-//!   Monday": what it means is what every crontab already means by it;
+-//! * **where the time zone lives.** `0 9 * * *` is a statement about a wall clock, so it is
+-//!   incomplete without the clock it is about — and what the schedule *answers* has to be an instant
+-//!   two processes can agree on;
+-//! * **what happens on the two DST days.** A reading the clock skips and a reading the clock repeats
+-//!   both need a rule written down, and "it depends" is how a nightly job runs at 03:00 once a year
+-//!   and nobody can say why.
+-//!
+-//! The types below are the shape the specs hold this module to; what a parsed field *is* — a bit per
+-//! value, a table, the text read again on every question — is the first of those decisions and is
+-//! deliberately not made here.
++//! * **Five fields, with the classic meaning.** `minute hour day-of-month month day-of-week`, each a
++//!   comma-separated list of `*`, `N`, `N-M`, `*/S` and `N-M/S`, numbers only: no seconds, no year,
++//!   no `JAN`, no `MON`. Anything else is refused with the field's name in the message, because the
++//!   alternative — a schedule that quietly means something the writer did not — is discovered by the
++//!   person the job was supposed to wake.
++//! * **The two day fields are a union, not an intersection.** `0 0 1 * 1` is "the first of the
++//!   month" *or* "any Monday": that is what a crontab written by somebody else already means, and
++//!   an engine that ANDs the two changes a customer's nightly job into a monthly one without
++//!   saying so. The rule keys on whether a field was written `*`: with both restricted the run
++//!   happens on either, and with one of them `*` only the other one decides.
++//! * **The zone travels with the schedule.** `0 9 * * *` is a statement about a wall clock, so it is
++//!   incomplete without the clock it is about: the same expression in `UTC` and in
++//!   `America/New_York` names two different instants, and the schedule carries the zone it was read
++//!   in rather than taking one per call. What it *answers* is an instant in UTC, which is the only
++//!   thing two processes can agree on.
++//! * **A reading of the wall clock is one run.** Two instants on a DST day are worth naming here,
++//!   because both have a defensible answer and this file has to pick one (the step body argues
++//!   both halves):
++//!   * on the day New York's clock goes from 02:00 to 03:00, `30 2 * * *` has no instant at all —
++//!     the reading is skipped, and the next run is tomorrow's. Running it at 03:00 would be
++//!     inventing a reading the schedule did not name; a caller that cannot accept a missing run has
++//!     a policy to write, not a schedule to bend;
++//!   * on the day it goes from 02:00 back to 01:00, `30 1 * * *` names *two* instants — 01:30 with
++//!     the old offset and 01:30 again with the new one — and both are runs, because the local clock
++//!     really does read 01:30 twice. `next_after` answers the first, and asked from that instant it
++//!     answers the second, so a caller that wants one run per reading bounds its own loop.
++
++use std::str::FromStr;
+ 
+-use chrono::{DateTime, Utc};
++use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
++use chrono_tz::Tz;
+ 
+ use crate::engine::error::Error;
+ 
++/// How many days ahead the search looks before it answers "never".
++///
++/// Five years, and the number is chosen rather than picked: the rarest thing a five-field expression
++/// can name is 29 February, which comes round every fourth year, so a schedule that matches nothing
++/// in five years can never match at all. That is what makes `None` an answer instead of a search
++/// that does not come back — `0 0 31 2 *` is legal to write and names nothing for ever.
++const HORIZON_DAYS: i64 = 366 * 5;
++
++/// One field of an expression: what a message calls it, and the values it may name.
++#[derive(Debug, Clone, Copy)]
++struct Field {
++    /// Name used in every refusal, because "invalid cron expression" is the message that makes
++    /// somebody read the source of the program that printed it.
++    name: &'static str,
++    /// Lowest value the field allows.
++    low: u32,
++    /// Highest value the field allows.
++    high: u32,
++}
++
++/// Minutes of the hour, `0-59`.
++const MINUTE: Field = Field {
++    name: "minute",
++    low: 0,
++    high: 59,
++};
++
++/// Hours of the day, `0-23`.
++const HOUR: Field = Field {
++    name: "hour",
++    low: 0,
++    high: 23,
++};
++
++/// Days of the month, `1-31`. There is no day zero.
++const DAY_OF_MONTH: Field = Field {
++    name: "day of month",
++    low: 1,
++    high: 31,
++};
++
++/// Months, `1-12`.
++const MONTH: Field = Field {
++    name: "month",
++    low: 1,
++    high: 12,
++};
++
++/// Days of the week, Sunday as `0`. `7` is a second spelling of Sunday and is folded into `0` when
++/// the field is read, which is what the classic implementations accept and what a schedule written
++/// for one of them already means.
++const DAY_OF_WEEK: Field = Field {
++    name: "day of week",
++    low: 0,
++    high: 7,
++};
++
++/// One field of an expression, as a bit per value: bit `value - low` is set when `value` is named.
++///
++/// A table rather than the text, because the question asked of a field is "do you allow 3?" and it
++/// is asked once per candidate minute of a search: a parser that kept the text would answer it again
++/// on every minute it looks at.
++#[derive(Debug, Clone, Copy)]
++struct Parsed {
++    /// The values the field names.
++    bits: u64,
++    /// Whether the field was written `*`, which is what the day-fields union rule keys on.
++    star: bool,
++}
++
+ /// A five-field cron expression, in the time zone it was read in.
+ ///
+ /// Fields are private and the schedule is asked one question ([`Schedule::next_after`]), which is
+-/// deliberate: what a caller can name is what this crate has to keep compatible, and how a parsed
+-/// field is stored is exactly the detail a later step should be free to change.
++/// deliberate: what a caller can name is what this crate has to keep compatible, and the storage of
++/// a parsed field is exactly the detail a later step (a cron editor, a schedule stored in a row)
++/// should be free to change.
+ #[derive(Debug, Clone)]
+ pub struct Schedule {
+-    // The representation is part of what this step teaches, so it is not written down here: a field
+-    // can be a bit per value, a list of ranges, or the text itself, and the body of
+-    // `jobq/3.10-cron-schedules` is where the trade is argued. The schedule also has to remember the
+-    // zone it was read in — the one decision that cannot be deferred to the question.
++    /// Minutes of the hour, as a bit per value.
++    minutes: u64,
++    /// Hours of the day, as a bit per value.
++    hours: u32,
++    /// Days of the month, as a bit per value (bit `day - 1` for day `day`).
++    days: u32,
++    /// Months, as a bit per value (bit `month - 1` for month `month`).
++    months: u16,
++    /// Days of the week, Sunday at bit 0. `7` is folded into `0` while the field is read.
++    weekdays: u8,
++    /// Whether the day-of-month field was written `*`.
++    day_of_month_any: bool,
++    /// Whether the day-of-week field was written `*`.
++    day_of_week_any: bool,
++    /// The zone the expression is a statement about.
++    zone: Tz,
+ }
+ 
+ impl Schedule {
+     /// Read a five-field expression, in UTC until [`Schedule::in_zone`] says otherwise.
+     ///
++    /// The grammar is the whole of `minute hour day-of-month month day-of-week`, where each field is
++    /// a comma-separated list of `*`, `N`, `N-M`, `*/S` or `N-M/S`. Surrounding whitespace and runs
++    /// of spaces are accepted — a crontab line gets pasted with either — and nothing else is: a
++    /// second, a year, `JAN`, `MONDAY`, `1-` and `*/0` are refused rather than guessed at.
++    ///
+     /// # Errors
+     ///
+     /// [`Error::Invalid`] when the expression is not five fields, when a value is outside the range
+     /// its field allows, when a range is written backwards, when a step is zero, or when an item is
+-    /// none of the shapes a field is made of. Every message names the field and what was wrong with
+-    /// it.
++    /// none of the five shapes above. Every message names the field and what was wrong with it.
+     pub fn parse(expression: &str) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.10-cron-schedules: read `{expression}` — five fields, or a refusal that names the field"
+-        )
++        let fields: Vec<&str> = expression.split_whitespace().collect();
++        let [minute, hour, day, month, weekday] = fields.as_slice() else {
++            return Err(refused(format!(
++                "`{expression}` is {} field(s), and a schedule is five (minute, hour, day of month, \
++                 month, day of week): a sixth field is a second or a year this grammar does not \
++                 have, and a missing one is a schedule that does not say when",
++                fields.len()
++            )));
++        };
++        let minutes = read_field(minute, MINUTE)?;
++        let hours = read_field(hour, HOUR)?;
++        let days = read_field(day, DAY_OF_MONTH)?;
++        let months = read_field(month, MONTH)?;
++        let weekdays = read_field(weekday, DAY_OF_WEEK)?;
++        Ok(Self {
++            minutes: minutes.bits,
++            hours: u32::try_from(hours.bits).unwrap_or(u32::MAX),
++            days: u32::try_from(days.bits).unwrap_or(u32::MAX),
++            months: u16::try_from(months.bits).unwrap_or(u16::MAX),
++            // `7` and `0` are the same day, so the two bits a `7` may have set become one.
++            weekdays: u8::try_from((weekdays.bits & 0x7f) | ((weekdays.bits >> 7) & 1))
++                .unwrap_or(u8::MAX),
++            day_of_month_any: days.star,
++            day_of_week_any: weekdays.star,
++            // A schedule that never says which zone it is about is a schedule about UTC: it is a
++            // defensible default, it is what a crontab on a server in a rack reads, and it is the
++            // one zone that means the same thing in every process.
++            zone: Tz::UTC,
++        })
+     }
+ 
+     /// The same expression, in the zone `name` names (an IANA name: `UTC`, `Europe/Berlin`,
+     /// `America/New_York`).
+     ///
++    /// The zone belongs to the schedule rather than to the question, because it is part of what the
++    /// expression *means*: `0 9 * * *` in Berlin and in New York are two different statements, and a
++    /// caller that could pass a zone to every question is a caller that can pass two different ones
++    /// to two questions about one schedule.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::Invalid`] when the name is not one the time zone database has.
++    /// [`Error::Invalid`] when the name is not one the time zone database has. Names are
++    /// case-sensitive, and an unknown name is refused rather than silently defaulted: a schedule
++    /// that ran in UTC because the zone was a typo is a schedule nobody notices until the nightly
++    /// report is five hours early, every night, for a year.
+     pub fn in_zone(self, name: &str) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.10-cron-schedules: resolve `{name}` — and refuse it rather than defaulting to UTC"
+-        )
++        let zone = Tz::from_str(name).map_err(|_| {
++            refused(format!(
++                "`{name}` is not a time zone this build knows: use an IANA name such as `UTC`, \
++                 `Europe/Berlin` or `America/New_York`, spelled the way the database spells it"
++            ))
++        })?;
++        Ok(Self { zone, ..self })
+     }
+ 
+     /// The first instant this schedule names that is strictly after `after`, or `None` when it names
+     /// no such instant.
+     ///
++    /// One question, on purpose: "which runs did I miss" is a policy — catch up on all of them, on
++    /// the most recent one, on none and count them — and a schedule that decided would be deciding
++    /// for the process that has the context. A caller that wants a catch-up writes a loop over this
++    /// function, which is also what keeps the bound where the caller can see it.
++    ///
++    /// The answer is an instant in UTC; the *search* is over wall-clock readings, because that is
++    /// what the fields name. Each reading the expression allows is turned into the instants a local
++    /// clock really reads it (none on the day the clock skips it, two on the day it repeats it) and
++    /// the first of those after `after` is the answer.
++    ///
+     /// Strictly after, because a schedule that fired on the instant it just fired on would be a
+-    /// loop; `None` rather than a search that does not come back, because `0 0 31 2 *` is a legal
+-    /// expression that names nothing ever.
++    /// loop, and `None` rather than an unbounded search, because `0 0 31 2 *` is a legal expression
++    /// that names nothing ever ([`HORIZON_DAYS`] is where the search gives up).
+     #[must_use]
+     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+-        todo!(
+-            "jobq/3.10-cron-schedules: the next reading after `{after}` — including the two DST days"
+-        )
++        // The local date `after` falls on is where the search starts rather than "an hour later":
++        // which candidates are still ahead is decided by comparing instants below, and on the day
++        // the clock repeats an hour, a candidate that looks past can still be ahead by an hour.
++        let start = self.zone.from_utc_datetime(&after.naive_utc()).date_naive();
++        for ahead in 0..=HORIZON_DAYS {
++            let Some(date) = start.checked_add_signed(TimeDelta::days(ahead)) else {
++                // The calendar ran out before the horizon did: nothing this expression names is
++                // reachable either.
++                return None;
++            };
++            if !self.matches_date(date) {
++                continue;
++            }
++            if let Some(at) = self.first_reading_after(date, after) {
++                return Some(at);
++            }
++        }
++        None
++    }
++
++    /// Whether `date` is one the two day fields name (cron's union rule, see the module docs).
++    fn matches_date(&self, date: NaiveDate) -> bool {
++        if self.months & (1 << (date.month() - 1)) == 0 {
++            return false;
++        }
++        let day_of_month = self.days & (1 << (date.day() - 1)) != 0;
++        let day_of_week = self.weekdays & (1 << date.weekday().num_days_from_sunday()) != 0;
++        match (self.day_of_month_any, self.day_of_week_any) {
++            // Both restricted: the run happens on either. This is the half of the rule that an
++            // engine gets wrong silently — `0 0 1 * 1` means thirty-odd runs a year, not one a
++            // month, and everybody who wrote such a line already believes that.
++            (false, false) => day_of_month || day_of_week,
++            (false, true) => day_of_month,
++            (true, false) => day_of_week,
++            (true, true) => true,
++        }
+     }
++
++    /// The first instant strictly after `after` that the expression names on `date`, if there is
++    /// one.
++    fn first_reading_after(&self, date: NaiveDate, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
++        let mut runs = Vec::new();
++        for hour in 0..=23 {
++            if self.hours & (1 << hour) == 0 {
++                continue;
++            }
++            for minute in 0..=59 {
++                if self.minutes & (1 << minute) == 0 {
++                    continue;
++                }
++                if let Some(local) = date.and_hms_opt(hour, minute, 0) {
++                    runs.extend(self.readings(local));
++                }
++            }
++        }
++        // Sorted, because the two instants of a reading the clock repeats are not in the order the
++        // local times are: on the day New York goes back, 01:45's *first* instant comes after
++        // 01:30's second one. Sorting one day's worth of instants is what keeps "the first one after
++        // `after`" the same answer whatever the offset did in between.
++        runs.sort_unstable();
++        runs.into_iter().find(|at| *at > after)
++    }
++
++    /// Every instant at which a local clock reads `local`: none when the clock skips that reading,
++    /// one when it reads it once, two when it reads it twice.
++    fn readings(&self, local: NaiveDateTime) -> Vec<DateTime<Utc>> {
++        match self.zone.from_local_datetime(&local) {
++            // The spring-forward day: this reading does not exist, so this run does not happen. The
++            // caller that cannot afford to lose it is the caller with a policy (see the module
++            // docs), not a schedule to reinterpret.
++            LocalResult::None => Vec::new(),
++            LocalResult::Single(at) => vec![at.with_timezone(&Utc)],
++            // The fall-back day: the same wall clock reads this twice, and both readings are runs.
++            LocalResult::Ambiguous(first, second) => {
++                vec![first.with_timezone(&Utc), second.with_timezone(&Utc)]
++            }
++        }
++    }
++}
++
++/// Read one field: a comma-separated list of `*`, `N`, `N-M`, `*/S` and `N-M/S`.
++fn read_field(text: &str, field: Field) -> Result<Parsed, Error> {
++    if text == "*" {
++        return Ok(Parsed {
++            bits: mask(field),
++            star: true,
++        });
++    }
++    let mut bits = 0u64;
++    for item in text.split(',') {
++        bits |= read_item(item, field)?;
++    }
++    Ok(Parsed { bits, star: false })
++}
++
++/// One item of a field.
++fn read_item(item: &str, field: Field) -> Result<u64, Error> {
++    let (range, step) = match item.split_once('/') {
++        Some((range, step)) => (range, Some(step)),
++        None => (item, None),
++    };
++    let step = match step {
++        Some(text) => number(text, item, field)?,
++        None => 1,
++    };
++    if step == 0 {
++        return Err(refused(format!(
++            "`{}`: `{item}` steps by zero, so it names nothing — a step of one is what `*` already \
++             means",
++            field.name
++        )));
++    }
++    let (first, last) = if range == "*" {
++        (field.low, field.high)
++    } else if let Some((from, to)) = range.split_once('-') {
++        let from = number(from, item, field)?;
++        let to = number(to, item, field)?;
++        if from > to {
++            return Err(refused(format!(
++                "`{}`: `{item}` is written backwards ({from} to {to}) — a range runs from low to \
++                 high, and a typo here is a schedule that never runs",
++                field.name
++            )));
++        }
++        (from, to)
++    } else {
++        let from = number(range, item, field)?;
++        // `5/2` is "every other value from 5 to the end of the field"; a bare `5` is just 5, which
++        // is why the end of the range depends on whether a step was written.
++        (from, if step > 1 { field.high } else { from })
++    };
++    for value in [first, last] {
++        if value < field.low || value > field.high {
++            return Err(refused(format!(
++                "`{}`: `{value}` is outside the values this field allows ({} to {}) — the item is \
++                 `{item}`",
++                field.name, field.low, field.high
++            )));
++        }
++    }
++    let mut bits = 0u64;
++    let mut value = first;
++    while value <= last {
++        bits |= 1u64 << (value - field.low);
++        value += step;
++    }
++    Ok(bits)
++}
++
++/// A number out of an item, with a message that names the field and the item it came from.
++fn number(text: &str, item: &str, field: Field) -> Result<u32, Error> {
++    text.parse::<u32>().map_err(|_| {
++        refused(format!(
++            "`{}`: `{item}` is not a number — a field is a list of `*`, `N`, `N-M`, `*/S` and \
++             `N-M/S`, and names like `JAN` or `MON` are not this grammar",
++            field.name
++        ))
++    })
++}
++
++/// Every value a field allows, as bits.
++fn mask(field: Field) -> u64 {
++    let width = field.high - field.low + 1;
++    (1u64 << width) - 1
++}
++
++/// One refusal, in the variant a caller can branch on: a schedule that does not read is a call site
++/// somebody has to fix, not a store that has to be retried.
++fn refused(detail: String) -> Error {
++    Error::Invalid { detail }
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index f3d04be..288953e 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -19,6 +19,7 @@
+ //! re-exported below), so the next release can move them without touching anybody.
+ 
+ pub(crate) mod clock;
++pub(crate) mod cron;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
+@@ -30,6 +31,7 @@ pub(crate) mod store;
+ mod sealed;
+ 
+ pub use clock::{Clock, SystemClock};
++pub use cron::Schedule;
+ pub use domain::{
+     DEFAULT_MAX_ATTEMPTS, Job, JobId, JobState, QUEUE_NAME_MAX, Queue, SubmitRequest, WorkerId,
+ };

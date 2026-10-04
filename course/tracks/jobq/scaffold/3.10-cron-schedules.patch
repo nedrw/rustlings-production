@@ -1,0 +1,104 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6da6889..b57fa4b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,9 @@ edition = "2024"
+ [dependencies]
+ # kiln:scaffold:begin
+ chrono = { version = "0.4.42", features = ["serde"] }
++# `jobq/3.10-cron-schedules`: a schedule carries the zone it is written in, and a zone is a name
++# from the time zone database rather than an offset somebody maintains by hand.
++chrono-tz = "0.10.4"
+ serde = { version = "1.0.229", features = ["derive"] }
+ serde_json = "1.0.151"
+ sqlx = { version = "0.9.0", default-features = false, optional = true, features = ["runtime-tokio", "postgres", "migrate", "macros", "uuid", "chrono"] }
+diff --git a/src/engine/cron.rs b/src/engine/cron.rs
+new file mode 100644
+index 0000000..d927746
+--- /dev/null
++++ b/src/engine/cron.rs
+@@ -0,0 +1,84 @@
++//! Cron expressions: what a schedule is, and the one question worth asking it.
++//!
++//! A schedule is data — five fields a person writes once and an engine reads for years — and the
++//! question this module answers is "when is the next run after this instant?". Step
++//! `jobq/3.10-cron-schedules` is about where that question stops: everything else an operator could
++//! want (which runs did I miss? should the job run twice on the day the clock goes back?) is a
++//! *policy*, and a library that answers a policy question has taken a decision away from the process
++//! that has the context to make it.
++//!
++//! Four decisions are this step's, and the body argues each of them:
++//!
++//! * **what a field is allowed to say.** `minute hour day-of-month month day-of-week`, each a
++//!   comma-separated list of `*`, `N`, `N-M`, `*/S` and `N-M/S` — and the answer has to include what
++//!   is *refused* (a second, a year, `JAN`, `MONDAY`, `1-`, `*/0`) and why a refusal beats a guess;
++//! * **what the two day fields mean together.** `0 0 1 * 1` is not "the first of the month *and* a
++//!   Monday": what it means is what every crontab already means by it;
++//! * **where the time zone lives.** `0 9 * * *` is a statement about a wall clock, so it is
++//!   incomplete without the clock it is about — and what the schedule *answers* has to be an instant
++//!   two processes can agree on;
++//! * **what happens on the two DST days.** A reading the clock skips and a reading the clock repeats
++//!   both need a rule written down, and "it depends" is how a nightly job runs at 03:00 once a year
++//!   and nobody can say why.
++//!
++//! The types below are the shape the specs hold this module to; what a parsed field *is* — a bit per
++//! value, a table, the text read again on every question — is the first of those decisions and is
++//! deliberately not made here.
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::error::Error;
++
++/// A five-field cron expression, in the time zone it was read in.
++///
++/// Fields are private and the schedule is asked one question ([`Schedule::next_after`]), which is
++/// deliberate: what a caller can name is what this crate has to keep compatible, and how a parsed
++/// field is stored is exactly the detail a later step should be free to change.
++#[derive(Debug, Clone)]
++pub struct Schedule {
++    // The representation is part of what this step teaches, so it is not written down here: a field
++    // can be a bit per value, a list of ranges, or the text itself, and the body of
++    // `jobq/3.10-cron-schedules` is where the trade is argued. The schedule also has to remember the
++    // zone it was read in — the one decision that cannot be deferred to the question.
++}
++
++impl Schedule {
++    /// Read a five-field expression, in UTC until [`Schedule::in_zone`] says otherwise.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the expression is not five fields, when a value is outside the range
++    /// its field allows, when a range is written backwards, when a step is zero, or when an item is
++    /// none of the shapes a field is made of. Every message names the field and what was wrong with
++    /// it.
++    pub fn parse(expression: &str) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.10-cron-schedules: read `{expression}` — five fields, or a refusal that names the field"
++        )
++    }
++
++    /// The same expression, in the zone `name` names (an IANA name: `UTC`, `Europe/Berlin`,
++    /// `America/New_York`).
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the name is not one the time zone database has.
++    pub fn in_zone(self, name: &str) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.10-cron-schedules: resolve `{name}` — and refuse it rather than defaulting to UTC"
++        )
++    }
++
++    /// The first instant this schedule names that is strictly after `after`, or `None` when it names
++    /// no such instant.
++    ///
++    /// Strictly after, because a schedule that fired on the instant it just fired on would be a
++    /// loop; `None` rather than a search that does not come back, because `0 0 31 2 *` is a legal
++    /// expression that names nothing ever.
++    #[must_use]
++    pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
++        todo!(
++            "jobq/3.10-cron-schedules: the next reading after `{after}` — including the two DST days"
++        )
++    }
++}
