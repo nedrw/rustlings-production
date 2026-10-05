@@ -311,6 +311,10 @@ app/jobq/
   memory 那一侧曾只按 `JobFilter` 过滤（租户句柄能列出别人的队列），已在 3.15 的参考解与规格里改正；
   `visible_queues` 是整个列表问一次的那个问题（每行问一次 `visible` 是把声明表走 N 遍）。从 3.16 起，
   凡是新增“列出来”的接口（CLI、报表、DLQ 视图）都得守同一条。
+- **`src/engine/**` 的文档注释里不要写 `crate::service`**（3.18 的作者踩过）：3.2 那条“引擎不依赖服务层”的检查
+  读的是源码文本，散文里的一个路径也会让它红；它管的是代码，不是意图。
+- **等待一定要有截止条件**（§4.4 的实测）：一个只有“队列空才退出”的循环会把变异门从 20 秒变成半小时。
+  纯函数式的步骤（无容器、无时钟、无等待）的变异门只要 9 秒（3.20 的实测）。
 - **质量闸门从 3.20 起是累积的，且带两个时钟**（提交 `kiln(mutants)`、`kiln(process)`，详见 §1.3 与 §4.4）：
   每步的 `selftest` 因此大约多花一分钟；`bench-budget` 那一行意味着每步要交
   `course/tracks/jobq/budget/<step-id>.toml`；超时只会杀直接子进程的时代结束了——超时会带走子进程的整棵后代树，
@@ -443,14 +447,14 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（18/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（20/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
-| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` must gates，全部 `hold the contract` |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow` → **`18/18 judged step(s) pass · 0 failed · 9 without content`**（18 步共 2 m 19 s；逐步 8/9/9/9/11/11/11/9/11/9/11/11/10/10/10/11/10/10）|
-| 默认特性全量套件 | `cargo test -p jobq` → **116 passed · 0 failed**（3.13 时 81 → 3.16 时 99 → 3.18 时 116）|
-| postgres 后端子集 | `KILN_BACKEND=postgres` 跑 11 个声明了后端的规格 → **75 passed · 0 failed** |
+| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` must gates，全部 `hold the contract` |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`20/20 judged · 0 failed · 0 blocked · 7 not_authored`**（20 步共 **2 m 38 s**）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **134 passed · 0 failed**（3.13 时 81 → 3.16 时 99 → 3.18 时 116 → 3.20 时 134）|
+| postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
 | CI | `cargo xtask ci` 上次全绿是 `0927803`（1634 s）；3.8–3.15 与闸门提交之后**未复跑**（逐条走 mailer/relay/jobq 三条 track，30 min+） |
@@ -492,8 +496,31 @@ future 来钉；`Store` 的五个方法是真的函数指针强转（line 136–
   tests/spec_port_conformance.rs:231:5)`。注意同一步的 `spec ✓`——**只跑内存后端的快速路径是绿的，是慢闸门抓到了分歧**。
 - 回滚后同一个命令：`15/15 judged step(s) pass · 0 failed`。
 
-**b) `slow:mutants@80` 与 c) `slow:bench-budget@10` 还没有可演练的步骤**：这两个门从 3.20 / 3.22 起才有步骤声明，
-`unsafe-budget@0` 从 3.24 起（表 §2.2），所以这三腿排在它们交付之后；做法已固定（§4.1）。
+**b) `slow:mutants@80`（第 3.20 步）：把一步的规格掏空。**
+3.20 声明这个门，它的模块是 `src/engine/mutation.rs`（策略、分数、报告）。劣化：把裁决那套断言的规格换成一份
+只“碰一下”模块的最小规格（`Score::new(0,0).judged()` 与 `MutationPolicy::new(80,1).threshold()`），
+所以被抽样的变异体没有任何断言可撞。原始行（`verify jobq --slow --json` 的 3.20）：
+
+```
+totals: {passed: 19, failed: 1, blocked: 0, not_authored: 7}
+== jobq/3.20-mutation-threshold: failed — the specs pass but a must gate does not
+   ✗ slow:mutants@80 (must): 6 of 6 mutant(s) survived (0% killed, needs ≥80%) (the walk took 10s)
+     — no test noticed src/engine/mutation.rs:74:21 `self.killed + self.survived` (`+` → `-`);
+       src/engine/mutation.rs:149:9 `!(self.min_judged == 0 || self.threshold > 100)` (`!` → `nothing`);
+       src/engine/mutation.rs:149:27 `!(…)` (`==` → `!=`); src/engine/mutation.rs:149:30 `!(…)` (`0` → `1`);
+       src/engine/mutation.rs:149:50 `!(…)` (`>` → `>=`);
+       src/engine/mutation.rs:162:41 `let floor = self.min_judged.max(1);` (`1` → `0`)
+```
+
+**对照实验**：同一棵树、同一条命令，规格完好时是 `20/20 judged · 0 failed`，而 3.20 自己的门是
+`6/6 killed (100%)`。门不但红，还把每个存活变异体的**文件:行:列**、原文与改写都点名了。
+
+**两次失败的尝试也值得记下**（都是“演习自己脏了树”）：① 只掏空两个用例不够——规格本身有冗余，别的用例仍会杀掉同一个变异体（这是好事，说明套件不是只有一处关注）；
+② 掏空时留下了：双空行→`fmt` 红，未用导入→`clippy` 红，误伤了辅助函数→整个树编不过。在**共享树**上做演习，先把自己弄得 lint-clean，
+否则你读到的是别的门。附带收获：树编不过时，`mutants` 拒绝判分，说“the spec does not pass on the project as it is, so no mutant can
+be judged”（它不会把编译错误当成杀死）。
+
+**c) `slow:bench-budget@10` 还没有可演练的步骤**：它从 3.22 起才有步骤声明，所以这一腿排在 3.22 交付之后；做法已固定（§4.1）。
 
 ### 4.4 `selftest` 为什么越来越慢（实测、根因、三步修法）
 
@@ -582,7 +609,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **已收口的缺口**：3.15 的 FURTHER 与 `src/cli/mod.rs` 的模块文档曾把死信命令行许给 3.16（而 3.16 只交端口那一半）——
   现在两处都指向 `jobq/3.26-dlq-cli`（提交 `course(jobq/3.15): the dead-letter CLI is its own step…`），
   探题 `ops-dlq-tooling.apply` 描述的面也将在 3.26 交付时对齐。
-- **M2 收尾待办**：验收演练的 b/c 两腿（`mutants`/`bench-budget`）要等 3.20/3.22，a/d 两腿已做并记在 §4.3；
+- **M2 收尾待办**：验收演练的 c 腿（`bench-budget`）要等 3.22，a/b/d 三腿已做并记在 §4.3；
   `cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的进度同步；`README.md` 的 track 表与
   Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/`t2-relay.md` 同构：步表、项目最终形状、
   装置与模式、实测数字、缺口）。

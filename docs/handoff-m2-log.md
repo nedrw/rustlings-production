@@ -16,6 +16,7 @@
 - 第九段 · 2026-10 · 3.16 交付、`selftest` 变慢的根因、以及 3.15 的一个真缺陷
 - 第十段 · 2026-10 · 第二十七步：DLQ 的命令行那一半单独成步
 - 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
+- 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -493,3 +494,43 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 - **下一步**：3.19+3.20 一批（3.20 起要接 `slow:mutants@80` 与 `clippy@4`，且每步要交 `budget/<step>.toml` 的日子从 3.22 开始）。
 
 ## 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
+
+### 做了什么
+
+- **3.19 属性不变量**（提交 `54a9b2c`，作业者 `0f343fa967d648fb`，这次提交就在主分支上）：新增 `src/engine/walk.rs`——
+  `Rng`（splitmix64，只有一个种子）、`Step`/`Invariant`/`Model` + `Machine`（用的是引擎自己的 `transition`，不是副本）、
+  `Counterexample`（种子 + 操作序列）、`walk`/`replay`/`shrink`；走着**每一步**都问一次不变量，把拒绝也算一步，
+  报告到第一次说“不”的那一步为止。
+- **3.20 变异门限**（提交 `b489e6d`）：新增 `src/engine/mutation.rs`——`Score`（空跑时 `percent()` 是 `None` 而不是 `0`）、
+  `MutationPolicy`（阈值 + 下限 + `passed`/`failed`/`unproven` 三个答案，下限无论如何抬到 1）、`Survivor`、`Report`、
+  `caught`（把 3.19 的 walk 对每个植入缺陷跑一遍）。它声明 `slow:mutants@80`，是**第一个真正跑变异门的步骤**。
+- **验收演练 b 腿做完**（详见 handoff §4.3）：把 3.20 的规格换成一份只“碰一下”模块的最小规格，
+  `verify jobq --slow --json` → `{passed: 19, failed: 1}`，唯一红的就是
+  `slow:mutants@80 (must): 6 of 6 mutant(s) survived (0% killed, needs ≥80%) (the walk took 10s)`，
+  并把六个存活变异体的 `文件:行:列` + 原文 + 改写全部点名；规格完好时同一条命令是 `20/20`、门是 `6/6 killed (100%)`。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest` | 3.19 `gates ✓ 9/9 must green`（17.5 s 热 / 45.0 s 全新缓存）、3.20 `10/10`（32.1 s / 30.6 s），全部 `hold the contract` |
+| 3.20 的变异门（尾巴树） | `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`；作业者又手动逐个扫了 15 个候选位点，15/15 全杀 |
+| 全步判定 | `kiln verify jobq --slow --json` → **`20/20 judged · 0 failed · 0 blocked · 7 not_authored`**，墙钟 **2 m 38 s** |
+| 全量套件 | `cargo test -p jobq` → **134 passed · 0 failed**（116 + 9 + 9）；postgres 后端 10 个规格 → **71 passed · 0 failed** |
+| 课程自己的检查 | `lint-caps` `no issues.`（136 slots · 119 positions · 73 authored，`checked 66 of 73`）；`links` `79 page(s) · 429 link(s)`；`i18n status` `structure: 0 error(s)`；`manifest` 20 份钉住 |
+
+### 坑与判读
+
+- **演习的两次失败尝试**：只掏空两个用例不够（套件有冗余，别的用例仍杀掉同一个变异体——这是好事）；
+  掏空时留下的双空行与未用导入让 `fmt`/`clippy` 在**整棵共享树**上红了，读起来像“20 步全红”。教训：
+  在共享树上做演习，先把自己弄得 lint-clean，否则读到的是别的门。附带收获：树编不过时 `mutants` 拒绝判分
+  （“the spec does not pass on the project as it is”）——它不会把编译错误当成杀死。
+- **作业者纠正了我 §4.2 的一个口径错误**：早先写的“postgres 跑 11 个规格 → 75 passed”把“我跑过的名单”当成了
+  “建 `PostgresStore` 的规格”；真正的数字是 **10 个规格 → 71 passed**（`spec_fairness` 只建内存存储）。已改。
+- **`kiln check` 没有 `--slow`**（作业者发现）：学员在 `check` 里看不到 `slow:mutants`，3.20 的 DONE WHEN 只能指向
+  `selftest`/`verify --slow`。记在 §5.2 作为可选改进。
+- **两条给后续作者的新约束**：①`src/engine/**` 的**文档注释**里不要写 `crate::service`——
+  3.2 那条“引擎不依赖服务层”的检查读的是源码文本，会被散文触发（已在 `src/engine/trace.rs` 上响过）；
+  ②任何等待都要有截止条件（§4.4），3.19/3.20 的规格是纯的，所以它们的变异门只要 9 s。
+
+## 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
