@@ -17,6 +17,7 @@
 - 第十段 · 2026-10 · 第二十七步：DLQ 的命令行那一半单独成步
 - 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
 - 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
+- 第十三段 · 2026-10 · 3.21–3.22，`bench-budget` 那一腿，以及一次“幽灵失败”的追根
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -534,3 +535,40 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   ②任何等待都要有截止条件（§4.4），3.19/3.20 的规格是纯的，所以它们的变异门只要 9 s。
 
 ## 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
+
+
+## 第十三段 · 2026-10 · 3.21–3.22，`bench-budget` 那一腿，以及一次“幽灵失败”的追根
+
+### 做了什么
+
+- **3.21 覆盖率政策**（提交 `78bb04c`）：策略而不是测量——`src/engine/coverage.rs`（`Kind`/`Site`/`Inventory`+`Foreign`/`Walked`/`Exempt`/
+  `ceiling`/`share`/`uncovered`/`CoveragePolicy::standard()`），交付页面 `docs/coverage.md`；把“整个库的百分比说明不了这一步”做成了机制：
+  模块外的地方被 `Inventory::add`/`Walked::visit` 拒（`Foreign`），别模块的 `score` 也被拒。复用 3.20 的 `Verdict`，不另造一套。
+- **3.22 基准预算**（提交 `f18735d`）：`src/engine/budget.rs`（`Work`/`Row`/`Pull`/`METRICS`/`SCALE_MAX`/`report`）、scaffold 提供 harness
+  `tests/budget.rs`、课程侧基线 `course/tracks/jobq/budget/3.22-bench-budget.toml`、页面 `docs/budget.md`。**指标是计数不是时间**
+  （`claim_statements=192`、`scan_cells=256`、`scale_ratio_max≤2.2`），所以在负载机器上不会抖。
+- **验收演练只剩 `unsafe-budget` 一条腿没做**：a（semver）、b（mutants）、c（bench-budget）、d（conformance）四条都有了原始行，见 §4.3。
+- **追了一次“幽灵失败”**：`docs/budget.md` 报 “cannot be read: No such file or directory”，而文件就在、源码没变。根因是 cargo 按**包名+版本**
+  选构建槽：`CARGO_TARGET_DIR` 被我从 shell 传给 kiln，又被 kiln 的子进程继承，于是同一棵树的规格跑在了别的树的构建槽里；
+  而规格用 `CARGO_MANIFEST_DIR` 读项目文件（编译期烘进二进制），陈旧二进制读的是**别的项目的**文件。修法是 kiln 把继承来的变量从每个子进程清掉
+  （提交 `84eb904`），复核：带外来 `CARGO_TARGET_DIR` 的 `verify jobq --json` 从 `20/22` 变成 **`22/22`**。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest` | 3.21 `gates ✓ 11/11 must green`、3.22 `12/12`，各跑两遍（含全新缓存），全部 `hold the contract` |
+| 3.22 的预算门 | `3 metric(s) within ±10% of the course baseline: claim_statements 192, scan_cells 256, scale_ratio_max 2` |
+| 两棵树的变异门 | 3.21 `6/6 killed (100%)`、3.22 `6/6 killed (100%)`（各 8–13 s）|
+| 全步判定 | `verify jobq --slow --json` → **`22/22 judged · 0 failed · 0 blocked · 5 not_authored`**（作者冷跑 4 m 47 s，我热跑 3 m 17 s）|
+| 全量套件 | `cargo test -p jobq` → **154 passed · 0 failed**；postgres 10 个规格 → 71 passed |
+| 课程自己的检查 | `lint-caps` `no issues.`（`checked 68 of 73`）；`links` `81 page(s) · 435 link(s)`；`i18n` `0 error(s)`；`manifest` 22 份 |
+
+### 坑与判读
+
+- **演习要先把自己弄干净**：两次演习都被 `fmt`/`clippy` 先红了（我在共享树里手改代码），读起来像“全部步骤都红”。
+  正确姿势：改完先 `cargo fmt` + 只看目标门，再跑 `verify`。
+- **共享构建槽的坑值得大声说**：任何“把 `CARGO_TARGET_DIR` 传给 kiln”的习惯都会让 kiln 的子进程共用别的树的槽；
+  现在 kiln 自己清掉了，但**在项目目录里手跑 cargo 时**仍要当心（每个作者的工作树都该有自己的 target）。
+- **作业者的两个判断我认可**：3.22 的模块是“预算的算术与报告”，不是文本变异器（那会把编译器塞进测试）；
+  它也没给 `Store` 加 `stats()`——那会把 `src/engine/store/memory.rs` 整文件拖进 3.22 的变异模块，而那里没有规格能杀掉变异体。

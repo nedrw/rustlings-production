@@ -447,13 +447,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（20/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（22/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` must gates，全部 `hold the contract` |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`20/20 judged · 0 failed · 0 blocked · 7 not_authored`**（20 步共 **2 m 38 s**）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
-| 默认特性全量套件 | `cargo test -p jobq` → **134 passed · 0 failed**（3.13 时 81 → 3.16 时 99 → 3.18 时 116 → 3.20 时 134）|
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`22/22 judged · 0 failed · 0 blocked · 5 not_authored`**（21/22 两步作者的冷缓存跑 4 m 47 s，我复核的热跑 3 m 17 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **154 passed · 0 failed**（81 → 99 → 116 → 134 → 154；最后一步多出的 1 例是 3.22 的 harness `tests/budget.rs` 自身）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
@@ -520,7 +520,23 @@ totals: {passed: 19, failed: 1, blocked: 0, not_authored: 7}
 否则你读到的是别的门。附带收获：树编不过时，`mutants` 拒绝判分，说“the spec does not pass on the project as it is, so no mutant can
 be judged”（它不会把编译错误当成杀死）。
 
-**c) `slow:bench-budget@10` 还没有可演练的步骤**：它从 3.22 起才有步骤声明，所以这一腿排在 3.22 交付之后；做法已固定（§4.1）。
+**c) `slow:bench-budget@10`（第 3.22 步）：把被预算盯着的路径换成 O(n²) 扫描。**
+劣化：`Pull::next` 每次发放都从批次开头重扫（丢掉游标），**答案不变、代价变了**。原始行：
+
+```
+✗ slow:bench-budget@10 (must): 2 of 3 metric(s) moved out of budget: scan_cells is 32896, 32640 of
+  the baseline 256 (more than ±10%); scale_ratio_max is 3.992 and has to stay ≤ 2.2 (it is an upper bound)
+```
+
+同一棵树、同一条命令的对照：`3 metric(s) within ±10% of the course baseline: claim_statements 192,
+scan_cells 256, scale_ratio_max 2` ✓。三点值得记：
+① 这次劣化同时被另外两道门抓到——规格（`the_pull_remembers_where_it_stopped` 红：计数器的语义是规格内容的一部分）
+与 `clippy`（我的循环用了切片下标）。3.22 的预算内容被**三重锚定**（代码常量、页面上的数字、harness 的负载），
+而只有预算门知道**基线**，所以只有它能给出“这个指标离开预算多少”的判决。
+② 只把 harness 的负载 256 改成 512（“负载涨了但没人重测预算”）也能让门红
+（`claim_statements is 384, 192 of the baseline 192`、`scan_cells is 512, 256 of the baseline 256`），
+代价是同时触发页面对照的规格用例——那是课程有意的性质，不是缺陷。
+③ 两次演习都在共享树里，所以先把自己弄干净：`fmt`/`clippy` 一旦被演习本身弄红，读到的就是别的门。
 
 ### 4.4 `selftest` 为什么越来越慢（实测、根因、三步修法）
 
@@ -606,6 +622,13 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **构建槽共享导致的幽灵失败已从 kiln 侧封掉**（提交 `kiln(process): the project's build directory is not the caller's`）：
+  cargo 按**包名+版本**选构建槽，不按目录，所以两棵树共用一个 `CARGO_TARGET_DIR` 时，一棵树的二进制会服务另一棵；
+  而这门课的规格用 `CARGO_MANIFEST_DIR`（编译期烘进二进制）读项目文件，于是"陈旧二进制"不是跑旧代码，而是**读别的项目的文件**
+  （实测：`docs/budget.md` “cannot be read: No such file or directory”，而文件就在，源码也没变；换一个干净的构建目录就绿）。
+  kiln 现在把**自己启动时带的 `CARGO_TARGET_DIR` 从每个子进程里清掉**：命令要么建在项目自己的 `target/`，
+  要么建在沙箱共享目录（`selftest`/`probe` 仍然共享，这是刻意的），闸门自己点名的目录（`coverage` 的插桩构建）优先于两者。
+  复核：带一个外来 `CARGO_TARGET_DIR` 跑 `kiln verify jobq --json`，改前 `20/22`（两例幽灵失败），改后 **`22/22`**。
 - **已收口的缺口**：3.15 的 FURTHER 与 `src/cli/mod.rs` 的模块文档曾把死信命令行许给 3.16（而 3.16 只交端口那一半）——
   现在两处都指向 `jobq/3.26-dlq-cli`（提交 `course(jobq/3.15): the dead-letter CLI is its own step…`），
   探题 `ops-dlq-tooling.apply` 描述的面也将在 3.26 交付时对齐。
