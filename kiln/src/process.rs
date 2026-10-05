@@ -224,14 +224,20 @@ pub fn run_streamed(program: &str, args: &[&str], dir: &Path, timeout: Duration)
 fn prepared(program: &str, args: &[&str], dir: &Path, env: &[(String, String)]) -> Command {
     let mut command = Command::new(program);
     command
+        // kiln's own build directory says nothing about where the *project* should build. Letting it
+        // through is how two different trees end up sharing one cargo slot — cargo keys a package by
+        // name and version, not by directory — and a binary built in one tree carries that tree's
+        // `CARGO_MANIFEST_DIR`, which is what this course's specs read their project files through:
+        // a stale binary does not merely run old code, it reads another project's files (measured:
+        // `docs/budget.md` "cannot be read" from a binary compiled elsewhere, with the file present).
+        .env_remove("CARGO_TARGET_DIR")
         .args(args)
         .envs(env.iter().map(|(name, value)| (name, value)))
         .current_dir(dir)
         .stdin(Stdio::null());
-    // The sandbox's shared build directory is the default, not an order: a caller that names its
-    // own knows better — the instrumented build of the `coverage` gate has to live somewhere of its
-    // own, because a different `RUSTFLAGS` is a different build and putting it in the shared
-    // directory would invalidate every ordinary build that follows it.
+    // A caller that names its own build directory knows better than the sandbox default (the
+    // `coverage` gate's instrumented build), and the sandbox default is applied only when nothing
+    // named one: see `share_cargo_target_dir`.
     let named_by_caller = env.iter().any(|(name, _)| name == "CARGO_TARGET_DIR");
     if let Some(target_dir) = CARGO_TARGET_DIR
         .get()
@@ -405,19 +411,17 @@ pub fn locate(program: &str) -> Option<PathBuf> {
 /// Where cargo will build for a command started in `project`.
 ///
 /// The same answer the child gets, from the same one place: [`share_cargo_target_dir`] when a run has
-/// asked for a shared directory, the environment otherwise, and the project's own `target/` when
-/// neither says anything. A gate that has to find what cargo produced (`coverage` needs the binaries
-/// a profile was written from) asks here instead of guessing, because a wrong answer would report a
-/// missing measurement rather than a wrong one.
+/// asked for a shared directory, and the project's own `target/` otherwise — never the environment
+/// kiln itself was started in, because [`prepared`] clears that variable out of every child (a gate
+/// that looked there would look where the build did not go). A gate that has to find what cargo
+/// produced (`coverage` needs the binaries a profile was written from) asks here instead of
+/// guessing, because a wrong answer would report a missing measurement rather than a wrong one.
 #[must_use]
 pub fn target_dir(project: &Path) -> PathBuf {
-    if let Some(shared) = CARGO_TARGET_DIR.get() {
-        return shared.clone();
-    }
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => project.join("target"),
-    }
+    CARGO_TARGET_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| project.join("target"))
 }
 
 /// `true` when `path` is a file this machine would let a program run.
@@ -578,13 +582,27 @@ mod tests {
             asked(&instrumented).as_deref(),
             Some(mine.to_string_lossy().as_ref())
         );
+
+        // The variable kiln itself was started with is *cleared*, not inherited: a caller's
+        // `CARGO_TARGET_DIR` (say, one used to keep kiln's own build out of a repository) must not
+        // decide where the project builds, or two trees can share one cargo slot. A program that is
+        // not cargo gets no value at all — the removal is what makes that explicit.
+        let shell = prepared("sh", &["-c", "true"], temp.path(), &[]);
+        assert_eq!(asked(&shell), None);
+        assert!(
+            shell
+                .get_envs()
+                .any(|(name, value)| name == "CARGO_TARGET_DIR" && value.is_none()),
+            "the inherited value has to be removed explicitly"
+        );
+
+        // And a cargo command with nothing named gets the sandbox's shared directory, which is the
+        // one place that keeps `selftest` from compiling the dependency graph per step.
         let plain = prepared("cargo", &["test"], temp.path(), &[]);
         assert_eq!(
             asked(&plain),
             Some(target_dir(temp.path()).display().to_string())
         );
-        let shell = prepared("sh", &["-c", "true"], temp.path(), &[]);
-        assert_eq!(asked(&shell), None);
     }
 
     #[cfg(unix)]
