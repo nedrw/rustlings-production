@@ -274,6 +274,21 @@ app/jobq/
   ② 沙箱副本的文件时间戳要往前推一秒（`fs::copy` 会带原时间戳，cargo 判新鲜度后默默用陈旧二进制）；
   ③ `coverage` 的「工具在位」路径**在本机没有端到端验证过**（`llvm-tools-preview` 未装）：集成测试断言
   的是诚实的 `blocked` + 安装行，测量逻辑用合成文档单位测试。
+- **重建 `dead_letters` 与 `replay` 是端口的事，且语义已被 3.16 钉死**（提交 `course(jobq/3.16-dlq-tooling)`）：
+  死信不是一个新表，是 `failed` 里的行（`dead_letters()` 返回一个 `JobFilter` 视图，不是取行口）；重放是
+  **另一个生命**而不是一次状态迁移（`transition` 里没有这个目的地，合法）；`revived(job, now)` 是唯一算术：
+  **计数保留、上限抬到 `attempts + 1`**（与 `relay/2.10` 的重置相反，因为逆迹行的身份是 `(job, kind, attempt)`）、
+  `last_error` 保留、租约字段清空、`run_at = store 自己的时钟`；`Store::replay` 是唯一回程（读锁下决定、
+  行与迹同事务），授权按 `QueueAction::Claim` 判、拒绝顺序是 `NotFound` → `Forbidden` → `Invalid`，
+  迹里多一个 `EventKind::Replayed`。后来步骤可以**加**方法/事件，不得改这几条的语义。
+- **`Store::list` 按句柄的可见性过滤，两个后端都得这样**（提交 `course(jobq/3.15): a listing answers what this handle may see`）：
+  memory 那一侧曾只按 `JobFilter` 过滤（租户句柄能列出别人的队列），已在 3.15 的参考解与规格里改正；
+  `visible_queues` 是整个列表问一次的那个问题（每行问一次 `visible` 是把声明表走 N 遍）。从 3.16 起，
+  凡是新增“列出来”的接口（CLI、报表、DLQ 视图）都得守同一条。
+- **质量闸门从 3.20 起是累积的，且带两个时钟**（提交 `kiln(mutants)`、`kiln(process)`，详见 §1.3 与 §4.4）：
+  每步的 `selftest` 因此大约多花一分钟；`bench-budget` 那一行意味着每步要交
+  `course/tracks/jobq/budget/<step-id>.toml`；超时只会杀直接子进程的时代结束了——超时会带走子进程的整棵后代树，
+  所以“某个命令卡住”不会再把整台机器拖慢。
 
 ## 3.5 步骤作者作业书（给子 agent 的固定配方）
 
