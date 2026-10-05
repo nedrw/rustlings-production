@@ -1,0 +1,29 @@
+# The operator's record for `jobq/3.26-dlq-cli`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/dlq_harness.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them counts acts and lines rather than seconds, so nothing here can flake on a
+# loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead, and the two of them are the two halves of the promise the step's page makes: every act
+# that happened is a line, and every line is about an act that happened and a person who took it.
+# Both bounds are zero on a record that holds — a line nobody can be asked about is not a record
+# that is slightly worse, it is the one an auditor trusts.
+command = "cargo test -p jobq --test dlq_harness -- --nocapture"
+
+[metric]
+# The calls the workload makes through the operator's door, refusals included: twelve acts that
+# have to happen and five that have to leave nothing behind. This number is a statement about the
+# *workload* (the harness states it in one constant), and it moves when the workload does.
+acts = 17
+# The lines the record holds afterwards: one per act that happened, and none for a refusal, a look
+# or the setup that built the dead letters. Exact, so a line that went missing moves it.
+record_lines = 12
+# The lines no call of the workload accounts for, as an upper bound: a record that can be written
+# for an act that did not happen is worse than no record at all.
+orphans_max = 0
+# The lines with no name on them, as an upper bound: the name is what makes an act somebody's, and
+# an act nobody is named for is an act nobody can be asked about.
+unattributed_max = 0

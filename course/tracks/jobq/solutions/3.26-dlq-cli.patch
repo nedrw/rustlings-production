@@ -1,0 +1,1691 @@
+diff --git a/docs/dlq.md b/docs/dlq.md
+index 2a452b3..e8ea59b 100644
+--- a/docs/dlq.md
++++ b/docs/dlq.md
+@@ -1,8 +1,13 @@
+ # The dead letters, from a terminal
+ 
+-<!-- TODO: a paragraph in the second person. What a dead letter *is* in this project (the state a
+-job ends up in when the attempts ran out, and where the row lives), who this page is for, and why a
+-queue full of them looks like a quiet queue. Name the module that decides what is stuck. -->
++A job the engine gave up on is a row in `failed`: the attempt budget ran out, and nothing will run
++it again on its own. `jobqd` keeps draining the queues that still work, so a queue full of dead
++letters looks exactly like a quiet queue — which is why the tool for them is a page rather than a
++dashboard nobody opens.
++
++This is that page. It is written for the person who has just been woken up, and it is in the order
++that person needs it: what is stuck, what to do about it, and what the machine will remember about
++what you did.
+ 
+ ## What is stuck
+ 
+@@ -10,55 +15,102 @@ queue full of them looks like a quiet queue. Name the module that decides what i
+ jobqc dlq list
+ ```
+ 
+-<!-- TODO: what a line of that answer holds, field by field, and what is missing from it on
+-purpose. Say which queue it died in, how many attempts it has spent, and the sentence its last
+-attempt died with — and why the payload is not here and where to get it when you have to. -->
++One line per dead letter, oldest first in the port's claim order — highest priority first — and
++then whatever the `--queue` and `--limit` filters leave:
++
++```text
++4f1c2f0a-…  signup   attempts=3  "the smtp server said 550 and meant it"
++9a02b1c7-…  signup   attempts=1  "connection refused"
++```
++
++Four fields and no payload. `attempts` is how many tries it has spent, and the sentence is what its
++last attempt died with: between them they are what you need to decide, and the payload is
++deliberately not here — a queue that prints a customer's data into a scrollback, a ticket and a
++pastebin has turned one incident into two. `jobqc inspect <ID> --json` has the payload, for the
++case where you actually have to read it.
++
++The reason on the line is quoted, because a handler's sentence can contain a newline and one line
++per job is worth keeping: use `--json` when a script is reading.
+ 
+ ## The two things you can do
+ 
+ ```sh
+-jobqc dlq replay <ID> --by <NAME> --reason <TEXT>
+-jobqc dlq discard <ID> --by <NAME> --reason <TEXT>
++jobqc dlq replay 4f1c2f0a-… --by ada --reason "the email server is back"
++jobqc dlq discard 9a02b1c7-… --by ada --reason "the customer withdrew the request"
+ ```
+ 
+-<!-- TODO: what each act does to the row, and what each one costs. A replay is the reversible
+-half: which fields of the job survive it, which one moves, and when the next worker takes it. A
+-discard is the other half: what it removes, why the reason is required for exactly one of the two
+-commands, and what the name is for (it is a record, not a credential — say where "may I" is
+-answered). -->
++**A replay gives the job one more attempt.** The count it has spent is kept, the ceiling moves to one
++past it, the reason the last life died stays on the row, and the job becomes due straight away — so
++the next worker that asks will take it. If it was wrong, the job is back in its queue with its
++payload and its counters, which is what makes this the safe half.
++
++**A discard throws the job away.** It is gone: the row, its payload, and its trail of what happened
++to it. Nothing can be reconstructed from what is left, which is why the command refuses to run
++without `--reason`, and why the tool needs a name from you for both of them:
++
++```sh
++jobqc dlq discard 9a02b1c7-… --by ada          # exit 2, and nothing moves
++```
++
++The name is not a credential — this store trusts the handle it is handed, and `jobq/3.13-queue-authz-attribution`
++is where "may I" is answered. It is a record: the tool writes down who acted and why, and an
++operator reading the record a week later is reading what somebody claimed, which is the difference
++between an act with a name on it and an act with nothing.
+ 
+ ## What it remembers
+ 
++Every act writes one line:
++
+ ```sh
+-jobqc dlq audit
++jobqc dlq audit --limit 20
++```
++
++```text
++2030-01-01T02:14:03+00:00 discard 9a02b1c7-… signup ada the customer withdrew the request
++2030-01-01T02:11:47+00:00 replay 4f1c2f0a-… signup ada the email server is back
+ ```
+ 
+-<!-- TODO: the record of acts, as a shape: one line per act, newest first, the fields it carries,
+-and what a refused act leaves behind. Say which line survives a job that is gone, and where the
+-record lives that lets it. -->
++One line per *act*, newest first: a refused act leaves no line at all (nothing happened), a look
++leaves none (an inspect that writes is an inspect an auditor cannot use), and the line carries the
++queue it was about, because after a discard there is no row left to ask. The record outlives every
++job in it — it is a table of its own, with no foreign key — and that is the whole of its value: for
++a replay the row is still there and its own trail says what happened to it, but for a discard this
++line is the only account there will be.
+ 
+ ## The codes a script branches on
+ 
+ | code | what it means | what to do |
+ | --- | --- | --- |
+-| `0` | TODO | TODO |
+-| `2` | TODO | TODO |
+-| `3` | TODO | TODO |
+-| `4` | TODO | TODO |
+-| `1` | TODO | TODO |
++| `0` | the command answered | read stdout |
++| `2` | the call was wrong | fix the command: an unknown subcommand, a missing `--by` or `--reason`, a reason that is only whitespace, a job that is not a dead letter |
++| `3` | the thing asked about is not there | the identity is wrong, or somebody else already acted on it |
++| `4` | the store refused | the queue would not take it; this is the retryable class |
++| `1` | this deployment is broken | the settings, a file, or a connection — this is not about the call |
+ 
+-<!-- TODO: one row per class, in this order, with what an operator does about each. Use the classes
+-`jobq/3.15-cli-contract` fixed rather than new numbers, and say the one line about prompts that
+-makes a script and a person run the same command. -->
++Nothing prompts. Every input is a flag, so a script and a person run the same command, and a command
++that is missing one exits `2` with a sentence naming it.
+ 
+ ## The first five minutes of an incident
+ 
+-<!-- TODO: the procedure, numbered, in the order somebody woken up should follow it — including the
+-step that is easy to skip: fixing the cause before the rows are put back. Say what a bulk replay of
+-a thousand jobs into a handler that is still broken costs. -->
++1. `jobqc dlq list` — what is stuck, and why each one died. If the count is climbing, the incident is
++   in the *producer* rather than in the dead letters, and `jobqc usage` is the next command.
++2. Read one up close: `jobqc inspect <ID> --json`.
++3. Fix the cause first. A replay of a thousand jobs into a broken handler is a thousand dead letters
++   again in ten minutes — and each replay spends an attempt it does not get back.
++4. Then act, one identity at a time, with a reason: a loop in the shell over the ids from step 1 is
++   the honest way to do it in bulk, and every iteration leaves its own line.
++5. Read what you did: `jobqc dlq audit`. If the record does not explain the incident to somebody who
++   was not there, the reasons were not good enough — write the ticket from it rather than from your
++   memory.
+ 
+ ## Where this comes from
+ 
+-<!-- TODO: link the files this page is about — [the command line's dead-letter group](TODO),
+-[the acts and their record](TODO), [the port](TODO) and [the table the record lives in](TODO) —
+-and name the step that decided the port underneath it. -->
++- [the command line's dead-letter group](../src/cli/dlq.rs) — the grammar, the refusals and the two
++  answer shapes.
++- [the acts and their record](../src/engine/operator.rs) — `Order` (what an operator is about to
++  do), `JobAudit` (the line), and the rules that decide which acts are allowed at all.
++- [the port](../src/engine/store/mod.rs) — `Store::operate` and `Store::acts`, the two methods the
++  tool goes through, and the one-transaction promise that makes a discard explainable.
++- [the table the record lives in](../migrations/0008_job_audit.sql) — why it has no foreign key.
++- [the release page](release.md) — the other half of shipping a build: this page is about the queue
++  it is running.
+diff --git a/migrations/0008_job_audit.sql b/migrations/0008_job_audit.sql
+new file mode 100644
+index 0000000..c4f5525
+--- /dev/null
++++ b/migrations/0008_job_audit.sql
+@@ -0,0 +1,48 @@
++-- The operator's record: who acted on a dead letter, when, and why.
++--
++-- Step `jobq/3.26-dlq-cli`. This is the project's eighth migration, so it is `0008` (`0001` wrote
++-- `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys, `0005` queues and
++-- their access model, `0006` the state machine's columns, `0007` the trace; `mailer` and `relay`
++-- number their own files).
++--
++-- Four decisions are in this file rather than in a sentence somewhere, and each one is a failure
++-- somebody meets:
++--
++--   * **there is no foreign key to `jobs`.** `0002_job_events.sql` ends the trail with the job it
++--     belongs to (`on delete cascade`), and its comment says in so many words that whether a purge
++--     keeps the trail of what it removed is the next step's decision, to be made "with a migration,
++--     which is the point of writing the schema down". This is that decision, and the answer is no:
++--     the row this table is about may be gone, and it is *because* it may be gone that the line has
++--     to survive. A constraint here would delete the only account of a discard at the moment the
++--     discard happened.
++--   * **the unit is an act, not a job.** `queue_audit` (`0005`) records accepted changes of the
++--     access model, and this records accepted acts on dead letters: the same job replayed once and
++--     thrown away later is two lines, and a *refused* act is no line at all. That is the difference
++--     from a trail of settles (`0002`), where the identity of a line is `(job, kind, attempt)` and
++--     a repeated append is the same line — here two lines are always two things a person did, so
++--     there is no unique index to defer to and every insert is a new row.
++--   * **the queue is denormalised on purpose.** A line an auditor reads has to say which queue the
++--     work was in, and after a discard there is no row left to ask; the queue is also what the read
++--     is *scoped* by, in the same shape every other scoped read has (`jobq/3.13-queue-authz-attribution`:
++--     a handle sees what the access model names, and `queue_permissions` is the view that answers
++--     it). A job's queue never changes, so there is nothing here that can go stale.
++--   * **`seq` is what orders it.** The trail is read newest first by `at`, which is enough there
++--     because a settle is identified by its job, kind and attempt; here two acts can share an
++--     instant (two operators, one dashboard, one second) and the record still has an order, because
++--     the order is when the lines were *appended* rather than what the clock read. `at` stays and
++--     is what a person reads.
++--
++-- The index is the one query this project runs: everything the record is read for is "what has been
++-- done lately, in the queues I can see", newest first, a page at a time.
++
++create table job_audit (
++    seq bigserial primary key,
++    job uuid not null,
++    queue text not null,
++    action text not null check (action in ('replay', 'discard')),
++    actor text not null,
++    reason text,
++    at timestamptz not null
++);
++
++create index job_audit_newest_first on job_audit (seq desc);
+diff --git a/src/cli/dlq.rs b/src/cli/dlq.rs
+new file mode 100644
+index 0000000..44cb118
+--- /dev/null
++++ b/src/cli/dlq.rs
+@@ -0,0 +1,411 @@
++//! The dead-letter queue from the command line: what is stuck, one more life, one last word.
++//!
++//! Step `jobq/3.26-dlq-cli`, and the group the grammar of `jobqc` grows. `jobq/3.15-cli-contract`
++//! wrote the four rules this file keeps — stdout is the answer, stderr is the diagnosis, one exit
++//! code per failure class, and `--json` never moves a code — and `jobq/3.16-dlq-tooling` built the
++//! interface underneath: the view (`dead_letters()`) and the replay. What is new here is the
++//! *door*, and the three commands behind it differ in what an operator is allowed to do to
++//! somebody else's work:
++//!
++//! * **`list` is the operator's view, and it is not a listing.** `jobqc list --state failed` asks
++//!   the same question and answers with the whole job, payload included. The row an operator
++//!   decides on is the *dead letter*: how many attempts it has spent and the sentence its last one
++//!   died with. Those two are what they came for, and the payload is the thing they must not have
++//!   — a tool that prints a customer's data into a terminal scrollback, a ticket and a pastebin
++//!   has moved a data-protection incident into the middle of the incident. `dlq list` is therefore
++//!   its own shape rather than a filter on `list`.
++//! * **the acts are signed, and one of them states why.** `--by <NAME>` is required for both, and
++//!   `--reason <TEXT>` for the one that cannot be undone. The record an auditor reads is about
++//!   people, and the two questions it answers are who did this and why; neither can be answered
++//!   afterwards from the row — a discarded job is gone, and a replayed one is a job whose trail of
++//!   `jobq/3.6-transaction-isolation` says *what* happened and never *who* did it.
++//! * **a refusal is a class.** Every acting command is one act on one identity, and the code it
++//!   leaves behind is the table of `jobq/3.3-library-errors` rather than a number invented here:
++//!   `2` when the call was wrong (an unknown subcommand, a missing flag, a blank reason, a job that
++//!   is not a dead letter), `3` when the identity is not there, `4` when the store refused, `1`
++//!   when the deployment is broken. A script branches on `$?`; the sentence on stderr is for the
++//!   human reading the log.
++//!
++//! There is deliberately no batch. `dlq replay <ID> <ID> <ID>` is a loop in the shell, and the
++//! reason is the third rule above: a command that acted on two identities and refused a third has
++//! no single class to leave behind, and printing the two that worked next to a failure would hand
++//! a script the half-document `jobq/3.15-cli-contract` forbids. One identity, one act, one answer,
++//! one code — and `dlq audit` is where an operator reads what a scripted loop did.
++//!
++//! ```text
++//! jobqc dlq list
++//! 4f1c… signup attempts=3 "the smtp server said 550 and meant it"
++//! jobqc dlq replay 4f1c… --by ada
++//! 2030-01-01T00:00:03+00:00 replay 4f1c… signup ada
++//! jobqc dlq discard 9a02… --by grace --reason "duplicate of 4f1c…"
++//! 2030-01-01T00:00:04+00:00 discard 9a02… signup grace duplicate of 4f1c…
++//! ```
++//!
++//! The answer of an act is the line the record was given, in the same shape `dlq audit` prints —
++//! because that is what just happened. A command that answered with something it had not written
++//! down would be a command whose answer and record can disagree.
++
++use serde::Serialize;
++
++use crate::engine::{
++    Act, DEFAULT_LIST_LIMIT, Error, Job, JobAudit, JobFilter, JobId, Order, Queue, dead_letters,
++};
++
++/// `dlq`: what was asked of the dead-letter queue.
++pub(super) enum Dlq {
++    /// `dlq list`: what is stuck.
++    List(Stuck),
++    /// `dlq replay` / `dlq discard`: the act, and everything the engine needs to take it.
++    ///
++    /// One variant for both commands, because the difference between them is the order they build
++    /// and nothing else — and a second variant would be a second place where "a discard has a
++    /// reason and a replay does not" could be got wrong.
++    Act(Order),
++    /// `dlq audit`: the acts operators have taken.
++    Audit(Page),
++}
++
++/// `dlq list`: the page of dead letters to print.
++pub(super) struct Stuck {
++    /// Only this queue, when the caller named one.
++    queue: Option<Queue>,
++    /// At most this many rows.
++    limit: usize,
++}
++
++/// `dlq audit`: how many lines of the record to print.
++pub(super) struct Page {
++    /// At most this many lines.
++    limit: usize,
++}
++
++impl Stuck {
++    /// The filter the engine is asked with: the view's rule, narrowed and bounded.
++    ///
++    /// `dead_letters()` is asked rather than the state spelled out again, so that "what a dead
++    /// letter is" has one spelling (`jobq/3.16-dlq-tooling`), and the limit is the listing's own:
++    /// a queue and a record both have no natural end.
++    fn filter(&self) -> JobFilter {
++        let mut filter = dead_letters().with_limit(self.limit);
++        if let Some(queue) = &self.queue {
++            filter = filter.with_queue(queue.clone());
++        }
++        filter
++    }
++}
++
++/// `jobqc dlq …`, from the arguments after `dlq`.
++///
++/// The globals are accepted on either side of the subcommand, the rule `jobqc` follows everywhere
++/// (`jobqc --json dlq list` and `jobqc dlq list --json` are one call, and so are `dlq list --help`
++/// and `--help`), and every mistake a caller can make is refused here — before any settings are
++/// read and before any store is opened, so that `2` means the call was wrong whether or not a
++/// database turns out to be reachable.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] for a subcommand this group does not have, a flag without a value, an
++/// identity that is not one, and an act with no name or no reason to write down.
++pub(super) fn parse(
++    mut args: impl Iterator<Item = String>,
++    options: &mut super::Options,
++) -> Result<super::Invocation, Error> {
++    let name = loop {
++        let Some(argument) = args.next() else {
++            return Err(Error::Invalid {
++                detail: "`dlq` needs one of `list`, `replay`, `discard` or `audit`: `jobqc dlq \
++                         list` is what is stuck, and `jobqc --help` lists the rest"
++                    .to_owned(),
++            });
++        };
++        match super::global(&argument, &mut args, options)? {
++            super::Global::Taken => continue,
++            super::Global::Asked(invocation) => return Ok(invocation),
++            super::Global::NotAnOption => break argument,
++        }
++    };
++    match name.as_str() {
++        "list" => list(args, options),
++        "replay" => act(args, options, Act::Replay),
++        "discard" => act(args, options, Act::Discard),
++        "audit" => page(args, options),
++        other => Err(Error::Invalid {
++            detail: format!(
++                "`{other}` is not a command of `dlq`: the ones it has are `list`, `replay`, \
++                 `discard` and `audit`"
++            ),
++        }),
++    }
++}
++
++/// `dlq list`: the queue to narrow by, and the page to print.
++fn list(
++    mut args: impl Iterator<Item = String>,
++    options: &mut super::Options,
++) -> Result<super::Invocation, Error> {
++    let mut stuck = Stuck {
++        queue: None,
++        limit: DEFAULT_LIST_LIMIT,
++    };
++    while let Some(argument) = args.next() {
++        match super::global(&argument, &mut args, options)? {
++            super::Global::Taken => continue,
++            super::Global::Asked(invocation) => return Ok(invocation),
++            super::Global::NotAnOption => {}
++        }
++        match argument.as_str() {
++            "--queue" => stuck.queue = Some(Queue::parse(&super::value(&mut args, "--queue")?)?),
++            "--limit" => {
++                stuck.limit = super::number(&super::value(&mut args, "--limit")?, "--limit")?;
++            }
++            other => return Err(unknown(other, "list")),
++        }
++    }
++    Ok(command(Dlq::List(stuck)))
++}
++
++/// `dlq audit`: how many lines of the record to print.
++fn page(
++    mut args: impl Iterator<Item = String>,
++    options: &mut super::Options,
++) -> Result<super::Invocation, Error> {
++    let mut page = Page {
++        limit: DEFAULT_LIST_LIMIT,
++    };
++    while let Some(argument) = args.next() {
++        match super::global(&argument, &mut args, options)? {
++            super::Global::Taken => continue,
++            super::Global::Asked(invocation) => return Ok(invocation),
++            super::Global::NotAnOption => {}
++        }
++        match argument.as_str() {
++            "--limit" => {
++                page.limit = super::number(&super::value(&mut args, "--limit")?, "--limit")?;
++            }
++            other => return Err(unknown(other, "audit")),
++        }
++    }
++    Ok(command(Dlq::Audit(page)))
++}
++
++/// `dlq replay` / `dlq discard`: the identity, the name, and the reason when the act needs one.
++///
++/// The two flags differ by act, and that difference is the step: `--reason` is what makes a discard
++/// reviewable, so it is required for exactly one of the two commands, and the order built at the
++/// end of this function is where that becomes a value the engine can check rather than a rule this
++/// file remembers.
++fn act(
++    mut args: impl Iterator<Item = String>,
++    options: &mut super::Options,
++    action: Act,
++) -> Result<super::Invocation, Error> {
++    let mut id = None;
++    let mut actor = None;
++    let mut reason = None;
++    while let Some(argument) = args.next() {
++        match super::global(&argument, &mut args, options)? {
++            super::Global::Taken => continue,
++            super::Global::Asked(invocation) => return Ok(invocation),
++            super::Global::NotAnOption => {}
++        }
++        match argument.as_str() {
++            "--by" => actor = Some(super::value(&mut args, "--by")?),
++            "--reason" => reason = Some(super::value(&mut args, "--reason")?),
++            other if other.starts_with('-') => return Err(unknown(other, action.as_str())),
++            other => {
++                if id.is_some() {
++                    return Err(Error::Invalid {
++                        detail: format!(
++                            "`{action}` takes one job id, and `{other}` is a second one: one act \
++                             on one identity is what leaves one class behind (`jobqc --help`)"
++                        ),
++                    });
++                }
++                id = Some(other.parse::<JobId>().map_err(|error| Error::Invalid {
++                    detail: format!("`{other}` is not a job id: {error}"),
++                })?);
++            }
++        }
++    }
++    let Some(id) = id else {
++        return Err(Error::Invalid {
++            detail: format!(
++                "`{action}` needs the identity of one dead letter: `jobqc dlq {action} <ID> --by \
++                 <NAME>`"
++            ),
++        });
++    };
++    let Some(actor) = actor else {
++        return Err(Error::Invalid {
++            detail: format!(
++                "`{action}` has to be signed: `--by <NAME>` is what the record keeps, and an act \
++                 nobody is named for is an act nobody can be asked about"
++            ),
++        });
++    };
++    let order = match (action, reason) {
++        (Act::Discard, Some(reason)) => Order::discard(id, &actor, &reason),
++        (Act::Discard, None) => {
++            return Err(Error::Invalid {
++                detail: "`discard` needs `--reason <TEXT>`: the work cannot be reconstructed from \
++                         what is left of it, and the line this writes is the only account there \
++                         will be"
++                    .to_owned(),
++            });
++        }
++        (Act::Replay, Some(reason)) => Order::replay(id, &actor).with_reason(&reason),
++        (Act::Replay, None) => Order::replay(id, &actor),
++    };
++    Ok(command(Dlq::Act(order)))
++}
++
++/// One `dlq` command, wrapped the way the grammar's other subcommands are.
++fn command(dlq: Dlq) -> super::Invocation {
++    super::Invocation::Command(super::Command::Dlq(dlq))
++}
++
++/// An argument a subcommand does not have, with the place that lists the ones it does.
++fn unknown(argument: &str, command: &str) -> Error {
++    Error::Invalid {
++        detail: format!(
++            "`{argument}` is not an option of `dlq {command}`: `jobqc --help` lists every one"
++        ),
++    }
++}
++
++/// Run one `dlq` command through the engine, and answer the bytes it produced.
++pub(super) async fn execute(
++    command: Dlq,
++    options: &super::Options,
++    env: &[(String, String)],
++) -> Result<String, Error> {
++    match command {
++        Dlq::List(stuck) => {
++            let engine = super::engine(options, env).await?;
++            let jobs = engine.list(&stuck.filter()).await?;
++            if options.json {
++                let views: Vec<DeadView<'_>> = jobs.iter().map(DeadView::new).collect();
++                return super::document(&views);
++            }
++            Ok(jobs.iter().map(dead_line).collect())
++        }
++        // The record line the store wrote is the answer, and the answer is what is printed: this
++        // command asks the engine for the act, and the engine is the only thing that has it.
++        Dlq::Act(order) => {
++            let engine = super::engine(options, env).await?;
++            let line = engine.store().operate(&order).await?;
++            answer(&[line], options.json)
++        }
++        Dlq::Audit(page) => {
++            let engine = super::engine(options, env).await?;
++            let lines = engine.store().acts(page.limit).await?;
++            answer(&lines, options.json)
++        }
++    }
++}
++
++/// One record line, or a page of them, in the shape the caller asked for.
++///
++/// An act answers exactly one line and the record answers a page, and the two are one function
++/// because they are one shape: the text is one line per record and the JSON is one document
++/// holding them — `[]` for an empty record rather than nothing at all, the rule
++/// `jobq/3.15-cli-contract` pinned for a listing.
++fn answer(lines: &[JobAudit], json: bool) -> Result<String, Error> {
++    if json {
++        let views: Vec<ActView<'_>> = lines.iter().map(ActView::new).collect();
++        return super::document(&views);
++    }
++    Ok(lines.iter().map(act_line).collect())
++}
++
++/// One dead letter in the text shape: four fields, and no payload.
++///
++/// `attempts` is a `key=value` field rather than a bare word, the shape `jobqc usage` uses for its
++/// counters, and the sentence the last attempt died with is written as a JSON string, the shape
++/// `jobqc list` uses for a payload: a handler's reason can contain a newline, and the encoding is
++/// what keeps one line one job.
++fn dead_line(job: &Job) -> String {
++    let (id, queue, attempts) = (job.id(), job.queue(), job.attempts());
++    let error = serde_json::Value::from(job.last_error()).to_string();
++    format!("{id} {queue} attempts={attempts} {error}\n")
++}
++
++/// One record line in the text shape: when, what, to which job, in which queue, by whom, and why.
++///
++/// The reason is the **rest of the line** rather than a sixth field, because a reason is a sentence
++/// somebody wrote and quoting it would be a second escaping rule to learn: it is either absent —
++/// the line then ends after the actor — or it is what the operator typed.
++fn act_line(line: &JobAudit) -> String {
++    let (at, action, job) = (line.at().to_rfc3339(), line.action(), line.job());
++    let (queue, actor) = (line.queue(), line.actor());
++    match line.reason() {
++        Some(reason) => format!("{at} {action} {job} {queue} {actor} {reason}\n"),
++        None => format!("{at} {action} {job} {queue} {actor}\n"),
++    }
++}
++
++/// One dead letter, as `--json` prints it.
++///
++/// The fields are written down and asserted in this order for the reason `jobqc inspect`'s are: a
++/// diff of two lines beats a set comparison that hides a rename. The payload is *absent* on
++/// purpose, and that is the point of the view rather than an omission — what an operator needs to
++/// decide with is the attempts and the sentence, and the customer's data is not part of it.
++#[derive(Serialize)]
++struct DeadView<'a> {
++    /// Identity, in the form every other command takes it.
++    id: JobId,
++    /// Which queue it died in.
++    queue: &'a str,
++    /// How many attempts it has spent.
++    attempts: u32,
++    /// Why the last one failed, in the handler's words.
++    last_error: Option<&'a str>,
++}
++
++impl<'a> DeadView<'a> {
++    /// One dead letter, borrowed rather than copied: a listing renders what the engine holds.
++    fn new(job: &'a Job) -> Self {
++        Self {
++            id: job.id(),
++            queue: job.queue().as_str(),
++            attempts: job.attempts(),
++            last_error: job.last_error(),
++        }
++    }
++}
++
++/// One line of the operator's record, as `--json` prints it.
++///
++/// The instant is a string in the shape the text line prints it in, so that a script reading one
++/// shape and a person reading the other are reading the same facts, and the reason is `null` when
++/// the act had none — which is a different answer from a reason somebody left blank, because that
++/// one is refused before the act is taken.
++#[derive(Serialize)]
++struct ActView<'a> {
++    /// When the store took the act, by its own clock.
++    at: String,
++    /// What was done (`replay` or `discard`).
++    action: &'a str,
++    /// The job it was done to.
++    job: JobId,
++    /// The queue it was in.
++    queue: &'a str,
++    /// Who did it.
++    actor: &'a str,
++    /// Why, when they said.
++    reason: Option<&'a str>,
++}
++
++impl<'a> ActView<'a> {
++    /// One line of the record, borrowed from the engine's value.
++    fn new(line: &'a JobAudit) -> Self {
++        Self {
++            at: line.at().to_rfc3339(),
++            action: line.action().as_str(),
++            job: line.job(),
++            queue: line.queue().as_str(),
++            actor: line.actor(),
++            reason: line.reason(),
++        }
++    }
++}
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 7b6f85d..f41aa06 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -47,6 +47,8 @@
+ //! assembly of this crate, and therefore a second thing that can disagree with the daemon about
+ //! which queue it is talking to — the boundary `jobq/3.1-engine-boundary` drew.
+ 
++pub(crate) mod dlq;
++
+ use std::io::Read;
+ use std::path::PathBuf;
+ use std::str::FromStr;
+@@ -70,6 +72,7 @@ COMMANDS:
+     inspect <ID>            print one job
+     list                    print the jobs this engine can see
+     usage                   print what the queues have done
++    dlq                     work on the dead letters: list, replay, discard, audit
+     help                    print this help
+ 
+ OPTIONS:
+@@ -82,6 +85,10 @@ COMMAND OPTIONS:
+     submit  --queue <NAME> --payload <JSON> | --stdin [--priority <N>] [--max-attempts <N>]
+     inspect <ID>
+     list    [--queue <NAME>] [--state <STATE>] [--limit <N>]
++    dlq list    [--queue <NAME>] [--limit <N>]
++    dlq replay  <ID> --by <NAME> [--reason <TEXT>]
++    dlq discard <ID> --by <NAME> --reason <TEXT>
++    dlq audit   [--limit <N>]
+ 
+ Settings are read from the file given by --config and overridden by the environment, where every
+ setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`, which is how a script
+@@ -229,7 +236,7 @@ enum Invocation {
+     Command(Command),
+ }
+ 
+-/// The four commands.
++/// Every command the tool has.
+ enum Command {
+     /// Queue one job.
+     Submit(Submit),
+@@ -239,6 +246,8 @@ enum Command {
+     List(List),
+     /// Print what the queues have done.
+     Usage,
++    /// Work on the dead letters (`jobq/3.26-dlq-cli`).
++    Dlq(dlq::Dlq),
+ }
+ 
+ /// `submit`: the job to queue.
+@@ -349,6 +358,7 @@ impl Parsed {
+             "list" => List::parse(args, &mut options)?,
+             "usage" => no_arguments(args, &mut options, "usage")?
+                 .unwrap_or(Invocation::Command(Command::Usage)),
++            "dlq" => dlq::parse(args, &mut options)?,
+             "help" => Invocation::Help,
+             other if other.starts_with('-') => {
+                 return Err(Error::Invalid {
+@@ -598,6 +608,10 @@ async fn execute(
+             }
+             Ok(lines.iter().map(usage_line).collect())
+         }
++        // The dead-letter group is a module of its own because it is a *door* rather than a
++        // command: three ways to act on somebody's work, and the arguments they take are what
++        // decides which (step `jobq/3.26-dlq-cli`).
++        Command::Dlq(command) => dlq::execute(command, options, env).await,
+     }
+ }
+ 
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 2a6aae7..5942ed5 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -18,6 +18,12 @@
+ //! `pub(crate)` module and `retry` — the module — is too, while `retry`, the *function*, is
+ //! re-exported below), so the next release can move them without touching anybody.
+ //!
++//! `jobq/3.26-dlq-cli` re-exports the four names of `operator`, and they are the other half of the
++//! dead-letter story: the *acts* an operator takes on a dead letter, the line each one leaves in
++//! the record, and the decision about which job may be thrown away at all. They are public for the
++//! reason [`revived`] is — an act and its record are things a caller asks about, and a tool that
++//! built its own would be a second answer to "who did this".
++//!
+ //! `jobq/3.16-dlq-tooling` re-exports the two names of `dlq`, and the emphasis is the opposite of
+ //! the paragraph above: [`dead_letters`] and [`revived`] are the operator's half of the dead-letter
+ //! queue — the view a tool filters by and the row a replay writes — so a caller is meant to *ask*
+@@ -35,6 +41,7 @@ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
+ pub(crate) mod mutation;
++pub(crate) mod operator;
+ pub(crate) mod policy;
+ pub(crate) mod release;
+ pub(crate) mod retry;
+@@ -67,6 +74,7 @@ pub use domain::{
+ pub use error::Error;
+ pub use events::{EventKind, JobEvent};
+ pub use mutation::{MutationPolicy, Report, Score, Survivor, Verdict, caught};
++pub use operator::{Act, JobAudit, Order, discardable};
+ pub use policy::Policy;
+ pub use release::{
+     Artifact, BINARIES, CHANGELOG, CHECKSUMS, DIGEST_HEX, Refusal, Release, TAG_PREFIX, VERSION,
+diff --git a/src/engine/operator.rs b/src/engine/operator.rs
+index 308762f..3efce23 100644
+--- a/src/engine/operator.rs
++++ b/src/engine/operator.rs
+@@ -64,18 +64,16 @@ impl Act {
+     /// through it rather than spelling it a second time.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        let _ = self;
+-        todo!(
+-            "jobq/3.26-dlq-cli: the one string a migration's `check`, the durable backend's \
+-             decoder and a person's `grep` all agree on (`EventKind::as_str` is the shape)"
+-        )
++        match self {
++            Act::Replay => "replay",
++            Act::Discard => "discard",
++        }
+     }
+ }
+ 
+ impl fmt::Display for Act {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = formatter;
+-        todo!("jobq/3.26-dlq-cli: an act prints as its stored name")
++        formatter.write_str(self.as_str())
+     }
+ }
+ 
+@@ -105,15 +103,23 @@ impl Order {
+     /// Put `job` back in its queue, signed `actor`.
+     #[must_use]
+     pub fn replay(job: JobId, actor: &str) -> Self {
+-        let _ = (job, actor);
+-        todo!("jobq/3.26-dlq-cli: the reversible act, with the name the record keeps")
++        Self {
++            job,
++            action: Act::Replay,
++            actor: actor.to_owned(),
++            reason: None,
++        }
+     }
+ 
+     /// Throw `job` away, signed `actor`, with `reason`.
+     #[must_use]
+     pub fn discard(job: JobId, actor: &str, reason: &str) -> Self {
+-        let _ = (job, actor, reason);
+-        todo!("jobq/3.26-dlq-cli: the act that cannot be undone, and the reason it has to carry")
++        Self {
++            job,
++            action: Act::Discard,
++            actor: actor.to_owned(),
++            reason: Some(reason.to_owned()),
++        }
+     }
+ 
+     /// The same order, with a note for the record.
+@@ -123,36 +129,32 @@ impl Order {
+     /// here, and the line then carries it.
+     #[must_use]
+     pub fn with_reason(mut self, reason: &str) -> Self {
+-        let _ = reason;
+-        todo!("jobq/3.26-dlq-cli: the same order with a note on it")
++        self.reason = Some(reason.to_owned());
++        self
+     }
+ 
+     /// The job this act is about.
+     #[must_use]
+     pub fn job(&self) -> &JobId {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: the job this act is about")
++        &self.job
+     }
+ 
+     /// What is being done to it.
+     #[must_use]
+     pub fn action(&self) -> Act {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: what is being done")
++        self.action
+     }
+ 
+     /// Who is doing it.
+     #[must_use]
+     pub fn actor(&self) -> &str {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: who is doing it, as the record will name them")
++        &self.actor
+     }
+ 
+     /// Why, when the caller left a reason.
+     #[must_use]
+     pub fn reason(&self) -> Option<&str> {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: why, when the caller left a reason")
++        self.reason.as_deref()
+     }
+ 
+     /// Whether this act may be taken at all.
+@@ -169,18 +171,32 @@ impl Order {
+     /// [`Error::Invalid`] when the name is blank, and when a discard's reason is blank or was
+     /// not given at all. Both name what the caller has to add.
+     pub fn check(&self) -> Result<(), Error> {
+-        let _ = self;
+-        todo!(
+-            "jobq/3.26-dlq-cli: the two things an act has to have before a store reads anything — \
+-             a name, and a reason for the act that leaves nothing behind"
+-        )
++        if self.actor.trim().is_empty() {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "a {} has to be signed: `--by <NAME>` is what the record keeps, and an act \
++                     nobody is named for is an act nobody can be asked about",
++                    self.action
++                ),
++            });
++        }
++        if self.action == Act::Discard && self.reason.as_deref().is_none_or(blank) {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "throwing job {} away needs a reason (`--reason <TEXT>`): the work cannot be \
++                     reconstructed from what is left of it, and the line this writes is the only \
++                     account there will be",
++                    self.job
++                ),
++            });
++        }
++        Ok(())
+     }
+ }
+ 
+ /// Whether `text` is empty or nothing but whitespace.
+ fn blank(text: &str) -> bool {
+-    let _ = text;
+-    todo!("jobq/3.26-dlq-cli: a name of spaces is not a name, and neither is a reason of spaces")
++    text.trim().is_empty()
+ }
+ 
+ /// One line of the operator's record: what was done, to which job, by whom, when, and why.
+@@ -225,11 +241,19 @@ impl JobAudit {
+     /// discard with no reason. The store asks the same question before it reads anything, and
+     /// asking it twice costs nothing and keeps this function total for a caller that did not.
+     pub fn of(order: &Order, job: &Job, at: DateTime<Utc>) -> Result<Self, Error> {
+-        let _ = (order, job, at);
+-        todo!(
+-            "jobq/3.26-dlq-cli: the line an act writes, with the name trimmed and a reason of \
+-             spaces left off"
+-        )
++        order.check()?;
++        Ok(Self {
++            job: job.id(),
++            queue: job.queue().clone(),
++            action: order.action(),
++            actor: order.actor().trim().to_owned(),
++            at,
++            reason: order
++                .reason()
++                .map(str::trim)
++                .filter(|reason| !reason.is_empty())
++                .map(str::to_owned),
++        })
+     }
+ 
+     /// The line as a backend that keeps columns decodes it.
+@@ -248,50 +272,50 @@ impl JobAudit {
+         reason: Option<String>,
+         at: DateTime<Utc>,
+     ) -> Self {
+-        let _ = (job, queue, action, actor, reason, at);
+-        todo!("jobq/3.26-dlq-cli: the same line, built from the columns a backend keeps")
++        Self {
++            job,
++            queue,
++            action,
++            actor,
++            at,
++            reason,
++        }
+     }
+ 
+     /// The job the act was about.
+     #[must_use]
+     pub fn job(&self) -> JobId {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: the job the act was about")
++        self.job
+     }
+ 
+     /// The queue it was in.
+     #[must_use]
+     pub fn queue(&self) -> &Queue {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: the queue the act was about")
++        &self.queue
+     }
+ 
+     /// What was done.
+     #[must_use]
+     pub fn action(&self) -> Act {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: what was done")
++        self.action
+     }
+ 
+     /// Who did it.
+     #[must_use]
+     pub fn actor(&self) -> &str {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: who did it")
++        &self.actor
+     }
+ 
+     /// When the store took the act.
+     #[must_use]
+     pub fn at(&self) -> DateTime<Utc> {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: when the store took the act, by its own clock")
++        self.at
+     }
+ 
+     /// Why, when the actor left a reason.
+     #[must_use]
+     pub fn reason(&self) -> Option<&str> {
+-        let _ = self;
+-        todo!("jobq/3.26-dlq-cli: why, when the actor left a reason")
++        self.reason.as_deref()
+     }
+ }
+ 
+@@ -308,9 +332,14 @@ impl JobAudit {
+ ///
+ /// [`Error::Invalid`], naming the state the job is in.
+ pub fn discardable(job: &Job) -> Result<(), Error> {
+-    let _ = job;
+-    todo!(
+-        "jobq/3.26-dlq-cli: only a job the engine gave up on can be thrown away, and the refusal \
+-         names the state this one is in"
+-    )
++    let (id, state) = (job.id(), job.state());
++    if state != JobState::Failed {
++        return Err(Error::Invalid {
++            detail: format!(
++                "job {id} is {state}, not failed: only a job the engine gave up on can be thrown \
++                 away"
++            ),
++        });
++    }
++    Ok(())
+ }
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 1352829..c5e7287 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -41,10 +41,11 @@ use crate::engine::dlq::revived;
+ use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
++use crate::engine::operator::{Act, JobAudit, Order, discardable};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::state::{Event, transition};
+-use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
++use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store, unwritten};
+ use crate::engine::tenant::Tenant;
+ use crate::engine::usage::{QueueUsage, Usage};
+ 
+@@ -77,6 +78,9 @@ struct Ledger {
+     /// The privileged decisions, oldest first. A trail is read newest first, which is this
+     /// reversed — and appending is what a trail does, so the vector is the honest shape.
+     audit: Vec<QueueAudit>,
++    /// The acts operators have taken on dead letters, oldest first, for the same reason: the
++    /// record is appended to, and it is read back newest first (`jobq/3.26-dlq-cli`).
++    acts: Vec<JobAudit>,
+ }
+ 
+ /// One held deduplication key.
+@@ -274,6 +278,26 @@ impl Ledger {
+             .collect()
+     }
+ 
++    /// Append one line to the operator's record.
++    ///
++    /// No identity check, unlike [`Ledger::record`]: two lines of this record are two acts, even
++    /// when they name the same job, the same actor and the same instant — an act is the unit and
++    /// not a settle, and the record is read as a list of things people did rather than as a set.
++    fn remember(&mut self, line: JobAudit) {
++        self.acts.push(line);
++    }
++
++    /// The acts `scope` may see, newest first, at most `limit` of them.
++    fn act_lines(&self, scope: Option<&Tenant>, limit: usize) -> Vec<JobAudit> {
++        self.acts
++            .iter()
++            .rev()
++            .filter(|line| self.visible(scope, line.queue()))
++            .take(limit)
++            .cloned()
++            .collect()
++    }
++
+     /// Whether this row is this worker's to settle.
+     ///
+     /// The check the durable backend writes as `and lease_owner = $2` in its `where` clause, in the
+@@ -654,39 +678,30 @@ impl Store for MemoryStore {
+     }
+ 
+     fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>> {
++        // `jobq/3.16-dlq-tooling`'s door: the act with nobody's name on it, so the record gets no
++        // line for it. What survives with the row is the trail line below.
++        Box::pin(async move { self.replay_of(id, None).map(|(job, _)| job) })
++    }
++
++    fn operate<'a>(&'a self, order: &'a Order) -> BoxFuture<'a, Result<JobAudit, Error>> {
+         Box::pin(async move {
+-            let mut ledger = self.ledger();
+-            // Which job this is, asked first: a row this handle may not see is answered like a row
+-            // nobody wrote, and the two must not be distinguishable
+-            // (`jobq/3.13-queue-authz-attribution`).
+-            ledger.visible_job(self.scope.as_ref(), id)?;
+-            let Some(before) = ledger.jobs.get(id).cloned() else {
+-                return Err(Error::NotFound { id: *id });
+-            };
+-            // The *action* is the queue's question, and it is `claim`'s rather than a fourth one:
+-            // putting work back into a queue you may not take work out of is somebody else's
+-            // decision. The operator's own door, and the queue's owner, are unaffected.
+-            ledger.permit(self.scope.as_ref(), &before.queue, QueueAction::Claim)?;
+-            // One instant for the row and for the line, and the lock is this store's transaction
+-            // (`jobq/3.6-transaction-isolation`): a refusal above returned before either write, and
+-            // what follows cannot be interrupted between them.
+-            let now = self.clock.now();
+-            let answer = revived(&before, now)?;
+-            ledger.jobs.insert(*id, answer.clone());
+-            // The line names the attempt the job had *spent*, which is the count the dead row still
+-            // holds — a replay is not an attempt, it is the queue owing one
+-            // (`jobq/3.16-dlq-tooling`).
+-            ledger.record(&JobEvent::new(
+-                *id,
+-                EventKind::Replayed,
+-                before.attempts,
+-                None,
+-                now,
+-            ));
+-            Ok(answer)
++            // The order's own requirements — a name, and a reason for the act that leaves nothing
++            // behind — are settled before anything is read, because they are about the act rather
++            // than about the row (`jobq/3.26-dlq-cli`).
++            order.check()?;
++            match order.action() {
++                Act::Replay => self
++                    .replay_of(order.job(), Some(order))
++                    .and_then(|(_, line)| unwritten(line)),
++                Act::Discard => self.discard_of(order),
++            }
+         })
+     }
+ 
++    fn acts<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<JobAudit>, Error>> {
++        Box::pin(async move { Ok(self.ledger().act_lines(self.scope.as_ref(), limit)) })
++    }
++
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         Box::pin(async move {
+             let ledger = self.ledger();
+@@ -945,6 +960,88 @@ impl Store for MemoryStore {
+     }
+ }
+ 
++impl MemoryStore {
++    /// The replay path, shared by the two doors that take it (`jobq/3.26-dlq-cli`).
++    ///
++    /// `order` is the whole of the difference between them: `None` is `Store::replay`, the act
++    /// with nobody's name on it, and `Some` is an operator's act, which the record keeps a line
++    /// for — answered with the row because the caller that asked for a line is the caller that has
++    /// to answer with it.
++    ///
++    /// One function rather than two, because the difference between the doors is two statements and
++    /// a second copy of this arithmetic would agree with the first until one of the two was edited.
++    fn replay_of(
++        &self,
++        id: &JobId,
++        order: Option<&Order>,
++    ) -> Result<(Job, Option<JobAudit>), Error> {
++        let mut ledger = self.ledger();
++        // Which job this is, asked first: a row this handle may not see is answered like a row
++        // nobody wrote, and the two must not be distinguishable
++        // (`jobq/3.13-queue-authz-attribution`).
++        ledger.visible_job(self.scope.as_ref(), id)?;
++        let Some(before) = ledger.jobs.get(id).cloned() else {
++            return Err(Error::NotFound { id: *id });
++        };
++        // The *action* is the queue's question, and it is `claim`'s rather than a fourth one:
++        // putting work back into a queue you may not take work out of is somebody else's
++        // decision. The operator's own door, and the queue's owner, are unaffected.
++        ledger.permit(self.scope.as_ref(), &before.queue, QueueAction::Claim)?;
++        // One instant for the row, the trail line and the record's line, and the lock is this
++        // store's transaction (`jobq/3.6-transaction-isolation`): a refusal above returned before
++        // either write, and what follows cannot be interrupted between them.
++        let now = self.clock.now();
++        // The line is built from the row the guard is holding rather than from anything the caller
++        // kept a copy of: the queue it names is the row's, and an order carries an identity for
++        // exactly this reason (`jobq/3.16-dlq-tooling`).
++        let line = match order {
++            Some(order) => Some(JobAudit::of(order, &before, now)?),
++            None => None,
++        };
++        let answer = revived(&before, now)?;
++        ledger.jobs.insert(*id, answer.clone());
++        // The line names the attempt the job had *spent*, which is the count the dead row still
++        // holds — a replay is not an attempt, it is the queue owing one
++        // (`jobq/3.16-dlq-tooling`).
++        ledger.record(&JobEvent::new(
++            *id,
++            EventKind::Replayed,
++            before.attempts,
++            None,
++            now,
++        ));
++        if let Some(line) = &line {
++            ledger.remember(line.clone());
++        }
++        Ok((answer, line))
++    }
++
++    /// The discard: the row and its trail are removed, and the record's line is all that is left.
++    fn discard_of(&self, order: &Order) -> Result<JobAudit, Error> {
++        let mut ledger = self.ledger();
++        let id = *order.job();
++        ledger.visible_job(self.scope.as_ref(), &id)?;
++        let Some(before) = ledger.jobs.get(&id).cloned() else {
++            return Err(Error::NotFound { id });
++        };
++        // The same question a replay asks, and answered by the same action: an operator who may
++        // take work out of a queue is an operator who may decide it is never going to run.
++        ledger.permit(self.scope.as_ref(), &before.queue, QueueAction::Claim)?;
++        // The state is checked before either removal, so a refusal leaves the row where it was
++        // (`jobq/3.16-dlq-tooling`'s rule for the other act).
++        discardable(&before)?;
++        let now = self.clock.now();
++        let line = JobAudit::of(order, &before, now)?;
++        // Both halves of the row go, and they go together: the trail cascades with the row in the
++        // durable backend (`migrations/0002_job_events.sql`), and a leak left here would be a
++        // trail this backend has and the other does not.
++        ledger.jobs.remove(&id);
++        ledger.events.remove(&id);
++        ledger.remember(line.clone());
++        Ok(line)
++    }
++}
++
+ /// The refusal a queue this scope may not see gives, worded like the one a queue nobody declared
+ /// gives, because they have to be the same answer.
+ fn no_such_queue(queue: &Queue) -> Error {
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index fc8fca6..feab908 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -55,6 +55,7 @@ use crate::engine::authz::{QueueAudit, QueueDeclaration};
+ use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::JobEvent;
++use crate::engine::operator::{JobAudit, Order};
+ use crate::engine::sealed::Sealed;
+ use crate::engine::tenant::Tenant;
+ use crate::engine::usage::QueueUsage;
+@@ -211,6 +212,44 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// [`Error::Store`] when the backend refused the write.
+     fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>>;
+ 
++    /// Take one operator's act on a dead letter, and write the line that records it.
++    ///
++    /// `jobq/3.26-dlq-cli`'s door, and the difference from [`Store::replay`] is the whole of it:
++    /// a replay puts a job back with nobody's name on it, while an *act* is something a person
++    /// did, and the record says who. Two acts are among the three decisions
++    /// [`crate::engine::Order`] holds: a name, and — for the act that cannot be undone — a
++    /// reason, both checked before this store reads anything.
++    ///
++    /// Three promises, and they are what makes this a method of the port rather than a query a
++    /// command assembles:
++    ///
++    /// * **the row is read under a lock before it is decided on**, so two operators acting on one
++    ///   dead letter cannot both be told they moved it (`jobq/3.16-dlq-tooling` made the same
++    ///   promise for a replay);
++    /// * **the change and the line are one transaction** (`jobq/3.6-transaction-isolation`), so a
++    ///   record that disagrees with the rows cannot be read out of the backend. It matters most
++    ///   for the discard, where the row is gone: a delete that committed without its line is work
++    ///   that disappeared with nobody recorded as having thrown it away;
++    /// * **a refused act writes nothing.** The order's own refusals happen before the read, the
++    ///   job's (not a dead letter, not there, not yours) before any write, and a line about an act
++    ///   that did not happen is a line an auditor cannot use.
++    ///
++    /// A replay taken through this door leaves **two** lines and that is not duplication: the
++    /// trail line of `jobq/3.16` says what happened to the job, and survives with it, while the
++    /// line this door writes is about the act and the person — a job replayed by somebody is
++    /// still replayed when the record is asked a year later and the job is long gone.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the order does not hold (a blank name, or a discard with no
++    /// reason), and when the job is not a dead letter, naming the state it is in;
++    /// [`Error::NotFound`] when there is no such job, or this store may not see it — one answer
++    /// for both, for the reason [`Store::replay`] gives; [`Error::Forbidden`] when this store may
++    /// see the queue and may not `claim` from it; [`Error::Conflict`] when the backend refused the
++    /// transaction and a caller may try again; [`Error::Store`] when the backend refused the
++    /// write.
++    fn operate<'a>(&'a self, order: &'a Order) -> BoxFuture<'a, Result<JobAudit, Error>>;
++
+     /// Read one job, whether or not a worker holds it.
+     ///
+     /// # Errors
+@@ -457,8 +496,50 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     ///
+     /// [`Error::Store`] when the backend refused the read.
+     fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>>;
++
++    /// The acts operators have taken on dead letters, newest first, at most `limit` of them.
++    ///
++    /// The read behind the tool that answers "who threw this away, and why": a **page** rather
++    /// than the whole record, for the reason [`Store::list`] is one — a record that grows with
++    /// every incident has no natural end, and a command that read all of it would be a command
++    /// whose cost is the age of the deployment.
++    ///
++    /// Lines about queues this handle may not see are **not in the answer** rather than refused,
++    /// which is what [`Store::get`] does with one row and [`Store::list`] with a page: the line
++    /// carries its queue for exactly this reason, and a tenant learns nothing about the rest of
++    /// the deployment by asking.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    fn acts<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<JobAudit>, Error>>;
+ }
+ 
++/// The line an act owes the record, or the failure of a backend that took it without writing one.
++///
++/// Unreachable in this crate: [`Store::operate`] refuses an order with no name on it, and both
++/// backends write a line exactly when the order has one. It is an answer rather than an `unwrap`
++/// because the case it stands for is the one this door exists to prevent
++/// (`jobq/3.26-dlq-cli`): an act with no line is an act nobody can be asked about, and a store that
++/// reported one as done would be lying about the only account of it there is.
++pub(crate) fn unwritten(line: Option<JobAudit>) -> Result<JobAudit, Error> {
++    line.ok_or_else(|| Error::Store {
++        source: Box::new(Unwritten),
++    })
++}
++
++/// The failure [`unwritten`] answers with.
++#[derive(Debug)]
++struct Unwritten;
++
++impl std::fmt::Display for Unwritten {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter.write_str("an act was taken and no line was written for it")
++    }
++}
++
++impl std::error::Error for Unwritten {}
++
+ /// A store behind a pointer is still a store.
+ ///
+ /// The engine is generic over the port, and the two shells that pick a backend at *runtime* — the
+@@ -504,6 +585,10 @@ impl<T: Store + ?Sized> Store for Arc<T> {
+         (**self).replay(id)
+     }
+ 
++    fn operate<'a>(&'a self, order: &'a Order) -> BoxFuture<'a, Result<JobAudit, Error>> {
++        (**self).operate(order)
++    }
++
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         (**self).get(id)
+     }
+@@ -561,4 +646,8 @@ impl<T: Store + ?Sized> Store for Arc<T> {
+     fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>> {
+         (**self).audit(limit)
+     }
++
++    fn acts<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<JobAudit>, Error>> {
++        (**self).acts(limit)
++    }
+ }
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index e733a38..6547fbf 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -55,10 +55,11 @@ use crate::engine::dlq::revived;
+ use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
++use crate::engine::operator::{Act, JobAudit, Order, discardable};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
+ use crate::engine::state::{Event, transition};
+-use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
++use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store, unwritten};
+ use crate::engine::tenant::Tenant;
+ use crate::engine::trace::{Context, TraceId};
+ use crate::engine::usage::{QueueUsage, Usage};
+@@ -287,6 +288,172 @@ impl PostgresStore {
+     }
+ }
+ 
++impl PostgresStore {
++    /// The replay path, shared by the two doors that take it (`jobq/3.26-dlq-cli`).
++    ///
++    /// `order` is the whole of the difference between them: `None` is `Store::replay`, the act
++    /// with nobody's name on it, and `Some` is an operator's act, which the record keeps a line
++    /// for — answered with the row because the caller that asked for a line is the caller that
++    /// has to answer with it.
++    ///
++    /// One function rather than two, because the difference between the doors is three statements
++    /// and a second copy of this transaction would agree with the first until one of the two was
++    /// edited — which is the mistake `revived` exists to make impossible one level up.
++    async fn replay_of(
++        &self,
++        id: &JobId,
++        order: Option<&Order>,
++    ) -> Result<(Job, Option<JobAudit>), Error> {
++        // One instant for the row, for the trail line and for the record's line, read from the
++        // engine's clock: `now()` in this file would be the database's opinion about the
++        // present, which is the second authority `jobq/3.8-clock-injection` exists to remove.
++        let now = self.clock.now();
++        let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
++        let scope = self.scope();
++        let held: Option<JobRow> = sqlx::query_as(LOCK_ONE)
++            .bind(id.as_uuid())
++            .bind(scope)
++            .fetch_optional(&mut *transaction)
++            .await
++            .map_err(refused)?;
++        let Some(held) = held else {
++            // A row that is not there *for this handle* is the answer a row nobody wrote gets,
++            // and the two are one answer on purpose: a refusal that told them apart would be an
++            // existence oracle for somebody else's job.
++            transaction.rollback().await.map_err(refused)?;
++            return Err(Error::NotFound { id: *id });
++        };
++        let before = held.into_job()?;
++        // The action is the queue's question, asked inside the transaction that holds the row,
++        // so the answer and the lock are about the same queue.
++        if let Some(refusal) = self
++            .refuse(&mut transaction, &before.queue, QueueAction::Claim)
++            .await?
++        {
++            transaction.rollback().await.map_err(refused)?;
++            return Err(refusal);
++        }
++        // The record's line is built from the row the lock is holding and from the instant the
++        // engine's clock reads, which is why it is built here rather than by the caller: the
++        // queue it names is the row's, and an order carries an identity for exactly this
++        // reason (`jobq/3.16-dlq-tooling`).
++        let line = match order {
++            Some(order) => Some(JobAudit::of(order, &before, now)?),
++            None => None,
++        };
++        // The decision is the engine's, and this backend writes what it answers and invents
++        // nothing — which is what keeps two backends from having two opinions about a replay.
++        let answer = match revived(&before, now) {
++            Ok(answer) => answer,
++            Err(refusal) => {
++                // Nothing was written, so there is nothing to undo; the rollback is what says
++                // so out loud and releases the lock the read took.
++                transaction.rollback().await.map_err(refused)?;
++                return Err(refusal);
++            }
++        };
++        let written: JobRow = sqlx::query_as(REPLAY)
++            .bind(id.as_uuid())
++            .bind(answer.state().as_str())
++            .bind(i64::from(answer.max_attempts()))
++            .bind(answer.run_at())
++            .fetch_one(&mut *transaction)
++            .await
++            .map_err(refused)?;
++        // The line goes through the transaction the row is in, so the two commit together: a
++        // row that moved with no line, or a line about a row that did not move, is the
++        // disagreement `jobq/3.6-transaction-isolation` built the trail to prevent.
++        append(
++            &mut transaction,
++            &JobEvent::new(*id, EventKind::Replayed, before.attempts, None, now),
++        )
++        .await?;
++        // And the operator's line, in the same transaction for the same reason — with the
++        // extra edge that a replay taken through this door must not be able to commit with a
++        // trail line and no record of who took it.
++        if let Some(line) = &line {
++            note(&mut transaction, line).await?;
++        }
++        transaction.commit().await.map_err(refused)?;
++        // The answer is the row the statement returned rather than the value that was decided:
++        // what a caller reads back is what the table holds.
++        Ok((written.into_job()?, line))
++    }
++
++    /// The discard: the row and its trail are removed, and the record's line is all that is left.
++    ///
++    /// The order's own requirements were checked before this was called; what is left is the row,
++    /// which is read under the same lock a replay reads it under, and the two predicates a
++    /// discard's safety rests on: `state = 'failed'` (the decision, written as a predicate that
++    /// matches nothing after the lock has seen the row) and the removal itself, which cascades to
++    /// the trail (`migrations/0002_job_events.sql`).
++    async fn discard_of(&self, order: &Order) -> Result<JobAudit, Error> {
++        let now = self.clock.now();
++        let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
++        let scope = self.scope();
++        let id = order.job();
++        let held: Option<JobRow> = sqlx::query_as(LOCK_ONE)
++            .bind(id.as_uuid())
++            .bind(scope)
++            .fetch_optional(&mut *transaction)
++            .await
++            .map_err(refused)?;
++        let Some(held) = held else {
++            transaction.rollback().await.map_err(refused)?;
++            return Err(Error::NotFound { id: *id });
++        };
++        let before = held.into_job()?;
++        if let Some(refusal) = self
++            .refuse(&mut transaction, &before.queue, QueueAction::Claim)
++            .await?
++        {
++            transaction.rollback().await.map_err(refused)?;
++            return Err(refusal);
++        }
++        // The state is the engine's decision about *which* act is possible, and it is asked before
++        // either write for the reason the replay's is: a refusal leaves the row where it was.
++        if let Err(refusal) = discardable(&before) {
++            transaction.rollback().await.map_err(refused)?;
++            return Err(refusal);
++        }
++        let line = JobAudit::of(order, &before, now)?;
++        // The row goes, and the predicate is what makes "the row this transaction decided about"
++        // and "the row this statement removes" the same row: the lock is held, so nothing can have
++        // moved it in between, and a statement that matched nothing is answered by the driver as
++        // the store failure it is rather than as a silent no-op.
++        let removed: (Uuid,) = sqlx::query_as(DISCARD)
++            .bind(id.as_uuid())
++            .fetch_one(&mut *transaction)
++            .await
++            .map_err(refused)?;
++        let _ = removed;
++        // The line is the *only* record of what happened, so it is written in the transaction
++        // that removes the row: a commit without it is work that disappeared with nobody named,
++        // and a rollback that lost the line would be a record of something that did not happen.
++        note(&mut transaction, &line).await?;
++        transaction.commit().await.map_err(refused)?;
++        Ok(line)
++    }
++}
++
++/// One line of the operator's record, in the transaction that takes the act.
++///
++/// A free function rather than a method of either backend, because the two callers are the two
++/// acts and neither of them owns the record: it is `job_audit`'s, written once, here.
++async fn note(connection: &mut PgConnection, line: &JobAudit) -> Result<(), Error> {
++    sqlx::query(NOTE)
++        .bind(line.job().as_uuid())
++        .bind(line.queue().as_str())
++        .bind(line.action().as_str())
++        .bind(line.actor())
++        .bind(line.reason())
++        .bind(line.at())
++        .execute(&mut *connection)
++        .await
++        .map_err(refused)?;
++    Ok(())
++}
++
+ impl Sealed for PostgresStore {}
+ 
+ impl Store for PostgresStore {
+@@ -547,67 +714,38 @@ impl Store for PostgresStore {
+     }
+ 
+     fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>> {
++        // `jobq/3.16-dlq-tooling`'s door: the act with nobody's name on it, so the record gets no
++        // line for it. What survives with the row is the trail line the helper below writes.
++        Box::pin(async move { self.replay_of(id, None).await.map(|(job, _)| job) })
++    }
++
++    fn operate<'a>(&'a self, order: &'a Order) -> BoxFuture<'a, Result<JobAudit, Error>> {
+         Box::pin(async move {
+-            // One instant for the row and for the line, read from the engine's clock: `now()` in
+-            // this file would be the database's opinion about the present, which is the second
+-            // authority `jobq/3.8-clock-injection` exists to remove.
+-            let now = self.clock.now();
+-            let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
+-            let scope = self.scope();
+-            let held: Option<JobRow> = sqlx::query_as(LOCK_ONE)
+-                .bind(id.as_uuid())
+-                .bind(scope)
+-                .fetch_optional(&mut *transaction)
+-                .await
+-                .map_err(refused)?;
+-            let Some(held) = held else {
+-                // A row that is not there *for this handle* is the answer a row nobody wrote gets,
+-                // and the two are one answer on purpose: a refusal that told them apart would be an
+-                // existence oracle for somebody else's job.
+-                transaction.rollback().await.map_err(refused)?;
+-                return Err(Error::NotFound { id: *id });
+-            };
+-            let before = held.into_job()?;
+-            // The action is the queue's question, asked inside the transaction that holds the row,
+-            // so the answer and the lock are about the same queue.
+-            if let Some(refusal) = self
+-                .refuse(&mut transaction, &before.queue, QueueAction::Claim)
+-                .await?
+-            {
+-                transaction.rollback().await.map_err(refused)?;
+-                return Err(refusal);
++            // The order's own requirements — a name, and a reason for the act that leaves nothing
++            // behind — are settled before anything is read, because they are about the act rather
++            // than about the row (`jobq/3.26-dlq-cli`).
++            order.check()?;
++            match order.action() {
++                Act::Replay => self
++                    .replay_of(order.job(), Some(order))
++                    .await
++                    .and_then(|(_, line)| unwritten(line)),
++                Act::Discard => self.discard_of(order).await,
+             }
+-            // The decision is the engine's, and this backend writes what it answers and invents
+-            // nothing — which is what keeps two backends from having two opinions about a replay.
+-            let answer = match revived(&before, now) {
+-                Ok(answer) => answer,
+-                Err(refusal) => {
+-                    // Nothing was written, so there is nothing to undo; the rollback is what says
+-                    // so out loud and releases the lock the read took.
+-                    transaction.rollback().await.map_err(refused)?;
+-                    return Err(refusal);
+-                }
+-            };
+-            let written: JobRow = sqlx::query_as(REPLAY)
+-                .bind(id.as_uuid())
+-                .bind(answer.state().as_str())
+-                .bind(i64::from(answer.max_attempts()))
+-                .bind(answer.run_at())
+-                .fetch_one(&mut *transaction)
++        })
++    }
++
++    fn acts<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<JobAudit>, Error>> {
++        Box::pin(async move {
++            let rows: Vec<AuditRow> = sqlx::query_as(RECORD_PAGE)
++                .bind(self.scope())
++                // `usize` to `bigint`: a caller asking for more lines than the column can hold
++                // wants all of them, and `limit` is a page rather than a promise about a number.
++                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
++                .fetch_all(&self.pool)
+                 .await
+                 .map_err(refused)?;
+-            // The line goes through the transaction the row is in, so the two commit together: a
+-            // row that moved with no line, or a line about a row that did not move, is the
+-            // disagreement `jobq/3.6-transaction-isolation` built the trail to prevent.
+-            append(
+-                &mut transaction,
+-                &JobEvent::new(*id, EventKind::Replayed, before.attempts, None, now),
+-            )
+-            .await?;
+-            transaction.commit().await.map_err(refused)?;
+-            // The answer is the row the statement returned rather than the value that was decided:
+-            // what a caller reads back is what the table holds.
+-            written.into_job()
++            rows.into_iter().map(AuditRow::into_line).collect()
+         })
+     }
+ 
+@@ -1171,6 +1309,37 @@ const REPLAY: &str = "update jobs set state = $2, max_attempts = $3, run_at = $4
+                       returning id, queue, payload::text as payload, state, priority, run_at, \
+                                 attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled";
+ 
++/// The removal a discard makes, once the engine has decided the job may go.
++///
++/// One statement, and `state = 'failed'` is the decision written as a predicate for the reason
++/// [`REPLAY`]'s is: the row is locked by the read above, so a statement that matched nothing is a
++/// store that broke rather than a caller who was wrong — and the driver answers that with the
++/// "no rows" error `refused` turns into a store failure. The trail goes with the row
++/// (`migrations/0002_job_events.sql` cascades), which is exactly what makes the record below the
++/// only account of what happened: it is the one line that does not live in `jobs`.
++const DISCARD: &str = "delete from jobs where id = $1 and state = 'failed' returning id";
++
++/// One line of the operator's record (`jobq/3.26-dlq-cli`).
++///
++/// No `on conflict`, unlike the trail's append: a line's identity there is `(job, kind, attempt)`
++/// and a settle appended twice is one settle, while two lines here are two acts — the same
++/// operator discarding two jobs with one word each is two things an auditor reads separately.
++const NOTE: &str = "insert into job_audit (job, queue, action, actor, reason, at) \
++                    values ($1, $2, $3, $4, $5, $6)";
++
++/// The record, newest first, narrowed to the queues this handle may see.
++///
++/// `seq` rather than `at` decides the order, and that is the one place this table is not shaped
++/// like the trail: two acts taken in the same millisecond are still two acts in an order, an
++/// instant is what the operator reads rather than what identifies the line, and a page ordered by
++/// a value two rows can share would hand the same incident back in a different order twice.
++/// `limit` bounds the answer for the reason [`Store::list`]'s does: a record grows with every
++/// incident, and reading all of it is a command whose cost is the age of the deployment.
++const RECORD_PAGE: &str = "select job, queue, action, actor, reason, at from job_audit \
++                           where ($1::text is null or queue in ( \
++                               select queue from queue_permissions where tenant = $1)) \
++                           order by seq desc limit $2";
++
+ /// What a settle does to the row it touches.
+ ///
+ /// An enum rather than a flag because the two settles differ in three places at once — the
+@@ -1540,6 +1709,61 @@ fn decode_kind(text: &str) -> Result<EventKind, Error> {
+     })
+ }
+ 
++/// One row of `job_audit`, in the shape the driver decodes it.
++///
++/// The same boundary as [`JobRow`] and [`EventRow`], one table over: the action is a text column
++/// and the queue arrives as the string the column holds, and [`AuditRow::into_line`] is the one
++/// place those are reconciled with the engine's values, so a row this backend wrote and cannot
++/// read back is reported where it can be seen.
++#[derive(sqlx::FromRow)]
++struct AuditRow {
++    /// The job the act was about. It may be gone from `jobs` — that is what this record is for.
++    job: Uuid,
++    /// The queue it was in.
++    queue: String,
++    /// What was done, as text.
++    action: String,
++    /// Who did it.
++    actor: String,
++    /// Why, when they said.
++    reason: Option<String>,
++    /// When the store took the act.
++    at: DateTime<Utc>,
++}
++
++impl AuditRow {
++    /// The engine's line, or the reason this table holds something the engine cannot read.
++    fn into_line(self) -> Result<JobAudit, Error> {
++        let queue =
++            Queue::parse(&self.queue).map_err(|error| unreadable("queue", error.to_string()))?;
++        Ok(JobAudit::stored(
++            JobId::from_uuid(self.job),
++            queue,
++            decode_act(&self.action)?,
++            self.actor,
++            self.reason,
++            self.at,
++        ))
++    }
++}
++
++/// The `action` column, as the enum the engine uses.
++///
++/// Written as a search over [`Act::as_str`] rather than a `match` on strings, the rule
++/// [`decode_kind`] follows: adding an act to the enum without teaching this function about it is
++/// impossible, because there is nothing here to teach.
++fn decode_act(text: &str) -> Result<Act, Error> {
++    [Act::Replay, Act::Discard]
++        .into_iter()
++        .find(|act| act.as_str() == text)
++        .ok_or_else(|| {
++            unreadable(
++                "action",
++                format!("`{text}` is not an act this engine knows"),
++            )
++        })
++}
++
+ /// The `state` column, as the enum the engine uses.
+ ///
+ /// The decoding is the model's (`jobq/3.14-job-state-machine`), spelling included: a name this

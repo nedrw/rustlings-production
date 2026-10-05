@@ -1,0 +1,616 @@
+diff --git a/docs/dlq.md b/docs/dlq.md
+new file mode 100644
+index 0000000..2a452b3
+--- /dev/null
++++ b/docs/dlq.md
+@@ -0,0 +1,64 @@
++# The dead letters, from a terminal
++
++<!-- TODO: a paragraph in the second person. What a dead letter *is* in this project (the state a
++job ends up in when the attempts ran out, and where the row lives), who this page is for, and why a
++queue full of them looks like a quiet queue. Name the module that decides what is stuck. -->
++
++## What is stuck
++
++```sh
++jobqc dlq list
++```
++
++<!-- TODO: what a line of that answer holds, field by field, and what is missing from it on
++purpose. Say which queue it died in, how many attempts it has spent, and the sentence its last
++attempt died with — and why the payload is not here and where to get it when you have to. -->
++
++## The two things you can do
++
++```sh
++jobqc dlq replay <ID> --by <NAME> --reason <TEXT>
++jobqc dlq discard <ID> --by <NAME> --reason <TEXT>
++```
++
++<!-- TODO: what each act does to the row, and what each one costs. A replay is the reversible
++half: which fields of the job survive it, which one moves, and when the next worker takes it. A
++discard is the other half: what it removes, why the reason is required for exactly one of the two
++commands, and what the name is for (it is a record, not a credential — say where "may I" is
++answered). -->
++
++## What it remembers
++
++```sh
++jobqc dlq audit
++```
++
++<!-- TODO: the record of acts, as a shape: one line per act, newest first, the fields it carries,
++and what a refused act leaves behind. Say which line survives a job that is gone, and where the
++record lives that lets it. -->
++
++## The codes a script branches on
++
++| code | what it means | what to do |
++| --- | --- | --- |
++| `0` | TODO | TODO |
++| `2` | TODO | TODO |
++| `3` | TODO | TODO |
++| `4` | TODO | TODO |
++| `1` | TODO | TODO |
++
++<!-- TODO: one row per class, in this order, with what an operator does about each. Use the classes
++`jobq/3.15-cli-contract` fixed rather than new numbers, and say the one line about prompts that
++makes a script and a person run the same command. -->
++
++## The first five minutes of an incident
++
++<!-- TODO: the procedure, numbered, in the order somebody woken up should follow it — including the
++step that is easy to skip: fixing the cause before the rows are put back. Say what a bulk replay of
++a thousand jobs into a handler that is still broken costs. -->
++
++## Where this comes from
++
++<!-- TODO: link the files this page is about — [the command line's dead-letter group](TODO),
++[the acts and their record](TODO), [the port](TODO) and [the table the record lives in](TODO) —
++and name the step that decided the port underneath it. -->
+diff --git a/src/engine/operator.rs b/src/engine/operator.rs
+new file mode 100644
+index 0000000..308762f
+--- /dev/null
++++ b/src/engine/operator.rs
+@@ -0,0 +1,316 @@
++//! The operator's half of the dead-letter queue: the acts a command takes, and the record of who
++//! took them.
++//!
++//! Step `jobq/3.26-dlq-cli`. `jobq/3.16-dlq-tooling` built the port a tool is written *against* —
++//! the view ([`dead_letters`]) and the decision ([`revived`]) — and its own summary says what it
++//! left out: the acts an operator's tool takes on the rows. This module is that half, and three
++//! decisions are written into the shapes below rather than into a command line, because each of
++//! them is a failure somebody meets at two in the morning:
++//!
++//! * **an act is signed.** An [`Order`] carries the name of whoever takes it, and an act with no
++//!   name is refused before anything moves. The trail of `jobq/3.6-transaction-isolation` records
++//!   *what* happened to a job — a `replayed` line and the attempt it named — and no amount of
++//!   reading it afterwards answers "who put this job back", which is the first question asked
++//!   about an act somebody else can watch. The name is a *claim* rather than a credential (this
++//!   project's store trusts the handle it is handed, `jobq/3.13-queue-authz-attribution`), and a
++//!   record of claims is still the difference between "an operator replayed this" and nobody
++//!   knowing there was an operator at all.
++//! * **the act that cannot be undone has to say why.** A replay is reversible: the job goes back
++//!   in its queue, and if that was wrong it is in the queue with its payload and its counters.
++//!   A discard is not: the work is thrown away and nothing in the job can say what it was for.
++//!   [`Order::check`] therefore refuses a discard whose reason is blank, before the row is even
++//!   read — the same rule the probe for this slot states, and the reason it is a *check* rather
++//!   than a warning is that a trail with one unexplainable line in it is a trail nobody trusts.
++//! * **the record outlives the row it is about.** `migrations/0002_job_events.sql` ends the trail
++//!   with the job it belongs to (`on delete cascade`), and it says in so many words that whether
++//!   a purge keeps its trail is the decision of the step that writes one. This is that step, and
++//!   the answer is a record of its own with **no foreign key**: a line about a job nobody kept is
++//!   a leak in a trail, and it is the *only* thing left in a record of acts. [`JobAudit`] is that
++//!   line, and `Store::operate` writes it in the same transaction as the change it describes.
++//!
++//! What is *not* here is the write, for the reason `jobq/3.16` gives about its own half: what the
++//! two backends owe is in the port's documentation (`Store::operate`, `Store::acts`), and the
++//! decision they both call is here, so that neither of them can invent an answer the other does
++//! not give.
++
++use std::fmt;
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::domain::{Job, JobId, JobState, Queue};
++use crate::engine::error::Error;
++
++/// What an operator did to a dead letter.
++///
++/// Two, and they are the two an operator has: put the work back, or throw it away.
++/// `#[non_exhaustive]`, like every list in this crate's public vocabulary
++/// (`jobq/3.2-public-api-baseline`): a third (a run somebody cancelled, a job handed to another
++/// queue) is a decision somebody will make later, and a caller that wrote a wildcard arm should
++/// not have to be rebuilt for it.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum Act {
++    /// Put the job back in its queue: one more attempt, and the ceiling moves.
++    Replay,
++    /// Throw the job away, and say why.
++    Discard,
++}
++
++impl Act {
++    /// The name this act is stored and printed under.
++    ///
++    /// The rule is [`crate::engine::EventKind`]'s: the string is what a migration, a query and a
++    /// person's `grep` all agree on, so it is written once, here, and the durable backend decodes
++    /// through it rather than spelling it a second time.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        let _ = self;
++        todo!(
++            "jobq/3.26-dlq-cli: the one string a migration's `check`, the durable backend's \
++             decoder and a person's `grep` all agree on (`EventKind::as_str` is the shape)"
++        )
++    }
++}
++
++impl fmt::Display for Act {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let _ = formatter;
++        todo!("jobq/3.26-dlq-cli: an act prints as its stored name")
++    }
++}
++
++/// One act an operator is about to take: what, to which job, by whom, and why.
++///
++/// A value rather than four arguments, because the act is what the record is about and because the
++/// three things that can be wrong with it (the name, the reason, the job) are then checked in one
++/// place instead of at every call site.
++///
++/// It carries the job's **identity** rather than the row: the row is the store's to read, under a
++/// lock, and an order that carried a copy of it would let a caller decide about a job that has
++/// moved since (`jobq/3.16-dlq-tooling`'s reason for `Store::replay` being a port method).
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Order {
++    /// The job the act is about.
++    job: JobId,
++    /// What is being done to it.
++    action: Act,
++    /// Who is doing it, as the record will name them.
++    actor: String,
++    /// Why, when the act cannot be undone without one.
++    reason: Option<String>,
++}
++
++impl Order {
++    /// Put `job` back in its queue, signed `actor`.
++    #[must_use]
++    pub fn replay(job: JobId, actor: &str) -> Self {
++        let _ = (job, actor);
++        todo!("jobq/3.26-dlq-cli: the reversible act, with the name the record keeps")
++    }
++
++    /// Throw `job` away, signed `actor`, with `reason`.
++    #[must_use]
++    pub fn discard(job: JobId, actor: &str, reason: &str) -> Self {
++        let _ = (job, actor, reason);
++        todo!("jobq/3.26-dlq-cli: the act that cannot be undone, and the reason it has to carry")
++    }
++
++    /// The same order, with a note for the record.
++    ///
++    /// A replay does not need one — the act is reversible, and the row says what happened — but an
++    /// operator who takes a dead letter out of a batch because of a ticket number can leave it
++    /// here, and the line then carries it.
++    #[must_use]
++    pub fn with_reason(mut self, reason: &str) -> Self {
++        let _ = reason;
++        todo!("jobq/3.26-dlq-cli: the same order with a note on it")
++    }
++
++    /// The job this act is about.
++    #[must_use]
++    pub fn job(&self) -> &JobId {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: the job this act is about")
++    }
++
++    /// What is being done to it.
++    #[must_use]
++    pub fn action(&self) -> Act {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: what is being done")
++    }
++
++    /// Who is doing it.
++    #[must_use]
++    pub fn actor(&self) -> &str {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: who is doing it, as the record will name them")
++    }
++
++    /// Why, when the caller left a reason.
++    #[must_use]
++    pub fn reason(&self) -> Option<&str> {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: why, when the caller left a reason")
++    }
++
++    /// Whether this act may be taken at all.
++    ///
++    /// Two requirements, and both are about the act rather than about the row, which is why a
++    /// store asks this before it reads anything: a **name** the record can be written with
++    /// (whitespace is not one), and a **reason** for the act that leaves nothing behind. A
++    /// discard with a blank one is refused rather than recorded, because a line saying
++    /// `discard` with no reason is the line an auditor cannot use — the reason is the only
++    /// thing that says why the work was thrown away, and the work is not there any more to ask.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the name is blank, and when a discard's reason is blank or was
++    /// not given at all. Both name what the caller has to add.
++    pub fn check(&self) -> Result<(), Error> {
++        let _ = self;
++        todo!(
++            "jobq/3.26-dlq-cli: the two things an act has to have before a store reads anything — \
++             a name, and a reason for the act that leaves nothing behind"
++        )
++    }
++}
++
++/// Whether `text` is empty or nothing but whitespace.
++fn blank(text: &str) -> bool {
++    let _ = text;
++    todo!("jobq/3.26-dlq-cli: a name of spaces is not a name, and neither is a reason of spaces")
++}
++
++/// One line of the operator's record: what was done, to which job, by whom, when, and why.
++///
++/// A row per *act taken*, which is the unit an auditor asks about: a refused act leaves no line
++/// (nothing happened), an act over two jobs is two lines (two jobs were changed), and a look
++/// leaves none at all. The three shapes the probe for this slot names — `acted`, `already`,
++/// `missing` — are the three answers an act can get; only the first one is a line.
++///
++/// `#[non_exhaustive]`, the same promise as [`crate::engine::Job`], for the same reason: the
++/// record grows when the acts do.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct JobAudit {
++    /// The job the act was about.
++    job: JobId,
++    /// The queue it was in, so that a handle only reads what it may see and an auditor reading
++    /// the line does not have to look the job up — which, after a discard, is impossible.
++    queue: Queue,
++    /// What was done.
++    action: Act,
++    /// Who did it, as they named themselves.
++    actor: String,
++    /// When the store took the act, by its own clock.
++    at: DateTime<Utc>,
++    /// Why, for the act that had to say.
++    reason: Option<String>,
++}
++
++impl JobAudit {
++    /// The line `order` writes about `job`, at `at`.
++    ///
++    /// Two things are settled here rather than at the store, because they are what the *record*
++    /// says and not what the backend holds: the actor is trimmed — a name somebody typed with a
++    /// trailing space is the same person, and two spellings of one name in a record is a record
++    /// that cannot be counted — and a reason that is only whitespace becomes no reason at all,
++    /// which is the same thing a replay without a note has.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the order does not hold ([`Order::check`]): a blank name, or a
++    /// discard with no reason. The store asks the same question before it reads anything, and
++    /// asking it twice costs nothing and keeps this function total for a caller that did not.
++    pub fn of(order: &Order, job: &Job, at: DateTime<Utc>) -> Result<Self, Error> {
++        let _ = (order, job, at);
++        todo!(
++            "jobq/3.26-dlq-cli: the line an act writes, with the name trimmed and a reason of \
++             spaces left off"
++        )
++    }
++
++    /// The line as a backend that keeps columns decodes it.
++    ///
++    /// Public for the reason [`crate::engine::JobEvent::stored`] is: the backend that holds the
++    /// columns is the backend that reads them back, and the shape it hands over is the shape every
++    /// other caller sees. The names it takes are already the engine's — decoding `replay` into an
++    /// [`Act`] is the backend's job, next to the column it came from — so there is nothing here to
++    /// refuse.
++    #[must_use]
++    pub fn stored(
++        job: JobId,
++        queue: Queue,
++        action: Act,
++        actor: String,
++        reason: Option<String>,
++        at: DateTime<Utc>,
++    ) -> Self {
++        let _ = (job, queue, action, actor, reason, at);
++        todo!("jobq/3.26-dlq-cli: the same line, built from the columns a backend keeps")
++    }
++
++    /// The job the act was about.
++    #[must_use]
++    pub fn job(&self) -> JobId {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: the job the act was about")
++    }
++
++    /// The queue it was in.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: the queue the act was about")
++    }
++
++    /// What was done.
++    #[must_use]
++    pub fn action(&self) -> Act {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: what was done")
++    }
++
++    /// Who did it.
++    #[must_use]
++    pub fn actor(&self) -> &str {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: who did it")
++    }
++
++    /// When the store took the act.
++    #[must_use]
++    pub fn at(&self) -> DateTime<Utc> {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: when the store took the act, by its own clock")
++    }
++
++    /// Why, when the actor left a reason.
++    #[must_use]
++    pub fn reason(&self) -> Option<&str> {
++        let _ = self;
++        todo!("jobq/3.26-dlq-cli: why, when the actor left a reason")
++    }
++}
++
++/// Whether this job may be thrown away, and the refusal that says why not.
++///
++/// [`revived`](crate::engine::revived)'s sibling: the same rule — only a job the engine gave up on
++/// has a second life or a last word — with the sentence the other act needs. A `queued` or
++/// `running` job is owed an attempt that is about to happen, so throwing it away would be a
++/// decision about work in flight, and a `succeeded` job is work somebody already got: discarding
++/// it would delete the record of something that happened rather than cancel something that has
++/// not.
++///
++/// # Errors
++///
++/// [`Error::Invalid`], naming the state the job is in.
++pub fn discardable(job: &Job) -> Result<(), Error> {
++    let _ = job;
++    todo!(
++        "jobq/3.26-dlq-cli: only a job the engine gave up on can be thrown away, and the refusal \
++         names the state this one is in"
++    )
++}
+diff --git a/tests/dlq_harness.rs b/tests/dlq_harness.rs
+new file mode 100644
+index 0000000..29ed19f
+--- /dev/null
++++ b/tests/dlq_harness.rs
+@@ -0,0 +1,218 @@
++//! The budget's harness for `jobq/3.26-dlq-cli`.
++//!
++//! This file is the course's, not the learner's. It is what the `bench-budget` gate runs, and the
++//! numbers it prints are compared with the baselines in
++//! `course/tracks/jobq/budget/3.26-dlq-cli.toml` — one workload of calls through the operator's
++//! door, and the record those calls leave behind.
++//!
++//! What it measures is a **count, never the clock**: the calls the workload makes, the lines the
++//! record holds afterwards, how many of those lines no call of the workload accounts for, and how
++//! many have no name on them. `kiln` compares counts, so the gate answers the same thing on a
++//! loaded machine as on an idle one, and no run of this file can flake because something else was
++//! compiling. `cargo test -p jobq --test dlq_harness -- --nocapture` prints the lines by hand; the
++//! `jobq-budget` prefix is what the gate reads.
++//!
++//! The four numbers are two promises, each read from both sides. **A call is one line, or nothing
++//! at all**: `acts` counts the calls this workload makes — five of them have to be refused, and
++//! that is the point of counting them — while `record_lines` counts what the record actually
++//! holds, so the distance between the two is what a refusal left behind, which is nothing. And
++//! **a line is about something a person did**: `orphans_max` counts lines no call of this workload
++//! accounts for, and `unattributed_max` counts those with no name on them. Both are upper bounds
++//! and both are zero, because a record that can be written for an act that did not happen is worse
++//! than no record at all — it is the one an auditor trusts.
++//!
++//! The numbers are printed *before* anything is asserted. A harness that panicked first would hand
++//! the gate no measurement, and a gate with no measurement can only say "blocked"; this way a
++//! record that came out wrong is reported with the counts that moved.
++
++use jobq::engine::{
++    Act, Error, JobAudit, JobId, MemoryStore, Order, Queue, Store, SubmitRequest, WorkerId,
++    dead_letters,
++};
++
++/// The queue every dead letter of this workload dies in.
++const QUEUE: &str = "billing";
++/// The dead letters the workload builds before it acts on any of them.
++const ROWS: usize = 12;
++/// How many of them are replayed; the rest are thrown away.
++const REPLAYED: usize = 6;
++/// The calls the workload makes that have to be refused: three the *order* refuses before anything
++/// is read (no reason at all, a reason of nothing but spaces, no name), and two the *row* refuses
++/// after it (an identity nobody wrote, and a job that is owed an attempt again rather than dead).
++const REFUSALS: usize = 5;
++/// The page the record is read with: one workload's acts, and no more.
++const PAGE: usize = 64;
++/// Who replays, and who throws work away. Two names, so that a line which lost its actor is a line
++/// the counts below can see.
++const REPLAYER: &str = "ada";
++/// Who throws work away.
++const DISCARDER: &str = "grace";
++/// The sentence every dead letter's last attempt died with.
++const REASON: &str = "the payment provider answered 502 and kept answering it";
++
++/// A queue, by name.
++fn queue() -> Queue {
++    Queue::parse(QUEUE).unwrap_or_else(|error| panic!("`{QUEUE}` is a queue name: {error}"))
++}
++
++/// The worker this workload claims with.
++fn worker() -> WorkerId {
++    WorkerId::new("dlq-harness")
++}
++
++/// One dead letter, built through the port: submitted, claimed, and failed.
++///
++/// The tool cannot fail a job — `jobqd` does that — so the rows this workload acts on are built the
++/// way the daemon leaves them, and every count below is about the acts rather than about the
++/// setup.
++async fn dead_letter(store: &dyn Store, invoice: usize) -> JobId {
++    let queue = queue();
++    let id = store
++        .enqueue(
++            SubmitRequest::new(queue.clone(), serde_json::json!({ "invoice": invoice }))
++                .with_max_attempts(1),
++        )
++        .await
++        .unwrap_or_else(|error| panic!("the port accepts this request: {error}"))
++        .id();
++    store
++        .claim(&worker(), &queue, 1)
++        .await
++        .unwrap_or_else(|error| panic!("a queue with a job due hands one out: {error}"));
++    store
++        .fail(&worker(), &id, REASON)
++        .await
++        .unwrap_or_else(|error| panic!("recording a failure cannot fail here: {error}"));
++    id
++}
++
++/// The record, as the three fields a caller compares lines by.
++async fn record(store: &dyn Store) -> Vec<(Act, JobId, String)> {
++    store
++        .acts(PAGE)
++        .await
++        .unwrap_or_else(|error| panic!("reading the record cannot fail here: {error}"))
++        .into_iter()
++        .map(|line| (line.action(), line.job(), line.actor().to_owned()))
++        .collect()
++}
++
++/// One call's answer, as the workload's ledger of lines sees it.
++///
++/// A refusal is not a failure here: it is counted, because what it leaves behind is the whole of
++/// what this file is measuring.
++fn ledger(
++    answer: Result<JobAudit, Error>,
++    taken: &mut Vec<(Act, JobId, String)>,
++    refused: &mut usize,
++) {
++    match answer {
++        Ok(line) => taken.push((line.action(), line.job(), line.actor().to_owned())),
++        Err(_) => *refused += 1,
++    }
++}
++
++#[tokio::test]
++async fn the_budget() {
++    let store = MemoryStore::new();
++
++    // The rows this workload acts on, built through the port: every one of them a job the engine
++    // gave up on, which is what an act is about.
++    let mut dead: Vec<JobId> = Vec::with_capacity(ROWS);
++    for invoice in 0..ROWS {
++        dead.push(dead_letter(&store, invoice).await);
++    }
++
++    // A look is not an act (`jobq/3.16-dlq-tooling`: reading is not an action), and it is the
++    // operator's first move — so it is here, and it counts for nothing below.
++    let stuck = store
++        .list(&dead_letters())
++        .await
++        .unwrap_or_else(|error| panic!("listing the dead letters cannot fail here: {error}"));
++    let before = record(&store).await;
++
++    let mut calls = 0usize;
++    let mut refused = 0usize;
++    let mut taken: Vec<(Act, JobId, String)> = Vec::new();
++
++    // Three calls the order refuses before the store reads anything. Two of them point at rows the
++    // twelve acts below still have to move, which is why they come first.
++    for order in [
++        Order::discard(dead[ROWS - 1], DISCARDER, ""),
++        Order::discard(dead[ROWS - 2], DISCARDER, "   "),
++        Order::replay(dead[ROWS - 3], "   "),
++    ] {
++        calls += 1;
++        ledger(store.operate(&order).await, &mut taken, &mut refused);
++    }
++
++    // The twelve acts: the first half of the dead letters get another life, the second half are
++    // thrown away with a reason. Every one of them is a line.
++    for id in dead.iter().take(REPLAYED) {
++        calls += 1;
++        let answer = store.operate(&Order::replay(*id, REPLAYER)).await;
++        ledger(answer, &mut taken, &mut refused);
++    }
++    for id in dead.iter().skip(REPLAYED) {
++        calls += 1;
++        let answer = store
++            .operate(&Order::discard(*id, DISCARDER, "customer asked us to stop"))
++            .await;
++        ledger(answer, &mut taken, &mut refused);
++    }
++
++    // Two calls the row refuses after the read: an identity nobody wrote, and a job that is owed an
++    // attempt again rather than dead — the first one the workload replayed.
++    for order in [
++        Order::replay(JobId::new(), REPLAYER),
++        Order::discard(dead[0], DISCARDER, "again"),
++    ] {
++        calls += 1;
++        ledger(store.operate(&order).await, &mut taken, &mut refused);
++    }
++
++    let record = record(&store).await;
++    let record_lines = record.len();
++    let orphans = record.iter().filter(|line| !taken.contains(line)).count();
++    let unattributed = record
++        .iter()
++        .filter(|(_, _, actor)| actor.trim().is_empty())
++        .count();
++
++    // The measurement, taken before any assertion: the calls the workload made, the lines the
++    // record holds because of them, and the two ways a line can be about nothing.
++    println!("jobq-budget acts={calls}");
++    println!("jobq-budget record_lines={record_lines}");
++    println!("jobq-budget orphans_max={orphans}");
++    println!("jobq-budget unattributed_max={unattributed}");
++
++    // What makes those four numbers a measurement rather than four numbers: the queue this file
++    // built, an empty record before the acts began, and the two promises the pairs stand for.
++    assert_eq!(
++        stuck.len(),
++        ROWS,
++        "the look has to show the rows this workload built, or the counts below are about a queue \
++         this file did not make"
++    );
++    assert!(
++        before.is_empty(),
++        "a submit, a claim and a failure are work and not acts, and a look is not an act either, so \
++         the record is empty before the twelve: {before:?}"
++    );
++    assert_eq!(
++        refused, REFUSALS,
++        "every act this workload expects to be refused was refused — an act that went through \
++         where one of these five belongs writes a line that nothing accounts for"
++    );
++    assert_eq!(
++        record_lines,
++        taken.len(),
++        "one act is one line: the port answered with {} of them and the record holds \
++         {record_lines}",
++        taken.len()
++    );
++    assert_eq!(
++        orphans, 0,
++        "not one line of the record is about an act this workload did not take"
++    );
++}
