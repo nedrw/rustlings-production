@@ -37,12 +37,14 @@
 //! of the tree it came from — and a mutant run would then judge yesterday's binary. [`make_fresh`]
 //! covers the copy and [`write_fresh`] every file this gate rewrites afterwards.
 //!
-//! The same fact runs the other way round, and the gate has to tidy up after it: the last thing a
-//! mutant run leaves in that shared slot is a build of the *mutated* tree, and cargo would serve it to
-//! a later build of the same tree — the learner's own `cargo test` would then run a mutant. So when the
-//! copy builds somewhere other than its own directory, the gate runs the spec once more after the last
-//! restore, which leaves the cache describing the code that is really there. That run is skipped in the
-//! usual case, where the copy builds into its own `target/` and takes its slot with it when it goes.
+//! The same fact runs the other way round, and it is why the copy builds in a directory of its own
+//! (`<cache>/kiln/mutants-target`, [`scratch::cache`]): cargo keys a slot by package name and version,
+//! so a copy that built into the shared directory would leave a binary whose `CARGO_MANIFEST_DIR`
+//! points at a copy that no longer exists — and the next gate to run the step's command reads that
+//! path. Measured (handoff M2 §5.2): `slow:mutants@80` followed by `slow:conformance@2` made the
+//! conformance run execute the *mutants copy's* binary, which then failed to open the project's own
+//! page. With a directory of its own the copy cannot reach anything outside itself, so the walk needs
+//! no cleanup pass after its last mutant.
 //!
 //! Before the mutants, the gate runs the spec once on the unmutated copy: a project whose own spec
 //! already fails would otherwise report every mutant as killed, which is the one answer this gate must
@@ -202,7 +204,20 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     let copy = scratch.path().join("project");
     copy_project(project, &copy)?;
 
-    let baseline = process::run_line(&command, &copy, ctx.timeout)?;
+    // The copy's builds get a directory of their own, and this is a correctness rule rather than a
+    // cache one: cargo keys a build slot by package name and version, not by the directory the
+    // package lives in, so a copy that built into the shared directory leaves a binary whose
+    // `CARGO_MANIFEST_DIR` points at a copy that no longer exists — and the *next* gate to run the
+    // step's command (`slow:conformance@2` runs right after this one) then reads another tree's
+    // files, or fails on a file it cannot open at all. `coverage` keeps a directory of its own for
+    // the same reason (a different `RUSTFLAGS` is a different build); this is the same rule for a
+    // different tree. The directory persists, so the baseline and the attempts after it reuse what
+    // they compiled — and `copy_project` stamps the copy fresh, so a build from an earlier run is
+    // never mistaken for this one's.
+    let target = scratch::cache("mutants-target")?;
+    let environment = [("CARGO_TARGET_DIR".to_owned(), target.display().to_string())];
+
+    let baseline = process::run_line_with_env(&command, &copy, ctx.timeout, &environment)?;
     if !baseline.success() {
         return Ok(GateOutcome::blocked(format!(
             "the spec does not pass on the project as it is, so no mutant can be judged — a mutant \
@@ -227,7 +242,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         let path = copy.join(&mutant.path);
         let original = read(&path)?;
         write_fresh(&path, &mutant.splice(&original)?)?;
-        let ran = process::run_line(&command, &copy, per_attempt)?;
+        let ran = process::run_line_with_env(&command, &copy, per_attempt, &environment)?;
         let verdict = verdict(&ran);
         // Put the file back before the next mutant: every mutant has to be measured against the same
         // tree, not against the one before it.
@@ -243,20 +258,6 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     }
     let elapsed = walk_started.elapsed();
     let stopped_early = killed + survived.len() < MUTANT_CAP && elapsed >= WALK_BUDGET;
-
-    // The last build in a shared target directory belongs to whoever built last, and that was a
-    // mutant. One more run of the spec over the restored copy leaves the cache describing the tree the
-    // learner has — and proves the copy was put back the way it was found.
-    if process::target_dir(project) != project.join("target") {
-        let restored = process::run_line(&command, &copy, ctx.timeout)?;
-        if !restored.success() {
-            return Ok(GateOutcome::blocked(format!(
-                "the copy of the project does not pass its own spec once the mutants are taken back \
-                 out, so the results above cannot be trusted — this is a `kiln` fault, not yours:\n    {}",
-                output(&restored)
-            )));
-        }
-    }
 
     Ok(judge(Tally {
         percent,
