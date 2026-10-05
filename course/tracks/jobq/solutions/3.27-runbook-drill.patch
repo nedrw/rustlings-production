@@ -1,0 +1,741 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+index 6da26d8..1aae8a7 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -1,76 +1,170 @@
+ # Runbook: the queue has stopped finishing work
+ 
+ The page a responder reads when jobs are arriving and not finishing. It is written as the procedure
+-it is, and every stage of it names four things: **the command** the responder types, **the signal**
+-that says the command answered well, **the refusal** that says it did not, and **the rollback** that
+-gets the queue back to where it was. The drill in [`../tests/support/drill.rs`](../tests/support/drill.rs)
+-walks these stages in order against a queue it breaks on purpose, and
+-`cargo test -p jobq --test spec_runbook` is the command that runs it: a stage that is not here is an
+-act nobody takes.
+-
+-This is the skeleton. The sections are the ones an incident page needs, and the stages below are the
+-ones this track's own pages have been describing all along — reading the queue, finding the rows,
+-looking at the dead letters, handing back what a daemon holds, and reading the numbers again. Every
+-part of every stage is `TODO` until it is written, and the drill will name the acts that are still
+-missing from the procedure once the stages that are here can be walked.
++it is — seven stages, in the order they are taken — and every stage names **the command** the
++responder types, **the signal** that says the command answered well, **the refusal** that says it did
++not, and **the rollback** that gets the queue back to where it was. The drill in
++[`../tests/support/drill.rs`](../tests/support/drill.rs) walks these stages against a queue it breaks
++on purpose, and `cargo test -p jobq --test spec_runbook` is the command that runs it: a stage that is
++not here is an act nobody takes.
++
++Two incidents look alike from the outside and are not. A queue that is **failing** ends attempts in
++`failed`; the rules that page somebody for it are in [`alerts.md`](alerts.md), and the dead letters
++they leave behind are what [`dlq.md`](dlq.md) is about. A queue that is **stuck** claims work and
++never ends it: no failure counter anywhere moves, the retry budgets are not being spent, and the
++only number that changes is the one nobody watches. This page is for the second incident, and its
++first stage is how you tell which one you are in.
+ 
+ ## Symptoms
+ 
+-What does a responder see first, from the outside? Name the alert that would page somebody
+-([`alerts.md`](alerts.md)) and what a person downstream notices before the queue does anything.
++What a responder sees first, from the outside:
++
++- A page from `jobq_running` (see [`alerts.md`](alerts.md)): one queue has been holding its whole
++  batch for fifteen minutes and finishing nothing.
++- Or a ticket: "the export has not run", "the digest email is late" — a queue that has stopped
++  making progress is noticed downstream first, because the queue itself has nothing to report.
++- Or a rollout: the new pods are up, the old ones are gone, and the backlog is not moving. The drain
++  in stage 6 is where a rollout either hands its work back or holds it for the lease.
++
++The one thing that is **not** a symptom: a rising `jobq_failed_total`. Failed attempts are the retry
++budget working ([`alerts.md`](alerts.md)). A stuck queue has a failure rate of zero.
+ 
+ ## Signals
+ 
+-| what to look at | where |
+-| --- | --- |
+-| `jobq_running` | `jobqc usage`, or the `signals` line of a run |
+-| `jobq_claimed_total` and `jobq_succeeded_total` | the same two places |
+-| `jobq_reclaimed_total` | the same two places |
+-| `jobq_submitted_total` | the same two places |
+-| TODO — the lines in the daemon's log that say what an attempt did | where |
++| what to look at | where | what it means |
++| --- | --- | --- |
++| `jobq_running` | `jobqc usage`, or the `signals` line of a run | attempts claimed and not ended: work holding a worker right now |
++| `jobq_claimed_total` vs `jobq_succeeded_total` | the same two places | claims rising with nothing finishing is the signature of a stuck queue |
++| `jobq_reclaimed_total` | the same two places | attempts nobody finished: a worker that stopped, or a lease that ran out |
++| `jobq_submitted_total` | the same two places | arrivals. A queue that stopped being fed has an empty backlog and no incident |
++| the attempt lines | the daemon's log (`../src/service/signals.rs`) | one line per attempt that settled, with `job`, `outcome`, `reason` and `took_ms` |
++| the `drained` line | the daemon's log on its way out | what a stop handed back (`../src/service/worker.rs`) |
++
++A reading that is taken **once**, when the process ends, is not a reading during an incident: the
++daemon publishes its counters on the way out, so the numbers an incident needs are the ones
++`jobqc usage` asks for. That command reads the store the daemon drains, so it is current whether
++the daemon is running or not.
+ 
+ ## Steps
+ 
+ ### 1. Read the queue before you touch it
+ 
+-- command: TODO
+-- signal: TODO
+-- refusal: TODO
+-- rollback: TODO
++- command: `jobqc usage --config /etc/jobq/daemon.toml`, the same settings file the daemon reads
++- signal: one line per queue with the six counters, and the two that matter together:
++  `claimed` climbing while `succeeded` stands still, with `failed` flat. Flat `failed` means
++  nothing is *failing* — the work is being held, not lost, and the stages below are safe to take
++- refusal: exit `4` — the store refused the read, so this deployment cannot reach the queue at all.
++  Stop here: every stage below needs the store, and the incident is the database's, not the queue's
++- rollback: nothing to undo. A read changes nothing, and no act below was taken
+ 
+ ### 2. Find the rows the failure is holding
+ 
+-- command: TODO
+-- signal: TODO
+-- refusal: TODO
+-- rollback: TODO
++- command: `jobqc list --state running --limit 50`
++- signal: the rows that are `running` — those are the attempts a worker is holding, and the number
++  of them is the `jobq_running` gauge read from the other end. A row that is `running` with a
++  worker that no longer exists will come back on its own when its lease runs out
++- refusal: exit `3` — the thing asked about is not there. An empty listing is an answer (`[]`), not
++  a refusal; `3` means the queue itself cannot be seen by this handle
++- rollback: nothing to undo. A listing is a read
+ 
+ ### 3. Look at the dead letters before you act on them
+ 
+-- command: TODO
+-- signal: TODO
+-- refusal: TODO
+-- rollback: TODO
+-
+-### 4. Hand back what a daemon is holding
++- command: `jobqc dlq list --queue signup`
++- signal: four fields per row — identity, attempts spent, the sentence the last attempt died with.
++  These are the only rows the acts in the next two stages may be pointed at: a `queued` or
++  `running` job is owed an attempt that is about to happen, and throwing one away is a decision
++  about work that is not an abandoned failure
++- refusal: exit `4` — the store refused; exit `3` — the queue is not visible to this handle
++- rollback: nothing to undo. Looking costs a page of output and changes nothing
++
++### 4. Put back what the cause explains
++
++- command: `jobqc dlq replay <ID> --by <your name>`, one identity at a time
++- signal: the act's own line, printed back as it was recorded, and the job is due again now with
++  one more attempt allowed. `jobqc inspect <ID>` then shows it `queued`
++- refusal: exit `2` when the call is wrong — no `--by`, or two identities, or a job that is not a
++  dead letter; exit `3` when the identity is not there. **A refused act writes nothing**: the row,
++  its trail and the record are exactly where they were, so the repair is to fix the call, not to
++  undo it
++- rollback: stage 5, on the same identity. A replay is one more attempt, and an attempt that was a
++  mistake is work thrown away with a reason — which is the only way back
++
++### 5. Stop the loop: throw away what the cause does not explain
++
++- command: `jobqc dlq discard <ID> --by <your name> --reason "<what the cause is>"`
++- signal: the act's own line, the row gone from the queue, its trail gone with it, and the line
++  still readable with `jobqc dlq audit`. Fix the cause **before** this stage: replaying a thousand
++  jobs into a handler that is still broken is a thousand dead letters ten minutes later
++- refusal: exit `2` when the reason is blank or the name is missing, and exit `2` when the row is
++  not a dead letter — the same refusal stage 3 exists to prevent. Nothing is written and nothing
++  moves, so the repair is the call and never the queue
++- rollback: **none.** This is the one act on this page that leaves nothing to undo: the work is
++  gone, and the line in `jobqc dlq audit` is the whole of what stays. Take it last, not first
++
++### 6. Hand back what a daemon is holding
++
++- command: `kill -TERM <the daemon's pid>` — a rollout, a pod eviction and a `systemctl stop` all
++  send this signal, and the daemon is written for it
++- signal: the daemon stops claiming, waits `worker.shutdown_seconds` for what is in flight, and
++  then says `drained` with `handed_back=N` before it exits `0` (`../src/service/worker.rs`). The
++  rows it could not finish go back to their queue with their leases released, so the next worker
++  takes them and nothing is lost
++- refusal: the line `the drain deadline passed with work still in flight` is not a failure: the
++  work in flight was aborted **and handed back**, which is that same `handed_back` count. What is
++  a refusal is a daemon that exits non-zero, or one that is still running after the signal: read
++  its last lines for the store it could not reach
++- rollback: none needed. The restart is the rollback: the lease is what makes a stop safe, and the
++  next worker with the same settings takes the same rows
++
++### 7. Read the numbers again, and the record of what you did
++
++- command: `jobqc usage --config /etc/jobq/daemon.toml` and `jobqc dlq audit --limit 20`
++- signal: `running` back to 0 for the queue and nothing left waiting: every job the deployment
++  accepted has either been settled or is a line somebody can point at — a dead letter on the list, or
++  an act in the record, with a name on it. That is the promise this page makes: **nothing the
++  deployment accepted is still owed**
++- refusal: exit `4` — the store refused the read, and the incident is not over whatever the log
++  says
++- rollback: nothing left to undo. What is left is the write-up: the acts are in `jobqc dlq audit`,
++  and the numbers are what the next responder starts from
+ 
+-- command: TODO
+-- signal: TODO
+-- refusal: TODO
+-- rollback: TODO
+-
+-### 5. Read the numbers again, and the record of what you did
++## Verification
+ 
+-- command: TODO
+-- signal: TODO
+-- refusal: TODO
+-- rollback: TODO
++"Recovered" is a fact about the queue, not a feeling: `running` is 0, and every job the deployment
++accepted is either `succeeded` or a dead letter somebody has looked at. The command that replays the
++whole page, in order, against a queue that is broken on purpose is:
+ 
+-## Verification
++```sh
++cargo test -p jobq --test spec_runbook
++```
+ 
+-What does "recovered" mean, as numbers, and which command replays it? The drill a responder runs is
+-`cargo test -p jobq --test spec_runbook`, and the promise it checks is the one the last stage makes.
++It walks the seven stages above, takes the acts they name, and reports the stage a refusal stopped
++at and the work still owed. A page that cannot be replayed is prose, and this is the command that
++says which of the two you are holding.
+ 
+ ## Escalation
+ 
+-Who do you wake up, with which numbers? And what is the one thing **not** to do, with the reason?
++- **The store is the incident** (stage 1 refuses with `4`, or every stage refuses the same way).
++  Wake whoever owns the database, and say what the queue holds: the rows are leased, not lost, and
++  every lease that runs out hands its attempt back. Do not restart workers in a loop — nothing in
++  this page needs the daemon to be up, and a restarting pod spends the leases it cannot keep.
++- **The queue is draining and one handler is slow** (`running` is at the batch size, `reclaimed`
++  is not moving, and the attempts that do finish take longer than `worker.lease_seconds`). That is
++  not a stuck queue: it is a lease shorter than the work. Raise `worker.lease_seconds` **and**
++  `worker.shutdown_seconds` together (`../src/service/config.rs`), and hand the numbers to whoever
++  owns the handler.
++- **Nothing is arriving** (`jobq_submitted_total` flat for an hour). The queue is fine. The
++  producer is what to wake up, and the honest thing to say about the queue is that it is empty.
++- What the next responder needs: the queue, the numbers from stages 1 and 7, the acts you took out
++  of `jobqc dlq audit`, and which stages refused. Not the story — the numbers.
++
++## Where this comes from
++
++- [PagerDuty: during an incident](https://response.pagerduty.com/during/during_an_incident/) — the
++  shape of the procedure this page is: what you are looking at, what you do, who you hand it to.
++- [`alerts.md`](alerts.md) — the rules that page somebody, and the signals the table above reads.
++- [`dlq.md`](dlq.md) — the dead-letter door, and the exit-code table `jobq/3.26-dlq-cli` made a
++  contract.
++- [`migration.md`](migration.md) — the schema's own procedure, whose deploy is what stage 6 is for.
++- `../src/service/worker.rs` — the drain, the lease renewal and the hand-back the `drained` line
++  reports.
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 5942ed5..a2abcc5 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -45,6 +45,7 @@ pub(crate) mod operator;
+ pub(crate) mod policy;
+ pub(crate) mod release;
+ pub(crate) mod retry;
++pub(crate) mod runbook;
+ pub(crate) mod scheduler;
+ pub(crate) mod schema;
+ pub(crate) mod state;
+@@ -81,6 +82,7 @@ pub use release::{
+     changelog_ok, checksums, digest, verify,
+ };
+ pub use retry::{DEFAULT_ATTEMPTS, Retried, retry};
++pub use runbook::{Gap, PARTS, Runbook, Stage};
+ pub use scheduler::Engine;
+ pub use schema::{
+     Action, Applied, BACKFILL_JOBS, BURST_LIMIT, BURST_MAX, Batch, Change, DEFAULT_BATCH,
+diff --git a/src/engine/runbook.rs b/src/engine/runbook.rs
+index bf891e0..31fca0d 100644
+--- a/src/engine/runbook.rs
++++ b/src/engine/runbook.rs
+@@ -107,10 +107,10 @@ impl Stage {
+     /// of a responder who was about to think about it and was interrupted.
+     #[must_use]
+     pub fn missing(&self) -> Option<&'static str> {
+-        todo!(
+-            "jobq/3.27-runbook-drill: the first of `PARTS` this stage does not name, and `None` when \
+-             it names all four"
+-        )
++        PARTS.iter().copied().find(|part| {
++            self.answer(part)
++                .is_none_or(|value| value.trim().is_empty())
++        })
+     }
+ 
+     /// `true` when this stage names all four things a responder is owed.
+@@ -226,10 +226,35 @@ impl Runbook {
+     /// heading, or the next part — which is what a page wrapped at a readable width looks like.
+     #[must_use]
+     pub fn of(page: &str) -> Self {
+-        todo!(
+-            "jobq/3.27-runbook-drill: read the page — a `###` heading that carries a number starts a \
+-             stage, and each of the four parts is its own line plus the wrapped lines under it"
+-        )
++        let mut stages: Vec<Stage> = Vec::new();
++        let mut pending: Option<Stage> = None;
++        let mut part: Option<&'static str> = None;
++        for line in page.lines() {
++            if let Some(heading) = line.trim_start().strip_prefix(STAGE) {
++                stages.extend(pending.take());
++                part = None;
++                pending =
++                    numbered(heading.trim()).map(|(number, title)| Stage::started(number, title));
++                continue;
++            }
++            let Some(stage) = pending.as_mut() else {
++                continue;
++            };
++            if line.trim().is_empty() {
++                part = None;
++                continue;
++            }
++            if let Some((name, value)) = named(line) {
++                stage.name(name, value);
++                part = Some(name);
++                continue;
++            }
++            if let Some(name) = part {
++                stage.continue_with(name, line);
++            }
++        }
++        stages.extend(pending);
++        Self { stages }
+     }
+ 
+     /// The stages of the procedure, in the order the page writes them.
+@@ -244,10 +269,28 @@ impl Runbook {
+     /// different repairs.
+     #[must_use]
+     pub fn gaps(&self) -> Vec<Gap> {
+-        todo!(
+-            "jobq/3.27-runbook-drill: every stage that is not runnable, in page order — an empty \
+-             page, a stage that forgets a part, a stage whose number is not the place it holds"
+-        )
++        let mut gaps: Vec<Gap> = Vec::new();
++        if self.stages.is_empty() {
++            gaps.push(Gap::Empty);
++            return gaps;
++        }
++        let mut expected: u32 = 1;
++        for stage in &self.stages {
++            if stage.number != expected {
++                gaps.push(Gap::OutOfOrder {
++                    number: stage.number,
++                    expected,
++                });
++            }
++            if let Some(part) = stage.missing() {
++                gaps.push(Gap::Missing {
++                    number: stage.number,
++                    part,
++                });
++            }
++            expected = expected.saturating_add(1);
++        }
++        gaps
+     }
+ 
+     /// `true` when every stage of the page names all four things and holds its place in the order.
+@@ -262,12 +305,14 @@ impl Runbook {
+ 
+ /// The number and title of a stage heading, or `None` when it carries no number.
+ fn numbered(heading: &str) -> Option<(u32, &str)> {
+-    todo!(
+-        "jobq/3.27-runbook-drill: the number and the title of a stage heading, or `None` when it carries none"
+-    )
++    let (digits, rest) = heading.split_at(heading.bytes().take_while(u8::is_ascii_digit).count());
++    let title = rest.strip_prefix('.')?;
++    Some((digits.parse().ok()?, title.trim()))
+ }
+ 
+ /// The part a line names, and what it says about it.
+ fn named(line: &str) -> Option<(&'static str, &str)> {
+-    todo!("jobq/3.27-runbook-drill: the part a line names, and what it says about it")
++    let (name, value) = line.trim().strip_prefix("- ")?.split_once(':')?;
++    let part = PARTS.iter().copied().find(|part| *part == name.trim())?;
++    Some((part, value.trim()))
+ }
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+index aadf631..56e1705 100644
+--- a/tests/support/drill.rs
++++ b/tests/support/drill.rs
+@@ -1,28 +1,22 @@
+-//! The drill for `jobq/3.27-runbook-drill` — the shape of one, and not a drill yet.
++//! The drill for `jobq/3.27-runbook-drill`: the procedure, replayed against a queue broken on
++//! purpose.
+ //!
+-//! A runbook is a claim about a system, and a claim nobody has executed is a wish. This file is
+-//! meant to be the execution: read `docs/runbook.md`, take the acts its stages name **in the order
+-//! the page names them**, and report what the deployment still owes afterwards.
++//! A runbook is a claim about a system, and a claim nobody has executed is a wish. This file is the
++//! execution: it reads `docs/runbook.md`, takes the acts its stages name, **in the order the page
++//! names them**, and reports what the deployment still owes afterwards. Three things it is written
++//! to answer:
+ //!
+-//! What is here is what a first version usually looks like. The incident is real — one worker takes
+-//! the whole queue, two attempts spend their budget, one job is owed another, and one row is left
+-//! held — and the report at the bottom of this file is an answer it *decided on* rather than one it
+-//! measured. Nothing walks the page, [`World`] is accepted and ignored, and the three worlds the
+-//! spec runs answer the same thing.
+-//!
+-//! What it is written to become, which is what the three worlds are for once they work:
+-//!
+-//! * **the page and the evidence are one list, read both ways.** Every act this file knows how to
+-//!   take ([`ACTS`]) has to be a stage the page names — [`Report::unnamed`] is what the page
+-//!   forgot — and every stage the page names has to be an act this file can take: a page that says
+-//!   `kubectl rollout restart` has drifted from the drill, and this file says so instead of
+-//!   skipping the stage;
++//! * **the page and the evidence are the same list, both ways.** Every act this file knows how to
++//!   take has to be a stage the page names ([`Report::unnamed`] is what the page forgot), and every
++//!   stage the page names has to be an act this file can take — a page that says `kubectl rollout
++//!   restart` is a page that has drifted from the drill, and this file says so instead of skipping
++//!   the stage;
+ //! * **a drill that cannot fail is decoration.** [`World::Never`] is the same procedure with
+-//!   nobody left to take the queue on, and it has to report the work that is still owed — the count
+-//!   the page's last stage promises is zero;
++//!   nothing left to take the queue on, and it reports the work that is still owed — the count the
++//!   page's last stage promises is zero;
+ //! * **the refusal is a stage, not a sentence.** [`World::Refused`] takes the act that cannot be
+ //!   undone *before* the stage that says which rows it is for, and reports what the door's refusal
+-//!   left behind: a refused act writes nothing (`jobq/3.26-dlq-cli`), which is the fact the
++//!   left behind. A refused act writes nothing (`jobq/3.26-dlq-cli`), which is the fact the
+ //!   responder's next move rests on.
+ //!
+ //! Everything here is in-process and on a clock the file states: the incident is a *value* rather
+@@ -34,8 +28,8 @@ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ use jobq::engine::{
+-    Clock, Engine, Job, JobId, JobState, MemoryStore, Queue, Runbook, Store, SubmitRequest,
+-    WorkerId,
++    Act, Clock, Engine, Job, JobFilter, JobId, JobState, MemoryStore, Order, Queue, Runbook, Stage,
++    Store, SubmitRequest, WorkerId, dead_letters,
+ };
+ 
+ /// The page this drill walks, relative to the project it is part of.
+@@ -115,31 +109,42 @@ impl Report {
+ 
+ /// Replay the procedure in one world, and answer what it found.
+ ///
+-/// Replay the procedure — as far as this version goes.
+-///
+-/// What is here is what a first version usually looks like, and it is worth reading before it is
+-/// rewritten: the incident is built for real ([`broken_queue`] takes the whole queue with one worker
+-/// and leaves one row held), the page is read for real ([`Runbook::of`]), and then the report below
+-/// is an answer this file *decided on* rather than one it measured. Nothing walks the stages:
+-/// `stages` is counted off the page, `unnamed` is empty because no act was compared with it,
+-/// `refused` is `None` because no act was refused, and `outstanding` is `0` because nobody asked the
+-/// store.
+-///
+-/// Turning this into a drill means four things, in this order: comparing the acts in [`ACTS`] with
+-/// the stages the page names and reporting the ones it does not name, walking `runbook.stages()` in
+-/// order and taking the act each one names, checking the page's own claims as it goes
+-/// (`engine.usage`, `engine.list`, `store.list`, `store.operate`, `store.release`), and letting
+-/// `world` decide what happens afterwards — a worker called [`LIVE`] taking the queue on, or nobody
+-/// doing so. `broken` names the rows every act is pointed at, and every act is taken under
+-/// [`OPERATOR`].
+-///
+ /// # Panics
+ ///
+-/// When the page cannot be read: this file walks a page, and a drill without one is a drill about
+-/// nothing.
++/// When the page cannot be read, when it names a stage whose command is not one of [`ACTS`] (the
++/// page and this file have drifted), or when one of the acts does not do what the page says it
++/// does — which is the failure a drill exists to produce.
+ #[must_use]
+ pub fn replay(world: World) -> Report {
+     let runbook = Runbook::of(&read_page());
++    // Before a single act is taken: what the page does not account for. The drill's script is the
++    // other half of the contract, and the two are compared rather than trusted.
++    let unnamed: Vec<&'static str> = ACTS
++        .iter()
++        .copied()
++        .filter(|act| {
++            !runbook
++                .stages()
++                .iter()
++                .any(|stage| stage.command().contains(act))
++        })
++        .collect();
++
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .expect("the drill's own runtime starts");
++    let (stages, refused, outstanding) = runtime.block_on(walk(&runbook, world));
++    Report {
++        stages,
++        unnamed,
++        refused,
++        outstanding,
++    }
++}
++
++/// Walk the page's stages, take the act each one names, and answer what was left owed.
++async fn walk(runbook: &Runbook, world: World) -> (usize, Option<u32>, usize) {
+     let clock = Arc::new(FrozenClock::at(START));
+     let store = Arc::new(
+         MemoryStore::new()
+@@ -149,38 +154,240 @@ pub fn replay(world: World) -> Report {
+     let engine = Engine::new(Arc::clone(&store));
+     let queue = Queue::parse(QUEUE).expect("the queue this drill uses is a name a queue may have");
+     let gone = WorkerId::new(GONE);
+-    let runtime = tokio::runtime::Builder::new_current_thread()
+-        .enable_all()
+-        .build()
+-        .expect("the drill's own runtime starts");
+-    let broken = runtime.block_on(broken_queue(&engine, &store, &queue, &gone));
+-
+-    // The rows the walk is written against — the two dead letters, the job that is owed an attempt,
+-    // and the row the departed worker is holding — and the world, which this version does not
+-    // consult yet: `Never` and `Refused` answer what `Recovers` answers.
+-    let _ = (
+-        world,
+-        &broken.dead,
+-        broken.owed,
+-        broken.held,
+-        ACTS,
+-        LIVE,
+-        OPERATOR,
+-    );
+-    Report {
+-        stages: runbook.stages().len(),
+-        unnamed: Vec::new(),
+-        refused: None,
+-        outstanding: 0,
++    let broken = broken_queue(&engine, &store, &queue, &gone).await;
++
++    let mut stages = 0usize;
++    let mut refused = None;
++    for stage in runbook.stages() {
++        let act = act_of(stage);
++        stages += 1;
++        match act {
++            // Stage 1: the read that tells a stuck queue from a failing one. The number that says
++            // "stuck" is claims that never finish, and this is where the drill asserts it is there:
++            // a drill against a healthy queue proves nothing about the procedure.
++            "jobqc usage" => {
++                let readings = engine
++                    .usage()
++                    .await
++                    .expect("the store answers for its queues");
++                let reading = readings
++                    .iter()
++                    .find(|reading| reading.queue() == &queue)
++                    .expect("the queue this drill fills is in the reading");
++                let usage = reading.usage();
++                assert!(
++                    usage.claimed() > usage.succeeded(),
++                    "stage {} reads the queue, and this one has {} claimed against {} succeeded: \
++                     the incident is claims that never finish, and a drill against a queue that is \
++                     keeping up is a drill that proves nothing",
++                    stage.number(),
++                    usage.claimed(),
++                    usage.succeeded()
++                );
++            }
++            // Stage 2: the rows a worker is holding.
++            "jobqc list" => {
++                let rows = engine
++                    .list(&JobFilter::new().with_state(JobState::Running))
++                    .await
++                    .expect("the store answers a listing");
++                assert_eq!(
++                    rows.len(),
++                    1,
++                    "stage {} lists the rows that are `running`, and the incident left exactly one \
++                     held by the worker that is gone: this listing answered {}",
++                    stage.number(),
++                    rows.len()
++                );
++                assert_eq!(
++                    rows.first().map(Job::id),
++                    Some(broken.held),
++                    "and it is the row stage 6 hands back, not some other attempt"
++                );
++            }
++            // Stage 3: the rows an act may be pointed at.
++            "jobqc dlq list" => {
++                let rows = store
++                    .list(&dead_letters())
++                    .await
++                    .expect("the store answers the dead-letter view");
++                assert_eq!(
++                    rows.len(),
++                    2,
++                    "stage {} reads the dead letters, and the incident left two: this listing \
++                     answered {}",
++                    stage.number(),
++                    rows.len()
++                );
++            }
++            // Stage 4: put back what the cause explains. One identity, one act, one answer.
++            "jobqc dlq replay" => {
++                let line = store
++                    .operate(&Order::replay(broken.dead[0], OPERATOR))
++                    .await
++                    .expect("a dead letter can be put back");
++                assert_eq!(
++                    line.action(),
++                    Act::Replay,
++                    "stage {} puts a job back, and the record says `{:?}`",
++                    stage.number(),
++                    line.action()
++                );
++            }
++            // Stage 5: the act that cannot be undone.
++            "jobqc dlq discard" => {
++                if world == World::Refused {
++                    // The responder who trusts their memory instead of stage 3: the act goes at a
++                    // row that is owed an attempt, and the door refuses it. What the drill is here
++                    // to show is the *state* the refusal leaves behind.
++                    let before: Vec<JobId> = store
++                        .list(&dead_letters())
++                        .await
++                        .expect("the store answers the dead-letter view")
++                        .iter()
++                        .map(Job::id)
++                        .collect();
++                    let written = store
++                        .acts(20)
++                        .await
++                        .expect("the store answers its record")
++                        .len();
++                    let error = store
++                        .operate(&Order::discard(
++                            broken.owed,
++                            OPERATOR,
++                            "the handler cannot fix this payload",
++                        ))
++                        .await
++                        .expect_err("a job that is owed an attempt is not a dead letter");
++                    assert_eq!(
++                        error.exit_code(),
++                        2,
++                        "the door answers a class and not a sentence: {error} answers `2` because \
++                         the call is wrong"
++                    );
++                    let after: Vec<JobId> = store
++                        .list(&dead_letters())
++                        .await
++                        .expect("the store answers the dead-letter view")
++                        .iter()
++                        .map(Job::id)
++                        .collect();
++                    assert_eq!(
++                        after, before,
++                        "a refused act writes nothing and moves nothing: the rows are exactly \
++                         where they were"
++                    );
++                    assert_eq!(
++                        store
++                            .acts(20)
++                            .await
++                            .expect("the store answers its record")
++                            .len(),
++                        written,
++                        "and it leaves no line in the record, which is what the page's refusal \
++                         column has to say"
++                    );
++                    refused = Some(stage.number());
++                }
++                let line = store
++                    .operate(&Order::discard(
++                        broken.dead[1],
++                        OPERATOR,
++                        "the upstream record this payload named is gone",
++                    ))
++                    .await
++                    .expect("a dead letter can be thrown away with a reason");
++                assert_eq!(
++                    line.action(),
++                    Act::Discard,
++                    "stage {} throws a job away, and the record says `{:?}`",
++                    stage.number(),
++                    line.action()
++                );
++            }
++            // Stage 6: the stop that hands work back rather than holding it.
++            "kill -TERM" => {
++                let handed_back = store
++                    .release(&gone)
++                    .await
++                    .expect("the store hands back what a worker holds");
++                assert_eq!(
++                    handed_back,
++                    1,
++                    "stage {} hands back what the daemon is holding, and this deployment was \
++                     holding {}",
++                    stage.number(),
++                    handed_back
++                );
++            }
++            other => panic!(
++                "stage {} names `{other}`, which is not one of the acts this drill can take \
++                 ({ACTS:?}): the page and the drill have drifted, and a stage nobody can run is a \
++                 stage nobody has run",
++                stage.number()
++            ),
++        }
++    }
++
++    // What happens after the procedure is the world's answer to "does anybody come back", and it
++    // is deliberately outside the loop: the procedure cannot make a worker exist. `World::Refused`
++    // recovers like `World::Recovers` does — the refused act is one act taken too early, and it is
++    // the only thing that should differ between those two reports.
++    if world != World::Never {
++        let live = WorkerId::new(LIVE);
++        loop {
++            let claimed = store
++                .claim(&live, &queue, 8)
++                .await
++                .expect("the worker that came back claims what is due");
++            if claimed.is_empty() {
++                break;
++            }
++            for job in &claimed {
++                store
++                    .complete(&live, &job.id())
++                    .await
++                    .expect("the worker that came back finishes what it took");
++            }
++        }
+     }
++
++    (stages, refused, owed(&store, &queue).await)
+ }
+ 
+-/// Walk the page's stages, take the act each one names, and answer what was left owed.
+ /// The act a stage names: the command it carries, matched against the script this file knows.
++fn act_of(stage: &Stage) -> &'static str {
++    let command = stage.command();
++    ACTS
++        .iter()
++        .copied()
++        .find(|act| command.contains(act))
++        .unwrap_or_else(|| {
++            panic!(
++                "stage {} names `{command}`, and this drill can take none of {ACTS:?}: a page whose \
++                 commands are not this deployment's commands is a page nobody has run",
++                stage.number()
++            )
++        })
++}
++
+ /// The jobs the deployment still owes an attempt: the ones waiting, and the ones being held.
+ ///
+ /// A settled job is not owed anything and a dead letter has already been given up on — what is left
+ /// is work that has not been attempted yet, and work an attempt is sitting on.
++async fn owed(store: &MemoryStore, queue: &Queue) -> usize {
++    let mut owed = 0usize;
++    for state in [JobState::Queued, JobState::Running] {
++        owed += store
++            .list(&JobFilter::new().with_queue(queue.clone()).with_state(state))
++            .await
++            .expect("the store answers a listing")
++            .len();
++    }
++    owed
++}
++
+ /// The queue as the incident left it.
+ struct Broken {
+     /// The two jobs whose attempts spent their budget: the dead letters.

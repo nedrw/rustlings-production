@@ -1,0 +1,794 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+new file mode 100644
+index 0000000..6da26d8
+--- /dev/null
++++ b/docs/runbook.md
+@@ -0,0 +1,76 @@
++# Runbook: the queue has stopped finishing work
++
++The page a responder reads when jobs are arriving and not finishing. It is written as the procedure
++it is, and every stage of it names four things: **the command** the responder types, **the signal**
++that says the command answered well, **the refusal** that says it did not, and **the rollback** that
++gets the queue back to where it was. The drill in [`../tests/support/drill.rs`](../tests/support/drill.rs)
++walks these stages in order against a queue it breaks on purpose, and
++`cargo test -p jobq --test spec_runbook` is the command that runs it: a stage that is not here is an
++act nobody takes.
++
++This is the skeleton. The sections are the ones an incident page needs, and the stages below are the
++ones this track's own pages have been describing all along — reading the queue, finding the rows,
++looking at the dead letters, handing back what a daemon holds, and reading the numbers again. Every
++part of every stage is `TODO` until it is written, and the drill will name the acts that are still
++missing from the procedure once the stages that are here can be walked.
++
++## Symptoms
++
++What does a responder see first, from the outside? Name the alert that would page somebody
++([`alerts.md`](alerts.md)) and what a person downstream notices before the queue does anything.
++
++## Signals
++
++| what to look at | where |
++| --- | --- |
++| `jobq_running` | `jobqc usage`, or the `signals` line of a run |
++| `jobq_claimed_total` and `jobq_succeeded_total` | the same two places |
++| `jobq_reclaimed_total` | the same two places |
++| `jobq_submitted_total` | the same two places |
++| TODO — the lines in the daemon's log that say what an attempt did | where |
++
++## Steps
++
++### 1. Read the queue before you touch it
++
++- command: TODO
++- signal: TODO
++- refusal: TODO
++- rollback: TODO
++
++### 2. Find the rows the failure is holding
++
++- command: TODO
++- signal: TODO
++- refusal: TODO
++- rollback: TODO
++
++### 3. Look at the dead letters before you act on them
++
++- command: TODO
++- signal: TODO
++- refusal: TODO
++- rollback: TODO
++
++### 4. Hand back what a daemon is holding
++
++- command: TODO
++- signal: TODO
++- refusal: TODO
++- rollback: TODO
++
++### 5. Read the numbers again, and the record of what you did
++
++- command: TODO
++- signal: TODO
++- refusal: TODO
++- rollback: TODO
++
++## Verification
++
++What does "recovered" mean, as numbers, and which command replays it? The drill a responder runs is
++`cargo test -p jobq --test spec_runbook`, and the promise it checks is the one the last stage makes.
++
++## Escalation
++
++Who do you wake up, with which numbers? And what is the one thing **not** to do, with the reason?
+diff --git a/src/engine/runbook.rs b/src/engine/runbook.rs
+new file mode 100644
+index 0000000..bf891e0
+--- /dev/null
++++ b/src/engine/runbook.rs
+@@ -0,0 +1,273 @@
++//! The runbook's own shape: a procedure somebody else can run, and the four things a stage owes.
++//!
++//! Step `jobq/3.27-runbook-drill`. Every step before this one added an *act* to a deployment and
++//! wrote the page that explains it; what none of them wrote is the **procedure** — the order those
++//! acts are taken in, by somebody who did not write any of them, at three in the morning. This
++//! module is the procedure's shape as a value a program can hold, and it exists because a runbook
++//! that is only prose cannot be judged by anything: [`Runbook::of`] reads a page and [`Runbook::gaps`]
++//! answers every stage that is not runnable.
++//!
++//! Four things are owed by every stage, and each one is a way a runbook fails:
++//!
++//! * **the command** — what the responder types. "Check that the workers are healthy" is a
++//!   sentence nobody can execute;
++//! * **the signal** — what the command answering *well* looks like. Without it the responder cannot
++//!   tell a queue that is draining from a queue that is stuck, and the act that follows is a guess;
++//! * **the refusal** — what it looks like when the command does *not* answer well. Every door in
++//!   this project answers a class rather than a sentence (`jobq/3.15-cli-contract`,
++//!   `jobq/3.26-dlq-cli`), and a step that does not name its refusal leaves the responder to
++//!   invent the branch — usually by retrying an act that will not work;
++//! * **the rollback** — how to get back to where the queue was. Some acts have none, and **saying
++//!   so is the point**: an act whose consequences cannot be undone (a discard, `jobq/3.26`) is
++//!   exactly the one a responder must know is irreversible *before* they take it.
++//!
++//! What this module is **not**: it runs nothing and it checks nothing against a deployment. It
++//! reads the page and judges its shape — which stage is which, and which of the four things a stage
++//! forgot. Whether the commands on the page are the commands this deployment has is the drill's
++//! question (it walks the page and takes the acts it names), and whether the acts work is the
++//! engine's.
++
++use std::fmt;
++
++/// The four things a stage of a runbook names, in the order a responder reads them.
++///
++/// An array rather than a list inside each function, because it is the whole contract of a stage:
++/// [`Stage::missing`] reports the first of these that a stage does not answer, and [`Gap::Missing`]
++/// names it, so a page and a report cannot disagree about what a stage is made of.
++pub const PARTS: [&str; 4] = ["command", "signal", "refusal", "rollback"];
++
++/// What a markdown heading at this depth starts, followed by a number.
++const STAGE: &str = "###";
++
++/// One stage of a procedure: a number, a title, and the four things it owes.
++///
++/// Built by [`Runbook::of`] and never by a caller, so a stage that exists is a stage that was read
++/// out of a page.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Stage {
++    /// Where it sits in the order, read from its heading.
++    number: u32,
++    /// What it is called, read from its heading after the number.
++    title: String,
++    /// The four answers, in [`PARTS`] order, empty when the stage did not name one.
++    answers: [String; PARTS.len()],
++}
++
++impl Stage {
++    /// The number its heading carries.
++    #[must_use]
++    pub fn number(&self) -> u32 {
++        self.number
++    }
++
++    /// What the stage is called: its heading without the marker and the number.
++    #[must_use]
++    pub fn title(&self) -> &str {
++        &self.title
++    }
++
++    /// What the responder types.
++    #[must_use]
++    pub fn command(&self) -> &str {
++        self.answer("command").unwrap_or_default()
++    }
++
++    /// What the command answering well looks like.
++    #[must_use]
++    pub fn signal(&self) -> &str {
++        self.answer("signal").unwrap_or_default()
++    }
++
++    /// What it looks like when the command does not answer well.
++    #[must_use]
++    pub fn refusal(&self) -> &str {
++        self.answer("refusal").unwrap_or_default()
++    }
++
++    /// How to get back to where the queue was, or the words that say there is no way back.
++    #[must_use]
++    pub fn rollback(&self) -> &str {
++        self.answer("rollback").unwrap_or_default()
++    }
++
++    /// One of the four answers by name, or `None` when this stage does not name that part.
++    ///
++    /// The name is one of [`PARTS`]; anything else is `None` rather than a panic, because the names
++    /// come from a page and a page is input.
++    #[must_use]
++    pub fn answer(&self, part: &str) -> Option<&str> {
++        let index = PARTS.iter().position(|name| *name == part)?;
++        self.answers.get(index).map(String::as_str)
++    }
++
++    /// The first of the four things this stage does not name, if it forgets one.
++    ///
++    /// "Does not name" includes naming it with nothing after the colon: `- rollback:` is the shape
++    /// of a responder who was about to think about it and was interrupted.
++    #[must_use]
++    pub fn missing(&self) -> Option<&'static str> {
++        todo!(
++            "jobq/3.27-runbook-drill: the first of `PARTS` this stage does not name, and `None` when \
++             it names all four"
++        )
++    }
++
++    /// `true` when this stage names all four things a responder is owed.
++    #[must_use]
++    pub fn holds(&self) -> bool {
++        self.missing().is_none()
++    }
++
++    /// Start a stage at `number`, called `title`.
++    fn started(number: u32, title: &str) -> Self {
++        Self {
++            number,
++            title: title.trim().to_owned(),
++            answers: std::array::from_fn(|_| String::new()),
++        }
++    }
++
++    /// Name a part, replacing whatever the stage had said about it.
++    fn name(&mut self, part: &str, value: &str) {
++        if let Some(slot) = self.slot(part) {
++            *slot = value.trim().to_owned();
++        }
++    }
++
++    /// Continue a part on the next line, which is what a page wrapped at a readable width looks
++    /// like: the value of a part is its own line plus every wrapped line after it.
++    fn continue_with(&mut self, part: &str, text: &str) {
++        if let Some(slot) = self.slot(part) {
++            if !slot.is_empty() {
++                slot.push(' ');
++            }
++            slot.push_str(text.trim());
++        }
++    }
++
++    /// The answer this part lives in.
++    fn slot(&mut self, part: &str) -> Option<&mut String> {
++        let index = PARTS.iter().position(|name| *name == part)?;
++        self.answers.get_mut(index)
++    }
++}
++
++impl fmt::Display for Stage {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(formatter, "stage {} ({})", self.number, self.title)
++    }
++}
++
++/// A stage of a page that is not runnable, and why.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Gap {
++    /// The page names no stage at all: it is prose about the system, not a procedure for it.
++    Empty,
++    /// A stage that does not name one of the four things a responder is owed.
++    Missing {
++        /// Which stage.
++        number: u32,
++        /// Which of [`PARTS`] it forgot.
++        part: &'static str,
++    },
++    /// A stage whose number is not the position it holds in the page.
++    OutOfOrder {
++        /// The number the heading carries.
++        number: u32,
++        /// The number that stage's position means.
++        expected: u32,
++    },
++}
++
++impl fmt::Display for Gap {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Gap::Empty => formatter.write_str(
++                "the page names no stage at all: a procedure nobody numbered is the prose a \
++                 responder reads instead of following",
++            ),
++            Gap::Missing { number, part } => write!(
++                formatter,
++                "stage {number} does not say what its `{part}` is: a stage that does not name one \
++                 of {PARTS:?} is a stage the responder finishes by improvising",
++            ),
++            Gap::OutOfOrder { number, expected } => write!(
++                formatter,
++                "stage {number} sits where stage {expected} belongs: a procedure is followed in \
++                 the page's order, and a number that disagrees with it is a stage taken out of \
++                 order",
++            ),
++        }
++    }
++}
++
++/// A procedure, as the page that carries it.
++///
++/// [`Runbook::of`] is the only way to build one: a runbook assembled by hand would be a claim about
++/// a page nobody read.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Runbook {
++    /// The stages, in the order the page writes them.
++    stages: Vec<Stage>,
++}
++
++impl Runbook {
++    /// The procedure a page describes: every `###` heading that carries a number, in page order.
++    ///
++    /// A heading at any other depth is prose, and a `###` heading with no number is *not a stage* —
++    /// it is a heading somebody wrote where a stage belongs, and the acts it was supposed to name
++    /// are the acts [`Runbook::gaps`] cannot see. The parse is deliberately this literal: a page is
++    /// read by a person under pressure, so what it says is what it says.
++    ///
++    /// A part's value is the rest of its own line and every line after it until a blank line, a
++    /// heading, or the next part — which is what a page wrapped at a readable width looks like.
++    #[must_use]
++    pub fn of(page: &str) -> Self {
++        todo!(
++            "jobq/3.27-runbook-drill: read the page — a `###` heading that carries a number starts a \
++             stage, and each of the four parts is its own line plus the wrapped lines under it"
++        )
++    }
++
++    /// The stages of the procedure, in the order the page writes them.
++    #[must_use]
++    pub fn stages(&self) -> &[Stage] {
++        &self.stages
++    }
++
++    /// Every stage that is not runnable, in page order, and why.
++    ///
++    /// A stage can be both out of order and incomplete; both are reported, because they are two
++    /// different repairs.
++    #[must_use]
++    pub fn gaps(&self) -> Vec<Gap> {
++        todo!(
++            "jobq/3.27-runbook-drill: every stage that is not runnable, in page order — an empty \
++             page, a stage that forgets a part, a stage whose number is not the place it holds"
++        )
++    }
++
++    /// `true` when every stage of the page names all four things and holds its place in the order.
++    ///
++    /// This is the whole judgement the page's shape admits: whether the acts on it *work* is not a
++    /// question about a page.
++    #[must_use]
++    pub fn holds(&self) -> bool {
++        self.gaps().is_empty()
++    }
++}
++
++/// The number and title of a stage heading, or `None` when it carries no number.
++fn numbered(heading: &str) -> Option<(u32, &str)> {
++    todo!(
++        "jobq/3.27-runbook-drill: the number and the title of a stage heading, or `None` when it carries none"
++    )
++}
++
++/// The part a line names, and what it says about it.
++fn named(line: &str) -> Option<(&'static str, &str)> {
++    todo!("jobq/3.27-runbook-drill: the part a line names, and what it says about it")
++}
+diff --git a/tests/runbook_harness.rs b/tests/runbook_harness.rs
+new file mode 100644
+index 0000000..f3a02bf
+--- /dev/null
++++ b/tests/runbook_harness.rs
+@@ -0,0 +1,95 @@
++//! The runbook's harness for `jobq/3.27-runbook-drill`.
++//!
++//! This file is the course's, not the learner's. It is what the `bench-budget` gate runs, and the
++//! numbers it prints are compared with the baseline in
++//! `course/tracks/jobq/budget/3.27-runbook-drill.toml` — the page this step delivers, counted by the
++//! crate's own reader.
++//!
++//! What it measures is a **count, never the clock**: the acts the drill's script takes, how many of
++//! them the page accounts for with a stage, and how many of its stages are not runnable. `kiln`
++//! compares counts, so the gate answers the same thing on a loaded machine as on an idle one, and no
++//! run of this file can flake because something else was compiling. `cargo test -p jobq --test
++//! runbook_harness -- --nocapture` prints the lines by hand; the `jobq-budget` prefix is what the
++//! gate reads.
++//!
++//! The act list is this file's own, and it is the *workload*: six acts this deployment's doors
++//! offer, one per stage of the procedure. The page has to account for every one of them, and the two
++//! `_max` numbers are the two ways it can fail to — an act it never names, and a stage that does not
++//! say what its command, signal, refusal and rollback are. The assertion before the first print is
++//! there so that a page nobody wrote reports a failure rather than four zeros that mean nothing.
++
++use std::path::{Path, PathBuf};
++
++use jobq::engine::Runbook;
++
++/// The acts the drill's script takes, in the order the procedure takes them.
++///
++/// Spelled the way a page names them, because that is what the count below matches on: the runbook
++/// and the drill have to call the acts the same thing, or the two documents have already drifted.
++const ACTS: [&str; 6] = [
++    "jobqc usage",
++    "jobqc list",
++    "jobqc dlq list",
++    "jobqc dlq replay",
++    "jobqc dlq discard",
++    "kill -TERM",
++];
++
++/// One file, read from the project it is part of.
++fn read(path: &Path) -> String {
++    std::fs::read_to_string(path)
++        .unwrap_or_else(|error| panic!("{} could not be read: {error}", path.display()))
++}
++
++#[test]
++fn the_runbook() {
++    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let page = root.join("docs/runbook.md");
++    let runbook = Runbook::of(&read(&page));
++
++    let named = ACTS
++        .iter()
++        .copied()
++        .filter(|act| {
++            runbook
++                .stages()
++                .iter()
++                .any(|stage| stage.command().contains(*act))
++        })
++        .count();
++    let unrunnable = runbook
++        .stages()
++        .iter()
++        .filter(|stage| !stage.holds())
++        .count();
++
++    println!("jobq-budget acts={}", ACTS.len());
++    println!("jobq-budget named={named}");
++    println!("jobq-budget unnamed_max={}", ACTS.len() - named);
++    println!("jobq-budget unrunnable_max={unrunnable}");
++
++    assert!(
++        !runbook.stages().is_empty(),
++        "{} names no stage at all, so every number above would be a zero that means nothing: this \
++         harness reads a procedure, and a page that is prose is not one",
++        page.display()
++    );
++    if !runbook.holds() || named < ACTS.len() {
++        // Not a `jobq-budget` line: the numbers above are the measurement, and this is what a
++        // reviewer is handed when the page is not a procedure yet.
++        println!("the page is not runnable yet:");
++        for stage in runbook.stages() {
++            if let Some(part) = stage.missing() {
++                println!("  {stage} does not name its `{part}`");
++            }
++        }
++        for act in ACTS.iter().copied().filter(|act| {
++            !runbook
++                .stages()
++                .iter()
++                .any(|stage| stage.command().contains(act))
++        }) {
++            println!("  no stage takes `{act}`");
++        }
++    }
++}
+diff --git a/tests/support/drill.rs b/tests/support/drill.rs
+new file mode 100644
+index 0000000..aadf631
+--- /dev/null
++++ b/tests/support/drill.rs
+@@ -0,0 +1,326 @@
++//! The drill for `jobq/3.27-runbook-drill` — the shape of one, and not a drill yet.
++//!
++//! A runbook is a claim about a system, and a claim nobody has executed is a wish. This file is
++//! meant to be the execution: read `docs/runbook.md`, take the acts its stages name **in the order
++//! the page names them**, and report what the deployment still owes afterwards.
++//!
++//! What is here is what a first version usually looks like. The incident is real — one worker takes
++//! the whole queue, two attempts spend their budget, one job is owed another, and one row is left
++//! held — and the report at the bottom of this file is an answer it *decided on* rather than one it
++//! measured. Nothing walks the page, [`World`] is accepted and ignored, and the three worlds the
++//! spec runs answer the same thing.
++//!
++//! What it is written to become, which is what the three worlds are for once they work:
++//!
++//! * **the page and the evidence are one list, read both ways.** Every act this file knows how to
++//!   take ([`ACTS`]) has to be a stage the page names — [`Report::unnamed`] is what the page
++//!   forgot — and every stage the page names has to be an act this file can take: a page that says
++//!   `kubectl rollout restart` has drifted from the drill, and this file says so instead of
++//!   skipping the stage;
++//! * **a drill that cannot fail is decoration.** [`World::Never`] is the same procedure with
++//!   nobody left to take the queue on, and it has to report the work that is still owed — the count
++//!   the page's last stage promises is zero;
++//! * **the refusal is a stage, not a sentence.** [`World::Refused`] takes the act that cannot be
++//!   undone *before* the stage that says which rows it is for, and reports what the door's refusal
++//!   left behind: a refused act writes nothing (`jobq/3.26-dlq-cli`), which is the fact the
++//!   responder's next move rests on.
++//!
++//! Everything here is in-process and on a clock the file states: the incident is a *value* rather
++//! than a race with the machine, and the whole replay is over in milliseconds, which is what lets
++//! the spec run it several times.
++
++use std::sync::{Arc, Mutex, PoisonError};
++use std::time::Duration;
++
++use chrono::{DateTime, Utc};
++use jobq::engine::{
++    Clock, Engine, Job, JobId, JobState, MemoryStore, Queue, Runbook, Store, SubmitRequest,
++    WorkerId,
++};
++
++/// The page this drill walks, relative to the project it is part of.
++const PAGE: &str = "docs/runbook.md";
++
++/// The queue this incident happens in.
++const QUEUE: &str = "signup";
++
++/// The instant every row in this replay is written at.
++///
++/// A clock the file states rather than the machine's: the incident has to be the same incident on
++/// the machine that is on fire and on the reviewer's laptop.
++const START: &str = "2030-01-01T00:00:00Z";
++
++/// The worker that was draining the queue when the incident started.
++const GONE: &str = "worker-that-left";
++
++/// The worker the deployment starts afterwards.
++const LIVE: &str = "worker-that-stayed";
++
++/// The name the acts are taken under, so that the record an auditor reads has one on every line.
++const OPERATOR: &str = "drill-operator";
++
++/// How long a claim is good for, as the deployment states it (`worker.lease_seconds`).
++const LEASE_SECONDS: u64 = 30;
++
++/// The acts this file knows how to take, spelled the way a page names them.
++///
++/// The strings are matched against a stage's command, which is why they are written as the tool's
++/// own names: the runbook and the drill have to agree about what the acts are called, or the two
++/// documents have already drifted.
++const ACTS: [&str; 6] = [
++    "jobqc usage",
++    "jobqc list",
++    "jobqc dlq list",
++    "jobqc dlq replay",
++    "jobqc dlq discard",
++    "kill -TERM",
++];
++
++/// Which world the drill replays in: the same procedure, with the deployment answering differently.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum World {
++    /// The responder walks the procedure in order, and a worker takes the queue on afterwards:
++    /// nothing the deployment accepted is still owed.
++    Recovers,
++    /// The same procedure with nothing left to take the queue on: what is still owed is what the
++    /// drill reports. This is the world that makes [`World::Recovers`] evidence.
++    Never,
++    /// The same procedure with the act that cannot be undone taken **before** the stage that says
++    /// which rows it is for: the refusal, and the state it leaves the queue in.
++    Refused,
++}
++
++/// What one replay found.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Report {
++    /// The stages of the page this replay walked, in the page's order.
++    pub stages: usize,
++    /// The acts the page names no stage for, in the order this file's script needs them.
++    pub unnamed: Vec<&'static str>,
++    /// The stage whose act the door refused, when the world refused one.
++    pub refused: Option<u32>,
++    /// The jobs the deployment still owes an attempt when the drill stops.
++    pub outstanding: usize,
++}
++
++impl Report {
++    /// The promise the page's last stage makes: nothing the deployment accepted is still owed.
++    ///
++    /// A report with no stages in it is not a promise kept — it is a drill that walked nothing.
++    #[must_use]
++    pub fn promise_held(&self) -> bool {
++        self.stages > 0 && self.outstanding == 0
++    }
++}
++
++/// Replay the procedure in one world, and answer what it found.
++///
++/// Replay the procedure — as far as this version goes.
++///
++/// What is here is what a first version usually looks like, and it is worth reading before it is
++/// rewritten: the incident is built for real ([`broken_queue`] takes the whole queue with one worker
++/// and leaves one row held), the page is read for real ([`Runbook::of`]), and then the report below
++/// is an answer this file *decided on* rather than one it measured. Nothing walks the stages:
++/// `stages` is counted off the page, `unnamed` is empty because no act was compared with it,
++/// `refused` is `None` because no act was refused, and `outstanding` is `0` because nobody asked the
++/// store.
++///
++/// Turning this into a drill means four things, in this order: comparing the acts in [`ACTS`] with
++/// the stages the page names and reporting the ones it does not name, walking `runbook.stages()` in
++/// order and taking the act each one names, checking the page's own claims as it goes
++/// (`engine.usage`, `engine.list`, `store.list`, `store.operate`, `store.release`), and letting
++/// `world` decide what happens afterwards — a worker called [`LIVE`] taking the queue on, or nobody
++/// doing so. `broken` names the rows every act is pointed at, and every act is taken under
++/// [`OPERATOR`].
++///
++/// # Panics
++///
++/// When the page cannot be read: this file walks a page, and a drill without one is a drill about
++/// nothing.
++#[must_use]
++pub fn replay(world: World) -> Report {
++    let runbook = Runbook::of(&read_page());
++    let clock = Arc::new(FrozenClock::at(START));
++    let store = Arc::new(
++        MemoryStore::new()
++            .with_clock(Arc::clone(&clock) as Arc<dyn Clock>)
++            .with_lease(Duration::from_secs(LEASE_SECONDS)),
++    );
++    let engine = Engine::new(Arc::clone(&store));
++    let queue = Queue::parse(QUEUE).expect("the queue this drill uses is a name a queue may have");
++    let gone = WorkerId::new(GONE);
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .expect("the drill's own runtime starts");
++    let broken = runtime.block_on(broken_queue(&engine, &store, &queue, &gone));
++
++    // The rows the walk is written against — the two dead letters, the job that is owed an attempt,
++    // and the row the departed worker is holding — and the world, which this version does not
++    // consult yet: `Never` and `Refused` answer what `Recovers` answers.
++    let _ = (
++        world,
++        &broken.dead,
++        broken.owed,
++        broken.held,
++        ACTS,
++        LIVE,
++        OPERATOR,
++    );
++    Report {
++        stages: runbook.stages().len(),
++        unnamed: Vec::new(),
++        refused: None,
++        outstanding: 0,
++    }
++}
++
++/// Walk the page's stages, take the act each one names, and answer what was left owed.
++/// The act a stage names: the command it carries, matched against the script this file knows.
++/// The jobs the deployment still owes an attempt: the ones waiting, and the ones being held.
++///
++/// A settled job is not owed anything and a dead letter has already been given up on — what is left
++/// is work that has not been attempted yet, and work an attempt is sitting on.
++/// The queue as the incident left it.
++struct Broken {
++    /// The two jobs whose attempts spent their budget: the dead letters.
++    dead: Vec<JobId>,
++    /// The job that is owed another attempt.
++    owed: JobId,
++    /// The row the vanished daemon still holds.
++    held: JobId,
++}
++
++/// Build the incident: four jobs accepted, one worker claiming all four, and what it did with them
++/// before it went away.
++///
++/// Three of the four are what a stuck queue looks like from the row's side — two attempts spent
++/// their budget and one job is owed another — and the fourth is the row the daemon is still
++/// holding, which is the one stage 2 finds and stage 6 hands back.
++async fn broken_queue(
++    engine: &Engine<Arc<MemoryStore>>,
++    store: &MemoryStore,
++    queue: &Queue,
++    worker: &WorkerId,
++) -> Broken {
++    let mut submitted: Vec<(u64, JobId)> = Vec::new();
++    for number in 1..=4u64 {
++        // The budget is the difference between a job that ends and one that is owed: the first two
++        // get a single attempt, so theirs is spent.
++        let attempts = if number <= 2 { 1 } else { 2 };
++        let request = SubmitRequest::new(queue.clone(), serde_json::json!({ "n": number }))
++            .with_max_attempts(attempts);
++        let id = engine
++            .submit(request)
++            .await
++            .expect("the engine accepts the jobs this drill submits");
++        submitted.push((number, id));
++    }
++
++    let claimed = store
++        .claim(worker, queue, submitted.len())
++        .await
++        .expect("the worker claims what is due");
++    assert_eq!(
++        claimed.len(),
++        submitted.len(),
++        "the incident starts with the whole queue held by one worker"
++    );
++
++    for job in &claimed {
++        let number = number_of(job);
++        match number {
++            // The budget is spent, so these two are dead letters.
++            1 | 2 => {
++                let state = store
++                    .fail(worker, &job.id(), "the handler refused this payload")
++                    .await
++                    .expect("a failure is recorded against the attempt this worker started");
++                assert_eq!(
++                    state,
++                    JobState::Failed,
++                    "an attempt budget of one makes that attempt the job's last: {state}"
++                );
++            }
++            // One more attempt is allowed, so this one goes back to its queue.
++            3 => {
++                let state = store
++                    .fail(worker, &job.id(), "the upstream system was away")
++                    .await
++                    .expect("a failure is recorded against the attempt this worker started");
++                assert_eq!(
++                    state,
++                    JobState::Queued,
++                    "a job inside its budget is owed again rather than given up on: {state}"
++                );
++            }
++            // And the fourth is left exactly as it was: held, by a worker that is about to be
++            // stopped.
++            _ => {}
++        }
++    }
++
++    Broken {
++        dead: vec![id_of(&submitted, 1), id_of(&submitted, 2)],
++        owed: id_of(&submitted, 3),
++        held: id_of(&submitted, 4),
++    }
++}
++
++/// The number this drill gave one job, read back off the row.
++fn number_of(job: &Job) -> u64 {
++    job.payload()
++        .get("n")
++        .and_then(serde_json::Value::as_u64)
++        .unwrap_or_else(|| panic!("every job this drill submits carries its own number: {job:?}"))
++}
++
++/// The identity of the job this drill submitted under `number`.
++fn id_of(submitted: &[(u64, JobId)], number: u64) -> JobId {
++    submitted
++        .iter()
++        .find(|(n, _)| *n == number)
++        .map(|(_, id)| *id)
++        .unwrap_or_else(|| panic!("this drill submitted a job numbered {number}"))
++}
++
++/// The page, read from the project this drill is part of.
++fn read_page() -> String {
++    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(PAGE);
++    std::fs::read_to_string(&path).unwrap_or_else(|error| {
++        panic!(
++            "{} is the page this drill walks, and it cannot be read: {error}",
++            path.display()
++        )
++    })
++}
++
++/// A clock frozen at one instant.
++///
++/// Frozen rather than moved: the incident this file replays is a value, and nothing in the
++/// procedure waits for a lease (`jobq/3.7-leases-and-recovery` is the step that owns that
++/// arithmetic, and its suite is where the waiting happens).
++#[derive(Debug)]
++struct FrozenClock {
++    /// The instant every read answers with.
++    now: Mutex<DateTime<Utc>>,
++}
++
++impl FrozenClock {
++    /// A clock stopped at `instant`.
++    fn at(instant: &str) -> Self {
++        Self {
++            now: Mutex::new(
++                instant
++                    .parse()
++                    .expect("the instant this drill states is RFC 3339"),
++            ),
++        }
++    }
++}
++
++impl Clock for FrozenClock {
++    fn now(&self) -> DateTime<Utc> {
++        *self.now.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++}
