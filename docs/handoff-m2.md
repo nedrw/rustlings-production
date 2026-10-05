@@ -640,12 +640,19 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **探题的句子与门不一致（收尾时对齐）**：`course/probes/unsafe-budget.apply.rs` 写着“`// SAFETY:` 在**同一行或上面三行**”，
   而 3.24 的规格与 `unsafe-budget@0` 门都要求**在上面**三行内。探题从不测同行注释，所以没有红；对齐它要么改那句话、要么改门的判据（建议改探题那句话，因为门与项目的 `// SAFETY:` 习惯一致）。
 - **3.23 的 `slow:mutants@80` 是 `5/6 (83%)`**（过线但在边上）：它的模块里有一个变异体没有规格能杀。留给收尾时决定是否补一条断言。
-- **`selftest` 与 `verify` 在 3.23 上不一致（已记，未解）**：同一条命令下 `verify jobq --slow` 让 3.23 全绿
-  （13/13 must 门，含页面用例与 `conformance@2`），而 `selftest jobq/3.23` 两次（暖缓存 + 全新缓存）都在
-  `slow:conformance@2` 红，两个后端都停在 `spec_online_schema.rs:113:33`（页面读取）。现场采样的线索：
-  selftest 的沙箱里 `app/jobq/docs/migration.md` 在 t≈75 s **存在**（脚手架 stub），t≈120 s **不存在**——
-  解法应用之后文件反而没了。怀疑在 `selftest` 的 prepare/apply 路径（`solution ✓ reference patch applies`
-  可能掩盖被跳过的文件）。**没有为了让命令变绿而放宽任何判据或改动产物**；3.23 的交付以 `verify --slow` 为准。
+- **`selftest` 与 `verify` 在 3.23 上不一致——已找到根因并修好**（提交 `kiln(mutants): the copy builds in a
+  directory of its own`）：报出来的现象是 `verify --slow` 让 3.23 全绿、而 `selftest` 两次都在
+  `slow:conformance@2` 红（两个后端都停在页面读取）。根因不是“解法没落地”（我当时的怀疑），而是**共享构建槽**：
+  cargo 按包名+版本选槽，`slow:mutants@80` 在**副本**里构建，它的二进制却落在沙箱共享槽里；紧随其后的
+  `slow:conformance@2` 会再跑一次本步命令，于是执行了**副本的二进制**，而那份二进制的 `CARGO_MANIFEST_DIR`
+  指向一个已经被删掉的 `kiln-mutants-*/project` → 读不到本项目的页面。3.25 的作者用两个实验定死了这一点
+  （沙箱里的页面其实全程都在；只把 mutants 的最后一次“恢复运行”挪进项目，规格就改在**行为**断言上红，
+  说明问题在二进制/槽而不只是路径），并验证了修法。我落地并复核：mutants 的副本现在建在
+  `<cache>/kiln/mutants-target`（与 `coverage` 的插桩目录同一规则），那一轮“清理运行”因此不再需要；
+  `selftest jobq/3.23` 由红转 **`13/13 must green`**，`jobq/3.24` 保持 `12/12`。
+- **一条给后来者的一般规律**（§3 也有）：**任何“在副本里跑 cargo”的装置都必须给副本自己的构建目录**，
+  否则它污染共享槽、让下一个跑同一条命令的人执行别的树的二进制。判据：命令的 `CARGO_MANIFEST_DIR`
+  指向哪里、那个目录是否还存在。
 - **构建槽共享导致的幽灵失败已从 kiln 侧封掉**（提交 `kiln(process): the project's build directory is not the caller's`）：
   cargo 按**包名+版本**选构建槽，不按目录，所以两棵树共用一个 `CARGO_TARGET_DIR` 时，一棵树的二进制会服务另一棵；
   而这门课的规格用 `CARGO_MANIFEST_DIR`（编译期烘进二进制）读项目文件，于是"陈旧二进制"不是跑旧代码，而是**读别的项目的文件**
