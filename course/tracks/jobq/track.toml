@@ -461,8 +461,10 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
+    "images",
     "semver@baseline",
 ]
+images = ["postgres:17-alpine"]
 hint = "Model the transitions as a total function on (state, event) and let the compiler refuse the illegal ones; the row's `state` column is then the encoding, never the model."
 
 [[step]]

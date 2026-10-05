@@ -1,0 +1,333 @@
+diff --git a/migrations/0006_job_states.sql b/migrations/0006_job_states.sql
+new file mode 100644
+index 0000000..6048d7c
+--- /dev/null
++++ b/migrations/0006_job_states.sql
+@@ -0,0 +1,29 @@
++-- The state column, closed: a job is in one of four states, and the database knows which.
++--
++-- Step `jobq/3.14-job-state-machine`. This is the project's sixth migration, so it is `0006`
++-- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys and
++-- `0005` the queues; `mailer` and `relay` number their own files).
++--
++-- The file is yours to write, and it holds one statement and one argument.
++--
++-- `jobs.state` has been a `text` column since `0001`. It holds the *encoding* of the engine's
++-- `JobState`, and until this step the only thing that knew the four names was the engine — which is
++-- one authority too few. A column that accepts any string accepts `dead`, `Queued`, `succeeded `
++-- with a trailing space, and the name of a state a later release will have; every one of those is a
++-- row the engine cannot read, or worse, a row a query stops matching.
++--
++-- So the statement you write is the schema's half of the model you wrote in `src/engine/state.rs`:
++-- the same four strings, spelled the same way, enforced by the database. Three things are worth
++-- deciding rather than copying:
++--
++--   * **the constraint is named.** A refusal that says `jobs_state_known` is a refusal an operator
++--     can look up in this file; PostgreSQL's generated name is a string nobody wrote.
++--   * **the four names are the encoding, not a second vocabulary.** The `check` and `JobState::as_str`
++--     have to agree, or the model and the schema have become two models — and the one that loses is
++--     the one that silently matches nothing.
++--   * **the constraint validates.** Adding it as `not valid` would leave exactly the rows it exists
++--     to find behind it. This table is small in every deployment this track has taught for, and the
++--     step with an answer for one that is not (`jobq/3.23-online-schema`) comes later.
++--
++-- `alter table jobs add constraint … check (…)` is the whole of it: one statement, and the column
++-- the claim's own index already narrows (`jobs_claimable`) is now closed on both sides.
+diff --git a/src/engine/state.rs b/src/engine/state.rs
+new file mode 100644
+index 0000000..5d99395
+--- /dev/null
++++ b/src/engine/state.rs
+@@ -0,0 +1,292 @@
++//! The life of a job, written down once.
++//!
++//! A job is in one of four states ([`JobState`]) and something happens to it ([`Event`]);
++//! [`transition`] is those two sentences written as **one total function**: every pair has an
++//! answer, and the answer for a move the machine does not allow is an [`Illegal`] that names both
++//! sides rather than a panic, a silent no-op or a state nobody expected.
++//!
++//! Six of the twenty-four pairs of a state and an event are moves; the table with those rows is
++//! in the step's body, and [`transition`] is where they are written down once. Every other pair is
++//! refused, and the refusal says which of the three things went wrong ([`Reason`]): the job is
++//! finished, the event needed it to be running, or the event needed it to be waiting. `succeeded`
++//! and `failed` are **terminal** — nothing happens after the end of a job, whatever arrives — and
++//! that is the half of the model a queue lives on: a job that finished must never be handed out
++//! again, and "must never" written as a state is what the other rules are checked against.
++//!
++//! This module is the model, and the model is a value. Three things follow from that, and they are
++//! what `jobq/3.14-job-state-machine` is about:
++//!
++//! * **the destinations are here, not in the settle paths.** Both backends compute where a job
++//!   goes by asking [`transition`], so `queued`, `running`, `succeeded` and `failed` are written
++//!   in one file in this crate. What the *statements* keep is the predicate — whether a row is
++//!   eligible at all — because a predicate that matches nothing is a query with no answer, while a
++//!   destination that a store invented is a row in a state the model does not have;
++//! * **the row's `state` column is the encoding of this enum, never the model.** [`JobState::as_str`]
++//!   and [`JobState::parse`] are the two directions, and a name this build does not know is refused
++//!   by the text that was stored ([`UnknownState`]) rather than rounded down to a state that would
++//!   run the job again. `migrations/0006_job_states.sql` is the same sentence one layer down: the
++//!   column has a `check`, so the database refuses a state the model does not have — from a store,
++//!   from a migration, or from somebody with `psql` open;
++//! * **every move has one answer.** A settle that is refused is [`Error::Invalid`] and stays that
++//!   way (`jobq/3.7-leases-and-recovery` pinned the variant, and a worker reading the message needs
++//!   the lease in it, which the model has no opinion about). What the model adds is that the
++//!   *destination* of every accepted move is one function rather than one per backend, which is
++//!   what a property test can walk (`jobq/3.19-property-invariants`).
++//!
++//! Where the moves come from is the other half: `jobq/3.6-transaction-isolation` is where a settle
++//! became one transaction, `jobq/3.7-leases-and-recovery` is where a claim stops being only a state
++//! change, and the two terminal states arrived with `delivery/dlq@apply` at `relay/2.10-dlq` — a
++//! job that is out of attempts is a job a human has to look at, which is a *state* rather than an
++//! absence of one.
++
++use std::fmt;
++
++use crate::engine::domain::JobState;
++
++/// Something that happens to a job.
++///
++/// The two events a settle produces ([`Event::Complete`], [`Event::Fail`]) and the two a claim
++/// produces ([`Event::Claim`], [`Event::ClaimLapsed`]) are the whole of what a job's life consists
++/// of. An event is *what happened*, not *what should be written down*: `retryable` is the attempt
++/// budget's answer, handed in by the store that counted the attempts, because the machine is about
++/// where a job is and not about how many tries it has had.
++///
++/// `#[non_exhaustive]`, because this list grows: a cancellation, a replay, a purge each arrive as a
++/// move in a later step, and a caller that wrote its wildcard arm on day one does not have to be
++/// rebuilt the day one of them lands (step `jobq/3.2-public-api-baseline`).
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum Event {
++    /// A worker took the job.
++    Claim,
++    /// The attempt finished the job.
++    Complete,
++    /// The attempt failed. `retryable` is whether the budget leaves another attempt.
++    Fail {
++        /// Whether another attempt is allowed, as the store's attempt count answered it.
++        retryable: bool,
++    },
++    /// The claim on a running job went away without being settled: the worker handed it back on its
++    /// way out, or its lease ran out and nobody renewed it.
++    ///
++    /// One event for both, and the same `retryable` as [`Event::Fail`], because the *state* answer
++    /// is the same one and the difference between the two is the story the row tells — the reason
++    /// in `last_error`, the kind of line in the trail, and which counter moves
++    /// (`jobq/3.13-queue-authz-attribution` counts them apart). The model's job is where the job
++    /// is; a model that merged them would have hidden which of the two happened.
++    ClaimLapsed {
++        /// Whether another attempt is allowed, as the store's attempt count answered it.
++        retryable: bool,
++    },
++}
++
++impl Event {
++    /// The event's name, as the table in the step's body writes it.
++    ///
++    /// One name per *kind*, not per flag: `retryable` is the budget's answer and it never decides
++    /// whether a move is allowed, so it is not part of what the event is called.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("jobq/3.14-job-state-machine: the name this event is written and printed under")
++    }
++}
++
++impl fmt::Display for Event {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++/// Every state, for the callers that have to be exhaustive rather than optimistic.
++///
++/// A property test walking the model (`jobq/3.19-property-invariants`) needs the list as data, and a
++/// list written by hand is a list that goes stale the moment a state is added: this one is checked
++/// against [`JobState::as_str`]'s names by the step's spec, so a fifth state cannot arrive without
++/// the round trip being looked at.
++pub const STATES: [JobState; 4] = [
++    JobState::Queued,
++    JobState::Running,
++    JobState::Succeeded,
++    JobState::Failed,
++];
++
++/// Every event, both spellings of the two events that carry a flag included.
++pub const EVENTS: [Event; 6] = [
++    Event::Claim,
++    Event::Complete,
++    Event::Fail { retryable: true },
++    Event::Fail { retryable: false },
++    Event::ClaimLapsed { retryable: true },
++    Event::ClaimLapsed { retryable: false },
++];
++
++/// Why a move was not allowed.
++///
++/// Three reasons rather than one, because a caller that treats "this job is finished" as "somebody
++/// else is running it" is a caller that retries work that is done. The class is written down so
++/// that the distinction survives in a `match` instead of living in a message somebody has to read.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum Reason {
++    /// The job is finished. Nothing happens after the end, whatever the event is.
++    Terminal,
++    /// The event is about a running job, and this one has not been claimed.
++    NotRunning,
++    /// The event is about a waiting job, and this one has already been claimed.
++    NotQueued,
++}
++
++impl fmt::Display for Reason {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let sentence = match self {
++            Reason::Terminal => "nothing happens after the end of a job",
++            Reason::NotRunning => "the event needs the job to be running",
++            Reason::NotQueued => "the event needs the job to be waiting",
++        };
++        formatter.write_str(sentence)
++    }
++}
++
++/// A move the machine does not allow, named on both sides.
++///
++/// `from` and `event` are what the caller has in its hand, and `reason` is the class: a refusal that
++/// said only "not allowed" would leave the operator to work out which of the three things it was.
++/// The [`fmt::Display`] sentence carries all three, because it is what ends up in a log line.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Illegal {
++    /// The state the job was in.
++    from: JobState,
++    /// The event that arrived.
++    event: Event,
++    /// Why it was refused.
++    reason: Reason,
++}
++
++impl Illegal {
++    /// A refusal, built where the machine decides one.
++    fn new(from: JobState, event: Event, reason: Reason) -> Self {
++        Self {
++            from,
++            event,
++            reason,
++        }
++    }
++
++    /// The state the job was in when the event arrived.
++    #[must_use]
++    pub fn from(&self) -> JobState {
++        self.from
++    }
++
++    /// The event that arrived.
++    #[must_use]
++    pub fn event(&self) -> Event {
++        self.event
++    }
++
++    /// Why the move was refused, as a class a caller can match on.
++    #[must_use]
++    pub fn reason(&self) -> Reason {
++        self.reason
++    }
++}
++
++impl fmt::Display for Illegal {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        // Both sides are named, and the reason is a sentence rather than a code: this is the line an
++        // operator reads in a log, next to the job id the caller already has.
++        write!(
++            formatter,
++            "a job that is `{}` cannot take the event `{}`: {}",
++            self.from, self.event, self.reason
++        )
++    }
++}
++
++impl std::error::Error for Illegal {
++    // A refusal is the whole failure: there is no chain behind it, and `source()` answering `None`
++    // is the honest answer. The `Error` impl is what lets a caller that collects failures of its
++    // own (`Box<dyn Error>`, an `anyhow::Error`) carry this one without a wrapper type.
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        None
++    }
++}
++
++/// A `state` column that holds a name this build does not know.
++///
++/// The text is kept exactly as the row held it, because that string is what an operator has to
++/// grep for: a refusal that said only "unknown state" would have thrown away the one fact that
++/// says which version wrote the row.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct UnknownState {
++    /// Exactly what the column held.
++    text: String,
++}
++
++impl UnknownState {
++    /// A refusal for the text that was stored.
++    #[must_use]
++    pub fn new(text: impl Into<String>) -> Self {
++        Self { text: text.into() }
++    }
++
++    /// Exactly what the column held.
++    #[must_use]
++    pub fn text(&self) -> &str {
++        &self.text
++    }
++}
++
++impl fmt::Display for UnknownState {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "`{}` is not a state this engine knows",
++            self.text
++        )
++    }
++}
++
++impl std::error::Error for UnknownState {
++    // The same argument as `Illegal`: the value is the failure.
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        None
++    }
++}
++
++impl JobState {
++    /// Read a state out of the column that holds it.
++    ///
++    /// The inverse of [`JobState::as_str`], and the reason the column is called an *encoding*: every
++    /// state the model has, the column can hold, and anything else is refused by the text that was
++    /// stored rather than rounded down. Refused rather than defaulted is the whole point — a value
++    /// the model does not know is a bug or a version skew, and turning it into `queued` is how a job
++    /// that finished is run a second time.
++    ///
++    /// # Errors
++    ///
++    /// [`UnknownState`] for anything but the four names, case included: `Queued` and `queued` are
++    /// two different strings, and the column, the CLI and a dashboard group by the second.
++    pub fn parse(text: &str) -> Result<Self, UnknownState> {
++        todo!(
++            "jobq/3.14-job-state-machine: the way back out of the column — every state `as_str` \
++             can write, and nothing else"
++        )
++    }
++}
++
++/// What happens to a job when `event` occurs while it is in `state`.
++///
++/// Total on purpose: every state and every event has an answer, and the answer for a move the
++/// machine does not allow is an [`Illegal`] naming the reason. A caller that has to handle three
++/// distinct refusals cannot accidentally treat "already finished" as "somebody else has it".
++///
++/// # Errors
++///
++/// [`Illegal`], as the table in this module's documentation says: the job is finished, the event
++/// needed it to be running, or the event needed it to be waiting.
++pub fn transition(state: JobState, event: Event) -> Result<JobState, Illegal> {
++    todo!("jobq/3.14-job-state-machine: the table in the step's body, as one total function")
++}

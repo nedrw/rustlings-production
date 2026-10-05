@@ -1,0 +1,503 @@
+diff --git a/migrations/0006_job_states.sql b/migrations/0006_job_states.sql
+index 6048d7c..433887e 100644
+--- a/migrations/0006_job_states.sql
++++ b/migrations/0006_job_states.sql
+@@ -4,26 +4,28 @@
+ -- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys and
+ -- `0005` the queues; `mailer` and `relay` number their own files).
+ --
+--- The file is yours to write, and it holds one statement and one argument.
++-- `jobs.state` has been a `text` column since `0001`, holding the *encoding* of the engine's
++-- `JobState`. Until this step the only thing that knew the four names was the engine, which is one
++-- authority too few: a column that accepts any string accepts `dead`, accepts `Queued`, accepts
++-- `succeeded ` with a trailing space, and accepts the name of a state a later release will have.
++-- Each of those is a row the engine cannot read back, or — in a query that compares it — a job that
++-- silently stops matching and stops moving.
+ --
+--- `jobs.state` has been a `text` column since `0001`. It holds the *encoding* of the engine's
+--- `JobState`, and until this step the only thing that knew the four names was the engine — which is
+--- one authority too few. A column that accepts any string accepts `dead`, `Queued`, `succeeded `
+--- with a trailing space, and the name of a state a later release will have; every one of those is a
+--- row the engine cannot read, or worse, a row a query stops matching.
++-- The `check` is the schema's half of the model in `src/engine/state.rs`, and it is deliberately
++-- the *same four strings* the enum spells in `JobState::as_str`. The database is the second place a
++-- state can be written down — a migration, a report, an operator with `psql` in their hand — so it
++-- is the second place that has to know which states exist. The constraint is named for the same
++-- reason the refusal is a variant rather than a sentence: a refusal that says `jobs_state_known` is
++-- one an operator can find in this file.
+ --
+--- So the statement you write is the schema's half of the model you wrote in `src/engine/state.rs`:
+--- the same four strings, spelled the same way, enforced by the database. Three things are worth
+--- deciding rather than copying:
++-- What this buys is the decision the step is about: the four names live in the enum and in the
++-- schema, adding a fifth is a migration rather than a refactor, and renaming one is refused by the
++-- database at the first write instead of being decoded as a state nobody knows.
+ --
+---   * **the constraint is named.** A refusal that says `jobs_state_known` is a refusal an operator
+---     can look up in this file; PostgreSQL's generated name is a string nobody wrote.
+---   * **the four names are the encoding, not a second vocabulary.** The `check` and `JobState::as_str`
+---     have to agree, or the model and the schema have become two models — and the one that loses is
+---     the one that silently matches nothing.
+---   * **the constraint validates.** Adding it as `not valid` would leave exactly the rows it exists
+---     to find behind it. This table is small in every deployment this track has taught for, and the
+---     step with an answer for one that is not (`jobq/3.23-online-schema`) comes later.
+---
+--- `alter table jobs add constraint … check (…)` is the whole of it: one statement, and the column
+--- the claim's own index already narrows (`jobs_claimable`) is now closed on both sides.
++-- The constraint validates rather than being added `not valid`: a check that skipped validation
++-- would leave exactly the rows it exists to find behind it, and this table is small in every
++-- deployment this track has taught for. `jobq/3.23-online-schema` is the step with an answer for
++-- one that is not.
++
++alter table jobs add constraint jobs_state_known
++    check (state in ('queued', 'running', 'succeeded', 'failed'));
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 736b0b2..6bc127b 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -166,7 +166,8 @@ impl fmt::Display for WorkerId {
+ }
+ 
+ /// Where a job is in its life. The row's `state` column is this enum's encoding, never the model
+-/// itself (step `jobq/3.14-job-state-machine` is where the legal moves get written down).
++/// itself: the moves are one function in `crate::engine::state`, and [`JobState::parse`] is the way
++/// back out of the column (step `jobq/3.14-job-state-machine`).
+ ///
+ /// `#[non_exhaustive]`, because this list grows: a lease that ran out and a cancellation are states
+ /// this engine will have before the track is over, and a caller that wrote a wildcard arm on day
+diff --git a/src/engine/error.rs b/src/engine/error.rs
+index 8090463..a16ccbd 100644
+--- a/src/engine/error.rs
++++ b/src/engine/error.rs
+@@ -30,6 +30,7 @@
+ use thiserror::Error as ThisError;
+ 
+ use crate::engine::domain::{JobId, Queue};
++use crate::engine::state::Illegal;
+ 
+ /// Everything the engine and its service can fail at.
+ ///
+@@ -197,3 +198,20 @@ impl Error {
+         }
+     }
+ }
++
++impl From<Illegal> for Error {
++    /// A move the state machine refuses (`jobq/3.14-job-state-machine`), as the failure a caller
++    /// reads.
++    ///
++    /// `Invalid` rather than a variant of its own, and the reason is a contract rather than taste:
++    /// `jobq/3.7-leases-and-recovery` pinned the class a refused settle comes back as, and a settle
++    /// the model refuses is exactly that — the same call gets the same answer, and the caller is
++    /// the one who can look at the row. The sentence is the model's, because the model is the thing
++    /// that knows both sides of the move (its `Display` names the state the job is in, the event
++    /// that arrived, and why it was refused).
++    fn from(illegal: Illegal) -> Self {
++        Error::Invalid {
++            detail: illegal.to_string(),
++        }
++    }
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 2109c1c..cd50943 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -28,6 +28,7 @@ pub(crate) mod events;
+ pub(crate) mod policy;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
++pub(crate) mod state;
+ pub(crate) mod store;
+ pub(crate) mod tenant;
+ pub(crate) mod timers;
+@@ -47,6 +48,7 @@ pub use events::{EventKind, JobEvent};
+ pub use policy::Policy;
+ pub use retry::{DEFAULT_ATTEMPTS, Retried, retry};
+ pub use scheduler::Engine;
++pub use state::{EVENTS, Event, Illegal, Reason, STATES, UnknownState, transition};
+ #[cfg(feature = "postgres")]
+ pub use store::PostgresStore;
+ pub use store::{BoxFuture, MemoryStore, Store};
+diff --git a/src/engine/state.rs b/src/engine/state.rs
+index 5d99395..c038ec8 100644
+--- a/src/engine/state.rs
++++ b/src/engine/state.rs
+@@ -5,13 +5,21 @@
+ //! answer, and the answer for a move the machine does not allow is an [`Illegal`] that names both
+ //! sides rather than a panic, a silent no-op or a state nobody expected.
+ //!
+-//! Six of the twenty-four pairs of a state and an event are moves; the table with those rows is
+-//! in the step's body, and [`transition`] is where they are written down once. Every other pair is
+-//! refused, and the refusal says which of the three things went wrong ([`Reason`]): the job is
+-//! finished, the event needed it to be running, or the event needed it to be waiting. `succeeded`
+-//! and `failed` are **terminal** — nothing happens after the end of a job, whatever arrives — and
+-//! that is the half of the model a queue lives on: a job that finished must never be handed out
+-//! again, and "must never" written as a state is what the other rules are checked against.
++//! | from | event | to |
++//! | --- | --- | --- |
++//! | `queued` | `claim` | `running` |
++//! | `running` | `complete` | `succeeded` |
++//! | `running` | `fail`, budget left | `queued` — the job is owed another attempt |
++//! | `running` | `fail`, budget spent | `failed` |
++//! | `running` | `claim lapse`, budget left | `queued` |
++//! | `running` | `claim lapse`, budget spent | `failed` |
++//!
++//! Everything else is refused, and the refusal says which of the three things went wrong
++//! ([`Reason`]): the job is finished, the event needed it to be running, or the event needed it to
++//! be waiting. `succeeded` and `failed` are **terminal** — nothing happens after the end of a job,
++//! whatever arrives — and that is the half of the model a queue lives on: a job that finished must
++//! never be handed out again, and "must never" written as a state is what the other four rules are
++//! checked against.
+ //!
+ //! This module is the model, and the model is a value. Three things follow from that, and they are
+ //! what `jobq/3.14-job-state-machine` is about:
+@@ -81,13 +89,15 @@ pub enum Event {
+ }
+ 
+ impl Event {
+-    /// The event's name, as the table in the step's body writes it.
+-    ///
+-    /// One name per *kind*, not per flag: `retryable` is the budget's answer and it never decides
+-    /// whether a move is allowed, so it is not part of what the event is called.
++    /// The event's name, as the table in this module's documentation writes it.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("jobq/3.14-job-state-machine: the name this event is written and printed under")
++        match self {
++            Event::Claim => "claim",
++            Event::Complete => "complete",
++            Event::Fail { .. } => "fail",
++            Event::ClaimLapsed { .. } => "claim lapse",
++        }
+     }
+ }
+ 
+@@ -270,10 +280,10 @@ impl JobState {
+     /// [`UnknownState`] for anything but the four names, case included: `Queued` and `queued` are
+     /// two different strings, and the column, the CLI and a dashboard group by the second.
+     pub fn parse(text: &str) -> Result<Self, UnknownState> {
+-        todo!(
+-            "jobq/3.14-job-state-machine: the way back out of the column — every state `as_str` \
+-             can write, and nothing else"
+-        )
++        STATES
++            .into_iter()
++            .find(|state| state.as_str() == text)
++            .ok_or_else(|| UnknownState::new(text))
+     }
+ }
+ 
+@@ -288,5 +298,26 @@ impl JobState {
+ /// [`Illegal`], as the table in this module's documentation says: the job is finished, the event
+ /// needed it to be running, or the event needed it to be waiting.
+ pub fn transition(state: JobState, event: Event) -> Result<JobState, Illegal> {
+-    todo!("jobq/3.14-job-state-machine: the table in the step's body, as one total function")
++    match (state, event) {
++        // The end of the job: every event after it is refused the same way, and that sameness is
++        // what "terminal" means here.
++        (JobState::Succeeded | JobState::Failed, event) => {
++            Err(Illegal::new(state, event, Reason::Terminal))
++        }
++        // Waiting. A claim is the only thing that may happen, and it is the whole reason a queue
++        // exists: a job nobody has taken cannot be finished, failed or have a claim lapse.
++        (JobState::Queued, Event::Claim) => Ok(JobState::Running),
++        (JobState::Queued, event) => Err(Illegal::new(state, event, Reason::NotRunning)),
++        // Running. Every event is a way for the attempt to end, and the budget — handed in as
++        // `retryable` — decides between the queue and the end of the job.
++        (JobState::Running, Event::Claim) => Err(Illegal::new(state, event, Reason::NotQueued)),
++        (JobState::Running, Event::Complete) => Ok(JobState::Succeeded),
++        (JobState::Running, Event::Fail { retryable } | Event::ClaimLapsed { retryable }) => {
++            Ok(if retryable {
++                JobState::Queued
++            } else {
++                JobState::Failed
++            })
++        }
++    }
+ }
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 292c7f0..036c05c 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -42,6 +42,7 @@ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
++use crate::engine::state::{Event, transition};
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ use crate::engine::tenant::Tenant;
+ use crate::engine::usage::{QueueUsage, Usage};
+@@ -526,7 +527,11 @@ impl Store for MemoryStore {
+             let mut claimed = Vec::new();
+             for id in due.into_iter().take(limit.min(room)) {
+                 if let Some(job) = ledger.jobs.get_mut(&id) {
+-                    job.state = JobState::Running;
++                    // Where a claim puts a job is the model's answer, not this loop's
++                    // (`jobq/3.14-job-state-machine`): the rows were chosen by the same fact
++                    // (`due` selects `queued`), so this cannot be refused — and if it ever were,
++                    // the claim would fail rather than stamp a state nobody decided.
++                    job.state = transition(job.state, Event::Claim)?;
+                     // An attempt starts when a worker takes the job, not when it finishes: a
+                     // worker that dies holding a job must still have spent one.
+                     job.attempts += 1;
+@@ -568,7 +573,9 @@ impl Store for MemoryStore {
+             }
+             let attempt = job.attempts;
+             let queue = job.queue.clone();
+-            job.state = JobState::Succeeded;
++            // The guard above is the *lease* — a fact the model has no opinion about, because a
++            // lease belongs to a worker rather than to a job. Where the job goes is the model's.
++            job.state = transition(job.state, Event::Complete)?;
+             job.last_error = None;
+             job.lease_owner = None;
+             job.lease_expires_at = None;
+@@ -614,12 +621,16 @@ impl Store for MemoryStore {
+             let attempt = job.attempts;
+             let queue = job.queue.clone();
+             job.last_error = Some(reason.to_owned());
+-            job.state = if job.attempts < job.max_attempts {
+-                JobState::Queued
+-            } else {
+-                JobState::Failed
+-            };
+-            let state = job.state;
++            // The destination is the model's answer and the *budget* is this store's question
++            // (`jobq/3.14-job-state-machine` keeps the two apart on purpose): an attempt that can
++            // be retried leaves the job owed again, and one that cannot ends it.
++            let state = transition(
++                job.state,
++                Event::Fail {
++                    retryable: job.attempts < job.max_attempts,
++                },
++            )?;
++            job.state = state;
+             job.lease_owner = None;
+             job.lease_expires_at = None;
+             // The attempt the line names is the one the claim started, read off the row the same
+@@ -714,7 +725,7 @@ impl Store for MemoryStore {
+                     continue;
+                 }
+                 if job.state == JobState::Running && job.lease_owner.as_ref() == Some(worker) {
+-                    handed_back.push((*id, job.queue.clone(), put_back(job, HANDED_BACK)));
++                    handed_back.push((*id, job.queue.clone(), put_back(job, HANDED_BACK)?));
+                 }
+             }
+             for (id, queue, attempt) in &handed_back {
+@@ -747,7 +758,7 @@ impl Store for MemoryStore {
+                 if job.state == JobState::Running
+                     && job.lease_expires_at.is_some_and(|at| at <= now)
+                 {
+-                    expired.push((*id, job.queue.clone(), put_back(job, ABANDONED)));
++                    expired.push((*id, job.queue.clone(), put_back(job, ABANDONED)?));
+                 }
+             }
+             for (id, queue, attempt) in &expired {
+@@ -890,16 +901,25 @@ fn forbidden(action: QueueAction) -> Error {
+ /// * the job goes back to `queued` while the budget has a try left and to `failed` when it does
+ ///   not, which is what makes a poison payload die: nobody has to *fail* it for the queue to stop
+ ///   handing it out.
+-fn put_back(job: &mut Job, reason: &str) -> u32 {
+-    job.state = if job.attempts < job.max_attempts {
+-        JobState::Queued
+-    } else {
+-        JobState::Failed
+-    };
++///
++/// The two rules are the model's (`jobq/3.14-job-state-machine`) rather than this file's, and the
++/// durable backend asks it the same question rather than spelling a `case` of its own: it binds the
++/// two destinations the model names, and keeps only the budget comparison in SQL.
++fn put_back(job: &mut Job, reason: &str) -> Result<u32, Error> {
++    // The row is running — both call sites select it that way — so the model's answer is the one a
++    // lapsed claim gets, with the budget deciding between the two destinations. A row that was not
++    // running is refused rather than moved, which is the model earning its keep: the alternative is
++    // a `case` expression that quietly answers something for a row nobody asked about.
++    job.state = transition(
++        job.state,
++        Event::ClaimLapsed {
++            retryable: job.attempts < job.max_attempts,
++        },
++    )?;
+     job.last_error = Some(reason.to_owned());
+     job.lease_owner = None;
+     job.lease_expires_at = None;
+-    job.attempts
++    Ok(job.attempts)
+ }
+ 
+ /// Why one worker may not settle this row, in the two cases that look alike and are not.
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 2457bd2..9c728cb 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -56,6 +56,7 @@ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+ use crate::engine::sealed::Sealed;
++use crate::engine::state::{Event, transition};
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ use crate::engine::tenant::Tenant;
+ use crate::engine::usage::{QueueUsage, Usage};
+@@ -425,7 +426,7 @@ impl Store for PostgresStore {
+             // unowned for as long as the second statement takes.
+             let rows: Vec<JobRow> = sqlx::query_as(
+                 "with taken as ( \
+-                     update jobs set state = 'running', attempts = jobs.attempts + 1, \
++                     update jobs set state = $9, attempts = jobs.attempts + 1, \
+                                      lease_owner = $4, lease_expires_at = $5 \
+                      where id in ( \
+                          select id from jobs \
+@@ -494,6 +495,10 @@ impl Store for PostgresStore {
+                 i64::try_from(self.policy.max_in_flight_per_tenant().unwrap_or(0))
+                     .unwrap_or(i64::MAX),
+             )
++            // The state a claim leaves the row in is the model's answer, bound like every other
++            // destination in this file (`destination`): the statement's half of the move is the
++            // predicate that chose the rows, and the other half is the model's.
++            .bind(destination(JobState::Queued, Event::Claim)?)
+             .fetch_all(&mut *connection)
+             .await
+             .map_err(refused)?;
+@@ -612,6 +617,15 @@ impl Store for PostgresStore {
+                 // else's claim puts an attempt that is running right now back in a queue its owner
+                 // is draining (`jobq/3.13-queue-authz-attribution`).
+                 .bind(self.scope())
++                // Where a handed-back row goes, as the model names it (`destination`).
++                .bind(destination(
++                    JobState::Running,
++                    Event::ClaimLapsed { retryable: true },
++                )?)
++                .bind(destination(
++                    JobState::Running,
++                    Event::ClaimLapsed { retryable: false },
++                )?)
+                 .execute(&self.pool)
+                 .await
+                 .map_err(refused)?;
+@@ -627,6 +641,16 @@ impl Store for PostgresStore {
+                 .bind(ABANDONED)
+                 .bind(EventKind::Reclaimed.as_str())
+                 .bind(self.scope())
++                // The same two destinations as `release`, because a lapsed claim is one event
++                // whatever ended it (`jobq/3.14-job-state-machine`).
++                .bind(destination(
++                    JobState::Running,
++                    Event::ClaimLapsed { retryable: true },
++                )?)
++                .bind(destination(
++                    JobState::Running,
++                    Event::ClaimLapsed { retryable: false },
++                )?)
+                 .execute(&self.pool)
+                 .await
+                 .map_err(refused)?;
+@@ -891,6 +915,10 @@ const RECLAIM_BATCH: i64 = 128;
+ /// its own budget leaves it in, and the insert writes one `reclaimed` line per row. One statement,
+ /// so there is no window in which a row has moved and its line has not.
+ ///
++/// The two states `put_back` chooses between are *bound* rather than spelled here
++/// (`jobq/3.14-job-state-machine`): the model names the two destinations of a lapsed claim, and the
++/// statement keeps the half that is data — which rows still have an attempt in the budget.
++///
+ /// `gen_random_uuid()` mints the line's identity in the database rather than in the engine, which is
+ /// the one place this file differs from `JobEvent::new` on purpose: the rows are being written by
+ /// SQL, and asking Rust for forty of them would mean forty round trips through a statement that
+@@ -903,7 +931,7 @@ const GIVE_BACK: &str = "with held as ( \
+         for update \
+     ), put_back as ( \
+         update jobs set \
+-            state = case when held.attempts < held.max_attempts then 'queued' else 'failed' end, \
++            state = case when held.attempts < held.max_attempts then $6 else $7 end, \
+             last_error = $2, \
+             lease_owner = null, \
+             lease_expires_at = null \
+@@ -937,7 +965,7 @@ const RECLAIM: &str = "with expired as ( \
+         for update skip locked \
+     ), put_back as ( \
+         update jobs set \
+-            state = case when expired.attempts < expired.max_attempts then 'queued' else 'failed' end, \
++            state = case when expired.attempts < expired.max_attempts then $6 else $7 end, \
+             last_error = $3, \
+             lease_owner = null, \
+             lease_expires_at = null \
+@@ -974,7 +1002,7 @@ const SETTLE: &str = "begin isolation level repeatable read";
+ /// reclaimed and claimed by somebody else, would otherwise settle *that* attempt — it holds the
+ /// same job id, and "running" is still true. What it does not hold is the lease, and the row is the
+ /// only place that can tell the two workers apart.
+-const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null, \
++const COMPLETE: &str = "update jobs set state = $4, last_error = null, \
+                                lease_owner = null, lease_expires_at = null \
+                        where id = $1 and state = 'running' and lease_owner = $2 \
+                          and ($3::text is null or jobs.queue in ( \
+@@ -984,7 +1012,7 @@ const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null,
+ /// The statement that records a failure: the row's own budget decides where the job goes, in the
+ /// same statement that writes the reason down — and the same lease guard.
+ const FAIL: &str = "update jobs set last_error = $3, \
+-                           state = case when attempts < max_attempts then 'queued' else 'failed' end, \
++                           state = case when attempts < max_attempts then $5 else $6 end, \
+                            lease_owner = null, lease_expires_at = null \
+                     where id = $1 and state = 'running' and lease_owner = $2 \
+                       and ($4::text is null or jobs.queue in ( \
+@@ -1023,12 +1051,24 @@ impl Change<'_> {
+             Change::Completed => sqlx::query_as(COMPLETE)
+                 .bind(id.as_uuid())
+                 .bind(worker.as_str())
+-                .bind(scope),
++                .bind(scope)
++                .bind(destination(JobState::Running, Event::Complete)?),
+             Change::Failed { reason } => sqlx::query_as(FAIL)
+                 .bind(id.as_uuid())
+                 .bind(worker.as_str())
+                 .bind(*reason)
+-                .bind(scope),
++                .bind(scope)
++                // Both answers the budget can produce, named by the model: the statement decides
++                // *which* of the two applies (it is the one holding `attempts` and
++                // `max_attempts`), and the model decides what each of them is called.
++                .bind(destination(
++                    JobState::Running,
++                    Event::Fail { retryable: true },
++                )?)
++                .bind(destination(
++                    JobState::Running,
++                    Event::Fail { retryable: false },
++                )?),
+         }
+         .fetch_optional(&mut **transaction)
+         .await
+@@ -1332,17 +1372,26 @@ fn decode_kind(text: &str) -> Result<EventKind, Error> {
+ }
+ 
+ /// The `state` column, as the enum the engine uses.
++///
++/// The decoding is the model's (`jobq/3.14-job-state-machine`), spelling included: a name this
++/// build does not know is refused by the *model* — with the text that was stored, which is what an
++/// operator greps for — and then reported as the store failure it is, because a row this backend
++/// wrote and cannot read back is not a caller's mistake.
+ fn decode_state(text: &str) -> Result<JobState, Error> {
+-    match text {
+-        "queued" => Ok(JobState::Queued),
+-        "running" => Ok(JobState::Running),
+-        "succeeded" => Ok(JobState::Succeeded),
+-        "failed" => Ok(JobState::Failed),
+-        other => Err(unreadable(
+-            "state",
+-            format!("`{other}` is not a state this engine knows"),
+-        )),
+-    }
++    JobState::parse(text).map_err(|unknown| unreadable("state", unknown.to_string()))
++}
++
++/// Where the model says a job goes, as the name a statement binds.
++///
++/// Every state this backend *writes* comes from here, so the four names live in one file
++/// (`src/engine/state.rs`) instead of being spelled again in SQL. What the statements keep are the
++/// predicates — `state = 'queued'`, `lease_owner = $2` — because a predicate that matches nothing
++/// is a query with no answer, while a destination this file invented would be a row in a state the
++/// model does not have. The budget comparison stays in the statement for the same reason: which
++/// attempts are left is data only the row knows, and the *model* is what turns that answer into a
++/// destination.
++fn destination(from: JobState, event: Event) -> Result<&'static str, Error> {
++    Ok(transition(from, event)?.as_str())
+ }
+ 
+ /// A count column, as the engine's unsigned count.
