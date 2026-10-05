@@ -1,0 +1,782 @@
+diff --git a/migrations/0007_traces.sql b/migrations/0007_traces.sql
+index d9c9fef..927ef14 100644
+--- a/migrations/0007_traces.sql
++++ b/migrations/0007_traces.sql
+@@ -4,31 +4,37 @@
+ -- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys, `0005` the
+ -- queues and `0006` the state constraint).
+ --
+--- The file is yours to write, and what it has to make possible is the one thing that decides the
+--- whole step: **the trace survives the process it was accepted in.** A request that submits a job
+--- ends long before the attempt runs — minutes, hours, another process, another host — so the only
+--- thing that can carry a context across this queue is the row the work is on. A context that
+--- travelled in a header, a task-local or a span would propagate beautifully in every test and lose
+--- the trace in every deployment.
++-- The trace has to be a column rather than a header, a span or a task-local, and that is the whole
++-- reason this file exists: the request that accepted the job ended long before the attempt runs —
++-- minutes, hours, in another process, on another host — so the only thing that can carry a context
++-- across the queue is the row the work is on. A context that travelled in memory would propagate
++-- beautifully in every test and lose the trace in every deployment.
+ --
+--- Three things to decide rather than copy, and each of them is a sentence your runbook will hold:
++-- Two columns rather than one, because they are two facts. `trace_id` is the identity, in the wire
++-- format's own text so that an operator with `psql` reads the same string their collector shows.
++-- `trace_sampled` is the *door's* decision: whether this trace is one the deployment started. It is
++-- not the last word — a hop that fails is exported whatever this says
++-- (`Context::exported` in `src/engine/trace.rs`) — and it is exactly the word that cannot be
++-- recomputed later, because the sampler that answered it may be a different setting by then, and a
++-- decision re-made from a new setting is a decision that disagrees with itself.
+ --
+---   * **two columns, because there are two facts.** The identity of the trace is one; the decision
+---     the *door* made about it is the other. The decision cannot be recomputed later — the sampler
+---     that answered it may be a different setting by then, and a decision re-made from a new
+---     setting is a decision that disagrees with itself — so it is stored rather than derived.
+---     There is a second decision, at the exit, but it is made from the outcome and from this one
+---     (`Context::exported`), not from a fresh roll.
+---   * **the shape of "no trace".** A job submitted before this migration and a job submitted by a
+---     caller who asked for nothing are both untraced, and a column that cannot say so will say
+---     `false` about one of them: nullable for the id, defaulted for the decision, and the two
+---     together mean "nobody asked". `jobq/3.23-online-schema` is the step with an answer for doing
+---     this to a table that is already big.
+---   * **the id's type.** Thirty-two lower-case hex characters is an external contract (the format's
+---     grammar, which `src/engine/trace.rs` enforces on the way in), and the column is where an
+---     operator and a query meet it. Text stores what the wire carries; a `uuid` column would store
+---     something the person reading the header cannot see.
++-- `trace_id` is nullable and `trace_sampled` defaults to false, which is the honest shape for both
++-- kinds of job that have no trace: the ones submitted before this migration and the ones a caller
++-- submitted without asking to be traced. A row with no id is a row nobody asked about; a row with an
++-- id and `false` is a trace that exists and is not kept, which is a different sentence and worth
++-- being able to write down.
+ --
+--- The index is part of the answer rather than an afterthought: "everything that happened in this
+--- trace" is the query an operator runs at three in the morning, and it should be a lookup. Consider
+--- what to do about the rows that have no trace, because most of them will.
++-- The id is text rather than `uuid` for the same reason the trail stores its kinds as text: the
++-- format's grammar is an external contract — thirty-two lower-case hex characters, never all
++-- zeroes — and the column is where a person and a query meet it. `src/engine/trace.rs` refuses an
++-- id that is not that, and a row that got in another way is refused when it is read back rather
++-- than handed on as a trace nobody can follow.
++
++alter table jobs add column trace_id text;
++alter table jobs add column trace_sampled boolean not null default false;
++
++-- The partial index is what makes "everything that happened in this trace" a lookup rather than a
++-- scan, and it is partial because the rows that matter are the ones that have an id: every job
++-- submitted before this migration, and every job nobody traced, would otherwise be an entry
++-- pointing at nothing.
++create index jobs_trace on jobs (trace_id) where trace_id is not null;
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 3f56412..7752ffd 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -14,6 +14,7 @@ use uuid::Uuid;
+ 
+ use crate::engine::dedup::Dedup;
+ use crate::engine::error::Error;
++use crate::engine::trace::Context;
+ 
+ /// Longest queue name the engine accepts, in bytes.
+ pub const QUEUE_NAME_MAX: usize = 64;
+@@ -227,9 +228,10 @@ impl fmt::Display for JobState {
+ ///
+ /// `#[non_exhaustive]` writes that promise into the type (step `jobq/3.2-public-api-baseline`):
+ /// private fields already make the constructor the door, and this says out loud that the row is
+-/// going to grow rather than that it happens to look finished today. It has grown once so far: the
+-/// two lease fields of step `jobq/3.7-leases-and-recovery` arrived without any caller of `Job`
+-/// having to be rebuilt, which is the promise being kept rather than described.
++/// going to grow rather than that it happens to look finished today. It has grown twice so far: the
++/// two lease fields of step `jobq/3.7-leases-and-recovery` and the trace of step
++/// `jobq/3.18-trace-sampling` arrived without any caller of `Job` having to be rebuilt, which is the
++/// promise being kept rather than described.
+ #[non_exhaustive]
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Job {
+@@ -255,6 +257,13 @@ pub struct Job {
+     pub(crate) lease_owner: Option<WorkerId>,
+     /// When the claim runs out, when somebody holds it.
+     pub(crate) lease_expires_at: Option<DateTime<Utc>>,
++    /// The trace this job belongs to, and the decision the door made about it
++    /// (`jobq/3.18-trace-sampling`).
++    ///
++    /// `None` is a job nobody asked to trace — one submitted before this step existed, or by a
++    /// caller that sent nothing and a deployment that had tracing off. The absence is the truth: a
++    /// trace id invented when the work is attempted is a trace that does not exist anywhere else.
++    pub(crate) trace: Option<Context>,
+ }
+ 
+ impl Job {
+@@ -337,6 +346,17 @@ impl Job {
+     pub fn may_retry(&self) -> bool {
+         self.attempts < self.max_attempts
+     }
++
++    /// The trace this job belongs to, when it belongs to one.
++    ///
++    /// The row is the carrier (`jobq/3.18-trace-sampling`): a worker is another process, often on
++    /// another host, and a context that travelled in a task-local or a header would be gone by the
++    /// time the attempt runs. What the worker needs from it is the trace id, the door's decision,
++    /// and the fact that neither is its own to change.
++    #[must_use]
++    pub fn trace(&self) -> Option<&Context> {
++        self.trace.as_ref()
++    }
+ }
+ 
+ /// What a caller says when it wants a job queued.
+@@ -364,6 +384,13 @@ pub struct SubmitRequest {
+     /// How long that name answers for, measured from this request. `None` beside a key is a
+     /// request the engine refuses: the window is part of the question.
+     pub(crate) dedup_window: Option<Duration>,
++    /// The trace this job is part of, when the caller is inside one (`jobq/3.18-trace-sampling`).
++    ///
++    /// The *door's* half of the step: the caller that knows the ambient context builds the
++    /// [`Context`] once, here, and the engine stores what it is given rather than deciding again —
++    /// two decisions about one trace is how a queue ends up with a job whose ids and whose
++    /// sampling flag disagree.
++    pub(crate) trace: Option<Context>,
+ }
+ 
+ impl SubmitRequest {
+@@ -378,6 +405,7 @@ impl SubmitRequest {
+             max_attempts: DEFAULT_MAX_ATTEMPTS,
+             dedup_key: None,
+             dedup_window: None,
++            trace: None,
+         }
+     }
+ 
+@@ -403,6 +431,18 @@ impl SubmitRequest {
+         self
+     }
+ 
++    /// The trace this job is part of, as the door decided it (`jobq/3.18-trace-sampling`).
++    ///
++    /// The value rather than the caller's header: [`Context::of`] is where a `traceparent` becomes
++    /// an identity and a decision, and it is called once, by whoever is accepting the job. What
++    /// arrives here is what the row keeps — so a caller that has no trace leaves this out and gets a
++    /// job whose trace is honestly absent rather than one this engine invented.
++    #[must_use]
++    pub fn with_trace(mut self, trace: Context) -> Self {
++        self.trace = Some(trace);
++        self
++    }
++
+     /// Name this request, so that a later request carrying the same key inside the window is
+     /// answered with the job this one produced instead of queuing a second job
+     /// (`jobq/3.12-dedup-window`).
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index b698cac..7c424aa 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -39,6 +39,7 @@ pub(crate) mod state;
+ pub(crate) mod store;
+ pub(crate) mod tenant;
+ pub(crate) mod timers;
++pub(crate) mod trace;
+ pub(crate) mod usage;
+ 
+ mod sealed;
+@@ -63,4 +64,5 @@ pub use store::PostgresStore;
+ pub use store::{BoxFuture, MemoryStore, Store};
+ pub use tenant::{TENANT_NAME_MAX, Tenant};
+ pub use timers::ReadySet;
++pub use trace::{Context, Hop, SPAN_ID_HEX, Sampler, SpanId, TRACE_ID_HEX, TraceId, Traceparent};
+ pub use usage::{QueueUsage, Usage};
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 1fa12bc..1352829 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -464,6 +464,10 @@ impl Store for MemoryStore {
+                 // Nobody holds a job that has just been written: the lease arrives with the claim.
+                 lease_owner: None,
+                 lease_expires_at: None,
++                // What the door decided travels with the row (`jobq/3.18-trace-sampling`): the
++                // worker that runs this job is another process, and the only contexts it can read
++                // are the ones somebody wrote down.
++                trace: request.trace,
+             };
+             if let Some(dedup) = &dedup {
+                 // Taking the key, and taking it again when the row it finds has expired: the
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index c872b03..e733a38 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -60,6 +60,7 @@ use crate::engine::sealed::Sealed;
+ use crate::engine::state::{Event, transition};
+ use crate::engine::store::{ABANDONED, BoxFuture, DEFAULT_LEASE, HANDED_BACK, Store};
+ use crate::engine::tenant::Tenant;
++use crate::engine::trace::{Context, TraceId};
+ use crate::engine::usage::{QueueUsage, Usage};
+ 
+ // Why the statements below are written out rather than assembled, and why they look the way they
+@@ -241,6 +242,14 @@ impl PostgresStore {
+         payload: String,
+         run_at: DateTime<Utc>,
+     ) -> Result<Job, Error> {
++        // The trace the door decided on, as the two columns the table keeps it in
++        // (`jobq/3.18-trace-sampling`): the id as its wire text and the decision as a boolean, and
++        // the absence of a trace is the absence of both rather than a false decision.
++        let trace_id = request
++            .trace
++            .as_ref()
++            .map(|trace| trace.trace().to_string());
++        let trace_sampled = request.trace.as_ref().is_some_and(|trace| trace.sampled());
+         // The row and the counter are one statement, and the counter is a second `with` clause
+         // rather than a second call: a job that is not there cannot be counted, and one that is
+         // cannot be missing from the count (`jobq/3.6-transaction-isolation`'s argument, one table
+@@ -248,16 +257,16 @@ impl PostgresStore {
+         let row: JobRow = sqlx::query_as(
+             "with written as ( \
+                  insert into jobs \
+-                     (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
+-                 values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7) \
++                     (id, queue, payload, state, priority, run_at, attempts, max_attempts, trace_id, trace_sampled) \
++                 values ($1, $2, $3::jsonb, $4, $5, $6, 0, $7, $8, $9) \
+                  returning id, queue, payload::text as payload, state, priority, run_at, \
+-                           attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                           attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+              ), counted as ( \
+                  insert into queue_usage (queue, submitted) values ($2, 1) \
+                  on conflict (queue) do update set submitted = queue_usage.submitted + 1 \
+              ) \
+              select id, queue, payload, state, priority, run_at, attempts, max_attempts, \
+-                    last_error, lease_owner, lease_expires_at from written",
++                    last_error, lease_owner, lease_expires_at, trace_id, trace_sampled from written",
+         )
+         .bind(id.as_uuid())
+         .bind(request.queue.as_str())
+@@ -269,6 +278,8 @@ impl PostgresStore {
+         // as a 32-bit integer would make "the caller asked for more attempts than the table
+         // holds" a case this method has to answer, and there is no good answer to it.
+         .bind(i64::from(request.max_attempts))
++        .bind(trace_id)
++        .bind(trace_sampled)
+         .fetch_one(&self.pool)
+         .await
+         .map_err(refused)?;
+@@ -314,6 +325,15 @@ impl Store for PostgresStore {
+             }
+             let payload = serde_json::to_string(&request.payload)
+                 .map_err(|error| unreadable("payload", error.to_string()))?;
++            // The trace the door decided on, as the two columns the table keeps it in
++            // (`jobq/3.18-trace-sampling`): the id as its wire text and the decision as a boolean.
++            // Both paths below write it, and a trace that travelled down one of them and not the
++            // other would be a job whose trace depends on how it was submitted.
++            let trace_id = request
++                .trace
++                .as_ref()
++                .map(|trace| trace.trace().to_string());
++            let trace_sampled = request.trace.as_ref().is_some_and(|trace| trace.sampled());
+             // The identity is the engine's, not the database's: a row whose key was invented by
+             // whichever backend happened to store it is a row whose key changes when the deployment
+             // moves it to the other one.
+@@ -354,22 +374,22 @@ impl Store for PostgresStore {
+                      returning job_id \
+                  ), fresh as ( \
+                      insert into jobs \
+-                         (id, queue, payload, state, priority, run_at, attempts, max_attempts) \
+-                     select $3, $1, $6::jsonb, $7, $8, $9, 0, $10 \
++                         (id, queue, payload, state, priority, run_at, attempts, max_attempts, trace_id, trace_sampled) \
++                     select $3, $1, $6::jsonb, $7, $8, $9, 0, $10, $11, $12 \
+                      where exists (select 1 from taken) \
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+-                               attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                               attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                  ), counted as ( \
+                      insert into queue_usage (queue, submitted) \
+                      select $1, (select count(*) from taken) \
+                      on conflict (queue) do update set submitted = queue_usage.submitted + excluded.submitted \
+                  ) \
+                  select id, queue, payload, state, priority, run_at, attempts, max_attempts, \
+-                        last_error, lease_owner, lease_expires_at from fresh \
++                        last_error, lease_owner, lease_expires_at, trace_id, trace_sampled from fresh \
+                  union all \
+                  select held.id, held.queue, held.payload::text as payload, held.state, \
+                         held.priority, held.run_at, held.attempts, held.max_attempts, \
+-                        held.last_error, held.lease_owner, held.lease_expires_at \
++                        held.last_error, held.lease_owner, held.lease_expires_at, held.trace_id, held.trace_sampled \
+                  from jobs held join dedup_keys key on key.job_id = held.id \
+                  where key.queue = $1 and key.key = $2 and not exists (select 1 from taken)",
+             )
+@@ -387,6 +407,8 @@ impl Store for PostgresStore {
+             .bind(request.priority)
+             .bind(run_at)
+             .bind(i64::from(request.max_attempts))
++            .bind(trace_id)
++            .bind(trace_sampled)
+             .fetch_one(&self.pool)
+             .await
+             .map_err(refused)?;
+@@ -451,14 +473,14 @@ impl Store for PostgresStore {
+                          for update skip locked \
+                      ) \
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+-                               attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                               attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                  ), counted as ( \
+                      insert into queue_usage (queue, claimed) \
+                      select $1, (select count(*) from taken) \
+                      on conflict (queue) do update set claimed = queue_usage.claimed + excluded.claimed \
+                  ) \
+                  select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+-                        max_attempts, last_error, lease_owner, lease_expires_at \
++                        max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                  from taken order by priority + case when $7 > 0 \
+                                         then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
+                                         else 0 end desc, \
+@@ -593,7 +615,7 @@ impl Store for PostgresStore {
+         Box::pin(async move {
+             let row: Option<JobRow> = sqlx::query_as(
+                 "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+-                        max_attempts, last_error, lease_owner, lease_expires_at \
++                        max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                  from jobs where id = $1 \
+                    and ($2::text is null or jobs.queue in ( \
+                        select queue from queue_permissions where tenant = $2))",
+@@ -626,7 +648,7 @@ impl Store for PostgresStore {
+             // questions rather than a list of clauses built in Rust.
+             let rows: Vec<JobRow> = sqlx::query_as(
+                 "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
+-                        max_attempts, last_error, lease_owner, lease_expires_at \
++                        max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                  from jobs \
+                  where ($1::text is null or queue = $1) \
+                    and ($2::text is null or state = $2) \
+@@ -1128,7 +1150,7 @@ const FAIL: &str = "update jobs set last_error = $3, \
+ /// it. With it, the second transaction either sees the row the first one left or is refused as a
+ /// serialization failure, which is `Error::Conflict` and retryable.
+ const LOCK_ONE: &str = "select id, queue, payload::text as payload, state, priority, run_at, \
+-                              attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                              attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled \
+                        from jobs where id = $1 \
+                          and ($2::text is null or jobs.queue in ( \
+                              select queue from queue_permissions where tenant = $2)) \
+@@ -1147,7 +1169,7 @@ const REPLAY: &str = "update jobs set state = $2, max_attempts = $3, run_at = $4
+                               lease_owner = null, lease_expires_at = null \
+                       where id = $1 and state = 'failed' \
+                       returning id, queue, payload::text as payload, state, priority, run_at, \
+-                                attempts, max_attempts, last_error, lease_owner, lease_expires_at";
++                                attempts, max_attempts, last_error, lease_owner, lease_expires_at, trace_id, trace_sampled";
+ 
+ /// What a settle does to the row it touches.
+ ///
+@@ -1417,6 +1439,11 @@ struct JobRow {
+     lease_owner: Option<String>,
+     /// When the claim runs out, when somebody holds it.
+     lease_expires_at: Option<DateTime<Utc>>,
++    /// The trace this job belongs to, as wire text, when it belongs to one
++    /// (`jobq/3.18-trace-sampling`).
++    trace_id: Option<String>,
++    /// What the door decided about that trace.
++    trace_sampled: bool,
+ }
+ 
+ impl JobRow {
+@@ -1441,6 +1468,17 @@ impl JobRow {
+             // job whose lease belongs to a name nobody can use.
+             lease_owner: self.lease_owner.map(WorkerId::new),
+             lease_expires_at: self.lease_expires_at,
++            // The trace, rebuilt as the value the worker reads: a column holding an id the format
++            // does not allow is a row this backend reports rather than one it hands on as a trace
++            // nobody can follow (`jobq/3.18-trace-sampling`).
++            trace: match self.trace_id {
++                Some(text) => Some(Context::stored(
++                    TraceId::parse(&text)
++                        .map_err(|error| unreadable("trace_id", error.to_string()))?,
++                    self.trace_sampled,
++                )),
++                None => None,
++            },
+         })
+     }
+ }
+diff --git a/src/engine/trace.rs b/src/engine/trace.rs
+index 495acfc..e193985 100644
+--- a/src/engine/trace.rs
++++ b/src/engine/trace.rs
+@@ -28,22 +28,6 @@
+ //! by hand for the reason `relay/2.19` wrote it by hand: the ids are a wire format, and a format two
+ //! systems interpret differently is not a shared context.
+ //!
+-//! # What is left to write
+-//!
+-//! Six bodies, and each of them is one of the decisions above:
+-//!
+-//! 1. [`TraceId::parse`] and [`SpanId::parse`] — the grammar;
+-//! 2. [`Traceparent::parse`] — the same grammar as a header (and the private reader the three of
+-//!    them share is yours to write);
+-//! 3. [`Sampler::decide`] — the door's decision, from the id and from nothing else;
+-//! 4. [`Context::of`] — the door itself;
+-//! 5. [`Context::exported`] — the exit.
+-//!
+-//! The rest of the step is not in this file: the row that carries the context (`Job`, both stores
+-//! and `migrations/0007_traces.sql`), the hop a worker mints per attempt, and the fields the line
+-//! about an attempt grows (`jobq/3.17-error-budget-alerts`). Nothing declares this module until you
+-//! re-export it from `crate::engine`.
+-//!
+ //! What this module deliberately does *not* do is export anything. There is no collector here, and a
+ //! field on the line is what this project has instead — `jobq/3.17-error-budget-alerts` is where
+ //! those fields were settled: the decision is the *value*, and what a deployment does with it —
+@@ -86,10 +70,15 @@ impl TraceId {
+     /// handling and starts a trace, because a lost parent link is a worse trace and a dropped job is
+     /// a worse queue.
+     pub fn parse(text: &str) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.18-trace-sampling: the trace id — exactly the format's own grammar, and an \
+-             id this crate would not write is not one it continues"
+-        )
++        let id = Self(hex_bytes::<16>(text, "trace")?);
++        if id.is_zero() {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "`{text}` is all zeroes, which the format reserves for \"there is no trace\""
++                ),
++            });
++        }
++        Ok(id)
+     }
+ 
+     /// A fresh trace, for a hop that has no parent to continue.
+@@ -133,7 +122,15 @@ impl SpanId {
+     ///
+     /// [`Error::Invalid`], on the same terms as [`TraceId::parse`].
+     pub fn parse(text: &str) -> Result<Self, Error> {
+-        todo!("jobq/3.18-trace-sampling: the span id — the same grammar, half the width")
++        let id = Self(hex_bytes::<8>(text, "span")?);
++        if id.0.iter().all(|byte| *byte == 0) {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "`{text}` is all zeroes, which the format reserves for \"there is no span\""
++                ),
++            });
++        }
++        Ok(id)
+     }
+ 
+     /// A span of this hop's own.
+@@ -184,10 +181,27 @@ impl Traceparent {
+     ///
+     /// [`Error::Invalid`] naming the field that is wrong.
+     pub fn parse(text: &str) -> Result<Self, Error> {
+-        todo!(
+-            "jobq/3.18-trace-sampling: the header — four fields, the version this crate writes, \
+-             two hex characters of flags, and no all-zero id"
+-        )
++        let parts: Vec<&str> = text.trim().split('-').collect();
++        let [version, trace, parent, flags] = parts.as_slice() else {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "a traceparent has exactly {FIELDS} fields \
++                     (`{VERSION}-<trace>-<span>-<flags>`), and this one has {}",
++                    parts.len()
++                ),
++            });
++        };
++        if *version != VERSION {
++            return Err(Error::Invalid {
++                detail: format!("traceparent version `{version}`: this crate writes `{VERSION}`"),
++            });
++        }
++        let flags = hex_bytes::<1>(flags, "flags")?;
++        Ok(Self {
++            trace: TraceId::parse(trace)?,
++            parent: SpanId::parse(parent)?,
++            sampled: flags[0] & 1 == 1,
++        })
+     }
+ 
+     /// The header this hop sends: the same trace, a span of its own, the sampling decision it
+@@ -286,10 +300,10 @@ impl Sampler {
+     /// two processes that made it at the same time.
+     #[must_use]
+     pub fn decide(&self, trace: &TraceId) -> bool {
+-        todo!(
+-            "jobq/3.18-trace-sampling: the share — a function of the trace id and of nothing \
+-             else, so that two hops which ask about one trace agree"
+-        )
++        let bytes = trace.as_bytes();
++        let mut tail = [0u8; 8];
++        tail.copy_from_slice(&bytes[8..]);
++        u64::from_be_bytes(tail) % 1000 < u64::from(self.per_mille)
+     }
+ }
+ 
+@@ -316,10 +330,19 @@ impl Context {
+     /// where a job's observability is settled, before anything is written down.
+     #[must_use]
+     pub fn of(parent: Option<&Traceparent>, sampler: &Sampler) -> Self {
+-        todo!(
+-            "jobq/3.18-trace-sampling: the door — the caller's trace and decision when there is \
+-             a caller, a fresh trace and this deployment's share when there is not"
+-        )
++        match parent {
++            Some(parent) => Self {
++                trace: parent.trace(),
++                sampled: parent.sampled(),
++            },
++            None => {
++                let trace = TraceId::generate();
++                Self {
++                    sampled: sampler.decide(&trace),
++                    trace,
++                }
++            }
++        }
+     }
+ 
+     /// The context a store read back, decision and all.
+@@ -353,10 +376,7 @@ impl Context {
+     /// the same question again with less information than the door had.
+     #[must_use]
+     pub fn exported(&self, failed: bool) -> bool {
+-        todo!(
+-            "jobq/3.18-trace-sampling: the exit — the door's answer, unless this hop is one an \
+-             operator will need to read"
+-        )
++        self.sampled || failed
+     }
+ }
+ 
+@@ -404,6 +424,41 @@ impl<'a> Hop<'a> {
+     }
+ }
+ 
++/// The bytes of a lower-case hex field, refusing anything else.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] naming the field and the length it should have: a caller that has to guess
++/// what was wrong with its header sends the same header again.
++fn hex_bytes<const N: usize>(text: &str, field: &str) -> Result<[u8; N], Error> {
++    let expected = N * 2;
++    let invalid = |detail: String| Error::Invalid { detail };
++    if text.len() != expected {
++        return Err(invalid(format!(
++            "a traceparent {field} is {expected} lower-case hex characters, and `{text}` has {}",
++            text.len()
++        )));
++    }
++    if !text
++        .bytes()
++        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        return Err(invalid(format!(
++            "`{text}` is not lower-case hex: the format is case-sensitive because every index that \
++             stores a trace id is"
++        )));
++    }
++    let mut bytes = [0u8; N];
++    for (byte, pair) in bytes
++        .iter_mut()
++        .zip(text.as_bytes().as_chunks::<2>().0.iter())
++    {
++        let digits = std::str::from_utf8(pair).map_err(|error| invalid(error.to_string()))?;
++        *byte = u8::from_str_radix(digits, 16).map_err(|error| invalid(error.to_string()))?;
++    }
++    Ok(bytes)
++}
++
+ /// The lower-case hex of some bytes.
+ fn hex(bytes: &[u8]) -> String {
+     let mut text = String::with_capacity(bytes.len() * 2);
+diff --git a/src/service/signals.rs b/src/service/signals.rs
+index b6b77f6..2cc4838 100644
+--- a/src/service/signals.rs
++++ b/src/service/signals.rs
+@@ -57,7 +57,7 @@
+ //!   that has just been created. [`Budget::floor`] is the traffic a window needs before its share is
+ //!   read, and it is a number in the page rather than a default somebody has to know.
+ 
+-use crate::engine::{JobId, Queue, QueueUsage, Usage, WorkerId};
++use crate::engine::{Hop, Job, Queue, QueueUsage, Usage, WorkerId};
+ 
+ /// How many parts a share is divided into: a basis point is a hundredth of a percent.
+ ///
+@@ -305,17 +305,15 @@ impl Outcome {
+ 
+ /// One attempt, as the line about it says it.
+ ///
+-/// A value rather than seven arguments at each call site, and that is the decision the step is
++/// A value rather than an argument list at each call site, and that is the decision the step is
+ /// about: the fields a query needs are one shape with one writer, so a line that is missing one of
+-/// them is a compile error rather than a query that silently returns nothing.
++/// them is a compile error rather than a query that silently returns nothing. The three fields that
++/// describe *which* attempt (the queue, the job, the count) come from the job itself, so a caller
++/// cannot pass a count that disagrees with the row it is about.
+ #[derive(Debug, Clone, Copy)]
+ pub struct Attempt<'a> {
+-    /// Which queue the job belongs to.
+-    queue: &'a Queue,
+-    /// Which job.
+-    job: &'a JobId,
+-    /// Which attempt of that job, as the row counts it.
+-    attempt: u32,
++    /// The job this attempt is of: its queue, its identity and the count so far.
++    job: &'a Job,
+     /// Which worker made it.
+     worker: &'a WorkerId,
+     /// How it ended.
+@@ -324,6 +322,9 @@ pub struct Attempt<'a> {
+     reason: &'a str,
+     /// How long the handler took, in whole milliseconds.
+     took_ms: u64,
++    /// The trace this attempt is a hop of, when the job carried one
++    /// (`jobq/3.18-trace-sampling`).
++    trace: Option<Hop<'a>>,
+ }
+ 
+ impl<'a> Attempt<'a> {
+@@ -332,25 +333,25 @@ impl<'a> Attempt<'a> {
+     /// `reason` is the handler's sentence and is written even when the attempt succeeded: the
+     /// field set is the same on every line, and an empty value is what "no reason" looks like to a
+     /// query. `took_ms` is a number rather than a formatted duration, because a collector can add
+-    /// numbers and cannot add `1.2s`.
++    /// numbers and cannot add `1.2s`. `trace` is the hop the worker minted from the context the row
++    /// carried — its own span, the job's trace id, and the export decision that a hop makes from the
++    /// door's answer and from how it ended.
+     #[must_use]
+-    pub fn new(
+-        queue: &'a Queue,
+-        job: &'a JobId,
+-        attempt: u32,
++    pub fn of(
++        job: &'a Job,
+         worker: &'a WorkerId,
+         outcome: Outcome,
+         reason: &'a str,
+         took_ms: u64,
++        trace: Option<Hop<'a>>,
+     ) -> Self {
+         Self {
+-            queue,
+             job,
+-            attempt,
+             worker,
+             outcome,
+             reason,
+             took_ms,
++            trace,
+         }
+     }
+ 
+@@ -361,30 +362,48 @@ impl<'a> Attempt<'a> {
+     ///
+     /// * **the level.** A failure is a warning and a success is information — so "everything at
+     ///   this level, in this window" is a query about endings, which is the query an operator has;
+-    /// * **the fields.** Queue, job, attempt, worker, outcome, reason and how long it took: the
+-    ///   path from a number on a page to the job behind it, which is the whole reason a queue's
+-    ///   lines and a queue's counters are worth having together. What is deliberately *not* here is
+-    ///   the payload (`crate::service::handler` explains why the row has it and a line does not).
++    /// * **the fields.** Queue, job, attempt, worker, outcome, reason, how long it took, and the
++    ///   trace: the path from a number on a page to the job behind it and then to the request that
++    ///   asked for it. What is deliberately *not* here is the payload
++    ///   (`crate::service::handler` explains why the row has it and a line does not).
++    ///
++    /// The trace fields are written on every line, empty when the job has no trace: a job nobody
++    /// asked to trace has no id to write, and inventing one at the exit would be a trace that
++    /// exists in one line and nowhere else.
+     pub fn emit(&self) {
++        let failed = self.outcome == Outcome::Failed;
++        let trace_id = self
++            .trace
++            .map_or_else(String::new, |hop| hop.trace().to_string());
++        let span_id = self
++            .trace
++            .map_or_else(String::new, |hop| hop.span().to_string());
++        let sampled = self.trace.is_some_and(|hop| hop.exported(failed));
+         match self.outcome {
+             Outcome::Succeeded => tracing::info!(
+-                queue = %self.queue,
+-                job = %self.job,
+-                attempt = self.attempt,
++                queue = %self.job.queue(),
++                job = %self.job.id(),
++                attempt = self.job.attempts(),
+                 worker = %self.worker,
+                 outcome = self.outcome.as_str(),
+                 reason = self.reason,
+                 took_ms = self.took_ms,
++                trace_id = %trace_id,
++                span_id = %span_id,
++                sampled,
+                 "attempt settled"
+             ),
+             Outcome::Failed => tracing::warn!(
+-                queue = %self.queue,
+-                job = %self.job,
+-                attempt = self.attempt,
++                queue = %self.job.queue(),
++                job = %self.job.id(),
++                attempt = self.job.attempts(),
+                 worker = %self.worker,
+                 outcome = self.outcome.as_str(),
+                 reason = self.reason,
+                 took_ms = self.took_ms,
++                trace_id = %trace_id,
++                span_id = %span_id,
++                sampled,
+                 "attempt settled"
+             ),
+         }
+diff --git a/src/service/worker.rs b/src/service/worker.rs
+index f49e907..c6e6758 100644
+--- a/src/service/worker.rs
++++ b/src/service/worker.rs
+@@ -52,6 +52,7 @@ use crate::engine::error::Error;
+ use crate::engine::retry::{DEFAULT_ATTEMPTS, retry};
+ use crate::engine::store::{BoxFuture, Store};
+ use crate::engine::timers::ReadySet;
++use crate::engine::trace::Hop;
+ use crate::service::signals::{Attempt, Outcome};
+ 
+ /// What a worker does with a job it has claimed.
+@@ -575,20 +576,22 @@ async fn handle_one(
+     job: Job,
+ ) -> Result<Settled, Error> {
+     let id = job.id();
+-    let queue = job.queue().clone();
+-    let attempt = job.attempts();
++    // This hop's span, minted from the context the row carried (`jobq/3.18-trace-sampling`): the
++    // trace id is the job's, the span is this attempt's, and a retry mints another one — two
++    // attempts that shared a span would look like one step in the waterfall, and the second attempt
++    // is the one worth looking at.
++    let hop = job.trace().map(Hop::of);
+     let started = Instant::now();
+     match handler.handle(&job).await {
+         Ok(()) => {
+             retry(DEFAULT_ATTEMPTS, || store.complete(&worker, &id)).await?;
+-            Attempt::new(
+-                &queue,
+-                &id,
+-                attempt,
++            Attempt::of(
++                &job,
+                 &worker,
+                 Outcome::Succeeded,
+                 "",
+                 elapsed_ms(started),
++                hop,
+             )
+             .emit();
+             Ok(Settled::Succeeded)
+@@ -598,14 +601,16 @@ async fn handle_one(
+             // and the budget decides whether another attempt is allowed.
+             let reason = error.to_string();
+             let state = retry(DEFAULT_ATTEMPTS, || store.fail(&worker, &id, &reason)).await?;
+-            Attempt::new(
+-                &queue,
+-                &id,
+-                attempt,
++            // A hop that failed is exported whatever the door decided: the trace an operator needs
++            // is the one nobody asked for in advance, and that is `Context::exported` rather than a
++            // second opinion here.
++            Attempt::of(
++                &job,
+                 &worker,
+                 Outcome::Failed,
+                 &reason,
+                 elapsed_ms(started),
++                hop,
+             )
+             .emit();
+             let _ = state.value();

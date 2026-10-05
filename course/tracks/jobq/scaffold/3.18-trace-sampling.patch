@@ -1,0 +1,461 @@
+diff --git a/migrations/0007_traces.sql b/migrations/0007_traces.sql
+new file mode 100644
+index 0000000..d9c9fef
+--- /dev/null
++++ b/migrations/0007_traces.sql
+@@ -0,0 +1,34 @@
++-- The trace a job belongs to, and the decision the door made about it.
++--
++-- Step `jobq/3.18-trace-sampling`. This is the project's seventh migration, so it is `0007`
++-- (`0001` wrote `jobs`, `0002` the trail, `0003` the lease, `0004` the deduplication keys, `0005` the
++-- queues and `0006` the state constraint).
++--
++-- The file is yours to write, and what it has to make possible is the one thing that decides the
++-- whole step: **the trace survives the process it was accepted in.** A request that submits a job
++-- ends long before the attempt runs — minutes, hours, another process, another host — so the only
++-- thing that can carry a context across this queue is the row the work is on. A context that
++-- travelled in a header, a task-local or a span would propagate beautifully in every test and lose
++-- the trace in every deployment.
++--
++-- Three things to decide rather than copy, and each of them is a sentence your runbook will hold:
++--
++--   * **two columns, because there are two facts.** The identity of the trace is one; the decision
++--     the *door* made about it is the other. The decision cannot be recomputed later — the sampler
++--     that answered it may be a different setting by then, and a decision re-made from a new
++--     setting is a decision that disagrees with itself — so it is stored rather than derived.
++--     There is a second decision, at the exit, but it is made from the outcome and from this one
++--     (`Context::exported`), not from a fresh roll.
++--   * **the shape of "no trace".** A job submitted before this migration and a job submitted by a
++--     caller who asked for nothing are both untraced, and a column that cannot say so will say
++--     `false` about one of them: nullable for the id, defaulted for the decision, and the two
++--     together mean "nobody asked". `jobq/3.23-online-schema` is the step with an answer for doing
++--     this to a table that is already big.
++--   * **the id's type.** Thirty-two lower-case hex characters is an external contract (the format's
++--     grammar, which `src/engine/trace.rs` enforces on the way in), and the column is where an
++--     operator and a query meet it. Text stores what the wire carries; a `uuid` column would store
++--     something the person reading the header cannot see.
++--
++-- The index is part of the answer rather than an afterthought: "everything that happened in this
++-- trace" is the query an operator runs at three in the morning, and it should be a lookup. Consider
++-- what to do about the rows that have no trace, because most of them will.
+diff --git a/src/engine/trace.rs b/src/engine/trace.rs
+new file mode 100644
+index 0000000..495acfc
+--- /dev/null
++++ b/src/engine/trace.rs
+@@ -0,0 +1,415 @@
++//! Where a job's work came from, and the decision about whether anybody keeps it.
++//!
++//! `relay/2.19-trace-propagation` carried a W3C `traceparent` across a service boundary: the ids
++//! are written on the row that the work happens on, a hop gets a span of its own, and the header is
++//! parsed and regenerated rather than forwarded. All of that holds here, and the queue makes three
++//! things true that a request path never does:
++//!
++//! * **the hop between the door and the work is a database hop.** The request that accepted the job
++//!   ended long before the attempt runs — minutes, hours, or in another process on another host —
++//!   so the trace cannot live in a task-local, a header map or a span: it is *written down* with the
++//!   job and read back by the worker. `jobq/3.18-trace-sampling` is the step where it lands, and the
++//!   row is the carrier;
++//! * **the sampling decision is made twice, and the two decisions are not the same question.** At
++//!   the door the only thing known is the trace id: the decision there is a *share*, and it has to be
++//!   a function of the id rather than of the moment, because a share decided by a clock or a counter
++//!   is a decision that disagrees with itself when two hops ask. At the exit the outcome is known,
++//!   and the outcome is exactly what a head-based decision cannot see: **the trace an operator needs
++//!   is the trace nobody asked for in advance**, and a failing attempt is kept whatever the door
++//!   said. What is *not* allowed is re-rolling: the door's answer travels on the row, and a hop that
++//!   asked its own sampler again would drop the trace it is inside — [`Context::exported`] is that
++//!   rule written as a function;
++//! * **a dead letter keeps its trace.** A job's second life (`jobq/3.16-dlq-tooling`) starts from
++//!   the row it died on, so the ids travel through a replay untouched: an incident that ends in a
++//!   replay is one trace from the request that submitted the job to the attempt that finally
++//!   succeeded.
++//!
++//! The vocabulary is the [W3C `trace-context`](https://www.w3.org/TR/trace-context/) one, written
++//! by hand for the reason `relay/2.19` wrote it by hand: the ids are a wire format, and a format two
++//! systems interpret differently is not a shared context.
++//!
++//! # What is left to write
++//!
++//! Six bodies, and each of them is one of the decisions above:
++//!
++//! 1. [`TraceId::parse`] and [`SpanId::parse`] — the grammar;
++//! 2. [`Traceparent::parse`] — the same grammar as a header (and the private reader the three of
++//!    them share is yours to write);
++//! 3. [`Sampler::decide`] — the door's decision, from the id and from nothing else;
++//! 4. [`Context::of`] — the door itself;
++//! 5. [`Context::exported`] — the exit.
++//!
++//! The rest of the step is not in this file: the row that carries the context (`Job`, both stores
++//! and `migrations/0007_traces.sql`), the hop a worker mints per attempt, and the fields the line
++//! about an attempt grows (`jobq/3.17-error-budget-alerts`). Nothing declares this module until you
++//! re-export it from `crate::engine`.
++//!
++//! What this module deliberately does *not* do is export anything. There is no collector here, and a
++//! field on the line is what this project has instead — `jobq/3.17-error-budget-alerts` is where
++//! those fields were settled: the decision is the *value*, and what a deployment does with it —
++//! send the span, sample the payload, keep the line — is its own business.
++
++use std::fmt;
++
++use uuid::Uuid;
++
++use crate::engine::error::Error;
++
++/// How many hex characters a trace id is.
++pub const TRACE_ID_HEX: usize = 32;
++/// How many hex characters a span id is.
++pub const SPAN_ID_HEX: usize = 16;
++/// The version this crate writes: the only one the format has ever had.
++const VERSION: &str = "00";
++/// How many parts a traceparent is divided into, all of them required.
++const FIELDS: usize = 4;
++
++/// A trace: one piece of work, followed across every hop that took part in it.
++///
++/// Sixteen bytes, printed as thirty-two lower-case hex characters, and **never all zeroes**: the
++/// format reserves that value for "there is no trace", so accepting it would put every caller that
++/// sends it into one trace together — a trace that is nobody's.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct TraceId([u8; 16]);
++
++impl TraceId {
++    /// Read the id a caller sent.
++    ///
++    /// Lower case, exactly [`TRACE_ID_HEX`] characters, and not all zeroes. Upper case is refused
++    /// rather than folded: `4BF9…` and `4bf9…` are the same id to a person and two different index
++    /// entries to everything else, and a service that silently accepts both makes the difference
++    /// somebody else's problem.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] naming what is wrong with the text: the caller keeps its `traceparent`
++    /// handling and starts a trace, because a lost parent link is a worse trace and a dropped job is
++    /// a worse queue.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.18-trace-sampling: the trace id — exactly the format's own grammar, and an \
++             id this crate would not write is not one it continues"
++        )
++    }
++
++    /// A fresh trace, for a hop that has no parent to continue.
++    #[must_use]
++    pub fn generate() -> Self {
++        Self(*Uuid::new_v4().as_bytes())
++    }
++
++    /// The id as the wire format writes it.
++    #[must_use]
++    pub fn as_hex(&self) -> String {
++        hex(&self.0)
++    }
++
++    /// The bytes, for a column that keeps the id rather than its text.
++    #[must_use]
++    pub fn as_bytes(&self) -> [u8; 16] {
++        self.0
++    }
++
++    /// `true` when every byte is zero, which the format reserves for "no trace".
++    fn is_zero(&self) -> bool {
++        self.0.iter().all(|byte| *byte == 0)
++    }
++}
++
++impl fmt::Display for TraceId {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.as_hex())
++    }
++}
++
++/// One hop of a trace: the span the caller was in when it handed the work over.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct SpanId([u8; 8]);
++
++impl SpanId {
++    /// Read the span a caller sent.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`], on the same terms as [`TraceId::parse`].
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        todo!("jobq/3.18-trace-sampling: the span id — the same grammar, half the width")
++    }
++
++    /// A span of this hop's own.
++    #[must_use]
++    pub fn generate() -> Self {
++        let bytes = Uuid::new_v4().into_bytes();
++        let mut span = [0u8; 8];
++        span.copy_from_slice(&bytes[..8]);
++        Self(span)
++    }
++
++    /// The span as the wire format writes it.
++    #[must_use]
++    pub fn as_hex(&self) -> String {
++        hex(&self.0)
++    }
++}
++
++impl fmt::Display for SpanId {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.as_hex())
++    }
++}
++
++/// The header a hop receives and sends: `00-<trace>-<span>-<flags>`.
++///
++/// Parsed and regenerated, never forwarded — the same rule `relay/2.19-trace-propagation` applied at
++/// a service boundary, and for the same reason: passing a caller's bytes through makes this queue a
++/// relay for whatever anybody sends.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Traceparent {
++    /// The trace this hop is part of.
++    trace: TraceId,
++    /// The span the sender was in.
++    parent: SpanId,
++    /// The sender's sampling decision.
++    sampled: bool,
++}
++
++impl Traceparent {
++    /// Read a header.
++    ///
++    /// Exactly four fields, the version this crate writes, two hex characters of flags with the low
++    /// bit carrying the sampled flag. Everything else is refused, and a refused header is not an
++    /// error to a caller: it means a trace starts here.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] naming the field that is wrong.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        todo!(
++            "jobq/3.18-trace-sampling: the header — four fields, the version this crate writes, \
++             two hex characters of flags, and no all-zero id"
++        )
++    }
++
++    /// The header this hop sends: the same trace, a span of its own, the sampling decision it
++    /// inherited.
++    #[must_use]
++    pub fn child(&self, span: SpanId) -> Self {
++        Self {
++            trace: self.trace,
++            parent: span,
++            sampled: self.sampled,
++        }
++    }
++
++    /// The trace this header names.
++    #[must_use]
++    pub fn trace(&self) -> TraceId {
++        self.trace
++    }
++
++    /// The span the sender was in.
++    #[must_use]
++    pub fn parent(&self) -> SpanId {
++        self.parent
++    }
++
++    /// The sender's sampling decision.
++    #[must_use]
++    pub fn sampled(&self) -> bool {
++        self.sampled
++    }
++}
++
++impl fmt::Display for Traceparent {
++    /// The header as it goes on the wire: four fields, lower case, no all-zero ids.
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "{VERSION}-{}-{}-{:02x}",
++            self.trace.as_hex(),
++            self.parent.as_hex(),
++            u8::from(self.sampled)
++        )
++    }
++}
++
++/// The share of traces a deployment starts, in per mille.
++///
++/// The decision is a function of the trace id and of nothing else, which is the property the whole
++/// step rests on: two hops that ask the same question about the same trace get the same answer, and
++/// a decision that depended on a clock, a counter or the current load would not. It is also what
++/// makes the choice checkable after the fact — a collector that has the id can say what the door
++/// decided without having been there.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Sampler {
++    /// Traces out of every thousand that are started.
++    per_mille: u16,
++}
++
++impl Sampler {
++    /// A sampler that starts `per_mille` traces out of every thousand.
++    ///
++    /// Above a thousand it is every trace, which is the only sensible reading of "more than all of
++    /// them".
++    #[must_use]
++    pub const fn per_mille(per_mille: u16) -> Self {
++        Self {
++            per_mille: if per_mille > 1000 { 1000 } else { per_mille },
++        }
++    }
++
++    /// Every trace.
++    #[must_use]
++    pub const fn always() -> Self {
++        Self::per_mille(1000)
++    }
++
++    /// No trace, which is a deployment that has turned tracing off at the door rather than a
++    /// deployment that drops what it has: the ids are still minted and still carried, and it is the
++    /// decisions that are all negative. A failure is still kept ([`Context::exported`]).
++    #[must_use]
++    pub const fn never() -> Self {
++        Self::per_mille(0)
++    }
++
++    /// The share this sampler starts, in per mille.
++    #[must_use]
++    pub fn share(&self) -> u16 {
++        self.per_mille
++    }
++
++    /// `true` when this trace is one the deployment starts.
++    ///
++    /// The last eight bytes of the id, read as a number, against the share: the low thousand
++    /// values of that number are the traces this sampler starts, so the decision is deterministic,
++    /// evenly spread over the id space, and free — no state, no lock, and no disagreement between
++    /// two processes that made it at the same time.
++    #[must_use]
++    pub fn decide(&self, trace: &TraceId) -> bool {
++        todo!(
++            "jobq/3.18-trace-sampling: the share — a function of the trace id and of nothing \
++             else, so that two hops which ask about one trace agree"
++        )
++    }
++}
++
++/// What travels with a job: the trace it belongs to, and the door's decision about it.
++///
++/// No span id, deliberately: a span is one hop's, the door and the attempt are two hops, and a
++/// context that carried the door's span id would make the whole queue look like one step in the
++/// waterfall.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Context {
++    /// The trace this job is part of.
++    trace: TraceId,
++    /// What the door decided: whether this trace is one the deployment starts.
++    sampled: bool,
++}
++
++impl Context {
++    /// What the door decides about a job it is accepting.
++    ///
++    /// A caller that sent a `traceparent` has already answered the question — its ids are used and
++    /// **its decision is kept**, because a hop with no sampler of its own has no business
++    /// overriding the sampler that started the trace. A caller that sent nothing starts a trace
++    /// here, and this deployment's [`Sampler`] decides; that is what "the door" means: one place
++    /// where a job's observability is settled, before anything is written down.
++    #[must_use]
++    pub fn of(parent: Option<&Traceparent>, sampler: &Sampler) -> Self {
++        todo!(
++            "jobq/3.18-trace-sampling: the door — the caller's trace and decision when there is \
++             a caller, a fresh trace and this deployment's share when there is not"
++        )
++    }
++
++    /// The context a store read back, decision and all.
++    ///
++    /// The read half of the round trip, like [`crate::engine::JobEvent::stored`]: a store hands the
++    /// row back without deciding anything again, because a store that re-ran the sampler would be a
++    /// second door — and the whole point of the decision is that it is made once and carried.
++    #[must_use]
++    pub fn stored(trace: TraceId, sampled: bool) -> Self {
++        Self { trace, sampled }
++    }
++
++    /// The trace this job is part of.
++    #[must_use]
++    pub fn trace(&self) -> TraceId {
++        self.trace
++    }
++
++    /// What the door decided.
++    #[must_use]
++    pub fn sampled(&self) -> bool {
++        self.sampled
++    }
++
++    /// Whether the hop that just ended is one that gets kept.
++    ///
++    /// The door's decision, unless the hop failed: a failed attempt is kept whatever the door said,
++    /// because the interesting trace is the one nobody asked for in advance and the failure is the
++    /// only place that can be learned. This is the second decision, and the reason it can be made
++    /// here at all is that the *id* travelled: a hop that re-asked its own sampler would be deciding
++    /// the same question again with less information than the door had.
++    #[must_use]
++    pub fn exported(&self, failed: bool) -> bool {
++        todo!(
++            "jobq/3.18-trace-sampling: the exit — the door's answer, unless this hop is one an \
++             operator will need to read"
++        )
++    }
++}
++
++/// One hop's trace: the context the job carried, and the span of *this* attempt.
++///
++/// The two halves are the whole of what a hop adds to a trace. The context is the job's — the trace
++/// id and the door's decision, neither of which a hop may change — and the span is the hop's own,
++/// minted here, because a span is one step in the waterfall and reusing the previous one makes two
++/// hops look like one. A retry mints another: the second attempt is the one worth looking at, and it
++/// is invisible if it shares a span with the first.
++#[derive(Debug, Clone, Copy)]
++pub struct Hop<'a> {
++    /// What the job carried.
++    context: &'a Context,
++    /// The span of this hop.
++    span: SpanId,
++}
++
++impl<'a> Hop<'a> {
++    /// The next hop of a trace: a span of its own, the context untouched.
++    #[must_use]
++    pub fn of(context: &'a Context) -> Self {
++        Self {
++            context,
++            span: SpanId::generate(),
++        }
++    }
++
++    /// The trace id, which every hop of one trace shares.
++    #[must_use]
++    pub fn trace(&self) -> TraceId {
++        self.context.trace()
++    }
++
++    /// This hop's span.
++    #[must_use]
++    pub fn span(&self) -> SpanId {
++        self.span
++    }
++
++    /// Whether this hop is kept, given how it ended.
++    #[must_use]
++    pub fn exported(&self, failed: bool) -> bool {
++        self.context.exported(failed)
++    }
++}
++
++/// The lower-case hex of some bytes.
++fn hex(bytes: &[u8]) -> String {
++    let mut text = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        text.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
++        text.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
++    }
++    text
++}
