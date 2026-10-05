@@ -1,0 +1,263 @@
+diff --git a/src/engine/walk.rs b/src/engine/walk.rs
+new file mode 100644
+index 0000000..17f5aa7
+--- /dev/null
++++ b/src/engine/walk.rs
+@@ -0,0 +1,257 @@
++//! A walk over the model: generate, ask after every step, and shrink what breaks.
++//!
++//! Step `jobq/3.19-property-invariants`. An example says "this input has that answer"; a property
++//! says "no input has any other", and the half that makes a property worth writing is the
++//! **counter-example** — a seed and the operations that break it — because that is what turns
++//! "this queue is broken somewhere" into a case somebody can run.
++//!
++//! Three decisions are written into the shapes below rather than into a test file:
++//!
++//! * **a walk is a seed.** [`Rng`] turns one number into an operation sequence with integer
++//!   arithmetic and nothing else, so the same seed produces the same operations on every machine,
++//!   in every run, in any process. A finding that could not be replayed would be a rumour.
++//! * **the invariant is asked after every step, not after the last one.** [`Invariant`] is handed
++//!   the history and the step that just happened, and the walk stops at the *first* step that says
++//!   no. A checker that runs at the end reports the whole sequence, and the operation to look at
++//!   is then usually not the last one.
++//! * **a refusal is a step.** `jobq/3.14-job-state-machine`'s `transition` refuses far more pairs
++//!   than it allows, and a walk that stopped at the first refusal would only ever see the moves a
++//!   job is *meant* to make — the part nobody needs a property test for.
++//!
++//! What is **not** here is the properties themselves. They belong to whoever runs the walk: a
++//! property is a decision about this queue, and this module is the machine that asks it a thousand
++//! times. The model below is the engine's own `transition` rather than a second copy of the table,
++//! so a walk exercises the rule the two stores actually ask (`jobq/3.14-job-state-machine`).
++
++use crate::engine::domain::JobState;
++use crate::engine::state::{EVENTS, Event, Illegal, transition};
++
++/// A generator: one seed in, one reproducible sequence of operations out.
++///
++/// Two promises, and both of them are what makes a finding worth reporting:
++///
++/// * **the same seed produces the same operations** — on any machine, in any process, in any build
++///   — because the arithmetic below is integer arithmetic and nothing else: no clock, no thread id,
++///   no address, no hash seed. A finding nobody can replay is a rumour;
++/// * **the sequence is spread over the whole alphabet.** [`Rng::below`] answers every value in its
++///   range, so a long walk reaches every event the model has rather than the first one over and
++///   over.
++///
++/// It is not a cryptographic generator and does not pretend to be. `splitmix64` is chosen because
++/// it is a counter and two mixing steps, it is deterministic by construction, and the only thing
++/// this build asks of it is an index into a list of six events.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Rng {
++    /// The whole state of the generator. Nothing else is kept, which is what makes two generators
++    /// built from one seed the same generator.
++    state: u64,
++}
++
++impl Rng {
++    /// A generator that starts from `seed`.
++    #[must_use]
++    pub fn new(seed: u64) -> Self {
++        todo!("jobq/3.19-property-invariants: the whole state of a generator is its seed")
++    }
++
++    /// The next 64 bits: the state advances, and what comes out is the state mixed with itself.
++    pub fn next_u64(&mut self) -> u64 {
++        todo!("jobq/3.19-property-invariants: a counter and two mixing steps, integer arithmetic")
++    }
++
++    /// A number in `0..bound`, and `0` when there is nothing to draw from.
++    ///
++    /// `0` rather than a panic, because "draw from an empty list" has one sane answer and a library
++    /// that panicked on it would fail inside somebody else's process.
++    ///
++    /// A remainder is not perfectly uniform when the bound does not divide 2^64 — for an alphabet
++    /// of six operations the bias is about one part in 3e18 — and that is the trade this generator
++    /// makes on purpose: a walk is a search for a counter-example, not a sample for a statistic.
++    #[must_use]
++    pub fn below(&mut self, bound: u64) -> u64 {
++        todo!("jobq/3.19-property-invariants: in range, total, and the same answer for one seed")
++    }
++}
++
++/// One step of a walk: what was played, and where the model went.
++///
++/// The invariant is handed the step rather than the state alone, because the properties worth
++/// writing are about *moves*: "a finished job is never handed out again" is a sentence about a
++/// before and an after, and a checker that saw only the state would have to keep its own copy of
++/// the trajectory to say it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Step {
++    /// The event that was played.
++    event: Event,
++    /// The state before it.
++    before: JobState,
++    /// The state after it: the model's destination, or `before` when the model refused the event.
++    after: JobState,
++    /// Whether the model accepted the event.
++    applied: bool,
++}
++
++impl Step {
++    /// The event that was played: one of the model's own events, never an invented one.
++    #[must_use]
++    pub fn event(&self) -> Event {
++        todo!("jobq/3.19-property-invariants: the event this step was handed")
++    }
++
++    /// The state the job was in.
++    #[must_use]
++    pub fn before(&self) -> JobState {
++        todo!("jobq/3.19-property-invariants: the state this step started from")
++    }
++
++    /// The state it is in now — or the one it was in when the model refused the event.
++    #[must_use]
++    pub fn after(&self) -> JobState {
++        todo!("jobq/3.19-property-invariants: the state this step ends in")
++    }
++
++    /// Whether the model accepted the event. A refusal is a step like any other: the event
++    /// happened, and the machine said no.
++    #[must_use]
++    pub fn applied(&self) -> bool {
++        todo!("jobq/3.19-property-invariants: whether the model took this step")
++    }
++}
++
++/// What a walk must keep, asked after every step.
++///
++/// One method, and `false` means "this step is the counter-example": the walk stops there, and the
++/// operations up to and including this one are what it reports. A property that cannot answer
++/// "no" is decoration — and the cheapest way to find out whether it can is to hand the walk one
++/// that always says `false`.
++///
++/// `history` is the events played so far, this one included, whether the model accepted them or
++/// refused them: a property about what a queue *saw* is not a property about what it did.
++pub trait Invariant {
++    /// Whether this step is allowed. `false` ends the walk here.
++    fn holds(&self, history: &[Event], step: &Step) -> bool;
++}
++
++/// A model a walk can step through.
++///
++/// The engine's own state machine is the model this crate walks ([`Machine`]); the trait exists so
++/// that a walk can also be pointed at a *changed* one — a rule somebody broke on purpose — which is
++/// what `jobq/3.20-mutation-threshold` does with a table of them. A model that is a second
++/// implementation of the table the engine runs would be a test of the copy, and that is why
++/// [`Machine`] delegates rather than re-states.
++pub trait Model {
++    /// Apply `event` to a job in `state`, or refuse it.
++    ///
++    /// # Errors
++    ///
++    /// [`Illegal`] when the model does not allow the move — the refusal names the state, the event
++    /// and the reason, and it is the same value `transition` answers with.
++    fn step(&self, state: JobState, event: Event) -> Result<JobState, Illegal>;
++}
++
++/// The engine's own state machine, as a model.
++///
++/// Zero-sized, because it is a name for `transition` rather than a thing with state: the table
++/// lives in one place in this crate, and a walk is another way of asking it questions.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Machine;
++
++impl Model for Machine {
++    fn step(&self, state: JobState, event: Event) -> Result<JobState, Illegal> {
++        todo!("jobq/3.19-property-invariants: the model is `transition`, not a copy of the table")
++    }
++}
++
++/// A property a walk broke: the seed it came from, and the operations that break it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Counterexample {
++    /// The seed of the run this was found in.
++    seed: u64,
++    /// The operations, up to and including the one that broke the invariant.
++    ops: Vec<Event>,
++}
++
++impl Counterexample {
++    /// What somebody has in hand: a run's seed, and the operations that break the invariant.
++    ///
++    /// Both, because they are two different things to reproduce. The seed replays the *run*; the
++    /// operations are the *case*, and after [`shrink`] they are no longer what that seed generates
++    /// — which is exactly why they are written down next to it.
++    #[must_use]
++    pub fn new(seed: u64, ops: Vec<Event>) -> Self {
++        todo!("jobq/3.19-property-invariants: a finding is a seed and a case")
++    }
++
++    /// The seed of the run this came from.
++    #[must_use]
++    pub fn seed(&self) -> u64 {
++        todo!("jobq/3.19-property-invariants: the run this case came from")
++    }
++
++    /// The operations, up to and including the one that broke the invariant.
++    #[must_use]
++    pub fn ops(&self) -> &[Event] {
++        todo!("jobq/3.19-property-invariants: the case, as operations")
++    }
++}
++
++/// Walk `length` generated operations from `seed` through `model`, asking the invariant after
++/// every step.
++///
++/// `None` means the invariant held everywhere — which is the answer a property gets most of the
++/// time, and the only answer that is worth nothing on its own: a walk is evidence when it *can*
++/// come back with something, so the step's spec hands it an invariant that cannot hold and a model
++/// with a planted defect and checks that it does.
++///
++/// A walk starts where a job starts (`queued`, the state an enqueue writes), plays the events the
++/// model's own alphabet lists, and treats a refusal as a step that left the job where it was.
++#[must_use]
++pub fn walk(
++    model: &dyn Model,
++    seed: u64,
++    length: usize,
++    invariant: &dyn Invariant,
++) -> Option<Counterexample> {
++    todo!("jobq/3.19-property-invariants: generate from the seed, ask after every step")
++}
++
++/// Play a written-down sequence of operations through `model`, asking the invariant after every
++/// step.
++///
++/// This is the walk without the generator in front of it, and it is what makes a finding a *case*:
++/// the operations of a counter-example can be replayed on their own, on a machine that generates
++/// nothing, and a shrunk one ([`shrink`]) is nothing but a shorter sequence somebody replays.
++///
++/// A sequence that never breaks the invariant answers `None`, and the operations it was given are
++/// not all played: the answer is the *prefix* up to the first step that said no, which is the same
++/// thing [`walk`] reports.
++#[must_use]
++pub fn replay(
++    model: &dyn Model,
++    seed: u64,
++    ops: &[Event],
++    invariant: &dyn Invariant,
++) -> Option<Counterexample> {
++    todo!("jobq/3.19-property-invariants: the walk without the generator in front of it")
++}
++
++/// The same failure with the operations it does not need taken out.
++///
++/// The contract is three sentences, and each of them is what the step's spec checks:
++///
++/// * the answer still breaks the invariant;
++/// * its operations are the ones it was given, in the same order, with some of them left out;
++/// * **no single operation can be taken out of the answer and still break it** — a locally minimal
++///   case. Deliberately not "the smallest": the smallest is a search over every subset, and the
++///   case a person reads is the one where nothing obvious is left to remove.
++///
++/// The seed is carried over, so the report says which run this came from even though the operations
++/// are no longer what that seed generates.
++#[must_use]
++pub fn shrink(
++    model: &dyn Model,
++    invariant: &dyn Invariant,
++    found: &Counterexample,
++) -> Counterexample {
++    todo!("jobq/3.19-property-invariants: take out what the failure does not need")
++}

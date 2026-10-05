@@ -1,0 +1,224 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 7c424aa..8021c1d 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -41,6 +41,7 @@ pub(crate) mod tenant;
+ pub(crate) mod timers;
+ pub(crate) mod trace;
+ pub(crate) mod usage;
++pub(crate) mod walk;
+ 
+ mod sealed;
+ 
+@@ -66,3 +67,4 @@ pub use tenant::{TENANT_NAME_MAX, Tenant};
+ pub use timers::ReadySet;
+ pub use trace::{Context, Hop, SPAN_ID_HEX, Sampler, SpanId, TRACE_ID_HEX, TraceId, Traceparent};
+ pub use usage::{QueueUsage, Usage};
++pub use walk::{Counterexample, Invariant, Machine, Model, Rng, Step, replay, shrink, walk};
+diff --git a/src/engine/walk.rs b/src/engine/walk.rs
+index 17f5aa7..32beec2 100644
+--- a/src/engine/walk.rs
++++ b/src/engine/walk.rs
+@@ -26,6 +26,10 @@
+ use crate::engine::domain::JobState;
+ use crate::engine::state::{EVENTS, Event, Illegal, transition};
+ 
++/// The increment `splitmix64` steps its state by: the 64-bit expansion of the golden ratio, which
++/// is the whole argument for choosing it.
++const SPLITMIX: u64 = 0x9e37_79b9_7f4a_7c15;
++
+ /// A generator: one seed in, one reproducible sequence of operations out.
+ ///
+ /// Two promises, and both of them are what makes a finding worth reporting:
+@@ -51,12 +55,16 @@ impl Rng {
+     /// A generator that starts from `seed`.
+     #[must_use]
+     pub fn new(seed: u64) -> Self {
+-        todo!("jobq/3.19-property-invariants: the whole state of a generator is its seed")
++        Self { state: seed }
+     }
+ 
+     /// The next 64 bits: the state advances, and what comes out is the state mixed with itself.
+     pub fn next_u64(&mut self) -> u64 {
+-        todo!("jobq/3.19-property-invariants: a counter and two mixing steps, integer arithmetic")
++        self.state = self.state.wrapping_add(SPLITMIX);
++        let mut mixed = self.state;
++        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
++        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
++        mixed ^ (mixed >> 31)
+     }
+ 
+     /// A number in `0..bound`, and `0` when there is nothing to draw from.
+@@ -69,7 +77,10 @@ impl Rng {
+     /// makes on purpose: a walk is a search for a counter-example, not a sample for a statistic.
+     #[must_use]
+     pub fn below(&mut self, bound: u64) -> u64 {
+-        todo!("jobq/3.19-property-invariants: in range, total, and the same answer for one seed")
++        if bound == 0 {
++            return 0;
++        }
++        self.next_u64() % bound
+     }
+ }
+ 
+@@ -95,26 +106,26 @@ impl Step {
+     /// The event that was played: one of the model's own events, never an invented one.
+     #[must_use]
+     pub fn event(&self) -> Event {
+-        todo!("jobq/3.19-property-invariants: the event this step was handed")
++        self.event
+     }
+ 
+     /// The state the job was in.
+     #[must_use]
+     pub fn before(&self) -> JobState {
+-        todo!("jobq/3.19-property-invariants: the state this step started from")
++        self.before
+     }
+ 
+     /// The state it is in now — or the one it was in when the model refused the event.
+     #[must_use]
+     pub fn after(&self) -> JobState {
+-        todo!("jobq/3.19-property-invariants: the state this step ends in")
++        self.after
+     }
+ 
+     /// Whether the model accepted the event. A refusal is a step like any other: the event
+     /// happened, and the machine said no.
+     #[must_use]
+     pub fn applied(&self) -> bool {
+-        todo!("jobq/3.19-property-invariants: whether the model took this step")
++        self.applied
+     }
+ }
+ 
+@@ -158,7 +169,7 @@ pub struct Machine;
+ 
+ impl Model for Machine {
+     fn step(&self, state: JobState, event: Event) -> Result<JobState, Illegal> {
+-        todo!("jobq/3.19-property-invariants: the model is `transition`, not a copy of the table")
++        transition(state, event)
+     }
+ }
+ 
+@@ -179,19 +190,19 @@ impl Counterexample {
+     /// — which is exactly why they are written down next to it.
+     #[must_use]
+     pub fn new(seed: u64, ops: Vec<Event>) -> Self {
+-        todo!("jobq/3.19-property-invariants: a finding is a seed and a case")
++        Self { seed, ops }
+     }
+ 
+     /// The seed of the run this came from.
+     #[must_use]
+     pub fn seed(&self) -> u64 {
+-        todo!("jobq/3.19-property-invariants: the run this case came from")
++        self.seed
+     }
+ 
+     /// The operations, up to and including the one that broke the invariant.
+     #[must_use]
+     pub fn ops(&self) -> &[Event] {
+-        todo!("jobq/3.19-property-invariants: the case, as operations")
++        &self.ops
+     }
+ }
+ 
+@@ -212,7 +223,12 @@ pub fn walk(
+     length: usize,
+     invariant: &dyn Invariant,
+ ) -> Option<Counterexample> {
+-    todo!("jobq/3.19-property-invariants: generate from the seed, ask after every step")
++    let mut rng = Rng::new(seed);
++    let mut drawn = Vec::with_capacity(length);
++    for _ in 0..length {
++        drawn.push(draw(&mut rng));
++    }
++    replay(model, seed, &drawn, invariant)
+ }
+ 
+ /// Play a written-down sequence of operations through `model`, asking the invariant after every
+@@ -232,7 +248,8 @@ pub fn replay(
+     ops: &[Event],
+     invariant: &dyn Invariant,
+ ) -> Option<Counterexample> {
+-    todo!("jobq/3.19-property-invariants: the walk without the generator in front of it")
++    let at = first_break(model, invariant, ops)?;
++    Some(Counterexample::new(seed, prefix(ops, at)))
+ }
+ 
+ /// The same failure with the operations it does not need taken out.
+@@ -253,5 +270,72 @@ pub fn shrink(
+     invariant: &dyn Invariant,
+     found: &Counterexample,
+ ) -> Counterexample {
+-    todo!("jobq/3.19-property-invariants: take out what the failure does not need")
++    let mut ops = found.ops().to_vec();
++    while let Some(shorter) = remove_one(model, invariant, &ops) {
++        ops = shorter;
++    }
++    Counterexample::new(found.seed(), ops)
++}
++
++/// The next operation: an event of the model's alphabet, and never anything else.
++///
++/// The alphabet is `EVENTS` rather than a list written here, because the list the model answers
++/// about and the list a walk draws from have to be one list (`jobq/3.14-job-state-machine`).
++fn draw(rng: &mut Rng) -> Event {
++    let index = rng.below(EVENTS.len() as u64) as usize;
++    EVENTS
++        .into_iter()
++        .cycle()
++        .nth(index)
++        .unwrap_or(Event::Claim)
++}
++
++/// The operations up to and including `at`.
++fn prefix(ops: &[Event], at: usize) -> Vec<Event> {
++    ops.iter().copied().take(at + 1).collect()
++}
++
++/// The index of the first step of `ops` that broke the invariant, if one did.
++fn first_break(model: &dyn Model, invariant: &dyn Invariant, ops: &[Event]) -> Option<usize> {
++    let mut history: Vec<Event> = Vec::with_capacity(ops.len());
++    let mut state = JobState::Queued;
++    for (index, event) in ops.iter().copied().enumerate() {
++        history.push(event);
++        let (after, applied) = destination(model, state, event);
++        let step = Step {
++            event,
++            before: state,
++            after,
++            applied,
++        };
++        if !invariant.holds(&history, &step) {
++            return Some(index);
++        }
++        state = after;
++    }
++    None
++}
++
++/// What the model answered, as a state and a flag: a refusal leaves the job where it was.
++fn destination(model: &dyn Model, state: JobState, event: Event) -> (JobState, bool) {
++    match model.step(state, event) {
++        Ok(after) => (after, true),
++        Err(_) => (state, false),
++    }
++}
++
++/// The first operation whose removal keeps the failure, from the end of the sequence towards the
++/// front, or `None` when there is none.
++///
++/// The direction is the one a person reads a case in: the last operation is usually the noise a
++/// long walk added after the interesting one, so it is the first candidate.
++fn remove_one(model: &dyn Model, invariant: &dyn Invariant, ops: &[Event]) -> Option<Vec<Event>> {
++    for index in (0..ops.len()).rev() {
++        let mut candidate = ops.to_vec();
++        candidate.remove(index);
++        if first_break(model, invariant, &candidate).is_some() {
++            return Some(candidate);
++        }
++    }
++    None
+ }
