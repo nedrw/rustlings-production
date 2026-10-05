@@ -447,13 +447,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（23/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（24/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
-| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` must gates，全部 `hold the contract` |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`23/23 judged · 0 failed · 0 blocked · 4 not_authored`**（22 步热跑 3 m 17 s，23 步 6 m 1 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
-| 默认特性全量套件 | `cargo test -p jobq` → **164 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164）|
+| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.24 `12/12` must gates，全部 `hold the contract`；**3.23 是例外**：`verify --slow` 13/13 全绿，`selftest` 在 `conformance@2` 红（§5.2） |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`24/24 judged · 0 failed · 0 blocked · 3 not_authored`**（22 步热跑 3 m 17 s，23 步 6 m 1 s，24 步 5 m 15 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **173 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
@@ -519,6 +519,21 @@ totals: {passed: 19, failed: 1, blocked: 0, not_authored: 7}
 ② 掏空时留下了：双空行→`fmt` 红，未用导入→`clippy` 红，误伤了辅助函数→整个树编不过。在**共享树**上做演习，先把自己弄得 lint-clean，
 否则你读到的是别的门。附带收获：树编不过时，`mutants` 拒绝判分，说“the spec does not pass on the project as it is, so no mutant can
 be judged”（它不会把编译错误当成杀死）。
+
+**e) `unsafe-budget@0`（第 3.24 步）：往生产代码里加一个没有理由的 `unsafe` 块。**
+劣化：在 `src/lib.rs` 追加一带有 `#[allow(unsafe_code)]`、**没有** `// SAFETY:` 的 `unsafe` 块。
+`verify jobq --slow` 只有 3.24 一步红，三层防线依次亮（原始行）：
+
+```
+slow:bench-budget@10 (must): 2 of 3 metric(s) moved out of budget: unsafe_occurrences is 1, 1 of the
+  baseline 0 (more than ±10%); undocumented_max is 1 and has to stay ≤ 0 (it is an upper bound)
+unsafe-budget@0 (must): 1 `unsafe` occurrence(s) in production code and this step allows 0: src/lib.rs:21
+spec ✗ … test the_crate_holds_its_own_budget … FAILED
+```
+
+（编译器那一层也亮：没有 `#[allow]` 时 `cargo check` 直接报 `usage of an unsafe block … -D unsafe-code`。）
+补上 `// SAFETY:` 之后 `unsafe_occurrences=1`、`undocumented_max=0` —— **仍然 Over**，也就是说贵的是那个数字，不是注释。
+回滚后 spec `8/8`、harness 三个零、门全绿。
 
 **c) `slow:bench-budget@10`（第 3.22 步）：把被预算盯着的路径换成 O(n²) 扫描。**
 劣化：`Pull::next` 每次发放都从批次开头重扫（丢掉游标），**答案不变、代价变了**。原始行：
@@ -622,6 +637,9 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **探题的句子与门不一致（收尾时对齐）**：`course/probes/unsafe-budget.apply.rs` 写着“`// SAFETY:` 在**同一行或上面三行**”，
+  而 3.24 的规格与 `unsafe-budget@0` 门都要求**在上面**三行内。探题从不测同行注释，所以没有红；对齐它要么改那句话、要么改门的判据（建议改探题那句话，因为门与项目的 `// SAFETY:` 习惯一致）。
+- **3.23 的 `slow:mutants@80` 是 `5/6 (83%)`**（过线但在边上）：它的模块里有一个变异体没有规格能杀。留给收尾时决定是否补一条断言。
 - **`selftest` 与 `verify` 在 3.23 上不一致（已记，未解）**：同一条命令下 `verify jobq --slow` 让 3.23 全绿
   （13/13 must 门，含页面用例与 `conformance@2`），而 `selftest jobq/3.23` 两次（暖缓存 + 全新缓存）都在
   `slow:conformance@2` 红，两个后端都停在 `spec_online_schema.rs:113:33`（页面读取）。现场采样的线索：
