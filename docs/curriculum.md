@@ -182,7 +182,7 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `perf/distributed-budget` | — | — | T5·5.17 | — |
 | `release/container-image` | — | T1·1.21 | T4·4.22 | — |
 | `release/artifacts` | — | T3·3.25 | — | — |
-| `ops/runbook-drill` | — | T1·1.22 | T3·3.26 | T4·4.24 |
+| `ops/runbook-drill` | — | T1·1.22 | T3·3.27 | T4·4.24 |
 | `ops/degradation-modes` | — | T2·2.24 | — | — |
 | `ops/rolling-upgrade` | — | T2·2.22 | T5·5.21 | — |
 | `ops/backup-restore` | — | T4·4.19 | — | — |
@@ -254,7 +254,7 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 ```mermaid
 flowchart TD
     T1["T1 mailer 邮件订阅微服务（22 步，入门→中）"] --> T2["T2 relay Webhook 投递（24 步，中）"]
-    T2 --> T3["T3 jobq 任务队列引擎（26 步，中高）"]
+    T2 --> T3["T3 jobq 任务队列引擎（27 步，中高）"]
     T3 --> T4["T4 lakelet 遥测存储与查询（24 步，高）"]
     T4 --> T5["T5 meshkv 分布式 KV/调度（22 步，最高，可选）"]
     P["probe + drill 库（间隔重复）"] -.-> T1
@@ -370,7 +370,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | 2.23 | 在线 schema 变更的第一次规模 | teach | `db/schema-online-evolution@aware` | 新旧代码并存读写通过 |
 | 2.24 | runbook v2 + 故障演练：DB 断连、下游慢、租户风暴 | deepen | `ops/degradation-modes@apply`（新增能力），并深化 T1 的 runbook 演练 | 三类演练脚本可复跑 |
 
-## 8. T3 `jobq`：通用任务队列引擎（26 步）
+## 8. T3 `jobq`：通用任务队列引擎（27 步）
 
 **状态：在建**（元数据、项目骨架与门阶梯已落地，逐步交付进度见
 [handoff-m2.md](handoff-m2.md) §2 与 [handoff-m2-log.md](handoff-m2-log.md)）。
@@ -400,7 +400,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 3.13 | 队列级授权与用量归因 | `sec/authz-tenant-isolation@operate` | 越权 + 归因报表 |
 | 3.14 | 任务状态机与终态语义 | `domain/state-machine@apply` | 非法转移不可表示（枚举 + property） |
 | 3.15 | CLI 契约：子命令、`--json`、退出码、stdin/stdout | `cli/contract@apply` | CLI 集成测试 |
-| 3.16 | DLQ 工具链：检查/重放/丢弃 | `ops/dlq-tooling@apply`、`delivery/dlq@operate` | 重放幂等、可审计 |
+| 3.16 | 死信队列视图与重放（端口层） | `ops/dlq-tooling@apply`、`delivery/dlq@operate` | 重放幂等、可审计 |
 | 3.17 | 指标与告警：错误预算、降噪 | `obs/metrics-slo@design`、`obs/structured-logs@design` | 告警规则能在故障演练中触发 |
 | 3.18 | 追踪跨队列传播与采样 | `obs/tracing-propagation@operate` | 采样策略不丢关键路径 |
 | 3.19 | 属性测试：状态机不变量 | `test/property-based@apply` | 找到过至少一个真实不变量违反 |
@@ -410,7 +410,8 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 3.23 | 在线 schema 演进：expand → backfill → contract | `db/schema-online-evolution@apply` | 三阶段演练 |
 | 3.24 | unsafe 预算：默认 `deny(unsafe_code)`，放行需安全注释 | `unsafe/budget@apply` | `unsafe-budget` 闸门 |
 | 3.25 | 制品与发布：`cargo-dist`、校验和、CHANGELOG 纪律 | `release/artifacts@apply` | 制品可运行 + checksum |
-| 3.26 | runbook 与升级演练 | `ops/runbook-drill@design` | 演练 + 复盘文档 |
+| 3.26 | 死信队列的操作台：看、重放、带理由丢弃 | `ops/dlq-tooling@operate`、`cli/contract@design` | 审计行 + 破坏性命令的理由 |
+| 3.27 | runbook 与升级演练 | `ops/runbook-drill@design` | 演练 + 复盘文档 |
 
 ## 9. T4 `lakelet`：遥测摄取与查询（24 步）
 

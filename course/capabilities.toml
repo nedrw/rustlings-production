@@ -92,6 +92,7 @@ apply = "meshkv/5.11"
 
 [capability."cli/contract"]
 apply = "jobq/3.15"
+design = "jobq/3.26"
 
 [capability."query/consistency-levels"]
 apply = "meshkv/5.12"
@@ -182,6 +183,7 @@ operate = "jobq/3.16"
 
 [capability."ops/dlq-tooling"]
 apply = "jobq/3.16"
+operate = "jobq/3.26"
 
 [capability."outbound/http-client"]
 apply = "relay/2.7"
@@ -283,7 +285,7 @@ apply = "jobq/3.25"
 
 [capability."ops/runbook-drill"]
 apply = "mailer/1.22"
-design = "jobq/3.26"
+design = "jobq/3.27"
 operate = "lakelet/4.24"
 
 [capability."ops/degradation-modes"]

@@ -1,7 +1,7 @@
-# M2 交接简报（T3 `jobq` 的 26 步 + 慢闸门 + conformance 套件）
+# M2 交接简报（T3 `jobq` 的 27 步 + 慢闸门 + conformance 套件）
 
 > M0/M1 见 [handoff-m0.md](handoff-m0.md) 与 [handoff-m1.md](handoff-m1.md)（机制、命令、约定、环境事实）。
-> 这份文件是 M2 的压缩上下文：慢闸门的分级决定与实现契约（§1）、T3 的 26 步与项目形状（§2）、
+> 这份文件是 M2 的压缩上下文：慢闸门的分级决定与实现契约（§1）、T3 的 27 步与项目形状（§2）、
 > 施工中钉下来的决定（§3）、实测数字与验收证据（§4）、缺口（§5）。
 > 施工过程分段记在 [handoff-m2-log.md](handoff-m2-log.md)。
 
@@ -9,7 +9,7 @@
 
 | 验收项 | 判据 |
 | --- | --- |
-| T3 `jobq` 26 步 | 正文、只读规格、加性 scaffold、参考解、闸门接线全部就位；`kiln verify jobq` 在最终树上全绿 |
+| T3 `jobq` 27 步 | 正文、只读规格、加性 scaffold、参考解、闸门接线全部就位；`kiln verify jobq` 在最终树上全绿 |
 | 慢闸门接入判定器并分级 | `mutants`、`coverage`、`bench-budget`、`semver`、`unsafe-budget` 都能跑；分级写进 plan §10 与本文件 §1 |
 | `conformance` 套件 | 同一套件在内存实现与 Postgres 实现上都跑（`conformance@N`） |
 | **故意劣化能被抓住** | 删掉索引 / 把 O(log n) 换成线性扫描 → `bench-budget` 红；改坏断言或删分支测试 → `mutants` 红；删公开项或改签名 → `semver` 红 |
@@ -137,7 +137,7 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 - 代价（要写进正文与 README 的数字）：`mutants` 每步最多 6 次规格运行（含容器的话 6×秒级），
   `bench-budget` 一次 harness，`conformance` 每个后端一次规格运行。都是 slow 路径的事。
 
-## 2. T3 `jobq`：26 步、项目形状、门阶梯
+## 2. T3 `jobq`：27 步、项目形状、门阶梯
 
 题材：把 T2 的场景换成**给别人用的引擎**——库的公开面 + worker 守护进程 + CLI，
 重点从「写服务」转向「设计接口」与「用工具证明质量」（curriculum §8）。
@@ -174,7 +174,13 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 | 3.23 | `3.23-online-schema` | deepen | `db/schema-online-evolution@apply` |
 | 3.24 | `3.24-unsafe-budget` | deepen | `unsafe/budget@apply` |
 | 3.25 | `3.25-release-artifacts` | teach | `release/artifacts@apply` |
-| 3.26 | `3.26-runbook-drill` | deepen | `ops/runbook-drill@design` |
+| 3.26 | `3.26-dlq-cli` | deepen | `ops/dlq-tooling@operate`、`cli/contract@design` |
+| 3.27 | `3.27-runbook-drill` | deepen | `ops/runbook-drill@design` |
+
+> `3.26-dlq-cli` 是 2026-10 追加的第二十七步（用户决定：3.15 的 FURTHER 承诺了“对死信下手的命令”，
+> 而 3.16 按任务书只做了端口那一半）。它插在 runbook 演练**之前**，因为演练要用这些命令；
+> 代价最小：只把演练从 3.26 移到 3.27，`3.16` 正文里对它的引用、`capabilities.toml` 的槽位（
+> `ops/dlq-tooling.operate`、`cli/contract.design`）与 `ops/runbook-drill.design` 同步改。
 
 ### 2.2 门阶梯（只增不减）
 
@@ -184,16 +190,22 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 | 从哪一步起 | 新增 |
 | --- | --- |
 | 3.1 | `clippy@2`（T2 的终点，T3 的起点） |
-| 3.2 | `semver@baseline`（must，快）——基线一旦建立就**持续**到 3.26 |
+| 3.2 | `semver@baseline`（must，快）——基线一旦建立就**持续**到 3.27 |
 | 3.3 | `clippy@3`（`missing_errors_doc` + pedantic 白名单；`disallowed_methods` 要等 3.8 写 `clippy.toml` 才生效） |
 | 3.5 | `slow:conformance@2`（must）＋ `images`（该步要 Postgres 才给） |
 | 3.20 | `slow:mutants@80`（must）＋ `clippy@4` |
 | 3.21 | `slow:?coverage@80`（should，工具缺失时 blocked） |
 | 3.22 | `slow:bench-budget@10`（must） |
 | 3.24 | `unsafe-budget@0`（must，快） |
-| 3.25 / 3.26 | `links`（交付页面的步骤） |
+| 3.25 起 | `links`（交付页面的步骤） |
 
-`conformance@2` 只写在「这一步判的就是端口」的步骤上（3.5、3.6、3.7、3.9、3.12、3.16、3.23 之类的现场），
+**3.20 以后是累积的**：每一步的门清单＝上表在它这一步时已生效的全部行（这就是“只增不减”）；
+`track.toml` 里 3.20–3.27 的清单在插 3.26 时一并补齐过（之前 3.21–3.26 只写了自己新增的那一行，
+与这张表不一致），因此那几步的作者要预期自己的步骤带上：`slow:mutants@80`、`slow:?coverage@80`、
+从 3.22 起的 `slow:bench-budget@10`（并交 `course/tracks/jobq/budget/<step>.toml`）、
+从 3.24 起的 `unsafe-budget@0`、从 3.25 起的 `links`。`selftest` 因此每步大约多花一分钟（§4.4）。
+
+`conformance@2` 只写在「这一步判的就是端口」的步骤上（3.5、3.6、3.7、3.9、3.12、3.16、3.23、3.26 之类的现场），
 `images` 同样只写在真起 Postgres 的步骤上——两者都是**步骤作用域**属性（plan §6），
 回归保护靠 `verify` 跑遍每步自己的闸门。
 
@@ -390,7 +402,7 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（15/26 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（16/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
@@ -508,7 +520,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 | `http/rate-limit@design`（3.9） | 同一步的公平调度已有 `sched-fairness.design` |
 | `sec/authz-tenant-isolation@operate`（3.13） | 配额那一半是 `sched-fairness.design` 的，剩下的是计数报表 |
 | `delivery/dlq@operate`（3.16） | 与 `ops-dlq-tooling.apply` 同一步同一件事 |
-| `ops/runbook-drill@design`（3.26） | 证据是一页文档 + 对它的评审，探针只能查步骤表的形状 |
+| `ops/runbook-drill@design`（3.27） | 证据是一页文档 + 对它的评审，探针只能查步骤表的形状 |
 
 ### 5.2 其他
 

@@ -354,7 +354,7 @@ T1 已按这份表钉过一次精确版本（在 `app/mailer/Cargo.toml` 里，�
 | --- | --- | --- |
 | **M0 垂直切片** | `kiln` 骨架（list/run/check/watch/hint/state/verify + i18n 回退 + images/doctor）+ 12 个闸门 + **T1 `mailer` 全部 22 步真实内容** | 新克隆一条 `kiln` 能一路做完 T1；`selftest` 对 T1 全绿；`kiln --lang ja` 优雅回退；watch 存盘重跑；容器步骤在 podman 下跑通 |
 | **M1 去重机制 + T2** | 能力台账、`lint-caps`（§3 D4 六条规则）、deepen/transfer 模板与 RECALL 卡片、`kiln plan --fast`/`probe`、间隔重复；**T2 `relay` 全部 24 步** | `lint-caps` 全仓通过；T2 的**6** 个 deepen/transfer 步（1 transfer + 5 deepen，见 `track.toml` 与 curriculum §7）无 WHY 段、RECALL 点名真实存在的更早步骤；`plan --fast` 能正确跳过 T1 已证明能力；`review --due` 有真实 probe 题 |
-| **M2 T3 + 慢闸门** | **T3 `jobq` 26 步**；mutants/coverage/bench/semver/unsafe 接入；conformance 套件 | 故意引入的劣化能被 mutants 与 bench-budget 抓到；`semver` 能拦住破坏性改动 |
+| **M2 T3 + 慢闸门** | **T3 `jobq` 27 步**；mutants/coverage/bench/semver/unsafe 接入；conformance 套件 | 故意引入的劣化能被 mutants 与 bench-budget 抓到；`semver` 能拦住破坏性改动 |
 | **M3 T4 + 容器与性能基建** | **T4 `lakelet` 24 步**；镜像预拉与运行时抽象打磨；soak/剖析流程 | 无网环境（镜像已预拉）能跑完 T4 的快路径；soak 能发现故意注入的任务泄漏 |
 | **M4 T5 + 分布式基建** | **T5 `meshkv` 22 步**（可选 track）；`turmoil`/`madsim` 确定性模拟；集群故障演练 | 同一 seed 重复跑结果一致；注入网络分区后系统行为可预测且断言明确 |
 | **M5 收尾** | 中文全量翻译（或首批核心步骤 + 术语表）、文档站、`kiln new-track` 指南、年度维护流程 | 用指南在 1 小时内起一条 3 步的玩具 track；`i18n status` 能报出漂移 |
@@ -374,7 +374,7 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。
 
-**M2 进行中**（2026-10）：T3 `jobq` 的 26 步已开工（元数据、项目骨架与门阶梯已提交；第一步
+**M2 进行中**（2026-10）：T3 `jobq` 的 27 步已开工（元数据、项目骨架与门阶梯已提交；第一步
 `jobq/3.1-engine-boundary` 通过 `selftest` 的全部判据），慢闸门的 should/must 分级与缺工具时的对策先写在
 [handoff-m2.md](handoff-m2.md) §1——原则是 **`must` 闸门只用这台机器一定有东西判定**（编译器、课程自己的基线文件、
 确定性计数），`coverage`/`deny` 这类需要外部二进制的保持 should；另外 `xtask ci` 修正为**逐条走完所有已开工的 track**

@@ -592,7 +592,7 @@ images = ["postgres:17-alpine"]
 hint = "The delta over `relay/2.19` is the sampling decision: a job submitted with sampling off must still produce a trace when it fails, and the worker cannot decide that from the parent's flags alone."
 
 # --------------------------------------------------------------------------------------------
-# Phase D — prove it (3.19-3.26): properties, mutation, coverage, budgets, releases, runbooks.
+# Phase D — prove it (3.19-3.27): properties, mutation, coverage, budgets, releases, tooling, runbooks.
 # --------------------------------------------------------------------------------------------
 
 [[step]]
@@ -675,8 +675,8 @@ gates = [
     "exit-code",
     "links",
     "semver@baseline",
-    "slow:?coverage@80",
     "slow:mutants@80",
+    "slow:?coverage@80",
 ]
 hint = "The number is the easy half; the policy is `docs/coverage.md`: which error branch each line of the inventory is walked by, and why the threshold is not 100%."
 
@@ -705,8 +705,9 @@ gates = [
     "exit-code",
     "links",
     "semver@baseline",
-    "slow:bench-budget@10",
+    "slow:mutants@80",
     "slow:?coverage@80",
+    "slow:bench-budget@10",
 ]
 hint = "Wall-clock numbers on a shared machine are noise, so the budget counts work instead: the harness reports `jobq-budget` counters, `kiln` compares them with the baseline the course shipped, and a complexity guard catches the O(n^2) rewrite that a small input hides."
 
@@ -739,6 +740,10 @@ gates = [
     "exit-code",
     "images",
     "semver@baseline",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+    "slow:bench-budget@10",
+    "slow:conformance@2",
 ]
 images = ["postgres:17-alpine"]
 hint = "The delta over `relay/2.23` is that the backfill is now a job in the queue it is migrating: batched, rate-limited, resumable, and cancellable without leaving the table half-converted."
@@ -766,8 +771,11 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
-    "unsafe-budget@0",
     "semver@baseline",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+    "slow:bench-budget@10",
+    "unsafe-budget@0",
 ]
 hint = "The delta over `relay/2.21` is that the budget is a number the gate can hold you to: zero is a decision, and allowing one block costs a `// SAFETY:` comment that says what would break if it were wrong."
 
@@ -796,23 +804,62 @@ gates = [
     "exit-code",
     "links",
     "semver@baseline",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+    "slow:bench-budget@10",
+    "unsafe-budget@0",
 ]
 hint = "An artifact is a promise about a file: the release build produces the two binaries and a checksum file, the version in the binaries matches the tag, and `CHANGELOG.md` says what changed since the last one."
 
 [[step]]
-id = "3.26-runbook-drill"
+id = "3.26-dlq-cli"
+title = "The dead-letter queue from the command line: look, replay, and drop with a reason"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/jobq/3.26-dlq-cli.md"
+time_hint = "120m"
+concepts = ["operator door", "audit trail", "destructive command"]
+teaches = ["ops/dlq-tooling@operate", "cli/contract@design"]
+requires = ["ops/dlq-tooling@apply", "cli/contract@apply", "db/port-conformance@apply"]
+run = { cmd = "cargo test -p jobq --test spec_dlq_cli" }
+spec = ["spec/3.26/dlq_cli.rs"]
+scaffold = "scaffold/3.26-dlq-cli.patch"
+solution = "solutions/3.26-dlq-cli.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "images",
+    "links",
+    "semver@baseline",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+    "slow:bench-budget@10",
+    "slow:conformance@2",
+    "unsafe-budget@0",
+]
+images = ["postgres:17-alpine"]
+hint = "The engine already answers `dead_letters()` and `replay` (`jobq/3.16-dlq-tooling`); what this step designs is the *door* an operator walks through — which subcommands exist, what a destructive one demands before it acts, and what an auditor finds afterwards. The spec drives the real binary, so the grammar is judged by running it."
+
+[[step]]
+id = "3.27-runbook-drill"
 title = "Run the runbook: a drill that finds the operator's missing step"
 kind = "design"
 origin = "deepen"
-entry = "docs/steps/en/jobq/3.26-runbook-drill.md"
+entry = "docs/steps/en/jobq/3.27-runbook-drill.md"
 time_hint = "120m"
 concepts = ["drill script", "rollback path", "postmortem"]
 teaches = ["ops/runbook-drill@design"]
-requires = ["ops/runbook-drill@apply", "obs/metrics-slo@design", "ops/dlq-tooling@apply"]
+requires = ["ops/runbook-drill@apply", "obs/metrics-slo@design", "ops/dlq-tooling@operate"]
 run = { cmd = "cargo test -p jobq --test spec_runbook" }
-spec = ["spec/3.26/runbook.rs"]
-scaffold = "scaffold/3.26-runbook-drill.patch"
-solution = "solutions/3.26-runbook-drill.patch"
+spec = ["spec/3.27/runbook.rs"]
+scaffold = "scaffold/3.27-runbook-drill.patch"
+solution = "solutions/3.27-runbook-drill.patch"
 gates = [
     "spec-integrity",
     "caps",
@@ -824,6 +871,9 @@ gates = [
     "exit-code",
     "links",
     "semver@baseline",
+    "slow:mutants@80",
     "slow:?coverage@80",
+    "slow:bench-budget@10",
+    "unsafe-budget@0",
 ]
 hint = "A runbook that has never been executed is a wish: the drill drives the failure through the engine's own ports (a store that refuses writes, a lease holder that goes silent) and the page has to name the symptom, the check and the action for each."
