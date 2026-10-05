@@ -1,0 +1,361 @@
+diff --git a/docs/budget.md b/docs/budget.md
+new file mode 100644
+index 0000000..c8b58fa
+--- /dev/null
++++ b/docs/budget.md
+@@ -0,0 +1,40 @@
++# A budget a slow machine cannot fail
++
++"It got slower" is the review comment nobody can act on, and the obvious answer to it — time the
++thing — is a measurement of the machine that ran it. A wall-clock budget on a shared build machine is
++red on a busy afternoon and green on a quiet one, and the reflex it teaches is to re-run the job until
++it passes. That is a gate nobody reads.
++
++<!-- TODO: say what this budget counts instead, and why those numbers are the same on every machine.
++Then say what the workload is: how many rows, in what order, and how many of them are not due yet —
++a queue that is entirely due is the easy half of the measurement. -->
++
++## What we measure
++
++| metric | what it counts | baseline |
++| --- | --- | --- |
++| `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` |
++
++<!-- TODO: one row per metric the harness prints, with the baseline
++`course/tracks/jobq/budget/3.22-bench-budget.toml` records for it — the names are the ones
++`jobq::engine::METRICS` lists, and the spec compares this page with that list. Say why there are two
++counts and not one: which defect shows in one of them and not the other. -->
++
++## The guard
++
++<!-- TODO: what the third metric is, why it is an upper bound rather than a target, and what the
++drain it exists to catch costs on a short queue versus a long one. Say what `Work::scale_to` answers
++when there is nothing to compare with, and why that is not zero. -->
++
++## How this is checked
++
++<!-- TODO: the command that prints the numbers, the gate that compares them with the baseline, and
++what the gate answers for a metric the harness did not print. Link the harness and the test that
++pins the counts: [the harness](TODO), [the step's test](TODO). -->
++
++## Where this comes from
++
++<!-- TODO: what a wall-clock benchmark has to do to be trustworthy, and one harness built on counts
++for the reason this page gives. -->
+diff --git a/src/engine/budget.rs b/src/engine/budget.rs
+new file mode 100644
+index 0000000..d1edc2d
+--- /dev/null
++++ b/src/engine/budget.rs
+@@ -0,0 +1,237 @@
++//! What a performance budget is made of: counts, a bound, and the lines a harness prints.
++//!
++//! Step `jobq/3.22-bench-budget`. "It got slower" is not a review comment anybody can act on, and a
++//! wall-clock number is not an answer to it either: on a shared machine it measures the machine, on
++//! a quiet one it measures the build profile, and a gate built on it goes red for reasons that have
++//! nothing to do with the diff. What this module holds is the other half of the measurement —
++//! **the work, counted** — plus the one shape a count can still hide.
++//!
++//! Three decisions are written into the shapes below:
++//!
++//! * **a count is the same number on every machine.** [`Work`] counts the two things a queue
++//!   operation does: cells examined and statements written. A loop over a batch is a number of
++//!   iterations, not a number of milliseconds, and it is the *work* the review is about — a doubled
++//!   query count is a defect whether or not the machine was busy;
++//! * **a small input hides the shape of the growth.** [`Work::scale_to`] is the work at twice the
++//!   size over the work at one size: a drain that remembers where it stopped stays near two, and one
++//!   that starts over is `n`/2 per row and looks fine on a ten-row queue. That is the *guard* this
++//!   step is named for, and it is an upper bound rather than a target — the number is allowed to go
++//!   down;
++//! * **the numbers are content, not constants in a test.** [`METRICS`], [`SCALE_MAX`] and
++//!   [`report`] are the project's half of a budget that a *gate* holds it to: the gate runs the
++//!   harness that prints these lines and compares them with the course's baseline
++//!   (`course/tracks/jobq/budget/3.22-bench-budget.toml`), so the names here and the names there are
++//!   one table read from both sides.
++//!
++//! What this module is **not**: a benchmark. There is no warm-up, no median of ten runs, no timer
++//! anywhere in it — a number that needs statistics to be trusted is a number this project does not
++//! put in a gate.
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::domain::JobId;
++
++/// The metric name of the calls a drain made into the queue.
++///
++/// One statement per row handed out, because that is the write a claim costs a store: a drain that
++/// answers fewer statements than the queue has due rows has lost work, and a budget that only
++/// counted cells would not notice.
++pub const CLAIM_STATEMENTS: &str = "claim_statements";
++
++/// The metric name of the rows a drain looked at.
++///
++/// Every row examined, including the ones that turned out not to be due: the cost of a batch is what
++/// the loop walked over, not what it kept.
++pub const SCAN_CELLS: &str = "scan_cells";
++
++/// The metric name of the guard: the work at twice the size over the work at one size.
++pub const SCALE_RATIO_MAX: &str = "scale_ratio_max";
++
++/// Every metric a harness prints, in the order a report writes them.
++///
++/// The array exists so that a page, a harness and a baseline can be read against one list instead of
++/// three: `docs/budget.md` states these names, the harness prints them, and the course's baseline
++/// file is written in them.
++pub const METRICS: [&str; 3] = [CLAIM_STATEMENTS, SCAN_CELLS, SCALE_RATIO_MAX];
++
++/// The bound the guard is judged against, as the course's baseline states it.
++///
++/// Twice the input, at most 2.2 times the work: a slack of a tenth over the two a linear drain
++/// costs, which is room for a per-batch constant. It is an **upper bound**: a drain that got cheaper
++/// is a drain that passed.
++pub const SCALE_MAX: f64 = 2.2;
++
++/// What one operation cost, counted in units two machines agree on.
++///
++/// Two counters rather than one, because they answer different questions and a defect usually shows
++/// in exactly one of them: a drain that examines every row twice has twice the cells and the same
++/// statements, and a drain that hands out the same row twice has the opposite. The pair is what
++/// localizes the defect; a single total would only say that something changed.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Work {
++    /// Rows looked at.
++    cells: usize,
++    /// Rows handed out — the store-side write one claim costs.
++    statements: usize,
++}
++
++impl Work {
++    /// A meter that has counted nothing yet.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("jobq/3.22-bench-budget: a meter that has counted nothing yet")
++    }
++
++    /// One more row looked at.
++    pub fn examine(&mut self) {
++        todo!("jobq/3.22-bench-budget: one more row looked at")
++    }
++
++    /// One more row handed out.
++    pub fn statement(&mut self) {
++        todo!("jobq/3.22-bench-budget: one more row handed out")
++    }
++
++    /// How many rows were looked at.
++    #[must_use]
++    pub fn cells(&self) -> usize {
++        todo!("jobq/3.22-bench-budget: how many rows were looked at")
++    }
++
++    /// How many rows were handed out.
++    #[must_use]
++    pub fn statements(&self) -> usize {
++        todo!("jobq/3.22-bench-budget: how many rows were handed out")
++    }
++
++    /// The whole cost of the operation, in both units.
++    #[must_use]
++    pub fn total(&self) -> usize {
++        todo!("jobq/3.22-bench-budget: the whole cost of the operation, in both units")
++    }
++
++    /// How many times more work `larger` cost than this measurement, or `None` when this one did no
++    /// work at all.
++    ///
++    /// `None` rather than zero for the reason `jobq/3.20-mutation-threshold` answers `None` for a
++    /// run that judged nothing: a comparison with no denominator is not a number, and a `0.0` here
++    /// would compare with a bound like any other ratio and report a *pass* for a drain that measured
++    /// nothing at all.
++    ///
++    /// The ratio is the guard: the caller doubles one input and asks how much the work grew, which
++    /// is a question about the algorithm's shape rather than about the machine it ran on.
++    #[must_use]
++    pub fn scale_to(&self, larger: &Self) -> Option<f64> {
++        todo!(
++            "jobq/3.22-bench-budget: how much more work the larger measurement cost, or `None` with no denominator"
++        )
++    }
++}
++
++/// One row of a queue, as a drain reads it: the identity a worker is handed and the instant the row
++/// may run.
++///
++/// The two fields are what `Store::claim`'s own order needs from a row — `MemoryStore::due`
++/// (`jobq/3.9-priority-fairness`) ranks by policy, then by `run_at`, then by identity, and answers
++/// identities — so this is the projection of a job row that a measured drain can be written over
++/// without a backend: the harness of this step builds its workload without a store, which is what
++/// makes the counts the same in every process and every run.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Row {
++    /// The job.
++    id: JobId,
++    /// The instant the row may run.
++    run_at: DateTime<Utc>,
++}
++
++impl Row {
++    /// A row that may run from `run_at` on.
++    #[must_use]
++    pub fn new(id: JobId, run_at: DateTime<Utc>) -> Self {
++        todo!("jobq/3.22-bench-budget: a row that may run from an instant on")
++    }
++
++    /// The job.
++    #[must_use]
++    pub fn id(&self) -> JobId {
++        todo!("jobq/3.22-bench-budget: the job")
++    }
++
++    /// The instant this row may run.
++    #[must_use]
++    pub fn run_at(&self) -> DateTime<Utc> {
++        todo!("jobq/3.22-bench-budget: the instant this row may run")
++    }
++
++    /// `true` when the row may run at `now`.
++    ///
++    /// `<=` rather than `<`: a job scheduled for this instant is due at this instant, and a second
++    /// of rounding is a second a worker spends idle.
++    #[must_use]
++    pub fn is_due(&self, now: DateTime<Utc>) -> bool {
++        todo!("jobq/3.22-bench-budget: whether the row may run at `now`")
++    }
++}
++
++/// A batch of rows, handed out in the order the store ranked them, with the cells counted.
++///
++/// The pull keeps **its place**: the cursor is where the last hand-out left off, and the difference
++/// between remembering it and starting over is the whole subject of this step's guard. A batch of
++/// `n` rows costs `n` cells here and `n²`/2 in the version that searches from the front for the next
++/// row it has not handed out — and on a ten-row queue the two are 10 and 55, which is a difference
++/// nobody sees until the queue is long.
++///
++/// A row that is not due at the `now` it was asked with is stepped over and **not** asked about
++/// again: this is a *drain*, not a timer. The rows arrive from a store that has already filtered by
++/// the instant it was asked about (`MemoryStore::due`), and a row that is not due yet belongs to the
++/// next question rather than to this answer — which is what keeps the cost of one drain linear in
++/// the batch instead of in the batch times the rows the batch is waiting for.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Pull {
++    /// The rows, in the order they were given.
++    rows: Vec<Row>,
++    /// Where the next hand-out starts looking.
++    cursor: usize,
++}
++
++impl Pull {
++    /// A pull over one batch, in the order it was given.
++    #[must_use]
++    pub fn of(rows: Vec<Row>) -> Self {
++        todo!("jobq/3.22-bench-budget: a pull over one batch, in the order it was given")
++    }
++
++    /// How many rows the pull has not passed yet.
++    #[must_use]
++    pub fn remaining(&self) -> usize {
++        todo!("jobq/3.22-bench-budget: how many rows the pull has not passed yet")
++    }
++
++    /// The next row that is due, counting every cell the search looked at.
++    ///
++    /// `None` when nothing left in the batch is due, and asking a drained pull again costs nothing:
++    /// the cursor is left at the end rather than reset, so a caller that drains in a loop cannot
++    /// pay for the batch twice by asking once too often.
++    pub fn next(&mut self, now: DateTime<Utc>, work: &mut Work) -> Option<JobId> {
++        todo!(
++            "jobq/3.22-bench-budget: the next row that is due, with every cell the search looked at counted"
++        )
++    }
++}
++
++/// The lines a harness prints, in the order a report reads them.
++///
++/// One drain at one size, and the same drain at twice it: the two counts come from the smaller run
++/// and the guard from the pair. A comparison with no denominator prints nothing — the line is left
++/// out rather than written as zero, because a harness that reported `0` would report a *pass* for a
++/// drain that measured nothing, and the gate that reads these lines treats a missing metric as
++/// `blocked` rather than as a pass.
++#[must_use]
++pub fn report(small: &Work, larger: &Work) -> Vec<String> {
++    todo!(
++        "jobq/3.22-bench-budget: the lines a harness prints, with the guard left out when there is no denominator"
++    )
++}
+diff --git a/tests/budget.rs b/tests/budget.rs
+new file mode 100644
+index 0000000..7265adc
+--- /dev/null
++++ b/tests/budget.rs
+@@ -0,0 +1,66 @@
++//! The performance budget's harness for `jobq/3.22-bench-budget`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check jobq/3.22-bench-budget
++//! --slow` runs, and the numbers it prints are compared with the baselines in
++//! `course/tracks/jobq/budget/3.22-bench-budget.toml` — one drain of a queue and the same drain at
++//! twice the size.
++//!
++//! What it measures is **work, never the clock**: `kiln` compares counts, so the gate answers the
++//! same thing on a loaded machine as on an idle one, and no run of this file can flake because
++//! something else was compiling. `cargo test -p jobq --test budget -- --nocapture` prints the lines
++//! by hand; the `jobq-budget` prefix is what the gate reads.
++
++use chrono::{DateTime, Duration, Utc};
++use jobq::engine::{JobId, Pull, Row, Work, report};
++
++/// The size of the queue the counts are taken on.
++///
++/// Twice this is the size the guard compares with, and this is the number the budget is written
++/// against — changing it changes what the baselines mean, so it is a decision and not a knob.
++const ROWS: usize = 256;
++/// Every fourth row of the workload is not due yet.
++///
++/// A queue that is entirely due is the easy half of the measurement: the drain has nothing to look
++/// at and skip, and `scan_cells` would say nothing that `claim_statements` does not. One row in four
++/// is the shape of a queue with timers in it.
++const NOT_DUE_EVERY: usize = 4;
++/// The instant the drain is asked about, and a fixed one: a number measured against the wall clock
++/// is a number a machine with a different clock would answer differently.
++const NOW_SECONDS: i64 = 1_700_000_000;
++
++/// The instant every row of the workload is compared with.
++fn now() -> DateTime<Utc> {
++    DateTime::from_timestamp(NOW_SECONDS, 0).expect("a fixed instant this file states itself")
++}
++
++/// One batch: rows in claim order, and every fourth of them due later rather than now.
++fn batch(rows: usize) -> Vec<Row> {
++    (0..rows)
++        .map(|index| {
++            let waiting = index % NOT_DUE_EVERY == NOT_DUE_EVERY - 1;
++            let run_at = if waiting {
++                now() + Duration::minutes(5)
++            } else {
++                now()
++            };
++            Row::new(JobId::new(), run_at)
++        })
++        .collect()
++}
++
++/// Drain one batch and answer what the drain cost.
++fn drain(rows: usize) -> Work {
++    let mut work = Work::new();
++    let mut pull = Pull::of(batch(rows));
++    while pull.next(now(), &mut work).is_some() {}
++    work
++}
++
++#[test]
++fn the_budget() {
++    let small = drain(ROWS);
++    let large = drain(2 * ROWS);
++    for line in report(&small, &large) {
++        println!("{line}");
++    }
++}

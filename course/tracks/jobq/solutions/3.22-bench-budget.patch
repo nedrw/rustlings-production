@@ -1,0 +1,274 @@
+diff --git a/docs/budget.md b/docs/budget.md
+index c8b58fa..3ab5fc2 100644
+--- a/docs/budget.md
++++ b/docs/budget.md
+@@ -1,40 +1,81 @@
+ # A budget a slow machine cannot fail
+ 
+-"It got slower" is the review comment nobody can act on, and the obvious answer to it — time the
+-thing — is a measurement of the machine that ran it. A wall-clock budget on a shared build machine is
+-red on a busy afternoon and green on a quiet one, and the reflex it teaches is to re-run the job until
+-it passes. That is a gate nobody reads.
++"It got slower" is the review comment nobody can act on, and the obvious answer to it — time the thing
++— is a measurement of the machine that ran it. A wall-clock budget on a shared build machine is red
++on a busy afternoon and green on a quiet one, and the reflex it teaches is to re-run the job until it
++passes. That is a gate nobody reads.
+ 
+-<!-- TODO: say what this budget counts instead, and why those numbers are the same on every machine.
+-Then say what the workload is: how many rows, in what order, and how many of them are not due yet —
+-a queue that is entirely due is the easy half of the measurement. -->
++The budget on this page counts **work instead of time**: the rows a drain looked at, the rows it
++handed out, and how the first of those grows when the queue doubles. Every one of those numbers is
++the same on a loaded machine as on an idle one, in this process and in the next one, so the answer is
++about the change rather than about the load.
+ 
+ ## What we measure
+ 
++The workload is one batch of **256 queue rows**, in the order a store ranked them
++([`MemoryStore::due`](../src/engine/store/memory.rs) is where that order is decided), with **one row
++in four not due yet** — a queue that is entirely due is the easy half: the drain has nothing to look
++at and skip.
++
+ | metric | what it counts | baseline |
+ | --- | --- | --- |
+-| `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` |
++| `claim_statements` | rows handed out — the write one claim costs a store | 192 |
++| `scan_cells` | rows looked at, including the ones that turned out not to be due | 256 |
++| `scale_ratio_max` | the work at twice the size over the work at one size: an upper bound | 2.2 |
++
++The two counts are taken from the **256-row** run and the guard from the pair, which is why the first
++two are 192 and 256: three of every four rows are due, and a drain that remembers where it stopped
++looks at each row once.
+ 
+-<!-- TODO: one row per metric the harness prints, with the baseline
+-`course/tracks/jobq/budget/3.22-bench-budget.toml` records for it — the names are the ones
+-`jobq::engine::METRICS` lists, and the spec compares this page with that list. Say why there are two
+-counts and not one: which defect shows in one of them and not the other. -->
++Two counters rather than one, because they answer different questions and the defect usually shows in
++exactly one of them: a drain that examines every row twice has twice the cells and the *same*
++statements, and a drain that hands the same row out twice is the opposite. A single total would only
++report that something changed.
+ 
+ ## The guard
+ 
+-<!-- TODO: what the third metric is, why it is an upper bound rather than a target, and what the
+-drain it exists to catch costs on a short queue versus a long one. Say what `Work::scale_to` answers
+-when there is nothing to compare with, and why that is not zero. -->
++`scale_ratio_max` is the metric this page exists for. A drain that keeps its place costs about twice
++the work when the input doubles; a drain that starts the search over on every pull costs **the
++square**: on a sixteen-row batch those two are 16 cells and 112, and 3.7 times the work when the batch
++doubles — a difference nobody sees until the queue is long, which is exactly when it matters.
++
++It is an **upper bound, not a target**. A drain that got cheaper passes; a drain that costs 2.2 times
++as much per doubling is the point at which somebody has to explain why. The bound is a tenth over the
++two a linear drain costs, which is room for a per-batch constant rather than for a change of shape.
++
++`Work::scale_to` answers `None` when the smaller drain examined nothing, and the report leaves the
++guard's line out rather than printing a zero: a `0` would compare with the bound like any other ratio
++and report a *pass* for a measurement that never happened.
+ 
+ ## How this is checked
+ 
+-<!-- TODO: the command that prints the numbers, the gate that compares them with the baseline, and
+-what the gate answers for a metric the harness did not print. Link the harness and the test that
+-pins the counts: [the harness](TODO), [the step's test](TODO). -->
++The harness is [`tests/budget.rs`](../tests/budget.rs) — a file this project's course ships, because
++a learner changing the instrument they are measured with is a learner changing the measurement. It
++prints one `jobq-budget <name>=<value>` line per metric:
++
++```sh
++cargo test -p jobq --test budget -- --nocapture
++```
++
++`kiln check jobq/3.22-bench-budget --slow` runs exactly that command and compares each number with the
++baseline the course keeps in `course/tracks/jobq/budget/3.22-bench-budget.toml`: every metric within
++±10%, and a name ending in `_max` only *downwards*. A metric the harness does not print is `blocked`
++rather than a pass, and a run that prints nothing comparable is not judged at all — the harness is
++course content, so what a broken instrument means is that the gate cannot answer, not that this
++project failed.
++
++The workload's size is content rather than a knob: changing it changes what the baselines mean, so it
++is a decision somebody makes in the same commit as the numbers. The step's own test
++([`tests/spec_budget.rs`](../tests/spec_budget.rs)) pins both: the counts the baselines were measured
++from, the three lines the harness prints, and the two drains that show what the guard is for.
+ 
+ ## Where this comes from
+ 
+-<!-- TODO: what a wall-clock benchmark has to do to be trustworthy, and one harness built on counts
+-for the reason this page gives. -->
++- [Criterion.rs: analysis](https://bheisler.github.io/criterion.rs/book/analysis.html) — what a
++  wall-clock benchmark has to do to be trustworthy (warm-up, sample size, outliers), and therefore
++  how much machinery a gate that depends on time needs;
++- [`iai`](https://github.com/bheisler/iai) — a benchmark harness built on instruction counts for
++  exactly the reason this page gives: it compares two versions of the code rather than two machines;
++- [Google SRE book: monitoring distributed systems](https://sre.google/sre-book/monitoring-distributed-systems/)
++  — the same argument one level up, about why a metric a dashboard charts has to mean the same thing
++  on every machine that reports it.
+diff --git a/src/engine/budget.rs b/src/engine/budget.rs
+index d1edc2d..a6bd4e7 100644
+--- a/src/engine/budget.rs
++++ b/src/engine/budget.rs
+@@ -80,35 +80,35 @@ impl Work {
+     /// A meter that has counted nothing yet.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("jobq/3.22-bench-budget: a meter that has counted nothing yet")
++        Self::default()
+     }
+ 
+     /// One more row looked at.
+     pub fn examine(&mut self) {
+-        todo!("jobq/3.22-bench-budget: one more row looked at")
++        self.cells += 1;
+     }
+ 
+     /// One more row handed out.
+     pub fn statement(&mut self) {
+-        todo!("jobq/3.22-bench-budget: one more row handed out")
++        self.statements += 1;
+     }
+ 
+     /// How many rows were looked at.
+     #[must_use]
+     pub fn cells(&self) -> usize {
+-        todo!("jobq/3.22-bench-budget: how many rows were looked at")
++        self.cells
+     }
+ 
+     /// How many rows were handed out.
+     #[must_use]
+     pub fn statements(&self) -> usize {
+-        todo!("jobq/3.22-bench-budget: how many rows were handed out")
++        self.statements
+     }
+ 
+     /// The whole cost of the operation, in both units.
+     #[must_use]
+     pub fn total(&self) -> usize {
+-        todo!("jobq/3.22-bench-budget: the whole cost of the operation, in both units")
++        self.cells + self.statements
+     }
+ 
+     /// How many times more work `larger` cost than this measurement, or `None` when this one did no
+@@ -123,9 +123,10 @@ impl Work {
+     /// is a question about the algorithm's shape rather than about the machine it ran on.
+     #[must_use]
+     pub fn scale_to(&self, larger: &Self) -> Option<f64> {
+-        todo!(
+-            "jobq/3.22-bench-budget: how much more work the larger measurement cost, or `None` with no denominator"
+-        )
++        if self.cells == 0 {
++            return None;
++        }
++        Some(larger.cells as f64 / self.cells as f64)
+     }
+ }
+ 
+@@ -150,19 +151,19 @@ impl Row {
+     /// A row that may run from `run_at` on.
+     #[must_use]
+     pub fn new(id: JobId, run_at: DateTime<Utc>) -> Self {
+-        todo!("jobq/3.22-bench-budget: a row that may run from an instant on")
++        Self { id, run_at }
+     }
+ 
+     /// The job.
+     #[must_use]
+     pub fn id(&self) -> JobId {
+-        todo!("jobq/3.22-bench-budget: the job")
++        self.id
+     }
+ 
+     /// The instant this row may run.
+     #[must_use]
+     pub fn run_at(&self) -> DateTime<Utc> {
+-        todo!("jobq/3.22-bench-budget: the instant this row may run")
++        self.run_at
+     }
+ 
+     /// `true` when the row may run at `now`.
+@@ -171,7 +172,7 @@ impl Row {
+     /// of rounding is a second a worker spends idle.
+     #[must_use]
+     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
+-        todo!("jobq/3.22-bench-budget: whether the row may run at `now`")
++        self.run_at <= now
+     }
+ }
+ 
+@@ -201,13 +202,13 @@ impl Pull {
+     /// A pull over one batch, in the order it was given.
+     #[must_use]
+     pub fn of(rows: Vec<Row>) -> Self {
+-        todo!("jobq/3.22-bench-budget: a pull over one batch, in the order it was given")
++        Self { rows, cursor: 0 }
+     }
+ 
+     /// How many rows the pull has not passed yet.
+     #[must_use]
+     pub fn remaining(&self) -> usize {
+-        todo!("jobq/3.22-bench-budget: how many rows the pull has not passed yet")
++        self.rows.len() - self.cursor
+     }
+ 
+     /// The next row that is due, counting every cell the search looked at.
+@@ -216,9 +217,18 @@ impl Pull {
+     /// the cursor is left at the end rather than reset, so a caller that drains in a loop cannot
+     /// pay for the batch twice by asking once too often.
+     pub fn next(&mut self, now: DateTime<Utc>, work: &mut Work) -> Option<JobId> {
+-        todo!(
+-            "jobq/3.22-bench-budget: the next row that is due, with every cell the search looked at counted"
+-        )
++        let mut index = self.cursor;
++        while let Some(row) = self.rows.get(index) {
++            work.examine();
++            if row.is_due(now) {
++                work.statement();
++                self.cursor = index + 1;
++                return Some(row.id());
++            }
++            index += 1;
++        }
++        self.cursor = self.rows.len();
++        None
+     }
+ }
+ 
+@@ -231,7 +241,12 @@ impl Pull {
+ /// `blocked` rather than as a pass.
+ #[must_use]
+ pub fn report(small: &Work, larger: &Work) -> Vec<String> {
+-    todo!(
+-        "jobq/3.22-bench-budget: the lines a harness prints, with the guard left out when there is no denominator"
+-    )
++    let mut lines = vec![
++        format!("jobq-budget {}={}", CLAIM_STATEMENTS, small.statements()),
++        format!("jobq-budget {}={}", SCAN_CELLS, small.cells()),
++    ];
++    if let Some(ratio) = small.scale_to(larger) {
++        lines.push(format!("jobq-budget {SCALE_RATIO_MAX}={ratio:.3}"));
++    }
++    lines
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index ff086cd..75858b9 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -25,6 +25,7 @@
+ //! crate's business either way.
+ 
+ pub(crate) mod authz;
++pub(crate) mod budget;
+ pub(crate) mod clock;
+ pub(crate) mod coverage;
+ pub(crate) mod cron;
+@@ -48,6 +49,7 @@ pub(crate) mod walk;
+ mod sealed;
+ 
+ pub use authz::{QueueAction, QueueAudit, QueueDeclaration, QueueGrant};
++pub use budget::{METRICS, Pull, Row, SCALE_MAX, Work, report};
+ pub use clock::{Clock, SystemClock};
+ pub use coverage::{
+     Exempt, Foreign, Inventory, Kind, POLICY_SCOPE, Policy as CoveragePolicy, Site, Walked,

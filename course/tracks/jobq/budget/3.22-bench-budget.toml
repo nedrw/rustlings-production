@@ -1,0 +1,19 @@
+# The performance budget of `jobq/3.22-bench-budget`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget.rs`, which the step's scaffold ships); the metrics are the lines it prints, and
+# every one of them is a count rather than a time, so nothing here can flake on a loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: `scale_ratio_max` is "no worse than this", not "about this".
+command = "cargo test -p jobq --test budget -- --nocapture"
+
+[metric]
+# The calls one drained batch made into the queue: one per row handed out.
+claim_statements = 192
+# The rows the drain looked at, including the ones that turned out not to be due.
+scan_cells = 256
+# work(512 rows) / work(256 rows): the guard against a drain whose cost grows with the square of the
+# queue rather than with the queue.
+scale_ratio_max = 2.2
