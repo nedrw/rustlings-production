@@ -828,7 +828,7 @@ index 036c05c..730201b 100644
  use crate::engine::error::Error;
  use crate::engine::events::{EventKind, JobEvent};
  use crate::engine::policy::Policy;
-@@ -661,6 +661,33 @@ impl Store for MemoryStore {
+@@ -661,6 +661,41 @@ impl Store for MemoryStore {
          })
      }
  
@@ -838,10 +838,18 @@ index 036c05c..730201b 100644
 +            // A row this handle may not see is a row that is not in the answer, which is the answer
 +            // `get` and `events` give for one: a listing is filtered by the same rule as everything
 +            // else rather than by a second one (`jobq/3.13-queue-authz-attribution`).
++            // asked once for the whole listing — `visible_queues` *is* that question, and asking
++            // `visible` per row would walk the declarations once per job.
++            let visible = ledger.visible_queues(self.scope.as_ref());
 +            let mut jobs: Vec<Job> = ledger
 +                .jobs
 +                .values()
 +                .filter(|job| filter.matches(job))
++                .filter(|job| {
++                    visible
++                        .as_ref()
++                        .is_none_or(|queues| queues.contains(&job.queue))
++                })
 +                .cloned()
 +                .collect();
 +            // The port's order (`jobq/3.15-cli-contract`): priority, then the one that has been due

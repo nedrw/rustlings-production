@@ -32,7 +32,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use jobq::cli::{self, USAGE};
-use jobq::engine::{JobId, PostgresStore, Store};
+use jobq::engine::{
+    JobFilter, JobId, PostgresStore, Queue, QueueDeclaration, Store, SubmitRequest, Tenant,
+};
 use serde_json::Value;
 use support::postgres::Postgres;
 
@@ -560,5 +562,71 @@ async fn a_script_submits_inspects_lists_and_reports_against_a_real_queue() {
             .count(),
         2,
         "the whole answer is still the two jobs the script submitted"
+    );
+}
+
+/// A listing answers with what *this* caller may see, on every backend.
+///
+/// `Store::list` is this step's method, and its promise is the port's: a row the handle may not see
+/// is a row that is not in the answer — the same rule `get` and `events` answer one job with. The
+/// case is asked of the store the conformance fixture builds, so the step's `conformance@2` gate
+/// runs it against the container too: an implementation that forgets the scope on one backend is a
+/// listing that leaks another tenant's work, which is the failure this file exists to catch.
+#[tokio::test]
+async fn a_listing_hides_the_queues_the_handle_may_not_see() {
+    let backend = support::store::backend().await;
+    let store = backend.store();
+    let acme = Tenant::parse("acme").expect("a legal tenant name");
+    let bob = Tenant::parse("bob").expect("a legal tenant name");
+    let mine = Queue::parse("acme-mail").expect("a legal queue name");
+    let theirs = Queue::parse("bob-mail").expect("a legal queue name");
+
+    for (queue, owner) in [(&mine, &acme), (&theirs, &bob)] {
+        let handle = store.scoped(owner);
+        handle
+            .declare_queue(&QueueDeclaration::new(queue.clone(), owner.clone()))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the {} backend refused a declaration: {error}",
+                    backend.name()
+                )
+            });
+        handle
+            .enqueue(SubmitRequest::new(
+                queue.clone(),
+                serde_json::json!({ "to": queue.as_str() }),
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the {} backend refused a submit: {error}", backend.name())
+            });
+    }
+
+    let listing = store
+        .scoped(&acme)
+        .list(&JobFilter::new())
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the {} backend refused a listing: {error}", backend.name())
+        });
+    let queues: Vec<&str> = listing.iter().map(|job| job.queue().as_str()).collect();
+    assert_eq!(
+        queues,
+        [mine.as_str()],
+        "`acme` submitted to its own queue and to nothing else, so its listing holds exactly that          job: the {} backend answered {queues:?} instead. A listing is read by a tool that shows an          operator what is in a queue, and a handle that answers with another tenant's queue is a          handle that leaks what it may not see (`jobq/3.13-queue-authz-attribution`)",
+        backend.name()
+    );
+
+    let everything = store.list(&JobFilter::new()).await.unwrap_or_else(|error| {
+        panic!("the {} backend refused a listing: {error}", backend.name())
+    });
+    let mut seen: Vec<&str> = everything.iter().map(|job| job.queue().as_str()).collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        ["acme-mail", "bob-mail"],
+        "the operator's door sees every queue, so the filter is a narrowing rather than a          replacement: the {} backend answered {seen:?}",
+        backend.name()
     );
 }
