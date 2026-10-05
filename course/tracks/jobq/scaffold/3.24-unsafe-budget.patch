@@ -1,0 +1,346 @@
+diff --git a/src/engine/unsafe_budget.rs b/src/engine/unsafe_budget.rs
+new file mode 100644
+index 0000000..53f76da
+--- /dev/null
++++ b/src/engine/unsafe_budget.rs
+@@ -0,0 +1,247 @@
++//! The crate's own `unsafe` budget: no uses in production code, and a reason for every exception.
++//!
++//! Step `jobq/3.24-unsafe-budget`. `relay/2.21-supply-policy` decided the *policy* for a service:
++//! `#![forbid(unsafe_code)]` at each crate root, plus the argument that a dependency's `unsafe` is
++//! not what the attribute talks about. What is left, for a project that has to *live* with the rule,
++//! is the number: how much `unsafe` the production code carries, whether every use of it says why it
++//! is there, and whether the policy that makes those uses exceptions is in place at all.
++//!
++//! Those three questions are what this module answers, and three decisions are written into the
++//! shapes below:
++//!
++//! * **the budget is a count, and zero is a decision.** Three numbers come out of a set of files —
++//!   `unsafe_occurrences`, `undocumented_max` and `unguarded_max` — and they are the same three
++//!   facts `kiln`'s `unsafe-budget@0` gate reads from outside the crate: uses, reasons, policy. The
++//!   project measures them itself so that the budget is a number in a file
++//!   (`course/tracks/jobq/budget/3.24-unsafe-budget.toml`) rather than a sentence in a review;
++//! * **a comment is not a use, and neither is a literal.** The scan below reads *code*: what stands
++//!   before a `//`, and what stands outside a `"…"`. A module that talks about the keyword in its
++//!   prose — this one does, at length — is otherwise its own first offender, and the count would say
++//!   nothing about the crate. The narrowing is stated rather than hidden: a literal or a block
++//!   comment that spans several lines is read a line at a time, and a raw string (`r"…"`) is not
++//!   special-cased. This crate writes none of those, and where the text is ambiguous the compiler and
++//!   `unsafe-budget@0` are still the ones holding the line;
++//! * **tests are not production code.** An item gated by `#[cfg(test)]` is skipped, wherever it sits
++//!   in the file and however deeply it nests, which is the split `clippy` makes when it decides what
++//!   a lint applies to. A count that included tests would push a project to write worse tests, and a
++//!   test that has to reach for `unsafe` is a statement about the test rather than about the library.
++//!
++//! What this module is **not**: a lint. It does not run the compiler, it has no opinion about whether
++//! a use is *sound* — a `// SAFETY:` reason is what puts that question in front of a reviewer — and
++//! it never decides what the budget should be. [`BUDGET`] is the number this step ships, and moving
++//! it is a decision somebody makes on purpose.
++
++use std::fmt;
++
++/// The budget this step ships: no use of `unsafe` in production code at all.
++///
++/// Zero rather than three, because the crate has no use to argue for and a budget nobody has spent
++/// is the cheapest one to keep. It is also the number `unsafe-budget@0` is judged with, so the
++/// project's own answer and the gate's agree by construction.
++pub const BUDGET: u32 = 0;
++
++/// How many lines above a use its `// SAFETY:` note may sit.
++///
++/// Three, because a note further up is a note about something else: the line a reader looks at first
++/// is the one immediately above the block. The gate reads the same window, so a note that satisfies
++/// this module satisfies it too.
++pub const WINDOW: usize = 3;
++
++/// The metric name of the uses of `unsafe` in the crate's production code.
++const UNSAFE_OCCURRENCES: &str = "unsafe_occurrences";
++
++/// The metric name of the uses with no reason above them.
++const UNDOCUMENTED_MAX: &str = "undocumented_max";
++
++/// The metric name of the production files the crate's policy does not cover.
++const UNGUARDED_MAX: &str = "unguarded_max";
++
++/// Every metric this budget is written in, in the order a report writes them.
++///
++/// The array exists so that a harness and a baseline can be read against one list instead of two:
++/// the harness prints these names, and the course's baseline file
++/// (`course/tracks/jobq/budget/3.24-unsafe-budget.toml`) is written in them. The first two are
++/// counts, exact to the use; the third is an upper bound, because "fewer files outside the policy"
++/// can only be an improvement.
++pub const UNSAFE_METRICS: [&str; 3] = [UNSAFE_OCCURRENCES, UNDOCUMENTED_MAX, UNGUARDED_MAX];
++
++/// One place production code uses the keyword.
++///
++/// The line is the whole of the position: a report that says `src/engine/store/mod.rs:41` sends a
++/// reader to the block, and the column would be a number nobody acts on. `documented` and `safety`
++/// are two views of one answer — whether there is a reason, and what it says — because a report
++/// that only said `documented: false` would leave the reviewer to open the file.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Occurrence {
++    /// Line number, counting from 1.
++    line: u32,
++    /// Whether a `// SAFETY:` note with a reason sits in the window above.
++    documented: bool,
++    /// The reason, when there is one.
++    safety: Option<String>,
++}
++
++impl Occurrence {
++    /// The line the use is on.
++    #[must_use]
++    pub fn line(&self) -> u32 {
++        todo!("jobq/3.24-unsafe-budget: the line the use is on")
++    }
++
++    /// Whether the use has a reason above it.
++    #[must_use]
++    pub fn documented(&self) -> bool {
++        todo!("jobq/3.24-unsafe-budget: whether the use has a reason above it")
++    }
++
++    /// The reason, when there is one.
++    #[must_use]
++    pub fn safety(&self) -> Option<&str> {
++        todo!("jobq/3.24-unsafe-budget: the reason, when there is one")
++    }
++}
++
++/// What one file says about its own `unsafe`, and what the crate's policy is.
++///
++/// The policy is a property of the *crate* rather than of the file, and it is carried here because
++/// every judgement about a use is relative to it: an exception is an exception to a rule. The
++/// manifest is where the rule lives, and reading it is the caller's business ([`denies_unsafe_code`]
++/// answers the question about a manifest's text).
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Audit {
++    /// The file, as the report names it.
++    file: String,
++    /// Every use in the file's production code, in line order.
++    occurrences: Vec<Occurrence>,
++    /// Whether the crate denies the keyword by default.
++    denies_by_default: bool,
++}
++
++impl Audit {
++    /// The file this audit is about.
++    #[must_use]
++    pub fn file(&self) -> &str {
++        todo!("jobq/3.24-unsafe-budget: the file this audit is about")
++    }
++
++    /// Every use in the file's production code.
++    #[must_use]
++    pub fn occurrences(&self) -> &[Occurrence] {
++        todo!("jobq/3.24-unsafe-budget: every use in the file's production code")
++    }
++
++    /// Whether the crate denies the keyword by default.
++    #[must_use]
++    pub fn denies_by_default(&self) -> bool {
++        todo!("jobq/3.24-unsafe-budget: whether the crate denies the keyword by default")
++    }
++
++    /// How many uses the file's production code has.
++    #[must_use]
++    pub fn count(&self) -> usize {
++        todo!("jobq/3.24-unsafe-budget: how many uses the file's production code has")
++    }
++
++    /// How many of them have no reason above them.
++    #[must_use]
++    pub fn undocumented(&self) -> usize {
++        todo!("jobq/3.24-unsafe-budget: how many of them have no reason above them")
++    }
++}
++
++/// Why the budget was refused.
++///
++/// Three refusals rather than one, because they are three different pieces of work: a policy to write
++/// in the manifest, a comment to write above a block, and a block to remove or a budget to raise on
++/// purpose. Each names the file, and the one that has a line names the line, because "unsafe budget
++/// exceeded" sends a reader to grep.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Refused {
++    /// The crate does not deny the keyword by default.
++    ///
++    /// There is no rule for the uses to be exceptions to, and a policy that is a habit rather than a
++    /// rule is what the next contributor does not have.
++    NotDenied {
++        /// Which file.
++        file: String,
++    },
++    /// A use with no reason above it.
++    Undocumented {
++        /// Which file.
++        file: String,
++        /// Which line.
++        line: u32,
++    },
++    /// More uses than the budget allows.
++    Over {
++        /// How many were found.
++        count: usize,
++        /// How many are allowed.
++        budget: u32,
++    },
++}
++
++impl fmt::Display for Refused {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("jobq/3.24-unsafe-budget: the sentence a refusal is read as")
++    }
++}
++
++// A refusal is the whole failure: there is no chain behind it, and the `source()` this impl
++// inherits answers `None`, which is the honest answer. The impl is what lets a caller that collects
++// failures of its own carry a refusal without a wrapper type.
++impl std::error::Error for Refused {}
++
++/// Read the crate's policy from a manifest: does it deny the keyword by default?
++///
++/// Two spellings, and both are cargo's: the level as a string (`unsafe_code = "deny"`) and as a table
++/// (`unsafe_code = { level = "deny" }`). `forbid` counts, because it is `deny` with the loosen option
++/// taken away; `warn` and `allow` do not, because a warning is what a policy looks like when nobody
++/// has decided anything. Both the package's table and the workspace's are read, since the project
++/// under `app/jobq` is its own workspace and either spelling puts the lint in front of the compiler.
++///
++/// A manifest that does not parse answers `false`: the honest reading of a policy that could not be
++/// read is that it is not there.
++#[must_use]
++pub fn denies_unsafe_code(manifest: &str) -> bool {
++    todo!("jobq/3.24-unsafe-budget: whether a manifest denies the keyword by default")
++}
++
++/// Audit one file: every use of the keyword in its production code, and whether each has a reason.
++///
++/// "Production code" is everything outside an item gated by `#[cfg(test)]`. `denies_by_default` is
++/// the crate's policy, which the caller reads from the manifest ([`denies_unsafe_code`]), and it is
++/// carried into the [`Audit`] because every use is judged against it.
++#[must_use]
++pub fn audit(file: &str, source: &str, denies_by_default: bool) -> Audit {
++    todo!("jobq/3.24-unsafe-budget: every use in one file, and whether each has a reason")
++}
++
++/// Apply the policy to a set of files, and answer how many uses there were.
++///
++/// The order the three rules are checked in is the order a reader fixes them, and it is part of the
++/// answer: **the policy first** (a crate that does not deny has no rule for the exceptions to be
++/// exceptions to), **then the reasons** (a line to write), **then the number** (a block to remove, or
++/// a budget to raise on purpose).
++///
++/// # Errors
++///
++/// [`Refused::NotDenied`], [`Refused::Undocumented`] or [`Refused::Over`], in that order.
++pub fn check(audits: &[Audit], budget: u32) -> Result<usize, Refused> {
++    todo!("jobq/3.24-unsafe-budget: the first thing wrong, in the order a reader fixes it")
++}
++
++/// The lines a harness prints, in the order a report reads them.
++///
++/// The three facts [`check`] judges, as numbers: the uses, the ones with no reason, and the files the
++/// policy does not cover. All three lines are printed even when the policy would refuse the tree —
++/// the numbers are the measurement, and the refusal is what a reviewer reads — because a missing
++/// metric is `blocked` to the gate rather than a failure, and a gate that blocks says nothing about
++/// the crate.
++#[must_use]
++pub fn counts(audits: &[Audit]) -> Vec<String> {
++    todo!("jobq/3.24-unsafe-budget: the lines a harness prints")
++}
+diff --git a/tests/unsafe_budget.rs b/tests/unsafe_budget.rs
+new file mode 100644
+index 0000000..e2245e2
+--- /dev/null
++++ b/tests/unsafe_budget.rs
+@@ -0,0 +1,87 @@
++//! The budget's harness for `jobq/3.24-unsafe-budget`.
++//!
++//! This file is the course's, not the learner's. It is what the `bench-budget` gate runs, and the
++//! numbers it prints are compared with the baselines in
++//! `course/tracks/jobq/budget/3.24-unsafe-budget.toml` — the crate's production code, counted by the
++//! crate's own audit.
++//!
++//! What it measures is a **count, never the clock**: the uses of a keyword in `src/**/*.rs`, how many
++//! of them have no reason above them, and how many files the policy does not cover. `kiln` compares
++//! counts, so the gate answers the same thing on a loaded machine as on an idle one, and no run of
++//! this file can flake because something else was compiling. `cargo test -p jobq --test
++//! unsafe_budget -- --nocapture` prints the lines by hand; the `jobq-budget` prefix is what the gate
++//! reads.
++//!
++//! Three numbers that are all zero are still a measurement, and this file says which crate it read:
++//! the walk below is over the project's own `src/`, and the policy comes from the project's own
++//! `Cargo.toml`. A harness that read nothing would print zeros that mean nothing, which is what the
++//! assertion before the first print is for.
++
++use std::path::{Path, PathBuf};
++
++use jobq::engine::{BUDGET, audit, check, counts, denies_unsafe_code};
++
++/// Every `.rs` file below `root`, in path order.
++fn sources(root: &Path) -> Vec<PathBuf> {
++    let mut found = Vec::new();
++    let mut pending = vec![root.to_path_buf()];
++    while let Some(directory) = pending.pop() {
++        let entries = std::fs::read_dir(&directory)
++            .unwrap_or_else(|error| panic!("{} could not be listed: {error}", directory.display()));
++        for entry in entries {
++            let path = entry.expect("the directory is readable").path();
++            if path.is_dir() {
++                pending.push(path);
++            } else if path.extension().is_some_and(|extension| extension == "rs") {
++                found.push(path);
++            }
++        }
++    }
++    found.sort();
++    found
++}
++
++/// One file, read from the project it is part of.
++fn read(path: &Path) -> String {
++    std::fs::read_to_string(path)
++        .unwrap_or_else(|error| panic!("{} could not be read: {error}", path.display()))
++}
++
++/// The project's own sources, audited against the project's own policy.
++fn audits(root: &Path) -> Vec<jobq::engine::Audit> {
++    let policy = read(&root.join("Cargo.toml"));
++    let denies = denies_unsafe_code(&policy);
++    let files = sources(&root.join("src"));
++    assert!(
++        !files.is_empty(),
++        "{} has no `src/**/*.rs` to audit, so every number below would be a zero that means \
++         nothing: this harness reads the project, and a project with no production code is not \
++         what it is for",
++        root.display()
++    );
++    files
++        .iter()
++        .map(|path| {
++            let file = path
++                .strip_prefix(root)
++                .unwrap_or(path)
++                .to_string_lossy()
++                .replace('\\', "/");
++            audit(&file, &read(path), denies)
++        })
++        .collect()
++}
++
++#[test]
++fn the_budget() {
++    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let audits = audits(&root);
++    for line in counts(&audits) {
++        println!("{line}");
++    }
++    if let Err(refused) = check(&audits, BUDGET) {
++        // Not a `jobq-budget` line: the numbers above are the measurement, and this is what a
++        // reviewer is handed when the crate is outside its budget.
++        println!("the crate's own policy refuses this tree: {refused}");
++    }
++}

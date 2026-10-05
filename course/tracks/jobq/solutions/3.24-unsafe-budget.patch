@@ -1,0 +1,385 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index b57fa4b..7e48b32 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -47,6 +47,10 @@ postgres = [
+ # `unsafe_code = "deny"`, and the block below is where it lands.
+ [lints.rust]
+ # kiln:scaffold:begin
++# The keyword is denied for every target of this package — the two binaries
++# included — and the one way to spend the budget is an `#[allow]` somebody
++# has to write on purpose (step `jobq/3.24-unsafe-budget`).
++unsafe_code = "deny"
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index e8cc404..9fdd666 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -44,6 +44,7 @@ pub(crate) mod store;
+ pub(crate) mod tenant;
+ pub(crate) mod timers;
+ pub(crate) mod trace;
++pub(crate) mod unsafe_budget;
+ pub(crate) mod usage;
+ pub(crate) mod walk;
+ 
+@@ -79,5 +80,9 @@ pub use store::{BoxFuture, MemoryStore, Store};
+ pub use tenant::{TENANT_NAME_MAX, Tenant};
+ pub use timers::ReadySet;
+ pub use trace::{Context, Hop, SPAN_ID_HEX, Sampler, SpanId, TRACE_ID_HEX, TraceId, Traceparent};
++pub use unsafe_budget::{
++    Audit, BUDGET, Occurrence, Refused, UNSAFE_METRICS, WINDOW, audit, check, counts,
++    denies_unsafe_code,
++};
+ pub use usage::{QueueUsage, Usage};
+ pub use walk::{Counterexample, Invariant, Machine, Model, Rng, Step, replay, shrink, walk};
+diff --git a/src/engine/unsafe_budget.rs b/src/engine/unsafe_budget.rs
+index 53f76da..35e2212 100644
+--- a/src/engine/unsafe_budget.rs
++++ b/src/engine/unsafe_budget.rs
+@@ -47,6 +47,9 @@ pub const BUDGET: u32 = 0;
+ /// this module satisfies it too.
+ pub const WINDOW: usize = 3;
+ 
++/// The lint a manifest denies to make the exceptions exceptions *to* something.
++const LINT: &str = "unsafe_code";
++
+ /// The metric name of the uses of `unsafe` in the crate's production code.
+ const UNSAFE_OCCURRENCES: &str = "unsafe_occurrences";
+ 
+@@ -65,6 +68,18 @@ const UNGUARDED_MAX: &str = "unguarded_max";
+ /// can only be an improvement.
+ pub const UNSAFE_METRICS: [&str; 3] = [UNSAFE_OCCURRENCES, UNDOCUMENTED_MAX, UNGUARDED_MAX];
+ 
++/// The marker a reason is written with.
++const NOTE: &str = "// SAFETY:";
++
++/// The attribute that makes an item test code.
++const CFG_TEST: &str = "#[cfg(test)]";
++
++/// The word this module counts.
++const UNSAFE: &str = "unsafe";
++
++/// The levels that deny a lint.
++const DENYING: [&str; 2] = ["deny", "forbid"];
++
+ /// One place production code uses the keyword.
+ ///
+ /// The line is the whole of the position: a report that says `src/engine/store/mod.rs:41` sends a
+@@ -86,19 +101,19 @@ impl Occurrence {
+     /// The line the use is on.
+     #[must_use]
+     pub fn line(&self) -> u32 {
+-        todo!("jobq/3.24-unsafe-budget: the line the use is on")
++        self.line
+     }
+ 
+     /// Whether the use has a reason above it.
+     #[must_use]
+     pub fn documented(&self) -> bool {
+-        todo!("jobq/3.24-unsafe-budget: whether the use has a reason above it")
++        self.documented
+     }
+ 
+     /// The reason, when there is one.
+     #[must_use]
+     pub fn safety(&self) -> Option<&str> {
+-        todo!("jobq/3.24-unsafe-budget: the reason, when there is one")
++        self.safety.as_deref()
+     }
+ }
+ 
+@@ -123,31 +138,34 @@ impl Audit {
+     /// The file this audit is about.
+     #[must_use]
+     pub fn file(&self) -> &str {
+-        todo!("jobq/3.24-unsafe-budget: the file this audit is about")
++        &self.file
+     }
+ 
+     /// Every use in the file's production code.
+     #[must_use]
+     pub fn occurrences(&self) -> &[Occurrence] {
+-        todo!("jobq/3.24-unsafe-budget: every use in the file's production code")
++        &self.occurrences
+     }
+ 
+     /// Whether the crate denies the keyword by default.
+     #[must_use]
+     pub fn denies_by_default(&self) -> bool {
+-        todo!("jobq/3.24-unsafe-budget: whether the crate denies the keyword by default")
++        self.denies_by_default
+     }
+ 
+     /// How many uses the file's production code has.
+     #[must_use]
+     pub fn count(&self) -> usize {
+-        todo!("jobq/3.24-unsafe-budget: how many uses the file's production code has")
++        self.occurrences.len()
+     }
+ 
+     /// How many of them have no reason above them.
+     #[must_use]
+     pub fn undocumented(&self) -> usize {
+-        todo!("jobq/3.24-unsafe-budget: how many of them have no reason above them")
++        self.occurrences
++            .iter()
++            .filter(|occurrence| !occurrence.documented)
++            .count()
+     }
+ }
+ 
+@@ -186,7 +204,22 @@ pub enum Refused {
+ 
+ impl fmt::Display for Refused {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!("jobq/3.24-unsafe-budget: the sentence a refusal is read as")
++        match self {
++            Self::NotDenied { file } => write!(
++                formatter,
++                "{file} is production code and the crate does not deny `{LINT}`: every use would be \
++                 an exception to a rule there is not one of"
++            ),
++            Self::Undocumented { file, line } => write!(
++                formatter,
++                "{file}:{line} uses the keyword and has no `{NOTE}` reason in the {WINDOW} lines \
++                 above it"
++            ),
++            Self::Over { count, budget } => write!(
++                formatter,
++                "{count} use(s) of the keyword in production code against a budget of {budget}"
++            ),
++        }
+     }
+ }
+ 
+@@ -207,7 +240,32 @@ impl std::error::Error for Refused {}
+ /// read is that it is not there.
+ #[must_use]
+ pub fn denies_unsafe_code(manifest: &str) -> bool {
+-    todo!("jobq/3.24-unsafe-budget: whether a manifest denies the keyword by default")
++    let Ok(table) = manifest.parse::<toml::Table>() else {
++        return false;
++    };
++    let package = table
++        .get("lints")
++        .and_then(|lints| lints.get("rust"))
++        .and_then(|rust| rust.get(LINT));
++    let workspace = table
++        .get("workspace")
++        .and_then(|workspace| workspace.get("lints"))
++        .and_then(|lints| lints.get("rust"))
++        .and_then(|rust| rust.get(LINT));
++    [package, workspace].into_iter().flatten().any(denies)
++}
++
++/// `true` when one entry of a lint table denies.
++fn denies(entry: &toml::Value) -> bool {
++    let level = match entry {
++        toml::Value::String(level) => level.as_str(),
++        toml::Value::Table(table) => table
++            .get("level")
++            .and_then(toml::Value::as_str)
++            .unwrap_or_default(),
++        _ => "",
++    };
++    DENYING.contains(&level)
+ }
+ 
+ /// Audit one file: every use of the keyword in its production code, and whether each has a reason.
+@@ -217,7 +275,28 @@ pub fn denies_unsafe_code(manifest: &str) -> bool {
+ /// carried into the [`Audit`] because every use is judged against it.
+ #[must_use]
+ pub fn audit(file: &str, source: &str, denies_by_default: bool) -> Audit {
+-    todo!("jobq/3.24-unsafe-budget: every use in one file, and whether each has a reason")
++    let lines: Vec<&str> = source.lines().collect();
++    let tests = test_lines(&lines);
++    let mut occurrences = Vec::new();
++    for (index, line) in lines.iter().enumerate() {
++        if tests.get(index).copied().unwrap_or(false) {
++            continue;
++        }
++        let code = code_of(line);
++        for _ in words(&code) {
++            let safety = reason_above(&lines, index);
++            occurrences.push(Occurrence {
++                line: index as u32 + 1,
++                documented: safety.is_some(),
++                safety,
++            });
++        }
++    }
++    Audit {
++        file: file.to_owned(),
++        occurrences,
++        denies_by_default,
++    }
+ }
+ 
+ /// Apply the policy to a set of files, and answer how many uses there were.
+@@ -231,7 +310,28 @@ pub fn audit(file: &str, source: &str, denies_by_default: bool) -> Audit {
+ ///
+ /// [`Refused::NotDenied`], [`Refused::Undocumented`] or [`Refused::Over`], in that order.
+ pub fn check(audits: &[Audit], budget: u32) -> Result<usize, Refused> {
+-    todo!("jobq/3.24-unsafe-budget: the first thing wrong, in the order a reader fixes it")
++    if let Some(audit) = audits.iter().find(|audit| !audit.denies_by_default()) {
++        return Err(Refused::NotDenied {
++            file: audit.file().to_owned(),
++        });
++    }
++    if let Some((file, line)) = audits.iter().find_map(|audit| {
++        audit
++            .occurrences()
++            .iter()
++            .find(|occurrence| !occurrence.documented())
++            .map(|occurrence| (audit.file(), occurrence.line()))
++    }) {
++        return Err(Refused::Undocumented {
++            file: file.to_owned(),
++            line,
++        });
++    }
++    let count: usize = audits.iter().map(Audit::count).sum();
++    if count > budget as usize {
++        return Err(Refused::Over { count, budget });
++    }
++    Ok(count)
+ }
+ 
+ /// The lines a harness prints, in the order a report reads them.
+@@ -243,5 +343,132 @@ pub fn check(audits: &[Audit], budget: u32) -> Result<usize, Refused> {
+ /// the crate.
+ #[must_use]
+ pub fn counts(audits: &[Audit]) -> Vec<String> {
+-    todo!("jobq/3.24-unsafe-budget: the lines a harness prints")
++    let occurrences: usize = audits.iter().map(Audit::count).sum();
++    let undocumented: usize = audits.iter().map(Audit::undocumented).sum();
++    let unguarded = audits
++        .iter()
++        .filter(|audit| !audit.denies_by_default())
++        .count();
++    vec![
++        format!("jobq-budget {UNSAFE_OCCURRENCES}={occurrences}"),
++        format!("jobq-budget {UNDOCUMENTED_MAX}={undocumented}"),
++        format!("jobq-budget {UNGUARDED_MAX}={unguarded}"),
++    ]
++}
++
++/// Which lines are inside an item gated by `#[cfg(test)]`.
++///
++/// The item is found the way a reader finds it — the attribute on one line, the item it gates opening
++/// a block on the next — and it ends where the block does, nesting included. An item with no block
++/// (`#[cfg(test)] mod tests;`) gates a file rather than a region, and there is nothing here to skip.
++fn test_lines(lines: &[&str]) -> Vec<bool> {
++    let mut inside = vec![false; lines.len()];
++    let mut depth: i32 = 0;
++    let mut gated: Option<i32> = None;
++    let mut waiting = false;
++    for (index, line) in lines.iter().enumerate() {
++        let code = code_of(line);
++        if code.trim_start().starts_with(CFG_TEST) {
++            waiting = true;
++        }
++        let opens = code.matches('{').count() as i32;
++        let closes = code.matches('}').count() as i32;
++        if waiting && opens > 0 {
++            gated = Some(depth + 1);
++            waiting = false;
++        }
++        depth += opens - closes;
++        if let Some(level) = gated {
++            if depth >= level {
++                if let Some(flag) = inside.get_mut(index) {
++                    *flag = true;
++                }
++            } else {
++                gated = None;
++            }
++        }
++    }
++    inside
++}
++
++/// The code of one line: what stands before a `//`, and outside a `"…"`.
++///
++/// The two things this module counts around are the two things a line of Rust says that are *about*
++/// code rather than code. A comment reaches to the end of the line; a literal ends at the next
++/// unescaped quote. A narrowed reading, stated: a literal that spans several lines is read a line at
++/// a time, so the lines it continues onto are read as code.
++fn code_of(line: &str) -> String {
++    let mut code = String::with_capacity(line.len());
++    let mut chars = line.chars();
++    while let Some(character) = chars.next() {
++        match character {
++            '/' if chars.clone().next() == Some('/') => break,
++            '"' => {
++                let mut escaped = false;
++                for inside in chars.by_ref() {
++                    if escaped {
++                        escaped = false;
++                    } else if inside == '\\' {
++                        escaped = true;
++                    } else if inside == '"' {
++                        break;
++                    }
++                }
++            }
++            _ => code.push(character),
++        }
++    }
++    code
++}
++
++/// Where the word stands alone in a line of code, as byte offsets.
++fn words(code: &str) -> Vec<usize> {
++    let mut found = Vec::new();
++    let mut from = 0;
++    while let Some(at) = code.get(from..).and_then(|rest| rest.find(UNSAFE)) {
++        let index = from + at;
++        if stands_alone(code, index) {
++            found.push(index);
++        }
++        from = index + UNSAFE.len();
++    }
++    found
++}
++
++/// `true` when the word starts at `at` and is not part of a longer name.
++///
++/// `unsafe_code` is the name of a *lint*, not a use of the keyword, and a policy that denies the lint
++/// would otherwise count as the thing it forbids.
++fn stands_alone(code: &str, at: usize) -> bool {
++    let bytes = code.as_bytes();
++    let before = at.checked_sub(1).and_then(|index| bytes.get(index));
++    let after = bytes.get(at + UNSAFE.len());
++    !before.copied().is_some_and(is_name_byte) && !after.copied().is_some_and(is_name_byte)
++}
++
++/// `true` when a byte can be part of a name.
++fn is_name_byte(byte: u8) -> bool {
++    byte == b'_' || byte.is_ascii_alphanumeric()
++}
++
++/// The reason the nearest `// SAFETY:` line above `index` gives, when it gives one.
++///
++/// The nearest marker is the one that answers: a bare `// SAFETY:` is not a reason and it does not
++/// fall through to an older comment, because the line a reader looks at first is the one immediately
++/// above the block.
++fn reason_above(lines: &[&str], index: usize) -> Option<String> {
++    let note = (1..=WINDOW)
++        .filter_map(|back| index.checked_sub(back))
++        .filter_map(|above| lines.get(above))
++        .find(|line| line.trim_start().starts_with(NOTE))?;
++    let reason = note
++        .trim_start()
++        .strip_prefix(NOTE)
++        .map(str::trim)
++        .unwrap_or_default();
++    if reason.is_empty() {
++        None
++    } else {
++        Some(reason.to_owned())
++    }
+ }

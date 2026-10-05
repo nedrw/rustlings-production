@@ -1,0 +1,25 @@
+# The unsafe budget of `jobq/3.24-unsafe-budget`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/unsafe_budget.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them is a count the project takes of its own sources rather than a time, so
+# nothing here can flake on a loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: fewer undocumented uses and fewer files outside the policy are both improvements, and the
+# number that is exact is the first one — a use is a use. Zero is the budget the step ships, and
+# zero is what these three numbers are on the crate as it stands: the crate's production code uses
+# the keyword nowhere, every file has a reason available for the day it does, and the manifest's
+# lint table denies it for the library and both binaries at once.
+command = "cargo test -p jobq --test unsafe_budget -- --nocapture"
+
+[metric]
+# The uses of the keyword in the crate's production code, counted by the crate's own audit. Exact,
+# so any use at all is a count the gate reports back with the numbers it moved.
+unsafe_occurrences = 0
+# The uses with no `// SAFETY:` reason in the three lines above them, as an upper bound.
+undocumented_max = 0
+# The production files the crate's policy does not cover: the crate denies `unsafe_code` for every
+# target, so this is the number of files that would have to be counted if it did not.
+unguarded_max = 0
