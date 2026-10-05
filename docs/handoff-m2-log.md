@@ -19,6 +19,7 @@
 - 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
 - 第十三段 · 2026-10 · 3.21–3.22，`bench-budget` 那一腿，以及一次“幽灵失败”的追根
 - 第十四段 · 2026-10 · 3.23 由我接手完成，以及一个 `selftest`/`verify` 的不一致
+- 第十五段 · 2026-10 · 3.25，以及 `selftest`/`verify` 不一致的根因（由 3.25 的作者找到）
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -608,3 +609,38 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 - **`solution ✓ reference patch applies` 可能掩盖被跳过的文件**（见上面的不一致）：报“应用成功”不等于每个 section 都落了地；
   以后在 `selftest` 之后确认关键文件的状态（如 `grep -c TODO <页>`）。
 - **`filter-map` 式的脚本要小心**：我用脚本扫 `cargo fmt` 的差异时只统计了文件；若不是“全部差异都在一个文件里”，重新生成的范围就得更大。
+
+
+## 第十五段 · 2026-10 · 3.25，以及 `selftest`/`verify` 不一致的根因（由 3.25 的作者找到）
+
+### 做了什么
+
+- **3.25 发布制品**（提交 `199a58a`）：`src/engine/release.rs`（tag/版本、`Refusal` 枚举、`CHANGELOG` 与 checksum 契约）+
+  第三个二进制 `jobq-release`（`exit-code` 门会探它）+ 页面 `docs/release.md` 与 `CHANGELOG.md` + `budget/3.25-release-artifacts.toml`。
+  它对成本拿了个明确的决定：**规格里不跑 `cargo build --release`**（那会被 `mutants` 重复十来遍），规格只判契约（7.3 s），
+  贵的读/哈希/拷贝放进 `bench-budget` 的 harness（只跑一次，6.6 s）。`mutants` 起初 5/6，它补了第 13 个用例（`--out` 指向普通文件 → 退出 1）拿到 **6/6**。
+- **3.23 的 `selftest`/`verify` 不一致：根因找到并修好**。它的作者用两个实验定死了机制：
+  ① 沙箱里 2 s 粒度的监视证明 `docs/migration.md` **全程都在**（3103 B stub → 7208 B 页面），所以不是文件被删；
+  ② 共享槽里的 `spec_online_schema-60e0…` 二进制的 `CARGO_MANIFEST_DIR` 烘的是 **`kiln-mutants-9750-1/project`**（一个已被删掉的变异副本）——
+  cargo 按**包名+版本**选槽，`mutants` 在副本里构建，紧随其后的 `conformance@2` 就执行了副本的二进制；把 mutants 的最后一次“恢复运行”挪进项目，
+  规格会改在**行为**断言上红（`spec_online_schema.rs:434:5`），证明问题在二进制/槽而不是路径。
+  修法：mutants 的副本建在 `<cache>/kiln/mutants-target`（与 `coverage` 同一规则，提交 `kiln(mutants): the copy builds in a directory of its own`），
+  那一轮清理运行随之不再需要。**我落地并复核**：`selftest jobq/3.23` 由红转 **`13/13 must green`**，`jobq/3.24`/`3.25` 保持 `12/12`、`13/13`。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 3.25 的 `selftest` | `gates ✓ 13/13 must green`，两遍（1 m 38 s / 2 m 03 s）；我也复核了一遍 `13/13` |
+| 3.25 的门 | `links` 6 页 36 链接全解析；`mutants` `6/6 (100%)` 38 s；`budget` `artifacts 2, checksum_lines 2, unverified_max 0, extras_max 0`；`unsafe-budget@0` 39 个生产文件 0 处 `unsafe` |
+| 全步判定 | `25/25 judged · 0 failed · 0 blocked · 2 not_authored` |
+| 全量套件 | `cargo test -p jobq` → **187 passed · 0 failed**；postgres 11 个 durable 规格 → **80 passed** |
+| 课程自己的检查 | `lint-caps` `no issues.`；`links` `84 page(s) · 449 link(s)`；`i18n` `0 error(s)`；`manifest` 25 份 |
+
+### 坑与判读
+
+- **一条值得写进 §3 的通用规律**：任何“在副本里跑 cargo”的装置都必须给副本**自己的构建目录**，否则它污染共享槽，
+  让下一个跑同一条命令的人执行**别的树**的二进制（而 `CARGO_MANIFEST_DIR` 是烘进去的，于是失败看起来像“文件不见了”）。
+  判据：这条命令读的项目文件，其 `CARGO_MANIFEST_DIR` 指向的目录是否还存在。
+- **作业者的偏差**：它把 body 先提交、其余产物在临时树里反复重写，最后合成一个提交而不是“每件产物一个提交”。可接受——
+  它验证过最终提交的那份字节（补丁字节与规格 hash 在三棵树里一致）。
