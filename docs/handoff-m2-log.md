@@ -343,9 +343,16 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 | postgres 后端子集 | `authz 6 · dedup 6 · fairness 4 · isolation 7 · leases 11 · port_conformance 8 · state_machine 5` → `47 passed · 0 failed` |
 | 夹具修复的两条证据 | 无特性：`cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（此前 `E0432`）；同一构建点名 `KILN_BACKEND=postgres` → `panicked at tests/support/store.rs:131` “needs the `postgres` feature this build was made without…”（是句子，不是编译错误）；有特性 + `KILN_BACKEND=postgres` → `8 passed`（6.28 s，真起容器） |
 | 课程自己的检查 | `lint-caps` `no issues.`（`checked 61 of 72 step bodies`）；`probe --check` `40/40`；`links` `74 page(s) · 414 link(s)` `✓ every target resolves`；`i18n status` `structure: 0 error(s)` |
+| 验收演练 a 腿（`semver`） | 删 `impl Default for JobId` → `✗ semver@baseline … error[E0277] … tests/semver_baseline.rs:64`（另有 `clippy@2` 附带红）；回滚后 `9/9 must gates passed` |
+| 验收演练 d 腿（`conformance`） | durable `claim` 外层排序 `run_at asc`→`desc`：memory `8 passed` / postgres `7 passed · 1 failed`；`kiln verify jobq --slow` → `14/15 … 1 failed`，红在 `slow:conformance@2 … memory ✓, postgres ✗`；回滚后 `15/15` |
 
 ### 坑与判读
 
+- **演练先否掉了我自己的第一个劣化方案**：把 `Engine::submit` 的参数放宽成 `impl Into<SubmitRequest>`，`semver` 门不红——
+  查过见证文件后确认这是对的（`Engine` 的 `async fn` 只能用闭包钉，对任何存在的调用方该改法都是源码兼容的；
+  `Store` 的五个方法才是真函数指针强转）。换“删一个被钉住的公开 `impl`”才算真破坏性改动，§4.3 里有这条边界。
+- **`app/` 在 `.gitignore` 里**：在铺出来的树上做演练时 `git add -A` 加不进 `app/jobq`，所以“改一处 → `git checkout -- .`
+  回滚”在那种临时树里不成立；要么 `git add -f app`，要么把劣化写成可逆的脚本替换（这次是后者）。
 - **“durable 规格名类型”不是缺陷，是设计**：夹具可以做到“任何装配都能编译”，规格做不到——它们是钉死的文本，
   要判“两个后端对同一问题给同一个答案”就必须点名背单词。生产项目里表达这条边界的机制是 Cargo 的
   `[[test]] required-features`；这里没做，因为那要一份随每一步成长的 target 清单，是课程设计决定（handoff §5.2）。

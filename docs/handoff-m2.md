@@ -396,6 +396,46 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
 | CI | `cargo xtask ci` 上次全绿是 `0927803`（1634 s）；3.8–3.15 与闸门提交之后**未复跑**（逐条走 mailer/relay/jobq 三条 track，30 min+） |
 
+### 4.3 验收演练（已做两腿，原始输出）
+
+在 `skip` 出的尾巴树上（`/private/tmp/fixcheck2`，等于 `app/jobq` 的参考解状态）按 §4.1 的做法：每次只改一处，
+跑判定，再回滚，再跑同一个命令。
+
+**a) `semver@baseline`（第 3.2 步）：删掉一个被见证文件钉住的公开 `impl`。**
+劣化：删掉 `impl Default for JobId`——仓库里没有任何代码用它，所以只有见证文件会注意到。
+
+```
+✗ semver@baseline the course's public-API witness (api/3.2-public-api-baseline.rs) no longer builds
+    against this tree, which is a breaking change to `jobq`'s public API:
+    error[E0277]: the trait bound `JobId: Default` is not satisfied
+      --> tests/semver_baseline.rs:64:27
+    64 | const _: fn() -> JobId = <JobId as Default>::default;
+7/9 must gates passed · … ✗ 2 must gate(s) did not pass
+```
+
+（第二个红的是 `clippy@2` 的 `new_without_default`，删 `Default` 的附带后果；两者都点出了位置。）
+回滚后同一个命令：`9/9 must gates passed`、`✓ semver@baseline … still compiles`。
+
+**演练顺手查出来的边界（写下来免得下一个人重查）**：把 `Engine::submit` 的参数从 `SubmitRequest` 放宽成
+`impl Into<SubmitRequest>`，这个门**不会**变红。原因是陈述而不是实现：门判的是“见证文件还能编过”，而这个改法对
+所有可能存在的调用方都是源码兼容的——`Engine` 的五个方法因为 `async fn` 的返回类型不可命名，只能用闭包包住
+future 来钉；`Store` 的五个方法是真的函数指针强转（line 136–140），比它严得多。所以“参数变成泛型”在**这个 API
+形状下**不是破坏性改动，门不红是对的。
+
+**d) `slow:conformance@2`（第 3.5 步）：让两个后端对同一个问题给不同答案。**
+劣化：把 durable `claim` 的**外层**（决定答案顺序的那一层）排序从 `run_at asc` 改成 `run_at desc`。
+
+- 后端各自跑同一条命令：`KILN_BACKEND=memory` → `8 passed · 0 failed`；`KILN_BACKEND=postgres` →
+  `7 passed · 1 failed`，失败信息是 `then the job that has been due the longest: …  left: JobId(1288ea57…) right:
+  JobId(dc63d344…)`。
+- 慢闸门本身：`kiln verify jobq --slow` → `14/15 judged step(s) pass · 1 failed`，红的那一步是
+  `✗ slow:conformance@2 the suite fails on 1 of 2 backend(s): memory ✓, postgres ✗ (exit code 101: … panicked at
+  tests/spec_port_conformance.rs:231:5)`。注意同一步的 `spec ✓`——**只跑内存后端的快速路径是绿的，是慢闸门抓到了分歧**。
+- 回滚后同一个命令：`15/15 judged step(s) pass · 0 failed`。
+
+**b) `slow:mutants@80` 与 c) `slow:bench-budget@10` 还没有可演练的步骤**：这两个门从 3.20 / 3.22 起才有步骤声明，
+`unsafe-budget@0` 从 3.24 起（表 §2.2），所以这三腿排在它们交付之后；做法已固定（§4.1）。
+
 ## 5. 缺口
 
 ### 5.1 probe 覆盖（T3 新增槽位）
@@ -434,6 +474,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
-- **M2 收尾待办**：验收演练（§4.1）未做；`cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的
-  进度同步；`README.md` 的 track 表与 Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/
-  `t2-relay.md` 同构：步表、项目最终形状、装置与模式、实测数字、缺口）。
+- **M2 收尾待办**：验收演练的 b/c 两腿（`mutants`/`bench-budget`）要等 3.20/3.22，a/d 两腿已做并记在 §4.3；
+  `cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的进度同步；`README.md` 的 track 表与
+  Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/`t2-relay.md` 同构：步表、项目最终形状、
+  装置与模式、实测数字、缺口）。
