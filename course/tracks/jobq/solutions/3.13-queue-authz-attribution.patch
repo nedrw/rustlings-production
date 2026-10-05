@@ -1951,6 +1951,26 @@ index 4a92e2f..2457bd2 100644
  /// A driver failure, as the port wants it: whole, for the caller that wants the detail.
  ///
  /// One class is split off, and the split is the subject of `jobq/3.6-transaction-isolation`: a
+@@ -233,5 +233,13 @@ impl Store for PostgresStore {
+-                         limit least($3, case when $6 = 0 then $3 \
+-                                              else greatest(0, $6 - ( \
+-                                                  select count(*) from jobs running \
+-                                                  where running.queue = $1 and running.state = 'running' \
+-                                              )) end) \
++                         limit least($3, case when $6 = 0 then $3 \
++                                              else greatest(0, $6 - ( \
++                                                  select count(*) from jobs running \
++                                                  where running.queue = $1 and running.state = 'running' \
++                                              )) end, \
++                                      case when $8 = 0 then $3 \
++                                           else greatest(0, $8 - ( \
++                                               select count(*) from jobs holding \
++                                               where holding.state = 'running' and holding.queue in ( \
++                                                   select owner_of.queue from queues owner_of \
++                                                   where owner_of.owner = (select owner from queues where queue = $1) \
++                                               ) \
++                                           )) end) \
+                      ) \
 diff --git a/src/engine/tenant.rs b/src/engine/tenant.rs
 index ecd4a70..699d4b4 100644
 --- a/src/engine/tenant.rs

@@ -1,0 +1,30 @@
+# The procedure's own counts for `jobq/3.27-runbook-drill`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/runbook_harness.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them counts acts and stages rather than seconds, so nothing here can flake on a
+# loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead, and the two of them are the two halves of the promise the step's page makes: every act the
+# drill's script takes is a stage the page names, and every stage the page names is runnable. Both
+# bounds are zero on a procedure that holds — an act nobody wrote down is not a runbook that is
+# slightly worse, it is the act somebody improvises at three in the morning.
+command = "cargo test -p jobq --test runbook_harness -- --nocapture"
+
+[metric]
+# The acts the drill's script takes: six doors this deployment offers, one per stage of the
+# procedure. This number is a statement about the *workload* (the harness states it in one constant),
+# and it moves when a door is added.
+acts = 6
+# The acts the page accounts for with a stage of its own: all of them, because a procedure that
+# skips an act is a procedure somebody improvises during an incident.
+named = 6
+# The acts the page names no stage for, as an upper bound: the drill takes them and the page says
+# nothing about them, which is the stage this step exists to find.
+unnamed_max = 0
+# The stages that do not name all four of `command`, `signal`, `refusal` and `rollback`, as an upper
+# bound: a stage that does not say what its refusal looks like is a failure that gets improvised, and
+# one that does not say what its rollback is leaves the responder stuck one act further in.
+unrunnable_max = 0

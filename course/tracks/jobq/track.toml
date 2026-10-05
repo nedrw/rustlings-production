@@ -1,4 +1,4 @@
-# T3 `jobq` — a reusable job queue engine (26 steps), see `docs/curriculum.md` §8.
+# T3 `jobq` — a reusable job queue engine (27 steps), see `docs/curriculum.md` §8.
 #
 # Same conventions as `course/tracks/{mailer,relay}/track.toml` (`kiln lint-caps` enforces them):
 # `teaches` matches the capability ledger slot by slot (R0), `requires` is what this step provably
@@ -20,7 +20,7 @@
 # per backend in `conformance.toml`. None of them needs a cargo tool this machine may not have;
 # `?coverage` is the one that does, and it is a *should* gate for exactly that reason.
 #
-# `origin`: 3.1 is a `transfer` (the third project skeleton in a row), fourteen steps are `deepen`
+# `origin`: 3.1 is a `transfer` (the third project skeleton in a row), fifteen steps are `deepen`
 # (T1/T2 established the capability at a shallower depth), eleven are `teach`.
 
 format_version = 1
@@ -851,7 +851,7 @@ kind = "design"
 origin = "deepen"
 entry = "docs/steps/en/jobq/3.27-runbook-drill.md"
 time_hint = "120m"
-concepts = ["drill script", "rollback path", "postmortem"]
+concepts = ["procedure as data", "four-part stage", "refusal and rollback"]
 teaches = ["ops/runbook-drill@design"]
 requires = ["ops/runbook-drill@apply", "obs/metrics-slo@design", "ops/dlq-tooling@operate"]
 run = { cmd = "cargo test -p jobq --test spec_runbook" }
@@ -874,4 +874,4 @@ gates = [
     "slow:bench-budget@10",
     "unsafe-budget@0",
 ]
-hint = "A runbook that has never been executed is a wish: the drill drives the failure through the engine's own ports (a store that refuses writes, a lease holder that goes silent) and the page has to name the symptom, the check and the action for each."
+hint = "A runbook that has never been executed is a wish: the page is the procedure, and the drill walks it in order — three worlds (`Recovers`, `Never`, `Refused`), and the acts the page does not name come out of the report as the stage it is missing. The stage owes four things (`command`, `signal`, `refusal`, `rollback`), and the two pages this track has never shipped a word for are the refusal and the rollback."

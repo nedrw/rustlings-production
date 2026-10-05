@@ -139,7 +139,7 @@ index 685e9dd..a29b431 100644
                      job.state = JobState::Running;
                      // An attempt starts when a worker takes the job, not when it finishes: a
 diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
-index 3d7d428..2e9afc1 100644
+index 3d7d428..33108da 100644
 --- a/src/engine/store/postgres.rs
 +++ b/src/engine/store/postgres.rs
 @@ -45,6 +45,7 @@ use crate::engine::clock::{Clock, SystemClock};
@@ -186,11 +186,28 @@ index 3d7d428..2e9afc1 100644
  }
  
  impl Sealed for PostgresStore {}
-@@ -205,7 +221,14 @@ impl Store for PostgresStore {
+@@ -194,6 +210,15 @@ impl Store for PostgresStore {
+             // longest due, then identity): `returning` says which rows changed, not in which
+             // order, and an order that comes out of the database by accident is an order that
+             // changes the day an index does.
++            //
++            // The cap is a *limit*, not a check: `$6` is the queue's remaining room and `$8` the
++            // owner's, and `least` is what makes one statement take no more rows than the room it
++            // has. A `where` clause that merely compared the count with the cap would be true for
++            // every due row (the count is taken once, before the update), and `limit $3` would then
++            // hand out the whole queue — which is a queue over its cap with nobody having decided
++            // it. Two claims running at the same instant can still both read the same room; that is
++            // the narrower window this step's body records, and the port's overlap promise is what
++            // `jobq/3.5`'s suite judges.
+             // The claim stamps the lease in the same statement that stamps the attempt, and that
+             // is the point of this step: a row that is running without an owner is a row nobody can
+             // recover, and a row whose owner is written in a second statement is a row that is
+@@ -205,8 +230,19 @@ impl Store for PostgresStore {
                       where id in ( \
                           select id from jobs \
                           where queue = $1 and state = 'queued' and run_at <= $2 \
 -                         order by priority desc, run_at asc, id asc \
+-                         limit $3 \
 +                           and ($6 = 0 or ( \
 +                               select count(*) from jobs running \
 +                               where running.queue = $1 and running.state = 'running' \
@@ -199,10 +216,15 @@ index 3d7d428..2e9afc1 100644
 +                                      then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
 +                                      else 0 end desc, \
 +                                  run_at asc, id asc \
-                          limit $3 \
++                         limit least($3, case when $6 = 0 then $3 \
++                                              else greatest(0, $6 - ( \
++                                                  select count(*) from jobs running \
++                                                  where running.queue = $1 and running.state = 'running' \
++                                              )) end) \
                           for update skip locked \
                       ) \
-@@ -214,7 +237,10 @@ impl Store for PostgresStore {
+                      returning id, queue, payload::text as payload, state, priority, run_at, \
+@@ -214,7 +250,10 @@ impl Store for PostgresStore {
                   ) \
                   select id, queue, payload::text as payload, state, priority, run_at, attempts, \
                          max_attempts, last_error, lease_owner, lease_expires_at \
@@ -214,7 +236,7 @@ index 3d7d428..2e9afc1 100644
              )
              .bind(queue.as_str())
              .bind(now)
-@@ -228,6 +254,16 @@ impl Store for PostgresStore {
+@@ -228,6 +267,16 @@ impl Store for PostgresStore {
              // authorities disagree eventually (step `jobq/3.8-clock-injection` is where the engine's
              // becomes injectable, and it must be the only one either backend reads).
              .bind(now + self.lease)

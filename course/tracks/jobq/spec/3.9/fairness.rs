@@ -15,12 +15,18 @@
 //! The aging cases use the clock of `jobq/3.8-clock-injection`, because "has waited long enough" is
 //! a statement about time and a test that cannot move time can only wait for it.
 
+mod support;
+
 use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as Lease;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use jobq::engine::{Clock, Engine, JobState, MemoryStore, Policy, Queue, SubmitRequest, WorkerId};
+use jobq::engine::{
+    Clock, Engine, JobState, MemoryStore, Policy, PostgresStore, Queue, Store, SubmitRequest,
+    WorkerId,
+};
+use support::store::{Backend, backend};
 
 /// A clock the test moves by hand, starting where no wall clock will reach during the run.
 #[derive(Debug)]
@@ -253,5 +259,77 @@ fn the_daemon_reports_the_policy_it_will_apply() {
     assert!(
         default.contains("worker.max_in_flight_per_queue = 0"),
         "and the cap is off by default: a cap nobody chose looks like a stuck queue: {default}"
+    );
+}
+
+/// The cap bounds the rows one claim takes, on every backend.
+///
+/// A cap is not advice: one queue may hold one job in flight, and a claim that asks for eight has to
+/// come back with one. This is the case the conformance gate runs against both stores, because the
+/// in-memory backend counts the rows as it takes them while the durable one has to make the count
+/// part of the statement that takes them — and a statement that merely *checks* the cap before the
+/// `limit` hands out everything that is due.
+#[tokio::test]
+async fn the_cap_bounds_the_rows_one_claim_takes() {
+    let backend = backend().await;
+    let policy = Policy::strict().with_cap(1);
+    let store: Arc<dyn Store> = match &backend {
+        Backend::Memory(_) => Arc::new(MemoryStore::new().with_policy(policy)),
+        Backend::Postgres { container, .. } => Arc::new(
+            PostgresStore::connect(&container.url())
+                .await
+                .expect("the container the fixture started is reachable")
+                .with_policy(policy),
+        ),
+    };
+    let queue = queue("capped");
+    let worker = WorkerId::new("cap-suite");
+    for index in 0..2 {
+        store
+            .enqueue(SubmitRequest::new(
+                queue.clone(),
+                payload(&format!("c{index}@example.com")),
+            ))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the {} backend refused a submit: {error}", backend.name())
+            });
+    }
+
+    let first = store
+        .claim(&worker, &queue, 8)
+        .await
+        .unwrap_or_else(|error| panic!("the {} backend refused a claim: {error}", backend.name()));
+    assert_eq!(
+        first.len(),
+        1,
+        "the queue's cap is one job in flight, so a claim for eight takes one row — the {} backend \
+         answered with {} of the two due jobs. A cap that only *checks* the count leaves the `limit` \
+         to hand out everything, and the queue ends up over its cap with nobody having decided it \
+         (jobq/3.9-priority-fairness)",
+        backend.name(),
+        first.len()
+    );
+
+    store
+        .complete(&worker, &first[0].id())
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "the {} backend refused a completion: {error}",
+                backend.name()
+            )
+        });
+    let second = store
+        .claim(&worker, &queue, 8)
+        .await
+        .unwrap_or_else(|error| panic!("the {} backend refused a claim: {error}", backend.name()));
+    assert_eq!(
+        second.len(),
+        1,
+        "the finished attempt handed its slot back, so the next claim takes the job that was \
+         waiting: the {} backend answered with {}",
+        backend.name(),
+        second.len()
     );
 }
