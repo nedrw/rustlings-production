@@ -52,6 +52,32 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 
 ### 1.3 每个新闸门的实现契约（实现与内容都按这份写）
 
+**实测成本（本机、热缓存、`time` 墙钟）：先看这张表再看下面各门的契约**，因为「慢门」里真正慢的只有两个：
+
+| 门 | 每次判定做什么 | 实测 | 大头在哪 |
+| --- | --- | --- | --- |
+| `fmt` | `cargo fmt --all --check` | 0.18 s | 进程启动 |
+| `spec-integrity` / `caps` / `i18n` / `unsafe-budget` | 读文件、算 hash、扫源码（不建房） | 毫秒 | — |
+| `exit-code` | 带探针参数跑两个二进制 | ~0.1 s | 两次进程启动 |
+| `images` | 问本地镜像库 | 秒内 | 引擎 CLI |
+| `semver@baseline` | 把见证文件当测试目标编一次 | **~2.5 s** | 一次 cargo 重建 + 链接 |
+| `clippy@N` | `cargo clippy --all-targets` | 单跑 23 s；同一棵树上的 10 个快门**合计 15 s** | rustc 跨 target 的检查 |
+| `no-todo` / `docs:public` | 同一套 clippy 机制（不同 `-D` 集合） | 与上一行共享产物 | 同上 |
+| `slow:conformance@2` | 同一条 `run.cmd` 跑两遍（memory + postgres） | 0.2 s + 7.5 s ≈ **8 s** | 每个 durable 用例自己起一个容器 |
+| `slow:bench-budget@P` | 跑预算命令一次 | 一次构建 + 跑 ≈ 2.5 s + 基准自身时间 | 一次 cargo |
+| `slow:?coverage@N` | 带 `-C instrument-coverage` 的构建 + 分析 | 本机 blocked（无 llvm-tools）；若真跑：一次冷重建 **22 s**（现在有自己的目录，见下） | 一次完整重建 |
+| `slow:mutants@N` | 基线 1 次 + 最多 12 次尝试 + 收尾 1 次，每次都重建+链接+跑 | 走完 12 次尝试 **60 s**（≈ 5 s/次，含一次卡死被 25 s 拒掉） | 尝试次数 × 一次 cargo |
+
+一个 `selftest` 的固定成本 ≈ 首次建项目 + 快门那 10 项（合计约 15 s）：热缓存下 3.5（11 个门）**19.7 s**、
+3.15（10 个门）**25.6 s**。所以 CI 的半小时是「很多次 20–30 秒」，不是某个门特别贵；
+**从 3.20 起每步多花的 ~60 s 全部来自 `mutants`**（成本 = 尝试次数 × 一次 cargo，而尝试次数是它自己决定的），
+所以 §4.4 的两个时钟（每次 `4×基线+15s`、整轮 300 s）就是给它的。
+
+**`coverage` 的构建目录是它自己的**（提交 `kiln(coverage): the instrumented build keeps a directory of its own`）：
+换 `RUSTFLAGS` 就是换一次构建，以前它用沙箱共享目录，会把普通构建的产物扔掉（下一步命令付 22 s）；
+现在它在 `<cache>/kiln/coverage-target` 里建，第二次跑还是增量的。这靠 `process::prepared` 的一条规则：
+**调用方点名的 `CARGO_TARGET_DIR` 优先于沙箱默认值**（沙箱共享目录是默认值，不是命令）。
+
 **`mutants@N`（慢，限本步模块）**
 
 - 变异的范围**不是**人工清单：取本步参考解补丁 `solutions/<step>.patch` 里改动/新增的 `.rs` 文件，
