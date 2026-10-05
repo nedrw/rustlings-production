@@ -12,6 +12,7 @@ format_version = 1
 "spec/3.12/dedup.rs" = "sha256:3492cc650a85d442edce163caa2fa341764730c4cb7306f8306e0ad030c96d37"
 "spec/3.13/authz.rs" = "sha256:44f2370a6710de3730bf4a0c5ca903e8d504d4ef134fdd73b6086208e51aa8de"
 "spec/3.14/state_machine.rs" = "sha256:0f78092ed1ce46109090b2a15b41883dbfacee149a72dae3837628af8eb806b9"
+"spec/3.15/cli.rs" = "sha256:769031e71e6ff6842933b40b474760ed7abe3335ce607d02b623b698398d7d8f"
 "spec/3.2/public_api.rs" = "sha256:b0c44a93db4dcd20a829772f05f43c3e377645c43ad45779e058d1eebe2cd005"
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
 "spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"

@@ -1,0 +1,186 @@
+diff --git a/src/bin/jobqc.rs b/src/bin/jobqc.rs
+new file mode 100644
+index 0000000..51e2f65
+--- /dev/null
++++ b/src/bin/jobqc.rs
+@@ -0,0 +1,27 @@
++//! The `jobqc` binary: a shell around the library.
++//!
++//! Everything this file decides is about *this process*: the arguments it was given, the
++//! environment it was started in, its standard input, the two streams its answer goes to, and the
++//! code it leaves behind. What the answer *is* — which command ran, which bytes went to which
++//! stream, which class of failure is which number — belongs to `jobq::cli`
++//! (step `jobq/3.15-cli-contract`), and the point of keeping it there is that this file has nowhere
++//! to disagree with it.
++
++use std::process::ExitCode;
++
++fn main() -> ExitCode {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    let env: Vec<(String, String)> = std::env::vars().collect();
++    let outcome = jobq::cli::run(args, &env, &mut std::io::stdin().lock());
++
++    // The two streams, in the order a reader of a terminal sees them, and the code. `print!` rather
++    // than `println!`: the newlines are part of the answer, and a second one per line is a second
++    // thing a script would have to strip.
++    if !outcome.stdout().is_empty() {
++        print!("{}", outcome.stdout());
++    }
++    if !outcome.stderr().is_empty() {
++        eprint!("{}", outcome.stderr());
++    }
++    ExitCode::from(outcome.code())
++}
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+new file mode 100644
+index 0000000..3d2023b
+--- /dev/null
++++ b/src/cli/mod.rs
+@@ -0,0 +1,147 @@
++//! The command line as an interface another program consumes.
++//!
++//! `jobqd` is a process a supervisor starts; `jobqc` is a tool a *script* runs, and a script is a
++//! customer with no patience and no imagination: it reads `$?`, it reads stdout, it reads stderr
++//! into a log, and it cannot answer a question. Everything in this module follows from that one
++//! sentence, and the four rules it produces are the step's contract:
++//!
++//! * **stdout is the answer, stderr is the diagnosis.** A command that succeeded prints its answer
++//!   on stdout and nothing on stderr; a command that failed prints *nothing* on stdout and a
++//!   sentence on stderr. A script that pipes stdout into a parser must never be handed half a
++//!   document plus a warning, which is why the two streams are decided here, as one value
++//!   ([`Outcome`]), instead of at five call sites that each remember the rule.
++//! * **one exit code per failure class.** `0` answered, `2` the call was wrong, `3` the thing asked
++//!   about is not there, `4` the store refused, `1` this deployment is broken.
++//!   `jobq/3.3-library-errors` wrote that table and [`crate::engine::Error::exit_code`] is it, so
++//!   this module never invents a code: it hands the failure over.
++//! * **`--json` never changes the exit code.** It changes what the answer *looks like* and nothing
++//!   else — the refusal path does not consult it — so a script can add `--json` to a working
++//!   command line and keep its error handling.
++//! * **nothing prompts.** Every input arrives as a flag or on standard input, and a call that is
++//!   missing one is a usage error naming what is missing. A command that waits for a human is a
++//!   command that hangs in CI, and the hang is the failure mode nobody debugs.
++//!
++//! The grammar is small on purpose — `submit`, `inspect`, `list`, `usage` — and it grows where a
++//! step needs it (`jobq/3.16-dlq-tooling` adds the two commands that act on a dead letter). What
++//! does not grow is the shape: a subcommand, its flags, one answer, one code.
++//!
++//! ```text
++//! jobqc submit --queue signup --payload '{"to":"ada@example.com"}'   →  queued 4f1c…
++//! jobqc list --queue signup --json                                   →  [{"id":"4f1c…",…}]
++//! ```
++//!
++//! The text shapes are one line per thing, and the payload inside them is compact JSON on that
++//! line: a payload that carried a newline would break `wc -l` as a way of counting jobs, so the
++//! encoding is what keeps "one line per job" true rather than a promise about payloads. The JSON
++//! shapes are one document, `[]` for an empty answer rather than nothing at all — a script that has
++//! to special-case "no output" is a script that gets it wrong once and then stops trusting the
++//! tool.
++//!
++//! # Where the engine is
++//!
++//! [`run`] answers with an [`Outcome`] and the binary writes it, so the contract is checkable
++//! without a process: the step's spec calls this function *and* runs the real binary. The store, on
++//! the other hand, is not this module's: the doors are the engine's ([`Engine`], and the per-tenant
++//! handle it hands out), and the settings that say which backend to open are the daemon's
++//! (`crate::service::open_store`). A command line that opened a pool itself would be a second
++//! assembly of this crate, and therefore a second thing that can disagree with the daemon about
++//! which queue it is talking to — the boundary `jobq/3.1-engine-boundary` drew.
++//!
++//! # What is left to write
++//!
++//! Everything between the command line and that value: which subcommand was asked for, which flags
++//! it takes, what each answer looks like, and which failures are the caller's. The usage text below
++//! is the grammar — it is the interface a script reads and the contract this file keeps — so it is
++//! given; the parser, the renderers and the two `Outcome` constructors are not, because "stdout is
++//! the answer, stderr is the diagnosis" is what this step is about, and a constructor that already
++//! did it would be the answer.
++
++use std::io::Read;
++
++/// The usage text: what the tool is, every command it has, and the codes it leaves behind.
++pub const USAGE: &str = "\
++usage: jobqc [OPTIONS] <COMMAND>
++
++COMMANDS:
++    submit                  queue one job and print its identity
++    inspect <ID>            print one job
++    list                    print the jobs this engine can see
++    usage                   print what the queues have done
++    help                    print this help
++
++OPTIONS:
++    --json                  print the answer as one JSON value on stdout
++    --config <FILE>         read settings from a TOML file (the same file jobqd reads)
++    --help, -h              print this help and exit
++    --version               print the version and exit
++
++COMMAND OPTIONS:
++    submit  --queue <NAME> --payload <JSON> | --stdin [--priority <N>] [--max-attempts <N>]
++    inspect <ID>
++    list    [--queue <NAME>] [--state <STATE>] [--limit <N>]
++
++Settings are read from the file given by --config and overridden by the environment, where every
++setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`, which is how a script
++points this tool at the same queue the daemon drains).
++
++Exit codes: 0 the command answered, 2 the call was wrong, 3 the thing asked about is not there,
++4 the store refused, 1 this deployment is broken.
++";
++
++/// What the process would have written, and the code it would have ended with.
++///
++/// One value rather than three writes, and that is the shape of the contract: "stdout is the
++/// answer, stderr is the diagnosis, the code is the class" is a decision about *this* value, so a
++/// test can assert it directly and a subprocess test asserts the same decision from outside. The
++/// binary that writes these bytes is a handful of lines because there is nothing left to decide.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Outcome {
++    /// What the process would exit with.
++    code: u8,
++    /// What standard output would have received.
++    stdout: String,
++    /// What standard error would have received.
++    stderr: String,
++}
++
++impl Outcome {
++    /// The bytes standard output would have received.
++    #[must_use]
++    pub fn stdout(&self) -> &str {
++        &self.stdout
++    }
++
++    /// The bytes standard error would have received.
++    #[must_use]
++    pub fn stderr(&self) -> &str {
++        &self.stderr
++    }
++
++    /// The code the process would have ended with.
++    #[must_use]
++    pub fn code(&self) -> u8 {
++        self.code
++    }
++}
++
++/// Run one command line: `args` without the program name, the environment the process was given,
++/// and its standard input.
++///
++/// Synchronous on purpose. A command that talks to a store needs a runtime, and the runtime is
++/// built inside that branch — so `--help` answers on a machine where a runtime cannot even start,
++/// and a program that wants this grammar from its own code does not have to be an async one to get
++/// it.
++///
++/// Nothing here panics and nothing here exits: every path a caller can take — a usage error, a
++/// store that is not reachable, a job that is not there — comes back as an [`Outcome`].
++#[must_use]
++pub fn run(
++    args: impl IntoIterator<Item = String>,
++    env: &[(String, String)],
++    input: &mut dyn Read,
++) -> Outcome {
++    todo!(
++        "jobq/3.15-cli-contract: the grammar, the two streams and the exit code — `USAGE` is the \
++         interface and everything else is yours"
++    )
++}

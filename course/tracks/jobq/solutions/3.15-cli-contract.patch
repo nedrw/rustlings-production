@@ -1,0 +1,1128 @@
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 3d2023b..dba281d 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -46,17 +46,20 @@
+ //! (`crate::service::open_store`). A command line that opened a pool itself would be a second
+ //! assembly of this crate, and therefore a second thing that can disagree with the daemon about
+ //! which queue it is talking to — the boundary `jobq/3.1-engine-boundary` drew.
+-//!
+-//! # What is left to write
+-//!
+-//! Everything between the command line and that value: which subcommand was asked for, which flags
+-//! it takes, what each answer looks like, and which failures are the caller's. The usage text below
+-//! is the grammar — it is the interface a script reads and the contract this file keeps — so it is
+-//! given; the parser, the renderers and the two `Outcome` constructors are not, because "stdout is
+-//! the answer, stderr is the diagnosis" is what this step is about, and a constructor that already
+-//! did it would be the answer.
+ 
+ use std::io::Read;
++use std::path::PathBuf;
++use std::str::FromStr;
++use std::sync::Arc;
++
++use serde::Serialize;
++
++use crate::engine::{
++    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ATTEMPTS, Engine, Error, Job, JobFilter, JobId, JobState,
++    Queue, QueueUsage, STATES, Store, SubmitRequest,
++};
++use crate::service::config::{Config, Flags};
++use crate::service::open_store;
+ 
+ /// The usage text: what the tool is, every command it has, and the codes it leaves behind.
+ pub const USAGE: &str = "\
+@@ -122,6 +125,29 @@ impl Outcome {
+     pub fn code(&self) -> u8 {
+         self.code
+     }
++
++    /// An answer: the code is `0`, stdout holds it, and stderr is empty.
++    fn answered(stdout: String) -> Self {
++        Self {
++            code: 0,
++            stdout,
++            stderr: String::new(),
++        }
++    }
++
++    /// A refusal: the code is the failure's class, stdout is **empty**, and the diagnosis names the
++    /// process that produced it.
++    ///
++    /// The empty stdout is the whole of the rule a script depends on, and it is written here rather
++    /// than at the call sites so that one of them cannot forget it. `--json` is not consulted: what
++    /// a failure *is* does not depend on how the answer would have been printed.
++    fn refused(error: &Error) -> Self {
++        Self {
++            code: error.exit_code(),
++            stdout: String::new(),
++            stderr: format!("jobqc: {error}\n"),
++        }
++    }
+ }
+ 
+ /// Run one command line: `args` without the program name, the environment the process was given,
+@@ -140,8 +166,586 @@ pub fn run(
+     env: &[(String, String)],
+     input: &mut dyn Read,
+ ) -> Outcome {
+-    todo!(
+-        "jobq/3.15-cli-contract: the grammar, the two streams and the exit code — `USAGE` is the \
+-         interface and everything else is yours"
++    match answer(args, env, input) {
++        Ok(stdout) => Outcome::answered(stdout),
++        Err(error) => Outcome::refused(&error),
++    }
++}
++
++/// The whole behaviour, as the `Result` the two streams are decided from.
++fn answer(
++    args: impl IntoIterator<Item = String>,
++    env: &[(String, String)],
++    input: &mut dyn Read,
++) -> Result<String, Error> {
++    let Parsed {
++        options,
++        invocation,
++    } = Parsed::parse(args)?;
++    let command = match invocation {
++        // Answered from the grammar alone: no settings are read, no store is opened and no runtime
++        // is started, which is what makes the two commands something a machine with nothing
++        // installed can still run.
++        Invocation::Help => return Ok(USAGE.to_owned()),
++        Invocation::Version => return Ok(format!("jobqc {}\n", env!("CARGO_PKG_VERSION"))),
++        Invocation::Command(command) => command,
++    };
++    // The runtime is built here rather than in the binary, because "this command needs one" is a
++    // fact about the command: it is the only thing in this file that is not a value, and it is
++    // reached by exactly the commands that talk to a store.
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .enable_all()
++        .build()
++        .map_err(|error| Error::Io {
++            source: std::io::Error::other(format!("`jobqc` could not start a runtime: {error}")),
++        })?;
++    runtime.block_on(execute(command, &options, env, input))
++}
++
++/// One command line, parsed: the global options and what was asked for.
++struct Parsed {
++    /// Options every command shares.
++    options: Options,
++    /// The command, or the two answers that are not commands.
++    invocation: Invocation,
++}
++
++/// The options that belong to the command line rather than to one command.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++struct Options {
++    /// `--json`: print the answer as one JSON value.
++    json: bool,
++    /// `--config <FILE>`: the settings file to read.
++    config: Option<PathBuf>,
++}
++
++/// What the command line was asked to do.
++enum Invocation {
++    /// `--help`, `-h`, `help`, or nothing at all: print the usage text.
++    Help,
++    /// `--version`.
++    Version,
++    /// A command that talks to the engine.
++    Command(Command),
++}
++
++/// The four commands.
++enum Command {
++    /// Queue one job.
++    Submit(Submit),
++    /// Print one job.
++    Inspect(Inspect),
++    /// Print the jobs this engine can see.
++    List(List),
++    /// Print what the queues have done.
++    Usage,
++}
++
++/// `submit`: the job to queue.
++struct Submit {
++    /// Which queue it goes to.
++    queue: Queue,
++    /// Where its payload comes from.
++    payload: Payload,
++    /// Higher runs first.
++    priority: i32,
++    /// Attempts allowed in total.
++    max_attempts: u32,
++}
++
++/// `inspect`: which job.
++struct Inspect {
++    /// The job's identity.
++    id: JobId,
++}
++
++/// `list`: which jobs.
++struct List {
++    /// Only this queue, when the caller named one.
++    queue: Option<Queue>,
++    /// Only jobs in this state, when the caller named one.
++    state: Option<JobState>,
++    /// At most this many jobs.
++    limit: usize,
++}
++
++/// Where a submitted job's payload comes from.
++enum Payload {
++    /// `--payload <JSON>`.
++    Text(String),
++    /// `--stdin`: read it from standard input.
++    Stdin,
++}
++
++/// What a global option did with one argument.
++enum Global {
++    /// Not a global option: the command's own parser has the argument.
++    NotAnOption,
++    /// Taken, and the line continues.
++    Taken,
++    /// `--help` or `--version`: the rest of the line is not read, and this is the answer.
++    Asked(Invocation),
++}
++
++/// One global option, if this argument is one.
++///
++/// Globals are accepted on either side of the subcommand, because a script author writes
++/// `jobqc --json list` and a person types `jobqc list --json`; a tool that took one of the two
++/// would be a tool whose `--help` has to explain which.
++fn global(
++    argument: &str,
++    args: &mut impl Iterator<Item = String>,
++    options: &mut Options,
++) -> Result<Global, Error> {
++    match argument {
++        "--json" => {
++            options.json = true;
++            Ok(Global::Taken)
++        }
++        "--config" => {
++            options.config = Some(PathBuf::from(value(args, "--config")?));
++            Ok(Global::Taken)
++        }
++        "--help" | "-h" => Ok(Global::Asked(Invocation::Help)),
++        "--version" => Ok(Global::Asked(Invocation::Version)),
++        _ => Ok(Global::NotAnOption),
++    }
++}
++
++impl Parsed {
++    /// The whole grammar, and the whole of "no command asks a question a script cannot answer".
++    ///
++    /// Everything a caller can get wrong is refused here, before any settings are read: a mistake
++    /// in the call exits `2` whether or not a database turns out to be reachable, which is what
++    /// makes `2` a code a script can act on.
++    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, Error> {
++        let mut args = args.into_iter();
++        let mut options = Options::default();
++        // The global options first; the first argument that is not one of them names the command.
++        let name = loop {
++            let Some(argument) = args.next() else {
++                // `jobqc` on its own is a question about what this tool does, and the answer is the
++                // usage text — on stdout with code `0`, because nothing went wrong.
++                return Ok(Self {
++                    options,
++                    invocation: Invocation::Help,
++                });
++            };
++            match global(&argument, &mut args, &mut options)? {
++                Global::Taken => continue,
++                Global::Asked(invocation) => {
++                    return Ok(Self {
++                        options,
++                        invocation,
++                    });
++                }
++                Global::NotAnOption => break argument,
++            }
++        };
++
++        let invocation = match name.as_str() {
++            "submit" => Submit::parse(args, &mut options)?,
++            "inspect" => Inspect::parse(args, &mut options)?,
++            "list" => List::parse(args, &mut options)?,
++            "usage" => no_arguments(args, &mut options, "usage")?
++                .unwrap_or(Invocation::Command(Command::Usage)),
++            "help" => Invocation::Help,
++            other if other.starts_with('-') => {
++                return Err(Error::Invalid {
++                    detail: format!(
++                        "unknown argument `{other}`: `jobqc --help` lists every option"
++                    ),
++                });
++            }
++            other => {
++                return Err(Error::Invalid {
++                    detail: format!("unknown command `{other}`: `jobqc --help` lists every one"),
++                });
++            }
++        };
++        Ok(Self {
++            options,
++            invocation,
++        })
++    }
++}
++
++impl Submit {
++    /// `submit`'s own flags. Nothing here touches a store: the queue is a name this engine can
++    /// write down, and the payload is text until it is read.
++    fn parse(
++        mut args: impl Iterator<Item = String>,
++        options: &mut Options,
++    ) -> Result<Invocation, Error> {
++        let mut queue = None;
++        let mut payload = None;
++        let mut priority = 0;
++        let mut max_attempts = DEFAULT_MAX_ATTEMPTS;
++        while let Some(argument) = args.next() {
++            match global(&argument, &mut args, options)? {
++                Global::Taken => continue,
++                Global::Asked(invocation) => return Ok(invocation),
++                Global::NotAnOption => {}
++            }
++            match argument.as_str() {
++                "--queue" => queue = Some(Queue::parse(&value(&mut args, "--queue")?)?),
++                // The last of the two payload sources wins, which is what a repeated flag does
++                // everywhere else on this command line (`jobqd`'s parser made that call first): a
++                // line that names both is a line somebody edited.
++                "--payload" => payload = Some(Payload::Text(value(&mut args, "--payload")?)),
++                "--stdin" => payload = Some(Payload::Stdin),
++                "--priority" => priority = number(&value(&mut args, "--priority")?, "--priority")?,
++                "--max-attempts" => {
++                    max_attempts = number(&value(&mut args, "--max-attempts")?, "--max-attempts")?;
++                }
++                other => return Err(unknown(other, "submit")),
++            }
++        }
++        let Some(queue) = queue else {
++            return Err(Error::Invalid {
++                detail: "`submit` needs `--queue <NAME>`: the queue this job goes to".to_owned(),
++            });
++        };
++        let Some(payload) = payload else {
++            return Err(Error::Invalid {
++                detail:
++                    "`submit` needs the job's payload: `--payload <JSON>`, or `--stdin` to read \
++                         it from standard input"
++                        .to_owned(),
++            });
++        };
++        Ok(Invocation::Command(Command::Submit(Self {
++            queue,
++            payload,
++            priority,
++            max_attempts,
++        })))
++    }
++
++    /// The payload, read from standard input when the caller asked for that.
++    ///
++    /// Reading happens here rather than in the parser because a command that was not asked to read
++    /// standard input must never touch it: a tool that read stdin on every call would hang on a
++    /// terminal, and a hang is the one failure a script cannot answer.
++    fn value(&self, input: &mut dyn Read) -> Result<serde_json::Value, Error> {
++        let text = match &self.payload {
++            Payload::Text(text) => text.clone(),
++            Payload::Stdin => {
++                let mut text = String::new();
++                input.read_to_string(&mut text)?;
++                text
++            }
++        };
++        serde_json::from_str(&text).map_err(|error| Error::Invalid {
++            detail: format!("the payload is not JSON: {error}"),
++        })
++    }
++}
++
++impl Inspect {
++    /// `inspect`'s one argument. The identity is parsed here, so a typo is a usage error rather
++    /// than a question about a store.
++    fn parse(
++        mut args: impl Iterator<Item = String>,
++        options: &mut Options,
++    ) -> Result<Invocation, Error> {
++        let mut id = None;
++        while let Some(argument) = args.next() {
++            match global(&argument, &mut args, options)? {
++                Global::Taken => continue,
++                Global::Asked(invocation) => return Ok(invocation),
++                Global::NotAnOption => {}
++            }
++            if id.is_some() {
++                return Err(Error::Invalid {
++                    detail: format!("`inspect` takes one job id, and `{argument}` is a second one"),
++                });
++            }
++            id = Some(argument.parse::<JobId>().map_err(|error| Error::Invalid {
++                detail: format!("`{argument}` is not a job id: {error}"),
++            })?);
++        }
++        let Some(id) = id else {
++            return Err(Error::Invalid {
++                detail: "`inspect` needs the identity of one job: `jobqc inspect <ID>`".to_owned(),
++            });
++        };
++        Ok(Invocation::Command(Command::Inspect(Self { id })))
++    }
++}
++
++impl List {
++    /// `list`'s filters, each of which the store answers rather than this module.
++    fn parse(
++        mut args: impl Iterator<Item = String>,
++        options: &mut Options,
++    ) -> Result<Invocation, Error> {
++        let mut list = Self {
++            queue: None,
++            state: None,
++            limit: DEFAULT_LIST_LIMIT,
++        };
++        while let Some(argument) = args.next() {
++            match global(&argument, &mut args, options)? {
++                Global::Taken => continue,
++                Global::Asked(invocation) => return Ok(invocation),
++                Global::NotAnOption => {}
++            }
++            match argument.as_str() {
++                "--queue" => list.queue = Some(Queue::parse(&value(&mut args, "--queue")?)?),
++                "--state" => list.state = Some(state(&value(&mut args, "--state")?)?),
++                "--limit" => list.limit = number(&value(&mut args, "--limit")?, "--limit")?,
++                other => return Err(unknown(other, "list")),
++            }
++        }
++        Ok(Invocation::Command(Command::List(list)))
++    }
++
++    /// The filter the engine is asked with.
++    fn filter(&self) -> JobFilter {
++        let mut filter = JobFilter::new().with_limit(self.limit);
++        if let Some(queue) = &self.queue {
++            filter = filter.with_queue(queue.clone());
++        }
++        if let Some(state) = self.state {
++            filter = filter.with_state(state);
++        }
++        filter
++    }
++}
++
++/// `jobq/3.14-job-state-machine`'s encoding, with the refusal phrased for somebody who typed it.
++fn state(text: &str) -> Result<JobState, Error> {
++    JobState::parse(text).map_err(|refused| Error::Invalid {
++        detail: format!(
++            "`{}` is not a state a job can be in: the states are {}",
++            refused.text(),
++            STATES
++                .iter()
++                .map(|state| format!("`{}`", state.as_str()))
++                .collect::<Vec<String>>()
++                .join(", ")
++        ),
++    })
++}
++
++/// A command that takes no arguments, and the refusal naming the one it was handed.
++///
++/// `Some` is an answer rather than a refusal: a `usage --help` is a request for the usage text.
++fn no_arguments(
++    mut args: impl Iterator<Item = String>,
++    options: &mut Options,
++    command: &str,
++) -> Result<Option<Invocation>, Error> {
++    while let Some(argument) = args.next() {
++        match global(&argument, &mut args, options)? {
++            Global::Taken => continue,
++            Global::Asked(invocation) => return Ok(Some(invocation)),
++            Global::NotAnOption => {}
++        }
++        return Err(Error::Invalid {
++            detail: format!("`{command}` takes no arguments, and `{argument}` is one"),
++        });
++    }
++    Ok(None)
++}
++
++/// Run one command through the engine, and answer the bytes it produced.
++async fn execute(
++    command: Command,
++    options: &Options,
++    env: &[(String, String)],
++    input: &mut dyn Read,
++) -> Result<String, Error> {
++    match command {
++        Command::Submit(submit) => {
++            // What the caller typed is answered before anything is opened: a payload that is not
++            // JSON is a mistake in the call, and it must not depend on a store being reachable.
++            let payload = submit.value(input)?;
++            let engine = engine(options, env).await?;
++            let request = SubmitRequest::new(submit.queue, payload)
++                .with_priority(submit.priority)
++                .with_max_attempts(submit.max_attempts);
++            let id = engine.submit(request).await?;
++            if options.json {
++                return document(&IdView { id });
++            }
++            Ok(format!("queued {id}\n"))
++        }
++        Command::Inspect(inspect) => {
++            let engine = engine(options, env).await?;
++            let job = engine.inspect(&inspect.id).await?;
++            if options.json {
++                return document(&JobView::new(&job));
++            }
++            Ok(job_line(&job))
++        }
++        Command::List(list) => {
++            let engine = engine(options, env).await?;
++            let jobs = engine.list(&list.filter()).await?;
++            if options.json {
++                let views: Vec<JobView<'_>> = jobs.iter().map(JobView::new).collect();
++                return document(&views);
++            }
++            Ok(jobs.iter().map(job_line).collect())
++        }
++        Command::Usage => {
++            let engine = engine(options, env).await?;
++            let lines = engine.usage().await?;
++            if options.json {
++                let views: Vec<UsageView<'_>> = lines.iter().map(UsageView::new).collect();
++                return document(&views);
++            }
++            Ok(lines.iter().map(usage_line).collect())
++        }
++    }
++}
++
++/// The engine the command talks through: the settings the daemon reads, turned into a store by the
++/// one place in this crate that turns settings into a store.
++///
++/// The command line does **not** open a database itself, and that is the boundary of
++/// `jobq/3.1-engine-boundary` still holding: a second place that built a pool would be a second
++/// place that could pick a different backend, a different lease or a different policy from the
++/// worker it is talking to. It does not *migrate* either: a tool that wrote on every read would be
++/// a tool a read-only replica cannot serve, and `jobqd` already owns that step.
++async fn engine(
++    options: &Options,
++    env: &[(String, String)],
++) -> Result<Engine<Arc<dyn Store>>, Error> {
++    let flags = Flags {
++        config: options.config.clone(),
++        ..Flags::default()
++    };
++    let config = Config::load(&flags, env)?;
++    Ok(Engine::new(open_store(&config).await?))
++}
++
++/// One job, as `--json` prints it.
++///
++/// The field order is written down and asserted, although JSON does not define one: a golden test
++/// that reorders its fields at every refactor is a test nobody reads, and a diff of two lines beats
++/// a set comparison that hides a rename.
++#[derive(Serialize)]
++struct JobView<'a> {
++    /// Identity, in the form every other command takes it.
++    id: JobId,
++    /// Which queue it belongs to.
++    queue: &'a str,
++    /// Where it is in its life.
++    state: &'a str,
++    /// The payload the handler is given, as the JSON value it is — not as a string of JSON, which
++    /// is the difference between `jq '.payload.to'` working and needing `fromjson` first.
++    payload: &'a serde_json::Value,
++}
++
++impl<'a> JobView<'a> {
++    /// One job, borrowed rather than copied: a listing renders what the engine already holds.
++    fn new(job: &'a Job) -> Self {
++        Self {
++            id: job.id(),
++            queue: job.queue().as_str(),
++            state: job.state().as_str(),
++            payload: job.payload(),
++        }
++    }
++}
++
++/// The identity a successful `submit` answers with.
++#[derive(Serialize)]
++struct IdView {
++    /// The job's identity.
++    id: JobId,
++}
++
++/// One queue's numbers, as `--json` prints them.
++#[derive(Serialize)]
++struct UsageView<'a> {
++    /// Which queue.
++    queue: &'a str,
++    /// Jobs written into it.
++    submitted: u64,
++    /// Attempts a worker started.
++    claimed: u64,
++    /// Attempts that finished their job.
++    succeeded: u64,
++    /// Attempts that reported a failure.
++    failed: u64,
++    /// Attempts that ended without either.
++    reclaimed: u64,
++    /// Attempts holding a worker right now: the derived number, and the one an operator wants.
++    running: u64,
++}
++
++impl<'a> UsageView<'a> {
++    /// One line of the report, as a value.
++    fn new(line: &'a QueueUsage) -> Self {
++        let usage = line.usage();
++        Self {
++            queue: line.queue().as_str(),
++            submitted: usage.submitted(),
++            claimed: usage.claimed(),
++            succeeded: usage.succeeded(),
++            failed: usage.failed(),
++            reclaimed: usage.reclaimed(),
++            running: usage.running(),
++        }
++    }
++}
++
++/// One job in the text shape: one line, four fields, and the payload as compact JSON — which cannot
++/// contain a naked newline, so a line is always one job.
++fn job_line(job: &Job) -> String {
++    let (id, queue, state, payload) = (job.id(), job.queue(), job.state(), job.payload());
++    format!("{id} {queue} {state} {payload}\n")
++}
++
++/// One queue's numbers in the text shape.
++fn usage_line(line: &QueueUsage) -> String {
++    let usage = line.usage();
++    let (queue, submitted) = (line.queue(), usage.submitted());
++    let (claimed, succeeded) = (usage.claimed(), usage.succeeded());
++    let (failed, reclaimed) = (usage.failed(), usage.reclaimed());
++    let running = usage.running();
++    format!(
++        "{queue} submitted={submitted} claimed={claimed} succeeded={succeeded} failed={failed} \
++         reclaimed={reclaimed} running={running}\n"
+     )
+ }
++
++/// One JSON document, with the newline a shell prompt expects after it.
++///
++/// Serialising a view of an engine value cannot fail in practice — every field is a number, a
++/// string, a uuid, or a payload the engine already holds as JSON — and it is still answered rather
++/// than unwrapped: this crate's library code is not allowed to panic, and "something could not be
++/// written" is the io class rather than a fourth kind of usage error.
++fn document<T: Serialize>(value: &T) -> Result<String, Error> {
++    let mut document = serde_json::to_string(value).map_err(|error| Error::Io {
++        source: std::io::Error::other(format!("the answer could not be written: {error}")),
++    })?;
++    document.push('\n');
++    Ok(document)
++}
++
++/// The value of a flag that needs one, or the sentence naming the flag that was left hanging.
++fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Error> {
++    args.next().ok_or_else(|| Error::Invalid {
++        detail: format!("`{flag}` needs a value"),
++    })
++}
++
++/// A number a flag was given, or the refusal that shows the caller what it typed.
++fn number<T: FromStr>(text: &str, flag: &str) -> Result<T, Error> {
++    text.parse::<T>().map_err(|_| Error::Invalid {
++        detail: format!("`{flag} {text}` is not a number"),
++    })
++}
++
++/// An argument this command does not have, with the place that lists the ones it does.
++fn unknown(argument: &str, command: &str) -> Error {
++    Error::Invalid {
++        detail: format!(
++            "`{argument}` is not an option of `{command}`: `jobqc --help` lists every one"
++        ),
++    }
++}
+diff --git a/src/engine/domain.rs b/src/engine/domain.rs
+index 6bc127b..3f56412 100644
+--- a/src/engine/domain.rs
++++ b/src/engine/domain.rs
+@@ -21,6 +21,14 @@ pub const QUEUE_NAME_MAX: usize = 64;
+ /// How many attempts a job gets when the caller does not say.
+ pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+ 
++/// How many jobs a listing answers with when the caller does not say (`jobq/3.15-cli-contract`).
++///
++/// A queue has no natural end, and a read that has none is a read that answers the same question
++/// with a million rows on the day somebody forgets a filter. The default is a page rather than a
++/// promise about how many jobs a queue holds, and [`JobFilter::with_limit`] is how a caller says
++/// otherwise.
++pub const DEFAULT_LIST_LIMIT: usize = 100;
++
+ /// A queue name: the unit of ordering, of fairness and of accounting.
+ #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+ pub struct Queue(String);
+@@ -480,3 +488,95 @@ impl SubmitRequest {
+         }
+     }
+ }
++
++/// Which jobs a read is about (`jobq/3.15-cli-contract`).
++///
++/// A value rather than three parameters, because a read that takes three optional arguments grows a
++/// fourth one at the next step and every call site with it: the filter travels as one thing, the
++/// two backends answer it with the same rule (a `where` clause in SQL, a predicate over a map in
++/// memory), and the *answer* is what the port's documentation fixes.
++///
++/// `queue` and `state` are asked separately on purpose: "what is waiting in `signup`" and "what has
++/// failed anywhere" are both questions an operator asks, and a filter that could not tell them apart
++/// would make one of the two unaskable.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct JobFilter {
++    /// Only this queue, when the caller named one.
++    queue: Option<Queue>,
++    /// Only jobs in this state, when the caller named one.
++    state: Option<JobState>,
++    /// How many jobs the answer may hold.
++    limit: usize,
++}
++
++impl JobFilter {
++    /// Every job this store can see, up to [`DEFAULT_LIST_LIMIT`] of them.
++    #[must_use]
++    pub fn new() -> Self {
++        Self {
++            queue: None,
++            state: None,
++            limit: DEFAULT_LIST_LIMIT,
++        }
++    }
++
++    /// Only the jobs of `queue`.
++    #[must_use]
++    pub fn with_queue(mut self, queue: Queue) -> Self {
++        self.queue = Some(queue);
++        self
++    }
++
++    /// Only the jobs in `state`.
++    #[must_use]
++    pub fn with_state(mut self, state: JobState) -> Self {
++        self.state = Some(state);
++        self
++    }
++
++    /// At most `limit` jobs.
++    ///
++    /// Zero is allowed and means "none": a bound is a bound, and a caller that asked for nothing
++    /// gets nothing rather than the default page.
++    #[must_use]
++    pub fn with_limit(mut self, limit: usize) -> Self {
++        self.limit = limit;
++        self
++    }
++
++    /// The queue the caller named, when it named one.
++    #[must_use]
++    pub fn queue(&self) -> Option<&Queue> {
++        self.queue.as_ref()
++    }
++
++    /// The state the caller named, when it named one.
++    #[must_use]
++    pub fn state(&self) -> Option<JobState> {
++        self.state
++    }
++
++    /// How many jobs the answer may hold.
++    #[must_use]
++    pub fn limit(&self) -> usize {
++        self.limit
++    }
++
++    /// Whether this filter names `job`, as both backends have to answer it.
++    ///
++    /// The same three questions the durable backend's `where` clause asks, written once so that the
++    /// two backends cannot disagree about what a filter means: this is the in-memory half, and
++    /// `migrations/0001_jobs.sql`'s columns are the other.
++    pub(crate) fn matches(&self, job: &Job) -> bool {
++        self.queue.as_ref().is_none_or(|queue| job.queue == *queue)
++            && self.state.is_none_or(|state| job.state == state)
++    }
++}
++
++impl Default for JobFilter {
++    /// An empty filter: every job, up to the default page.
++    fn default() -> Self {
++        Self::new()
++    }
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index cd50943..f1edf0d 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -41,7 +41,8 @@ pub use clock::{Clock, SystemClock};
+ pub use cron::Schedule;
+ pub use dedup::{DEDUP_KEY_MAX, Dedup};
+ pub use domain::{
+-    DEFAULT_MAX_ATTEMPTS, Job, JobId, JobState, QUEUE_NAME_MAX, Queue, SubmitRequest, WorkerId,
++    DEFAULT_LIST_LIMIT, DEFAULT_MAX_ATTEMPTS, Job, JobFilter, JobId, JobState, QUEUE_NAME_MAX,
++    Queue, SubmitRequest, WorkerId,
+ };
+ pub use error::Error;
+ pub use events::{EventKind, JobEvent};
+diff --git a/src/engine/scheduler.rs b/src/engine/scheduler.rs
+index a89775d..7be0350 100644
+--- a/src/engine/scheduler.rs
++++ b/src/engine/scheduler.rs
+@@ -7,7 +7,7 @@
+ //! those decisions changes — which is the point of an engine at all.
+ 
+ use crate::engine::authz::{QueueAudit, QueueDeclaration};
+-use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
++use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::store::Store;
+ use crate::engine::tenant::Tenant;
+@@ -137,6 +137,20 @@ impl<S: Store> Engine<S> {
+         self.store.audit(limit).await
+     }
+ 
++    /// The jobs this engine can see, in the order `claim` documents (`jobq/3.15-cli-contract`).
++    ///
++    /// The read behind `jobqc list`, and the engine's roof over it for the reason every other door
++    /// here is: a caller that asks the engine does not have to know which backend it was handed, and
++    /// a bounded page ([`JobFilter::limit`]) is what keeps "what is in this queue" a question a tool
++    /// can ask about a queue that is deep.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    pub async fn list(&self, filter: &JobFilter) -> Result<Vec<Job>, Error> {
++        self.store.list(filter).await
++    }
++
+     /// Read one job, or say there is none.
+     ///
+     /// # Errors
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 036c05c..730201b 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -37,7 +37,7 @@ use chrono::{DateTime, Utc};
+ 
+ use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
+-use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
++use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+@@ -661,6 +661,33 @@ impl Store for MemoryStore {
+         })
+     }
+ 
++    fn list<'a>(&'a self, filter: &'a JobFilter) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
++        Box::pin(async move {
++            let ledger = self.ledger();
++            // A row this handle may not see is a row that is not in the answer, which is the answer
++            // `get` and `events` give for one: a listing is filtered by the same rule as everything
++            // else rather than by a second one (`jobq/3.13-queue-authz-attribution`).
++            let mut jobs: Vec<Job> = ledger
++                .jobs
++                .values()
++                .filter(|job| filter.matches(job))
++                .cloned()
++                .collect();
++            // The port's order (`jobq/3.15-cli-contract`): priority, then the one that has been due
++            // longest, then identity — the rule `claim` documents, written once for the answer
++            // rather than for the moment of taking.
++            jobs.sort_by(|left, right| {
++                right
++                    .priority
++                    .cmp(&left.priority)
++                    .then_with(|| left.run_at.cmp(&right.run_at))
++                    .then_with(|| left.id.cmp(&right.id))
++            });
++            jobs.truncate(filter.limit());
++            Ok(jobs)
++        })
++    }
++
+     fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
+         Box::pin(async move {
+             let mut ledger = self.ledger();
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 556265e..83baf72 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -32,6 +32,12 @@
+ //! filter that lives in the queries cannot be forgotten by a call site, and a tenant that is a
+ //! parameter is a tenant a caller can get wrong.
+ //!
++//! `jobq/3.15-cli-contract` widens it by one, and the reason is what a command line is: a tool that
++//! answers "what is in this queue" needs to *ask* it, and the alternative — a CLI that builds its
++//! own query — is a CLI that reaches past the engine into whatever backend the deployment happens
++//! to run. [`Store::list`] is that question, [`Store::scoped`] is already the answer to "whose
++//! jobs", and the order it answers in is the order `claim` documents rather than a second policy.
++//!
+ //! The port is **sealed** (step `jobq/3.2-public-api-baseline`): `Sealed` is a supertrait, so the
+ //! two promises above are made by the crate and by the backends it ships, not by anyone who happens
+ //! to implement these methods. A third-party backend could not keep the second promise — this crate
+@@ -40,12 +46,13 @@
+ 
+ use std::future::Future;
+ use std::pin::Pin;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use chrono::{DateTime, Utc};
+ 
+ use crate::engine::authz::{QueueAudit, QueueDeclaration};
+-use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
++use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::JobEvent;
+ use crate::engine::sealed::Sealed;
+@@ -183,6 +190,27 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// error: looking is allowed to come up empty).
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>>;
+ 
++    /// A page of jobs, in the order `claim` documents: highest priority first, then the one that
++    /// has been due longest, then by ascending identity (`jobq/3.15-cli-contract`).
++    ///
++    /// The order is the port's for the reason `claim`'s is: an operator reading a list, a script
++    /// diffing two of them and a test asserting one all need the same answer from both backends,
++    /// and an order that came out of whichever index the engine happened to use is an order that
++    /// changes the day the engine does. What is *not* here is the scheduling policy: the per-queue
++    /// cap and the aging of `jobq/3.9-priority-fairness` are decisions of the moment a claim is
++    /// made, so this is a view of the rows rather than a forecast of the next claim.
++    ///
++    /// [`JobFilter::limit`] bounds the answer, and a listing that had no bound would be a read
++    /// whose cost is the size of the queue. Jobs this handle may not see are **not in the answer**
++    /// rather than refused, which is what [`Store::get`] does with one row and what
++    /// [`Store::events`] does with a trail: a scoped store lists the jobs of the queues it can see,
++    /// and the caller learns nothing about the rest by asking.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the backend refused the read.
++    fn list<'a>(&'a self, filter: &'a JobFilter) -> BoxFuture<'a, Result<Vec<Job>, Error>>;
++
+     /// Append one line to a job's trail, answering whether it was new.
+     ///
+     /// Appending is **idempotent by the line's own identity** (`jobq/3.6-transaction-isolation`): a
+@@ -401,3 +429,103 @@ pub trait Store: Sealed + Send + Sync + 'static {
+     /// [`Error::Store`] when the backend refused the read.
+     fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>>;
+ }
++
++/// A store behind a pointer is still a store.
++///
++/// The engine is generic over the port, and the two shells that pick a backend at *runtime* — the
++/// daemon and `jobqc` — hold what they picked as an `Arc<dyn Store>`: one method per line of
++/// forwarding, and the whole of what a caller pays for choosing its store from its configuration
++/// rather than from its source code. It widens the seal in the only direction the seal allows —
++/// `Sealed` is implemented here too, so what a stranger can wrap is exactly the set of backends this
++/// crate certifies and nothing else.
++impl<T: Store + ?Sized> Sealed for Arc<T> {}
++
++impl<T: Store + ?Sized> Store for Arc<T> {
++    fn enqueue<'a>(&'a self, request: SubmitRequest) -> BoxFuture<'a, Result<Job, Error>> {
++        (**self).enqueue(request)
++    }
++
++    fn claim<'a>(
++        &'a self,
++        worker: &'a WorkerId,
++        queue: &'a Queue,
++        limit: usize,
++    ) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
++        (**self).claim(worker, queue, limit)
++    }
++
++    fn complete<'a>(
++        &'a self,
++        worker: &'a WorkerId,
++        id: &'a JobId,
++    ) -> BoxFuture<'a, Result<(), Error>> {
++        (**self).complete(worker, id)
++    }
++
++    fn fail<'a>(
++        &'a self,
++        worker: &'a WorkerId,
++        id: &'a JobId,
++        reason: &'a str,
++    ) -> BoxFuture<'a, Result<JobState, Error>> {
++        (**self).fail(worker, id, reason)
++    }
++
++    fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
++        (**self).get(id)
++    }
++
++    fn list<'a>(&'a self, filter: &'a JobFilter) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
++        (**self).list(filter)
++    }
++
++    fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
++        (**self).record(event)
++    }
++
++    fn migrate<'a>(&'a self) -> BoxFuture<'a, Result<(), Error>> {
++        (**self).migrate()
++    }
++
++    fn renew<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        (**self).renew(worker)
++    }
++
++    fn release<'a>(&'a self, worker: &'a WorkerId) -> BoxFuture<'a, Result<u32, Error>> {
++        (**self).release(worker)
++    }
++
++    fn reclaim_expired<'a>(&'a self) -> BoxFuture<'a, Result<u32, Error>> {
++        (**self).reclaim_expired()
++    }
++
++    fn events<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Vec<JobEvent>, Error>> {
++        (**self).events(id)
++    }
++
++    fn next_due<'a>(
++        &'a self,
++        queue: &'a Queue,
++    ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>> {
++        (**self).next_due(queue)
++    }
++
++    fn declare_queue<'a>(
++        &'a self,
++        declaration: &'a QueueDeclaration,
++    ) -> BoxFuture<'a, Result<(), Error>> {
++        (**self).declare_queue(declaration)
++    }
++
++    fn scoped(&self, tenant: &Tenant) -> Box<dyn Store> {
++        (**self).scoped(tenant)
++    }
++
++    fn usage<'a>(&'a self) -> BoxFuture<'a, Result<Vec<QueueUsage>, Error>> {
++        (**self).usage()
++    }
++
++    fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>> {
++        (**self).audit(limit)
++    }
++}
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index 9c728cb..eb96760 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -51,7 +51,7 @@ use uuid::Uuid;
+ 
+ use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
+-use crate::engine::domain::{Job, JobId, JobState, Queue, SubmitRequest, WorkerId};
++use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+ use crate::engine::policy::Policy;
+@@ -548,6 +548,38 @@ impl Store for PostgresStore {
+         })
+     }
+ 
++    fn list<'a>(&'a self, filter: &'a JobFilter) -> BoxFuture<'a, Result<Vec<Job>, Error>> {
++        Box::pin(async move {
++            // One statement, and the filter is in it rather than applied afterwards: a scope's
++            // filter is the `where` clause (`jobq/3.13-queue-authz-attribution` made the same call
++            // for every other read), and a listing that read the table and then filtered in Rust
++            // would be a listing that reads rows the caller may not see.
++            //
++            // `$1`/`$2` are `Option<&str>`: `null` means "the caller did not name one", which is
++            // the same shape the trail read uses and the reason the two filters are independent
++            // questions rather than a list of clauses built in Rust.
++            let rows: Vec<JobRow> = sqlx::query_as(
++                "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
++                        max_attempts, last_error, lease_owner, lease_expires_at \
++                 from jobs \
++                 where ($1::text is null or queue = $1) \
++                   and ($2::text is null or state = $2) \
++                   and ($3::text is null or jobs.queue in ( \
++                       select queue from queue_permissions where tenant = $3)) \
++                 order by priority desc, run_at asc, id asc \
++                 limit $4",
++            )
++            .bind(filter.queue().map(Queue::as_str))
++            .bind(filter.state().map(JobState::as_str))
++            .bind(self.scope())
++            .bind(i64::try_from(filter.limit()).unwrap_or(i64::MAX))
++            .fetch_all(&self.pool)
++            .await
++            .map_err(refused)?;
++            rows.into_iter().map(JobRow::into_job).collect()
++        })
++    }
++
+     fn record<'a>(&'a self, event: &'a JobEvent) -> BoxFuture<'a, Result<bool, Error>> {
+         Box::pin(async move {
+             // One statement, so it needs no transaction of its own: the unique index decides who
+diff --git a/src/lib.rs b/src/lib.rs
+index 025e05e..ab54eb2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,13 +1,15 @@
+ //! `jobq` — a job queue engine: a library that queues and runs jobs, and a daemon that drains them.
+ //!
+-//! The engine is the product and the binary is a shell around it. Everything a test can reach lives
+-//! in [`engine`]; [`service`] (the daemon) depends on the engine, and the engine depends on neither
+-//! the daemon nor anything else that runs it — that direction is what makes it reusable in a program
+-//! that is not this one (step `jobq/3.1-engine-boundary`).
++//! The engine is the product and the two binaries are shells around it. Everything a test can reach
++//! lives in [`engine`]; [`service`] (the daemon) and [`cli`] (the command line) depend on the
++//! engine, and the engine depends on neither of them nor on anything else that runs it — that
++//! direction is what makes it reusable in a program that is not this one (step
++//! `jobq/3.1-engine-boundary`).
+ //!
+ //! The modules below are the shape of the project, and the first step is where they start doing
+ //! something: the wiring is done and the behaviour is not. Read the specs — they say what each module
+ //! owes, from outside.
+ 
++pub mod cli;
+ pub mod engine;
+ pub mod service;
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index 93e0c28..d708b58 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -132,7 +132,18 @@ fn worker_settings(config: &Config) -> WorkerSettings {
+ /// else is the durable backend, which this function never opens itself — it hands the URL to
+ /// [`open_durable`], the single place a durable store is reached from, and the place the `postgres`
+ /// feature gate belongs.
+-async fn open_store(config: &Config) -> Result<Arc<dyn Store>, Error> {
++///
++/// `jobq/3.15-cli-contract` is the second caller, which is why this stops being private: `jobqc`
++/// talks to the queue the daemon drains, and the only way for that to be true rather than intended
++/// is for both of them to build their store from the same settings in the same place. A caller that
++/// assembled its own would be a second assembly of this crate, and therefore a second thing that can
++/// disagree about which backend, which lease and which policy a deployment is running.
++///
++/// # Errors
++///
++/// [`Error::Config`] when the settings name a store this build cannot open (a durable URL in an
++/// assembly without the `postgres` feature); [`Error::Store`] when the store cannot be reached.
++pub async fn open_store(config: &Config) -> Result<Arc<dyn Store>, Error> {
+     let lease = Duration::from_secs(config.worker.lease_seconds);
+     let policy = policy(config);
+     match config.store.url.as_deref() {
