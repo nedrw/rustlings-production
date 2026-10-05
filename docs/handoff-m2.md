@@ -641,12 +641,16 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
-- **真缺陷（未修，收尾第一项）**：**durable 的每队列在飞上限（cap）没有真正限住一次领取的行数**。`postgres.rs` 的 cap 判据是
+- **真缺陷（已修，提交 `jobq(3.9): the cap bounds the rows a claim takes, not just the count`）**：**durable 的每队列在飞上限（cap）没有真正限住一次领取的行数**。`postgres.rs` 的 cap 判据是
   `where` 里的**非相关**子查询（`(select count(*) from jobs running where …) < $6`），它只被求值一次，`limit $3` 于是把**所有到期行**拿走；
-  内存后端边取边计数，只取到上限。复现（3.26 作者）：两条重放的死信 + `Policy::with_cap(1)` + `claim(8)` → postgres 返回 **2**，memory 返回 **1**。
-  `jobq/3.9` 的规格只建内存存储，所以连它的 `slow:conformance@2` 也抓不到。修法方向：让 `limit` **容量感知**
-  （`least($3, greatest(0, $6 - (select count(*) … running …)))`，`$6 = 0` 时不限），并给 3.9 的规格补一条**两后端都跑**的用例（用 conformance 夹具建库），
-  然后重跑 `verify --slow`。
+  内存后端边取边计数，只取到上限。复现（3.26 作者）：两条重放的死信 + `Policy::strict().with_cap(1)` + `claim(8)` → postgres 返回 **2**，memory 返回 **1**。
+  `jobq/3.9` 的规格只建内存存储，所以连它的 `slow:conformance@2` 也抓不到。
+  **修法（已落地）**：让 `limit` **容量感知**——3.9 的语句取 `least($3, case when $6 = 0 then $3 else greatest(0, $6 - (select count(*) … running …)) end)`，
+  3.13 引入 owner 上限后在同一行再接一项；给 3.9 的规格补了一条**两后端都跑**的用例（`the_cap_bounds_the_rows_one_claim_takes`，经 conformance 夹具建库）。
+  **复核**：`selftest jobq/3.9` → `11/11 must green`（含 `slow:conformance@2`：memory ✓、postgres ✓）、`selftest jobq/3.13` → `10/10`。
+  **留下的窄窗口**：两条**并发**的 claim 仍可能各自读到同一份余量（语句级快照），因此队列瞬时可能超出上限一行；
+  彻底修需要按队列串行（例如先 `select … from queues for update`），超出本次范围，记在这里。
+  这条也让一个设计代价变具体了：“`conformance` 只写在判端口的步骤上”——3.9 的规格本来只建内存存储，于是**对后端的承诺没有人判**。
 - **`ops/dlq-tooling@operate` 没有同深度的探题**（3.26 作者发现）：`kiln plan` 自己说得很清楚——"there is no exercise at operate; the closest is
   `kiln probe ops-dlq-tooling.apply` (apply), which re-checks the habit and not this depth"——所以 `kiln skip jobq/3.26-dlq-cli` 必须带 `--force`。
   §5.1 的探题表里没有这个槽位的行（`probe --check` 仍是 40/40）。要么补一道 operate 深度的题，要么在 §5.1 里写明为什么没有。
