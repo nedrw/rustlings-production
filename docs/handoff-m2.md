@@ -443,14 +443,14 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（16/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（18/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` must gates，全部 `hold the contract` |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow` → `15/15 judged step(s) pass · 0 failed · 0 not prepared · 11 without content` |
-| 默认特性全量套件 | `cargo test -p jobq` → **92 passed · 0 failed**（3.13 时基线 81，3.14/3.15 加了 11 例） |
-| postgres 后端子集 | `KILN_BACKEND=postgres` 走 `authz 6 · dedup 6 · fairness 4 · isolation 7 · leases 11 · port_conformance 8 · state_machine 5` → **47 passed · 0 failed** |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow` → **`18/18 judged step(s) pass · 0 failed · 9 without content`**（18 步共 2 m 19 s；逐步 8/9/9/9/11/11/11/9/11/9/11/11/10/10/10/11/10/10）|
+| 默认特性全量套件 | `cargo test -p jobq` → **116 passed · 0 failed**（3.13 时 81 → 3.16 时 99 → 3.18 时 116）|
+| postgres 后端子集 | `KILN_BACKEND=postgres` 跑 11 个声明了后端的规格 → **75 passed · 0 failed** |
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
 | CI | `cargo xtask ci` 上次全绿是 `0927803`（1634 s）；3.8–3.15 与闸门提交之后**未复跑**（逐条走 mailer/relay/jobq 三条 track，30 min+） |
@@ -579,6 +579,9 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **已收口的缺口**：3.15 的 FURTHER 与 `src/cli/mod.rs` 的模块文档曾把死信命令行许给 3.16（而 3.16 只交端口那一半）——
+  现在两处都指向 `jobq/3.26-dlq-cli`（提交 `course(jobq/3.15): the dead-letter CLI is its own step…`），
+  探题 `ops-dlq-tooling.apply` 描述的面也将在 3.26 交付时对齐。
 - **M2 收尾待办**：验收演练的 b/c 两腿（`mutants`/`bench-budget`）要等 3.20/3.22，a/d 两腿已做并记在 §4.3；
   `cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的进度同步；`README.md` 的 track 表与
   Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/`t2-relay.md` 同构：步表、项目最终形状、

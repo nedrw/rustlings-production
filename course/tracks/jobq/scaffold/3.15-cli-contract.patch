@@ -61,7 +61,7 @@ index 0000000..3d2023b
 +//!   command that hangs in CI, and the hang is the failure mode nobody debugs.
 +//!
 +//! The grammar is small on purpose — `submit`, `inspect`, `list`, `usage` — and it grows where a
-+//! step needs it (`jobq/3.16-dlq-tooling` adds the two commands that act on a dead letter). What
++//! step needs it (`jobq/3.26-dlq-cli` adds the commands that act on a dead letter). What
 +//! does not grow is the shape: a subcommand, its flags, one answer, one code.
 +//!
 +//! ```text

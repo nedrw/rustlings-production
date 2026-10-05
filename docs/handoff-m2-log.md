@@ -15,6 +15,7 @@
 - 第八段 · 2026-10 · 3.12–3.15，以及一个装不进“无特性”装配的夹具
 - 第九段 · 2026-10 · 3.16 交付、`selftest` 变慢的根因、以及 3.15 的一个真缺陷
 - 第十段 · 2026-10 · 第二十七步：DLQ 的命令行那一半单独成步
+- 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -451,3 +452,44 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   它的参考解仍能过，但探题与步骤现在描述的是同一槽位的两半。
 
 ## 第十段 · 2026-10 · 第二十七步：DLQ 的命令行那一半单独成步
+
+### 做了什么
+
+- **3.17 错误预算与告警**（提交 `a000531`，作业者 `a1841fabda3f4213`，cherry-pick 自 `b441b48`）：一条规则贯穿两个槽位——
+  进程导出的**家族表**（`signals()`：五个计数器、一个仪表、每个一个有限基数的标签）、**样本行**的字段就是那张表的
+  名字（每个队列一个字段，什么都没发生前写零）、**尝试行**带查询需要的字段并把一次运行做成 **span**（守护进程/worker/
+  每个任务的日志行都继承它），而**预算**是两次读数之差（`bad = failed + reclaimed` 除 `total = settled`，带流量下限）。
+  `docs/alerts.md` 是那一页，它的规则由规格对照 `signals()` 逐条检查。
+- **3.18 追踪采样**（提交 `579fd59`）：上下文是行上的值（`Job::trace()`，`migrations/0007_traces.sql` 两列），**门只决定一次**
+  （`Context::of`：调用方的决定优先，否则 `Sampler::decide` 按 id 确定性地掷），worker 不再重掷、每次尝试开一个 span
+  （`Hop::of`），出口只补门不可能知道的信息（`Context::exported(failed)`：失败的 hop 无论门说什么都留下）；重放原样带走它。
+- **两个指针收口**（提交 `course(jobq/3.15): the dead-letter CLI is its own step…`）：3.15 的 FURTHER 与
+  `src/cli/mod.rs` 的模块文档（在 3.15 的 **scaffold** 补丁里）曾把死信命令行许给 3.16；两处现在都指向 `jobq/3.26-dlq-cli`。
+  改 scaffold 就重跑了 `selftest jobq/3.15`（`10/10`）——这是“改了早期产物就要重验”的同一规矩。
+- **合并方式**：这次作业者的两个提交不在主分支 HEAD 上（Delta 只把文件materialize到工作树），
+  我先 `git stash` 再 `cherry-pick b441b48 99f3003`，然后 `git diff 99f3003 HEAD -- course` 为空证明逐字节一致，最后扔掉 stash。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest` | 3.17 `gates ✓ 10/10 must green`、3.18 `10/10`，各两遍（第二遍全新缓存 `/private/tmp/xdg-318c`），全部 `hold the contract` |
+| 全步判定（当前 18 步的尾巴树） | `kiln verify jobq --slow` → **`18/18 judged step(s) pass · 0 failed · 0 not prepared · 9 without content`**，墙钟 **2 m 19 s**（验证了 coverage/process 改动没有拖慢共享 target 那条路）|
+| 默认特性全量套件 | `cargo test -p jobq` → **116 passed · 0 failed**（99 + 8 `spec_alerts` + 9 `spec_tracing`）|
+| postgres 后端子集 | 11 个声明后端的规格 → **75 passed · 0 failed**；`spec_tracing` 单跑 `9 passed · 1.98 s` |
+| 课程自己的检查 | `lint-caps` `no issues.`（136 slots · 119 positions · 73 authored steps）；`links` `77 page(s) · 423 link(s)`；`i18n status` `structure: 0 error(s)`；`spec manifest` 18 份钉住 |
+
+### 坑与判读
+
+- **作业者自己纠正了元数据**：3.17 的种子声明了 `images`，但它没有任何用例真的起 Postgres（进程那条用 `JOBQ__STORE__URL=memory`），
+  于是删掉；3.18 保留并“挣到”它（行那只用例经 `support::store::backend()` 参数化，所以 `KILN_BACKEND=postgres` 会真的跑 `0007`）。
+  这正是 §2.2「`images` 只给真起容器的步骤」的形状。
+- **`Attempt::new` → `Attempt::of(…)`**（3.18）：追踪把构造子推到 8 个参数，`clippy::too_many_arguments` 在 `clippy@3` 是硬错，
+  而 `#[allow]` 不是选项；改成收一个 `Job` 反而更好——队列/id/计数只有一个来源。3.17 规格不构造 `Attempt`，因此仍然成立。
+- **两条记给下一个作者的真坑**（来自作业者）：① 在订阅器安装**之前**创建的 span 永远不会被记录（`info_span!` 在创建时选 dispatcher），
+  所以 `logging::init` 先装、后开 span；② “引擎不依赖服务层”那条源码文本检查会被**文档注释**里提到的 `crate::service` 触发
+  （它在 `src/engine/trace.rs` 的散文上响过）。
+- **作业者没跑 `verify --slow`**（它的验收清单只要求套件）；这条由我在合并后补上 ↑。
+- **下一步**：3.19+3.20 一批（3.20 起要接 `slow:mutants@80` 与 `clippy@4`，且每步要交 `budget/<step>.toml` 的日子从 3.22 开始）。
+
+## 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
