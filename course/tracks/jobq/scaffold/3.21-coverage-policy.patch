@@ -1,0 +1,524 @@
+diff --git a/docs/coverage.md b/docs/coverage.md
+new file mode 100644
+index 0000000..a043728
+--- /dev/null
++++ b/docs/coverage.md
+@@ -0,0 +1,40 @@
++# Coverage as a policy
++
++A coverage number is the easiest number in a build report to produce and the easiest one to be wrong
++about. This page is the policy that number is judged against: which places have to be walked, out of
++what, and why the threshold is not a hundred.
++
++The scope is `src/engine`: the rules of this queue, which are what a case can hold a threshold over.
++<!-- TODO: say why the service around them is not in this policy, and what a percentage that averaged
++the two would be a percentage about. -->
++
++## What the policy is
++
++<!-- TODO: the threshold and the kind of place it counts, as numbers and in the words
++`CoveragePolicy::standard()` uses in `src/engine/coverage.rs` — the spec compares this page with
++that method, so a page that says something else is a page that has stopped being true. Say which
++places make the ceiling below a hundred, and why the two numbers are related. -->
++
++## The inventory
++
++| place | kind | case | the branch |
++| --- | --- | --- | --- |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++
++<!-- TODO: one row per branch a case has to walk, at least. `place` is a path under the scope — the
++spec refuses a row from another module, because that is exactly what
++`Inventory::add` refuses. `case` is the test that walks the branch, and it has to be one that
++really walks it: this table is the claim, and the coverage gate is the measurement. -->
++
++## What cannot be walked
++
++<!-- TODO: the branches no case can reach, and the reason for each. An entry without a reason is the
++one this section exists to catch, and `Inventory::exempt` takes the reason as an argument. -->
++
++## How this is measured and checked
++
++<!-- TODO: the command that measures it, what the gate judges it over, and what it answers on a
++machine without the LLVM tools. Link the pages this one is built on: [the compiler's
++instrumentation](TODO), and [the tool that reads a profile back](TODO). -->
+diff --git a/src/engine/coverage.rs b/src/engine/coverage.rs
+new file mode 100644
+index 0000000..3e06bdc
+--- /dev/null
++++ b/src/engine/coverage.rs
+@@ -0,0 +1,472 @@
++//! What a coverage number is allowed to say: which places have to be walked, and out of what.
++//!
++//! Step `jobq/3.21-coverage-policy`. `jobq/3.20-mutation-threshold` asks what a suite *notices*;
++//! this step asks what it *touches*, which is the number every review already quotes. The measuring
++//! half of that question is the course's (`kiln check jobq/3.21-coverage-policy --slow`, with
++//! `llvm-cov` underneath it); what lives here is the half a review argues about.
++//!
++//! Four decisions are written into the shapes below:
++//!
++//! * **a line is not a decision.** [`Kind::Line`] and [`Kind::Branch`] are counted apart, because
++//!   an error arm no case ever takes is a hundred percent of its lines and half of its branches,
++//!   and the second number is the one that describes the suite;
++//! * **an inventory is about one module.** [`Inventory::add`] refuses a place from somewhere else,
++//!   and [`Walked::visit`] refuses it too, so the arithmetic below answers [`Foreign`] instead of a
++//!   percentage the moment the two sides disagree about which module they describe. That is the
++//!   defect this step exists for: a percentage over a whole library is dominated by code nobody
++//!   doubts, and it says nothing about the module the step is about;
++//! * **the places no case can reach are named, and they are not a run's fault.**
++//!   [`Inventory::exempt`] records a branch the compiler knows is there and a case cannot take, and
++//!   [`Inventory::ceiling`] answers the highest share any run can reach — which is what makes a
++//!   threshold above it ([`Policy::is_satisfiable`]) a decision nobody can meet rather than a
++//!   target somebody is failing;
++//! * **the answer is a list.** "78%" is not something a person can act on; [`Inventory::uncovered`]
++//!   is the places still to write a case for, as places a reader's editor can open.
++//!
++//! What this module is **not**: a measurement. It does not build the project, merge profile data
++//! or read a profile back — `kiln`'s `coverage` gate does that, and this step's spec never starts
++//! one instrumented binary. What is here is the rule a measurement is judged by.
++
++use std::collections::BTreeSet;
++use std::fmt;
++
++use crate::engine::mutation::Verdict;
++
++/// The module the project's coverage policy is about.
++///
++/// One constant rather than a string in two places, because the subject of a policy is the half of
++/// it that is easiest to lose: `docs/coverage.md` states this scope, [`Policy::standard`]'s
++/// threshold is a decision about it, and the spec compares the two. The engine's own rules are the
++/// part of this project a case can hold a threshold over; the service around them is wiring, and a
++/// percentage over the whole crate would be a percentage about `main`.
++pub const POLICY_SCOPE: &str = "src/engine";
++
++/// What a coverage number counts: a place that ran, or a decision that went one way.
++///
++/// Two kinds rather than one, and they are not interchangeable: a line is *visited* and a branch is
++/// *taken*. A function whose error arm nothing ever triggers has every one of its lines covered and
++/// half of its decisions unexercised, and a suite that reports one number has reported the first.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub enum Kind {
++    /// A line of the module: it executed, or it did not.
++    Line,
++    /// One way out of a decision: it was taken, or it was not.
++    Branch,
++}
++
++impl Kind {
++    /// The word a report prints.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("jobq/3.21-coverage-policy: the word a report prints for each kind")
++    }
++}
++
++impl fmt::Display for Kind {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("jobq/3.21-coverage-policy: the word, as `Display` prints it")
++    }
++}
++
++/// One place in a module that a run has to walk.
++///
++/// A `Site` is a claim about the code, and it is deliberately the smallest claim the thing that
++/// measures can be held to: the file, the line, and which of the two questions that line answers.
++/// The *case* that walks it stays prose (`docs/coverage.md`), because a place cannot name a test.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Site {
++    /// The module the place is in, relative to the project.
++    path: String,
++    /// 1-based line, the way a compiler numbers them and a reader counts them.
++    line: usize,
++    /// Whether this place is a statement or a decision.
++    kind: Kind,
++}
++
++impl Site {
++    /// A line: it ran, or it did not.
++    #[must_use]
++    pub fn line(path: impl Into<String>, line: usize) -> Self {
++        todo!("jobq/3.21-coverage-policy: a place that is a line of the module")
++    }
++
++    /// A decision: one way out of it was taken, or it was not.
++    #[must_use]
++    pub fn branch(path: impl Into<String>, line: usize) -> Self {
++        todo!("jobq/3.21-coverage-policy: a place that is one way out of a decision")
++    }
++
++    /// The module this place is in.
++    #[must_use]
++    pub fn path(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: the module this place is in")
++    }
++
++    /// The line number, 1-based.
++    ///
++    /// `line_number` rather than `line`, because a place is *made* out of a line
++    /// ([`Site::line`]) and *asked* for one, and one name for the two would make the constructor
++    /// an accessor with an argument.
++    #[must_use]
++    pub fn line_number(&self) -> usize {
++        todo!("jobq/3.21-coverage-policy: the line, 1-based")
++    }
++
++    /// Which of the two questions this place answers.
++    #[must_use]
++    pub fn kind(&self) -> Kind {
++        todo!("jobq/3.21-coverage-policy: which of the two questions this place answers")
++    }
++
++    /// `src/engine/store/memory.rs:518` — the place a reader's editor can open.
++    ///
++    /// The same shape `jobq/3.20-mutation-threshold`'s survivors and `kiln`'s own reports are
++    /// written in: a report from a tool and a report from this project agreeing on how a place is
++    /// named is what lets a reviewer read exactly one of them.
++    #[must_use]
++    pub fn place(&self) -> String {
++        todo!("jobq/3.21-coverage-policy: the place, spelled the way a reader's editor opens it")
++    }
++}
++
++impl fmt::Display for Site {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("jobq/3.21-coverage-policy: the place, as `Display` prints it")
++    }
++}
++
++/// A place no case can reach, and the reason the page gives for it.
++///
++/// The reason is part of the record rather than a comment next to it: an exemption is a decision
++/// about the code that somebody has to be able to review, and a page that lists places without
++/// saying why is a page whose first entry is "this one was annoying".
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Exempt {
++    /// The place nothing walks.
++    site: Site,
++    /// Why no case can walk it, in the words of whoever decided that.
++    reason: String,
++}
++
++impl Exempt {
++    /// A place nothing walks, and why.
++    #[must_use]
++    pub fn of(site: Site, reason: impl Into<String>) -> Self {
++        todo!("jobq/3.21-coverage-policy: the place, and the reason nothing walks it")
++    }
++
++    /// The place.
++    #[must_use]
++    pub fn site(&self) -> &Site {
++        todo!("jobq/3.21-coverage-policy: the place nothing walks")
++    }
++
++    /// Why no case can walk it.
++    #[must_use]
++    pub fn reason(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: why no case can walk it")
++    }
++}
++
++/// The places a run actually reached.
++///
++/// A set rather than a count, and that is the whole difference between coverage and "how many times
++/// a line ran": a line executed a thousand times in a loop is one place, and a share that counted
++/// executions would be a share about the test data rather than about the suite.
++#[non_exhaustive]
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Walked {
++    /// The module the run measured, which is what makes a share comparable with an inventory.
++    scope: String,
++    /// The places the run reached.
++    reached: BTreeSet<Site>,
++}
++
++impl Walked {
++    /// A run of one module.
++    #[must_use]
++    pub fn of(scope: impl Into<String>) -> Self {
++        todo!("jobq/3.21-coverage-policy: a run of one module, which has reached nothing yet")
++    }
++
++    /// The module this run measured.
++    #[must_use]
++    pub fn scope(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: the module this run measured")
++    }
++
++    /// Record that the run reached `site`.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when the place is not in the module this run measures: a run of one module is
++    /// not evidence about another, and a `Walked` that accepted it would carry a place no
++    /// inventory could ever account for.
++    pub fn visit(&mut self, site: &Site) -> Result<(), Foreign> {
++        todo!(
++            "jobq/3.21-coverage-policy: one place the run reached, and the refusal of another module's"
++        )
++    }
++
++    /// `true` when the run reached this place.
++    #[must_use]
++    pub fn reached(&self, site: &Site) -> bool {
++        todo!("jobq/3.21-coverage-policy: whether this run reached the place")
++    }
++
++    /// How many places the run reached.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("jobq/3.21-coverage-policy: how many places the run reached")
++    }
++
++    /// `true` when the run reached nothing.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("jobq/3.21-coverage-policy: whether it reached anything at all")
++    }
++}
++
++/// A place that is not in the module a claim is about.
++///
++/// The same refusal from both directions, because both of them are the same defect: an inventory
++/// that absorbed a place from another module would report a percentage about a tree rather than
++/// about the module it claims to describe, and a run of one module compared with another's
++/// inventory would report a percentage about nothing at all.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Foreign {
++    /// The module the claim is about.
++    scope: String,
++    /// The place, or the module, that does not belong to it.
++    path: String,
++}
++
++impl Foreign {
++    /// The module the claim is about.
++    #[must_use]
++    pub fn scope(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: the module the claim is about")
++    }
++
++    /// What was offered to it.
++    #[must_use]
++    pub fn path(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: what was offered to it instead")
++    }
++}
++
++impl fmt::Display for Foreign {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("jobq/3.21-coverage-policy: the sentence a refusal prints")
++    }
++}
++
++impl std::error::Error for Foreign {}
++
++/// The places one module has, and the ones no case can reach.
++///
++/// The inventory is the *claim* half of a coverage number: what the module consists of, which of
++/// those places a case has to walk, and which of them nothing can. It is written by a person and it
++/// is checked against the code by hand — a place that no longer exists is a claim that stopped being
++/// true, and nothing in this module can see that; what the module *can* do is refuse to grow into a
++/// second module, which is the way this claim usually goes wrong.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Inventory {
++    /// The module every place in it is in.
++    scope: String,
++    /// The places a case has to walk, in the order they were recorded.
++    sites: Vec<Site>,
++    /// The places nothing walks, with the reason, in the order they were recorded.
++    exemptions: Vec<Exempt>,
++}
++
++impl Inventory {
++    /// An inventory of one module: `scope` is the path every place in it has to live under.
++    #[must_use]
++    pub fn of(scope: impl Into<String>) -> Self {
++        todo!("jobq/3.21-coverage-policy: an inventory of one module, with nothing in it yet")
++    }
++
++    /// The module this inventory is about.
++    #[must_use]
++    pub fn scope(&self) -> &str {
++        todo!("jobq/3.21-coverage-policy: the module this inventory is about")
++    }
++
++    /// Record a place a case has to walk.
++    ///
++    /// Recording a place that was exempt takes the exemption back, because a place is either
++    /// something a case walks or something it cannot — never both, and never neither.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when the place is not in [`Inventory::scope`]: a percentage over a library is
++    /// not a percentage about the step, and the refusal happens here rather than in a review.
++    pub fn add(&mut self, site: Site) -> Result<(), Foreign> {
++        todo!(
++            "jobq/3.21-coverage-policy: a place a case has to walk, and the refusal of one from another module"
++        )
++    }
++
++    /// Record a place no case can reach, and the reason it cannot.
++    ///
++    /// An exempt place stays part of the inventory — it is a place the module has, and a run that
++    /// does not reach it has not failed — but it stops being a place a case has to walk, it never
++    /// counts towards a share, and it is never in [`Inventory::uncovered`]: an exemption is a
++    /// decision, not a to-do.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when the place is not in [`Inventory::scope`].
++    pub fn exempt(&mut self, site: Site, reason: impl Into<String>) -> Result<(), Foreign> {
++        todo!("jobq/3.21-coverage-policy: a place no case can take, and the reason it cannot")
++    }
++
++    /// The places a case has to walk, in the order they were recorded.
++    #[must_use]
++    pub fn sites(&self) -> &[Site] {
++        todo!(
++            "jobq/3.21-coverage-policy: the places a case has to walk, in the order they were recorded"
++        )
++    }
++
++    /// The places nothing walks, with their reasons.
++    #[must_use]
++    pub fn exemptions(&self) -> &[Exempt] {
++        todo!("jobq/3.21-coverage-policy: the places nothing walks, with their reasons")
++    }
++
++    /// Every place of this kind the module has: the walkable ones and the exempted ones.
++    #[must_use]
++    pub fn total(&self, kind: Kind) -> usize {
++        todo!(
++            "jobq/3.21-coverage-policy: every place of this kind the module has, walkable and exempt alike"
++        )
++    }
++
++    /// The places of this kind a case can reach: the denominator a share is *about*.
++    #[must_use]
++    pub fn walkable(&self, kind: Kind) -> usize {
++        todo!("jobq/3.21-coverage-policy: the places of this kind a case can reach")
++    }
++
++    /// The highest share any run can reach on this inventory, in whole percent, or `None` when the
++    /// module has no place of this kind at all.
++    ///
++    /// `None` rather than `100`, for the reason `jobq/3.20-mutation-threshold` answers `None` for a
++    /// run that judged nothing: a module with no branch in the inventory is not a fully covered
++    /// module, it is a question the inventory does not ask.
++    #[must_use]
++    pub fn ceiling(&self, kind: Kind) -> Option<u32> {
++        todo!(
++            "jobq/3.21-coverage-policy: the highest share any run can reach, or `None` when there is nothing to reach"
++        )
++    }
++
++    /// The share of this inventory a run walked, in whole percent, or `None` when the module has no
++    /// place of this kind.
++    ///
++    /// The denominator is every place of the kind the module has, exempt ones included, and only
++    /// the walkable ones can be counted as covered — so a perfect run scores exactly
++    /// [`Inventory::ceiling`] rather than a hundred, and the two numbers can be compared.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when `walked` measured another module: a share of one module's places is not an
++    /// answer about another's.
++    pub fn share(&self, kind: Kind, walked: &Walked) -> Result<Option<u32>, Foreign> {
++        todo!("jobq/3.21-coverage-policy: the share of this inventory a run walked")
++    }
++
++    /// The places of this kind still to write a case for, in inventory order, or the reason there
++    /// is no such list.
++    ///
++    /// Exempt places are left out on purpose: they are the entries a reader is meant to *argue*
++    /// with, not the ones that come with a to-do attached.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when `walked` measured another module.
++    pub fn uncovered(&self, kind: Kind, walked: &Walked) -> Result<Vec<&Site>, Foreign> {
++        todo!("jobq/3.21-coverage-policy: the places still to write a case for")
++    }
++}
++
++/// The rule this project holds itself to: a share, of one kind of place.
++///
++/// Two fields rather than one, because "90%" is a decision about branches and about lines, and the
++/// two are different decisions: a branch threshold is what a suite has to have thought about, while
++/// a line threshold is what the compiler already told you. The policy carries no scope of its own —
++/// a policy is applied to an inventory, and the inventory is the thing that knows which module it
++/// describes.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Policy {
++    /// The share of the walkable places a run has to reach.
++    threshold: u32,
++    /// Which of the two questions the threshold counts.
++    kind: Kind,
++}
++
++impl Policy {
++    /// A policy: `threshold` percent of the places of `kind`.
++    #[must_use]
++    pub fn of(threshold: u32, kind: Kind) -> Self {
++        todo!("jobq/3.21-coverage-policy: a threshold and the kind of place it counts")
++    }
++
++    /// The policy `docs/coverage.md` states, and the one the spec compares that page with.
++    ///
++    /// A branch rather than a line, and short of a hundred: the branches are what a suite has to
++    /// have decided about, and the ceiling of any real module is below a hundred because some of
++    /// its branches are there for a compiler or a panic path rather than for a case
++    /// ([`Inventory::exempt`]). A policy of a hundred would be a rule that the first honest
++    /// exemption makes impossible, which is why the ceiling is asked first.
++    #[must_use]
++    pub fn standard() -> Self {
++        Self::of(90, Kind::Branch)
++    }
++
++    /// The share this policy asks for.
++    #[must_use]
++    pub fn threshold(&self) -> u32 {
++        todo!("jobq/3.21-coverage-policy: the share this policy asks for")
++    }
++
++    /// Which of the two questions this policy counts.
++    #[must_use]
++    pub fn kind(&self) -> Kind {
++        todo!("jobq/3.21-coverage-policy: which of the two questions the threshold counts")
++    }
++
++    /// Whether this policy can be met on `inventory` at all.
++    ///
++    /// The review's half, and it is separate from [`Policy::judge`] on purpose: the arithmetic is
++    /// what a build does, and this is the question a person asks once — "can anybody satisfy the
++    /// rule we wrote down?" A threshold above the ceiling, or a policy about a kind of place the
++    /// module does not have, is a rule nobody read after writing it.
++    #[must_use]
++    pub fn is_satisfiable(&self, inventory: &Inventory) -> bool {
++        todo!("jobq/3.21-coverage-policy: whether anybody can meet this policy on this inventory")
++    }
++
++    /// What a run of this module means to this policy.
++    ///
++    /// The three answers are `jobq/3.20-mutation-threshold`'s, because they are the same three:
++    /// met, missed, and *not answerable* — here because the inventory has no place of this kind,
++    /// there because the run had too few mutants to be evidence. A two-valued gate has to fold the
++    /// third into one of the others, and both sentences it could print would be wrong: "not good
++    /// enough" sends somebody to write a case for a module that has nothing to walk.
++    ///
++    /// # Errors
++    ///
++    /// [`Foreign`] when `walked` measured another module than the inventory describes.
++    pub fn judge(&self, inventory: &Inventory, walked: &Walked) -> Result<Verdict, Foreign> {
++        todo!("jobq/3.21-coverage-policy: what a run of this module means to this policy")
++    }
++}

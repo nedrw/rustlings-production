@@ -19,6 +19,7 @@ format_version = 1
 "spec/3.19/invariants.rs" = "sha256:d1512a99fda0a77fbe4b2724c7ff1a675741d135b80aa973175ec1cefc03a27a"
 "spec/3.2/public_api.rs" = "sha256:b0c44a93db4dcd20a829772f05f43c3e377645c43ad45779e058d1eebe2cd005"
 "spec/3.20/mutation.rs" = "sha256:27678e89faf157b9992cd79f9560b801f4ecacb474b6af5054e1839bb29d832e"
+"spec/3.21/coverage_policy.rs" = "sha256:0e2bdc423072eebda510dc27c8df90c2d8db4d5c6b08261c2f0028d1c439cb88"
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
 "spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"
 "spec/3.5/port_conformance.rs" = "sha256:925f3c33e859df18b36d4f0940b8a0965480abad51deb35db9236502921ee9f4"

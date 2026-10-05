@@ -1,0 +1,548 @@
+diff --git a/docs/coverage.md b/docs/coverage.md
+index a043728..e3a495d 100644
+--- a/docs/coverage.md
++++ b/docs/coverage.md
+@@ -1,40 +1,88 @@
+ # Coverage as a policy
+ 
+-A coverage number is the easiest number in a build report to produce and the easiest one to be wrong
+-about. This page is the policy that number is judged against: which places have to be walked, out of
+-what, and why the threshold is not a hundred.
++A coverage number is the easiest number in a build report to produce and the easiest one to be
++wrong about. `cargo llvm-cov` over this project answers one percentage about everything in it, and
++that percentage is dominated by the modules nobody argues about: the wiring, the adapters that
++exist so a type can be named — code that has no branches worth a case, and that is genuinely
++covered.
++
++What this page states is the other half: **which places have to be walked, out of what, and why the
++threshold is not a hundred**. The measurement is [`kiln`'s coverage gate] and this page is the claim
++that measurement is judged against, so the two are read together.
+ 
+ The scope is `src/engine`: the rules of this queue, which are what a case can hold a threshold over.
+-<!-- TODO: say why the service around them is not in this policy, and what a percentage that averaged
+-the two would be a percentage about. -->
++The service around them ([the daemon and the CLI]) is wiring, and a percentage that averaged the two
++would be a percentage about `main`.
+ 
+ ## What the policy is
+ 
+-<!-- TODO: the threshold and the kind of place it counts, as numbers and in the words
+-`CoveragePolicy::standard()` uses in `src/engine/coverage.rs` — the spec compares this page with
+-that method, so a page that says something else is a page that has stopped being true. Say which
+-places make the ceiling below a hundred, and why the two numbers are related. -->
++**90% of the branches of the engine.** A *branch* is one way out of a decision: the arm of a `match`,
++the two sides of an `if`, the `Err` arm of a `?`. A *line* is not the same question, and the
++difference is the whole reason this page exists: an error arm no case ever takes leaves every line
++of that function covered and half of its decisions unexercised, so a suite reporting lines reports
++the half that the compiler already told us about.
++
++Below `src/engine` there are ten branches in the inventory below, and **one of them no case can
++take** (see [What cannot be walked]), so the highest share any run can reach — the *ceiling* of this
++inventory — is **90%**, which is exactly what the policy asks for. That is deliberate and it is
++uncomfortable: `Inventory::ceiling` exists so that `CoveragePolicy::is_satisfiable` can say when a
++threshold has walked past what the code allows, and the next honest exemption anybody adds has to
++come with a lower threshold in the same diff.
+ 
+ ## The inventory
+ 
++One row per place a case has to walk, and the case that walks it. A row without a case is a wish; a
++`case` without a place is unverifiable.
++
+ | place | kind | case | the branch |
+ | --- | --- | --- | --- |
+-| `TODO` | `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` | `TODO` |
+-
+-<!-- TODO: one row per branch a case has to walk, at least. `place` is a path under the scope — the
+-spec refuses a row from another module, because that is exactly what
+-`Inventory::add` refuses. `case` is the test that walks the branch, and it has to be one that
+-really walks it: this table is the claim, and the coverage gate is the measurement. -->
++| `src/engine/coverage.rs` | branch | `cargo test -p jobq --test spec_coverage_policy` | the refusal when a place is not in the inventory's module |
++| `src/engine/coverage.rs` | branch | `cargo test -p jobq --test spec_coverage_policy` | `ceiling`'s truncation and the empty-inventory answer |
++| `src/engine/mutation.rs` | branch | `cargo test -p jobq --test spec_mutation` | the empty run's `None` in `Score::percent` |
++| `src/engine/mutation.rs` | branch | `cargo test -p jobq --test spec_mutation` | the floor of one mutant in `MutationPolicy::judge` |
++| `src/engine/store/memory.rs` | branch | `cargo test -p jobq --test spec_fairness` | the per-queue cap arm of `claim` |
++| `src/engine/store/memory.rs` | branch | `cargo test -p jobq --test spec_leases` | the expired-lease arm of `reclaim_expired` |
++| `src/engine/walk.rs` | branch | `cargo test -p jobq --test spec_invariants` | the walk's early exit on the first counter-example |
++| `src/engine/dlq.rs` | branch | `cargo test -p jobq --test spec_dlq` | `revived`'s attempt ceiling |
++| `src/engine/state.rs` | branch | `cargo test -p jobq --test spec_state_machine` | a refused transition, which is a step of its own |
++| `src/engine/coverage.rs` | line | `cargo test -p jobq --test spec_coverage_policy` | the truncating division that turns two counts into a percentage |
+ 
+ ## What cannot be walked
+ 
+-<!-- TODO: the branches no case can reach, and the reason for each. An entry without a reason is the
+-one this section exists to catch, and `Inventory::exempt` takes the reason as an argument. -->
++- `src/engine/clock.rs` — the body of `SystemClock::now`. It reads the wall clock: a case that took
++  this branch would make the suite depend on the machine's time, and every other instant in the
++  crate comes through the injected [`Clock`] for exactly that reason. The place stays in the
++  inventory, because it is a place the module has; the exemption is what says no case can take it.
++
++Adding another exception is a decision somebody has to write down here with its reason, and it is
++the reason `Inventory::exempt` takes one: a page that lists places without saying why is a page
++whose first entry is "this one was annoying".
+ 
+ ## How this is measured and checked
+ 
+-<!-- TODO: the command that measures it, what the gate judges it over, and what it answers on a
+-machine without the LLVM tools. Link the pages this one is built on: [the compiler's
+-instrumentation](TODO), and [the tool that reads a profile back](TODO). -->
++`kiln check jobq/3.21-coverage-policy --slow` runs the `coverage` gate, which builds the project
++with `-C instrument-coverage`, runs this step's suite under it, and judges the **lines of this step's
++own module** — the same place the `mutants` gate mutates. On a machine without the LLVM tools the
++gate answers `blocked` and prints the install line rather than a number; that is the honest answer
++and it is not a failure of this project.
++
++What the gate cannot check is this page, so the spec does: the engine's policy
++(`CoveragePolicy::standard()`), the module it is about, and the columns of the inventory are
++compared with the page you are reading — a page that states a different threshold is a page that has
++stopped being true.
++
++## Where this comes from
++
++- [`-C instrument-coverage`] — what the compiler emits, and why a profile needs the binaries it came
++  from;
++- [`llvm-cov`] — `export --summary`, which is the document the gate reads;
++- [`grcov`] — the same profiles without the LLVM tools, and a good example of what a coverage report
++  looks like when it is built around files rather than around a single number.
++
++[`kiln`'s coverage gate]: ../tests/spec_coverage_policy.rs
++[the daemon and the CLI]: ../src/service/mod.rs
++[What cannot be walked]: #what-cannot-be-walked
++[`Clock`]: ../src/engine/clock.rs
++[`-C instrument-coverage`]: https://doc.rust-lang.org/rustc/instrument-coverage.html
++[`llvm-cov`]: https://llvm.org/docs/CommandGuide/llvm-cov.html
++[`grcov`]: https://github.com/mozilla/grcov
+diff --git a/src/engine/coverage.rs b/src/engine/coverage.rs
+index 3e06bdc..bff6cf9 100644
+--- a/src/engine/coverage.rs
++++ b/src/engine/coverage.rs
+@@ -59,13 +59,16 @@ impl Kind {
+     /// The word a report prints.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("jobq/3.21-coverage-policy: the word a report prints for each kind")
++        match self {
++            Self::Line => "line",
++            Self::Branch => "branch",
++        }
+     }
+ }
+ 
+ impl fmt::Display for Kind {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!("jobq/3.21-coverage-policy: the word, as `Display` prints it")
++        formatter.write_str(self.as_str())
+     }
+ }
+ 
+@@ -89,19 +92,28 @@ impl Site {
+     /// A line: it ran, or it did not.
+     #[must_use]
+     pub fn line(path: impl Into<String>, line: usize) -> Self {
+-        todo!("jobq/3.21-coverage-policy: a place that is a line of the module")
++        Self::of(path, line, Kind::Line)
+     }
+ 
+     /// A decision: one way out of it was taken, or it was not.
+     #[must_use]
+     pub fn branch(path: impl Into<String>, line: usize) -> Self {
+-        todo!("jobq/3.21-coverage-policy: a place that is one way out of a decision")
++        Self::of(path, line, Kind::Branch)
++    }
++
++    /// Where both constructors meet, so a place cannot be built as one kind and counted as another.
++    fn of(path: impl Into<String>, line: usize, kind: Kind) -> Self {
++        Self {
++            path: path.into(),
++            line,
++            kind,
++        }
+     }
+ 
+     /// The module this place is in.
+     #[must_use]
+     pub fn path(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: the module this place is in")
++        &self.path
+     }
+ 
+     /// The line number, 1-based.
+@@ -111,13 +123,13 @@ impl Site {
+     /// an accessor with an argument.
+     #[must_use]
+     pub fn line_number(&self) -> usize {
+-        todo!("jobq/3.21-coverage-policy: the line, 1-based")
++        self.line
+     }
+ 
+     /// Which of the two questions this place answers.
+     #[must_use]
+     pub fn kind(&self) -> Kind {
+-        todo!("jobq/3.21-coverage-policy: which of the two questions this place answers")
++        self.kind
+     }
+ 
+     /// `src/engine/store/memory.rs:518` — the place a reader's editor can open.
+@@ -127,13 +139,13 @@ impl Site {
+     /// named is what lets a reviewer read exactly one of them.
+     #[must_use]
+     pub fn place(&self) -> String {
+-        todo!("jobq/3.21-coverage-policy: the place, spelled the way a reader's editor opens it")
++        format!("{}:{}", self.path, self.line)
+     }
+ }
+ 
+ impl fmt::Display for Site {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!("jobq/3.21-coverage-policy: the place, as `Display` prints it")
++        formatter.write_str(&self.place())
+     }
+ }
+ 
+@@ -155,19 +167,22 @@ impl Exempt {
+     /// A place nothing walks, and why.
+     #[must_use]
+     pub fn of(site: Site, reason: impl Into<String>) -> Self {
+-        todo!("jobq/3.21-coverage-policy: the place, and the reason nothing walks it")
++        Self {
++            site,
++            reason: reason.into(),
++        }
+     }
+ 
+     /// The place.
+     #[must_use]
+     pub fn site(&self) -> &Site {
+-        todo!("jobq/3.21-coverage-policy: the place nothing walks")
++        &self.site
+     }
+ 
+     /// Why no case can walk it.
+     #[must_use]
+     pub fn reason(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: why no case can walk it")
++        &self.reason
+     }
+ }
+ 
+@@ -189,13 +204,16 @@ impl Walked {
+     /// A run of one module.
+     #[must_use]
+     pub fn of(scope: impl Into<String>) -> Self {
+-        todo!("jobq/3.21-coverage-policy: a run of one module, which has reached nothing yet")
++        Self {
++            scope: scope.into(),
++            reached: BTreeSet::new(),
++        }
+     }
+ 
+     /// The module this run measured.
+     #[must_use]
+     pub fn scope(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: the module this run measured")
++        &self.scope
+     }
+ 
+     /// Record that the run reached `site`.
+@@ -206,27 +224,32 @@ impl Walked {
+     /// not evidence about another, and a `Walked` that accepted it would carry a place no
+     /// inventory could ever account for.
+     pub fn visit(&mut self, site: &Site) -> Result<(), Foreign> {
+-        todo!(
+-            "jobq/3.21-coverage-policy: one place the run reached, and the refusal of another module's"
+-        )
++        if !inside(&self.scope, site.path()) {
++            return Err(Foreign {
++                scope: self.scope.clone(),
++                path: site.path().to_owned(),
++            });
++        }
++        self.reached.insert(site.clone());
++        Ok(())
+     }
+ 
+     /// `true` when the run reached this place.
+     #[must_use]
+     pub fn reached(&self, site: &Site) -> bool {
+-        todo!("jobq/3.21-coverage-policy: whether this run reached the place")
++        self.reached.contains(site)
+     }
+ 
+     /// How many places the run reached.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("jobq/3.21-coverage-policy: how many places the run reached")
++        self.reached.len()
+     }
+ 
+     /// `true` when the run reached nothing.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("jobq/3.21-coverage-policy: whether it reached anything at all")
++        self.reached.is_empty()
+     }
+ }
+ 
+@@ -249,19 +272,23 @@ impl Foreign {
+     /// The module the claim is about.
+     #[must_use]
+     pub fn scope(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: the module the claim is about")
++        &self.scope
+     }
+ 
+     /// What was offered to it.
+     #[must_use]
+     pub fn path(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: what was offered to it instead")
++        &self.path
+     }
+ }
+ 
+ impl fmt::Display for Foreign {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!("jobq/3.21-coverage-policy: the sentence a refusal prints")
++        write!(
++            formatter,
++            "`{}` is not part of `{}`, so a number measured there is not a number about it",
++            self.path, self.scope
++        )
+     }
+ }
+ 
+@@ -289,13 +316,17 @@ impl Inventory {
+     /// An inventory of one module: `scope` is the path every place in it has to live under.
+     #[must_use]
+     pub fn of(scope: impl Into<String>) -> Self {
+-        todo!("jobq/3.21-coverage-policy: an inventory of one module, with nothing in it yet")
++        Self {
++            scope: scope.into(),
++            sites: Vec::new(),
++            exemptions: Vec::new(),
++        }
+     }
+ 
+     /// The module this inventory is about.
+     #[must_use]
+     pub fn scope(&self) -> &str {
+-        todo!("jobq/3.21-coverage-policy: the module this inventory is about")
++        &self.scope
+     }
+ 
+     /// Record a place a case has to walk.
+@@ -308,9 +339,10 @@ impl Inventory {
+     /// [`Foreign`] when the place is not in [`Inventory::scope`]: a percentage over a library is
+     /// not a percentage about the step, and the refusal happens here rather than in a review.
+     pub fn add(&mut self, site: Site) -> Result<(), Foreign> {
+-        todo!(
+-            "jobq/3.21-coverage-policy: a place a case has to walk, and the refusal of one from another module"
+-        )
++        self.offer(&site)?;
++        self.exemptions.retain(|exempt| exempt.site() != &site);
++        self.sites.push(site);
++        Ok(())
+     }
+ 
+     /// Record a place no case can reach, and the reason it cannot.
+@@ -324,35 +356,50 @@ impl Inventory {
+     ///
+     /// [`Foreign`] when the place is not in [`Inventory::scope`].
+     pub fn exempt(&mut self, site: Site, reason: impl Into<String>) -> Result<(), Foreign> {
+-        todo!("jobq/3.21-coverage-policy: a place no case can take, and the reason it cannot")
++        self.offer(&site)?;
++        self.sites.retain(|known| known != &site);
++        self.exemptions.push(Exempt::of(site, reason));
++        Ok(())
++    }
++
++    /// The one refusal both recorders make.
++    fn offer(&self, site: &Site) -> Result<(), Foreign> {
++        if !inside(&self.scope, site.path()) {
++            return Err(Foreign {
++                scope: self.scope.clone(),
++                path: site.path().to_owned(),
++            });
++        }
++        Ok(())
+     }
+ 
+     /// The places a case has to walk, in the order they were recorded.
+     #[must_use]
+     pub fn sites(&self) -> &[Site] {
+-        todo!(
+-            "jobq/3.21-coverage-policy: the places a case has to walk, in the order they were recorded"
+-        )
++        &self.sites
+     }
+ 
+     /// The places nothing walks, with their reasons.
+     #[must_use]
+     pub fn exemptions(&self) -> &[Exempt] {
+-        todo!("jobq/3.21-coverage-policy: the places nothing walks, with their reasons")
++        &self.exemptions
+     }
+ 
+     /// Every place of this kind the module has: the walkable ones and the exempted ones.
+     #[must_use]
+     pub fn total(&self, kind: Kind) -> usize {
+-        todo!(
+-            "jobq/3.21-coverage-policy: every place of this kind the module has, walkable and exempt alike"
+-        )
++        self.sites.iter().filter(|site| site.kind() == kind).count()
++            + self
++                .exemptions
++                .iter()
++                .filter(|exempt| exempt.site().kind() == kind)
++                .count()
+     }
+ 
+     /// The places of this kind a case can reach: the denominator a share is *about*.
+     #[must_use]
+     pub fn walkable(&self, kind: Kind) -> usize {
+-        todo!("jobq/3.21-coverage-policy: the places of this kind a case can reach")
++        self.sites.iter().filter(|site| site.kind() == kind).count()
+     }
+ 
+     /// The highest share any run can reach on this inventory, in whole percent, or `None` when the
+@@ -363,9 +410,7 @@ impl Inventory {
+     /// module, it is a question the inventory does not ask.
+     #[must_use]
+     pub fn ceiling(&self, kind: Kind) -> Option<u32> {
+-        todo!(
+-            "jobq/3.21-coverage-policy: the highest share any run can reach, or `None` when there is nothing to reach"
+-        )
++        percent(self.walkable(kind), self.total(kind))
+     }
+ 
+     /// The share of this inventory a run walked, in whole percent, or `None` when the module has no
+@@ -380,7 +425,13 @@ impl Inventory {
+     /// [`Foreign`] when `walked` measured another module: a share of one module's places is not an
+     /// answer about another's.
+     pub fn share(&self, kind: Kind, walked: &Walked) -> Result<Option<u32>, Foreign> {
+-        todo!("jobq/3.21-coverage-policy: the share of this inventory a run walked")
++        self.agree(walked)?;
++        let reached = self
++            .sites
++            .iter()
++            .filter(|site| site.kind() == kind && walked.reached(site))
++            .count();
++        Ok(percent(reached, self.total(kind)))
+     }
+ 
+     /// The places of this kind still to write a case for, in inventory order, or the reason there
+@@ -393,7 +444,23 @@ impl Inventory {
+     ///
+     /// [`Foreign`] when `walked` measured another module.
+     pub fn uncovered(&self, kind: Kind, walked: &Walked) -> Result<Vec<&Site>, Foreign> {
+-        todo!("jobq/3.21-coverage-policy: the places still to write a case for")
++        self.agree(walked)?;
++        Ok(self
++            .sites
++            .iter()
++            .filter(|site| site.kind() == kind && !walked.reached(site))
++            .collect())
++    }
++
++    /// The one refusal the arithmetic makes: a run of one module against another's inventory.
++    fn agree(&self, walked: &Walked) -> Result<(), Foreign> {
++        if walked.scope() == self.scope {
++            return Ok(());
++        }
++        Err(Foreign {
++            scope: self.scope.clone(),
++            path: walked.scope().to_owned(),
++        })
+     }
+ }
+ 
+@@ -417,7 +484,7 @@ impl Policy {
+     /// A policy: `threshold` percent of the places of `kind`.
+     #[must_use]
+     pub fn of(threshold: u32, kind: Kind) -> Self {
+-        todo!("jobq/3.21-coverage-policy: a threshold and the kind of place it counts")
++        Self { threshold, kind }
+     }
+ 
+     /// The policy `docs/coverage.md` states, and the one the spec compares that page with.
+@@ -435,13 +502,13 @@ impl Policy {
+     /// The share this policy asks for.
+     #[must_use]
+     pub fn threshold(&self) -> u32 {
+-        todo!("jobq/3.21-coverage-policy: the share this policy asks for")
++        self.threshold
+     }
+ 
+     /// Which of the two questions this policy counts.
+     #[must_use]
+     pub fn kind(&self) -> Kind {
+-        todo!("jobq/3.21-coverage-policy: which of the two questions the threshold counts")
++        self.kind
+     }
+ 
+     /// Whether this policy can be met on `inventory` at all.
+@@ -452,7 +519,10 @@ impl Policy {
+     /// module does not have, is a rule nobody read after writing it.
+     #[must_use]
+     pub fn is_satisfiable(&self, inventory: &Inventory) -> bool {
+-        todo!("jobq/3.21-coverage-policy: whether anybody can meet this policy on this inventory")
++        match inventory.ceiling(self.kind) {
++            Some(ceiling) => self.threshold <= ceiling,
++            None => false,
++        }
+     }
+ 
+     /// What a run of this module means to this policy.
+@@ -467,6 +537,29 @@ impl Policy {
+     ///
+     /// [`Foreign`] when `walked` measured another module than the inventory describes.
+     pub fn judge(&self, inventory: &Inventory, walked: &Walked) -> Result<Verdict, Foreign> {
+-        todo!("jobq/3.21-coverage-policy: what a run of this module means to this policy")
++        let Some(share) = inventory.share(self.kind, walked)? else {
++            return Ok(Verdict::Unproven);
++        };
++        if share >= self.threshold {
++            return Ok(Verdict::Passed);
++        }
++        Ok(Verdict::Failed)
++    }
++}
++
++/// `true` when `path` is the module `scope` names, or something inside it.
++///
++/// A prefix test rather than `starts_with` on its own, because `src/engine` is a prefix of
++/// `src/engineers/queue.rs` as well: a scope that absorbed a module with a longer name would be
++/// exactly the defect [`Foreign`] exists to refuse.
++fn inside(scope: &str, path: &str) -> bool {
++    path == scope || path.starts_with(&format!("{scope}/"))
++}
++
++/// Whole percent of `part` out of `whole`, or `None` when there is nothing to be a part of.
++fn percent(part: usize, whole: usize) -> Option<u32> {
++    if whole == 0 {
++        return None;
+     }
++    u32::try_from(part * 100 / whole).ok()
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 49d68f7..ff086cd 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -26,6 +26,7 @@
+ 
+ pub(crate) mod authz;
+ pub(crate) mod clock;
++pub(crate) mod coverage;
+ pub(crate) mod cron;
+ pub(crate) mod dedup;
+ pub(crate) mod dlq;
+@@ -48,6 +49,9 @@ mod sealed;
+ 
+ pub use authz::{QueueAction, QueueAudit, QueueDeclaration, QueueGrant};
+ pub use clock::{Clock, SystemClock};
++pub use coverage::{
++    Exempt, Foreign, Inventory, Kind, POLICY_SCOPE, Policy as CoveragePolicy, Site, Walked,
++};
+ pub use cron::Schedule;
+ pub use dedup::{DEDUP_KEY_MAX, Dedup};
+ pub use dlq::{dead_letters, revived};
