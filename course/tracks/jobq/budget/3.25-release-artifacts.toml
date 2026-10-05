@@ -1,0 +1,26 @@
+# The artifact contract of `jobq/3.25-release-artifacts`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/release_harness.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them counts files or lines rather than seconds, so nothing here can flake on a
+# loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead, and the two of them are the two halves of the promise this step's page makes: every file
+# in the release is covered by the checksum file, and the release carries nothing the contract does
+# not name. Both are zero on a release that holds, which is why the numbers are exact rather than a
+# target — a file nobody checked is not a release that is slightly worse.
+command = "cargo test -p jobq --test release_harness -- --nocapture"
+
+[metric]
+# The files the release carries: the daemon and the client, the two binaries the build produces.
+artifacts = 2
+# The lines of the checksum file: one per artifact, in the format `sha256sum -c` reads.
+checksum_lines = 2
+# The binaries the checksum file does not cover, as an upper bound: a release whose manifest names
+# fewer files than it carries is a release somebody will fail to check.
+unverified_max = 0
+# The files the release carries that are not one of the two binaries, as an upper bound: a build
+# stamp, a README or a debug symbol that arrived unannounced is a file nobody agreed to ship.
+extras_max = 0

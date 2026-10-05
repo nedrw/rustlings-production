@@ -23,6 +23,7 @@ format_version = 1
 "spec/3.22/budget.rs" = "sha256:0d25c5a12b57f6d4a7e0f4a309e710045bd9fd643beea75d9a723f5aa624617a"
 "spec/3.23/online_schema.rs" = "sha256:faa354c1037874f3231d5b6f77e2fc9ae2d3f03f931e293b8836027b9505afc4"
 "spec/3.24/unsafe_budget.rs" = "sha256:a9bea8ec288ab88132d21377a2f36af1c05bf267ea8e5822c7839e604d817b4f"
+"spec/3.25/release.rs" = "sha256:7714f64a7fa0d41be4b5c92ea8173b57158f80d5242d2957d9120b82190bef32"
 "spec/3.3/library_errors.rs" = "sha256:740e214d2e5a7f4287b97acf1da0896a94f394e07b2ea1ec646d0b252bc827d9"
 "spec/3.4/feature_assembly.rs" = "sha256:d8e745fa6364b27cba54daaf2c981e235b62a3c490866bd106e2f33ea73448cf"
 "spec/3.5/port_conformance.rs" = "sha256:925f3c33e859df18b36d4f0940b8a0965480abad51deb35db9236502921ee9f4"

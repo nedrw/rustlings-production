@@ -1,0 +1,820 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1593a7b..cf637c5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,14 +1,35 @@
+ # Changelog
+ 
+-<!-- TODO: write down the rules this file follows, in the file itself: what a section is, what the
+-heading at the top is for, and what a released version's section has to say. Then promote the
+-section below and fill it in. `0.1.0` is this project's first release, so its section is the
+-project as a user meets it rather than a list of commits — the engine, the daemon, the client, the
+-store port, the dead-letter queue, and what a release is made of. One bullet per thing a user can
+-act on; `jobq/3.2-public-api-baseline` is where the reason for this file was written down. -->
++Every release of `jobq` is written down here, newest first. The format follows
++[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), the version numbers follow
++[Semantic Versioning](https://semver.org/), and one rule is enforced by the release tool rather
++than by review: a version whose section is missing, empty, or still sitting under `Unreleased` is a
++version the tool refuses to publish, because a number without an account of itself is a rollback
++nobody can reason about.
+ 
+ ## [Unreleased]
+ 
+-## [0.1.0] - TODO
++## [0.1.0] - 2026-10-05
+ 
+-<!-- TODO: what this version contains. -->
++### Added
++
++- the engine as a library of its own: submitting, claiming, completing and failing jobs, with a
++  public surface that is what `src/engine/mod.rs` re-exports and nothing else.
++- two binaries around it: `jobqd`, the worker daemon that drains queues, and `jobqc`, the client an
++  operator or a script runs, with one exit code per failure class.
++- the store port with two implementations — an in-memory engine and a Postgres backend — held to
++  one conformance suite, so "the same question gets the same answer" is a test rather than a hope.
++- leases and recovery: a worker that dies mid-job leaves a lease to expire rather than a row stuck
++  in `running`, and a graceful shutdown drains what is in flight.
++- scheduling: priorities that do not starve a queue, cron schedules, delayed timers, and a dedup
++  window that collapses a duplicate submission.
++- queues with tenants and declarations: a handle only lists what it may see, and a refusal does not
++  tell a stranger which queues exist.
++- the dead-letter queue as an operator's view: `dead_letters()`, `replay`, and the audit trail a
++  replay leaves behind.
++- observability: an error budget with alerts that name their metric and window, structured logs that
++  a query can read, and traces that reach the worker that ran the job.
++- the project's own quality budgets: property tests over the state machine, a mutation threshold, a
++  coverage policy, a performance budget counted in work rather than seconds, and an unsafe budget of
++  zero.
++- the release itself: `jobq-release`, a `SHA256SUMS` per release, and this file.
+diff --git a/docs/release.md b/docs/release.md
+index 4800e92..d375dc9 100644
+--- a/docs/release.md
++++ b/docs/release.md
+@@ -1,36 +1,116 @@
+-# Releasing jobq
++# Shipping a release
+ 
+-<!-- TODO: a paragraph in the second person. What a release of this project is made of, who reads
+-this page, and what the tag `v0.1.0` has to do with the version in `Cargo.toml`. Name the two
+-binaries and the checksum file. -->
++A release is a promise about a file: that the name says which version it is and which machine it
++was built for, that the bytes are the ones that were tested, and that somebody reading the version
++number can find out what changed in it. Everything on this page is one of those three.
+ 
+-## The commands
++A release of this project is the two binaries, [`jobqd`](../src/bin/jobqd.rs) and
++[`jobqc`](../src/bin/jobqc.rs), plus [`SHA256SUMS`](../src/engine/release.rs) — a checksum file in
++the format `sha256sum -c` reads. They are written into a directory named `jobq-<version>-<target>`,
++and the version in that name is the version in [`Cargo.toml`](../Cargo.toml) — there is one copy of
++it, and the tag is checked against it rather than typed a second time.
+ 
+-<!-- TODO: the whole procedure as commands, in order: the release build, the tool that publishes
+-it (`jobq-release`), and the check a user runs on what they downloaded. The release directory is
+-named after the version and the target, and `SHA256SUMS` is the file that is checked. -->
++## The commands
+ 
+ ```sh
+-TODO
++# 1. the release build, on the machine (or the runner) that is shipping
++target=aarch64-apple-darwin
++cargo build --release
++
++# 2. publish it: the tag, the target, what to package and where to put it
++cargo run --bin jobq-release -- \
++    --tag v0.1.0 --target "$target" \
++    --from target/release --out dist
++
++# 3. check what came out, with the tool the user will use
++cd dist/jobq-0.1.0-aarch64-apple-darwin
++sha256sum -c SHA256SUMS      # macOS: shasum -a 256 -c SHA256SUMS
+ ```
+ 
++Step 2 prints exactly the lines it wrote into `SHA256SUMS`, which is what a pipeline log should
++show: what was published, and what each file hashes to.
++
++## What the tool refuses
++
++[`jobq-release`](../src/bin/jobq-release.rs) builds nothing. It decides whether what it was handed
++*is* the release the tag names, and it refuses in three places:
++
++| the check | the failure it catches | exit |
++| --- | --- | --- |
++| the tag is `v` and this crate's version | a release started from the wrong ref, or a tree whose version was never bumped | `2` |
++| each binary is there and reports the version when asked `--version` | a release assembled out of a stale build, or out of a directory the build never wrote | `3` / `1` |
++| `CHANGELOG.md` has a non-empty section for the version, with nothing left under `Unreleased` | a version number published without an account of itself | `1` |
++
++The third one is the check people are tempted to skip, and the reason it is here is that a tag can
++be moved but a changelog entry cannot be reconstructed from it afterwards: `Unreleased` is where a
++change is written down as it is made, and promoting it is what makes a release say what went out.
++
+ ## What a user does with it
+ 
+-<!-- TODO: how somebody who downloaded the release checks that the bytes are the ones we built,
+-with a tool that is already on their machine, and what `jobqd` and `jobqc` are for. -->
++Download the two files, and check them before trusting either:
++
++```sh
++sha256sum -c SHA256SUMS
++export PATH="$PWD:$PATH"
++jobqd --check-config --config jobqd.toml   # refuses a file it cannot read, before it drains anything
++jobqc --help
++```
++
++`jobqd --version` and `jobqc --version` print the version this release is, which is the number to
++quote in a bug report — and the number the tool checked against the tag when the release was made.
++A release that verified is a release whose bytes are the ones that were built; a release that did
++not is a download to throw away, not to debug.
+ 
+ ## Where this runs in a pipeline
+ 
+-<!-- TODO: the job at the end of the pipeline from `mailer/1.3-ci`: what it is handed, what
+-happens when the tool refuses, and why the release is started by a tag rather than by a branch. -->
++The job is the last step of the pipeline of `mailer/1.3-ci`, and it is started by a **tag** rather
++than by a branch: pushing `v0.1.0` starts a build, and the same tag is what the job hands the tool.
++If the tool refuses, the job fails and nothing is uploaded — which is the point. The exit codes are
++the table from [`jobq/3.15-cli-contract`](../src/cli/mod.rs): a `2` means the tag and the tree
++disagree and a human has to bump something, `3` means the build did not produce what the job
++promised, and `1` means the release itself did not check out.
+ 
+ ## What a release does not carry yet
+ 
+-<!-- TODO: signing, installers, and packaging per platform. Say what this project does instead of
+-each of them, and why the checksum file is the part that had to be here. -->
++No signature and no per-platform packaging. A signature needs a key to manage, rotate and revoke,
++and it answers a question this project cannot answer yet — *who* built this — while the checksum
++file answers the one that matters first: whether the bytes arrived intact. Installers, archives and
++package-manager entries are what a real release adds on top of this shape
++([`cargo-dist`](https://opensource.axo.dev/cargo-dist/) is the tool that does it); the shape itself
++— two files, one manifest, one account of what changed — is what has to exist before any of them is
++worth wiring up.
++
++## How this is checked
++
++The release rehearsal is [`tests/release_harness.rs`](../tests/release_harness.rs) — a file this
++project's course ships, because a learner changing the instrument they are measured with is a
++learner changing the measurement. It runs the tool over the binaries this tree just built and
++prints four counts:
++
++```sh
++cargo test -p jobq --test release_harness -- --nocapture
++```
++
++| metric | what it counts | baseline |
++| --- | --- | --- |
++| `artifacts` | the binaries the release carries | 2 |
++| `checksum_lines` | the lines of the checksum file: one per binary | 2 |
++| `unverified_max` | binaries the checksum file does not cover: an upper bound | 0 |
++| `extras_max` | files the release carries that are not one of the two binaries: an upper bound | 0 |
++
++`kiln check jobq/3.25-release-artifacts --slow` runs that command and compares each number with the
++baseline the course keeps in `course/tracks/jobq/budget/3.25-release-artifacts.toml`. They are
++counts rather than seconds, so the gate answers the same thing on a loaded machine as on an idle
++one, and the two upper bounds are the promise this page is about: nothing in the release went
++unchecked, and nothing got in that the release does not declare.
+ 
+ ## Where this comes from
+ 
+-<!-- TODO: link the files this page is about — the tool, the module that decides what a release
+-is, the changelog, and the harness that measures what came out: [the tool](TODO),
+-[the module](TODO), [the changelog](TODO), [the harness](TODO). -->
++- [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — the section vocabulary and the
++  `Unreleased` heading the tool insists on;
++- [Semantic Versioning 2.0.0](https://semver.org/) — what the version number promises, which is the
++  half of the release that a witness file holds (`jobq/3.2-public-api-baseline`);
++- [GNU Coreutils: `sha256sum`](https://www.gnu.org/software/coreutils/manual/html_node/sha2-utilities.html)
++  — the format of `SHA256SUMS`, including why the separator is two spaces;
++- [The Cargo book: manifest](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field)
++  — where a version lives, and why nothing else in this project writes one down.
+diff --git a/src/bin/jobq-release.rs b/src/bin/jobq-release.rs
+index 10032b1..2256a0e 100644
+--- a/src/bin/jobq-release.rs
++++ b/src/bin/jobq-release.rs
+@@ -37,10 +37,10 @@
+ //! accepts what it does not understand starts with the wrong settings and never says so.
+ 
+ use std::fmt;
+-use std::path::PathBuf;
+-use std::process::ExitCode;
++use std::path::{Path, PathBuf};
++use std::process::{Command, ExitCode};
+ 
+-use jobq::engine::{CHANGELOG, CHECKSUMS, Refusal, Release};
++use jobq::engine::{Artifact, CHANGELOG, CHECKSUMS, Refusal, Release, changelog_ok, checksums};
+ 
+ /// What the tool is, which flag means what, and what it refuses.
+ const USAGE: &str = "\
+@@ -63,31 +63,45 @@ struct Args {
+     changelog: PathBuf,
+ }
+ 
+-/// What went wrong: the call, or the release.
++/// What went wrong: the call, the release, or this machine.
+ ///
+-/// Two kinds, because they leave different codes behind: a call the tool could not understand is
+-/// the caller's mistake, and everything [`Refusal`] describes is the release's.
++/// Three kinds, because they leave different codes behind: a call the tool could not understand is
++/// the caller's mistake, everything [`Refusal`] describes is the release's, and a release that
++/// could not be *written* is this machine's.
+ enum Fault {
+     /// The call was wrong: an unknown flag, a flag with no value, a flag left out.
+     Usage(String),
+     /// The release was refused.
+     Release(Refusal),
++    /// The release could not be written where it was asked to be written.
++    Write(String),
+ }
+ 
+ impl Fault {
+     /// The exit code this fault leaves behind.
+     fn exit_code(&self) -> u8 {
+-        let _ = self;
+-        todo!(
+-            "jobq/3.25-release-artifacts: the code a usage error leaves, and the code a refusal leaves"
+-        )
++        match self {
++            // The call was wrong. The table is the one `jobq/3.15-cli-contract` reads.
++            Self::Usage(_) => 2,
++            Self::Release(refused) => refused.exit_code(),
++            // This deployment is broken: there is nowhere to put the release.
++            Self::Write(_) => 1,
++        }
++    }
++}
++
++impl From<Refusal> for Fault {
++    fn from(refused: Refusal) -> Self {
++        Self::Release(refused)
+     }
+ }
+ 
+ impl fmt::Display for Fault {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = formatter;
+-        todo!("jobq/3.25-release-artifacts: one sentence per fault")
++        match self {
++            Self::Usage(detail) | Self::Write(detail) => write!(formatter, "{detail}"),
++            Self::Release(refused) => write!(formatter, "{refused}"),
++        }
+     }
+ }
+ 
+@@ -109,34 +123,114 @@ fn main() -> ExitCode {
+ 
+ /// Publish the release the arguments name, answering with the checksum file's lines.
+ fn run(args: &[String]) -> Result<Vec<String>, Fault> {
+-    let _ = args;
+-    todo!(
+-        "jobq/3.25-release-artifacts: read the flags, check the release, write it, and answer with the checksum lines"
+-    )
++    let args = parse(args)?;
++    let release = Release::of(&args.tag, &args.target)?;
++
++    // What the build produced, and what each of those files says it is. The bytes are read before
++    // the binary is run: a release ships bytes, and a binary that cannot be run is refused by the
++    // same sentence that refuses one that cannot be read.
++    let mut artifacts = Vec::with_capacity(release.binaries().len());
++    for name in release.binaries() {
++        let path = args.from.join(name);
++        let bytes = std::fs::read(&path).map_err(|error| fault_for(&path, &error))?;
++        let said = reported_version(&path)?;
++        release.accepts(name, &said)?;
++        artifacts.push(Artifact::of(name, bytes));
++    }
++
++    // The account of what changed. A version whose notes are missing, empty, or still sitting
++    // under `Unreleased` has not said what is in it, and that is the state a rollback cannot be
++    // reasoned about — so it is refused rather than published.
++    let changelog = std::fs::read_to_string(&args.changelog)
++        .map_err(|error| fault_for(&args.changelog, &error))?;
++    changelog_ok(&changelog, release.version())?;
++
++    let published = write_release(&release, &artifacts, &args.out)
++        .map_err(|error| Fault::Write(format!("the release could not be written: {error}")))?;
++    Ok(published.lines().map(str::to_owned).collect())
+ }
+ 
+ /// The flags, or the usage error that says which one is wrong.
+ fn parse(args: &[String]) -> Result<Args, Fault> {
+-    let _ = args;
+-    todo!(
+-        "jobq/3.25-release-artifacts: `--tag`, `--target`, `--from`, `--out` and `--changelog`, and a refusal that names what it did not understand"
+-    )
++    let mut tag: Option<&str> = None;
++    let mut target: Option<&str> = None;
++    let mut from: Option<&str> = None;
++    let mut out: Option<&str> = None;
++    let mut changelog: Option<&str> = None;
++
++    let mut pending = args.iter();
++    while let Some(argument) = pending.next() {
++        let slot = match argument.as_str() {
++            "--tag" => &mut tag,
++            "--target" => &mut target,
++            "--from" => &mut from,
++            "--out" => &mut out,
++            "--changelog" => &mut changelog,
++            other => {
++                return Err(Fault::Usage(format!(
++                    "`{other}` is not an argument this tool knows\n{USAGE}"
++                )));
++            }
++        };
++        let Some(value) = pending.next() else {
++            return Err(Fault::Usage(format!("`{argument}` needs a value\n{USAGE}")));
++        };
++        if value.starts_with("--") {
++            return Err(Fault::Usage(format!(
++                "`{argument}` needs a value, and `{value}` is another flag\n{USAGE}"
++            )));
++        }
++        *slot = Some(value.as_str());
++    }
++
++    let missing = |flag: &str| Fault::Usage(format!("`{flag}` is required\n{USAGE}"));
++    Ok(Args {
++        tag: tag.ok_or_else(|| missing("--tag"))?.to_owned(),
++        target: target.ok_or_else(|| missing("--target"))?.to_owned(),
++        from: PathBuf::from(from.ok_or_else(|| missing("--from"))?),
++        out: PathBuf::from(out.ok_or_else(|| missing("--out"))?),
++        changelog: PathBuf::from(changelog.unwrap_or(CHANGELOG)),
++    })
+ }
+ 
+ /// What one binary says when it is asked for its version.
+-fn reported_version(binary: &std::path::Path, name: &str) -> Result<String, Fault> {
+-    let _ = (binary, name);
+-    todo!("jobq/3.25-release-artifacts: run the binary with `--version` and answer what it printed")
++///
++/// Both streams are read: a program that answers on stderr has still answered, and the check is
++/// about the version rather than about which stream carried it.
++fn reported_version(path: &Path) -> Result<String, Fault> {
++    let output = Command::new(path)
++        .arg("--version")
++        .output()
++        .map_err(|error| fault_for(path, &error))?;
++    let mut said = String::from_utf8_lossy(&output.stdout).into_owned();
++    said.push_str(&String::from_utf8_lossy(&output.stderr));
++    Ok(said)
+ }
+ 
+-/// The release directory's contents: the binaries and the checksum file.
+-fn write_release(
+-    release: &Release,
+-    artifacts: &[jobq::engine::Artifact],
+-    out: &std::path::Path,
+-) -> std::io::Result<String> {
+-    let _ = (release, artifacts, out);
+-    todo!(
+-        "jobq/3.25-release-artifacts: `<out>/<directory>/` with the bytes and `{CHECKSUMS}`, and the checksum file back as text"
+-    )
++/// The refusal a file deserves: "not there" and "not usable" are different answers, and they
++/// leave different exit codes behind, so the operating system's own reason is what decides.
++fn fault_for(path: &Path, error: &std::io::Error) -> Fault {
++    let name = path.display().to_string();
++    if error.kind() == std::io::ErrorKind::NotFound {
++        Refusal::MissingInput { name }.into()
++    } else {
++        Refusal::Unreadable {
++            name,
++            detail: error.to_string(),
++        }
++        .into()
++    }
++}
++
++/// Write `<out>/<directory>/` with the binaries and the checksum file, and answer with the text of
++/// the checksum file — which is what a pipeline log should show.
++fn write_release(release: &Release, artifacts: &[Artifact], out: &Path) -> std::io::Result<String> {
++    let directory = out.join(release.directory());
++    std::fs::create_dir_all(&directory)?;
++    for artifact in artifacts {
++        std::fs::write(directory.join(artifact.name()), artifact.bytes())?;
++    }
++    let manifest = checksums(artifacts);
++    std::fs::write(directory.join(CHECKSUMS), &manifest)?;
++    Ok(manifest)
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 9fdd666..2a6aae7 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -36,6 +36,7 @@ pub(crate) mod error;
+ pub(crate) mod events;
+ pub(crate) mod mutation;
+ pub(crate) mod policy;
++pub(crate) mod release;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
+ pub(crate) mod schema;
+@@ -67,6 +68,10 @@ pub use error::Error;
+ pub use events::{EventKind, JobEvent};
+ pub use mutation::{MutationPolicy, Report, Score, Survivor, Verdict, caught};
+ pub use policy::Policy;
++pub use release::{
++    Artifact, BINARIES, CHANGELOG, CHECKSUMS, DIGEST_HEX, Refusal, Release, TAG_PREFIX, VERSION,
++    changelog_ok, checksums, digest, verify,
++};
+ pub use retry::{DEFAULT_ATTEMPTS, Retried, retry};
+ pub use scheduler::Engine;
+ pub use schema::{
+diff --git a/src/engine/release.rs b/src/engine/release.rs
+index fda3686..2a94b2a 100644
+--- a/src/engine/release.rs
++++ b/src/engine/release.rs
+@@ -11,8 +11,8 @@
+ //!   quote in a bug report;
+ //! * **the name carries the version and the target.** `jobq-0.1.0-aarch64-apple-darwin` is two
+ //!   facts in a file name, and a name that carries one of them is a name a mirror, a proxy or a CI
+-//!   cache is free to confuse with another build. That is why the directory is [`Release::directory`]
+-//!   rather than a string every caller formats;
++//!   cache is free to confuse with another build. That is why the directory is
++//!   [`Release::directory`] rather than a string every caller formats;
+ //! * **a checksum file is a format, not a hash.** [`checksums`] writes `<digest>  <name>` with two
+ //!   spaces, sorted, one line per file, because that is what `sha256sum -c` reads — and [`verify`]
+ //!   reads it back in both directions: every file has a line, and every line has a file;
+@@ -31,6 +31,8 @@
+ 
+ use std::fmt;
+ 
++use sha2::{Digest, Sha256};
++
+ /// The version this crate is, read from the manifest when it is compiled.
+ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+ 
+@@ -77,31 +79,31 @@ impl Artifact {
+     /// The file name, exactly as it is downloaded.
+     #[must_use]
+     pub fn name(&self) -> &str {
+-        todo!("jobq/3.25-release-artifacts: the name this artifact is downloaded under")
++        &self.name
+     }
+ 
+     /// The bytes.
+     #[must_use]
+     pub fn bytes(&self) -> &[u8] {
+-        todo!("jobq/3.25-release-artifacts: the bytes the release ships")
++        &self.bytes
+     }
+ 
+     /// How many bytes the artifact is.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("jobq/3.25-release-artifacts: what the artifact weighs")
++        self.bytes.len()
+     }
+ 
+     /// `true` for an artifact with no bytes in it.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("jobq/3.25-release-artifacts: whether there is anything in it")
++        self.bytes.is_empty()
+     }
+ 
+     /// The artifact's digest, as the checksum file writes it.
+     #[must_use]
+     pub fn digest(&self) -> String {
+-        todo!("jobq/3.25-release-artifacts: the digest of this artifact's bytes")
++        digest(&self.bytes)
+     }
+ }
+ 
+@@ -133,46 +135,61 @@ impl Release {
+     /// `refs/tags/v0.1.0` is a ref), and [`Refusal::VersionMismatch`] when it names a version that
+     /// is not this crate's.
+     pub fn of(tag: &str, target: &str) -> Result<Self, Refusal> {
+-        let _ = (tag, target);
+-        todo!(
+-            "jobq/3.25-release-artifacts: the release a tag names, or the refusal that says why it is not one"
+-        )
++        let Some(version) = tag
++            .strip_prefix(TAG_PREFIX)
++            .filter(|version| !version.is_empty())
++        else {
++            return Err(Refusal::NotATag {
++                tag: tag.to_owned(),
++            });
++        };
++        if version != VERSION {
++            return Err(Refusal::VersionMismatch {
++                tag: tag.to_owned(),
++                version: VERSION.to_owned(),
++            });
++        }
++        Ok(Self {
++            tag: tag.to_owned(),
++            version: version.to_owned(),
++            target: target.to_owned(),
++        })
+     }
+ 
+     /// The tag this release was cut from.
+     #[must_use]
+     pub fn tag(&self) -> &str {
+-        todo!("jobq/3.25-release-artifacts: the tag the release was cut from")
++        &self.tag
+     }
+ 
+     /// The version inside it, which is this crate's.
+     #[must_use]
+     pub fn version(&self) -> &str {
+-        todo!("jobq/3.25-release-artifacts: the version the tag names")
++        &self.version
+     }
+ 
+     /// The target it was built for.
+     #[must_use]
+     pub fn target(&self) -> &str {
+-        todo!("jobq/3.25-release-artifacts: the target the release is for")
++        &self.target
+     }
+ 
+     /// The directory the release is written into: `jobq-<version>-<target>`.
+     #[must_use]
+     pub fn directory(&self) -> String {
+-        todo!("jobq/3.25-release-artifacts: the two facts a release's name carries")
++        format!("jobq-{}-{}", self.version, self.target)
+     }
+ 
+     /// The executables the release carries.
+     #[must_use]
+     pub fn binaries(&self) -> &'static [&'static str] {
+-        todo!("jobq/3.25-release-artifacts: the files a release is made of")
++        &BINARIES
+     }
+ 
+     /// The name of the file the release is checked with.
+     #[must_use]
+     pub fn checksums(&self) -> &'static str {
+-        todo!("jobq/3.25-release-artifacts: the checksum file's name")
++        CHECKSUMS
+     }
+ 
+     /// Whether `output` — what a binary printed for `--version` — is this release's version.
+@@ -186,8 +203,15 @@ impl Release {
+     ///
+     /// [`Refusal::WrongBinary`] naming the file, what it said, and what this release is.
+     pub fn accepts(&self, name: &str, output: &str) -> Result<(), Refusal> {
+-        let _ = (name, output);
+-        todo!("jobq/3.25-release-artifacts: whether a binary says it is this release")
++        let said = reported(output).unwrap_or_default();
++        if said == self.version {
++            return Ok(());
++        }
++        Err(Refusal::WrongBinary {
++            name: name.to_owned(),
++            said: said.to_owned(),
++            version: self.version.clone(),
++        })
+     }
+ }
+ 
+@@ -276,24 +300,124 @@ impl Refusal {
+     /// `2` is the reason the classes exist.
+     #[must_use]
+     pub fn exit_code(&self) -> u8 {
+-        todo!("jobq/3.25-release-artifacts: the class of failure each refusal is")
++        match self {
++            // The call was wrong: the tag is not this project's, or it names another version.
++            Self::NotATag { .. } | Self::VersionMismatch { .. } => 2,
++            // The thing asked about is not there.
++            Self::MissingInput { .. } => 3,
++            // This deployment is broken: the build, the checksum file, or the account of it.
++            Self::Unreadable { .. }
++            | Self::WrongBinary { .. }
++            | Self::ChecksumMismatch { .. }
++            | Self::MissingFile { .. }
++            | Self::NotInManifest { .. }
++            | Self::NoChangelogSection { .. }
++            | Self::EmptySection { .. }
++            | Self::UnreleasedNotPromoted { .. } => 1,
++        }
+     }
+ }
+ 
+ impl fmt::Display for Refusal {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = formatter;
+-        todo!(
+-            "jobq/3.25-release-artifacts: one sentence per refusal, naming the file or the version"
+-        )
++        match self {
++            Self::NotATag { tag } => write!(
++                formatter,
++                "`{tag}` is not a tag of this project: a tag is `{TAG_PREFIX}` and the version"
++            ),
++            Self::VersionMismatch { tag, version } => write!(
++                formatter,
++                "`{tag}` names a version that is not this crate's (`{version}`)"
++            ),
++            Self::MissingInput { name } => write!(
++                formatter,
++                "`{name}` is not in the directory the release is made from"
++            ),
++            Self::Unreadable { name, detail } => {
++                write!(formatter, "`{name}` could not be read: {detail}")
++            }
++            Self::WrongBinary {
++                name,
++                said,
++                version,
++            } => write!(
++                formatter,
++                "`{name}` reports `{said}` and this release is `{version}`"
++            ),
++            Self::ChecksumMismatch {
++                name,
++                expected,
++                found,
++            } => write!(
++                formatter,
++                "`{name}` hashes to `{found}` and `{CHECKSUMS}` says `{expected}`"
++            ),
++            Self::MissingFile { name } => write!(
++                formatter,
++                "`{CHECKSUMS}` names `{name}`, which the release does not carry"
++            ),
++            Self::NotInManifest { name } => write!(
++                formatter,
++                "`{name}` is not in `{CHECKSUMS}`, so nothing checked it"
++            ),
++            Self::NoChangelogSection { version } => {
++                write!(formatter, "`{CHANGELOG}` has no section for `{version}`")
++            }
++            Self::EmptySection { version } => write!(
++                formatter,
++                "the section for `{version}` in `{CHANGELOG}` says nothing"
++            ),
++            Self::UnreleasedNotPromoted { version } => write!(
++                formatter,
++                "`{CHANGELOG}` still holds notes under `{UNRELEASED}`: promote them into `{version}`"
++            ),
++        }
++    }
++}
++
++/// The section name of the heading that holds what nobody has released yet.
++const UNRELEASED: &str = "Unreleased";
++
++/// The version a `--version` line reports: the last word of the first line.
++///
++/// The first line and not the whole output, because a program is allowed to say something after its
++/// answer (a build stamp, a deprecation warning), and that something is not part of the version.
++fn reported(output: &str) -> Option<&str> {
++    output.lines().next()?.split_whitespace().last()
++}
++
++/// The section a line opens, or `None` when the line is not a release heading.
++///
++/// `## [0.1.0] - 2026-10-05` and `## 0.1.0` are one heading in two house styles, and `###` is a
++/// section *of* a release rather than a release — which is the difference between a version that
++/// has an account of itself and a version nested under somebody else's.
++fn heading(line: &str) -> Option<&str> {
++    let rest = line.trim_start().strip_prefix("##")?.trim_start();
++    if rest.starts_with('#') {
++        return None;
+     }
++    let name = rest.strip_prefix('[').map_or_else(
++        || rest.split_whitespace().next().unwrap_or_default(),
++        |bracketed| bracketed.split(']').next().unwrap_or_default(),
++    );
++    Some(name.trim())
++}
++
++/// Whether a line of a section is a line somebody wrote: not blank, and not a comment.
++///
++/// A comment that spans several lines is read a line at a time — the narrowing is stated rather
++/// than hidden, and this project writes neither a multi-line comment nor a multi-line heading.
++fn says_something(line: &str) -> bool {
++    let text = line.trim();
++    !text.is_empty() && !text.starts_with("<!--")
+ }
+ 
+ /// The digest of `bytes`, as the checksum file writes it: SHA-256, 64 lower-case hex characters.
+ #[must_use]
+ pub fn digest(bytes: &[u8]) -> String {
+-    let _ = bytes;
+-    todo!("jobq/3.25-release-artifacts: the SHA-256 of the bytes, in lower-case hex")
++    let mut hasher = Sha256::new();
++    hasher.update(bytes);
++    format!("{:x}", hasher.finalize())
+ }
+ 
+ /// The checksum file for `artifacts`: one `<digest>  <name>` line each, sorted by name.
+@@ -303,8 +427,16 @@ pub fn digest(bytes: &[u8]) -> String {
+ /// rather than a broken one.
+ #[must_use]
+ pub fn checksums(artifacts: &[Artifact]) -> String {
+-    let _ = artifacts;
+-    todo!("jobq/3.25-release-artifacts: the checksum file, in the format a tool reads")
++    let mut lines: Vec<String> = artifacts
++        .iter()
++        .map(|artifact| format!("{}  {}", artifact.digest(), artifact.name()))
++        .collect();
++    lines.sort();
++    let mut text = lines.join("\n");
++    if !text.is_empty() {
++        text.push('\n');
++    }
++    text
+ }
+ 
+ /// Check a downloaded set of files against the checksum file it came with.
+@@ -319,8 +451,37 @@ pub fn checksums(artifacts: &[Artifact]) -> String {
+ /// [`Refusal::ChecksumMismatch`] naming the file and both digests, [`Refusal::MissingFile`] for a
+ /// line whose file is not here, or [`Refusal::NotInManifest`] for a file no line mentions.
+ pub fn verify(manifest: &str, artifacts: &[Artifact]) -> Result<(), Refusal> {
+-    let _ = (manifest, artifacts);
+-    todo!("jobq/3.25-release-artifacts: a checked set of files, or the first thing that is wrong")
++    for line in manifest.lines() {
++        let mut words = line.split_whitespace();
++        let (Some(expected), Some(name)) = (words.next(), words.next()) else {
++            continue;
++        };
++        let Some(artifact) = artifacts.iter().find(|artifact| artifact.name() == name) else {
++            return Err(Refusal::MissingFile {
++                name: name.to_owned(),
++            });
++        };
++        let found = artifact.digest();
++        if found != expected {
++            return Err(Refusal::ChecksumMismatch {
++                name: name.to_owned(),
++                expected: expected.to_owned(),
++                found,
++            });
++        }
++    }
++    for artifact in artifacts {
++        let listed = manifest.lines().any(|line| {
++            let mut words = line.split_whitespace();
++            matches!((words.next(), words.next()), (Some(_), Some(name)) if name == artifact.name())
++        });
++        if !listed {
++            return Err(Refusal::NotInManifest {
++                name: artifact.name().to_owned(),
++            });
++        }
++    }
++    Ok(())
+ }
+ 
+ /// Is this changelog ready to be the release's account of `version`?
+@@ -339,6 +500,56 @@ pub fn verify(manifest: &str, artifacts: &[Artifact]) -> Result<(), Refusal> {
+ /// [`Refusal::NoChangelogSection`], [`Refusal::EmptySection`] or
+ /// [`Refusal::UnreleasedNotPromoted`], naming the version.
+ pub fn changelog_ok(changelog: &str, version: &str) -> Result<(), Refusal> {
+-    let _ = (changelog, version);
+-    todo!("jobq/3.25-release-artifacts: whether the changelog accounts for this version")
++    let mut section: Option<&str> = None;
++    let mut notes = false;
++    let mut version_seen = false;
++    let mut unreleased_holds_notes = false;
++
++    for line in changelog.lines() {
++        let Some(name) = heading(line) else {
++            if says_something(line) {
++                notes = true;
++            }
++            continue;
++        };
++        // The section that just ended, before this heading opened the next one.
++        if let Some(seen) = section {
++            if seen == version && !notes {
++                return Err(Refusal::EmptySection {
++                    version: version.to_owned(),
++                });
++            }
++            if seen == UNRELEASED && notes && !version_seen {
++                unreleased_holds_notes = true;
++            }
++        }
++        if name == version {
++            version_seen = true;
++        }
++        section = Some(name);
++        notes = false;
++    }
++    // The last section is closed by the end of the file.
++    if let Some(seen) = section {
++        if seen == version && !notes {
++            return Err(Refusal::EmptySection {
++                version: version.to_owned(),
++            });
++        }
++        if seen == UNRELEASED && notes && !version_seen {
++            unreleased_holds_notes = true;
++        }
++    }
++
++    if !version_seen {
++        return Err(Refusal::NoChangelogSection {
++            version: version.to_owned(),
++        });
++    }
++    if unreleased_holds_notes {
++        return Err(Refusal::UnreleasedNotPromoted {
++            version: version.to_owned(),
++        });
++    }
++    Ok(())
+ }
