@@ -667,10 +667,10 @@ index 0000000..dab96b5
 +}
 diff --git a/tests/support/store.rs b/tests/support/store.rs
 new file mode 100644
-index 0000000..d00ad10
+index 0000000..56f973b
 --- /dev/null
 +++ b/tests/support/store.rs
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,145 @@
 +//! The store the conformance suite runs against: one suite, every backend.
 +//!
 +//! Step `jobq/3.5-store-port-conformance` is about a *suite* that runs more than once, so the spec
@@ -690,11 +690,20 @@ index 0000000..d00ad10
 +//!   has — and every failure names the backend ([`Backend::name`]), because the same assertion is
 +//!   about to run against two of them.
 +//!
++//! A third rule, about the assembly rather than about an assertion: **the fixture compiles in every
++//! assembly this course asks for.** The suite's default backend is `memory`, and the build with no
++//! features is an assembly of its own (`jobq/3.4-feature-assembly`), so what only a durable build
++//! has sits behind `#[cfg(feature = "postgres")]` — asking a build without the feature for
++//! `postgres` is a sentence, not a compile error inside a fixture nobody edited.
++//!
 +//! The schema is applied before the store is handed over ([`backend`]), so every case starts from
 +//! the same place; [`Backend::migrate`] runs that step again for the case that is about it.
 +
-+use jobq::engine::{Error, MemoryStore, PostgresStore, Store};
++#[cfg(feature = "postgres")]
++use jobq::engine::PostgresStore;
++use jobq::engine::{Error, MemoryStore, Store};
 +
++#[cfg(feature = "postgres")]
 +use super::postgres::Postgres;
 +
 +/// The variable that says which backend to build.
@@ -716,6 +725,11 @@ index 0000000..d00ad10
 +    /// The in-process store: no container, no connection, nothing to clean up.
 +    Memory(MemoryStore),
 +    /// The durable store, and the container the database lives in.
++    ///
++    /// A build with no features has no `PostgresStore` to put here (`jobq/3.4-feature-assembly`: the
++    /// in-memory engine alone is meant to be a working assembly), so the variant arrives with the
++    /// feature — and the suite's default backend, `memory`, does not need it.
++    #[cfg(feature = "postgres")]
 +    Postgres {
 +        /// The port, backed by the container's database.
 +        store: PostgresStore,
@@ -730,6 +744,7 @@ index 0000000..d00ad10
 +    pub fn name(&self) -> &'static str {
 +        match self {
 +            Backend::Memory(_) => "memory",
++            #[cfg(feature = "postgres")]
 +            Backend::Postgres { .. } => "postgres",
 +        }
 +    }
@@ -739,6 +754,7 @@ index 0000000..d00ad10
 +    pub fn store(&self) -> &dyn Store {
 +        match self {
 +            Backend::Memory(store) => store,
++            #[cfg(feature = "postgres")]
 +            Backend::Postgres { store, .. } => store,
 +        }
 +    }
@@ -757,6 +773,7 @@ index 0000000..d00ad10
 +    pub async fn migrate(&self) -> Result<(), Error> {
 +        match self {
 +            Backend::Memory(_) => Ok(()),
++            #[cfg(feature = "postgres")]
 +            Backend::Postgres { store, .. } => store.migrate().await,
 +        }
 +    }
@@ -764,11 +781,13 @@ index 0000000..d00ad10
 +
 +/// Build the backend `KILN_BACKEND` names, with its schema already applied.
 +///
-+/// Panics when the variable names a backend this course has not certified, and when the container
-+/// cannot be started: inside a case, a fixture that cannot start is a failure with a sentence.
++/// Panics when the variable names a backend this course has not certified, when this build has no
++/// durable backend to give it, and when the container cannot be started: inside a case, a fixture
++/// that cannot start is a failure with a sentence.
 +pub async fn backend() -> Backend {
 +    match kind().as_str() {
 +        "memory" => Backend::Memory(MemoryStore::new()),
++        #[cfg(feature = "postgres")]
 +        "postgres" => {
 +            let container = Postgres::start();
 +            let store = PostgresStore::connect(&container.url())
@@ -780,6 +799,16 @@ index 0000000..d00ad10
 +                .expect("this project's migration applies to the schema it describes");
 +            Backend::Postgres { store, container }
 +        }
++        // A build without the feature cannot run this backend at all, and the honest answer is the
++        // assembly that can — not a container that starts and then has no store to put in it, and
++        // not a suite that silently measures the in-memory one twice.
++        #[cfg(not(feature = "postgres"))]
++        "postgres" => panic!(
++            "`{BACKEND}=postgres` needs the `postgres` feature this build was made without: \
++             `cargo test --features postgres` is the assembly that has a durable store in it, and \
++             `jobq/3.4-feature-assembly` is the step that says why a build has to assemble without \
++             it too"
++        ),
 +        other => panic!(
 +            "`{BACKEND}={other}` names no backend this suite knows: the certified ones are \
 +             `memory` (the default) and `postgres`, and `conformance.toml` is the file that \

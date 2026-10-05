@@ -1828,15 +1828,16 @@ index c6fd4f8..91de070 100644
 +    (lease / 2).max(Duration::from_millis(1))
  }
 diff --git a/tests/support/store.rs b/tests/support/store.rs
-index d00ad10..5bf4d9a 100644
+index 56f973b..2c2feeb 100644
 --- a/tests/support/store.rs
 +++ b/tests/support/store.rs
-@@ -82,10 +82,9 @@ impl Backend {
+@@ -98,11 +98,9 @@ impl Backend {
      ///
      /// [`Error::Store`] when the backend refused to apply its schema.
      pub async fn migrate(&self) -> Result<(), Error> {
 -        match self {
 -            Backend::Memory(_) => Ok(()),
+-            #[cfg(feature = "postgres")]
 -            Backend::Postgres { store, .. } => store.migrate().await,
 -        }
 +        // One call, because `jobq/3.7-leases-and-recovery` put the step on the port: a backend with
