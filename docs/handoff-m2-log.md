@@ -6,7 +6,13 @@
 ## 索引
 
 - 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
-- （后续段落按施工顺序追加）
+- 第二段 · 2026-10 · 3.2–3.4（公开面/错误/特性装配）与题库扩到 35 道
+- 第三段 · 2026-10 · 六个慢闸门落地，3.2–3.4 的 `semver` 由 pending 转真
+- 第四段 · 2026-10 · 全量 `cargo xtask ci` 第一次跑通（含逐 track selftest）
+- 第五段 · 2026-10 · 3.5（存储端口与一致性套件）：一次假红、两处我自己的缺陷、一个夹具加固
+- 第六段 · 2026-10 · 3.6–3.7（事务隔离、租约与恢复）
+- 第七段 · 2026-10 · 3.8–3.11（时钟注入、公平策略、cron、延迟定时器）
+- 第八段 · 2026-10 · 3.12–3.15，以及一个装不进“无特性”装配的夹具
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -299,4 +305,57 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   scaffold 只给 `src/engine/timers.rs`，模块声明与端口方法由参考解做（规格在 scaffold 态因此是 `E0432`，与 3.9 同形）。
 - **`chrono-tz = "0.10.4"`** 沿用文件自己的惯用法（精确版本在 `Cargo.lock` 里），不写成 `= 0.10.4`。
 
-## 第八段（待写）
+## 第八段 · 2026-10 · 3.12–3.15，以及一个装不进“无特性”装配的夹具
+
+### 做了什么
+
+- **3.12 去重窗口**（提交 `course(jobq/3.12)`）：`Dedup`（键 + 窗口）构造注入，键在同一队列同一窗口内只答一个
+  `JobId`；迁移 `0004` 建唯一索引，端口新增按键查回的口。
+- **3.13 队列鉴权与归属**（提交 `course(jobq/3.13)`）：`Queue` 的声明、`Scope`/`QueueAction` 与拒绝入表；迁移 `0005`；
+  配额与越权的作业“看不见”而不只是“拒绝”。
+- **3.14 作业状态机**（提交 `course(jobq/3.14)`，作业者 `1a6bf93e5b444153`）：`transition(state, event)` 成为唯一的状态规则
+  （两个后端的 settle 语句改成“问模型要目的地”，SQL 里只剩谓词），非法迁移有具名拒绝值 `Illegal`
+  （`Reason::{Terminal, NotRunning, NotQueued}`，`From<Illegal> for Error` 映射到 3.7 钉的 `Error::Invalid`/退出码 2）；
+  `JobState::parse` 是列的读回口，`migrations/0006_job_states.sql` 用具名 `check` 关住那一列——“手写进 psql 的非法状态”
+  是内存后端答不了的问题，所以这一步自己起容器（为此补了 `images` 声明）。scaffold 只给新文件 `src/engine/state.rs` + 迁移
+  stub（scaffold 态因此是 `E0432`）。
+- **3.15 CLI 契约**（提交 `course(jobq/3.15)`，同一作业者）：`src/cli/mod.rs`（语法 + `Outcome`：退出码与两个流是一个值）
+  + `src/bin/jobqc.rs`（11 行），`--json` 不改变退出码，stdout 是答案、stderr 是诊断；端口新增 `Store::list` + `JobFilter`
+  （按 `claim` 文档的顺序、有界页、越权的作业直接看不见），`impl Store for Arc<T>` 让两个二进制在运行时挑后端；
+  `service::open_store` 转公开，`jobqc` 与 `jobqd` 从同一处、同一份设置建 store（且 `jobqc` 不迁移）。
+- **一个 pre-existing 缺陷：一致性夹具装不进“无 postgres”的装配**（提交 `course(jobq/3.5): the conformance fixture…`）。
+  3.5 的 scaffold 建的 `tests/support/store.rs` 无条件 `use jobq::engine::PostgresStore`，于是
+  `cargo test -p jobq --no-default-features` 在**课程自己发的文件**里报 `E0432`——而这个夹具的默认后端就是 `memory`，
+  且“无特性也要能装配”正是它前一步（3.4）的判据。作业者报了它但按规矩没动别人的产物；我在主树上修：只加
+  `#[cfg(feature = "postgres")]`（导入、`Backend::Postgres` 变体与它的分支），没有特性又点名 `postgres` 时给一句指明装配的话；
+  3.7 打在同一文件上的 hunk 按新内容重新生成（`@@ -82,10 +82,9 @@` → `@@ -98,11 +98,9 @@`）。两个拥有该文件的步骤都重跑了
+  `selftest`（`11/11` 与 `11/11`）。
+- **边界记在 handoff §5.2**：需要特性的不是夹具而是**规格**——15 个 spec target 里有 9 个按设计点名 `PostgresStore`，
+  所以“durable 那一半套件要 `--features postgres`”是构造性的，不是夹具的毛病。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest`（两遍，第二遍全新缓存） | 3.12 `11/11`、3.13 `10/10`、3.14 `10/10`、3.15 `10/10` must gates；3.14/3.15 都是 `1/1 step(s) hold the contract` |
+| 全步判定（在 `skip` 出的尾巴树上） | `kiln verify jobq --slow` → `15/15 judged step(s) pass · 0 failed · 0 not prepared · 11 without content`；逐步 `8/9/9/9/11/11/11/9/11/9/11/11/10/10/10` |
+| 默认特性全量套件 | `cargo test -p jobq` → **92 passed · 0 failed**（3.13 基线 81，两步加了 11 例；夹具修完再取一次仍是 92） |
+| postgres 后端子集 | `authz 6 · dedup 6 · fairness 4 · isolation 7 · leases 11 · port_conformance 8 · state_machine 5` → `47 passed · 0 failed` |
+| 夹具修复的两条证据 | 无特性：`cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（此前 `E0432`）；同一构建点名 `KILN_BACKEND=postgres` → `panicked at tests/support/store.rs:131` “needs the `postgres` feature this build was made without…”（是句子，不是编译错误）；有特性 + `KILN_BACKEND=postgres` → `8 passed`（6.28 s，真起容器） |
+| 课程自己的检查 | `lint-caps` `no issues.`（`checked 61 of 72 step bodies`）；`probe --check` `40/40`；`links` `74 page(s) · 414 link(s)` `✓ every target resolves`；`i18n status` `structure: 0 error(s)` |
+
+### 坑与判读
+
+- **“durable 规格名类型”不是缺陷，是设计**：夹具可以做到“任何装配都能编译”，规格做不到——它们是钉死的文本，
+  要判“两个后端对同一问题给同一个答案”就必须点名背单词。生产项目里表达这条边界的机制是 Cargo 的
+  `[[test]] required-features`；这里没做，因为那要一份随每一步成长的 target 清单，是课程设计决定（handoff §5.2）。
+- **`kiln skip --all` 走的是默认 track（mailer），不是 `--track`**：这个版本的 `skip` 没有 `--track`（`selftest`/`verify` 有），
+  要铺 jobq 的树得按路径序逐个 `kiln skip jobq/<step> --force`——交接文档里那条命令写错了，已在 §4.1 改正并换成循环。
+- **`kiln verify <track>` 判的是 `app/<track>`**：worktree 里没有 `app/` 时逐个报 `app/jobq does not exist yet`，
+  `0/0 judged`（这不是“全绿”）。取数字要先铺树。
+- **3.15 的退出码 4 用例用“这个构建打不开的连接串”而不是“不可达的主机”**：`PgPoolOptions` 对后者会等自己的 30 s 超时，
+  会把该步的快速路径拖到 ~37 s；类别相同（`Error::Store`/退出 4），用例 15 ms 拿到结论。
+- **打包旧 target dir 的诱惑**：修复后用共享 target dir 跑过一轮，正是交接文档警告的“同名同版本测试二进制被复用”场景；
+  修复的验证全部改用 `/private/tmp/fixcheck2-target`（全新）重取。
+- **3.16（DLQ 工具）与 3.17（预算告警）的作业者已经在跑**（子 agent `475cb3f144864910`），任务书里写明了：不要改
+  `tests/support/store.rs`（我在主树上动），需要的夹具辅助放新文件。

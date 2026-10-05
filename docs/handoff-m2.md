@@ -356,8 +356,15 @@ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --
 
 ```sh
 # 1) 在 app/jobq 里得到整条 track 的参考解状态（真项目，不是夹具）
-CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
-  cargo run -q -p kiln -- skip --all --force --track jobq
+#    注意：这个版本的 `kiln skip` 没有 `--track`，`--all` 走的是 course.toml 的默认 track（mailer）；
+#    铺 jobq 的树要按路径序逐个 skip（`selftest`/`verify` 才有 `--track`）。
+for s in 3.1-engine-boundary 3.2-public-api-baseline 3.3-library-errors 3.4-feature-assembly \
+         3.5-store-port-conformance 3.6-transaction-isolation 3.7-leases-and-recovery \
+         3.8-clock-injection 3.9-priority-fairness 3.10-cron-schedules 3.11-delayed-timers \
+         3.12-dedup-window 3.13-queue-authz-attribution 3.14-job-state-machine 3.15-cli-contract; do
+  CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
+    cargo run -q -p kiln -- skip "jobq/$s" --force
+done
 
 # 2) 四类故意劣化，每次只改一处，改完跑那一步的判定
 git -C app/jobq diff            # 先存下“好树”
@@ -377,7 +384,17 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（每 5–6 步同步一次。）
+（15/26 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+
+| 项 | 值 |
+| --- | --- |
+| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` must gates，全部 `hold the contract` |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow` → `15/15 judged step(s) pass · 0 failed · 0 not prepared · 11 without content` |
+| 默认特性全量套件 | `cargo test -p jobq` → **92 passed · 0 failed**（3.13 时基线 81，3.14/3.15 加了 11 例） |
+| postgres 后端子集 | `KILN_BACKEND=postgres` 走 `authz 6 · dedup 6 · fairness 4 · isolation 7 · leases 11 · port_conformance 8 · state_machine 5` → **47 passed · 0 failed** |
+| 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
+| 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
+| CI | `cargo xtask ci` 上次全绿是 `0927803`（1634 s）；3.8–3.15 与闸门提交之后**未复跑**（逐条走 mailer/relay/jobq 三条 track，30 min+） |
 
 ## 5. 缺口
 
@@ -403,4 +420,20 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 
 ### 5.2 其他
 
-（收尾时写。）
+- **durable 那一半套件需要 `--features postgres`，这是设计而不是缺陷。** 15 个 spec target 里有 9 个按设计点名
+  `PostgresStore`（`spec_authz`、`spec_cli`、`spec_dedup`、`spec_isolation`、`spec_leases`、`spec_state_machine`、
+  `spec_timers`，以及 3.23 起会新增的），所以 `cargo test -p jobq --no-default-features` 永远编不过它们——规格是钉死的
+  文本，“两个后端对同一问题给同一个答案”这件事必须点名背单词。夹具不同：3.5 的 `tests/support/store.rs` 已经改成在
+  任何装配里都能编译（导入、`Backend::Postgres` 变体与它的分支加 `#[cfg(feature = "postgres")]`，提交
+  `course(jobq/3.5): the conformance fixture has to compile in every assembly`），默认后端 `memory` 在无特性装配里
+  可跑（`spec_port_conformance` 8 passed，修复前根本不过编译）。生产项目里表达这条边界的机制是 Cargo 的
+  `[[test]] required-features = ["postgres"]`；这里没做，因为那要一份随每一步成长的 target 清单，是课程设计决定，
+  留给 M2 之后（3.24/3.25 的步骤书里不要再把它当成缺陷重报）。
+- **`kiln verify <track>` 判的是 `app/<track>` 里的真实项目**：worktree 里没有 `app/` 时逐个报
+  `app/jobq does not exist yet`（`0/0 judged`）。取“全步判定”的数字要先铺树（§4.1 的第 1 步），再在那棵树里跑；
+  本次是 15/15。
+- **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
+  精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **M2 收尾待办**：验收演练（§4.1）未做；`cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的
+  进度同步；`README.md` 的 track 表与 Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/
+  `t2-relay.md` 同构：步表、项目最终形状、装置与模式、实测数字、缺口）。
