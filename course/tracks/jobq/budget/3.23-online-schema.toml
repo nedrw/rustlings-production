@@ -1,0 +1,20 @@
+# The performance budget of `jobq/3.23-online-schema`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/backfill_budget.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them is a count rather than a time, so nothing here can flake on a loaded machine.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: it is the number the page (`docs/migration.md`) commits to, and the harness prints the
+# measurement it is compared with — `burst_max` is "no more than one batch due at a time", not "about
+# one", and `resume_ratio_max` is the share of the table a resumed run may still have to look at.
+command = "cargo test -p jobq --test backfill_budget -- --nocapture"
+
+[metric]
+# The statements one plan over the whole table submits: one per batch of 256 rows.
+backfill_jobs = 16
+# The most batches a plan may make due in one interval — the rate, as an upper bound.
+burst_max = 1
+# What a run that resumes at the halfway mark still costs, against the plan for all of it.
+resume_ratio_max = 0.6
