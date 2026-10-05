@@ -498,14 +498,20 @@ hint = "Scripts are the customer: `--json` on stdout, diagnostics on stderr, one
 
 [[step]]
 id = "3.16-dlq-tooling"
-title = "Dead letters: inspect, replay and drop, with a trail"
+title = "Dead letters: what is stuck, why, and one more life"
 kind = "milestone"
 origin = "deepen"
 entry = "docs/steps/en/jobq/3.16-dlq-tooling.md"
 time_hint = "120m"
-concepts = ["dead letter store", "replay semantics", "audit trail"]
+concepts = ["dead-letter view", "replay as a second life", "audit trail"]
 teaches = ["ops/dlq-tooling@apply", "delivery/dlq@operate"]
-requires = ["delivery/dlq@apply", "cli/contract@apply", "domain/state-machine@apply"]
+requires = [
+    "delivery/dlq@apply",
+    "domain/state-machine@apply",
+    "db/transactions@design",
+    "time/clock-injection@apply",
+    "sec/authz-tenant-isolation@operate",
+]
 run = { cmd = "cargo test -p jobq --test spec_dlq" }
 spec = ["spec/3.16/dlq.rs"]
 scaffold = "scaffold/3.16-dlq-tooling.patch"
@@ -524,7 +530,7 @@ gates = [
     "slow:conformance@2",
 ]
 images = ["postgres:17-alpine"]
-hint = "The delta over `relay/2.10` is the operator's half: replay is idempotent, every replay or drop leaves an audit row, and the command works while the worker is running."
+hint = "The delta over `relay/2.10` is whose decision the way back is: a replay is the engine's arithmetic, written once so both backends answer the same way, and it is a second life rather than a move — the count is kept, the ceiling moves one past it, and the line it leaves is the audit."
 
 [[step]]
 id = "3.17-error-budget-alerts"

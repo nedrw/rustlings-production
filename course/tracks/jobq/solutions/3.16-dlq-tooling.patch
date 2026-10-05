@@ -1,0 +1,369 @@
+diff --git a/src/engine/dlq.rs b/src/engine/dlq.rs
+index b601c6a..869d692 100644
+--- a/src/engine/dlq.rs
++++ b/src/engine/dlq.rs
+@@ -46,11 +46,6 @@
+ //! on, and the state change and its trail line are one transaction (`jobq/3.6-transaction-isolation`
+ //! is the pattern).
+ //!
+-//! # What is left to write
+-//!
+-//! The two functions below — the view and the decision — and then the three places that carry them:
+-//! the port method that calls the decision, the two backends that implement it, and the line they
+-//! append to the trail, whose name this build does not have yet.
+ 
+ use chrono::{DateTime, Utc};
+ 
+@@ -65,10 +60,7 @@ use crate::engine::error::Error;
+ /// handle's question (`jobq/3.13-queue-authz-attribution`) rather than the filter's.
+ #[must_use]
+ pub fn dead_letters() -> JobFilter {
+-    todo!(
+-        "jobq/3.16-dlq-tooling: the view — the one state a job the engine gave up on is in, and \
+-         nothing else about the filter changed"
+-    )
++    JobFilter::new().with_state(JobState::Failed)
+ }
+ 
+ /// The row a replay of `job` writes, or the refusal that says this job has no second life.
+@@ -87,8 +79,27 @@ pub fn dead_letters() -> JobFilter {
+ /// [`Error::Invalid`], naming the state, when `job` is not a dead letter: the caller asked for a
+ /// second life for something that either already has one or has finished with it.
+ pub fn revived(job: &Job, now: DateTime<Utc>) -> Result<Job, Error> {
+-    todo!(
+-        "jobq/3.16-dlq-tooling: the three decisions — only a dead letter has a second life, the \
+-         count is kept and the ceiling moves, and the reason the last life died stays"
+-    )
++    let (id, state) = (job.id(), job.state());
++    if state != JobState::Failed {
++        return Err(Error::Invalid {
++            detail: format!(
++                "job {id} is {state}, not failed: only a job the engine gave up on has a second \
++                 life"
++            ),
++        });
++    }
++    let mut revived = job.clone();
++    // The state a job is *born* in, which is the same name `enqueue` writes: a second life starts
++    // where the first one did, and this is not a move the model has a row for.
++    revived.state = JobState::Queued;
++    // One more attempt than the job has already started. A dead letter is a row whose count has
++    // caught up with its ceiling, so this is the same number as `max_attempts + 1` and it is
++    // written this way round because the count is the fact and the ceiling is the policy.
++    revived.max_attempts = job.attempts() + 1;
++    revived.run_at = now;
++    // A dead row holds no lease, and clearing the two fields anyway is what keeps "no second life
++    // inherits a claim" a property of this function rather than of where the job died.
++    revived.lease_owner = None;
++    revived.lease_expires_at = None;
++    Ok(revived)
+ }
+diff --git a/src/engine/events.rs b/src/engine/events.rs
+index fa07ef4..b09cff9 100644
+--- a/src/engine/events.rs
++++ b/src/engine/events.rs
+@@ -32,10 +32,10 @@ use crate::engine::domain::JobId;
+ 
+ /// What happened to a job.
+ ///
+-/// `#[non_exhaustive]`, for the same reason [`crate::engine::JobState`] is: this list grows — a
+-/// replay, a purge and a run somebody cancelled are all events an operator has to be able to read —
+-/// and a caller that wrote a wildcard arm on day one should not have to be rebuilt the day one of
+-/// them arrives.
++/// `#[non_exhaustive]`, for the same reason [`crate::engine::JobState`] is: this list grows, and
++/// the day-one promise is that a caller who wrote a wildcard arm is not rebuilt when it does. One
++/// has arrived — [`EventKind::Replayed`] came with `jobq/3.16-dlq-tooling` — and a purge and a run
++/// somebody cancelled are still events an operator would have to be able to read.
+ #[non_exhaustive]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub enum EventKind {
+@@ -46,6 +46,15 @@ pub enum EventKind {
+     /// The attempt was abandoned rather than finished — the worker holding it stopped, or its
+     /// lease ran out — and the job went back to the queue.
+     Reclaimed,
++    /// The job was a dead letter and an operator gave it a second life.
++    ///
++    /// The one kind that is not a settle: nothing happened to an attempt here, the queue was told to
++    /// owe a finished job one more (`jobq/3.16-dlq-tooling`), and the line names the attempt the job
++    /// had **spent** when that happened rather than a new one. It is a line an operator reads for
++    /// the same reason the others are: "has this job been put back before?" is the first question
++    /// after an incident, and the row itself cannot answer it — a job that was replayed looks
++    /// exactly like a job that was never handed out.
++    Replayed,
+ }
+ 
+ impl EventKind {
+@@ -59,6 +68,7 @@ impl EventKind {
+             EventKind::Completed => "completed",
+             EventKind::AttemptFailed => "attempt-failed",
+             EventKind::Reclaimed => "reclaimed",
++            EventKind::Replayed => "replayed",
+         }
+     }
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index f1edf0d..b698cac 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -17,11 +17,18 @@
+ //! `engine::events::…` and `engine::retry::…` do not exist for a caller (`events` is a
+ //! `pub(crate)` module and `retry` — the module — is too, while `retry`, the *function*, is
+ //! re-exported below), so the next release can move them without touching anybody.
++//!
++//! `jobq/3.16-dlq-tooling` re-exports the two names of `dlq`, and the emphasis is the opposite of
++//! the paragraph above: [`dead_letters`] and [`revived`] are the operator's half of the dead-letter
++//! queue — the view a tool filters by and the row a replay writes — so a caller is meant to *ask*
++//! them rather than to find them. The module is still `pub(crate)`, so where they live is the
++//! crate's business either way.
+ 
+ pub(crate) mod authz;
+ pub(crate) mod clock;
+ pub(crate) mod cron;
+ pub(crate) mod dedup;
++pub(crate) mod dlq;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
+@@ -40,6 +47,7 @@ pub use authz::{QueueAction, QueueAudit, QueueDeclaration, QueueGrant};
+ pub use clock::{Clock, SystemClock};
+ pub use cron::Schedule;
+ pub use dedup::{DEDUP_KEY_MAX, Dedup};
++pub use dlq::{dead_letters, revived};
+ pub use domain::{
+     DEFAULT_LIST_LIMIT, DEFAULT_MAX_ATTEMPTS, Job, JobFilter, JobId, JobState, QUEUE_NAME_MAX,
+     Queue, SubmitRequest, WorkerId,
+diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
+index 730201b..1e48247 100644
+--- a/src/engine/store/memory.rs
++++ b/src/engine/store/memory.rs
+@@ -37,6 +37,7 @@ use chrono::{DateTime, Utc};
+ 
+ use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
++use crate::engine::dlq::revived;
+ use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+@@ -648,6 +649,40 @@ impl Store for MemoryStore {
+         })
+     }
+ 
++    fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>> {
++        Box::pin(async move {
++            let mut ledger = self.ledger();
++            // Which job this is, asked first: a row this handle may not see is answered like a row
++            // nobody wrote, and the two must not be distinguishable
++            // (`jobq/3.13-queue-authz-attribution`).
++            ledger.visible_job(self.scope.as_ref(), id)?;
++            let Some(before) = ledger.jobs.get(id).cloned() else {
++                return Err(Error::NotFound { id: *id });
++            };
++            // The *action* is the queue's question, and it is `claim`'s rather than a fourth one:
++            // putting work back into a queue you may not take work out of is somebody else's
++            // decision. The operator's own door, and the queue's owner, are unaffected.
++            ledger.permit(self.scope.as_ref(), &before.queue, QueueAction::Claim)?;
++            // One instant for the row and for the line, and the lock is this store's transaction
++            // (`jobq/3.6-transaction-isolation`): a refusal above returned before either write, and
++            // what follows cannot be interrupted between them.
++            let now = self.clock.now();
++            let answer = revived(&before, now)?;
++            ledger.jobs.insert(*id, answer.clone());
++            // The line names the attempt the job had *spent*, which is the count the dead row still
++            // holds — a replay is not an attempt, it is the queue owing one
++            // (`jobq/3.16-dlq-tooling`).
++            ledger.record(&JobEvent::new(
++                *id,
++                EventKind::Replayed,
++                before.attempts,
++                None,
++                now,
++            ));
++            Ok(answer)
++        })
++    }
++
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         Box::pin(async move {
+             let ledger = self.ledger();
+diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
+index 83baf72..fc8fca6 100644
+--- a/src/engine/store/mod.rs
++++ b/src/engine/store/mod.rs
+@@ -182,6 +182,35 @@ pub trait Store: Sealed + Send + Sync + 'static {
+         reason: &'a str,
+     ) -> BoxFuture<'a, Result<JobState, Error>>;
+ 
++    /// Put a dead letter back in its queue, and answer with the row the replay wrote.
++    ///
++    /// A replay is a **second life** rather than a move (`jobq/3.16-dlq-tooling`): `failed` is
++    /// terminal in the model of `jobq/3.14-job-state-machine`, so nothing can be *done to* a
++    /// finished job — an operator starts another one instead. Only a dead letter has one, and what
++    /// the second life changes is the engine's own decision ([`crate::engine::revived`]): the
++    /// attempt count is kept, the ceiling moves to one past it, the reason the last life died stays
++    /// on the row, and the job becomes due at this store's clock. Anything else is refused by
++    /// naming the state the job is in, because "already owed an attempt" and "finished" are two
++    /// different answers to the caller.
++    ///
++    /// Two promises make this a method of the port rather than a query, and both of them are about
++    /// what "I looked and then I wrote" means under concurrency: the row is read **under a lock**
++    /// before it is decided on, so two operators replaying at the same instant cannot both be told
++    /// they moved a job, and the change and the line it appends to the trail are **one transaction**
++    /// (`jobq/3.6-transaction-isolation`), so an operator reconstructing an incident cannot meet a
++    /// row and a trail that disagree. The line is the whole of the audit this step buys: its kind
++    /// is `EventKind::Replayed` and it names the attempt the job had spent when it was put back.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::NotFound`] when there is no such job, or this store may not see it — one answer for
++    /// both, because a caller that may not use an identity must not be able to tell it from one
++    /// that does not exist; [`Error::Forbidden`] when this store may see the queue and may not
++    /// `claim` from it; [`Error::Invalid`] when the job is not a dead letter, naming the state it is
++    /// in; [`Error::Conflict`] when the backend refused the transaction and a caller may try again;
++    /// [`Error::Store`] when the backend refused the write.
++    fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>>;
++
+     /// Read one job, whether or not a worker holds it.
+     ///
+     /// # Errors
+@@ -471,6 +500,10 @@ impl<T: Store + ?Sized> Store for Arc<T> {
+         (**self).fail(worker, id, reason)
+     }
+ 
++    fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>> {
++        (**self).replay(id)
++    }
++
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         (**self).get(id)
+     }
+diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
+index eb96760..c872b03 100644
+--- a/src/engine/store/postgres.rs
++++ b/src/engine/store/postgres.rs
+@@ -51,6 +51,7 @@ use uuid::Uuid;
+ 
+ use crate::engine::authz::{QueueAction, QueueAudit, QueueDeclaration};
+ use crate::engine::clock::{Clock, SystemClock};
++use crate::engine::dlq::revived;
+ use crate::engine::domain::{Job, JobFilter, JobId, JobState, Queue, SubmitRequest, WorkerId};
+ use crate::engine::error::Error;
+ use crate::engine::events::{EventKind, JobEvent};
+@@ -523,6 +524,71 @@ impl Store for PostgresStore {
+         Box::pin(async move { self.settle(worker, id, Change::Failed { reason }).await })
+     }
+ 
++    fn replay<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Job, Error>> {
++        Box::pin(async move {
++            // One instant for the row and for the line, read from the engine's clock: `now()` in
++            // this file would be the database's opinion about the present, which is the second
++            // authority `jobq/3.8-clock-injection` exists to remove.
++            let now = self.clock.now();
++            let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
++            let scope = self.scope();
++            let held: Option<JobRow> = sqlx::query_as(LOCK_ONE)
++                .bind(id.as_uuid())
++                .bind(scope)
++                .fetch_optional(&mut *transaction)
++                .await
++                .map_err(refused)?;
++            let Some(held) = held else {
++                // A row that is not there *for this handle* is the answer a row nobody wrote gets,
++                // and the two are one answer on purpose: a refusal that told them apart would be an
++                // existence oracle for somebody else's job.
++                transaction.rollback().await.map_err(refused)?;
++                return Err(Error::NotFound { id: *id });
++            };
++            let before = held.into_job()?;
++            // The action is the queue's question, asked inside the transaction that holds the row,
++            // so the answer and the lock are about the same queue.
++            if let Some(refusal) = self
++                .refuse(&mut transaction, &before.queue, QueueAction::Claim)
++                .await?
++            {
++                transaction.rollback().await.map_err(refused)?;
++                return Err(refusal);
++            }
++            // The decision is the engine's, and this backend writes what it answers and invents
++            // nothing — which is what keeps two backends from having two opinions about a replay.
++            let answer = match revived(&before, now) {
++                Ok(answer) => answer,
++                Err(refusal) => {
++                    // Nothing was written, so there is nothing to undo; the rollback is what says
++                    // so out loud and releases the lock the read took.
++                    transaction.rollback().await.map_err(refused)?;
++                    return Err(refusal);
++                }
++            };
++            let written: JobRow = sqlx::query_as(REPLAY)
++                .bind(id.as_uuid())
++                .bind(answer.state().as_str())
++                .bind(i64::from(answer.max_attempts()))
++                .bind(answer.run_at())
++                .fetch_one(&mut *transaction)
++                .await
++                .map_err(refused)?;
++            // The line goes through the transaction the row is in, so the two commit together: a
++            // row that moved with no line, or a line about a row that did not move, is the
++            // disagreement `jobq/3.6-transaction-isolation` built the trail to prevent.
++            append(
++                &mut transaction,
++                &JobEvent::new(*id, EventKind::Replayed, before.attempts, None, now),
++            )
++            .await?;
++            transaction.commit().await.map_err(refused)?;
++            // The answer is the row the statement returned rather than the value that was decided:
++            // what a caller reads back is what the table holds.
++            written.into_job()
++        })
++    }
++
+     fn get<'a>(&'a self, id: &'a JobId) -> BoxFuture<'a, Result<Option<Job>, Error>> {
+         Box::pin(async move {
+             let row: Option<JobRow> = sqlx::query_as(
+@@ -1051,6 +1117,38 @@ const FAIL: &str = "update jobs set last_error = $3, \
+                           select queue from queue_permissions where tenant = $4)) \
+                     returning state, attempts, queue";
+ 
++/// The row a replay decides on, locked for the length of the transaction.
++///
++/// `for update` is the promise the port makes, and it is not the same thing as the scope filter
++/// next to it: the filter chooses *which* row this handle may see (the rule every read follows,
++/// `jobq/3.13-queue-authz-attribution`), and the lock is what makes the read and the write that
++/// follows it one act. Without it, two operators could each read the same dead row, each compute
++/// "one more attempt" from the count they read, and the second one's write would set a ceiling that
++/// had already been spent — a job that is `failed` with `attempts = max_attempts` and no way to run
++/// it. With it, the second transaction either sees the row the first one left or is refused as a
++/// serialization failure, which is `Error::Conflict` and retryable.
++const LOCK_ONE: &str = "select id, queue, payload::text as payload, state, priority, run_at, \
++                              attempts, max_attempts, last_error, lease_owner, lease_expires_at \
++                       from jobs where id = $1 \
++                         and ($2::text is null or jobs.queue in ( \
++                             select queue from queue_permissions where tenant = $2)) \
++                       for update";
++
++/// The write a replay makes, once the engine has decided it.
++///
++/// The destination and the ceiling are *bound* rather than computed here, and that is the point of
++/// `jobq/3.16-dlq-tooling`: `attempts + 1` in this statement would be a second arithmetic, written
++/// in a language the in-memory backend does not speak, and the two of them would agree until one of
++/// them was edited. `state = 'failed'` stays in the statement because a predicate that matches
++/// nothing is a query with no answer, while a destination invented in SQL would be a row in a state
++/// nobody can name (`jobq/3.14-job-state-machine`). `attempts` and `last_error` are absent because
++/// the decision keeps them, and the lease is cleared because a second life inherits no claim.
++const REPLAY: &str = "update jobs set state = $2, max_attempts = $3, run_at = $4, \
++                              lease_owner = null, lease_expires_at = null \
++                      where id = $1 and state = 'failed' \
++                      returning id, queue, payload::text as payload, state, priority, run_at, \
++                                attempts, max_attempts, last_error, lease_owner, lease_expires_at";
++
+ /// What a settle does to the row it touches.
+ ///
+ /// An enum rather than a flag because the two settles differ in three places at once — the
+@@ -1392,6 +1490,7 @@ fn decode_kind(text: &str) -> Result<EventKind, Error> {
+         EventKind::Completed,
+         EventKind::AttemptFailed,
+         EventKind::Reclaimed,
++        EventKind::Replayed,
+     ]
+     .into_iter()
+     .find(|kind| kind.as_str() == text)

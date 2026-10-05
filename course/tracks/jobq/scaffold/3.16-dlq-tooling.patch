@@ -1,0 +1,100 @@
+diff --git a/src/engine/dlq.rs b/src/engine/dlq.rs
+new file mode 100644
+index 0000000..b601c6a
+--- /dev/null
++++ b/src/engine/dlq.rs
+@@ -0,0 +1,94 @@
++//! The dead-letter queue: what is stuck, why it is stuck, and the one way back.
++//!
++//! A job the engine gave up on is a row in `failed` (`jobq/3.14-job-state-machine` made that state
++//! terminal, and the attempt budget is what puts a job there). Everything an operator asks about
++//! one is already on the port: *what* is stuck (`Store::list` with a state filter), *why* it
++//! stopped (`last_error` and the counters), and *how* it got there (the trail of
++//! `jobq/3.6-transaction-isolation` through `Store::events`). Two things are missing, and they are
++//! what this module is.
++//!
++//! **The queue is a view, not a table.** A dead letter is a row in `failed` and nothing else, so
++//! the interface to the dead-letter queue is the *same store* asked a narrower question. Copying
++//! the rows into a collection of their own — the shape the name suggests, and the one the first
++//! implementation reaches for — gives one job two rows: the copy's payload goes stale, a replay has
++//! to move both of them, and the operator reads a queue that is no longer the queue.
++//! [`dead_letters`] is that view as a value, so a command, a dashboard and a test ask the same
++//! question instead of each spelling `state = 'failed'` in its own dialect.
++//!
++//! **A replay is a second life, not a move.** `transition` is the one total function that says
++//! where a job goes when something *happens to it*, and it makes `failed` terminal: nothing happens
++//! after the end of a job, whatever event arrives. That stays true here, and it is why this module
++//! exists instead of a row in that table — an event is something that happens to a job's life, and
++//! an operator's replay starts another one. So a replay is neither a destination the model can be
++//! asked for nor a statement a single backend may invent: two backends have to answer the same way
++//! about it, which is the whole reason the port exists, so the arithmetic is written once, here,
++//! and both of them call it.
++//!
++//! Three decisions are in [`revived`], and each of them is a sentence a runbook can hold:
++//!
++//! * **only a dead letter has a second life.** Anything else is refused, naming the state it is
++//!   in: a `queued` or `running` job is already owed an attempt, and a `succeeded` job given
++//!   another one is a duplicate nobody asked for — the boundary `relay/2.10-dlq` drew for a
++//!   delivery, kept here for a job;
++//! * **the count is kept and the ceiling moves.** A replay answers "give it one more go", and it
++//!   says so by raising `max_attempts` to one past the count rather than by putting the count back
++//!   to zero. `relay/2.10` reset the count and for its table that was right; here it would be a
++//!   lie in a column the engine reads (`may_retry`, the counters, the listing) *and* it would lose
++//!   a line of the trail: a line's identity is `(job, kind, attempt)`
++//!   (`migrations/0002_job_events.sql`), so a job replayed twice from a count of zero would append
++//!   the line the first replay already wrote, and the history would say it was replayed once;
++//! * **the reason the last life died is kept.** `last_error` is left where the settle wrote it: it
++//!   is the answer to the operator's first question, and the thing that makes it stale is the thing
++//!   that clears it — an attempt which succeeds ([`crate::engine::Store::complete`]).
++//!
++//! What is *not* here is the write. `Store::replay` is the port's, and the two promises that make
++//! it a port method are the port's documentation: the row is read under a lock before it is decided
++//! on, and the state change and its trail line are one transaction (`jobq/3.6-transaction-isolation`
++//! is the pattern).
++//!
++//! # What is left to write
++//!
++//! The two functions below — the view and the decision — and then the three places that carry them:
++//! the port method that calls the decision, the two backends that implement it, and the line they
++//! append to the trail, whose name this build does not have yet.
++
++use chrono::{DateTime, Utc};
++
++use crate::engine::domain::{Job, JobFilter, JobState};
++use crate::engine::error::Error;
++
++/// The dead-letter queue as a value: every job this engine has given up on.
++///
++/// One rule, written once, so that a command, a dashboard and a test filter by the same thing
++/// rather than each of them spelling the state out. The page is the listing's own default and the
++/// queue is not named: a queue has no natural end, and *whose* dead letters these are is the
++/// handle's question (`jobq/3.13-queue-authz-attribution`) rather than the filter's.
++#[must_use]
++pub fn dead_letters() -> JobFilter {
++    todo!(
++        "jobq/3.16-dlq-tooling: the view — the one state a job the engine gave up on is in, and \
++         nothing else about the filter changed"
++    )
++}
++
++/// The row a replay of `job` writes, or the refusal that says this job has no second life.
++///
++/// The value is the whole row rather than a list of columns to set, and that is deliberate: it is
++/// what lets the in-memory backend assign it and the durable one write the fields it holds, so
++/// that neither of them can decide anything this function did not.
++///
++/// `now` is the store's own clock (`jobq/3.8-clock-injection`), and it is where the replayed job
++/// becomes due: an operator who replays a job wants it run, and the instant that decision is made
++/// at is the store's, so a deployment with a fixed clock replays deterministically like it does
++/// everything else.
++///
++/// # Errors
++///
++/// [`Error::Invalid`], naming the state, when `job` is not a dead letter: the caller asked for a
++/// second life for something that either already has one or has finished with it.
++pub fn revived(job: &Job, now: DateTime<Utc>) -> Result<Job, Error> {
++    todo!(
++        "jobq/3.16-dlq-tooling: the three decisions — only a dead letter has a second life, the \
++         count is kept and the ceiling moves, and the reason the last life died stays"
++    )
++}
