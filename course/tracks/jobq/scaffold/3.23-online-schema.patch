@@ -1,0 +1,566 @@
+diff --git a/docs/migration.md b/docs/migration.md
+new file mode 100644
+index 0000000..952b257
+--- /dev/null
++++ b/docs/migration.md
+@@ -0,0 +1,66 @@
++# Changing the queue's own schema while the queue keeps running
++
++This page is the procedure for one change: a column the queue's own table is gaining, while the
++queue is serving. It is written as phases because a single migration cannot be safe while two
++releases are running against the same database, and it is written down because the person who runs
++the middle one is not always the person who wrote the first.
++
++<!-- TODO: name the change (the table and the column), say what the value is and where it is
++computed, and say why the value already being in every row is what makes this change one nobody
++can get wrong. Then say who reads this page and when. -->
++
++## Phase one — expand
++
++```sql
++TODO
++```
++
++<!-- TODO: the statements, in order, and why there are so few of them. Say which of them hold a
++lock and for how long, say why the column is nullable and has no default, and say what the release
++that is already running does when it writes a row — that release is the reason this phase exists.
++Then say what the read path answers while the column is empty, and why it is that expression rather
++than a second one written out. -->
++
++## Phase two — backfill
++
++<!-- TODO: say where the middle phase runs, and why that is the queue's own work rather than a
++script next to it. Then fill in the table below: one row per metric the harness prints, what it
++counts, the baseline `course/tracks/jobq/budget/3.23-online-schema.toml` records for it, and why it
++is a decision rather than a constant. The names are the ones `jobq::engine::PLAN_METRICS` lists, and
++the spec compares this page with that list. -->
++
++| metric | what it counts | baseline | why |
++| --- | --- | --- | --- |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` |
++
++<!-- TODO: the two guards are upper bounds rather than targets — say what staying under them means
++for a change that got cheaper, and what the plan the guard exists to catch looks like as a number.
++Say what the harness prints for a comparison with no denominator, and why that is not `0`. -->
++
++```
++TODO: the three lines the harness prints
++```
++
++## Phase three — contract
++
++```sql
++TODO
++```
++
++<!-- TODO: the statements, in order, and what each of them is for: which one is a catalog change
++and which one is the scan, and why the two are separate statements. Say why this phase is a later
++release than the first one, and what it takes away from the read path. -->
++
++## Running it, and running it again
++
++<!-- TODO: what each phase answers when it has already happened, and which of these statements may
++be run again by nature and which may not — that difference is the whole reason a phase asks the
++catalog before it runs. Say what the last phase answers while rows still have no value and what the
++database would have said instead. Then say what has to be undone after a run that died halfway. -->
++
++## Where this comes from
++
++<!-- TODO: the documentation for the statements above, and the step this one deepens. Link the
++harness and the test that pins the counts: [the harness](TODO), [the step's test](TODO). -->
+diff --git a/src/engine/schema.rs b/src/engine/schema.rs
+new file mode 100644
+index 0000000..f452316
+--- /dev/null
++++ b/src/engine/schema.rs
+@@ -0,0 +1,422 @@
++//! Changing the queue's own schema while the queue keeps running.
++//!
++//! Step `jobq/3.23-online-schema`. `relay/2.23-online-schema` established what a schema change
++//! costs when the process applying it is not the only one running: **expand** adds a column
++//! without rewriting a row, **backfill** fills the rows that predate it in batches, and
++//! **contract** is a later release that makes the column `not null` and takes the read path's
++//! fallback away. What this module holds is that change as an engine sees it, and the three
++//! decisions it adds are what makes the middle phase a deployment's problem rather than a
++//! command's:
++//!
++//! * **the backfill is a job in the queue it is migrating.** [`Change::backfill`] answers
++//!   [`Action::Jobs`] — a [`Plan`] of batches, submitted to a queue in the table being changed — so
++//!   the middle phase goes through the same port, the same claims, the same workers and the same
++//!   trail as the work it is walking past. It is batched because one statement per batch is what
++//!   makes a batch atomic, and paced because a plan whose batches are all due at once consumes the
++//!   queue it is supposed to be leaving alone (`jobq/3.11-delayed-timers` is the column the pace
++//!   is written with).
++//! * **every phase asks the catalog before it runs.** `alter table … add column` is not
++//!   idempotent: the second run of an expand is an error rather than a no-op. So a phase takes
++//!   [`Applied`] — what the database already answers — and says [`Action::Nothing`] rather than
++//!   re-running its statements, or [`Action::Blocked`] when the phase before it has not finished.
++//!   That is what "safe to run twice" means here, and it is why the contract refuses while rows
++//!   are still empty instead of letting the database refuse a `set not null` halfway through a
++//!   deploy.
++//! * **the constraint is the contract's, not the expand's.** `check (<column> is not null)` —
++//!   even `not valid` — holds for every *new* row the moment it exists, and the release the expand
++//!   phase exists to keep working writes rows that do not name the column. So the expand adds the
++//!   column and the index a batch reads and nothing else, and the constraint, its validation and
++//!   `set not null` are the later deploy (`jobq/3.6-transaction-isolation` promised this step an
++//!   answer for a table that is too large to validate under a deploy's lock).
++//! * **the read path and the backfill are one expression.** [`Change::fallback`] is built from
++//!   [`Change::computed`], and [`Plan::statement`] writes the same text: the stored number and
++//!   the computed one cannot disagree, because there is one expression and two places that read
++//!   it (`relay/2.23` argued this for a service; the shape is worth keeping).
++//!
++//! The port does not change: not one method is added to `Store`, because what a deployment needs
++//! from the engine here is the *plan* — which phase is next, and what the middle one costs — and
++//! the port's `enqueue` already takes the jobs it produces.
++
++use chrono::{DateTime, Duration, Utc};
++
++use crate::engine::domain::{Queue, SubmitRequest};
++
++/// The metric name of the jobs a backfill plan submits.
++pub const BACKFILL_JOBS: &str = "backfill_jobs";
++
++/// The metric name of the rate guard: the most batches one interval holds.
++pub const BURST_MAX: &str = "burst_max";
++
++/// The metric name of the resumability guard: a plan for what is left against a plan for all of
++/// it.
++pub const RESUME_RATIO_MAX: &str = "resume_ratio_max";
++
++/// Every metric a harness prints, in the order a report writes them.
++///
++/// One list, because a page, a harness and the course's baseline are three readers of the same
++/// names (`docs/migration.md` states them, `tests/backfill_budget.rs` prints them, and
++/// `course/tracks/jobq/budget/3.23-online-schema.toml` is written in them).
++pub const PLAN_METRICS: [&str; 3] = [BACKFILL_JOBS, BURST_MAX, RESUME_RATIO_MAX];
++
++/// The most batches the plan may have due in one interval.
++///
++/// The rate the middle phase keeps, as a number a gate can read: a migration is allowed to be
++/// slow, and it is not allowed to become the queue's bottleneck while it runs.
++pub const BURST_LIMIT: u32 = 1;
++
++/// The bound on the resumability guard.
++///
++/// A plan that resumes from what is left costs about half of what the plan for the whole table
++/// costs, and `0.6` is a bound rather than a target — a plan that measured less than its share is
++/// a plan that passed.
++pub const RESUME_LIMIT: f64 = 0.6;
++
++/// How many rows one batch fills when the caller does not say.
++///
++/// Small enough that one batch holds a row lock for milliseconds, large enough that a table of a
++/// few million rows is thousands of jobs rather than millions.
++pub const DEFAULT_BATCH: u32 = 256;
++
++/// How far apart two batches are scheduled when the caller does not say, in seconds.
++pub const DEFAULT_INTERVAL_SECONDS: i64 = 1;
++
++/// One column of the queue's own table, gaining a value while the queue runs.
++///
++/// The whole description is four things — the table, the column, the expression that computes the
++/// value, and the queue the batches run on — plus the two numbers that are the *rate*. The names
++/// the database will show an operator (`<table>_<column>_known`, `<table>_unfilled_<column>`) are
++/// derived from the column rather than spelled again, so the constraint that says the column is
++/// never empty and the index that finds the rows that are can always be found from the column
++/// they are about.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Change {
++    /// The table the queue's rows live in.
++    table: String,
++    /// The column being added.
++    column: String,
++    /// The SQL expression that produces the value, written once.
++    computed: String,
++    /// The queue whose jobs fill the column.
++    queue: Queue,
++    /// Rows one batch fills.
++    batch: u32,
++    /// How far apart two batches are scheduled.
++    interval: Duration,
++}
++
++impl Change {
++    /// The change a column of `table` is gaining: the value `computed` produces, filled by jobs on
++    /// `queue`.
++    #[must_use]
++    pub fn new(table: &str, column: &str, computed: &str, queue: Queue) -> Self {
++        todo!("jobq/3.23-online-schema: the change a column of a table is gaining, filled by jobs on a queue");
++    }
++
++    /// How many rows one batch fills.
++    #[must_use]
++    pub fn with_batch(mut self, rows: u32) -> Self {
++        todo!("jobq/3.23-online-schema: how many rows one batch fills");
++    }
++
++    /// How far apart two batches are scheduled: the rate this change keeps.
++    #[must_use]
++    pub fn with_interval(mut self, interval: Duration) -> Self {
++        todo!("jobq/3.23-online-schema: how far apart two batches are scheduled");
++    }
++
++    /// The table the queue's rows live in.
++    #[must_use]
++    pub fn table(&self) -> &str {
++        todo!("jobq/3.23-online-schema: the table the queue's rows live in");
++    }
++
++    /// The column being added.
++    #[must_use]
++    pub fn column(&self) -> &str {
++        todo!("jobq/3.23-online-schema: the column being added");
++    }
++
++    /// The expression that produces the value.
++    #[must_use]
++    pub fn computed(&self) -> &str {
++        todo!("jobq/3.23-online-schema: the expression that produces the value");
++    }
++
++    /// The queue whose jobs fill the column.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        todo!("jobq/3.23-online-schema: the queue whose jobs fill the column");
++    }
++
++    /// How many rows one batch fills.
++    #[must_use]
++    pub fn rows_per_batch(&self) -> u32 {
++        todo!("jobq/3.23-online-schema: how many rows one batch fills");
++    }
++
++    /// How far apart two batches are scheduled.
++    #[must_use]
++    pub fn interval(&self) -> Duration {
++        todo!("jobq/3.23-online-schema: how far apart two batches are scheduled");
++    }
++
++    /// The constraint that says the column is never empty, as the database will name it.
++    #[must_use]
++    pub fn constraint(&self) -> String {
++        todo!("jobq/3.23-online-schema: the constraint that says the column is never empty, named after the column");
++    }
++
++    /// The partial index the backfill reads, as the database will name it.
++    #[must_use]
++    pub fn index(&self) -> String {
++        todo!("jobq/3.23-online-schema: the partial index the backfill reads, named after the column");
++    }
++
++    /// The read path's answer while the column is empty.
++    ///
++    /// The same expression the backfill writes, wrapped in a `coalesce` with the column it fills:
++    /// a read path that answered the column and nothing else would answer `null` for every row
++    /// that predates the change, which is what turns an expand phase into a breaking change.
++    #[must_use]
++    pub fn fallback(&self) -> String {
++        todo!("jobq/3.23-online-schema: the read path's answer while the column is empty, built from `computed`");
++    }
++
++    /// Phase one: add the column, the constraint and the index, without touching a row.
++    ///
++    /// `Nothing` when the column is already there, because the statements are not idempotent by
++    /// nature: an expand that ran twice has to change nothing, and `add column` would refuse the
++    /// second run rather than repeat itself.
++    #[must_use]
++    pub fn expand(&self, applied: &Applied) -> Action {
++        todo!("jobq/3.23-online-schema: phase one: the statements that add the column, or nothing when it is already there");
++    }
++
++    /// Phase two: the rows that predate the column, filled in batches by jobs on the queue.
++    ///
++    /// `Nothing` when every row has a value, and `Blocked` before the expand: there is nothing to
++    /// fill until the column is there, and a batch statement would be an error rather than an
++    /// empty answer.
++    #[must_use]
++    pub fn backfill(&self, applied: &Applied, now: DateTime<Utc>) -> Action {
++        todo!("jobq/3.23-online-schema: phase two: the plan of jobs for the rows that have no value, or why there is none");
++    }
++
++    /// The middle phase's arithmetic: what filling `remaining` rows with jobs costs.
++    ///
++    /// [`Change::backfill`] is the phase, and it answers [`Action::Nothing`] for a table whose rows
++    /// all have a value; this is the plan those rows would be filled by, for a caller that is
++    /// budgeting the work rather than starting it (a change of no rows is a plan of no batches).
++    #[must_use]
++    pub fn plan(&self, remaining: u32, now: DateTime<Utc>) -> Plan {
++        todo!("jobq/3.23-online-schema: the middle phase's arithmetic: what filling `remaining` rows costs");
++    }
++
++    /// Phase three: make the database check the rows it was told to skip, and take the index the
++    /// backfill read away.
++    ///
++    /// `Nothing` when the constraint has already been validated, and `Blocked` while rows are
++    /// still empty — that is the database's own `set not null` refusal, moved to the place where
++    /// it costs a deployment nothing.
++    #[must_use]
++    pub fn contract(&self, applied: &Applied) -> Action {
++        todo!("jobq/3.23-online-schema: phase three: the statements that make the database check the rows, or why it may not yet");
++    }
++
++
++}
++
++/// What the database already answers about a change, so a phase knows whether it is a repeat.
++///
++/// Counted rather than assumed: a phase that runs its statements without asking is a phase whose
++/// second run is an error, and the three fields are exactly the questions a deployment asks — is
++/// the column there, how many rows have no value, has the constraint been validated.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Applied {
++    /// Whether the column is there.
++    column: bool,
++    /// How many rows have no value. Only meaningful once the column is there.
++    remaining: u32,
++    /// Whether the database has checked the rows that predate the constraint.
++    validated: bool,
++}
++
++impl Applied {
++    /// What a database that has never seen this change answers.
++    #[must_use]
++    pub fn before() -> Self {
++        todo!("jobq/3.23-online-schema: what a database that has never seen this change answers");
++    }
++
++    /// What it answers between the expand and the contract: the column is there, and `remaining`
++    /// rows have no value.
++    #[must_use]
++    pub fn expanded(remaining: u32) -> Self {
++        todo!("jobq/3.23-online-schema: what it answers between the expand and the contract");
++    }
++
++    /// What it answers after the contract.
++    #[must_use]
++    pub fn contracted() -> Self {
++        todo!("jobq/3.23-online-schema: what it answers after the contract");
++    }
++
++    /// Whether the column is there.
++    #[must_use]
++    pub fn column(&self) -> bool {
++        todo!("jobq/3.23-online-schema: whether the column is there");
++    }
++
++    /// How many rows have no value.
++    #[must_use]
++    pub fn remaining(&self) -> u32 {
++        todo!("jobq/3.23-online-schema: how many rows have no value");
++    }
++
++    /// Whether the database has checked the rows that predate the constraint.
++    #[must_use]
++    pub fn validated(&self) -> bool {
++        todo!("jobq/3.23-online-schema: whether the database has checked the rows that predate the constraint");
++    }
++}
++
++/// What one phase of a change has to do, given what the database already answers.
++///
++/// The four answers are the whole of "safe to run twice": a phase with work is statements or jobs,
++/// a phase that already happened is [`Action::Nothing`] with its reason, and a phase whose
++/// predecessor has not finished is [`Action::Blocked`] — the difference between a no-op and a
++/// refusal, which a caller that only saw an error message could not tell apart.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Action {
++    /// The statements a deployment runs, in order.
++    Statements(Vec<String>),
++    /// The jobs to submit: the middle phase, as work the queue runs.
++    Jobs(Plan),
++    /// The phase is already applied, and the reason is written down.
++    Nothing(&'static str),
++    /// The phase before this one has not finished, and the reason is written down.
++    Blocked(&'static str),
++}
++
++/// The middle phase, as work the queue runs: one job per batch, paced.
++///
++/// A plan is the change plus the batches that are left, and it is a function of what the catalog
++/// says is missing rather than of the size of the table — that is the whole of resuming a backfill
++/// that was interrupted, and it is why the second plan is cheaper than the first
++/// ([`RESUME_LIMIT`]).
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Plan {
++    /// The change this plan runs.
++    change: Change,
++    /// The batches, in the order they run.
++    batches: Vec<Batch>,
++}
++
++impl Plan {
++    /// The change this plan runs.
++    #[must_use]
++    pub fn change(&self) -> &Change {
++        todo!("jobq/3.23-online-schema: the change this plan runs");
++    }
++
++    /// The batches, in the order they run.
++    #[must_use]
++    pub fn batches(&self) -> &[Batch] {
++        todo!("jobq/3.23-online-schema: the batches, in the order they run");
++    }
++
++    /// How many jobs the plan submits.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("jobq/3.23-online-schema: how many jobs the plan submits");
++    }
++
++    /// Whether the plan has nothing to submit.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("jobq/3.23-online-schema: whether the plan has nothing to submit");
++    }
++
++    /// How many rows the plan fills: exactly what was missing, no more.
++    #[must_use]
++    pub fn rows(&self) -> u32 {
++        todo!("jobq/3.23-online-schema: how many rows the plan fills");
++    }
++
++    /// The most batches due in one interval: the rate this plan keeps.
++    ///
++    /// Batches are bucketed by the interval that separates two of them, so a paced plan answers one
++    /// and a plan whose interval is zero answers its own length — which is the defect
++    /// [`BURST_LIMIT`] exists to catch, because a migration that hands the whole table to the
++    /// queue's workers at once is a migration that stops the queue.
++    #[must_use]
++    pub fn burst(&self) -> u32 {
++        todo!("jobq/3.23-online-schema: the most batches due in one interval: the rate this plan keeps");
++    }
++
++    /// The one statement one batch runs, or `None` when the plan has no such batch.
++    ///
++    /// A single `update` over the rows that have no value: the predicate is *the value is absent*
++    /// rather than a bookmark, which is what makes a re-run fill nothing and a run that was
++    /// interrupted finishable by anybody, and `limit` is what makes the batch atomic and small.
++    #[must_use]
++    pub fn statement(&self, index: usize) -> Option<String> {
++        todo!("jobq/3.23-online-schema: the one statement one batch runs");
++    }
++
++    /// The jobs to submit, in the order they run.
++    ///
++    /// Each one carries the batch it is (`migration.table`, `migration.column`, `migration.batch`,
++    /// `migration.rows`), because the worker that claims it has to know what to run, and each one
++    /// is due when the plan says: the pace is `run_at`, so a batch that is not due yet is work a
++    /// claim will not hand out.
++    #[must_use]
++    pub fn requests(&self) -> Vec<SubmitRequest> {
++        todo!("jobq/3.23-online-schema: the jobs to submit, in the order they run");
++    }
++}
++
++/// One batch of the middle phase: how many rows it fills, and when it may run.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Batch {
++    /// Rows this batch fills.
++    rows: u32,
++    /// The instant it may run.
++    due_at: DateTime<Utc>,
++}
++
++impl Batch {
++
++    /// How many rows this batch fills.
++    #[must_use]
++    pub fn rows(&self) -> u32 {
++        todo!("jobq/3.23-online-schema: how many rows this batch fills");
++    }
++
++    /// When this batch may run.
++    #[must_use]
++    pub fn due_at(&self) -> DateTime<Utc> {
++        todo!("jobq/3.23-online-schema: when this batch may run");
++    }
++}
++
++/// The lines a harness prints, in the order a report reads them.
++///
++/// What a change of `rows` rows costs, and the two guards over it: the rate a plan keeps and what
++/// resuming one from `left` rows costs against planning the whole table. The counts come from the
++/// plan for the whole table and the ratio from the pair, and the counts are of the *plan* rather
++/// than of a run — a budget measured before the work exists is what a deployment reads before it
++/// starts one.
++///
++/// A change of no rows prints two lines rather than a zero ratio, because `0.0` compares with a
++/// bound like any other ratio and would report a *pass* for a plan that measured nothing: the gate
++/// that reads these lines treats a missing metric as `blocked`, which is the honest answer.
++#[must_use]
++pub fn cost(change: &Change, rows: u32, left: u32, now: DateTime<Utc>) -> Vec<String> {
++    todo!("jobq/3.23-online-schema: the lines a harness prints: the cost of the plan and the two guards over it");
++}
+diff --git a/tests/backfill_budget.rs b/tests/backfill_budget.rs
+new file mode 100644
+index 0000000..456f250
+--- /dev/null
++++ b/tests/backfill_budget.rs
+@@ -0,0 +1,60 @@
++//! The budget's harness for `jobq/3.23-online-schema`.
++//!
++//! This file is the course's, not the learner's. It is what the `bench-budget` gate runs, and the
++//! numbers it prints are compared with the baselines in
++//! `course/tracks/jobq/budget/3.23-online-schema.toml` — one online change of one table, and what
++//! a plan that resumes the half of it that is left costs.
++//!
++//! What it measures is **work, never the clock**: the jobs a plan submits, the most batches it
++//! makes due at once, and the plan for what is left against the plan for all of it. `kiln`
++//! compares counts, so the gate answers the same thing on a loaded machine as on an idle one, and
++//! no run of this file can flake because something else was compiling.
++//! `cargo test -p jobq --test backfill_budget -- --nocapture` prints the lines by hand; the
++//! `jobq-budget` prefix is what the gate reads.
++
++use chrono::{DateTime, Duration, Utc};
++use jobq::engine::{Change, Queue, cost};
++
++/// The size of the table the counts are taken on.
++///
++/// This and the batch size are what every baseline below is a statement about: changing either of
++/// them changes what the numbers mean, so they move in the same commit as the numbers.
++const ROWS: u32 = 4_096;
++/// The rows that are still empty when the run resumes: half the table, which is the state a run
++/// that was interrupted at the halfway mark leaves behind.
++const DONE: u32 = 2_048;
++/// Rows one batch of the backfill fills: the size of one job, and the size of one write.
++const BATCH: u32 = 256;
++/// The rate: one batch per this many seconds.
++const INTERVAL_SECONDS: i64 = 1;
++/// The table the queue's own rows live in.
++const TABLE: &str = "jobs";
++/// The column this step's change adds.
++const COLUMN: &str = "payload_bytes";
++/// The expression that produces the column's value: the database's, in bytes.
++const COMPUTED: &str = "octet_length(payload::text)";
++/// The queue the backfill's jobs run on.
++const QUEUE: &str = "migrations";
++/// The instant the plan is made, and a fixed one: a plan measured against the wall clock is a plan
++/// a machine with a different clock answers differently.
++const NOW_SECONDS: i64 = 1_700_000_000;
++
++/// The instant every plan in this file is made at.
++fn now() -> DateTime<Utc> {
++    DateTime::from_timestamp(NOW_SECONDS, 0).expect("a fixed instant this file states itself")
++}
++
++/// The change the budget is written against, at the rate the baseline states.
++fn change() -> Change {
++    let queue = Queue::parse(QUEUE).expect("`migrations` is a queue name");
++    Change::new(TABLE, COLUMN, COMPUTED, queue)
++        .with_batch(BATCH)
++        .with_interval(Duration::seconds(INTERVAL_SECONDS))
++}
++
++#[test]
++fn the_budget() {
++    for line in cost(&change(), ROWS, ROWS - DONE, now()) {
++        println!("{line}");
++    }
++}
