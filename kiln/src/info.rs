@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(relay.project, "app/relay");
 
         let jobq = course.track("jobq").unwrap();
-        assert_eq!(jobq.step.len(), 26);
+        assert_eq!(jobq.step.len(), 27);
         assert_eq!(jobq.project, "app/jobq");
         assert_eq!(jobq.index, 3, "the path order is T1, T2, T3");
 
@@ -840,10 +840,10 @@ mod tests {
             "the exit capabilities of §5 are declared"
         );
 
-        // Counts of curriculum.md §3: 97 capabilities, 134 slots, 118 steps pinned.
+        // Counts of curriculum.md §3: 97 capabilities, 136 slots, 119 steps pinned.
         assert_eq!(course.ledger().capability_count(), 97);
-        assert_eq!(course.ledger().slot_count(), 134);
-        assert_eq!(course.ledger().positions().len(), 118);
+        assert_eq!(course.ledger().slot_count(), 136);
+        assert_eq!(course.ledger().positions().len(), 119);
 
         // A step reference resolves by number, by id, and with the track prefix.
         for reference in ["1.14", "1.14-worker", "mailer/1.14", "mailer/1.14-worker"] {

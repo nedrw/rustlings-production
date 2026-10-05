@@ -1229,15 +1229,15 @@ mod tests {
         let report = lint_root(root).unwrap();
 
         assert_eq!(report.capabilities, 97);
-        assert_eq!(report.slots, 134);
-        assert_eq!(report.ledger_positions, 118);
-        // Every track the ledger plans through T3 has metadata now (T1 22 + T2 24 + T3 26); the
+        assert_eq!(report.slots, 136);
+        assert_eq!(report.ledger_positions, 119);
+        // Every track the ledger plans through T3 has metadata now (T1 22 + T2 24 + T3 27); the
         // bodies inside those steps arrive one at a time, which is what the R5 notice below
         // reports. T4 and T5 are still ledger-only, so this number moves again when their metadata
         // lands — that is the point of asserting it here.
         assert_eq!(
             report.authored_steps,
-            22 + 24 + 26,
+            22 + 24 + 27,
             "T1, T2 and T3 metadata"
         );
         assert!(report.is_clean(), "{:?}", report.issues);

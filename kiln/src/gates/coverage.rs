@@ -13,9 +13,11 @@
 //! The run: the step's own `run.cmd` under `RUSTFLAGS=-C instrument-coverage`, with
 //! `LLVM_PROFILE_FILE` pointing into a scratch directory; then `llvm-profdata merge -sparse`, then
 //! `llvm-cov export --summary` over the test binaries cargo produced. Both the profiles and the merged
-//! data are removed with the scratch directory when the gate ends. The instrumented build leaves its
-//! own objects in cargo's target directory, which is a build artifact like any other — but note that a
-//! different `RUSTFLAGS` is a different build, so the next ordinary run of the project recompiles it.
+//! data are removed with the scratch directory when the gate ends. The instrumented objects do *not*
+//! live in the ordinary build directory — a different `RUSTFLAGS` is a different build, and putting it
+//! there would make every ordinary build that follows recompile the project (measured: 22 s cold on the
+//! machine this was written on). They get a cache directory of their own, which also means the gate's
+//! second run is incremental.
 //!
 //! Facts about the machine are reported as blocks, not failures: no tools, no profile data, no test
 //! binary, an unreadable export, or an instrumented spec run that did not pass would each mean a
@@ -113,8 +115,15 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         path: profiles.clone(),
         source,
     })?;
+    // An instrumented build gets a build directory of its own, and it *keeps* it (`scratch::cache`
+    // rather than the per-run scratch): a different `RUSTFLAGS` is a different build, so sharing the
+    // ordinary directory would throw away every artifact the learner's next command needs (measured:
+    // a cold rebuild of this project is 22 s, and the ordinary build would pay it again). Keeping it
+    // also makes the gate's own second run incremental rather than a full rebuild.
+    let target = scratch::cache("coverage-target")?;
     let environment = [
         ("RUSTFLAGS".to_owned(), instrumented()),
+        ("CARGO_TARGET_DIR".to_owned(), target.display().to_string()),
         (
             "LLVM_PROFILE_FILE".to_owned(),
             profiles
@@ -157,7 +166,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
-    let deps = process::target_dir(project).join("debug").join("deps");
+    let deps = target.join("debug").join("deps");
     let objects = executables(&deps);
     if objects.is_empty() {
         return Ok(GateOutcome::blocked(format!(

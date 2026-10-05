@@ -66,6 +66,29 @@ pub fn shared_target_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// A directory that outlives the run that made it, under the machine's cache.
+///
+/// [`directory`] is per run and deleted when the run ends; what a gate needs *between* runs — an
+/// instrumented build directory, which is expensive to make and worthless the moment it is thrown
+/// away — lives here instead.
+///
+/// # Errors
+///
+/// [`KilnError::Write`] when the machine has nowhere to put a cache.
+pub fn cache(name: &str) -> Result<PathBuf> {
+    let base = cache_base(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
+        .ok_or_else(|| KilnError::Write {
+            path: PathBuf::from(format!("<cache>/kiln/{name}")),
+            source: io::Error::other("neither XDG_CACHE_HOME nor HOME says where a cache belongs"),
+        })?;
+    let dir = base.join("kiln").join(name);
+    std::fs::create_dir_all(&dir).map_err(|source| KilnError::Write {
+        path: dir.clone(),
+        source,
+    })?;
+    Ok(dir)
+}
+
 /// Where a container build keeps what it downloads and compiles, one cache per machine.
 ///
 /// `name` is the fixture's own convention — `container-target` for what a build compiles,
@@ -75,10 +98,7 @@ pub fn shared_target_dir() -> Option<PathBuf> {
 /// takes a path), which is why they live where a person can find them.
 #[must_use]
 pub fn container_cache(name: &str) -> Option<PathBuf> {
-    let base = cache_base(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
-    let dir = base.join("kiln").join(name);
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+    cache(name).ok()
 }
 
 /// Where a cache belongs, from the two variables that say so (tested without touching the

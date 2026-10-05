@@ -99,7 +99,7 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `api/idempotency-key` | — | T2·2.2 | T5·5.8 | — |
 | `api/library-design` | T3·3.1 | T3·3.2 | — | — |
 | `api/client-sdk` | — | T5·5.11 | — | — |
-| `cli/contract` | — | T3·3.15 | — | — |
+| `cli/contract` | — | T3·3.15 | T3·3.26 | — |
 | `query/consistency-levels` | — | T5·5.12 | — | — |
 
 ### 3.3 领域与安全
@@ -140,7 +140,7 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `delivery/ordering` | — | T2·2.9 | — | — |
 | `delivery/retry-budget` | — | — | T2·2.8 | — |
 | `delivery/dlq` | — | T2·2.10 | — | T3·3.16 |
-| `ops/dlq-tooling` | — | T3·3.16 | — | — |
+| `ops/dlq-tooling` | — | T3·3.16 | — | T3·3.26 |
 | `outbound/http-client` | — | T2·2.7 | T4·4.21 | — |
 
 ### 3.6 调度、存储、查询

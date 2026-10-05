@@ -228,7 +228,15 @@ fn prepared(program: &str, args: &[&str], dir: &Path, env: &[(String, String)]) 
         .envs(env.iter().map(|(name, value)| (name, value)))
         .current_dir(dir)
         .stdin(Stdio::null());
-    if let Some(target_dir) = CARGO_TARGET_DIR.get().filter(|_| program == "cargo") {
+    // The sandbox's shared build directory is the default, not an order: a caller that names its
+    // own knows better — the instrumented build of the `coverage` gate has to live somewhere of its
+    // own, because a different `RUSTFLAGS` is a different build and putting it in the shared
+    // directory would invalidate every ordinary build that follows it.
+    let named_by_caller = env.iter().any(|(name, _)| name == "CARGO_TARGET_DIR");
+    if let Some(target_dir) = CARGO_TARGET_DIR
+        .get()
+        .filter(|_| program == "cargo" && !named_by_caller)
+    {
         command.env("CARGO_TARGET_DIR", target_dir);
     }
     command
@@ -544,6 +552,39 @@ mod tests {
             survivors.is_empty(),
             "a grandchild outlived the deadline: {survivors}"
         );
+    }
+
+    #[test]
+    fn a_caller_named_target_directory_beats_the_sandbox_one() {
+        // Two builds that differ only in `RUSTFLAGS` are two builds, so a gate that instruments the
+        // project has to be able to keep its objects somewhere of its own — otherwise it invalidates
+        // every ordinary build that follows it (measured: a cold rebuild of this project is 22 s).
+        // The caller's name wins, and the sandbox default only ever reaches `cargo`: the other
+        // programs a gate starts are not build tools.
+        let temp = TempDir::new("process-target-dir");
+        let sandbox = temp.path().join("sandbox-target");
+        share_cargo_target_dir(sandbox);
+        let mine = temp.path().join("instrumented-target");
+        let named = [("CARGO_TARGET_DIR".to_owned(), mine.display().to_string())];
+        let asked = |command: &Command| -> Option<String> {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == "CARGO_TARGET_DIR")
+                .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+
+        let instrumented = prepared("cargo", &["test"], temp.path(), &named);
+        assert_eq!(
+            asked(&instrumented).as_deref(),
+            Some(mine.to_string_lossy().as_ref())
+        );
+        let plain = prepared("cargo", &["test"], temp.path(), &[]);
+        assert_eq!(
+            asked(&plain),
+            Some(target_dir(temp.path()).display().to_string())
+        );
+        let shell = prepared("sh", &["-c", "true"], temp.path(), &[]);
+        assert_eq!(asked(&shell), None);
     }
 
     #[cfg(unix)]
