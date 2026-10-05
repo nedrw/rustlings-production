@@ -94,6 +94,10 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 - **上限**：每步最多判 `MUTANT_CAP = 6` 个变异体，候选按行号等距取样（确定性）；`ATTEMPT_CAP = 12` 是*尝试*上限，
   所以一个编译不过的位置浪费一次尝试而不是一个名额。参数 `N` 是百分数阈值，`killed / (killed + survived) >= N%`，
   分母为 0 时判 `blocked`（不是 pass）。
+- **模块是「补丁碰过的整份文件」**（3.26 的实测后果）：它的补丁要碰 `store/{memory,postgres,mod}.rs`，取样于是落在**别的步骤拥有**的代码上
+  （`memory.rs:536` 的每队列在飞上限过滤、`441` 的 rank aging 算术、`106` 的迹行身份），三个存活变异体只能由**这一步的规格**杀掉 →
+  3.26 的 spec 从 8 例长到 11 例，其中两例断言的是 `jobq/3.9` 建立过的语义。判据本身是对的，但后来者要预期这件事，
+  并在正文里说清那些用例属于谁的承诺。
 - **两个时钟**（§4.4 的教训）：单个变异体最多跑 `4 × 未变异基线耗时 + 15s`（再被 `--timeout` 封顶）——变异体只差一个算子，
   超过四倍还在跑就是卡住了；整轮最多 `WALK_BUDGET = 300s`，到点就停止并声明“走路被预算截断”。报告里带这轮花了多少秒。
 - 报告行必须点名存活的变异体（文件、行、列、原文），否则学员不知道该补什么测试。
@@ -447,13 +451,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（25/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（26/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.24 `12/12` must gates，全部 `hold the contract`；**3.23 是例外**：`verify --slow` 13/13 全绿，`selftest` 在 `conformance@2` 红（§5.2） |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`25/25 judged · 0 failed · 0 blocked · 2 not_authored`**（22 步 3 m 17 s，23 步 6 m 1 s，24 步 5 m 15 s，25 步 5 m 30 s 量级；3.25 的 `mutants` 是 `6/6 killed (100%)`，walk 38 s——它判的文件多）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
-| 默认特性全量套件 | `cargo test -p jobq` → **187 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187）|
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`26/26 judged · 0 failed · 0 blocked · 1 without content`**（22 步 3 m 17 s，23 步 6 m 1 s，24 步 5 m 15 s，25 步 5 m 30 s 量级，26 步 6 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 的 `6/6` 26 s——3.25 判的文件多）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **199 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199；3.26 的尾巴树上两后端都是 199）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `40/40`；`links` → **84 page(s) · 449 link(s) · 279 external target(s)**，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
@@ -637,6 +641,15 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **真缺陷（未修，收尾第一项）**：**durable 的每队列在飞上限（cap）没有真正限住一次领取的行数**。`postgres.rs` 的 cap 判据是
+  `where` 里的**非相关**子查询（`(select count(*) from jobs running where …) < $6`），它只被求值一次，`limit $3` 于是把**所有到期行**拿走；
+  内存后端边取边计数，只取到上限。复现（3.26 作者）：两条重放的死信 + `Policy::with_cap(1)` + `claim(8)` → postgres 返回 **2**，memory 返回 **1**。
+  `jobq/3.9` 的规格只建内存存储，所以连它的 `slow:conformance@2` 也抓不到。修法方向：让 `limit` **容量感知**
+  （`least($3, greatest(0, $6 - (select count(*) … running …)))`，`$6 = 0` 时不限），并给 3.9 的规格补一条**两后端都跑**的用例（用 conformance 夹具建库），
+  然后重跑 `verify --slow`。
+- **`ops/dlq-tooling@operate` 没有同深度的探题**（3.26 作者发现）：`kiln plan` 自己说得很清楚——"there is no exercise at operate; the closest is
+  `kiln probe ops-dlq-tooling.apply` (apply), which re-checks the habit and not this depth"——所以 `kiln skip jobq/3.26-dlq-cli` 必须带 `--force`。
+  §5.1 的探题表里没有这个槽位的行（`probe --check` 仍是 40/40）。要么补一道 operate 深度的题，要么在 §5.1 里写明为什么没有。
 - **探题的句子与门不一致（收尾时对齐）**：`course/probes/unsafe-budget.apply.rs` 写着“`// SAFETY:` 在**同一行或上面三行**”，
   而 3.24 的规格与 `unsafe-budget@0` 门都要求**在上面**三行内。探题从不测同行注释，所以没有红；对齐它要么改那句话、要么改门的判据（建议改探题那句话，因为门与项目的 `// SAFETY:` 习惯一致）。
 - **3.23 的 `slow:mutants@80` 是 `5/6 (83%)`**（过线但在边上）：它的模块里有一个变异体没有规格能杀。留给收尾时决定是否补一条断言。
