@@ -374,7 +374,11 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。
 
-**M2 进行中**（2026-10）：T3 `jobq` 的 27 步已开工（元数据、项目骨架与门阶梯已提交；第一步
+**M2 已交付**（2026-10）：T3 `jobq` 的 27 步全部就位（正文、只读规格、加性 scaffold、参考解、闸门接线），
+验收见 [t3-jobq.md](t3-jobq.md) 与 [handoff-m2.md](handoff-m2.md) §4：`kiln verify jobq --slow` → `27/27`、
+`cargo xtask ci` → exit 0（`27/27 step(s) hold the contract`）。以下是开工时记下的分级与对策：
+
+（开工记录）T3 `jobq` 的 27 步已开工（元数据、项目骨架与门阶梯已提交；第一步
 `jobq/3.1-engine-boundary` 通过 `selftest` 的全部判据），慢闸门的 should/must 分级与缺工具时的对策先写在
 [handoff-m2.md](handoff-m2.md) §1——原则是 **`must` 闸门只用这台机器一定有东西判定**（编译器、课程自己的基线文件、
 确定性计数），`coverage`/`deny` 这类需要外部二进制的保持 should；另外 `xtask ci` 修正为**逐条走完所有已开工的 track**

@@ -34,7 +34,7 @@ with stricter gates and fewer hints.
 | --- | --- | --- | --- |
 | T1 | `mailer` — subscription microservice (inspired by *Zero To Production in Rust*) **delivered** | intro → mid | 22 |
 | T2 | `relay` — webhook delivery service **delivered** | mid | 24 |
-| T3 | `jobq` — job queue engine (library + worker + CLI) | mid-high | 26 |
+| T3 | `jobq` — job queue engine (library + worker + CLI) | mid-high | 27 |
 | T4 | `lakelet` — telemetry ingest and query | high | 24 |
 | T5 | `meskv` — distributed KV / scheduler (optional) | highest | 22 |
 
@@ -141,7 +141,8 @@ which is why it is kept:
 python3 tools/lint-caps-md.py   # 97 capabilities, 118 steps, 134 (capability, depth) slots, 0 issues
 ```
 
-What is not in yet: T3–T5 content; the rest of T2 (`relay` is being authored step by step, see
+What is not in yet: T4–T5 content (T1, T2 and T3 are authored — `docs/t1-mailer.md`, `docs/t2-relay.md`,
+`docs/t3-jobq.md`); the rest of T2 (`relay` is being authored step by step, see
 [docs/handoff-m1.md](docs/handoff-m1.md)); the slow-path gates (`mutants`, `coverage`, `bench`,
 `loom`, `soak`, `sim`); translations (the fallback chain and the drift detector are ready, no locale
 has translated bodies); the `new-track` generator; a documentation site. See

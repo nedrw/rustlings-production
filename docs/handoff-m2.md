@@ -451,17 +451,17 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（26/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（**27/27 步交付**，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
-| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.24 `12/12` must gates，全部 `hold the contract`；**3.23 是例外**：`verify --slow` 13/13 全绿，`selftest` 在 `conformance@2` 红（§5.2） |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`26/26 judged · 0 failed · 0 blocked · 1 without content`**（22 步 3 m 17 s，23 步 6 m 1 s，24 步 5 m 15 s，25 步 5 m 30 s 量级，26 步 6 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 的 `6/6` 26 s——3.25 判的文件多）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
-| 默认特性全量套件 | `cargo test -p jobq` → **199 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199；3.26 的尾巴树上两后端都是 199）|
+| 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.23 `13/13` · 3.24 `12/12` · 3.25 `13/13` · 3.26 `15/15` · 3.27 `13/13` must gates，全部 `hold the contract`（3.23 曾因共享构建槽在 `conformance@2` 上假红，根因见 §5.2，已修） |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `40/40`；`links` → **84 page(s) · 449 link(s) · 279 external target(s)**，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
-| CI | `cargo xtask ci` 上次全绿是 `0927803`（1634 s）；3.8–3.15 与闸门提交之后**未复跑**（逐条走 mailer/relay/jobq 三条 track，30 min+） |
+| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）|
 
 ### 4.3 验收演练（已做两腿，原始输出）
 
@@ -683,7 +683,8 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **派单经验（三次死亡后总结）**：**一次派一步**。两批“两步一个任务”的作业者都无声死掉（3.16/3.17 那对在 rustfmt 附近停下、
   留下一个 `dlq.rs` 草稿；3.23/3.24 那对什么都没留下），而单步重派都交付了（3.16、3.23）。任务书里已写死：每个产物一做好就提交、
   长命令输出重定向只看尾部、卡住就停并报告。最后一批（3.25、3.26、3.27）按单步派。
-- **M2 收尾待办**：验收演练只剩 `unsafe-budget` 一腿（要 3.24 交付）；
-  `cargo xtask ci` 全量复跑未做；`docs/curriculum.md` §7/§8 与 `plan.md` §11 的进度同步；`README.md` 的 track 表与
-  Status 段（T3 标 delivered、数字重测）；`docs/t3-jobq.md`（与 `t1-mailer.md`/`t2-relay.md` 同构：步表、项目最终形状、
-  装置与模式、实测数字、缺口）。
+- **M2 收尾（已做完的）**：验收演练五条腿全有原始行（§4.3）；`cargo xtask ci` → exit 0（`27/27 step(s) hold the contract`，32 m 12 s）；
+  `docs/t3-jobq.md` 已写（与 `t1-mailer.md`/`t2-relay.md` 同构）；`README.md` 的 track 表与 Status、`plan.md` §11、`curriculum.md` §8 的数字已同步。
+- **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
+  ② `ops/dlq-tooling@operate` 的同深度探题（要么补一道，要么在 §5.1 写明为什么没有）；③ `coverage` 装上 `llvm-tools-preview` 后那条测量路径的端到端验证；
+  ④ 3.23 的 `slow:mutants@80` 83% 要不要补一条断言（过线但在边上）。

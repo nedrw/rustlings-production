@@ -538,7 +538,6 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 
 ## 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
 
-
 ## 第十三段 · 2026-10 · 3.21–3.22，`bench-budget` 那一腿，以及一次“幽灵失败”的追根
 
 ### 做了什么
@@ -575,7 +574,6 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
 - **作业者的两个判断我认可**：3.22 的模块是“预算的算术与报告”，不是文本变异器（那会把编译器塞进测试）；
   它也没给 `Store` 加 `stats()`——那会把 `src/engine/store/memory.rs` 整文件拖进 3.22 的变异模块，而那里没有规格能杀掉变异体。
 
-
 ## 第十四段 · 2026-10 · 3.23 由我接手完成，以及一个 `selftest`/`verify` 的不一致
 
 ### 做了什么
@@ -610,7 +608,6 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   以后在 `selftest` 之后确认关键文件的状态（如 `grep -c TODO <页>`）。
 - **`filter-map` 式的脚本要小心**：我用脚本扫 `cargo fmt` 的差异时只统计了文件；若不是“全部差异都在一个文件里”，重新生成的范围就得更大。
 
-
 ## 第十五段 · 2026-10 · 3.25，以及 `selftest`/`verify` 不一致的根因（由 3.25 的作者找到）
 
 ### 做了什么
@@ -644,3 +641,40 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   判据：这条命令读的项目文件，其 `CARGO_MANIFEST_DIR` 指向的目录是否还存在。
 - **作业者的偏差**：它把 body 先提交、其余产物在临时树里反复重写，最后合成一个提交而不是“每件产物一个提交”。可接受——
   它验证过最终提交的那份字节（补丁字节与规格 hash 在三棵树里一致）。
+
+## 第十六段 · 2026-10 · 3.27，cap 真缺陷的修复，以及 M2 验收（CI 全绿）
+
+### 做了什么
+
+- **3.27 runbook 演练**（提交 `ecbc230`，`kind = design`）：`src/engine/runbook.rs` 是页面读取器（`Runbook::of`/`gaps`/`holds`，
+  `Gap::{Empty, Missing, OutOfOrder}`，`Stage` 而不是 `Step` 以免撞 3.19 的 API），页面 `docs/runbook.md` 是流程本身，
+  `tests/support/drill.rs` 的演练把三个世界（`Recovers`/`Never`/`Refused`）跑一遍。规模 13/13 must 门、`mutants` 6/6 13 s、
+  `budget` 四个页面计数、`links` 8 页 50 链接。它自己的总结（我认可）：四页“这个工具做什么”不是流程——**全项目没有一页写过回滚**
+  （`grep -ri rollback docs/*.md` 只命中过 *scrollback*），也没写过“一个行为被拒绝之后队列停在哪里”；演练因此补了三个阶段/一行。
+  它还纠正了种子元数据（`concepts`/`hint` 曾许“一个拒绝写入的存储”，而内存后端造不出 `Store` 类错误），正文里直说了这件事。
+- **cap 真缺陷修好**（提交 `cae1a2c` + `84c87e3`）：3.26 作者发现的“durable 的在飞上限没有限住一次领取的行数”已修——
+  3.9 的语句取 `least($3, 房间)`（队列余量），3.13 引入 owner 上限后在同行再接一项；3.9 的规格补了**两后端都跑**的用例
+  （`the_cap_bounds_the_rows_one_claim_takes`，经 conformance 夹具建库）。复核：3.9 `11/11`（conformance memory ✓ postgres ✓）、3.13 `10/10`。
+  留了一个窄窗口并写进 §5.2：两条**并发**的 claim 仍可能各读同一份余量。
+  过程中的两个坑：把 hunk 手工拼进补丁会让 kiln 的 applier 拒绝（`\ No newline` 与错位的 section），**改成从两棵树重新生成整份补丁**；
+  以及我第一次把 3.13 才引入的 `$8`/`queues` 子查询抄进了 3.9 的语句（那时表还不存在），被 `relation "queues" does not exist` 抓住。
+- **M2 验收**：`kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**；
+  `cargo xtask ci` → **exit 0 · 32 m 12 s · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 全步判定（27 步尾巴树） | `{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}` |
+| 全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
+| `cargo xtask ci` | exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract` |
+| 3.27 的门 | `mutants` `6/6 (100%)` 13 s；`budget` `acts 6, named 6, unnamed_max 0, unrunnable_max 0`；`links` 8 页 50 链接；`unsafe-budget@0` 42 文件 0 处 |
+| cap 修复 | 3.9 `11/11`（含 conformance 两后端）、3.13 `10/10`；修前 postgres 会多拿（3.26 作者的复现：2 vs 1）|
+| 课程自己的检查 | `lint-caps` `no issues.`；`links` 86 页；`i18n` 0 error；`probe --check` 40/40 |
+
+### 坑与判读
+
+- **作业者的一次 Delta 故障**（3.27 作者记下）：它在工作树里 `mkdir` 了一个空目录，Delta 的 materialization 随即卡住（“the checkout kept changing”），
+  文件工具还能用、终端全废；删掉那个目录才解冻，代价是 Delta 把删除又传播成一次文件删除。结论：**不要在工作树里手建目录**（用文件工具写字就会自动建目录）。
+- **第 5 个作业者失败模式**：3.26 的收尾者耗尽上下文，交回的不是报告而是一份“进度总结”——但那份总结里写清了实现在哪里、验证到什么程度、
+  以及剩下什么，于是接手只花了它的“待办清单”而不是重做。**让子代理在上下文耗尽时留下一份可接手的总结**，这件事值得写进 §3.5 的任务书模板。
