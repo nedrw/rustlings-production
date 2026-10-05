@@ -9,7 +9,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -273,7 +273,7 @@ fn execute(
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.kill();
+            stop(&mut child);
             break child.wait().ok();
         }
         thread::sleep(POLL_INTERVAL);
@@ -298,6 +298,60 @@ fn execute(
         timed_out,
         elapsed: started.elapsed(),
     })
+}
+
+/// Stop the child and everything it started.
+///
+/// `Child::kill` reaches one process, and a `cargo test` is two: the binary doing the work is one
+/// level below the command a gate started, and it is the one that goes on burning a core — and
+/// holding the shared build directory's lock, which makes every later command slower — after the
+/// command it belonged to has been reported as timed out. Measured in `docs/handoff-m2.md` §4.4: a
+/// hung `cargo test` left its test binary alive for forty minutes, and the runs after it looked ten
+/// times slower than they were.
+///
+/// The list is taken *before* the child is signalled: a descendant of a dead process is adopted by
+/// `init`, and the link that says whose it was goes with it. `ps` and `kill` are the only way to ask
+/// that question and to send that signal from the standard library, and both are POSIX — the same
+/// two tools the project's own process fixture already uses for `SIGTERM`.
+fn stop(child: &mut Child) {
+    for pid in descendants(child.id()) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+/// The pids running under `root`, in the order they were found.
+///
+/// An empty answer when `ps` is not there is the honest one: the child is still killed, and a
+/// grandchild that survives is the old behaviour rather than a new failure.
+fn descendants(root: u32) -> Vec<u32> {
+    let Ok(listing) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    let mut children: Vec<(u32, u32)> = Vec::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(pid), Some(parent)) = (fields.next(), fields.next())
+            && let (Ok(pid), Ok(parent)) = (pid.parse(), parent.parse())
+        {
+            children.push((pid, parent));
+        }
+    }
+    let mut found = Vec::new();
+    let mut level = vec![root];
+    while let Some(parent) = level.pop() {
+        for (pid, its_parent) in &children {
+            if *its_parent == parent {
+                found.push(*pid);
+                level.push(*pid);
+            }
+        }
+    }
+    found
 }
 
 /// Run a whitespace-separated command line — the form `run.cmd` uses in `track.toml`.
@@ -451,6 +505,45 @@ mod tests {
         assert!(!ran.success());
         assert!(ran.stderr.contains("was killed after"), "{}", ran.stderr);
         assert!(ran.elapsed < Duration::from_secs(5), "{:?}", ran.elapsed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_command_takes_its_grandchildren_with_it() {
+        // The case this exists for is `cargo test`, whose test binary is one level below the
+        // command a gate started: killing only the direct child leaves the process that is actually
+        // running behind (and holding the shared build directory's lock). `sleep 37` is a duration
+        // nothing else on this machine is likely to be using.
+        let temp = TempDir::new("process-descendants");
+        let ran = run(
+            "sh",
+            &["-c", "sleep 37"],
+            temp.path(),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        assert!(ran.timed_out, "{ran:?}");
+        // The signal is asynchronous, so the answer is polled rather than assumed.
+        let mut survivors = String::from("not looked at");
+        for _ in 0..40 {
+            let listing = Command::new("ps")
+                .args(["-A", "-o", "command="])
+                .output()
+                .expect("ps is POSIX");
+            survivors = String::from_utf8_lossy(&listing.stdout)
+                .lines()
+                .filter(|line| line.contains("sleep 37"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if survivors.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            survivors.is_empty(),
+            "a grandchild outlived the deadline: {survivors}"
+        );
     }
 
     #[cfg(unix)]
