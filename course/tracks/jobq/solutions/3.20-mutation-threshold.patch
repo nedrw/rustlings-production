@@ -1,0 +1,243 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 8021c1d..49d68f7 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -32,6 +32,7 @@ pub(crate) mod dlq;
+ pub(crate) mod domain;
+ pub(crate) mod error;
+ pub(crate) mod events;
++pub(crate) mod mutation;
+ pub(crate) mod policy;
+ pub(crate) mod retry;
+ pub(crate) mod scheduler;
+@@ -56,6 +57,7 @@ pub use domain::{
+ };
+ pub use error::Error;
+ pub use events::{EventKind, JobEvent};
++pub use mutation::{MutationPolicy, Report, Score, Survivor, Verdict, caught};
+ pub use policy::Policy;
+ pub use retry::{DEFAULT_ATTEMPTS, Retried, retry};
+ pub use scheduler::Engine;
+diff --git a/src/engine/mutation.rs b/src/engine/mutation.rs
+index a99461b..2e90e98 100644
+--- a/src/engine/mutation.rs
++++ b/src/engine/mutation.rs
+@@ -49,19 +49,19 @@ impl Score {
+     /// A tally: `killed` mutants the suite noticed, `survived` mutants it did not.
+     #[must_use]
+     pub fn new(killed: usize, survived: usize) -> Self {
+-        todo!("jobq/3.20-mutation-threshold: a run is two counts")
++        Self { killed, survived }
+     }
+ 
+     /// The mutants the suite noticed.
+     #[must_use]
+     pub fn killed(&self) -> usize {
+-        todo!("jobq/3.20-mutation-threshold: the mutants a case failed on")
++        self.killed
+     }
+ 
+     /// The mutants it did not.
+     #[must_use]
+     pub fn survived(&self) -> usize {
+-        todo!("jobq/3.20-mutation-threshold: the mutants every case was green on")
++        self.survived
+     }
+ 
+     /// The mutants that were judged at all: the denominator of the score.
+@@ -71,7 +71,7 @@ impl Score {
+     /// fraction rather than inside it as a survivor.
+     #[must_use]
+     pub fn judged(&self) -> usize {
+-        todo!("jobq/3.20-mutation-threshold: the denominator of the score")
++        self.killed + self.survived
+     }
+ 
+     /// The share of the judged mutants that died, in whole percent, or `None` when nothing was
+@@ -87,7 +87,11 @@ impl Score {
+     /// a pass.
+     #[must_use]
+     pub fn percent(&self) -> Option<u32> {
+-        todo!("jobq/3.20-mutation-threshold: a share of what was judged, and `None` for nothing")
++        let judged = self.judged();
++        // `checked_div` *is* the decision above: a share of nothing is not a number, so the answer
++        // travels as `None` rather than as a zero a threshold would compare with.
++        let share = (self.killed * 100).checked_div(judged)?;
++        Some(share as u32)
+     }
+ }
+ 
+@@ -113,19 +117,22 @@ impl MutationPolicy {
+     /// A policy: `threshold` percent of at least `min_judged` judged mutants.
+     #[must_use]
+     pub fn new(threshold: u32, min_judged: usize) -> Self {
+-        todo!("jobq/3.20-mutation-threshold: a threshold and a floor")
++        Self {
++            threshold,
++            min_judged,
++        }
+     }
+ 
+     /// The share of the judged mutants a build has to kill.
+     #[must_use]
+     pub fn threshold(&self) -> u32 {
+-        todo!("jobq/3.20-mutation-threshold: the share this policy asks for")
++        self.threshold
+     }
+ 
+     /// How many mutants have to be judged before the share is evidence.
+     #[must_use]
+     pub fn min_judged(&self) -> usize {
+-        todo!("jobq/3.20-mutation-threshold: the evidence this policy asks for")
++        self.min_judged
+     }
+ 
+     /// Whether this policy can be met at all.
+@@ -139,7 +146,7 @@ impl MutationPolicy {
+     /// nobody read.
+     #[must_use]
+     pub fn is_satisfiable(&self) -> bool {
+-        todo!("jobq/3.20-mutation-threshold: the two ways to write a rule nobody can meet")
++        !(self.min_judged == 0 || self.threshold > 100)
+     }
+ 
+     /// What `score` means to this policy.
+@@ -152,7 +159,14 @@ impl MutationPolicy {
+     /// The comparison is `>=` rather than `>` on purpose: a threshold of 80 is *met* by 80%.
+     #[must_use]
+     pub fn judge(&self, score: Score) -> Verdict {
+-        todo!("jobq/3.20-mutation-threshold: three answers, and a floor of one mutant")
++        let floor = self.min_judged.max(1);
++        if score.judged() < floor {
++            return Verdict::Unproven;
++        }
++        if score.killed * 100 >= (self.threshold as usize) * score.judged() {
++            return Verdict::Passed;
++        }
++        Verdict::Failed
+     }
+ }
+ 
+@@ -176,7 +190,11 @@ impl Verdict {
+     /// The word a report prints and a CI job greps for.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("jobq/3.20-mutation-threshold: the three words a report prints")
++        match self {
++            Verdict::Passed => "passed",
++            Verdict::Failed => "failed",
++            Verdict::Unproven => "unproven",
++        }
+     }
+ }
+ 
+@@ -215,19 +233,25 @@ impl Survivor {
+         column: usize,
+         edit: impl Into<String>,
+     ) -> Self {
+-        todo!("jobq/3.20-mutation-threshold: where a survivor lives")
++        Self {
++            path: path.into(),
++            line,
++            column,
++            edit: edit.into(),
++        }
+     }
+ 
+     /// `src/engine/mutation.rs:42:17` — the place a reader's editor can open.
+     #[must_use]
+     pub fn place(&self) -> String {
+-        todo!("jobq/3.20-mutation-threshold: the four things a case needs, in one string")
++        let (path, line, column) = (&self.path, self.line, self.column);
++        format!("{path}:{line}:{column}")
+     }
+ 
+     /// The rewrite that lived, e.g. `` `>=` → `>` ``.
+     #[must_use]
+     pub fn edit(&self) -> &str {
+-        todo!("jobq/3.20-mutation-threshold: the rewrite that lived")
++        &self.edit
+     }
+ }
+ 
+@@ -252,25 +276,29 @@ impl Report {
+     /// one of them, or a count nobody can point at.
+     #[must_use]
+     pub fn of(policy: &MutationPolicy, score: Score, survivors: Vec<Survivor>) -> Self {
+-        todo!("jobq/3.20-mutation-threshold: judge the score and keep both halves")
++        Self {
++            score,
++            verdict: policy.judge(score),
++            survivors,
++        }
+     }
+ 
+     /// What the policy said.
+     #[must_use]
+     pub fn verdict(&self) -> Verdict {
+-        todo!("jobq/3.20-mutation-threshold: what the policy said")
++        self.verdict
+     }
+ 
+     /// The score the verdict came from.
+     #[must_use]
+     pub fn score(&self) -> Score {
+-        todo!("jobq/3.20-mutation-threshold: the score this verdict came from")
++        self.score
+     }
+ 
+     /// The mutants the suite did not notice.
+     #[must_use]
+     pub fn survivors(&self) -> &[Survivor] {
+-        todo!("jobq/3.20-mutation-threshold: the mutants the suite did not notice")
++        &self.survivors
+     }
+ 
+     /// The one line a CI job prints and a person reads.
+@@ -280,7 +308,18 @@ impl Report {
+     /// — how many mutants were judged, when that is the problem rather than the score.
+     #[must_use]
+     pub fn summary(&self) -> String {
+-        todo!("jobq/3.20-mutation-threshold: the one line a CI job prints")
++        let killed = self.score.killed();
++        let judged = self.score.judged();
++        let share = share(self.score);
++        match self.verdict {
++            Verdict::Passed => format!("{killed}/{judged} mutant(s) killed ({share})"),
++            Verdict::Failed => {
++                format!("{killed}/{judged} mutant(s) killed ({share}), below the threshold")
++            }
++            Verdict::Unproven => {
++                format!("{judged} mutant(s) judged ({share}), which is not enough evidence")
++            }
++        }
+     }
+ }
+ 
+@@ -303,5 +342,25 @@ pub fn caught(
+     invariants: &[&dyn Invariant],
+     mutants: &[&dyn Model],
+ ) -> Score {
+-    todo!("jobq/3.20-mutation-threshold: one walk per mutant, per invariant")
++    let mut killed = 0;
++    let mut survived = 0;
++    for mutant in mutants {
++        let noticed = invariants
++            .iter()
++            .any(|invariant| walk(*mutant, seed, length, *invariant).is_some());
++        if noticed {
++            killed += 1;
++        } else {
++            survived += 1;
++        }
++    }
++    Score::new(killed, survived)
++}
++
++/// A percentage as a report prints it, or the words a report uses when there is none.
++fn share(score: Score) -> String {
++    match score.percent() {
++        Some(percent) => format!("{percent}%"),
++        None => "nothing judged".to_owned(),
++    }
+ }

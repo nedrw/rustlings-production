@@ -1,0 +1,313 @@
+diff --git a/src/engine/mutation.rs b/src/engine/mutation.rs
+new file mode 100644
+index 0000000..a99461b
+--- /dev/null
++++ b/src/engine/mutation.rs
+@@ -0,0 +1,307 @@
++//! What a mutation run proves, and what it does not.
++//!
++//! Step `jobq/3.20-mutation-threshold`. `jobq/3.19-property-invariants` built the machine that can
++//! answer *no*; this module is what happens to that answer. A mutation run takes a rule of the
++//! code, changes it in one place, and asks the suite whether it noticed: the mutants the suite
++//! failed on are **killed** and the ones it shrugged at **survived**, and the share that died is the
++//! only number in a build report that is about the tests rather than about the code.
++//!
++//! Four decisions are written into the shapes below:
++//!
++//! * **the score is a share of the judged, not of the attempted.** A mutant whose site does not
++//!   compile is not evidence about the suite, and counting it would let a project raise its score by
++//!   making its own code unbuildable.
++//! * **an empty run has no percentage, and is not a pass.** [`Score::percent`] answers `None` rather
++//!   than `0`, and [`MutationPolicy::judge`] has a floor of one mutant whatever the configured floor says:
++//!   a denominator of zero makes a percentage undefined, and `0%` compared with a threshold is a
++//!   number that means something it does not.
++//! * **there are three answers, not two.** "The suite is not good enough" and "there is not enough
++//!   evidence to say" send a maintainer to different places — one to write a test, the other to fix
++//!   whatever stopped the mutants from being judged — and a boolean has to fold one of them into
++//!   the other.
++//! * **the survivors are named.** A score nobody can act on is a score that gets ignored, so a
++//!   survivor carries the place a reader's editor can open ([`Survivor::place`]) and the rewrite
++//!   that lived.
++//!
++//! What this module is **not**: a tool. It does not parse Rust, rewrite it or build it — the
++//! course's `mutants` gate does that (`kiln check jobq/3.20-mutation-threshold --slow`), and so does
++//! `cargo mutants` in a project that has it installed. What lives here is the arithmetic a build is
++//! held to and the report it prints, which is the half a reviewer argues about.
++
++use std::fmt;
++
++use crate::engine::walk::{Invariant, Model, walk};
++
++/// What a run over a set of mutants found: the ones the suite noticed, and the ones it did not.
++///
++/// Two counts and no percentage of its own: "how many" is what a run produces, and "what share"
++/// is what a policy does with it ([`Score::percent`]).
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Score {
++    /// Mutants the suite noticed: a case failed, so the change is covered.
++    killed: usize,
++    /// Mutants it did not: the change is in the tree and every case is green.
++    survived: usize,
++}
++
++impl Score {
++    /// A tally: `killed` mutants the suite noticed, `survived` mutants it did not.
++    #[must_use]
++    pub fn new(killed: usize, survived: usize) -> Self {
++        todo!("jobq/3.20-mutation-threshold: a run is two counts")
++    }
++
++    /// The mutants the suite noticed.
++    #[must_use]
++    pub fn killed(&self) -> usize {
++        todo!("jobq/3.20-mutation-threshold: the mutants a case failed on")
++    }
++
++    /// The mutants it did not.
++    #[must_use]
++    pub fn survived(&self) -> usize {
++        todo!("jobq/3.20-mutation-threshold: the mutants every case was green on")
++    }
++
++    /// The mutants that were judged at all: the denominator of the score.
++    ///
++    /// Judged rather than attempted, and the difference is a mutant whose site does not compile or
++    /// whose run never finished: it says nothing about the suite either way, so it is outside the
++    /// fraction rather than inside it as a survivor.
++    #[must_use]
++    pub fn judged(&self) -> usize {
++        todo!("jobq/3.20-mutation-threshold: the denominator of the score")
++    }
++
++    /// The share of the judged mutants that died, in whole percent, or `None` when nothing was
++    /// judged.
++    ///
++    /// `None` rather than zero, and that is the decision this type exists to make: an empty run is
++    /// not the worst possible score, it is the *absence* of one. A `0%` would compare with a
++    /// threshold like any other number, and a build that judged nothing would be reported as a
++    /// build that failed rather than as a build that did not look.
++    ///
++    /// The division truncates — `Score::new(5, 6)` is 45%, not 46 — because a threshold of 80 is a
++    /// decision about whole percent and rounding up would let a run one mutant short of it read as
++    /// a pass.
++    #[must_use]
++    pub fn percent(&self) -> Option<u32> {
++        todo!("jobq/3.20-mutation-threshold: a share of what was judged, and `None` for nothing")
++    }
++}
++
++/// The rule a build is held to: a share of the judged mutants, and enough of them to mean anything.
++///
++/// `MutationPolicy` rather than `Policy`: the engine already has one of those (`jobq/3.9-priority-fairness`,
++/// the scheduler's rule about which job goes first), and the two have nothing to do with each other —
++/// one decides which work runs, and this one decides whether a build ships.
++///
++/// Two numbers rather than one, because a threshold on its own is met by a run that judged three
++/// mutants well: a hundred percent of three is not the same evidence as a hundred percent of forty,
++/// and a policy that cannot say so is a policy that a project tunes its sampling until it passes.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct MutationPolicy {
++    /// The percentage of the judged mutants a run has to kill.
++    threshold: u32,
++    /// How many mutants have to be judged before the percentage counts as evidence.
++    min_judged: usize,
++}
++
++impl MutationPolicy {
++    /// A policy: `threshold` percent of at least `min_judged` judged mutants.
++    #[must_use]
++    pub fn new(threshold: u32, min_judged: usize) -> Self {
++        todo!("jobq/3.20-mutation-threshold: a threshold and a floor")
++    }
++
++    /// The share of the judged mutants a build has to kill.
++    #[must_use]
++    pub fn threshold(&self) -> u32 {
++        todo!("jobq/3.20-mutation-threshold: the share this policy asks for")
++    }
++
++    /// How many mutants have to be judged before the share is evidence.
++    #[must_use]
++    pub fn min_judged(&self) -> usize {
++        todo!("jobq/3.20-mutation-threshold: the evidence this policy asks for")
++    }
++
++    /// Whether this policy can be met at all.
++    ///
++    /// "Nobody can satisfy this" has exactly two shapes, and both of them are mistakes a review
++    /// catches rather than a build: a threshold above 100%, which nothing can reach, and a floor of
++    /// zero, which is a rule that reads as if it is about evidence and then asks for none. The
++    /// arithmetic below refuses the second one on its own ([`MutationPolicy::judge`] keeps a floor of one
++    /// mutant whatever the configuration says); what this method is for is the *review*, because a
++    /// policy is a decision somebody wrote down and a decision that cannot be met is a decision
++    /// nobody read.
++    #[must_use]
++    pub fn is_satisfiable(&self) -> bool {
++        todo!("jobq/3.20-mutation-threshold: the two ways to write a rule nobody can meet")
++    }
++
++    /// What `score` means to this policy.
++    ///
++    /// Three answers rather than two, because "the suite is not good enough" and "there is not
++    /// enough evidence to say" are different sentences to whoever reads them. The floor is the
++    /// configured one, raised to one mutant: a run that judged nothing has proven nothing, and that
++    /// is a property of the arithmetic rather than a setting somebody can turn off.
++    ///
++    /// The comparison is `>=` rather than `>` on purpose: a threshold of 80 is *met* by 80%.
++    #[must_use]
++    pub fn judge(&self, score: Score) -> Verdict {
++        todo!("jobq/3.20-mutation-threshold: three answers, and a floor of one mutant")
++    }
++}
++
++/// What a score means to a policy.
++///
++/// `#[non_exhaustive]`, like the rest of this crate's vocabulary: a fourth answer (a run that was
++/// cut short by its budget, say) is a decision somebody will make, and a caller that wrote a
++/// wildcard arm should not have to be rebuilt for it.
++#[non_exhaustive]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Verdict {
++    /// Enough evidence, and at or above the threshold.
++    Passed,
++    /// Enough evidence, and below the threshold.
++    Failed,
++    /// Not enough evidence to say either way: neither a pass nor a failure.
++    Unproven,
++}
++
++impl Verdict {
++    /// The word a report prints and a CI job greps for.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("jobq/3.20-mutation-threshold: the three words a report prints")
++    }
++}
++
++impl fmt::Display for Verdict {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++/// One mutant the suite did not notice, at a place a person can look at.
++///
++/// The place rather than the mutant itself: a survivor is something to *write a case for*, and what
++/// that case needs is the file, the line, the column and the rewrite that lived — the same four
++/// things `kiln`'s own gate reports, because a report from a tool and a report from this project
++/// being the same shape is what lets a reviewer read exactly one of them.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Survivor {
++    /// The file, relative to the project.
++    path: String,
++    /// 1-based line.
++    line: usize,
++    /// 1-based column within the line: one line can hold two of the same operator, and a report
++    /// that named only the line would name the same place twice.
++    column: usize,
++    /// The rewrite that lived, written the way the tool describes it.
++    edit: String,
++}
++
++impl Survivor {
++    /// A mutant that lived at `path:line:column`, where `edit` is the rewrite.
++    #[must_use]
++    pub fn new(
++        path: impl Into<String>,
++        line: usize,
++        column: usize,
++        edit: impl Into<String>,
++    ) -> Self {
++        todo!("jobq/3.20-mutation-threshold: where a survivor lives")
++    }
++
++    /// `src/engine/mutation.rs:42:17` — the place a reader's editor can open.
++    #[must_use]
++    pub fn place(&self) -> String {
++        todo!("jobq/3.20-mutation-threshold: the four things a case needs, in one string")
++    }
++
++    /// The rewrite that lived, e.g. `` `>=` → `>` ``.
++    #[must_use]
++    pub fn edit(&self) -> &str {
++        todo!("jobq/3.20-mutation-threshold: the rewrite that lived")
++    }
++}
++
++/// What a run is worth, and what to write a case for.
++#[non_exhaustive]
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Report {
++    /// The score the verdict came from.
++    score: Score,
++    /// What the policy said about it.
++    verdict: Verdict,
++    /// The mutants the suite did not notice, in the order they were tried.
++    survivors: Vec<Survivor>,
++}
++
++impl Report {
++    /// Judge `score` against `policy`, naming the mutants that lived.
++    ///
++    /// The survivors are handed in rather than derived from the score, and that is the honest
++    /// shape: the run knows which mutants lived and what they were, and a report that reconstructed
++    /// them from a count would hide the case where the two disagree — a caller that forgot to count
++    /// one of them, or a count nobody can point at.
++    #[must_use]
++    pub fn of(policy: &MutationPolicy, score: Score, survivors: Vec<Survivor>) -> Self {
++        todo!("jobq/3.20-mutation-threshold: judge the score and keep both halves")
++    }
++
++    /// What the policy said.
++    #[must_use]
++    pub fn verdict(&self) -> Verdict {
++        todo!("jobq/3.20-mutation-threshold: what the policy said")
++    }
++
++    /// The score the verdict came from.
++    #[must_use]
++    pub fn score(&self) -> Score {
++        todo!("jobq/3.20-mutation-threshold: the score this verdict came from")
++    }
++
++    /// The mutants the suite did not notice.
++    #[must_use]
++    pub fn survivors(&self) -> &[Survivor] {
++        todo!("jobq/3.20-mutation-threshold: the mutants the suite did not notice")
++    }
++
++    /// The one line a CI job prints and a person reads.
++    ///
++    /// Three shapes, because the three verdicts are three different next actions: a share to
++    /// compare with the threshold, the same share with the threshold named, and the evidence itself
++    /// — how many mutants were judged, when that is the problem rather than the score.
++    #[must_use]
++    pub fn summary(&self) -> String {
++        todo!("jobq/3.20-mutation-threshold: the one line a CI job prints")
++    }
++}
++
++/// What the suite caught among a table of mutants: one walk per mutant, per invariant.
++///
++/// This is the whole of mutation testing, and it is three lines: a mutant is a *model* somebody
++/// changed ([`Model`], `jobq/3.19-property-invariants`), the suite is the invariants it has, and a
++/// mutant is killed when one of them comes back with a counter-example. Everything a tool adds on
++/// top of that is bookkeeping — where to apply the change, whether it builds, how long to wait —
++/// and the bookkeeping is why the tool is worth having.
++///
++/// One seed for the whole run, because that is what makes two runs comparable: a suite that caught a
++/// mutant under one seed and missed it under another is a suite whose score depends on the weather.
++/// A mutant that no invariant catches is a *survivor*, and naming it is the caller's business: this
++/// is the arithmetic of the run, and the names of the rules are the table that was planted.
++#[must_use]
++pub fn caught(
++    seed: u64,
++    length: usize,
++    invariants: &[&dyn Invariant],
++    mutants: &[&dyn Model],
++) -> Score {
++    todo!("jobq/3.20-mutation-threshold: one walk per mutant, per invariant")
++}
