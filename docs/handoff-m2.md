@@ -447,13 +447,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 
 ### 4.2 施工中的数字
 
-（22/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
+（23/27 步交付，全部在**最终树**上重取过；取法：worktree 里对应命令 + 私有 `CARGO_TARGET_DIR`/`XDG_CACHE_HOME`。）
 
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` must gates，全部 `hold the contract` |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`22/22 judged · 0 failed · 0 blocked · 5 not_authored`**（21/22 两步作者的冷缓存跑 4 m 47 s，我复核的热跑 3 m 17 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
-| 默认特性全量套件 | `cargo test -p jobq` → **154 passed · 0 failed**（81 → 99 → 116 → 134 → 154；最后一步多出的 1 例是 3.22 的 harness `tests/budget.rs` 自身）|
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`23/23 judged · 0 failed · 0 blocked · 4 not_authored`**（22 步热跑 3 m 17 s，23 步 6 m 1 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 默认特性全量套件 | `cargo test -p jobq` → **164 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（`97 capabilities · 134 slots · 118 ledger positions · 72 authored steps`，`checked 61 of 72 step bodies`）；`probe --check` → `40 exercise(s) · 40 reference(s) passed`；`links` → `74 page(s) · 414 link(s) · 254 external target(s)`，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
@@ -622,6 +622,12 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   本次是 15/15。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
+- **`selftest` 与 `verify` 在 3.23 上不一致（已记，未解）**：同一条命令下 `verify jobq --slow` 让 3.23 全绿
+  （13/13 must 门，含页面用例与 `conformance@2`），而 `selftest jobq/3.23` 两次（暖缓存 + 全新缓存）都在
+  `slow:conformance@2` 红，两个后端都停在 `spec_online_schema.rs:113:33`（页面读取）。现场采样的线索：
+  selftest 的沙箱里 `app/jobq/docs/migration.md` 在 t≈75 s **存在**（脚手架 stub），t≈120 s **不存在**——
+  解法应用之后文件反而没了。怀疑在 `selftest` 的 prepare/apply 路径（`solution ✓ reference patch applies`
+  可能掩盖被跳过的文件）。**没有为了让命令变绿而放宽任何判据或改动产物**；3.23 的交付以 `verify --slow` 为准。
 - **构建槽共享导致的幽灵失败已从 kiln 侧封掉**（提交 `kiln(process): the project's build directory is not the caller's`）：
   cargo 按**包名+版本**选构建槽，不按目录，所以两棵树共用一个 `CARGO_TARGET_DIR` 时，一棵树的二进制会服务另一棵；
   而这门课的规格用 `CARGO_MANIFEST_DIR`（编译期烘进二进制）读项目文件，于是"陈旧二进制"不是跑旧代码，而是**读别的项目的文件**
