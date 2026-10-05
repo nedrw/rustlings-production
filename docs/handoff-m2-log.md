@@ -18,6 +18,7 @@
 - 第十一段 · 2026-10 · 3.17–3.18，以及把两个“以后再说”的指针收口
 - 第十二段 · 2026-10 · 3.19–3.20，以及验收标准里 `mutants` 那一腿的原始证据
 - 第十三段 · 2026-10 · 3.21–3.22，`bench-budget` 那一腿，以及一次“幽灵失败”的追根
+- 第十四段 · 2026-10 · 3.23 由我接手完成，以及一个 `selftest`/`verify` 的不一致
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -572,3 +573,38 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   现在 kiln 自己清掉了，但**在项目目录里手跑 cargo 时**仍要当心（每个作者的工作树都该有自己的 target）。
 - **作业者的两个判断我认可**：3.22 的模块是“预算的算术与报告”，不是文本变异器（那会把编译器塞进测试）；
   它也没给 `Store` 加 `stats()`——那会把 `src/engine/store/memory.rs` 整文件拖进 3.22 的变异模块，而那里没有规格能杀掉变异体。
+
+
+## 第十四段 · 2026-10 · 3.23 由我接手完成，以及一个 `selftest`/`verify` 的不一致
+
+### 做了什么
+
+- **作业者第二次无声死亡**（`d53167f90f9c422e`），但这次留下了四件产物：正文、spec、scaffold、参考解。我接手补齐了缺的部分：
+  ① `course/tracks/jobq/budget/3.23-online-schema.toml`（`backfill_jobs = 16`、`burst_max = 1`、`resume_ratio_max = 0.6`——最后一个是页面承诺的**上界**，harness 打印的是实测 0.500）；
+  ② 正文 RECALL 的两处 R5 违规（它点名了**本步自己**，还把 `migrations/0006_job_states.sql` 当成步骤引用）；
+  ③ 参考解补丁：`src/engine/schema.rs` 不是 rustfmt 形状（`fmt` 门会红），我按 §3.5 的做法用「脚手架态 vs 解法态」的 git diff 重新生成了 `schema.rs` 的 hunk，
+  中途还踩到自己的坑——直接拼接 hunk 产生了 `\ No newline at end of file`（kiln 的补丁引擎不支持）并弄坏了相邻 section，最后整份补丁都是从两棵树重新生成的（路径要项目相对，不是仓库相对）。
+- **验收**：`verify jobq --slow --json` → **`23/23 judged · 0 failed · 0 blocked · 4 not_authored`**，3.23 的 13/13 must 门全绿——
+  `5/6 mutant(s) killed (83%, needs ≥80%)`、`3 metric(s) within ±10%: backfill_jobs 16, burst_max 1, resume_ratio_max 0.5`、`2 backend(s) pass the same suite: memory ✓, postgres ✓`；
+  尾巴树 `cargo test -p jobq` → **164 passed · 0 failed**（154 + 9 + 1 harness）；`lint-caps` `no issues.`。
+- **发现一个未解的不一致**：同一条命令下 `verify jobq --slow` 让 3.23 全绿，而 `selftest jobq/3.23` 两次（暖 + 全新缓存）都在 `slow:conformance@2` 红，
+  两个后端都停在页面读取（`spec_online_schema.rs:113:33`）。现场采样：沙箱里 `app/jobq/docs/migration.md` 在 t≈75 s **在**（脚手架 stub，14 个 TODO），t≈120 s **不在**。
+  对照实验：3.21、3.22（它们的页面由**解法**创建，不是脚手架）用同一个 XDG 跑 `selftest` 全绿 → 触发条件看起来是「脚手架发页面 stub + 规格读页面」。
+  **没有为了让命令变绿而放宽判据或改产物**；3.23 的交付以 `verify --slow` 为准，这件事记在 handoff §5.2 待查。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 全步判定（23 步尾巴树） | `23/23 judged · 0 failed · 0 blocked · 4 not_authored`，墙钟 **6 m 1 s** |
+| 3.23 的门 | 13/13 must 绿：mutants `5/6 (83%)` 9 s、budget 三指标在 ±10%、conformance 两后端、coverage blocked（should）|
+| 全量套件 | `cargo test -p jobq` → **164 passed · 0 failed**；3.23 的 spec 在 postgres 上 `9 passed · 4.69 s` |
+| 课程自己的检查 | `lint-caps` `no issues.`；`cargo fmt --all --check` 干净；`manifest` 23 份钉住 |
+
+### 坑与判读
+
+- **拼补丁不如重新生成补丁**：手改 hunk 会留下 `\ No newline`、会错切 section、还会让 `skip` 静默失败（补丁不适用时 `skip` 仍然退出 0，
+  于是我以为树是解法态、其实是脚手架态——一整轮“幽灵失败”都源于此）。规矩：**改了就重新生成整份补丁**（两棵树 + `git diff --cached --no-renames --binary`），并检查路径前缀。
+- **`solution ✓ reference patch applies` 可能掩盖被跳过的文件**（见上面的不一致）：报“应用成功”不等于每个 section 都落了地；
+  以后在 `selftest` 之后确认关键文件的状态（如 `grep -c TODO <页>`）。
+- **`filter-map` 式的脚本要小心**：我用脚本扫 `cargo fmt` 的差异时只统计了文件；若不是“全部差异都在一个文件里”，重新生成的范围就得更大。
