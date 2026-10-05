@@ -1,0 +1,508 @@
+diff --git a/docs/alerts.md b/docs/alerts.md
+new file mode 100644
+index 0000000..4bb2944
+--- /dev/null
++++ b/docs/alerts.md
+@@ -0,0 +1,40 @@
++# Alerts that deserve to wake somebody
++
++A queue's numbers are [<!-- TODO: link the module that exports them -->](TODO), and they are reported
++as one line per queue every time a run finishes saying what it did. This page is what the deployment
++does with them, and it has to be written the way an alert has to be written to be worth having: each
++rule names the signal it reads, the threshold that fires it, the window the threshold is measured
++over, and the drill that triggers it on purpose.
++
++## What we promise
++
++The budget: <!-- TODO: the share of settled attempts that has to finish the job, and how many settled
++attempts a window needs before its share is read at all. Say both as numbers in this section — the
++spec compares them with `Budget::standard()` in `src/service/signals.rs`, so a page that says
++something else is a page that has stopped being true. -->
++
++The unit is the attempt that *settled*: finished, failed, or reclaimed. A retried attempt is the
++budget working; an attempt nobody finished is a loss no failure counter in this crate sees.
++
++## Rules
++
++| signal | threshold | window | drill | severity | what to do |
++| --- | --- | --- | --- | --- | --- |
++| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
++| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
++
++<!-- TODO: one row per family `signals()` exports, at least. The signal column is a name from that
++table — a rule written against a number nobody counts is a rule that never fires. The drill column is
++the command that triggers the rule on purpose; it is `cargo test -p jobq --test spec_alerts`, which
++is also what the spec checks for. -->
++
++## Escalation
++
++<!-- TODO: what to do while the cause is unknown, and the one instruction that is counter-intuitive
++about a queue that lives in a store. -->
++
++## Where this comes from
++
++<!-- TODO: the pages this one is built on — an alerting-rules reference, and the burn-rate framing
++the two windows come from. -->
+diff --git a/src/service/signals.rs b/src/service/signals.rs
+new file mode 100644
+index 0000000..540a15e
+--- /dev/null
++++ b/src/service/signals.rs
+@@ -0,0 +1,456 @@
++//! What this process says about itself: the families it counts, the line about one attempt, and the
++//! budget a queue's failures are measured against.
++//!
++//! `jobq/3.13-queue-authz-attribution` made the engine count five things per queue, and the trail of
++//! `jobq/3.6-transaction-isolation` made every settle leave a line. Neither of them decided what an
++//! operator *reads* those as, and that is what this module is: a name, a shape, and the rule that
++//! turns a number into something that wakes a person up.
++//!
++//! **The families are a contract, and they are written once.** [`signals`] is the whole of what this
++//! process exports, and every name in it is there for a reason a query can act on:
++//!
++//! * **a kind, because a counter and a gauge are read differently.** A counter only ever rises, so
++//!   the question asked of it is "how fast" — and the answer is the difference between two
++//!   readings, which is why a rule has a window. A gauge is a reading: asking how fast a gauge is
++//!   rising is a question about the scrape, not about the queue;
++//! * **a label set, and it is small.** The series a family is cut by is the whole of what a query
++//!   can group by, and every value is a series in every collector (`relay/2.18-delivery-metrics`
++//!   applied this to a delivery). Here the axis is the queue, which is the axis a multi-tenant
++//!   queue is asked about — a job id, a worker name or a payload in a label would be a series per
++//!   job, and no alert can be written against a name that changes;
++//! * **a help line, because a number without one is a number somebody guesses at** at three in the
++//!   morning.
++//!
++//! **The sample is the line the process writes.** [`Sample::emit`] writes one line per queue with a
++//! field per family, and the field names *are* the family names — which is what keeps this table
++//! and whoever queries the log from drifting apart. A queue that has seen nothing is reported at
++//! zero rather than left out: a series that appears only after the first failure is a query that
++//! answers "no data" exactly during the quiet period, which is indistinguishable from a queue
++//! that is down (`relay/2.18`'s rule, and the reason [`samples`] takes the queues the deployment
++//! drains rather than the queues the store happens to know).
++//!
++//! **An attempt's line is the other grain, and it is the one that answers "why".** The sample says
++//! "three of this queue's settles in the last five minutes ended badly"; [`Attempt`] says which
++//! jobs, which attempt, and in the handler's own words what went wrong — the line an operator
++//! reads *after* an alert, and the line that leads to the dead letters of `jobq/3.16-dlq-tooling`.
++//! Its fields are the same on every outcome, because a field that is only sometimes there is a
++//! query that has to handle it; the *level* is what differs, and it is part of the contract for
++//! the same reason.
++//!
++//! **A budget is arithmetic over a window, and a window is two readings.** A counter is cumulative
++//! from the day the queue was created, so "the failure rate" is not a property of a reading — an
++//! old queue and a new one with the same rate read differently, and neither reading is the answer.
++//! [`Budget::burn_between`] is that difference, and the two decisions in it are what a budget of
++//! failures means for *this* queue:
++//!
++//! * **the unit is the attempt that ended, not the job that arrived and not the attempt that
++//!   started.** A queue whose submissions stopped has a failure rate of zero and no work at all;
++//!   the budget is about settles. What is *arriving* is a different question, and what is *stuck*
++//!   is the gauge above;
++//! * **a reclaim is a loss and a retry is not.** An attempt that fails and is handed back is the
++//!   retry machinery doing its job — it costs the job an attempt, and the queue nothing. An attempt
++//!   that ends `reclaimed` is work nobody finished: a worker died holding it, or its lease ran out,
++//!   and no failure counter in this crate sees it. A budget that counted only `failed` reads zero
++//!   through a deployment that is losing every job it claims;
++//! * **a share below the floor says nothing.** One failure in one attempt is a 100% failure rate,
++//!   and it is also a Tuesday: a rule that pages on it pages on every quiet hour and on every queue
++//!   that has just been created. [`Budget::floor`] is the traffic a window needs before its share is
++//!   read, and it is a number in the page rather than a default somebody has to know.
++//!
++//! # What is left to write
++//!
++//! Four bodies, and each of them is one of the decisions above:
++//!
++//! 1. [`signals`] — the families, with the names a rule writes and a help line each;
++//! 2. [`Sample::emit`] — the line the process reports, one field per family;
++//! 3. [`Attempt::emit`] — the line about one attempt: the fields a query needs, and the level;
++//! 4. [`Budget::burn_between`] — what two readings of the counters say about the budget.
++//!
++//! Nothing declares this module yet: wiring it into `crate::service` is the first decision, and
++//! until it is made the spec does not compile.
++
++use crate::engine::{JobId, Queue, QueueUsage, Usage, WorkerId};
++
++/// How many parts a share is divided into: a basis point is a hundredth of a percent.
++///
++/// The same unit the service's settings use for anything expressed as a rate, so that "1%" is
++/// written once rather than as `0.01` in one place and `1` in another.
++pub const BASIS_POINTS: u64 = 10_000;
++
++/// The label every family in this module is cut by.
++const QUEUE: &[&str] = &["queue"];
++
++/// The two shapes a family of numbers has over time.
++///
++/// The difference is not cosmetic: it decides what a query may ask. A counter is cumulative and
++/// its rate is a difference between two readings; a gauge is the value at an instant and its
++/// rate is a question about scrapes.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SignalKind {
++    /// Cumulative since the process started, and only ever rising.
++    Counter,
++    /// A reading at an instant, which may go up or down.
++    Gauge,
++}
++
++impl SignalKind {
++    /// The word an exposition and a rule table write.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            SignalKind::Counter => "counter",
++            SignalKind::Gauge => "gauge",
++        }
++    }
++}
++
++/// One number this process exports, and everything a query has to know about it.
++///
++/// Fields are private and read through accessors, like [`crate::engine::Job`]: the table below is
++/// the interface, and a family that gains a field is a change inside this module.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Signal {
++    /// The name a query and a rule write.
++    name: &'static str,
++    /// Counter or gauge.
++    kind: SignalKind,
++    /// The labels every series of this family carries.
++    labels: &'static [&'static str],
++    /// One sentence: what this number is.
++    help: &'static str,
++}
++
++impl Signal {
++    /// A family, as the table below writes one.
++    #[must_use]
++    pub const fn new(
++        name: &'static str,
++        kind: SignalKind,
++        labels: &'static [&'static str],
++        help: &'static str,
++    ) -> Self {
++        Self {
++            name,
++            kind,
++            labels,
++            help,
++        }
++    }
++
++    /// The name a query and a rule write.
++    #[must_use]
++    pub fn name(&self) -> &'static str {
++        self.name
++    }
++
++    /// Counter or gauge.
++    #[must_use]
++    pub fn kind(&self) -> SignalKind {
++        self.kind
++    }
++
++    /// The labels every series of this family carries.
++    #[must_use]
++    pub fn labels(&self) -> &'static [&'static str] {
++        self.labels
++    }
++
++    /// One sentence: what this number is.
++    #[must_use]
++    pub fn help(&self) -> &'static str {
++        self.help
++    }
++}
++
++/// Every family this process exports.
++///
++/// Five counters and one gauge, which is exactly what the engine keeps
++/// (`jobq/3.13-queue-authz-attribution`) plus the one number that is *derived* there: the gauges and
++/// the counters are the facts, and [`Usage::running`] is what the facts add up to right now.
++///
++/// One family per settle kind rather than one counter with an `outcome` label, and that is the
++/// shape the sample line can carry: its fields are the family names, so a family whose value is a
++/// label's would be one field holding five numbers. The four codes a query groups by are the four
++/// names, and a rule that reads one of them reads the name it was written for.
++#[must_use]
++pub fn signals() -> &'static [Signal] {
++    todo!(
++        "jobq/3.17-error-budget-alerts: the families — a name, a kind and a label set each, with \
++         a help line that says what the number is"
++    )
++}
++
++/// The family a rule names, or `None` when this process does not export one.
++///
++/// This is the rule a step's rules page is judged by: the leftmost column of a rule is a name from
++/// [`signals`], so a page that wakes somebody up for a number nobody counts cannot be written.
++#[must_use]
++pub fn signal(name: &str) -> Option<&'static Signal> {
++    signals().iter().find(|signal| signal.name == name)
++}
++
++/// One queue's reading of every family, and the line it is written as.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Sample {
++    /// Which queue this reading is about.
++    queue: Queue,
++    /// What it has done.
++    usage: Usage,
++}
++
++impl Sample {
++    /// One queue's reading.
++    #[must_use]
++    pub fn new(queue: Queue, usage: Usage) -> Self {
++        Self { queue, usage }
++    }
++
++    /// Which queue this reading is about — the value of the label every family carries.
++    #[must_use]
++    pub fn queue(&self) -> &Queue {
++        &self.queue
++    }
++
++    /// Write this reading as the line a collector reads: one field per family, plus the label.
++    ///
++    /// The field list is written out rather than looped over: a subscriber indexes a field by a
++    /// literal name, so the table above and this list are two spellings of one set of names. What
++    /// keeps them one set is the test in this step's spec, which reads the fields off a line a real
++    /// process wrote and compares them with [`signals`].
++    ///
++    /// The message is `signals`, and it is what a query selects on: one line per queue per report,
++    /// which is the sample a rule's window is made of.
++    pub fn emit(&self) {
++        todo!(
++            "jobq/3.17-error-budget-alerts: the sample — one field per family, named the way the \
++             table names it, plus the label every family carries"
++        )
++    }
++}
++
++/// One reading per queue the deployment drains, in the order it drains them.
++///
++/// The queues come from the deployment rather than from the store, and that is the whole of the
++/// zero-line rule: a queue the settings name has a series from the first report on, and what the
++/// store answered for it is folded in when there is an answer. A queue with no reading at all is
++/// [`Usage::default`] — six zeroes — rather than a missing series.
++#[must_use]
++pub fn samples(queues: &[Queue], readings: &[QueueUsage]) -> Vec<Sample> {
++    queues
++        .iter()
++        .map(|queue| {
++            let usage = readings
++                .iter()
++                .find(|reading| reading.queue() == queue)
++                .map_or_else(Usage::default, QueueUsage::usage);
++            Sample::new(queue.clone(), usage)
++        })
++        .collect()
++}
++
++/// How an attempt ended, in the words a query groups by.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Outcome {
++    /// The attempt finished its job.
++    Succeeded,
++    /// The attempt reported a failure.
++    Failed,
++}
++
++impl Outcome {
++    /// The word the line carries and a query groups by.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Outcome::Succeeded => "succeeded",
++            Outcome::Failed => "failed",
++        }
++    }
++}
++
++/// One attempt, as the line about it says it.
++///
++/// A value rather than seven arguments at each call site, and that is the decision the step is
++/// about: the fields a query needs are one shape with one writer, so a line that is missing one of
++/// them is a compile error rather than a query that silently returns nothing.
++#[derive(Debug, Clone, Copy)]
++pub struct Attempt<'a> {
++    /// Which queue the job belongs to.
++    queue: &'a Queue,
++    /// Which job.
++    job: &'a JobId,
++    /// Which attempt of that job, as the row counts it.
++    attempt: u32,
++    /// Which worker made it.
++    worker: &'a WorkerId,
++    /// How it ended.
++    outcome: Outcome,
++    /// What went wrong, in the handler's own words; empty when nothing did.
++    reason: &'a str,
++    /// How long the handler took, in whole milliseconds.
++    took_ms: u64,
++}
++
++impl<'a> Attempt<'a> {
++    /// One attempt of one job.
++    ///
++    /// `reason` is the handler's sentence and is written even when the attempt succeeded: the
++    /// field set is the same on every line, and an empty value is what "no reason" looks like to a
++    /// query. `took_ms` is a number rather than a formatted duration, because a collector can add
++    /// numbers and cannot add `1.2s`.
++    #[must_use]
++    pub fn new(
++        queue: &'a Queue,
++        job: &'a JobId,
++        attempt: u32,
++        worker: &'a WorkerId,
++        outcome: Outcome,
++        reason: &'a str,
++        took_ms: u64,
++    ) -> Self {
++        Self {
++            queue,
++            job,
++            attempt,
++            worker,
++            outcome,
++            reason,
++            took_ms,
++        }
++    }
++
++    /// Write the line.
++    ///
++    /// Two things are decided here rather than at the call site, and both are properties of the
++    /// line rather than of the attempt:
++    ///
++    /// * **the level.** A failure is a warning and a success is information — so "everything at
++    ///   this level, in this window" is a query about endings, which is the query an operator has;
++    /// * **the fields.** Queue, job, attempt, worker, outcome, reason and how long it took: the
++    ///   path from a number on a page to the job behind it, which is the whole reason a queue's
++    ///   lines and a queue's counters are worth having together. What is deliberately *not* here is
++    ///   the payload (`crate::service::handler` explains why the row has it and a line does not).
++    pub fn emit(&self) {
++        todo!(
++            "jobq/3.17-error-budget-alerts: the line about one attempt — the fields a query needs, \
++             the same ones on every outcome, and the level that says which outcome it was"
++        )
++    }
++}
++
++/// The budget a queue's failures are measured against.
++///
++/// Two numbers, and both of them are a deployment's decision rather than this crate's: how much of
++/// the work may end badly ([`Budget::allow_bad`], in basis points), and how much traffic a window
++/// needs before its share is read at all ([`Budget::floor`]).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Budget {
++    /// Bad basis points the work may spend.
++    allow_bad: u16,
++    /// Settled attempts a window needs before its share is read.
++    floor: u64,
++}
++
++impl Budget {
++    /// The budget this course's rules page is written for: 1% of the settled attempts in a window
++    /// may end badly, and the share is read once a hundred attempts have settled in it.
++    #[must_use]
++    pub const fn standard() -> Self {
++        Self {
++            allow_bad: 100,
++            floor: 100,
++        }
++    }
++
++    /// A budget of `allow_bad` basis points with a floor of `floor` settled attempts.
++    #[must_use]
++    pub const fn new(allow_bad: u16, floor: u64) -> Self {
++        Self { allow_bad, floor }
++    }
++
++    /// Bad basis points the work may spend.
++    #[must_use]
++    pub fn allow_bad(&self) -> u16 {
++        self.allow_bad
++    }
++
++    /// Settled attempts a window needs before its share is read.
++    #[must_use]
++    pub fn floor(&self) -> u64 {
++        self.floor
++    }
++
++    /// What happened between two readings of one queue, measured against this budget.
++    ///
++    /// The subtraction is the window: a counter is cumulative, so what a rule's `[5m]` selects is
++    /// the difference between the reading now and the reading five minutes ago. `saturating` here is
++    /// arithmetic rather than paranoia — the counters of a store that was restored from a backup
++    /// can read lower than they did, and a report that answered a wrapped number under that would
++    /// be worse than one that answered zero.
++    ///
++    /// # What is counted
++    ///
++    /// `total` is the attempts that *ended* in the window: succeeded, failed, reclaimed. `bad` is
++    /// the ones that did not finish their job — the failures, whether or not the job was retried
++    /// (a retry is the budget being spent on purpose), and the reclaims, which is the half no
++    /// failure counter in this crate sees.
++    #[must_use]
++    pub fn burn_between(&self, earlier: &Usage, later: &Usage) -> Burn {
++        todo!(
++            "jobq/3.17-error-budget-alerts: the window — what each counter gained between two \
++             readings, and which of those gains a budget counts as bad"
++        )
++    }
++}
++
++/// What the settled attempts of one window say about a budget.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Burn {
++    /// Attempts that ended without finishing their job.
++    bad: u64,
++    /// Attempts that ended at all.
++    total: u64,
++    /// The budget they were measured against.
++    budget: Budget,
++}
++
++impl Burn {
++    /// A window's numbers, measured against a budget.
++    #[must_use]
++    pub const fn of(bad: u64, total: u64, budget: Budget) -> Self {
++        Self { bad, total, budget }
++    }
++
++    /// Attempts that ended without finishing their job.
++    #[must_use]
++    pub fn bad(&self) -> u64 {
++        self.bad
++    }
++
++    /// Attempts that ended at all.
++    #[must_use]
++    pub fn total(&self) -> u64 {
++        self.total
++    }
++
++    /// The bad attempts this window's traffic allows, rounded down.
++    #[must_use]
++    pub fn allowed(&self) -> u64 {
++        u64::from(self.budget.allow_bad).saturating_mul(self.total) / BASIS_POINTS
++    }
++
++    /// `true` while the window holds too little traffic for its share to mean anything.
++    ///
++    /// The rule the noise decision is made of: a share needs a denominator before it is a claim
++    /// about a queue rather than about one unlucky job.
++    #[must_use]
++    pub fn below_floor(&self) -> bool {
++        self.total < self.budget.floor
++    }
++
++    /// `true` when the window spent more of the budget than it was allowed.
++    #[must_use]
++    pub fn exceeded(&self) -> bool {
++        !self.below_floor() && self.bad > self.allowed()
++    }
++}

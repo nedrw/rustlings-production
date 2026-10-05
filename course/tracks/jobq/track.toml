@@ -555,12 +555,10 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
-    "images",
     "links",
     "semver@baseline",
 ]
-images = ["postgres:17-alpine"]
-hint = "A rule is a decision you defend: the spec reads `docs/alerts.md` and checks that every rule names its metric, its threshold, its window and the drill that is supposed to trigger it."
+hint = "A rule is a decision you defend: the spec reads `docs/alerts.md` and checks that every rule names its metric, its threshold, its window and the drill that is supposed to trigger it. The other half is what the lines carry: one sample per queue with a field per family, and one line per attempt with the fields a query needs — with the run as a span, because a task does not inherit one."
 
 [[step]]
 id = "3.18-trace-sampling"

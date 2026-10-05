@@ -1,0 +1,581 @@
+diff --git a/docs/alerts.md b/docs/alerts.md
+index 4bb2944..8c5ed99 100644
+--- a/docs/alerts.md
++++ b/docs/alerts.md
+@@ -1,40 +1,65 @@
+ # Alerts that deserve to wake somebody
+ 
+-A queue's numbers are [<!-- TODO: link the module that exports them -->](TODO), and they are reported
+-as one line per queue every time a run finishes saying what it did. This page is what the deployment
+-does with them, and it has to be written the way an alert has to be written to be worth having: each
+-rule names the signal it reads, the threshold that fires it, the window the threshold is measured
+-over, and the drill that triggers it on purpose.
++A queue's numbers are [five counters and one gauge](../src/service/signals.rs), cut by queue, and
++they are reported as one line per queue every time a run finishes saying what it did. This page is
++what the deployment does with them, and it is written the way an alert has to be written to be worth
++having: each rule names the signal it reads, the threshold that fires it, the window the threshold
++is measured over, and the drill that triggers it on purpose.
++
++A rule that leaves any of those out is a rule nobody can review. And a rule whose signal is not in
++the table is worse than that: it is a rule that never fires, and it looks exactly like a healthy
++queue.
+ 
+ ## What we promise
+ 
+-The budget: <!-- TODO: the share of settled attempts that has to finish the job, and how many settled
+-attempts a window needs before its share is read at all. Say both as numbers in this section — the
+-spec compares them with `Budget::standard()` in `src/service/signals.rs`, so a page that says
+-something else is a page that has stopped being true. -->
++**99% of the attempts that settle finish their job.** An *attempt that settles* is one that ended —
++finished, failed, or was reclaimed by the store — and it is the unit the budget is measured in
++rather than the job that arrived or the attempt that started: a queue whose submissions stopped has
++a failure rate of zero and no work at all, and a job that is still being retried has not been
++judged yet.
++
++A window is read once **at least 100 attempts** have settled in it. Below that, a share is a
++statement about one unlucky job and not about a queue — one failure in one attempt is a 100%
++failure rate, and it is also a Tuesday. The floor is part of the rule rather than a habit of the
++person reading it.
+ 
+-The unit is the attempt that *settled*: finished, failed, or reclaimed. A retried attempt is the
+-budget working; an attempt nobody finished is a loss no failure counter in this crate sees.
++What the two halves of the arithmetic are worth remembering for: a **failed attempt that is retried
++is the budget working** — the engine spends an attempt and gets a delivery — while a **reclaimed
++attempt is a loss that no failure counter in this crate sees** ([the worker](../src/service/worker.rs)
++hands back what it cannot finish, and the store reclaims what a dead worker left). A window that
++loses every job it claims has a failure counter of zero.
+ 
+ ## Rules
+ 
+ | signal | threshold | window | drill | severity | what to do |
+ | --- | --- | --- | --- | --- | --- |
+-| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
+-| `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
+-
+-<!-- TODO: one row per family `signals()` exports, at least. The signal column is a name from that
+-table — a rule written against a number nobody counts is a rule that never fires. The drill column is
+-the command that triggers the rule on purpose; it is `cargo test -p jobq --test spec_alerts`, which
+-is also what the spec checks for. -->
++| `jobq_failed_total` | more than 1% of the attempts that settled in the window | `5m` | `cargo test -p jobq --test spec_alerts` | page | The fast burn. One queue is failing faster than its budget allows, right now. Read its attempt lines for `outcome=failed`, group them by `reason`, and fix or reject the payloads behind the biggest group; a job that has spent its budget is a dead letter ([the view the operator uses next](../src/engine/dlq.rs)). |
++| `jobq_failed_total` | more than 1% of the attempts that settled in the window | `1h` | `cargo test -p jobq --test spec_alerts` | ticket | The slow burn: the same share, held for an hour, is what a fast window misses during a trickle of traffic. It is a ticket rather than a page because the fast rule above will have paged already if the queue is actually on fire. |
++| `jobq_reclaimed_total` | 2 or more in the window | `5m` | `cargo test -p jobq --test spec_alerts` | page | Work nobody finished: a worker stopped holding a job, or a lease ran out. Nobody reported a failure, so this is the alert that exists because no other one fires. Start from the `worker` field of the attempt lines and the exit reason of that pod; a restart loop is the usual cause, and every reclaim is an attempt the job will never get back. |
++| `jobq_reclaimed_total` | 20 or more in the window | `1h` | `cargo test -p jobq --test spec_alerts` | ticket | The same loss at the rate a fleet that restarts on a schedule produces. Nobody is paged, because nothing is down — what is being spent is the retry budget of jobs that were fine. |
++| `jobq_running` | at the batch size (8 by default) for the whole window | `15m` | `cargo test -p jobq --test spec_alerts` | page | Workers are holding everything they are allowed to hold and finishing nothing. Either a handler is stuck (the attempt lines for those jobs stop after the claim) or the store stopped answering; this is the one number that rises when the queue is stuck rather than failing. |
++| `jobq_claimed_total` | 0 while the submitted total keeps rising | `15m` | `cargo test -p jobq --test spec_alerts` | page | Jobs are arriving and nobody is taking them. Either the workers are gone, or every one of them is refusing the queue — both are invisible in the failure counters, because nothing has failed yet. |
++| `jobq_succeeded_total` | 0 rise while the claimed total keeps rising | `15m` | `cargo test -p jobq --test spec_alerts` | page | The other half of a stuck queue, and the one an operator checks first: claims are being spent and nothing is finishing. Read the `took_ms` of the attempt lines — work that takes longer than the lease is work that will be reclaimed next. |
++| `jobq_submitted_total` | 0 for a queue that had traffic | `1h` | `cargo test -p jobq --test spec_alerts` | ticket | The producer is broken, or its credentials expired. This is the only rule here about a number that is too *quiet*, and it is a ticket rather than a page because a queue that is draining happily is not an incident for the queue. |
+ 
+ ## Escalation
+ 
+-<!-- TODO: what to do while the cause is unknown, and the one instruction that is counter-intuitive
+-about a queue that lives in a store. -->
++When the queue is losing work and nobody knows why yet: stop the bleed before diagnosing it. The
++budget a job is given is a setting, and raising it ([`worker`](../src/service/config.rs)) turns a
++queue that is losing jobs into a queue that is retrying them — the attempts are cheap and the dead
++letters are not. What it does not do is fix anything, and it spends the same budget the rules above
++are watching.
++
++The one thing not to do is restart the daemon. The queue lives in the store: a restart releases
++what this worker holds (an attempt nobody finished) and the next worker picks the job up, which is
++correct and also exactly what the reclaim counter just told you about.
+ 
+ ## Where this comes from
+ 
+-<!-- TODO: the pages this one is built on — an alerting-rules reference, and the burn-rate framing
+-the two windows come from. -->
++- [Prometheus: alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)
++  — the `for:` clause and the expression syntax the windows here are written for;
++- [Google SRE workbook: alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) — the
++  burn-rate framing this page uses, including why a fast window and a slow one are two rules rather
++  than one rule with two thresholds;
++- [Prometheus: naming](https://prometheus.io/docs/practices/naming/) — the units and the suffixes
++  the family names follow.
+diff --git a/src/service/handler.rs b/src/service/handler.rs
+index 12d44b8..9e15501 100644
+--- a/src/service/handler.rs
++++ b/src/service/handler.rs
+@@ -18,6 +18,13 @@
+ //!   contains `; rm -rf /` is a payload, not a command line. The exit status is the verdict —
+ //!   zero means the job is done, anything else is an attempt that failed, with the status as the
+ //!   reason the row keeps.
++//!
++//! One thing is deliberately *not* in the line the reference handler writes, and
++//! `jobq/3.17-error-budget-alerts` is the step that decided it: the payload. A line is data a
++//! collector indexes, and a payload is the customer's own record — it is unbounded, it is the next
++//! thing somebody finds in a log search while looking for something else, and an operator
++//! debugging a queue never needs it to say *which* job is stuck. The row has it, and the command
++//! handler is handed it on standard input; the line names the job instead.
+ 
+ use std::io::Write;
+ use std::path::PathBuf;
+@@ -53,6 +60,10 @@ pub fn for_config(config: &Config) -> Result<Box<dyn Handler>, Error> {
+ }
+ 
+ /// The handler a deployment gets when it names no program: it records the job and takes it as done.
++///
++/// What it writes is the attempt's identity and nothing else — the fields
++/// `crate::service::signals::Attempt` writes on the settle path, one layer earlier. A payload here
++/// would be the one field on a line that a collector cannot use and an operator must not have.
+ #[derive(Debug, Default)]
+ pub struct LogHandler;
+ 
+@@ -63,7 +74,6 @@ impl Handler for LogHandler {
+                 job = %job.id(),
+                 queue = %job.queue(),
+                 attempt = job.attempts(),
+-                payload = %job.payload(),
+                 "handled"
+             );
+             Ok(())
+diff --git a/src/service/logging.rs b/src/service/logging.rs
+index 59a49da..778c6d5 100644
+--- a/src/service/logging.rs
++++ b/src/service/logging.rs
+@@ -3,7 +3,21 @@
+ //! Same shape as `mailer/1.6-logging` and `relay`'s copy of it — one subscriber, JSON or
+ //! text, a run id on every line — with one difference that this project forces: the daemon has no
+ //! request to hang a span on, so the *worker and the job* are the fields. Step
+-//! `jobq/3.17-error-budget-alerts` is where those fields are judged as a contract.
++//! `jobq/3.17-error-budget-alerts` is where those fields are judged as a contract, and this module
++//! is two thirds of the answer:
++//!
++//! * **the run is a span, not a field.** T1's `mailer/1.6-logging` made the run a span named `run`
++//!   with the id in `run.id`, and the reason it is a span rather than an argument is the whole
++//!   design: a field is written by whoever remembers to write it, and a span is *context* — every
++//!   line written inside it carries the id without the line knowing it exists. The daemon's own
++//!   lines here are inside it, and so are the lines of the tasks the daemon starts, once each task
++//!   is handed the span (`crate::service::serve`, `crate::service::worker`);
++//! * **the field names are the query's**, which is `crate::service::signals`' argument rather than
++//!   this module's, because what a line about an attempt has to carry is a property of the queue
++//!   rather than of the logging setup;
++//! * **one line per run, printed where the process says what it is.** The install line is the first
++//!   line of the run and the one an operator uses to tell two runs apart in a collector; it is
++//!   written inside the span for the same reason as every other line.
+ 
+ use std::fmt;
+ 
+@@ -50,11 +64,19 @@ impl fmt::Display for RunId {
+     }
+ }
+ 
+-/// Install the subscriber for the rest of the process's life.
++/// Install the subscriber for the rest of the process's life, and open the run's span.
+ ///
+ /// Called once, before anything that might log: a daemon with no subscriber drops every line it
+ /// writes, and a daemon that installs two panics inside the second one.
+ ///
++/// **The span is opened after the subscriber, in that order.** A span is claimed from the
++/// dispatcher that is installed when it is *created*, so a span built one line too early is a span
++/// nobody will ever record — every event inside it arrives with no context at all, and the one line
++/// an operator uses to find a run is the one line missing from every run. The call sites that build
++/// the span here and in `crate::service::serve` are two pieces of the same run rather than one
++/// nested inside the other: a span is the unit of *work*, and installing a log and draining a queue
++/// are two of them.
++///
+ /// # Errors
+ ///
+ /// [`Error::Config`] when the level filter cannot be parsed — a typo in a
+@@ -81,7 +103,10 @@ pub fn init(
+     }
+ 
+     // The first line of every run, and the one an operator uses to tell two runs apart in a
+-    // collector: T1's `mailer/1.6-logging` asked for exactly this and it still holds.
+-    tracing::info!(run = %run, "logging installed");
++    // collector: T1's `mailer/1.6-logging` asked for exactly this and it still holds. The id is not
++    // a field here — it is the span this line and the rest of the run are written inside.
++    tracing::info_span!("run", "run.id" = run.as_str()).in_scope(|| {
++        tracing::info!("logging installed");
++    });
+     Ok(())
+ }
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index d708b58..6d2adcf 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -22,11 +22,14 @@ setting is spelled `JOBQ__SECTION__KEY` (for example `JOBQ__STORE__URL`).
+ pub mod config;
+ pub mod handler;
+ pub mod logging;
++pub mod signals;
+ pub mod worker;
+ 
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
++use tracing::{Instrument, instrument};
++
+ use crate::engine::{Error, MemoryStore, Policy, Queue, Store};
+ pub use config::{Config, Flags};
+ pub use logging::RunId;
+@@ -45,11 +48,17 @@ use worker::{Shutdown, Worker, WorkerSettings};
+ /// `worker.shutdown_seconds` to finish, what the deadline cuts is handed back, and the process exits
+ /// `0` — the contract `jobq/3.1-engine-boundary` pinned for the line below and for the exit code.
+ ///
++/// Every line this function writes, and every line the tasks it starts write, is inside the run's
++/// span (`jobq/3.17-error-budget-alerts`): the span is `run`, its field is the id `logging::init`
++/// built for this process, and the two tasks below are handed it by hand — `tokio::spawn` starts a
++/// task with an empty context, so a span that is merely *current* here reaches none of them.
++///
+ /// # Errors
+ ///
+ /// [`Error::Config`] when the settings do not name a store this build knows how to open, or name a
+ /// handler that is not there; [`Error::Store`] when the store cannot be opened or migrated;
+ /// whatever the worker itself fails at.
++#[instrument(name = "run", skip_all, fields(run.id = %run.as_str()))]
+ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+     let store: Arc<dyn Store> = open_store(&config).await?;
+     // Every start, against a database that is usually already current: the second run has to change
+@@ -61,25 +70,30 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+     let handler = handler::for_config(&config)?;
+     let settings = worker_settings(&config);
+     let queues: Vec<&str> = config.worker.queues.iter().map(Queue::as_str).collect();
+-    let worker = Worker::new(store, handler, settings);
++    // The store is shared rather than handed over: the last thing this run does is ask it what the
++    // queues now hold (see the sample below), and the worker needs the same handle.
++    let worker = Worker::new(Arc::clone(&store), handler, settings);
+     let shutdown = Shutdown::new();
++    let running = tracing::Span::current();
+ 
+     // The signal becomes the worker's own signal: one shape for "stop claiming", whoever sent it,
+     // which is what lets the loop be tested without a process to send anything to.
+-    let signalling = tokio::spawn({
+-        let shutdown = shutdown.clone();
+-        async move {
+-            shutdown_signal().await;
+-            shutdown.trigger();
++    let signalling = tokio::spawn(
++        {
++            let shutdown = shutdown.clone();
++            async move {
++                shutdown_signal().await;
++                shutdown.trigger();
++            }
+         }
+-    });
++        .instrument(running.clone()),
++    );
+ 
+-    let draining = tokio::spawn(async move { worker.run(shutdown).await });
++    let draining = tokio::spawn(async move { worker.run(shutdown).await }.instrument(running));
+ 
+     // Announced *after* the worker is running, so that the line a supervisor waits for means what it
+     // says: a process that has said this claims work.
+     tracing::info!(
+-        run = %run,
+         queues = %queues.join(","),
+         batch = config.worker.batch,
+         worker = %config.worker.name,
+@@ -97,7 +111,6 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+     };
+     signalling.abort();
+     tracing::info!(
+-        run = %run,
+         claimed = report.claimed(),
+         succeeded = report.succeeded(),
+         failed = report.failed(),
+@@ -105,6 +118,15 @@ pub async fn serve(config: Config, run: RunId) -> Result<(), Error> {
+         handed_back = report.handed_back(),
+         "stopped"
+     );
++
++    // The last line a run writes about itself, and the sample a rule's window is made of one line
++    // at a time (`jobq/3.17-error-budget-alerts`): the counters live in the store rather than in
++    // this process, so what a run can honestly report is a *reading* — one line per queue the
++    // deployment drains, in family order, at zero for a queue that has seen nothing.
++    let readings = store.usage().await?;
++    for sample in signals::samples(&config.worker.queues, &readings) {
++        sample.emit();
++    }
+     Ok(())
+ }
+ 
+diff --git a/src/service/signals.rs b/src/service/signals.rs
+index 540a15e..b6b77f6 100644
+--- a/src/service/signals.rs
++++ b/src/service/signals.rs
+@@ -56,18 +56,6 @@
+ //!   and it is also a Tuesday: a rule that pages on it pages on every quiet hour and on every queue
+ //!   that has just been created. [`Budget::floor`] is the traffic a window needs before its share is
+ //!   read, and it is a number in the page rather than a default somebody has to know.
+-//!
+-//! # What is left to write
+-//!
+-//! Four bodies, and each of them is one of the decisions above:
+-//!
+-//! 1. [`signals`] — the families, with the names a rule writes and a help line each;
+-//! 2. [`Sample::emit`] — the line the process reports, one field per family;
+-//! 3. [`Attempt::emit`] — the line about one attempt: the fields a query needs, and the level;
+-//! 4. [`Budget::burn_between`] — what two readings of the counters say about the budget.
+-//!
+-//! Nothing declares this module yet: wiring it into `crate::service` is the first decision, and
+-//! until it is made the spec does not compile.
+ 
+ use crate::engine::{JobId, Queue, QueueUsage, Usage, WorkerId};
+ 
+@@ -174,12 +162,53 @@ impl Signal {
+ /// names, and a rule that reads one of them reads the name it was written for.
+ #[must_use]
+ pub fn signals() -> &'static [Signal] {
+-    todo!(
+-        "jobq/3.17-error-budget-alerts: the families — a name, a kind and a label set each, with \
+-         a help line that says what the number is"
+-    )
++    SIGNALS
+ }
+ 
++/// [`signals`], as the value every caller is answered with.
++///
++/// A constant rather than a literal inside the function: a reference to an array built in the body is
++/// a reference to a temporary, and the table is the same table for the life of the process.
++const SIGNALS: &[Signal] = &[
++    Signal::new(
++        "jobq_submitted_total",
++        SignalKind::Counter,
++        QUEUE,
++        "Jobs written into the queue, whether or not anybody claimed them.",
++    ),
++    Signal::new(
++        "jobq_claimed_total",
++        SignalKind::Counter,
++        QUEUE,
++        "Attempts a worker started.",
++    ),
++    Signal::new(
++        "jobq_succeeded_total",
++        SignalKind::Counter,
++        QUEUE,
++        "Attempts that finished their job.",
++    ),
++    Signal::new(
++        "jobq_failed_total",
++        SignalKind::Counter,
++        QUEUE,
++        "Attempts that reported a failure, whether or not the job was retried.",
++    ),
++    Signal::new(
++        "jobq_reclaimed_total",
++        SignalKind::Counter,
++        QUEUE,
++        "Attempts that ended without being finished or failed: a worker that stopped holding them, \
++         or a lease that ran out.",
++    ),
++    Signal::new(
++        "jobq_running",
++        SignalKind::Gauge,
++        QUEUE,
++        "Attempts claimed and not yet ended, which is the work holding a worker right now.",
++    ),
++];
++
+ /// The family a rule names, or `None` when this process does not export one.
+ ///
+ /// This is the rule a step's rules page is judged by: the leftmost column of a rule is a name from
+@@ -221,10 +250,16 @@ impl Sample {
+     /// The message is `signals`, and it is what a query selects on: one line per queue per report,
+     /// which is the sample a rule's window is made of.
+     pub fn emit(&self) {
+-        todo!(
+-            "jobq/3.17-error-budget-alerts: the sample — one field per family, named the way the \
+-             table names it, plus the label every family carries"
+-        )
++        tracing::info!(
++            queue = %self.queue,
++            jobq_submitted_total = self.usage.submitted(),
++            jobq_claimed_total = self.usage.claimed(),
++            jobq_succeeded_total = self.usage.succeeded(),
++            jobq_failed_total = self.usage.failed(),
++            jobq_reclaimed_total = self.usage.reclaimed(),
++            jobq_running = self.usage.running(),
++            "signals"
++        );
+     }
+ }
+ 
+@@ -331,10 +366,28 @@ impl<'a> Attempt<'a> {
+     ///   lines and a queue's counters are worth having together. What is deliberately *not* here is
+     ///   the payload (`crate::service::handler` explains why the row has it and a line does not).
+     pub fn emit(&self) {
+-        todo!(
+-            "jobq/3.17-error-budget-alerts: the line about one attempt — the fields a query needs, \
+-             the same ones on every outcome, and the level that says which outcome it was"
+-        )
++        match self.outcome {
++            Outcome::Succeeded => tracing::info!(
++                queue = %self.queue,
++                job = %self.job,
++                attempt = self.attempt,
++                worker = %self.worker,
++                outcome = self.outcome.as_str(),
++                reason = self.reason,
++                took_ms = self.took_ms,
++                "attempt settled"
++            ),
++            Outcome::Failed => tracing::warn!(
++                queue = %self.queue,
++                job = %self.job,
++                attempt = self.attempt,
++                worker = %self.worker,
++                outcome = self.outcome.as_str(),
++                reason = self.reason,
++                took_ms = self.took_ms,
++                "attempt settled"
++            ),
++        }
+     }
+ }
+ 
+@@ -396,10 +449,12 @@ impl Budget {
+     /// failure counter in this crate sees.
+     #[must_use]
+     pub fn burn_between(&self, earlier: &Usage, later: &Usage) -> Burn {
+-        todo!(
+-            "jobq/3.17-error-budget-alerts: the window — what each counter gained between two \
+-             readings, and which of those gains a budget counts as bad"
+-        )
++        let succeeded = later.succeeded().saturating_sub(earlier.succeeded());
++        let failed = later.failed().saturating_sub(earlier.failed());
++        let reclaimed = later.reclaimed().saturating_sub(earlier.reclaimed());
++        let bad = failed.saturating_add(reclaimed);
++        let total = succeeded.saturating_add(bad);
++        Burn::of(bad, total, *self)
+     }
+ }
+ 
+diff --git a/src/service/worker.rs b/src/service/worker.rs
+index 22f69e7..f49e907 100644
+--- a/src/service/worker.rs
++++ b/src/service/worker.rs
+@@ -44,6 +44,7 @@ use std::time::Duration;
+ use tokio::sync::watch;
+ use tokio::task::JoinSet;
+ use tokio::time::{Instant, sleep, timeout_at};
++use tracing::Instrument;
+ 
+ use crate::engine::clock::{Clock, SystemClock};
+ use crate::engine::domain::{Job, Queue, WorkerId};
+@@ -51,6 +52,7 @@ use crate::engine::error::Error;
+ use crate::engine::retry::{DEFAULT_ATTEMPTS, retry};
+ use crate::engine::store::{BoxFuture, Store};
+ use crate::engine::timers::ReadySet;
++use crate::service::signals::{Attempt, Outcome};
+ 
+ /// What a worker does with a job it has claimed.
+ ///
+@@ -357,12 +359,21 @@ impl Worker {
+         // renewed knows nothing about the thing that is running: a handler that takes longer than a
+         // lease has no way to say "still here", and the row would quietly become claimable by
+         // somebody else in the middle of the attempt it is describing.
+-        let renewing = tokio::spawn(renewing(
+-            Arc::clone(&self.store),
+-            self.settings.name.clone(),
+-            self.settings.lease,
+-            shutdown.clone(),
+-        ));
++        //
++        // Instrumented like every other task this loop starts: a span is context, and a task is a
++        // new context (`jobq/3.17-error-budget-alerts`) — a line about a renewal that nobody can
++        // trace back to the run that wrote it is exactly the line an operator needs after a
++        // duplicate-work incident.
++        let run = tracing::Span::current();
++        let renewing = tokio::spawn(
++            renewing(
++                Arc::clone(&self.store),
++                self.settings.name.clone(),
++                self.settings.lease,
++                shutdown.clone(),
++            )
++            .instrument(run.clone()),
++        );
+ 
+         while !shutdown.triggered() {
+             // Every turn starts here: a row whose lease ran out belongs to nobody, and the worker
+@@ -462,11 +473,18 @@ impl Worker {
+     /// The task owns clones rather than borrows (`Arc<dyn Store>`, `Arc<dyn Handler>`) because a
+     /// spawned task has to outlive the call that made it: that is what lets several jobs be handled
+     /// at once, and it is why the store the worker holds is shared rather than borrowed.
++    ///
++    /// It is also where the run reaches the line about one attempt: a task is a new context, so the
++    /// span the worker is running inside has to be put on it by hand (`jobq/3.17-error-budget-alerts`).
++    /// Without this the attempt lines of a deployment have no run id at all, and the query that goes
++    /// from "this queue is burning" to "these jobs" starts in a log where half the lines cannot be
++    /// attributed.
+     fn spawn_job(&self, jobs: &mut JoinSet<Result<Settled, Error>>, job: Job) {
+         let store = Arc::clone(&self.store);
+         let handler = Arc::clone(&self.handler);
+         let worker = self.settings.name.clone();
+-        jobs.spawn(async move { handle_one(store, handler, worker, job).await });
++        let run = tracing::Span::current();
++        jobs.spawn(async move { handle_one(store, handler, worker, job).await }.instrument(run));
+     }
+ 
+     /// Collect what a turn's tasks came to, and drain when the signal says so.
+@@ -545,6 +563,11 @@ enum Settled {
+ /// The settle is retried with the engine's own bound, because a settle is a transaction the database
+ /// can refuse for concurrency (`jobq/3.6-transaction-isolation`): the first attempt losing a race is
+ /// a second attempt, not a failed job, and the store is the layer that reports the difference.
++///
++/// Both endings are written by [`Attempt::emit`] rather than by two `tracing` calls here
++/// (`jobq/3.17-error-budget-alerts`): the fields a query needs about an attempt are one shape with
++/// one writer, so the line that answers "which jobs, and why" cannot be missing a field on one of
++/// the two paths.
+ async fn handle_one(
+     store: Arc<dyn Store>,
+     handler: Arc<dyn Handler>,
+@@ -552,11 +575,22 @@ async fn handle_one(
+     job: Job,
+ ) -> Result<Settled, Error> {
+     let id = job.id();
++    let queue = job.queue().clone();
++    let attempt = job.attempts();
+     let started = Instant::now();
+     match handler.handle(&job).await {
+         Ok(()) => {
+             retry(DEFAULT_ATTEMPTS, || store.complete(&worker, &id)).await?;
+-            tracing::info!(job = %id, worker = %worker, took = ?started.elapsed(), "succeeded");
++            Attempt::new(
++                &queue,
++                &id,
++                attempt,
++                &worker,
++                Outcome::Succeeded,
++                "",
++                elapsed_ms(started),
++            )
++            .emit();
+             Ok(Settled::Succeeded)
+         }
+         Err(error) => {
+@@ -564,13 +598,31 @@ async fn handle_one(
+             // and the budget decides whether another attempt is allowed.
+             let reason = error.to_string();
+             let state = retry(DEFAULT_ATTEMPTS, || store.fail(&worker, &id, &reason)).await?;
+-            tracing::warn!(job = %id, worker = %worker, reason = %reason, "attempt failed");
++            Attempt::new(
++                &queue,
++                &id,
++                attempt,
++                &worker,
++                Outcome::Failed,
++                &reason,
++                elapsed_ms(started),
++            )
++            .emit();
+             let _ = state.value();
+             Ok(Settled::Failed)
+         }
+     }
+ }
+ 
++/// How long an attempt took, in whole milliseconds.
++///
++/// A number rather than a formatted [`Duration`]: a query can add up numbers, and `1.2s` is a
++/// string a dashboard has to parse. The conversion cannot fail in any run a machine survives, and
++/// the saturated answer is what a clock that jumped backwards is reported as.
++fn elapsed_ms(started: Instant) -> u64 {
++    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
++}
++
+ /// Keep telling the store that the claims this worker holds are still alive.
+ ///
+ /// A renewal is not a settle: it moves an instant, not a state, and it is not retried. It must not
