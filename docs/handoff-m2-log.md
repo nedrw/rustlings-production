@@ -13,6 +13,7 @@
 - 第六段 · 2026-10 · 3.6–3.7（事务隔离、租约与恢复）
 - 第七段 · 2026-10 · 3.8–3.11（时钟注入、公平策略、cron、延迟定时器）
 - 第八段 · 2026-10 · 3.12–3.15，以及一个装不进“无特性”装配的夹具
+- 第九段 · 2026-10 · 3.16 交付、`selftest` 变慢的根因、以及 3.15 的一个真缺陷
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -366,3 +367,56 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   修复的验证全部改用 `/private/tmp/fixcheck2-target`（全新）重取。
 - **3.16（DLQ 工具）与 3.17（预算告警）的作业者已经在跑**（子 agent `475cb3f144864910`），任务书里写明了：不要改
   `tests/support/store.rs`（我在主树上动），需要的夹具辅助放新文件。
+
+## 第九段 · 2026-10 · 3.16 交付、`selftest` 变慢的根因、以及 3.15 的一个真缺陷
+
+### 做了什么
+
+- **3.16 作业者死了一次，换成单步重派后交付**（提交 `course(jobq/3.16-dlq-tooling)`，作业者 `2f3f05ae7dcb4410`）：
+  死掉的那个作业者（`475cb3f144864910`）在 rustfmt 附近停下，工作树里什么都没留下，但它的草稿
+  `src/engine/dlq.rs`（`revived(job, now)`：只有死信有第二次生命、计数保留而上限抬高、上次死因保留）在
+  `/private/tmp/jobq316-sol` 里，我把它收成 `/private/tmp/jobq-316-dlq-draft.rs` 交给新作业者。新作业者按草稿的脊梁交付：
+  `dead_letters()` 是一个 `JobFilter` 视图、`Store::replay` 是唯一回程（读锁下决定、行与迹同事务）、
+  `EventKind::Replayed`；步骤标题/`concepts`/`hints` 按“端口而不是 CLI”的实际范围改过。
+- **`selftest` 越来越慢的真因**（提交 `kiln(process)`、`kiln(mutants)`、`docs(m2)`，详见 handoff §4.4）：
+  超时只杀了直接子进程，`cargo test` 的**孙进程（测试二进制）变成孤儿**，卡死的那个活了 40 分钟，占一个核并握着共享
+  构建目录的锁，于是后面每一次命令、每个 worker 都变慢——每卡一次再漏一个，这才是“越来越慢”的真身；
+  修法是先收后代再一起杀（`ps` + `kill`，都是 POSIX）。第二个真因：一个变异体能让规格永不停（
+  `MemoryStore::claim` 的 `&&`→`||` 让过滤对所有行成立，规格的 `loop{claim;if empty break}` 永不空），
+  当时唯一的防线是全局 `--timeout` 300s × 最多 12 次；现在每个变异体限 `4×基线+15s`、整轮限 300s，报告里写
+  `did not finish within 25s` / `the walk took 60s`。第三个：取样里大多位置根本编不过（类型里的尖括号、`format!` 的 `!`、
+  闭包的 `||`、`==` 臂、构造子改写），修了表并把报告从 `文件:行` 改成 `文件:行:列`。
+- **3.15 的一个真缺陷**（提交 `course(jobq/3.15): a listing answers what this handle may see`）：
+  `MemoryStore::list` 只在注释里写了“按句柄的规则过滤”，实际只用了 `JobFilter`——租户句柄能列出别的租户的队列；
+  durable 那一侧绑了 `self.scope()`，一直是对的。3.16 的作者在自己的第一个草稿里撞上了（memory 红 / postgres 绿），
+  按规矩没动别人的产物。修法用文件里已有的 `visible_queues`（整个列表问一次，而不是每行问一次），
+  并把那个断言加到 **3.15 自己的规格**里，且写成用 conformance 夹具建库的形式——于是步自己的 `slow:conformance@2` 门会
+  在两个后端上跑它。`MemoryStore` 的 `list` 之外没有别的路径变。
+
+### 数字（原样）
+
+| 项 | 值 |
+| --- | --- |
+| 3.16 交付 | `selftest` 三遍（含全新缓存）`11/11 must green`；尾巴树 `cargo test -p jobq` **98 passed**（3.15 时 92），postgres 子集 `53 passed` |
+| 3.16 的运行时长（修完之后） | `selftest jobq/3.16-dlq-tooling` 带 11 个门（含 `slow:conformance@2`）≈ **1 分半**量级 |
+| `selftest` 基线 | 真课程 3.5 `19.7 s`、3.15 `25.6 s`（热缓存，`time` 墙钟）；同树 + `slow:conformance@2` `1 m 23 s` |
+| 修前的干跑（3.5 临时声明 `slow:mutants@80`） | **>30 min，两次，无结果**；修后 **`1 m 23 s` · 12/12 绿** |
+| 变异门报告（修后，阈值临时提到 `@101` 逼出来） | `1 of 6 mutant(s) survived (83% killed, needs ≥101%) (5 of 12 attempts could not be judged…; the walk took 60s)`；卡住的那个写成 `memory.rs:59:47 \`&&\` → \`||\` — did not finish within 25s` |
+| `kiln` 自己 | `cargo test -p kiln` **271 + 21 + 1**；新增回归：`sh -c 'sleep 37'` 被超时后 `ps` 里不能再有它、两个时钟的纯函数、报告列号 |
+| 3.15 修复的牙 | 回退修复 → 新用例红（`the memory backend answered ["acme-mail", "bob-mail"] instead`）；修复后 `spec_cli` 两后端各 `7 passed`；尾巴树 **99 passed · 0 failed**、postgres 子集 **66 passed · 0 failed** |
+| 3.15/3.16 重验 | `selftest jobq/3.15` 两遍（含全新缓存）`10/10`；`jobq/3.16` `11/11`（证明 3.16 的补丁仍能落在被改过的 `memory.rs` 上） |
+
+### 坑与判读
+
+- **改了早期步骤的产物，就要重跑后期的 `selftest`**：3.15 的参考解改了 `MemoryStore::list`，而 3.16 的参考解也在同一文件里
+  加 `Store::replay`——两个补丁共用上下文。重跑 `selftest jobq/3.16`（它按序应用 3.1–3.16）才证明“改早期不破后期”。
+- **规格是 `.rs` 文件，`fmt` 是项目门**：手写的新用例没排过格式，`fmt` 门直接挂了（输出里就是 rustfmt 的 diff）；
+  课程侧的规格要用 `rustfmt --config-path rustfmt.toml --config skip_children=true` 过一遍再钉 hash。
+- **工具的进程模型是真实成本**：这次两个“越来越慢”都不是算法问题，而是*进程与锁*的问题——
+  超时漏孤儿、孤儿握锁。以后遇到“同一条命令以前跑得快”，先看 `ps`，再看算法。
+- **子 agent 的死亡是有规律的**：死在长命令和大输出附近（rustfmt、`cargo test` 全量、`selftest`）。
+  新任务书里已经写死：输出重定向到文件、只看尾部、不在一个任务里做两步、每个产物一做好就提交。
+- **两处没动的事**：① `3.15` 的 FURTHER 还写着“3.16 是让这个语法长大的地方（两个对死信下手的命令）”，而 3.16 按任务书
+  只做了端口一层，没加 CLI 命令——要么改那句话，要么把 CLI 那一半单独开一步（需要用户定）；
+  ② `course/probes/ops-dlq-tooling.apply.rs` 考的是 `Dlq::inspect/replay/discard` 与审计行，比 3.16 实际交的面大，
+  它的参考解仍能过，但探题与步骤现在描述的是同一槽位的两半。
