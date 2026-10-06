@@ -78,7 +78,9 @@ T3 是一个用步一层层长出来的**任务队列引擎**：一个库（引�
 
 ## 6. T3 范围内剩下的缺口
 
-- `slow:?coverage@80` 在本机永远是 `blocked`（没装 `llvm-tools-preview`）；安装后它的测量路径仍未端到端验证过。
+- `slow:?coverage@80` 的测量路径 2026-10 跑通（装了 `llvm-tools-preview`），过程中修掉门里四个真缺陷（handoff §5.2）。真实数字：
+  3.21 **80%**、3.23 100%、3.24 95%、3.25 87%、3.27 85%、**3.26 36%**（模块含 `src/cli/**`，规格只驱动库那层）、3.22 `blocked`。
+  待做：让插桩构建跑在项目副本里。
 - `mutants` 的模块是“补丁碰过的整份文件”： 3.23 的 5/6 与 3.26 为别人的文件补的三条用例都是这个规则的代价。
 - durable 的 cap 在**并发** claim 下仍可能各读同一份余量（handoff §5.2 记了窄窗口）。
 - ~~`ops/dlq-tooling@operate` 没有同深度探题~~ 已补（`course/probes/ops-dlq-tooling.operate.rs`，题库 41 道）。

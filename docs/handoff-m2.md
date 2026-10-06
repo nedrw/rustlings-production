@@ -691,7 +691,13 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **M2 收尾（已做完的）**：验收演练五条腿全有原始行（§4.3）；`cargo xtask ci` → exit 0（`27/27 step(s) hold the contract`，32 m 12 s）；
   `docs/t3-jobq.md` 已写（与 `t1-mailer.md`/`t2-relay.md` 同构）；`README.md` 的 track 表与 Status、`plan.md` §11、`curriculum.md` §8 的数字已同步。
 - **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
-  ② `ops/dlq-tooling@operate` 的同深度探题（要么补一道，要么在 §5.1 写明为什么没有）；③ `coverage` 装上 `llvm-tools-preview` 后那条测量路径的端到端验证；
-  ④ ~~3.23 的 `slow:mutants@80` 83%~~ **已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
+  ② ~~`ops/dlq-tooling@operate` 的同深度探题~~ **已补**（`ops-dlq-tooling.operate`，题库 41 道）；③ **`coverage` 测量路径已跑通**（装了 `llvm-tools-preview`），并找出四个真缺陷（`kiln(coverage)` 两笔）：
+   ① 门把 `rustc` 探针跑在临时目录，那里 `rust-toolchain.toml` 不生效 → 问的是默认工具链，于是为 pinned 工具链装了工具的机器上永远 `blocked`（更糟：默认工具链恰有工具时会用**另一个 LLVM**读 profile）；
+   ② `llvm-cov export` 在 LLVM 22 里是 `--summary-only`，不是 `--summary`；
+   ③ 导出文档含所有依赖源码 → 超过 kiln 的 256 KiB 读取上限 → 截断后解析失败；现在只留本棵树（`--ignore-filename-regex`）；
+   ④ 共享构建槽让插桩结果来自**另一个沙箱** → 现在守卫：模块路径不落在本棵树内判 `blocked` 并说明，而不是给别的树的百分比。
+   **第一份真实覆盖数字**（should 门）：3.21 **80%**（165/204 刚好在线）、3.23 **100%**、3.24 **95%**、3.25 **87%**、3.27 **85%**、**3.26 只有 36%（847/2345，模块含 `src/cli/**` 而规格驱动的是库那层）**、3.22 `blocked`。
+   **待做**：让插桩构建跑在项目副本里（像 mutants），共享槽就彻底不参与。
+  ④ 3.23 的 `slow:mutants@80` **已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
      存活变异体是 `schema.rs:238:36` 的 `self.batch.max(1)`（`1` → `0`），症状是**死循环**；新用例把 `plan()` 放进带上限的线程里（5 s 截止），
      于是一个“永不推进的宽度”变成**失败的断言**而不是挂死——强制把阈值提到 `@101` 复核时读到 `0 of 6 mutant(s) survived (100% killed)`。
