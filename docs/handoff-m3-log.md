@@ -340,3 +340,73 @@ zstd round trip: 65536 byte(s) -> 270 byte(s) (0.4% of the original)
 
 （`crc32fast` 4.1 已经在用，`turmoil` 见段 6：两个 registry 源都在这台机器的缓存里，所以到 4.7 为止的
 依赖集不需要网络。）
+
+## 段 9：`lakelet/4.4-wal-recovery`（B1 的第三步，`slow:sim@3` 第一次真跑）
+
+**做了什么**：`store/wal-recovery@apply` 由子 agent 交付（提交 `f4f066a`，3191 行新增）——**第一次派发因
+provider 连接错误失败、没留下任何东西**（worker 是隔离工作树、只在成功时合并），第二次成功。交付物：
+记录格式（`LKLT` + 版本头、`[length][payload][seal]`）、`wal::{checksum,segment,replay}.rs`、
+`src/engine/spool/recover.rs`（scaffold 新建的契约文件，`Spool::recovered`）、四种死法的 turmoil 装置
+`tests/sim_wal.rs` + `sim/4.4-wal-recovery.toml`、14 个用例的规格（含两个穷举扫描）、正文（deepen 模板）、
+以及骨架的 `[dev-dependencies]` 标记块与 `Service::restart` 夹具。
+
+**规格的四条不变量**：① 记录自描述且校验和覆盖**长度**（只覆盖载荷的话，被改的长度会把记录末端挪到
+seal 还盖得住的地方，恢复就会把别人的字节当成记录交出来）；② 恢复只回放前缀、在第一个无法证明的记录处
+**停下**（跳过比短更糟）；③ `durable_offset` 就是承诺的边界，开库即恢复并把拒绝的尾巴切掉，下一次 append
+从恢复到的末端继续；④ **每个截断点**（0 字节到整文件）都恢复成记录的前缀——两个扫描用例，一个是
+`segment::scan`（20 条记录的全部前缀），一个是 `Spool::open`（一个 store 的全部切点）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+selftest：4.1 9/9 · 4.2 10/10 · 4.3 9/9 · 4.4 10/10 must green（scaffold ✓ / solution ✓ / hold the contract）
+check 4.4 --slow：✓ slow:sim@3  3 seed(s) ran, transcripts 1fcbf0d8/9938dcf4/a4486a02 — seed 1 replayed identically (2s)
+                  ✓ slow:mutants@80 5/6 mutant(s) killed (83%, needs ≥80%) (10s)
+                  ✓ slow:?coverage@80 142 of 151 line(s) (94% ≥ 80%)
+                  11/11 must gate(s) passed · 1 should gate(s) run · real 44.5s
+                  （这一行是撤掉 `links` 之前取的；撤掉后 selftest 是 `10/10 must green`，见下面第 3 条）
+sim（app/lakelet 里）：seed 1 跑两遍 → 54 行 `lakelet-sim` 逐字节相同；seed 7 → 第 1 行起就不同
+  lakelet-sim recovered kind=process records=12 bytes=593 discarded=0 stop=end
+  lakelet-sim recovered kind=torn    records=13 bytes=642 discarded=24 stop=torn
+  lakelet-sim recovered kind=rewrite records=14 bytes=691 discarded=49 stop=corrupt
+  lakelet-sim recovered kind=machine records=16 bytes=789 discarded=0 stop=end
+  lakelet-sim done records=17 flushes=7 deaths=4
+演练（把“停下”改成“跳过”：信任长度继续走）：
+  spec → FAILED. 12 passed; 2 failed（点名 a_flipped_byte_ends_the_replay_at_the_record_it_changed 与
+         a_record_the_replay_cannot_prove_is_not_skipped_over）
+  sim  → 红：`restart` was refused: kind=rewrite: … the replay says it proved every record (0 discarded, `end`)
+  回滚 → spec 14 passed；sim 1 passed；check --slow 回到全绿
+全局：lint-caps no issues · links 94 page(s)/476 link(s) 全解析 · i18n 0 error · probe 41/41 ·
+      cargo test -p kiln 317+21+1 · clippy --workspace --all-targets -D warnings exit 0 · 工作树无 target/
+```
+
+**这一段钉下来的五件事**：
+
+1. **4.3 的两个开口都按“让承诺变真”收口**：停机路径真的 flush（任何策略）并记
+   `flushed the store written=… durable=…`，开库记 `store recovered records=… bytes=… discarded=…`；
+   `docs/crash-points.md` 第 6 条（原先写“干净停机其实不 flush”）被改写，而不是留一个没人关的窗口。
+   实现放在 `Spool::recovered()`（引擎侧）而不是引擎的日志器，4.1 的“引擎不碰服务层”边界保持成立。
+2. **四种死法，第四个是实测逼出来的**：只有截断类死法（进程/机器/撕裂）时，“跳过无法证明的记录”这个
+   缺陷对 `slow:sim@3` **不可见**（子 agent 实测：spec 红、三个种子全绿）——因为截断总是让扫描在
+   “长度/载荷不全”处就停下（`Stop::Torn`），根本走不到 seal 检查。加上 `rewrite`（整写落盘但一个字节
+   变了）之后三个种子都会红。我复核了这个方向：那种“跳过”注入确实同时点亮 spec 两条用例与 sim。
+3. **梯子回到计划**：作业书里我把 4.4 的门写成“九个快 + 三个慢、期望 12/12”，子 agent 因此补了 `links`。
+   但 `m3-plan.md` §6 明写“`links` 只写在真交页面的步骤上”，4.4 不在名单里——它不交新页面，只是**编辑**
+   4.3 的 `crash-points.md`。那页的链接由 4.3 的门在**最终树**上看着（实测：4.3 的 `links` 在 4.4 铺完后
+   报 `12 link(s) in 4 page(s)`，此前是 9），所以把 `links` 从 4.4 的清单里撤掉、selftest 回到
+   `10/10 must green`（提交 `c01cdc2`）。**教训是我的作业书要对着计划核门数，不能凭上一步的清单推**。
+4. **一个只有课程作者才会踩的坑**：`kiln run <step>` 不会覆盖学员已有的文件，所以课程自己改装置
+   （`tests/sim_wal.rs` 这类 scaffold 送进项目的文件）之后，老 `app/<track>/` 里那份**旧的**还在，门判的是
+   旧装置。子 agent 实测：digests 从 `5dd009a0/eddf61b3/fd32e3d5` 变成 `1fcbf0d8/9938dcf4/a4486a02`，
+   中间只删了 `app/lakelet/tests/sim_wal.rs` 再 `kiln run`。已写进 handoff-m3 §1。
+5. **一个不可杀的变异体**：`src/engine/spool.rs:125` 的区间判断（`>=` → `>`）只有在 `elapsed() == millis`
+   恰好相等时才不同，真实时钟上做不出来（4.3 的规格本来就拒绝断言“区间什么时候 flush”，authoring §6.4
+   禁止靠 sleep 同步）。83% 过线，记在提交正文里，没有用 flaky 用例去凑。
+
+**CI 预算的第一个实测数**：4.4 的 `--slow` 全程 **44.5 s**（mutants 10 s、sim 2 s，其余是 coverage 的插桩
+构建）。计划里按 T3 外推的“mutants 60–90 s/步、12 步 12–18 分钟”因此偏悲观——`kiln` 自己实现变异、每步
+最多判 6 个、复用一份副本，12 步的实测预估 ≈ 2 分钟。§6 的那行已按实测改。
+
+**下一步**：B1 到此结束（4.1–4.4）。给开发者 B1 检查点报告；随后 B2 从 `4.5-batch-writes` 开始
+（`io/batching@design`、`slow:bench-budget@10` 第一次上场，车道是计数不是时间：`<track>-budget <name>=<value>`
++ 课程侧 `budget/4.5-batch-writes.toml` 的 `[metric]` 基线，`_max` 结尾的只许变小）。

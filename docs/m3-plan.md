@@ -47,7 +47,7 @@
 | 4.1 | `4.1-ingest-protocol` | `ingest/protocol@apply` | **transfer** | — | `src/protocol/**`（长度前缀 + 校验 + 版本字）、`src/service/{config,logs,ingest}.rs`、`src/bin/{lakeletd,lakelet-load}.rs`、`tests/support/**`、`docs/protocol.md`；骨架 = 整个项目 |
 | 4.2 | `4.2-parser-fuzz` | `test/fuzzing@apply` | teach | `slow:fuzz@N` + `slow:?coverage@80` | `tests/fuzz_protocol.rs`（课程装置）、`src/protocol/mutate.rs`、学员的回归语料 `tests/corpus/**` |
 | 4.3 | `4.3-write-path-adr` | `store/wal-recovery@aware` | teach | — | `src/engine/wal/policy.rs`（fsync 策略作为数据，类型名是 `Policy`；`Policy::DEFAULT = interval(50ms)` 由实测推出）、`src/engine/spool/durable.rs`（scaffold 新建的契约文件：六个方法签名 + `todo!()`，因为骨架的 `spool.rs` 不能被插入可被改写的桩——见 authoring.md §5 规则 6）、`docs/adr/0001-write-path.md`、`docs/crash-points.md` |
-| 4.4 | `4.4-wal-recovery` | `store/wal-recovery@apply` | deepen | `slow:sim@3` + `slow:mutants@80` + `slow:?coverage@80` | `src/engine/wal/{mod,segment,replay,checksum}.rs`、`tests/sim_wal.rs`（turmoil 场景）、崩溃点语料 |
+| 4.4 | `4.4-wal-recovery` | `store/wal-recovery@apply` | deepen | `slow:sim@3` + `slow:mutants@80` + `slow:?coverage@80` | `src/engine/wal/{mod,segment,replay,checksum}.rs`、`src/engine/spool/recover.rs`（scaffold 新建的契约文件：`Spool::recovered`，见 authoring.md §5 规则 6）、`tests/sim_wal.rs`（turmoil 场景，四种死法：进程/机器/撕裂/改写）、崩溃点语料 |
 | 4.5 | `4.5-batch-writes` | `io/batching@design` | teach | `slow:bench-budget@10` | `src/engine/flush/{mod,batcher}.rs`、`tests/budget.rs`（课程装置）、`docs/write-amplification.md` |
 | 4.6 | `4.6-ingest-backpressure` | `async/backpressure@design` | deepen | `slow:sim@3` | `src/service/backpressure.rs`（有界队列 + `Block/DropNewest/DropOldest/Sample` 策略）、`tests/sim_backpressure.rs` |
 | 4.7 | `4.7-columnar-segments` | `store/columnar@apply` | teach | `slow:bench-budget@10` + `unsafe-budget@0` | `src/engine/segment/{mod,encode,decode,compress}.rs`、`docs/format.md` |
@@ -213,8 +213,9 @@ T4 的起点与差异：
 - **`slow:bench-budget@P` 从 4.5 起**（写放大是第一个“代价可数的”主题），之后按上表逐步出现。
 - **`slow:mutants@80` 只在 12 个步骤上**（4.2、4.4、4.7、4.9、4.10、4.11、4.12、4.13、4.14、4.17、4.19、4.21）：
   它是步骤作用域质量门（plan §6 的“持久属性”名单里没有它），判的是“这一步的规格有没有说服力”，
-  挑的是模块正确性关键、且规格强度就是这一步的主题的步骤。**估算代价**：T4 的模块比 T3 大，按 T3 实测（13–38 s/步）外推 60–90 s/步，
-  ≈ 12–18 分钟进 CI。见 §7 D-1（备选是全步累积 ≈ 21–30 分钟，或不带）。
+  挑的是模块正确性关键、且规格强度就是这一步的主题的步骤。**代价：计划按 T3 实测（13–38 s/步）外推了
+  60–90 s/步、≈ 12–18 分钟进 CI，但 4.4 实测只要 10 s**（kiln 自己实现变异、每步只判最多 6 个、复用同一份
+  副本），所以 12 步的实测预估降到 ≈ 2 分钟——CI 预算比计划乐观得多。见 §7 D-1。
 
 ## 7. 决策点（要你拍板的）
 
