@@ -255,7 +255,7 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 
 两条实用规则：
 
-1. **快闸门优先**：普通步骤 `kiln run` 目标 < 60 秒；慢闸门标 `slow`，只在 `kiln verify --slow` 跑。反馈速度就是 rustlings 的全部魔力。
+1. **快闸门优先**：普通步骤 `kiln run` 目标 < 60 秒；慢闸门标 `slow`，只由 `kiln verify --slow` / `kiln check --slow` / `selftest` 跑。反馈速度就是 rustlings 的全部魔力。
 2. **panic 政策要讲清楚**：启动期早失败（缺配置、端口占用）允许 panic + 注释；请求路径上不允许。闸门按此实现，而不是一刀切禁止 panic，否则学员学到的是坏习惯。
 
 还有一条关于**闸门作用域**的澄清（M0 第一段的实测反馈）：
@@ -343,7 +343,7 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 - **外部工具缺失当成一等公民**：本机只装了 `cargo clippy`/`fmt`/`watch`/`expand`，`nextest`/`llvm-cov`/`mutants`/`deny` 全未装。闸门必须先探测工具，缺失时报「跑 `cargo install cargo-mutants`」这类可执行指令，而不是抛退出码；`kiln doctor` 一次性列出全部缺失项与安装命令。
 - **`must` 慢闸门不许需要未安装的工具**（M2 定下，plan §6 的表按此实现）：`mutants`/`bench-budget`/`semver`/`unsafe-budget`/`conformance` 都由 `kiln` 自己用编译器、课程目录里的基线文件与确定性计数判定；`cargo-mutants`/`cargo-semver-checks`/`cargo-llvm-cov`/`cargo-deny` 是生产里的做法，写进正文与 `doctor`，但不是判据。缺口工具能改变的只有一件事：`coverage` 与 `deny` 是 `should`，缺工具时 `⚠ blocked` 并给出安装指令。
   - 可复现性的三个来源：判据是**编译器与计数**（没有一项看墙钟时间或网络）；取样是**确定性**的（变异体按源序等距取前 6 个，预算基线是课程文件，后端列表是项目文件）；**工具缺失不改判**（`must` 不依赖外部工具，`should` 缺失时只警告）。
-- **慢闸门的分工与耗时**（M2 实测口径）：`mutants` 每步最多 6 次规格运行（在复用同一份沙箱复制品上增量重编）；`bench-budget` 一次 harness；`conformance` 每个后端一次规格运行；`coverage` 在工具链没有 llvm-tools 时零成本跳过。它们在 `kiln run`/`check` 这类快路径上**一次也不跑**（`slow:` 前缀由 runner 跳过），回归保护靠 `verify --slow` 与 `selftest`。
+- **慢闸门的分工与耗时**（M2 实测口径）：`mutants` 每步最多 6 次规格运行（在复用同一份沙箱复制品上增量重编）；`bench-budget` 一次 harness；`conformance` 每个后端一次规格运行；`coverage` 在工具链没有 llvm-tools 时零成本跳过。它们在 `kiln run`/`check` 这类快路径上**一次也不跑**（`slow:` 前缀由 runner 跳过；`check --slow` 是按需入口，跑的是同一个集合），回归保护靠 `verify --slow` 与 `selftest`。
 
 ### 依赖版本基线（已核对 crates.io，2026-10）
 

@@ -25,6 +25,7 @@
 - 第十八段 · 2026-10 · “coverage 应该如何提高”：先量，然后发现门丢掉了子进程的 profile
 - 第十九段 · 2026-10 · 用户定下 coverage 的模块规则（方案 ③），以及一次被中断的 CI
 - 第二十段 · 2026-10 · “覆盖率为什么不前置”：解释清楚了，不前置
+- 第二十一段 · 2026-10 · 一份独立 review 的十项发现：A/B/C/E 落地，D 待定
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -756,6 +757,40 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   但 `sandbox::copy_project` 的定义就是“把每个拷进来的文件盖到未来一秒”，于是**所有**被复制的文件都满足它。
   结论：要么让那些文件根本不在副本里（把 `.profraw` 排除），要么用“运行中出现”的集合差，不要拿时间戳跟一个盖戳步骤比。
 - **边界写进契约、不装作解决**：现在收的是“被测量树里出现的 `.profraw`”；如果某个规格把子进程的 cwd 设到树外（目前没有），那份数据仍然收不到（§1.3）。
+
+## 第二十一段 · 2026-10 · 一份独立 review 的十项发现：A/B/C/E 落地，D 待定
+
+### 做了什么
+
+- 用户要求“review 一下之前的 review 结果，然后提出修改方案”：我读了那个 review 线程（`Measure coverage over what a step brings`，它自己没有文件改动），
+  逐条核过它的证据（SAFETY 窗口的四处、`executables` 的扫描面、模块后缀匹配、`copy_project` 的 `file_type`、两个无锁目录、`RUSTFLAGS` 的来源、`Scaffold::Skeleton`），
+  然后给了分批方案：A（探题对齐，单独一笔）+ B（coverage 两处口径）+ C（符号链接 / 骨架步）+ D（rustflags 边界 + 共享目录的锁）+ E（`check --slow`）。
+- 用户批复“按你建议拉一个子agent开始”：派一个 worker 做 A+B（任务书里带了环境事实、验收命令、“一批一提交”、“卡住就停并报告”），
+  我自己接了 C 与 E（它们与 worker 改的文件不重叠，合并是干净的）。
+- 落地（都在 `main`，工作树干净）：
+  - **A** `5dbe3c7`（worker）：探题与参考解都改成“标记必须在**上面**三行”，`reason_above` 的窗口去掉 `=index`；
+    反例用例的**形状**与任务书写的不一样（worker 报告）：探题只认行首的 `// SAFETY:`，所以“行尾同行标记”不成立；
+    真正的反例是“这一行既是使用、又是它自己的标记”（扫描按词计数，标记行里的 `unsafe` 也算一处）。
+  - **B** `788705e`（worker）：`executables_of_the_run` 同时读构建根与 `deps`（同一把尺：非递归、可执行位、`mtime ≥ since`）；
+    模块路径改成 `strip_prefix` 相等（副本外仍是故障、副本内但不是那个文件则忽略）。两条单测都能区分（把任一处改回去，对应用例会红）。
+  - **C** `35ec238`（我）：`copy_project` 跟随符号链接（`fs::metadata`）+ 已走目录集合防环；骨架步按“自己补丁碰过的文件”判（文档 + 单测钉住，理由见 §5.2）。
+  - **E** `d49b4c1`（我）：`check --slow` 跑与 `verify --slow`/`selftest` 同一集合；顺手修了汇总行把“没跑的门”当“未实现”的两个计数
+    （`--slow` 下的 `11/10`，以及快路径下把两个跳过的慢门报成“catalogue gate(s) not implemented yet”）。
+  - `c9146b2`（我）：探题里残留的 `at or above` 断言文案。
+- **合并方式**：worker 的两笔以“内容”到达我的工作树（不带提交），按老规矩 `git stash push -u` → `git cherry-pick bf36acc 9947ece` → 比对两次 diff **逐字节一致** → `git stash drop`。
+- **复核（我独立重取）**：`cargo test -p kiln` → **285 + 21 + 1**；`kiln probe --check` → **41/41**；
+  尾巴树 `verify jobq --slow --json` → exit 0 · **7 m 21.7 s** · 27/27 `clean`，七条 coverage 与八条 mutants 走法数字逐条不变；`check jobq/3.21-coverage-policy --slow` → **1 m 38 s**。
+- **待定**：D（#5 两个共享构建目录的锁、#6 `RUSTFLAGS` 与 `.cargo/config.toml` 的边界）——两条都需要取舍（有界等待后 `blocked` / 检测到就 `blocked`），
+  且只在人工并发或项目自配 rustflags 时触发；先把边界写进 §1.3，等用户定。
+
+### 坑与判读
+
+- **review 的一条建议会重新引入刚修掉的缺陷**：#7 建议“骨架步列出整块骨架”，而骨架带着整条 track 的 stub
+  （`src/engine/error.rs` 是 3.3 的题目、`src/bin/jobqd.rs` 很后面）——列进去就是把别步的代码算进第一步的分母。改成写清楚 + 单测钉住。
+- **任务书不能代替读代码（worker 的两处修正）**：探题的标记必须是行首（所以我给的反例形状不成立）；
+  `Path::ends_with` 是按路径组件比的（所以 `xsrc/store.rs` 从来不是误报，只有 `backup/src/store.rs` 那类才是）。
+- **`check --slow` 暴露了两个旧计数错**：汇总行过去把跳过的慢门算成“catalogue gate(s) not implemented yet”——
+  学员在快路径上一直看着一行不实的提示；现在按“跑过的门”计数，并把跳过的慢门单独列出来。
 
 ## 第十九段 · 2026-10 · 用户定下 coverage 的模块规则（方案 ③），以及一次被中断的 CI
 

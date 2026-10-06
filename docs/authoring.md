@@ -213,7 +213,7 @@ track 骨架的规则与 patch 的规则一样）。
 | `clippy@2` | must 闸门，参数 `2`（lint 阶梯） |
 | `mutants:80` | must 闸门，参数 `80`（阈值） |
 | `?pedantic` | **should** 闸门：告警不阻塞 |
-| `slow:mutants` | 慢闸门：只在 `kiln verify --slow` / `selftest` 跑 |
+| `slow:mutants` | 慢闸门：只由 `kiln verify --slow` / `kiln check --slow` / `selftest` 跑 |
 
 规则：
 

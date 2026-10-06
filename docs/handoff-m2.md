@@ -33,7 +33,7 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
   `⚠ blocked` + 可复制的安装指令，**绝不把一步变红**。
 - **must 的慢闸门必须确定性**：不允许把墙钟时间当作判据（共享机器上必然假红），判据是**计数**
   （语句数、单元格扫描数、杀死/存活的变异体数、编译成败）。
-- **快路径 `<60s` 不动**：所有慢闸门都带 `slow:` 前缀，只由 `kiln verify --slow` 与 `selftest` 跑。
+- **快路径 `<60s` 不动**：所有慢闸门都带 `slow:` 前缀，只由 `kiln verify --slow`、`kiln check --slow` 与 `selftest` 跑。
 
 ### 1.2 分级表（写进 plan.md §6 的表）
 
@@ -768,7 +768,20 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   #1 探题把 `// SAFETY:` 的窗口教成“含同行”、#2 `executables` 只扫 `target/debug/deps`、#3 模块匹配是字符串后缀、
   #4 `copy_project` 静默跳过符号链接、#5 两个共享构建目录无锁、#6 `RUSTFLAGS` 会覆盖项目 `.cargo/config.toml` 的 `build.rustflags`、
   #7 骨架步的模块口径、#8 方案 ③ 那笔的 CI 数、#9 `kiln check` 没有 `--slow`、#10 上面那条（已定：不做）。
-  处理：#4 与 #7 已落地（提交 `35ec238`）；#1 与 #2/#3 由 worker 施工中（数字补在本条）；#5/#6（一批）与 #9 待定；#8 随本轮收尾的 CI 补。
+  **已落地**：#1（`5dbe3c7`：探题与参考解都改成“只认上面三行”，并加了一条“标记就在使用的那一行”的反例用例——
+  修前 `probe --check` 对它就报 `0 reference(s) passed`；探题与参考解的测试模块逐字节一致）、
+  #2/#3（`788705e`：`executables_of_the_run` 同时读构建根与 `deps`；模块路径改成 `strip_prefix` 相等，落在副本外仍是故障、落在副本内但不是那个文件则忽略）、
+  #4/#7（`35ec238`）、#9（`d49b4c1`：`check --slow` 跑与 `verify --slow`/`selftest` 同一集合；
+  顺手修了汇总行把“没跑的门”当成“未实现”的两个计数，现在分列 `slow gate(s) skipped` 与 `catalogue gate(s) not implemented yet`）、
+  `c9146b2`（探题里还留着一条 `at or above` 的断言文案）。
+  **待定**：#5/#6 一批（见下一条）；**#8 随本轮收尾的 CI 补**。
+  **复核数字**（我独立重取）：`cargo test -p kiln` → **285 + 21 + 1**；`kiln probe --check` → **41/41**；
+  尾巴树 `verify jobq --slow --json` → exit 0 · **7 m 21.7 s** · `{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`、
+  七条 coverage 与八条 mutants 走法的数字逐条不变（204/204、64/64、237/237、205/215、293/334、307/325、121/141）；
+  `check jobq/3.21-coverage-policy --slow` → 1 m 38 s。
   **#7 的处理与 review 的建议不同**（它建议列出整块骨架）：骨架是课程的起始材料，它带的那批 stub 大多属于后面的步骤
   （jobq 的骨架含 `src/engine/error.rs`（3.3 的题目）与 `src/bin/jobqd.rs`（很后面）），列进去就会把别步的代码算进第一步的分母——
   正是方案 ③ 刚修掉的缺陷；所以现在是把“骨架步按自己补丁碰过的文件判”写进 `sources.rs` 的文档并用单测钉住。
+- **一条记下来的小瑕疵（review 作者发现，未修）**：`probe --check` 在红的时候会把**比实际红的多**的探题算成失败——
+  它按“目标文件名出现在 cargo 输出里”归因，而 `sec-authz-tenant-isolation.apply` 会因为自己的 `unused_must_use` 警告被点进去。
+  总数（`N reference(s) passed`）是准的，看名单时要打个折扣。
