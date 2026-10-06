@@ -328,3 +328,15 @@ $ CARGO_NET_OFFLINE=true XDG_CACHE_HOME=/private/tmp/xdg-offline43 kiln selftest
 `{passed: 24, failed: 0, blocked: 0, not_authored: 0, clean: true}`，`cargo xtask ci` 要 exit 0 且末行是
 `24/24 step(s) hold the contract`。两条都必须从**scratch 副本**里跑（`kiln` 会把项目命令的
 `CARGO_TARGET_DIR` 清掉，工作树里不许出现 `target/`，见 handoff-m3 §1 第 1 条）。
+
+腿 1 的依赖面又多测了一个：4.7 要引入的 `zstd`（新依赖，带 C 源码的 `zstd-sys`）在**冷目标目录 + `--offline`**
+下 4.25 s 构建并跑通一次压缩往返（9 个 crate 编译，`zstd-sys v2.1.0+zstd.1.5.7` 走 `cc`）：
+
+```
+$ cd /private/tmp/zstdprobe && CARGO_TARGET_DIR=/private/tmp/zstdprobe-cold cargo run --offline
+   Compiling zstd-sys v2.1.0+zstd.1.5.7 … Compiling zstd v0.13.3 … Finished `dev` profile in 4.25s
+zstd round trip: 65536 byte(s) -> 270 byte(s) (0.4% of the original)
+```
+
+（`crc32fast` 4.1 已经在用，`turmoil` 见段 6：两个 registry 源都在这台机器的缓存里，所以到 4.7 为止的
+依赖集不需要网络。）
