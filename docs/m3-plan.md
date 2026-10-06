@@ -46,7 +46,7 @@
 | --- | --- | --- | --- | --- | --- |
 | 4.1 | `4.1-ingest-protocol` | `ingest/protocol@apply` | **transfer** | — | `src/protocol/**`（长度前缀 + 校验 + 版本字）、`src/service/{config,logs,ingest}.rs`、`src/bin/{lakeletd,lakelet-load}.rs`、`tests/support/**`、`docs/protocol.md`；骨架 = 整个项目 |
 | 4.2 | `4.2-parser-fuzz` | `test/fuzzing@apply` | teach | `slow:fuzz@N` + `slow:?coverage@80` | `tests/fuzz_protocol.rs`（课程装置）、`src/protocol/mutate.rs`、学员的回归语料 `tests/corpus/**` |
-| 4.3 | `4.3-write-path-adr` | `store/wal-recovery@aware` | teach | — | `src/engine/wal/policy.rs`（fsync 策略作为数据）、`docs/adr/0001-write-path.md`、`docs/crash-points.md` |
+| 4.3 | `4.3-write-path-adr` | `store/wal-recovery@aware` | teach | — | `src/engine/wal/policy.rs`（fsync 策略作为数据，类型名是 `Policy`；`Policy::DEFAULT = interval(50ms)` 由实测推出）、`src/engine/spool/durable.rs`（scaffold 新建的契约文件：六个方法签名 + `todo!()`，因为骨架的 `spool.rs` 不能被插入可被改写的桩——见 authoring.md §5 规则 6）、`docs/adr/0001-write-path.md`、`docs/crash-points.md` |
 | 4.4 | `4.4-wal-recovery` | `store/wal-recovery@apply` | deepen | `slow:sim@3` + `slow:mutants@80` + `slow:?coverage@80` | `src/engine/wal/{mod,segment,replay,checksum}.rs`、`tests/sim_wal.rs`（turmoil 场景）、崩溃点语料 |
 | 4.5 | `4.5-batch-writes` | `io/batching@design` | teach | `slow:bench-budget@10` | `src/engine/flush/{mod,batcher}.rs`、`tests/budget.rs`（课程装置）、`docs/write-amplification.md` |
 | 4.6 | `4.6-ingest-backpressure` | `async/backpressure@design` | deepen | `slow:sim@3` | `src/service/backpressure.rs`（有界队列 + `Block/DropNewest/DropOldest/Sample` 策略）、`tests/sim_backpressure.rs` |

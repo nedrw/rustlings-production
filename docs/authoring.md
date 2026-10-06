@@ -152,6 +152,16 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
 4. scaffold 决定**函数签名**：规格测试只依赖 scaffold 里声明的签名，学员改签名就会编译失败——
    这是明确反馈，不是玄学。
 5. scaffold patch 必须在**参考解之前**应用：`selftest` 的顺序是 `scaffold → 期望失败 → 应用参考解 → 期望全绿`。
+6. **插入的行必须一直是学员树里的那几行 —— 要交付"签名由课程给、语义由学员写"的桩，就让 scaffold 新建文件。**
+   `kiln` 用"加进去的行还在不在标记块里"判断 scaffold 是否已应用；学员（和参考解）**就地改写**过的桩
+   不再满足这一条，退回按上下文找 hunk 时又因为插入块自己把 `begin`/`end` 之间的上下文挪了位而失败——
+   于是重跑 `kiln run` 会在**解完的树上**报课程侧的补丁错误、责怪学员的编辑。插入只留给不会变的一行
+   （`mod <file>;`、一条依赖、`pub mod x;`），桩本身放进新建的契约文件里：4.2 的
+   `src/protocol/mutate.rs`、4.3 的 `src/engine/spool/durable.rs` 都是这个形状（后者实测过两轮：
+   插入式的桩在解完的树上重跑 `kiln run` → `patch does not apply to src/engine/spool.rs: hunk 1 does not
+   fit`；改成新建文件后同一棵树重跑 → `note: …durable.rs is yours, so it was left untouched`，规格
+   依旧 14 passed）。骨架里凡是要被后步扩展的文件都得先有标记块（见 handoff-m3 §1 第 4 条），否则
+   scaffold 连那不会变的一行也无处可插。
 
 `kiln run <step>` 与 `kiln check <step>` 都会先把这个步骤准备好（同步规格 + 应用 scaffold），两步都是幂等的：
 

@@ -229,3 +229,72 @@ digests: [94288898bf44b93b, 84a6e3eaa0081a1d, 6c741d597ac261f3] · distinct: 3
    顺序就是判据，别排序、别只打印汇总数。
 
 **下一步**：4.3 交付后按这份契约写 4.4 的作业书（`slow:sim@3` + `slow:mutants@80` + `slow:?coverage@80`）。
+
+## 段 7：`lakelet/4.3-write-path-adr`（B1 的第二步）
+
+**做了什么**：`store/wal-recovery@aware` 这一步由子 agent 交付（提交 `167c1f0`），我复核后把它退回去
+修了一轮（提交 `cc75a0c`），两轮一共 6 个文件、约 1800 行新增。交付物：`src/engine/wal/policy.rs`
+（`Policy`/`Losses`/`ALL`/`DEFAULT`/`name`/`describe`/`parse`）、`src/engine/spool/durable.rs`（scaffold 新建的
+契约文件：六个方法签名 + `todo!()`）、`docs/adr/0001-write-path.md`、`docs/crash-points.md`、正文（teach 模板）
+与 14 个用例的规格；4.1 的 `Spool` 因此获得“可持久字节数”这个概念（`durable_offset`）。
+
+**这一步的核心是实测出来的数字，不是口味**：
+
+```
+$ mkdir -p /private/tmp/fsync-probe && cd /private/tmp/fsync-probe   # ADR 里贴了完整程序
+$ CARGO_TARGET_DIR=/private/tmp/fsync-probe-target cargo run -q --release
+append + sync_all, one record at a time: n=2000 mean=4173us p50=4075us p95=5045us p99=5369us
+append + sync_data, one record at a time: n=2000 mean=4152us p50=4074us p95=4980us p99=5132us
+append + fsync, one record at a time: n=2000 mean=52us p50=45us p95=86us p99=158us
+append 20 records, then one sync_all: n=100 mean=5051us p50=5041us p95=6932us p99=7080us
+```
+
+一次持久写 **4.173 ms** → `per-record` 的天花板约 **240 条/s**（这不是遥测存储）；裸 `fsync(2)` **52 µs**——
+差八十倍，所以“量了 `fsync` 就说这是刷盘成本”会给出一个错方向的数。区间按 ADR 里写明的规则推出
+（“设备最多占墙钟的十分之一” → `I ≥ 41.7 ms` → **50 ms**），`Policy::DEFAULT = interval(50ms)`。
+子 agent 把 `sync_all == F_FULLFSYNC` 标成“推断”，我读了工具链源码把它变成引用：`rustc 1.98.1` 的
+`library/std/src/sys/fs/unix.rs` 里 `os_fsync` 与 `os_datasync` 在 `#[cfg(target_vendor = "apple")]` 下
+**都是** `libc::fcntl(fd, libc::F_FULLFSYNC)`（1413/1418 与 1427/1432 行）——这同时解释了它报告里
+“为什么 `sync_data` 也是 4.15 ms”的疑点。`docs/crash-points.md` 六条（进程死 / 机器死 / 撕裂写 /
+目录项未落 / flush 失败 / 干净停机其实不 flush），每条都写“设备上有什么、恢复看到什么、哪个策略丢什么、
+运维看到什么”——这就是 4.4 的地图。
+
+**我重取的验收行**（本机 rustc 1.98.1，自己的构建）：
+
+```
+$ kiln selftest lakelet/4.1-ingest-protocol --track lakelet → scaffold ✓ / solution ✓ / gates 9/9 · hold the contract
+$ kiln selftest lakelet/4.2-parser-fuzz --track lakelet      → scaffold ✓ / solution ✓ / gates 10/10
+$ kiln selftest lakelet/4.3-write-path-adr --track lakelet   → scaffold ✓（test …FAILED，不是编译错误）/ solution ✓ / gates 9/9
+$ kiln lint-caps    → no issues.（97 · 136 · 119 · 97；R5 检查 76/97 篇）
+$ kiln links        → 93 page(s) · 475 link(s) 全解析
+$ kiln i18n status  → structure: 0 error(s)
+$ kiln probe --check → 41/41
+$ cargo test -q -p kiln → 317 + 21 + 1 passed
+在 scratch 副本里走学员流程：
+$ kiln run 4.3（在**解完的树**上重跑）→ note: …durable.rs is yours, so it was left untouched ×4；
+                                              test result: ok. 14 passed; 0 failed
+$ kiln check 4.3 → 9/9 must gate(s) passed（links: 9 link(s) in 4 page(s)）
+只铺 scaffold（不铺参考解）的副本：cargo test --no-run → exit 0（无 E0599）；
+                                     cargo test --test spec_write_path → FAILED. 1 passed; 13 failed
+```
+
+**退回修的一件事，以及它逼出来的一条规则**：第一轮交付的 scaffold **没有声明规格调用的六个 `Spool`
+方法**，于是 scaffold 态是编译红（`E0599`）。子 agent 引 `t2-relay.md:72` 的先例接受了它，但
+`docs/authoring.md` §5.3/§5.4 写的是“标记块由骨架写定、签名由 scaffold 决定”——真正的缺口是**骨架的
+`spool.rs` 从来没拿到标记块**（4.2 补过五个同类文件，漏了它），而它正是这条 track 后面每一步都要改的文件。
+修的过程中又发现一条**框架级的**事实（已写进 `docs/authoring.md` §5 新增的规则 6）：**scaffold 插入的行
+必须一直是学员树里的那几行**——`kiln` 靠这个判断“已应用”，所以“签名由课程给、语义由学员写”的桩
+**不能靠插入**：学员就地改写过的 `todo!()` 体不再是那几行，退回按上下文找 hunk 时插入块又把
+`begin`/`end` 之间的上下文挪了位，于是**在解完的树上重跑 `kiln run` 会报课程侧的补丁错误并责怪学员**。
+实测两轮（`patch does not apply to src/engine/spool.rs: hunk 1 does not fit`）之后，形状改成
+“scaffold 新建 `src/engine/spool/durable.rs` 放六个签名 + `todo!()`，插入只留不会变的一行 `mod durable;`”，
+重跑就是上面那条 `left untouched` + 14 passed。这也是 4.2 的 `mutate.rs` 早就用对的形状，只是当时没有
+把理由写下来。
+
+**留下一件给 4.4 的决定**（不阻塞）：`bin/lakeletd.rs` 的文档注释写着停机时“stop accepting, **flush**,
+log `draining`”，但代码里没有任何地方 flush——`Never`/`interval` 成为默认之后这句话从空转变为假承诺。
+子 agent 没动 4.1 的文件，把它记成了崩溃点清单的第 6 条（“干净停机其实不 flush”）。4.4 定“acknowledged
+= `durable_offset`”时顺手把它决定掉：要么停机真 flush，要么页面写清停机与机器死的区别。
+
+**下一步**：`lakelet/4.4-wal-recovery`（`store/wal-recovery@apply`：校验和 + 部分写 + 重放，
+`slow:sim@3` 的第一次真跑，契约见本文件段 6 的探针结论），然后给开发者 B1 检查点报告。
