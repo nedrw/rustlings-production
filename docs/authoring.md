@@ -162,6 +162,11 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
    fit`；改成新建文件后同一棵树重跑 → `note: …durable.rs is yours, so it was left untouched`，规格
    依旧 14 passed）。骨架里凡是要被后步扩展的文件都得先有标记块（见 handoff-m3 §1 第 4 条），否则
    scaffold 连那不会变的一行也无处可插。
+   **参考解同样不许改写插入的行**（4.6 实测：参考解把插入的 `super::backpressure::Policy` 缩成 `Policy` 并加了
+   一条 `use`，于是 scaffold 在解完的树上不再被认作已应用：`kiln run 4.6` →
+   `patch does not apply to src/service/config.rs: hunk 1 does not fit`）。插入的行只能选"以后谁都不会想改"
+   的那种写法（全路径而非 `use` 后的短名就是这类）；否则它的完成态要自己再生成一遍 scaffold 与参考解，
+   而不是指望学员的树能容忍。
 
 `kiln run <step>` 与 `kiln check <step>` 都会先把这个步骤准备好（同步规格 + 应用 scaffold），两步都是幂等的：
 

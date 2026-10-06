@@ -308,7 +308,7 @@ plan §9 要六条腿，每条要“原始输出 + 回滚对比”。做不到�
 | --- | --- | --- |
 | 1 无网快路径 | 预拉镜像 + 私有 `XDG_CACHE_HOME` + `CARGO_NET_OFFLINE=true` → `kiln verify lakelet`（不带 `--slow`）绿 | **部分已做**：整个 T4 依赖集能无网构建（下面那行）；`kiln verify lakelet` 要等 24 步齐 |
 | 2 注入泄漏 | `slow:soak` 红并点名计数 → 回滚绿 | 等 4.17（`slow:soak@N` 第一次上场） |
-| 3 换掉合并顺序 | 用 `HashMap` 迭代顺序替换一处合并 → `slow:sim` 红 → 回滚绿 | 等 4.6/4.8（`sim@3` 的下一批用户；4.4 会先跑通 `sim` 门） |
+| 3 换掉合并顺序 | 用 `HashMap` 迭代顺序替换一处合并 → `slow:sim` 红 → 回滚绿 | **已做**（段 11，4.6）：写者拿到帧的顺序换成 `HashMap` 迭代 → `✗ slow:sim@3 the same seed produced two different transcripts: seed 1 came out as 5da24ff3 and 45197a26`；回滚 → `✓ … transcripts 4b891aaf/59a2e06b/59d4f669 — seed 1 replayed identically` |
 | 4 未分类的截断帧 | 注入 → fuzz/spec 红 → 回滚绿 | **已做**（段 5）：bug 种回去 → `kiln run` `FAILED. 5 passed; 2 failed`、`✗ slow:fuzz@3 3 of 3 seed(s) did not pass … panicked at src/protocol/sniff.rs:89:32`；回滚 → `7 passed` / `10/10 must gate(s) passed` |
 | 5 拿掉 4.14 的剪枝 | `bench-budget` 红 → 回滚绿 | 等 4.14 |
 | 6 改一个协议向量 / 弄坏 Dockerfile | `spec-integrity` 红 / `container-repro` 红 | 前半每步的 selftest 都在跑；后半等 4.22 的 Dockerfile |
@@ -476,3 +476,67 @@ check 4.5 --slow：✓ slow:bench-budget@10 11 metric(s) judged against the cour
 
 **下一步**：`4.6-ingest-backpressure`（`async/backpressure@design`：`Block`/`DropNewest`/`DropOldest`/`Sample`
 四种策略各带丢弃计数 + `slow:sim@3` 三种子；“谁被丢掉”是依赖调度的答案，也是 plan §9 演练第 3 条的落点）。
+
+## 段 11：`lakelet/4.6-ingest-backpressure`（B2 的第二步，plan §9 演练第 3 条在这里完成）
+
+**做了什么**：`async/backpressure@design` 由子 agent 交付（提交 `3aa7272`，3234 行新增）：13 个用例的规格、
+正文（deepen 模板，264 行）、`service/backpressure.rs`（有界队列 + 四策略 + `Stats`/`Tally`）、骨架
+`config.rs` 的两个标记块与 `queue.{capacity,policy}` 四层配置、课程装置 `tests/sim_backpressure.rs` 与
+`sim/4.6-ingest-backpressure.toml`。
+
+**两条守恒式就是这一步的骨架**：
+
+```
+offered == accepted + dropped     每个被交上来的帧要么归队列、要么被丢
+accepted == written + queued      静止时：队列欠着还没写的那些
+```
+
+四个策略在边界上做什么（以及每个动哪个计数）：`Block` 等到有位置再收（从不丢，只动 `offered`/`accepted`）；
+`DropNewest` 拒收**正在到达**的帧并把它交回去点名；`DropOldest` 收下新帧、丢掉**等得最久**的帧（深度不变，
+绝不丢写者已经拿走的）；`Sample` 是**速率**（每 4 个收 1 个）而不是边界行为，收下的那个遇到满则按
+`DropOldest` 让位。`Stats { offered, accepted, dropped, written }` 是队列的账，`Tally { written, dropped, bytes }`
+是**每个连接**的账，只有队列能在帧有了结局（写掉或丢掉）时记账——包括后来被驱逐的那帧记在当初交上来的那个
+连接头上。**“被丢的帧永远不会被确认”**就是这么成立的：4.1 的行 `connection closed accepted=… rejected=…
+bytes=…` 在三策略下都还是真的（`accepted = tally.written()`、`rejected = 协议拒绝 + tally.dropped()`）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+selftest：4.1 9/9 · 4.2 10/10 · 4.3 9/9 · 4.4 10/10 · 4.5 10/10 · 4.6 9/9 must green（六份都 hold the contract）
+check 4.6 --slow：✓ slow:sim@3  3 seed(s) ran, transcripts 4b891aaf/59a2e06b/59d4f669 — seed 1 replayed identically (2s)
+                 9/9 must gate(s) passed · real 12.7s
+全局：lint-caps no issues（R5 检查 79/97 篇）· links 96 page(s) · i18n 0 error · probe 41/41 · cargo test -p kiln 318+21+1
+```
+
+**演练第 3 条（换掉合并顺序 → `slow:sim` 红 → 回滚绿），我亲手跑了一遍**：把写者拿到帧的顺序从队列的 FIFO
+换成一个 `HashMap` 的迭代顺序（`take()` 里先把 `waiting` 收进 `HashMap<usize, Waiting>` 再遍历）：
+
+```
+✗ slow:sim@3  the same seed produced two different transcripts: seed 1 came out as 5da24ff3 and 45197a26 —
+              a scenario replays exactly, and this one does not. A map's iteration order, a wall-clock read or a
+              task spawned without a fixed order is the usual cause; the fix is to make the observed order an
+              output of the scenario, not of the machine
+8/9 must gate(s) passed · 9/9 after the rollback（transcripts 回到 4b891aaf/59a2e06b/59d4f669）
+```
+
+子 agent 的同一注入还测到规格**也会**注意到（六次跑给出的失败用例数在 1–5 之间浮动——注入的缺陷本身就是
+不确定的，所以这不算规格 flake），并额外跑了 10 个种子（2、3、5、11、13、42、99、1000、7777777、20260102）
+全绿作为鲁棒性证据。
+
+**这一段钉下来的四件事**：
+
+1. **演练账本（段 8）的腿 3 完成**——判据是“重放半部红”，门自己的报错文本已经把 `HashMap` 迭代顺序点名为
+   常见原因之一（这条文本是 4.4 写 `sim` 门时留下的，这次第一次真用上）。
+2. **参考解不许改写 scaffold 插入的行**（新的一课，已写进 `authoring.md` §5 规则 6）：4.6 的第一版参考解把
+   插入的 `super::backpressure::Policy` 缩写成 `Policy` 并加了一条 `use`，于是 scaffold 在**解完的树上**
+   不再被认作已应用（`patch does not apply to src/service/config.rs: hunk 1 does not fit`）。插入的行只能选
+   “以后谁都不会想改”的写法（全路径就是这类）。这与规则 6 的桩那半条是同一个机制，现在两半都有实测例子。
+3. **队列的单位是帧，不是样本**：4.1 的承诺是逐字节的（三帧进、三记录出），而 4.5 已经让帧成为写入与批量的
+   单位；一个 `Record` 队列得重新编码多样本帧，字节就不再可复现。代价是“丢一帧 = 丢它带的样本”，页面与
+   `Stats` 的文档都写明。
+4. **`Sample` 是速率而不是边界策略**：只在满时采样等于 `DropNewest` 加戏，而“收下的那个遇到满再拒收”就不是
+   “每 N 个收 1 个”了；速率让守护进程那一层的数字与调度无关（8 帧、容量 2 → 每台机器都是 `accepted=2
+   dropped=6`），这也是那两条守护进程用例能确定的原因。
+
+**下一步**：`4.7-columnar-segments`（teach，`store/columnar@apply`：先往返、再判体积 `bytes_per_sample_max`；
+`unsafe-budget@0` 要求项目 manifest 里 `unsafe_code = "deny"`；`zstd` 冷构建离线 4.25 s 已测）。
