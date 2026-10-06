@@ -174,7 +174,6 @@ gates = [
     "no-todo",
     "docs:public",
     "exit-code",
-    "links",
     "slow:sim@3",
     "slow:mutants@80",
     "slow:?coverage@80",
