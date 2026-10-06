@@ -1334,25 +1334,15 @@ fn coverage_measures_the_step_module_or_names_the_component_to_install() {
         return;
     }
 
-    // With the tools, the gate measures: either the module is covered enough, or the report says by
-    // how much it is not, or it says that the profile it read describes *another* tree — the fixture
-    // shares the gate's build directory with every other fixture that ran before it, and a number
-    // about another tree is the one answer this gate must never give.
+    // With the tools, the gate measures: the run happens in a *copy* of the fixture, stamped fresh
+    // (`src/gates/sandbox.rs`), so no other test's build can serve this one and the answer is a
+    // number — the module is covered enough, or the report says by how much it is not. A `blocked`
+    // answer here would mean this gate could not measure the tree it was asked about, which is a
+    // defect in the gate rather than an answer to accept.
     assert!(
-        matches!(
-            outcomes(&results)[0],
-            Outcome::Passed | Outcome::Failed | Outcome::Blocked
-        ),
+        matches!(results[0].outcome, Outcome::Passed | Outcome::Failed),
         "{}",
         report(&results)
     );
-    if outcomes(&results)[0] == Outcome::Blocked {
-        assert!(
-            results[0].detail.contains("different") && results[0].detail.contains("tree"),
-            "a blocked answer with the tools present is only honest when it names the reason: {}",
-            results[0].detail
-        );
-        return;
-    }
     assert!(results[0].detail.contains('%'), "{}", results[0].detail);
 }

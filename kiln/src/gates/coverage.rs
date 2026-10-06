@@ -19,19 +19,30 @@
 //! machine this was written on). They get a cache directory of their own, which also means the gate's
 //! second run is incremental.
 //!
+//! The run happens in a **copy** of the project, stamped fresh ([`sandbox::copy_project`]), and that is
+//! a correctness rule rather than tidiness: cargo keys a build slot by package *name and version* rather
+//! than by the directory a package lives in, so a binary in the shared cache can be one an earlier
+//! sandbox built from a tree this one has never had — and the profile it writes describes *that* tree.
+//! Measured (handoff M2 §5.2): `jobq/3.22-bench-budget` answered `blocked` — "the profile has no
+//! executable line for the step's module (src/engine/budget.rs …)" — because its module is a file this
+//! step's own patch *creates*, and the binary that ran came from a tree without it. In a stamped copy the
+//! artifact can only be this run's, because every source in it is newer than anything built before it;
+//! only the copy is stamped, so the dependencies it uses are still cached and a run costs one package
+//! rebuild (handoff M2 §1.3). The build directory stays the gate's own, so the ordinary build the
+//! learner's next command needs is untouched either way.
+//!
 //! Facts about the machine are reported as blocks, not failures: no tools, no profile data, no test
 //! binary, an unreadable export, or an instrumented spec run that did not pass would each mean a
 //! number that describes something other than the learner's code.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
 use crate::error::{KilnError, Result};
 use crate::gates::runner::{GateContext, output_detail};
-use crate::gates::sources;
-use crate::gates::{GateOutcome, GateSpec};
+use crate::gates::{GateOutcome, GateSpec, sandbox, sources};
 use crate::process;
 use crate::scratch;
 
@@ -121,6 +132,11 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     };
 
     let scratch = scratch::directory("coverage")?;
+    // The tree that is built, measured and reported on is a copy of the project, never the project
+    // itself: see the module docs and [`sandbox::copy_project`]. The copy is what every path below is
+    // answered against — the report's numbers, and the files the export has to name.
+    let measured = scratch.path().join("project");
+    sandbox::copy_project(project, &measured)?;
     let profiles = scratch.path().join("profiles");
     std::fs::create_dir_all(&profiles).map_err(|source| KilnError::Write {
         path: profiles.clone(),
@@ -130,7 +146,8 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // rather than the per-run scratch): a different `RUSTFLAGS` is a different build, so sharing the
     // ordinary directory would throw away every artifact the learner's next command needs (measured:
     // a cold rebuild of this project is 22 s, and the ordinary build would pay it again). Keeping it
-    // also makes the gate's own second run incremental rather than a full rebuild.
+    // also makes the gate's own second run incremental — the copy's stamps rebuild the *package*, and
+    // the dependencies, which are not in the copied tree, stay as cargo left them.
     let target = scratch::cache("coverage-target")?;
     let environment = [
         ("RUSTFLAGS".to_owned(), instrumented()),
@@ -143,7 +160,10 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
                 .into_owned(),
         ),
     ];
-    let ran = process::run_line_with_env(&run.cmd, project, ctx.timeout, &environment)?;
+    // The instant before the run: everything cargo links from here on is this copy's, and everything
+    // older in the shared directory belongs to a run that came before (see [`executables`]).
+    let started = SystemTime::now();
+    let ran = process::run_line_with_env(&run.cmd, &measured, ctx.timeout, &environment)?;
     if !ran.success() {
         return Ok(GateOutcome::blocked(format!(
             "the spec run under `-C instrument-coverage` did not pass, so any coverage number would \
@@ -167,7 +187,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     let merged_run = process::run(
         &lossy(&tools.profdata),
         &borrowed(&merge_args),
-        project,
+        &measured,
         ctx.timeout,
     )?;
     if !merged_run.success() {
@@ -178,16 +198,16 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     }
 
     let deps = target.join("debug").join("deps");
-    let objects = executables(&deps);
+    let objects = executables(&deps, started);
     if objects.is_empty() {
         return Ok(GateOutcome::blocked(format!(
-            "no test binary under {} — profile data can only be read back against the binaries it \
-             came from, and this run left none",
+            "no test binary under {} was linked by this run — profile data can only be read back 
+             against the binaries it came from, and this run left none",
             deps.display()
         )));
     }
-    // Every executable at once: `llvm-cov` ignores an object with no coverage data, so what the \
-    // deps directory holds besides this run's test binaries costs nothing.
+    // Every executable this run left, at once: the objects carry one coverage mapping each, and
+    // `llvm-cov` reads them together with the merged profile.
     let mut export_args: Vec<String> = vec![
         "export".to_owned(),
         "--summary-only".to_owned(),
@@ -204,7 +224,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     let exported = process::run(
         &lossy(&tools.cov),
         &borrowed(&export_args),
-        project,
+        &measured,
         ctx.timeout,
     )?;
     if !exported.success() {
@@ -214,8 +234,8 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
-    let coverage = summary(&exported.stdout, project, &module)?;
-    Ok(judge(required, &coverage, &module))
+    let coverage = summary(&exported.stdout, &measured, &module)?;
+    Ok(judge(required, &coverage, &module, &measured))
 }
 
 /// The `RUSTFLAGS` the instrumented run uses: the project's own, plus instrumentation.
@@ -253,11 +273,22 @@ fn profiles_written(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Every runnable file of a target directory, in path order.
+/// Every runnable file of a target directory that `since` did not come after, in path order.
 ///
 /// Test binaries live in `target/debug/deps` with a hash in the name, and they are the executables
 /// there: the `.d` files beside them are not, so the executable bit is what tells the two apart.
-fn executables(directory: &Path) -> Vec<PathBuf> {
+///
+/// They are also not all of *this* run. cargo keys an artifact by package name and version, so a
+/// shared build directory — and this gate's is shared by every step that declares it — keeps the
+/// test binaries of every run that ever used it, each one carrying the coverage mapping of the tree
+/// it was built from. Handing all of them to `llvm-cov` does not merely cost time: it pairs this
+/// run's profile with an object of another tree and answers with *that* tree's files (measured: the
+/// export named a copy of a previous run, every line of it uncovered, which the guard below then
+/// turned into a `blocked` for a step whose work had been measured perfectly well). The run builds
+/// in a copy whose every source is stamped ahead of the clock, so cargo links the test binary again
+/// — and a file it links during the run is newer than the instant before the run, which is the test
+/// for "this run's": what is older is what an earlier run left behind.
+fn executables(directory: &Path, since: SystemTime) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -265,6 +296,11 @@ fn executables(directory: &Path) -> Vec<PathBuf> {
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| process::is_executable(path))
+        .filter(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= since)
+        })
         .collect();
     found.sort();
     found
@@ -279,12 +315,14 @@ struct Coverage {
     covered: u64,
     /// The module's files the export had data for.
     files: Vec<String>,
-    /// Module line(s) the export named *outside* this tree.
+    /// Module line(s) the export named *outside* the copy this run measured.
     ///
-    /// cargo keys a build slot by package name and version, so an instrumented run in another copy of
-    /// this project can answer here — with that copy's line counts. A path that ends with the module's
-    /// name but lives somewhere else is that case, and a number about another tree is worse than no
-    /// number.
+    /// This used to be a guard against a number from another sandbox (cargo keys a build slot by
+    /// package name and version, so a tree that had built before this one could answer here). The
+    /// run now builds in a copy of this step's own tree, stamped fresh, so there is no other tree
+    /// left to answer; what is counted here is a fault rather than a foreign measurement — a path
+    /// that ends with the module's name and does not live in the copy, which means the profile came
+    /// from something other than this run.
     foreign: u64,
 }
 
@@ -330,26 +368,30 @@ struct Lines {
 }
 
 /// Line coverage of the step's module, out of an export document.
-fn summary(document: &str, project: &Path, module: &[String]) -> Result<Coverage> {
+///
+/// `measured` is the root the profile's files have to live under — the copy this run built in — and
+/// `module` holds the step's files as paths relative to it.
+fn summary(document: &str, measured: &Path, module: &[String]) -> Result<Coverage> {
     let export: Export = serde_json::from_str(document).map_err(|source| {
         KilnError::Invalid(format!(
             "`llvm-cov export --summary-only` answered with something this build cannot read: {source}"
         ))
     })?;
     let mut coverage = Coverage::default();
+    let root = resolved(measured);
     for file in export.data.iter().flat_map(|data| &data.files) {
         // The export answers with the path the compiler used, which is absolute; joining keeps a
         // relative one working too, because `join` replaces the path when it is already absolute.
-        let absolute = project.join(&file.filename);
+        let absolute = measured.join(&file.filename);
         let Some(relative) = module
             .iter()
             .find(|relative| absolute.ends_with(relative.as_str()))
         else {
             continue;
         };
-        // A path that ends with the module's name but does not live in the tree being judged is a
-        // build of another copy: counting it would report another tree's lines as this step's.
-        if !absolute.starts_with(project) {
+        // A path that ends with the module's name but does not live in the copy this run built in is
+        // a build of something else: counting it would report another tree's lines as this step's.
+        if !resolved(&absolute).starts_with(&root) {
             coverage.foreign += 1;
             continue;
         }
@@ -362,15 +404,31 @@ fn summary(document: &str, project: &Path, module: &[String]) -> Result<Coverage
     Ok(coverage)
 }
 
+/// A path with its symlinks resolved, or as written when it does not resolve at all.
+///
+/// A text prefix is not identity, and this is not a hypothetical: on a machine whose temporary
+/// directory is reached through a symlink the compiler records the *resolved* path, so a run in
+/// `/var/folders/…` answers with files named `/private/var/folders/…` — the same file, and a prefix
+/// test calls it another tree (measured: it did, for the gate's own copy, which is why the integration
+/// test used to have to accept `blocked` as an answer). A path that does not resolve is not a file of
+/// the copy — an artifact of a tree that is gone answers nothing — so it keeps the form it came in,
+/// which the prefix test then refuses.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The gate's answer, from what the export says about the module.
-fn judge(required: u32, coverage: &Coverage, module: &[String]) -> GateOutcome {
+fn judge(required: u32, coverage: &Coverage, module: &[String], measured: &Path) -> GateOutcome {
     if coverage.lines == 0 && coverage.foreign > 0 {
         return GateOutcome::blocked(format!(
-            "the profile names {} line(s) of this step's module in a *different* tree, so the \
-             instrumented build came from another copy of this project — cargo keys a build slot by \
-             package name and version, and a percentage about another tree is not this step's number. \
-             Clear the gate's build directory (or the sandbox it shares) and run again",
-            coverage.foreign
+            "the profile names {} line(s) of this step's module outside the copy this run measured \
+             ({}), so the instrumented build was not this run's: every file of that copy is stamped \
+             newer than any build before it, which is what keeps an artifact of another tree from \
+             answering here. A module reached through a symlink, or named by an absolute path, is \
+             the shape of that fault — the module is `{}`",
+            coverage.foreign,
+            measured.display(),
+            module.join(", ")
         ));
     }
     if coverage.lines == 0 {
@@ -428,11 +486,11 @@ mod tests {
         {
           "files": [
             {
-              "filename": "/work/app/jobq/src/store.rs",
+              "filename": "/work/sandbox/project/src/store.rs",
               "summary": { "lines": { "count": 40, "covered": 34 } }
             },
             {
-              "filename": "/work/app/jobq/src/main.rs",
+              "filename": "/work/sandbox/project/src/main.rs",
               "summary": { "lines": { "count": 10, "covered": 10 } }
             }
           ]
@@ -442,16 +500,18 @@ mod tests {
       "version": "2.3.1"
     }"#;
 
+    /// The copy a run builds in, as [`summary`] and [`judge`] are told about it.
+    const MEASURED: &str = "/work/sandbox/project";
+
     #[test]
     fn only_the_steps_module_counts_towards_its_coverage() {
         let module = ["src/store.rs".to_owned(), "src/queue.rs".to_owned()];
-        let coverage =
-            summary(EXPORT, Path::new("/work/app/jobq"), &module).expect("the fixture reads");
+        let coverage = summary(EXPORT, Path::new(MEASURED), &module).expect("the fixture reads");
         assert_eq!(coverage.lines, 40, "main.rs is not part of this step");
         assert_eq!(coverage.covered, 34);
         assert_eq!(coverage.files, ["src/store.rs"]);
 
-        let passed = judge(80, &coverage, &module);
+        let passed = judge(80, &coverage, &module, Path::new(MEASURED));
         assert_eq!(passed.outcome, Outcome::Passed);
         assert!(passed.detail.contains("85%"), "{}", passed.detail);
         assert!(
@@ -460,21 +520,41 @@ mod tests {
             passed.detail
         );
 
-        let failed = judge(90, &coverage, &module);
+        let failed = judge(90, &coverage, &module, Path::new(MEASURED));
         assert_eq!(failed.outcome, Outcome::Failed);
         assert!(failed.detail.contains("below the 90%"), "{}", failed.detail);
     }
 
     #[test]
-    fn a_module_with_no_data_is_blocked_not_passed() {
-        let coverage = summary(
-            EXPORT,
-            Path::new("/work/app/jobq"),
-            &["src/other.rs".to_owned()],
-        )
-        .expect("the fixture reads");
+    fn a_module_named_outside_the_copy_is_reported_as_a_fault_not_as_a_number() {
+        // What the copy turns from a routine answer into a fault: the same file name, one directory
+        // over — a profile that cannot come from the run this gate made.
+        let foreign = EXPORT.replace(MEASURED, "/work/other-sandbox/project");
+        let module = ["src/store.rs".to_owned()];
+        let coverage = summary(&foreign, Path::new(MEASURED), &module).expect("the fixture reads");
         assert_eq!(coverage.lines, 0);
-        let outcome = judge(1, &coverage, &["src/other.rs".to_owned()]);
+        assert_eq!(coverage.foreign, 1);
+
+        let outcome = judge(1, &coverage, &module, Path::new(MEASURED));
+        assert_eq!(outcome.outcome, Outcome::Blocked);
+        assert!(
+            outcome.detail.contains(MEASURED) && outcome.detail.contains("stamped"),
+            "the report has to name the copy it measured: {}",
+            outcome.detail
+        );
+    }
+
+    #[test]
+    fn a_module_with_no_data_is_blocked_not_passed() {
+        let coverage = summary(EXPORT, Path::new(MEASURED), &["src/other.rs".to_owned()])
+            .expect("the fixture reads");
+        assert_eq!(coverage.lines, 0);
+        let outcome = judge(
+            1,
+            &coverage,
+            &["src/other.rs".to_owned()],
+            Path::new(MEASURED),
+        );
         assert_eq!(outcome.outcome, Outcome::Blocked);
         assert!(
             outcome.detail.contains("src/other.rs"),

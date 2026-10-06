@@ -29,13 +29,12 @@
 //! runner's global deadline for every attempt is how one step's gate turns into an hour.
 //!
 //! The copy is made in a scratch directory, never in the learner's tree, and every file in it is
-//! stamped ahead of the clock. That is cargo's rule rather than this gate's: a build directory is
-//! keyed by package *name and version*, not by the directory a package lives in, so a copy of the
-//! project and the project itself are one build slot, and cargo decides whether a slot is up to date
-//! by comparing the modification times of its sources with the build it already has. `fs::copy`
-//! brings the original's timestamps along, which can make a fresh copy look *older* than an artifact
-//! of the tree it came from — and a mutant run would then judge yesterday's binary. [`make_fresh`]
-//! covers the copy and [`write_fresh`] every file this gate rewrites afterwards.
+//! stamped ahead of the clock — [`sandbox::copy_project`], which is also what the `coverage` gate
+//! builds in, and where the two reasons are written out: cargo keys a build slot by package *name
+//! and version* rather than by the directory a package lives in, so a copied tree is one slot with
+//! the tree it came from, and a build that is not preceded by a newer source is served the artifact
+//! of that other tree. [`sandbox`] also carries the toolchain pin the project is built under, so a
+//! mutant run compiles with the compiler the learner's own commands use.
 //!
 //! The same fact runs the other way round, and it is why the copy builds in a directory of its own
 //! (`<cache>/kiln/mutants-target`, [`scratch::cache`]): cargo keys a slot by package name and version,
@@ -52,13 +51,12 @@
 
 use std::ops::Range;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::error::{KilnError, Result};
 use crate::gates::lexer::{Class, classify, is_identifier_byte};
 use crate::gates::runner::{GateContext, clip};
-use crate::gates::sources;
-use crate::gates::{GateOutcome, GateSpec};
+use crate::gates::{GateOutcome, GateSpec, sandbox, sources};
 use crate::process::{self, Ran};
 use crate::scratch;
 
@@ -202,7 +200,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 
     let scratch = scratch::directory("mutants")?;
     let copy = scratch.path().join("project");
-    copy_project(project, &copy)?;
+    sandbox::copy_project(project, &copy)?;
 
     // The copy's builds get a directory of their own, and this is a correctness rule rather than a
     // cache one: cargo keys a build slot by package name and version, not by the directory the
@@ -212,8 +210,8 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // files, or fails on a file it cannot open at all. `coverage` keeps a directory of its own for
     // the same reason (a different `RUSTFLAGS` is a different build); this is the same rule for a
     // different tree. The directory persists, so the baseline and the attempts after it reuse what
-    // they compiled — and `copy_project` stamps the copy fresh, so a build from an earlier run is
-    // never mistaken for this one's.
+    // they compiled — and the copy is stamped fresh, so a build from an earlier run is never
+    // mistaken for this one's.
     let target = scratch::cache("mutants-target")?;
     let environment = [("CARGO_TARGET_DIR".to_owned(), target.display().to_string())];
 
@@ -634,76 +632,7 @@ fn sample(candidates: &[Mutant], cap: usize) -> Vec<Mutant> {
         .collect()
 }
 
-/// Copy a project into a sandbox, leaving build output and version control behind.
-///
-/// `target/` and `.git/` are the two directories that are large and regenerable; everything else is
-/// content a mutant run needs, `Cargo.lock` included, so that the copy neither re-resolves
-/// dependencies nor wants a network.
-fn copy_project(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).map_err(|source| KilnError::Write {
-        path: to.to_path_buf(),
-        source,
-    })?;
-    let entries = std::fs::read_dir(from).map_err(|source| KilnError::Read {
-        path: from.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| KilnError::Read {
-            path: from.to_path_buf(),
-            source,
-        })?;
-        let name = entry.file_name();
-        if matches!(name.to_str(), Some("target" | ".git")) {
-            continue;
-        }
-        let source_path = entry.path();
-        let target_path = to.join(&name);
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            copy_project(&source_path, &target_path)?;
-        } else if kind.is_file() {
-            // Byte for byte: a project may hold images, fixtures or a lock file, and none of them is
-            // text this gate has an opinion about.
-            std::fs::copy(&source_path, &target_path).map_err(|source| KilnError::Write {
-                path: target_path.clone(),
-                source,
-            })?;
-            make_fresh(&target_path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Make a file in the sandbox newer than any build that came before this gate.
-///
-/// Cargo keeps a build when no source is *newer* than it, and it identifies a package by name and
-/// version rather than by the directory the package lives in — so a copy of `jobq` in a sandbox and
-/// the learner's own `jobq` are one build slot in a shared `CARGO_TARGET_DIR`. `fs::copy` preserves
-/// timestamps, which lets a fresh copy look *older* than an artifact of the tree it came from: cargo
-/// calls the artifact current and the mutants are judged against the wrong binary (which is how this
-/// gate behaved before it stamped its copy). A second ahead of now is unambiguously newer, and it also
-/// clears the case a file system with second granularity would otherwise hide — two writes inside one
-/// second look equal there.
-fn make_fresh(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|source| KilnError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    file.set_modified(SystemTime::now() + Duration::from_secs(1))
-        .map_err(|source| KilnError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok(())
-}
-
-/// Write a file of the sandbox copy, stamped the way [`make_fresh`] stamps a copied one.
+/// Write a file of the sandbox copy, stamped the way [`sandbox::make_fresh`] stamps a copied one.
 ///
 /// Every mutant is one rewrite of one file, so it is this call that has to make cargo notice: a mutant
 /// that is never rebuilt is a mutant that is never killed, which is the opposite of what this gate is
@@ -713,7 +642,7 @@ fn write_fresh(path: &Path, contents: &str) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })?;
-    make_fresh(path)
+    sandbox::make_fresh(path)
 }
 
 /// Read a file of the sandbox copy.
@@ -939,7 +868,7 @@ mod tests {
             .modified()
             .expect("the fixture file has a timestamp");
         assert!(
-            written > SystemTime::now(),
+            written > std::time::SystemTime::now(),
             "{written:?} is not ahead of now"
         );
     }
