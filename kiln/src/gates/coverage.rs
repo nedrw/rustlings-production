@@ -158,7 +158,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // the build would therefore not be the one the project's own commands make (see
     // [`configured_rustflags`]). Refused before anything is built, because the alternative is a
     // percentage about a tree nobody has.
-    if let Some((file, key)) = configured_rustflags(project) {
+    if let Some((file, key)) = configured_rustflags(project, ctx.course.root()) {
         return Ok(GateOutcome::blocked(format!(
             "{} sets `{key}`, and `RUSTFLAGS` in the environment wins over a project's cargo config \
              — the instrumented build would have flags your own commands never use, so this gate \
@@ -323,22 +323,27 @@ fn instrumented() -> String {
 /// refuses the run instead of answering about the wrong build.
 ///
 /// Cargo reads configuration from the directory its command runs in and from that directory's
-/// ancestors, which is why the project's own `.cargo/` and the `.cargo/` of the directory above it
-/// are both read: this course's projects live at `app/<track>`, one level below the repository root,
-/// so those are the two places a project of this course carries a config. Both spellings cargo
-/// accepts are looked for, and a config that cannot be read or parsed is left to cargo — it reports
-/// its own error about the file, and a gate that guessed at a broken one would answer about a build
-/// that does not exist either.
-fn configured_rustflags(project: &Path) -> Option<(PathBuf, String)> {
-    let mut directories: Vec<&Path> = vec![project];
-    if let Some(parent) = project.parent() {
-        directories.push(parent);
-    }
-    directories.into_iter().find_map(|directory| {
-        ["config.toml", "config"]
+/// ancestors, which is why the walk starts at the project and goes up: this course's projects live
+/// at `app/<track>` below the repository root, and a `rustflags` at any level in between belongs to
+/// the build the learner's own commands make and not to the one this gate can reproduce. The walk
+/// stops at `root` (the course's own tree) — the machine's `$CARGO_HOME/config.toml` is deliberately
+/// not read: it is the machine's business rather than the course's, and a gate that blocked on it
+/// would answer about a file the learner cannot see in the project (handoff M2 §1.3 states that
+/// boundary). Both spellings cargo accepts are looked for, and a config that cannot be read or
+/// parsed is left to cargo — it reports its own error about the file, and a gate that guessed at a
+/// broken one would answer about a build that does not exist either.
+fn configured_rustflags(project: &Path, root: &Path) -> Option<(PathBuf, String)> {
+    let mut directory = Some(project);
+    while let Some(here) = directory {
+        if let Some(found) = ["config.toml", "config"]
             .iter()
-            .find_map(|name| rustflags_in(&directory.join(".cargo").join(name)))
-    })
+            .find_map(|name| rustflags_in(&here.join(".cargo").join(name)))
+        {
+            return Some(found);
+        }
+        directory = if here == root { None } else { here.parent() };
+    }
+    None
 }
 
 /// The `rustflags` key of one cargo config file, when it has one.
@@ -861,10 +866,11 @@ mod tests {
         // build its own commands make. The gate has to *find* those flags (review finding #6) rather
         // than report a percentage about that build.
         let temp = TempDir::new("coverage-rustflags");
+        let root = temp.path().to_path_buf();
         let project = temp.path().join("app/jobq");
         std::fs::create_dir_all(&project).unwrap();
         assert_eq!(
-            configured_rustflags(&project),
+            configured_rustflags(&project, &root),
             None,
             "no `.cargo/` at all: nothing to find"
         );
@@ -873,7 +879,8 @@ mod tests {
             "app/jobq/.cargo/config.toml",
             "[build]\nrustflags = [\"--cfg\", \"x\"]\n",
         );
-        let (file, key) = configured_rustflags(&project).expect("`[build] rustflags` is found");
+        let (file, key) =
+            configured_rustflags(&project, &root).expect("`[build] rustflags` is found");
         assert_eq!(key, "build.rustflags");
         assert_eq!(file, project.join(".cargo/config.toml"));
 
@@ -882,14 +889,16 @@ mod tests {
             "app/jobq/.cargo/config.toml",
             "[target.'cfg(unix)']\nrustflags = [\"-C\", \"opt-level=1\"]\n",
         );
-        let (_, key) = configured_rustflags(&project).expect("a target's rustflags is found");
+        let (_, key) =
+            configured_rustflags(&project, &root).expect("a target's rustflags is found");
         assert_eq!(key, "target.cfg(unix).rustflags");
 
         // `config` is the other file name cargo accepts, and a table of its own under the target is
         // a config that sets the key too.
         std::fs::remove_file(project.join(".cargo/config.toml")).unwrap();
         temp.write("app/jobq/.cargo/config", "[target.'cfg(unix)'.rustflags]\n");
-        let (file, key) = configured_rustflags(&project).expect("the dotted form is found too");
+        let (file, key) =
+            configured_rustflags(&project, &root).expect("the dotted form is found too");
         assert_eq!(key, "target.cfg(unix).rustflags");
         assert_eq!(file, project.join(".cargo/config"));
     }
@@ -897,28 +906,57 @@ mod tests {
     #[test]
     fn the_directory_above_the_project_is_read_as_well() {
         // Cargo reads the config of the directory its command runs in and of that directory's
-        // ancestors, and this course's projects live at `app/<track>` — so a config in `app/` is one
-        // the learner's own commands use and the copy the gate builds in does not have.
+        // ancestors, and this course's projects live at `app/<track>` — so a config in `app/`, or in
+        // the course's own root, is one the learner's own commands use and the copy the gate builds
+        // in does not have. Above the root is the machine's business, not the course's (handoff M2
+        // §1.3 states that boundary).
         let temp = TempDir::new("coverage-rustflags-parent");
-        let project = temp.path().join("app/jobq");
+        let root = temp.path().join("course");
+        let project = root.join("app/jobq");
         std::fs::create_dir_all(&project).unwrap();
         temp.write(
-            "app/jobq/.cargo/config.toml",
+            "course/app/jobq/.cargo/config.toml",
             "[build]\njobs = 4\n[alias]\ncheck = \"clippy\"\n",
         );
         assert_eq!(
-            configured_rustflags(&project),
+            configured_rustflags(&project, &root),
             None,
             "keys that are not `rustflags` are not flags"
         );
 
         temp.write(
-            "app/.cargo/config.toml",
+            "course/app/.cargo/config.toml",
             "[build]\nrustflags = \"-C target-cpu=native\"\n",
         );
-        let (file, key) = configured_rustflags(&project).expect("the directory above sets them");
+        let (file, key) =
+            configured_rustflags(&project, &root).expect("the directory above sets them");
         assert_eq!(key, "build.rustflags");
-        assert_eq!(file, temp.path().join("app/.cargo/config.toml"));
+        assert_eq!(file, root.join("app/.cargo/config.toml"));
+
+        // The course's own root counts too: a `rustflags` there is part of the build a learner's
+        // commands make, and the walk reaches it.
+        std::fs::remove_file(root.join("app/.cargo/config.toml")).unwrap();
+        temp.write(
+            "course/.cargo/config.toml",
+            "[target.'cfg(unix)']\nrustflags = [\"--cfg\", \"course\"]\n",
+        );
+        let (file, key) =
+            configured_rustflags(&project, &root).expect("the course root sets them too");
+        assert_eq!(key, "target.cfg(unix).rustflags");
+        assert_eq!(file, root.join(".cargo/config.toml"));
+
+        // One level above the course root is where the walk stops: it is not a file the project can
+        // be answerable for.
+        std::fs::remove_file(root.join(".cargo/config.toml")).unwrap();
+        temp.write(
+            "above/.cargo/config.toml",
+            "[build]\nrustflags = [\"--cfg\", \"outside\"]\n",
+        );
+        assert_eq!(
+            configured_rustflags(&project, &root),
+            None,
+            "the walk is bounded at the course root"
+        );
     }
 
     #[test]
@@ -929,7 +967,7 @@ mod tests {
         let temp = TempDir::new("coverage-rustflags-broken");
         let project = temp.path().join("app/jobq");
         temp.write("app/jobq/.cargo/config.toml", "[build\nrustflags = \n");
-        assert_eq!(configured_rustflags(&project), None);
+        assert_eq!(configured_rustflags(&project, temp.path()), None);
     }
 
     #[test]
