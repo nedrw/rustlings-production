@@ -71,18 +71,19 @@ T3 是一个用步一层层长出来的**任务队列引擎**：一个库（引�
 | 全步判定（27 步尾巴树，`kiln verify jobq --slow --json`）| **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`** |
 | 全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**；durable 规格在 `KILN_BACKEND=postgres` 下同样全绿 |
 | 逐步 `selftest` | 3.1–3.27 全绿（13–15 个 must 门；3.5/3.6/3.7/3.9/3.11/3.12/3.16/3.23/3.26 含 `slow:conformance@2`）|
-| 慢门 | `mutants` 6/6 或 5/6（3.24 是 83%）；`bench-budget` 三/四个计数在 ±10%；`unsafe-budget@0` 零 `unsafe`；`?coverage`（装了 `llvm-tools-preview`，构建在项目副本里）3.21/3.22/3.23 **100%**、3.24 95%、3.25 87%、3.27 85%、**3.26 37%**（低于它自己声明的 80%，见 §6）|
+| 慢门 | `mutants` 6/6 或 5/6（3.24 是 83%）；`bench-budget` 三/四个计数在 ±10%；`unsafe-budget@0` 零 `unsafe`；`?coverage`（装了 `llvm-tools-preview`，构建在项目副本里、子进程数据也算）3.21/3.22/3.23 **100%**、3.24 95%、3.25 87%、3.27 85%、**3.26 56%**（低于它自己声明的 80%，见 §6）|
 | 课程自有检查 | `lint-caps` `no issues.`（97/136/119/73）；`links` **87 page(s) · 464 link(s) · 283 external target(s)**，全部解析；`i18n` 0 error；`probe --check` 41/41 |
-| `cargo xtask ci` | **exit 0 · 32 m 12 s · `27/27 step(s) hold the contract`**（2026-10-06 在 coverage 改动后复跑：exit 0 · 35 m 32 s）|
+| `cargo xtask ci` | **exit 0 · 39 m 22.9 s · `27/27 step(s) hold the contract`**（2026-10-06，子进程 profile 那笔之后）|
 | M2 验收演练 | 五条腿都有原始行（semver / mutants / bench-budget / conformance / unsafe-budget），见 handoff §4.3 |
 
 ## 6. T3 范围内剩下的缺口
 
-- `slow:?coverage@80` 的测量路径 2026-10 跑通（装了 `llvm-tools-preview`），过程中修掉门里**七个**真缺陷（handoff §5.2）；
-  插桩构建现在跑在项目的**副本**里（`gates/sandbox.rs`，与 `mutants` 共用），共享构建槽不再参与。真实数字（2026-10-06 复核）：
-  3.21 **100%**（204/204）、3.22 **100%**（64/64，修前 `blocked`）、3.23 **100%**、3.24 95%、3.25 87%、3.27 85%、**3.26 37%**（918/2438）。
+- `slow:?coverage@80` 的测量路径 2026-10 跑通（装了 `llvm-tools-preview`），过程中修掉门里**八个**真缺陷（handoff §5.2）；
+  插桩构建现在跑在项目的**副本**里（`gates/sandbox.rs`，与 `mutants` 共用），共享构建槽不再参与；子进程自己写的 profile 也算（`env_clear` 启动的真二进制看不到 `LLVM_PROFILE_FILE`）。真实数字（2026-10-06 复核）：
+  3.21 **100%**（204/204）、3.22 **100%**（64/64，修前 `blocked`）、3.23 **100%**、3.24 95%、3.25 87%、3.27 85%、**3.26 56%（1367/2438）**。
 - **3.26 的 `?coverage@80` 与「模块 = 补丁碰过的整份文件」这条规则冲突**：它的模块含 `src/cli/**`、`src/engine/store/*` 里更早步骤拥有的代码，
-  所以这一步的模块天然到不了 80%（数字是真的，不是缺陷）。选项与建议见 handoff §5.2（推荐让步骤自己声明模块）；在那之前它是一个 should 红，不影响 `clean`。
+  所以这一步的模块到不了 80%——但那不是“工具没写测试”：它自己的文件 `src/cli/dlq.rs` 是 **90%**，剩下的未覆盖行几乎全在更早步骤拥有的大文件里。
+  选项与建议见 handoff §5.2（推荐让步骤自己声明模块）；在那之前它是一个 should 红，不影响 `clean`。
 - `mutants` 的模块是“补丁碰过的整份文件”：3.24 的 **5/6（83%，在线上）** 与 3.26 为别人的文件补的三条用例都是这个规则的代价。
 - durable 的 cap 在**并发** claim 下仍可能各读同一份余量（handoff §5.2 记了窄窗口）。
 - ~~`ops/dlq-tooling@operate` 没有同深度探题~~ 已补（`course/probes/ops-dlq-tooling.operate.rs`，题库 41 道）。

@@ -167,6 +167,10 @@ cargo 按**包名+版本**选构建槽、不按目录，所以插桩目录里可
   `llvm-profdata merge -sparse`，然后**对这次运行链接的每个 object 各做一次 `llvm-cov export --summary-only`**
   （`--ignore-filename-regex` 只留本棵树），同一文件取「覆盖最多、其次映射最全」的那份视图，
   只判**本步模块**（= 本步参考解补丁碰过的生产 `.rs` 文件）的行覆盖 ≥ N%。
+- **子进程写的数据也算这次的**：规格若用 `env_clear` 启动真二进制（`jobq/3.15`、`jobq/3.26` 就是这样判“命令行”的——脚本看到什么环境是接口的一部分），
+  那个子进程看不到 `LLVM_PROFILE_FILE`，LLVM 会把 profile 写进**它的工作目录**，也就是这次测量的那棵树里。
+  门把这些 `.profraw` 一起 merge（`profiles_of_the_run`），并且 `sandbox::copy_project` **不复制** `.profraw`
+  （副本给每个文件盖戳，别的运行的 profile 会“比开跑还新”，从而被误当成本次的）。
 - 三条正确性规则（都不是整洁问题）：① **副本 + 时间戳**——共享槽里别的沙箱的插桩二进制会拿**别的树**的行数回答
   （实测 3.22 因此 `blocked`，而它的套件其实覆盖了那个模块 64/64）；② **逐 object 导出**——把多个二进制一次交给
   `llvm-cov export` 是「一个二进制的多个 object」的调用形状，会丢掉只有部分二进制携带的文件，并按它碰巧配上的
@@ -323,7 +327,7 @@ app/jobq/
   ② 沙箱副本的文件时间戳要往前推一秒（`fs::copy` 会带原时间戳，cargo 判新鲜度后默默用陈旧二进制）；
   ③ `coverage` 的「工具在位」路径**在本机没有端到端验证过**（`llvm-tools-preview` 未装）：集成测试断言
   的是诚实的 `blocked` + 安装行，测量逻辑用合成文档单位测试。（**2026-10 已解决**：装上组件、测量路径端到端跑通，
-  过程中修掉两批共七个真缺陷，见 §5.2；集成测试现在要求 `Passed | Failed` **且报告里带一个 `%`**。）
+  过程中修掉两批共七个真缺陷再加一个（子进程 profile），见 §5.2；集成测试现在要求 `Passed | Failed` **且报告里带一个 `%`**。）
 - **重建 `dead_letters` 与 `replay` 是端口的事，且语义已被 3.16 钉死**（提交 `course(jobq/3.16-dlq-tooling)`）：
   死信不是一个新表，是 `failed` 里的行（`dead_letters()` 返回一个 `JobFilter` 视图，不是取行口）；重放是
   **另一个生命**而不是一次状态迁移（`transition` 里没有这个目的地，合法）；`revived(job, now)` 是唯一算术：
@@ -476,13 +480,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.23 `13/13` · 3.24 `12/12` · 3.25 `13/13` · 3.26 `15/15` · 3.27 `13/13` must gates，全部 `hold the contract`（3.23 曾因共享构建槽在 `conformance@2` 上假红，根因见 §5.2，已修） |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`**。2026-10-06（coverage 改动落地后）我复跑一次：**exit 0 · 8 m 41.0 s**，八个 `mutants` 走法与上表逐条一致 |
-| 七个 `slow:?coverage@80`（副本 + 逐 object 导出的实现） | 3.21 **100%**（204/204）、3.22 **100%**（64/64，修前是 `blocked`）、3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）都 ≥80%；**3.26 37%（918/2438）低于它自己声明的 80%**——模块含 `src/cli/**` 与 `src/engine/store/*` 里更早步骤拥有的代码，见 §5.2 的待定项（should 门，不影响 `clean`） |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`**。2026-10-06（coverage 改动落地后）我复跑一次：**exit 0 · 8 m 41.0 s**，八个 `mutants` 走法与上表逐条一致；再把**子进程的 profile** 算进来后复跑：**exit 0 · 8 m 23.8 s**，3.26 的模块由 918/2438 变 **1367/2438**（见 §5.2 的 ⑧） |
+| 七个 `slow:?coverage@80`（副本 + 逐 object 导出 + 子进程 profile 的实现） | 3.21 **100%**（204/204）、3.22 **100%**（64/64，修前是 `blocked`）、3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）都 ≥80%；**3.26 56%（1367/2438）低于它自己声明的 80%**（修前 37%，其中它自己的文件 `src/cli/dlq.rs` 被报成 0/199）——剩下的缺口是 `src/cli/**` 与 `src/engine/store/*` 里更早步骤拥有的代码，见 §5.2 的待定项（should 门，不影响 `clean`） |
 | 默认特性全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **87 page(s) · 464 link(s) · 283 external target(s)**，`✓ every target resolves`（2026-10-06 复核时的数字）；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
-| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）|
+| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）；子进程 profile 那笔之后又跑一次：**exit 0 · 39 m 22.9 s**，输出同上（kiln 单测 `278 + 21 + 1`）|
 
 ### 4.3 验收演练（已做两腿，原始输出）
 
@@ -714,8 +718,8 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
   ② ~~`ops/dlq-tooling@operate` 的同深度探题~~ **已补**（`ops-dlq-tooling.operate`，题库 41 道）；
   ③ ~~`coverage` 的插桩构建跑进项目副本~~ **已做**（2026-10-06，提交 `fa8f996` + `44bbc52`，见下一条）；
-  ④ **待用户定：3.26 的 `slow:?coverage@80` 在参考解上红（37%）**，见下文与 §4.2。
-- **`coverage` 的两批真缺陷（都已修）**。第一批（`b37e5e2` + `8f7363e`，2026-10）：
+  ④ **待用户定：3.26 的 `slow:?coverage@80` 在参考解上红（⑧ 修后是 56%）**，见下文与 §4.2。
+- **`coverage` 的真缺陷（都已修，八条）**。第一批（`b37e5e2` + `8f7363e`，2026-10）：
    ① 门把 `rustc` 探针跑在临时目录，那里 `rust-toolchain.toml` 不生效 → 问的是默认工具链，于是为 pinned 工具链装了工具的机器上永远 `blocked`（更糟：默认工具链恰有工具时会用**另一个 LLVM**读 profile）；
    ② `llvm-cov export` 在 LLVM 22 里是 `--summary-only`，不是 `--summary`；
    ③ 导出文档含所有依赖源码 → 超过 kiln 的 256 KiB 读取上限 → 截断后解析失败；现在只留本棵树（`--ignore-filename-regex`）；
@@ -729,13 +733,19 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
    ⑦ **多个二进制一次 `llvm-cov export`** 是「一个二进制的多个 object」的调用形状——它会丢掉只有部分二进制携带的文件（3.22 的 `budget.rs`），
       并让同一个文件按它碰巧配上的那个 object 回答；同理，共享目录里**历次运行**的插桩产物也会被配到这次的 profile 上（报出一棵已删除的树，全未覆盖）。
       现在逐 object 导出、同一文件取「覆盖最多、其次映射最全」的那份视图，且只读**这次运行**链接的 object（`mtime ≥ 运行前一刻`）。
-  **修后的数字**（我复跑 `verify jobq --slow --json`：exit 0 · 8 m 41.0 s，与施工者两次 8 m 50.8 / 8 m 57.3 s 逐条一致）：3.21 **100%**（204/204）、3.22 **100%**（64/64）、
-  3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）、**3.26 37%（918/2438）**。
+  第三批（`032554b`，2026-10-06）：
+   ⑧ **子进程的 profile 被丢掉了**：规格用 `env_clear` 启动真二进制时（`jobq/3.15`、`3.26` 判“命令行”的做法），
+      子进程看不到 `LLVM_PROFILE_FILE`，LLVM 把 profile 写进**它的工作目录**（就是被测量的那棵树），而门只看自己指的那个目录——
+      于是 3.26 自己的文件 `src/cli/dlq.rs` 被报成 **0/199**，而那次运行实际走到 181/199。现在门把树里出现的 `.profraw` 一起 merge，
+      副本也不再复制 `.profraw`（规则见 §1.3）。
+  **修后的数字**（我复跑 `verify jobq --slow --json`：exit 0 · 8 m 41.0 s，与施工者两次 8 m 50.8 / 8 m 57.3 s 逐条一致；⑧ 之后再复跑一次：exit 0 · 8 m 23.8 s）：3.21 **100%**（204/204）、3.22 **100%**（64/64）、
+  3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）、**3.26 由 37%（918/2438）到 56%（1367/2438）**（⑧ 的功劳，见下）。
   两个数字变化都不是调参：3.21 的旧值来自「多二进制一次导出」配上的一个**没跑过的** bin 的视图（同一个文件三个视图是 204/204、197/131、165/204）；
   3.26 的分母由 2345 变 2438，因为旧值是合并调用对同一批文件的混合映射，而新值按「一个文件只数一次」相加。
 - **待用户定：3.26 的 coverage 与「模块 = 补丁碰过的整份文件」这条规则冲突。** 3.26 的补丁要碰 `src/cli/mod.rs`、
   `src/engine/store/{memory,postgres,mod}.rs`、`src/engine/operator.rs`，而那些文件的绝大部分行是**更早的步骤**拥有的、只由那几步的规格驱动，
-  所以这一步的模块天然到不了 80%（37% 是真实数字，不是缺陷；`mutants` 那边同样的粒度问题是靠给 3.26 的规格补用例解决的，见 §1.3）。三个选项：
+  所以这一步的模块到不了 80%（⑧ 修完是 **56%**：它自己的文件 `src/cli/dlq.rs` **181/199 = 90%**，而剩下 1071 行未覆盖里有 1015 行
+  落在 `postgres.rs`（528）、`memory.rs`（255）、`cli/mod.rs`（232）这三个更早步骤拥有的大文件里；数字是真的，不是缺陷）。三个选项：
   ① 保持现状，把这件事写进 3.26 的正文（学员会看到一条永远红的 should 行）；
   ② 让**步骤自己声明模块**（元数据给出文件清单，默认仍是补丁碰过的文件；`lint-caps` 校验它是补丁文件的子集），3.26 声明 `src/cli/dlq.rs` 等；
   ③ 把 coverage 的模块收窄成「这一步**新建**的文件；没有新建时回退到碰过的文件」（3.26 → `src/cli/dlq.rs`）。
