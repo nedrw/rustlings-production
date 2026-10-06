@@ -1,0 +1,786 @@
+# T4 `lakelet` — telemetry ingestion and query (24 steps), see `docs/curriculum.md` §9.
+#
+# Same conventions as `course/tracks/{mailer,relay,jobq}/track.toml` (`kiln lint-caps` enforces them):
+# `teaches` matches the capability ledger slot by slot (R0), `requires` is what this step provably
+# builds on (R3), `entry`/`spec`/`scaffold`/`solution` are relative to this track directory,
+# `run.cmd` runs in `project` below and never through a shell, and the gate ladder only ever tightens.
+#
+# The ladder starts where T3 ended — `clippy@4`, and the persistent set (`spec-integrity`, `caps`,
+# `i18n`, `fmt`, `no-todo`, `docs:public`, `exit-code`) — and differs from T3 in three places, each
+# one a decision rather than an accident (docs/m3-plan.md §6):
+#
+# * **no `semver@baseline`**: the gate arrives with the capability that teaches it, and T4 has no
+#   `api/library-design` slot. T4's public surface is the wire format, and that is pinned the way
+#   bytes have to be pinned: `spec/4.1/ingest_protocol.rs` holds the frames, and `spec-integrity`
+#   holds their hashes.
+# * **`links` is step-scoped**, as plan §6 asks: it is declared by the steps that ship a page
+#   (`docs/protocol.md`, the ADR, the format, the query page, the perf/profile/soak/capacity pages,
+#   the DR drill, the build and supply-chain pages, the rotation page, the runbook).
+# * **the three new slow gates** — `slow:sim@N`, `slow:fuzz@N`, `slow:soak@N` — are kiln's own
+#   implementation (plan §6, handoff M3 §4): the seeds, the workload floor and the live-counter
+#   bounds live in `sim/`, `fuzz/` and `soak/` files the course owns, and every judgement is a
+#   count, a transcript or a bound. `slow:mutants@80` is declared by the twelve steps whose module is
+#   where correctness is decided (not by all twenty-four): it costs about a minute per step, and the
+#   plan's §6 list keeps slow quality gates step-scoped where the artifact they judge appears.
+#
+# `origin`: 4.1 is a `transfer` (the fourth project skeleton in a row, as `jobq/3.1` was the third),
+# sixteen steps are `teach` (T4 establishes twenty-two slots no earlier track reached), seven are
+# `deepen` (4.4, 4.6, 4.15, 4.21, 4.22, 4.23, 4.24).
+
+format_version = 1
+id = "lakelet"
+index = 4
+title = "Lakelet — a telemetry store with a query engine"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6), and it
+# has no database: the point of T4 is the store the project builds itself (WAL, segments, compaction).
+project = "app/lakelet"
+
+# Exit capabilities (curriculum.md §5): what this track has to have established by its last step.
+exit = [
+    "ingest/protocol@apply",
+    "io/batching@design",
+    "store/wal-recovery@apply",
+    "store/columnar@apply",
+    "store/compaction@design",
+    "query/engine@design",
+    "query/index-pruning@apply",
+    "perf/profiling@operate",
+    "perf/soak@apply",
+    "ops/backup-restore@apply",
+    "build/reproducibility@apply",
+    "ops/runbook-drill@operate",
+]
+
+# --------------------------------------------------------------------------------------------
+# Phase A — the ingest protocol, its edges, and the write path (4.1-4.4).
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "4.1-ingest-protocol"
+title = "Framing is the interface: a length-prefixed ingest protocol with a checksum"
+kind = "milestone"
+origin = "transfer"
+entry = "docs/steps/en/lakelet/4.1-ingest-protocol.md"
+time_hint = "120m"
+concepts = ["length-prefixed framing", "checksum", "partial reads"]
+teaches = ["ingest/protocol@apply"]
+# requires: the fourth project skeleton, and the pieces it re-stands (the learner has done this in
+# mailer/1.1, relay/2.1 and jobq/3.1 — the DELTA is the binary protocol and the append-only store).
+requires = [
+    "repo/workspace-layout@apply",
+    "cfg/layered-config@design",
+    "obs/structured-logs@design",
+    "time/clock-injection@apply",
+    "cli/contract@apply",
+]
+run = { cmd = "cargo test -p lakelet --test spec_ingest_protocol" }
+spec = ["spec/4.1/ingest_protocol.rs"]
+scaffold = "skeleton"
+solution = "solutions/4.1-ingest-protocol.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+]
+hint = "A frame is a length, a version byte, the payload and a checksum, and the decoder has to answer three ways: a whole frame, a short buffer that needs more bytes, and a frame that is not this protocol. `docs/protocol.md` is what the bytes mean to anyone else."
+
+[[step]]
+id = "4.2-parser-fuzz"
+title = "A parser is only as good as the corpus of things that broke it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.2-parser-fuzz.md"
+time_hint = "90m"
+concepts = ["seeded mutation", "regression corpus", "panic-free parsing"]
+teaches = ["test/fuzzing@apply"]
+requires = ["ingest/protocol@apply", "err/typed-errors@design"]
+run = { cmd = "cargo test -p lakelet --test spec_parser_fuzz" }
+spec = ["spec/4.2/parser_fuzz.rs"]
+scaffold = "scaffold/4.2-parser-fuzz.patch"
+solution = "solutions/4.2-parser-fuzz.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:fuzz@3",
+    "slow:?coverage@80",
+]
+hint = "Three seeds, one mutator, and a rule that a malformed frame is always a typed error and never a panic. Every input that ever found a panic stays in the spec as a pinned case; `cargo-fuzz` is what a production project uses, and `kiln doctor` tells you it is not installed here."
+
+[[step]]
+id = "4.3-write-path-adr"
+title = "Durability is a decision: what fsync costs and which crashes you accept"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.3-write-path-adr.md"
+time_hint = "90m"
+concepts = ["fsync policy", "crash points", "decision record"]
+teaches = ["store/wal-recovery@aware"]
+requires = ["err/typed-errors@design", "obs/structured-logs@design"]
+run = { cmd = "cargo test -p lakelet --test spec_write_path" }
+spec = ["spec/4.3/write_path.rs"]
+scaffold = "scaffold/4.3-write-path-adr.patch"
+solution = "solutions/4.3-write-path-adr.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+]
+hint = "The decision is a value in the code (`WalPolicy`) and a sentence in `docs/adr/0001-write-path.md`, and the spec checks that the two agree: the crash-point table says what each policy loses, and the enum says which one this build uses."
+
+[[step]]
+id = "4.4-wal-recovery"
+title = "Recovery replays a prefix: checksums, torn writes, and the records that were acknowledged"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.4-wal-recovery.md"
+time_hint = "120m"
+concepts = ["checksummed records", "torn write", "replay"]
+teaches = ["store/wal-recovery@apply"]
+requires = [
+    "store/wal-recovery@aware",
+    "time/clock-injection@apply",
+    "err/typed-errors@design",
+]
+run = { cmd = "cargo test -p lakelet --test spec_wal_recovery" }
+spec = ["spec/4.4/wal_recovery.rs"]
+scaffold = "scaffold/4.4-wal-recovery.patch"
+solution = "solutions/4.4-wal-recovery.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:sim@3",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+]
+hint = "Two halves: every truncation point of a written log recovers to a prefix of what was acknowledged (an exhaustive sweep of the file), and the concurrent half — writers, a flush, a crash, a restart — is deterministic under a seed (`KILN_SIM_SEED`), which is what `slow:sim@3` checks."
+
+# --------------------------------------------------------------------------------------------
+# Phase B — batching, backpressure, segments and compaction (4.5-4.8).
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "4.5-batch-writes"
+title = "Write amplification: batch the calls, and count what a flush costs"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.5-batch-writes.md"
+time_hint = "120m"
+concepts = ["write amplification", "batch size", "flush accounting"]
+teaches = ["io/batching@design"]
+requires = ["store/wal-recovery@apply", "async/backpressure@aware"]
+run = { cmd = "cargo test -p lakelet --test spec_batch_writes" }
+spec = ["spec/4.5/batch_writes.rs"]
+scaffold = "scaffold/4.5-batch-writes.patch"
+solution = "solutions/4.5-batch-writes.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:bench-budget@10",
+]
+hint = "The counters are the lesson: bytes written per sample, fsyncs per batch, and the same numbers at twice the batch size. `tests/budget.rs` prints them and the course baseline (`budget/4.5-batch-writes.toml`) says what they have to stay near."
+
+[[step]]
+id = "4.6-ingest-backpressure"
+title = "Overload has to be a decision, not an out-of-memory kill"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.6-ingest-backpressure.md"
+time_hint = "120m"
+concepts = ["bounded queue", "drop policy", "reported overload"]
+teaches = ["async/backpressure@design"]
+requires = ["async/backpressure@apply", "io/batching@design"]
+run = { cmd = "cargo test -p lakelet --test spec_backpressure" }
+spec = ["spec/4.6/backpressure.rs"]
+scaffold = "scaffold/4.6-ingest-backpressure.patch"
+solution = "solutions/4.6-ingest-backpressure.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:sim@3",
+]
+hint = "Four policies (`Block`, `DropNewest`, `DropOldest`, `Sample`), each with a counter that says how much it dropped, and a deterministic overload scenario: `slow:sim@3` runs the whole thing under three seeds, because \"who got dropped\" is exactly the answer that depends on the schedule."
+
+[[step]]
+id = "4.7-columnar-segments"
+title = "A segment is columns: encode, compress, and prove the round trip"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.7-columnar-segments.md"
+time_hint = "150m"
+concepts = ["columnar layout", "delta/RLE encoding", "block compression"]
+teaches = ["store/columnar@apply"]
+requires = ["io/batching@design", "store/wal-recovery@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_columnar_segments" }
+spec = ["spec/4.7/columnar_segments.rs"]
+scaffold = "scaffold/4.7-columnar-segments.patch"
+solution = "solutions/4.7-columnar-segments.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "unsafe-budget@0",
+    "slow:bench-budget@10",
+    "slow:mutants@80",
+]
+hint = "Round trip first (every value in, the same values out, in order), then the size: `bytes_per_sample_max` in the budget is what the encoding is for. `docs/format.md` writes the layout down, because a segment format nobody else can read is a bug with a deadline."
+
+[[step]]
+id = "4.8-compaction"
+title = "Compaction rewrites segments while readers keep reading"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.8-compaction.md"
+time_hint = "120m"
+concepts = ["merge policy", "read consistency", "rewrite amplification"]
+teaches = ["store/compaction@design"]
+requires = ["store/columnar@apply", "store/wal-recovery@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_compaction" }
+spec = ["spec/4.8/compaction.rs"]
+scaffold = "scaffold/4.8-compaction.patch"
+solution = "solutions/4.8-compaction.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:sim@3",
+    "slow:bench-budget@10",
+]
+hint = "The reader must never see a half-compacted store: a query that starts before a merge and ends after it has to answer the same thing as one that ran entirely before. `slow:sim@3` runs query and compaction against each other under three seeds; the budget counts how many bytes a merge rewrote per byte it removed."
+
+# --------------------------------------------------------------------------------------------
+# Phase C — retention, query, and the numbers a query must be right about (4.9-4.14).
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "4.9-retention"
+title = "Retention deletes what nobody can still read — and proves it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.9-retention.md"
+time_hint = "90m"
+concepts = ["time partitioning", "cutoff", "deletion proof"]
+teaches = ["store/retention@apply"]
+requires = ["store/columnar@apply", "time/clock-injection@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_retention" }
+spec = ["spec/4.9/retention.rs"]
+scaffold = "scaffold/4.9-retention.patch"
+solution = "solutions/4.9-retention.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:bench-budget@10",
+    "slow:mutants@80",
+]
+hint = "\"Old data is gone\" is a claim with two halves: everything older than the cutoff is unreachable, and nothing newer than it was touched. The counter says how many bytes a retention pass reclaimed, and the test says which segments could not be deleted because a reader was holding them."
+
+[[step]]
+id = "4.10-downsampling"
+title = "A downsampled answer is still an answer: windows, alignment, tolerance"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.10-downsampling.md"
+time_hint = "120m"
+concepts = ["window aggregation", "alignment", "declared tolerance"]
+teaches = ["query/downsampling@apply"]
+requires = ["store/columnar@apply", "api/pagination@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_downsampling" }
+spec = ["spec/4.10/downsampling.rs"]
+scaffold = "scaffold/4.10-downsampling.patch"
+solution = "solutions/4.10-downsampling.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:bench-budget@10",
+    "slow:mutants@80",
+]
+hint = "The query interface lands here (`lakeletq query`, with the CLI contract T3 established: one exit code per failure class, stdout is the answer), and the interesting case is the window that is not aligned to the data: a downsampled mean compared with the raw mean, inside a tolerance the code states."
+
+[[step]]
+id = "4.11-query-engine"
+title = "A restricted query engine: parse, plan, and refuse what is not answerable"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.11-query-engine.md"
+time_hint = "150m"
+concepts = ["grammar subset", "query plan", "typed rejection"]
+teaches = ["query/engine@design"]
+requires = ["query/downsampling@apply", "err/typed-errors@design"]
+run = { cmd = "cargo test -p lakelet --test spec_query_engine" }
+spec = ["spec/4.11/query_engine.rs"]
+scaffold = "scaffold/4.11-query-engine.patch"
+solution = "solutions/4.11-query-engine.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+]
+hint = "`SELECT mean(value) FROM cpu WHERE host = 'a' AND ts BETWEEN … AND … GROUP BY time(5m), series` — and the refusals matter as much as the answers: unknown metric, an aggregation that does not exist, a range wider than retention, a window that is not a legal step. `EXPLAIN` prints the plan: which segments, which columns, how many rows."
+
+[[step]]
+id = "4.12-aggregation-correctness"
+title = "Floats, monotonic time and time zones: the numbers a query is wrong about"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.12-aggregation-correctness.md"
+time_hint = "120m"
+concepts = ["summation error", "monotonic time", "time-zone arithmetic"]
+teaches = ["num/aggregation-correctness@apply"]
+requires = ["query/engine@design", "time/clock-injection@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_aggregation" }
+spec = ["spec/4.12/aggregation.rs"]
+scaffold = "scaffold/4.12-aggregation-correctness.patch"
+solution = "solutions/4.12-aggregation-correctness.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:mutants@80",
+    "slow:?coverage@80",
+]
+hint = "Every case here compares two implementations and states the tolerance: a running sum against a naive sum, values recorded while the clock stepped backwards, a day that is not 24 hours long. \"Close enough\" is a number in the code, not a hope in a comment."
+
+[[step]]
+id = "4.13-model-based-tests"
+title = "A model of the store, and a random walk that has to agree with it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.13-model-based-tests.md"
+time_hint = "120m"
+concepts = ["reference model", "operation sequence", "shrinking"]
+teaches = ["test/model-based@apply"]
+requires = ["test/property-based@apply", "store/wal-recovery@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_model_based" }
+spec = ["spec/4.13/model_based.rs"]
+scaffold = "scaffold/4.13-model-based-tests.patch"
+solution = "solutions/4.13-model-based-tests.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:sim@3",
+    "slow:mutants@80",
+]
+hint = "The model is the contract in its simplest form (a map of series to values, plus a rule for what compaction may throw away); the walk applies random operations to both and compares after every step. The seed comes from `KILN_SIM_SEED`, so `slow:sim@3` replays the same three walks that `kiln run` just walked."
+
+[[step]]
+id = "4.14-index-pruning"
+title = "Pruning is measurable: how many segments a query did not have to open"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.14-index-pruning.md"
+time_hint = "120m"
+concepts = ["zone map", "predicate pruning", "measured pruning rate"]
+teaches = ["query/index-pruning@apply"]
+requires = ["query/engine@design", "store/columnar@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_index_pruning" }
+spec = ["spec/4.14/index_pruning.rs"]
+scaffold = "scaffold/4.14-index-pruning.patch"
+solution = "solutions/4.14-index-pruning.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:bench-budget@10",
+    "slow:mutants@80",
+]
+hint = "An index is only worth its space if the plan can prove a segment cannot match — min/max per column, and a counter that says how many were skipped. The wrong answer to watch for is the one that is *correct and slow*: pruning that prunes nothing passes every functional test."
+
+# --------------------------------------------------------------------------------------------
+# Phase D — performance as an artifact: budgets, profiles, soak, cardinality, recovery (4.15-4.20).
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "4.15-budget-regression"
+title = "From budget to blame: which phase moved, and by how much"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.15-budget-regression.md"
+time_hint = "120m"
+concepts = ["phase attribution", "counter diffing", "regression story"]
+teaches = ["perf/bench-budget@operate"]
+requires = ["perf/bench-budget@apply", "perf/load-testing@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_budget_regression" }
+spec = ["spec/4.15/budget_regression.rs"]
+scaffold = "scaffold/4.15-budget-regression.patch"
+solution = "solutions/4.15-budget-regression.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:bench-budget@10",
+]
+hint = "T3 taught the budget; this is what to do when it goes red. The engine counts work per phase (decode, scan, aggregate, serialize), `tests/attribution.rs` prints a profile of those counts, and `docs/perf.md` is the write-up that names the phase a regression came from."
+
+[[step]]
+id = "4.16-profiling"
+title = "A profile is evidence: sample the process, read it, and say what it means"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.16-profiling.md"
+time_hint = "120m"
+concepts = ["sampling profiler", "hot path", "conclusion"]
+teaches = ["perf/profiling@operate"]
+requires = ["perf/bench-budget@operate"]
+run = { cmd = "cargo test -p lakelet --test spec_profiling" }
+spec = ["spec/4.16/profiling.rs"]
+scaffold = "scaffold/4.16-profiling.patch"
+solution = "solutions/4.16-profiling.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+]
+hint = "Which sampler runs here is `kiln doctor`'s business, and the answer on a stock macOS is `sample` (`cargo-flamegraph` needs root for `dtrace`). The deliverable is `docs/profile.md`: what was sampled, the two symbols at the top, and the change the number justifies — checked against the phase counters, so the prose cannot drift from the code."
+
+[[step]]
+id = "4.17-soak"
+title = "Soak: what is still alive after ten thousand cycles"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.17-soak.md"
+time_hint = "120m"
+concepts = ["leak counters", "steady state", "long run"]
+teaches = ["perf/soak@apply"]
+requires = ["perf/profiling@operate", "async/backpressure@design"]
+run = { cmd = "cargo test -p lakelet --test spec_soak" }
+spec = ["spec/4.17/soak.rs"]
+scaffold = "scaffold/4.17-soak.patch"
+solution = "solutions/4.17-soak.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:soak@4000",
+    "slow:mutants@80",
+]
+hint = "The gate judges counters and not minutes: `tests/soak.rs` runs the ingest/flush/query cycle `cycles_min` times and prints what is still alive at the end (tasks, file handles, tracked series). The long form of the same command (`LAKELET_SOAK_MINUTES=30`) is what a real soak is, and `docs/soak.md` says which number moved the last time it ran."
+
+[[step]]
+id = "4.18-cardinality-cost"
+title = "Cardinality is the bill: cap the series, and price the ones you keep"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.18-cardinality-cost.md"
+time_hint = "120m"
+concepts = ["series cardinality", "admission cap", "cost per series"]
+teaches = ["obs/cardinality-cost@apply"]
+requires = ["obs/metrics-slo@design", "store/columnar@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_cardinality" }
+spec = ["spec/4.18/cardinality.rs"]
+scaffold = "scaffold/4.18-cardinality.patch"
+solution = "solutions/4.18-cardinality.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:soak@4000",
+]
+hint = "A label with an unbounded value set is how a telemetry store dies: the cap is a policy with a counter (`series_rejected_total`), the refusal is visible to the client, and `docs/cardinality.md` prices the series that were kept. The soak gate is here because a cap that leaks is what a long run finds."
+
+[[step]]
+id = "4.19-backup-restore"
+title = "Backups are only real once you have restored one"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.19-backup-restore.md"
+time_hint = "120m"
+concepts = ["manifest", "incremental copy", "RTO/RPO"]
+teaches = ["ops/backup-restore@apply"]
+requires = [
+    "store/wal-recovery@apply",
+    "store/columnar@apply",
+    "time/clock-injection@apply",
+]
+run = { cmd = "cargo test -p lakelet --test spec_backup_restore" }
+spec = ["spec/4.19/backup_restore.rs"]
+scaffold = "scaffold/4.19-backup-restore.patch"
+solution = "solutions/4.19-backup-restore.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:sim@3",
+    "slow:mutants@80",
+]
+hint = "The drill is the deliverable: a copy interrupted mid-segment, a manifest that says what is complete, and a restore that ends in a readable store — with the two numbers written down (`docs/dr-drill.md`): how long the restore took, and how much of the tail it lost. `slow:sim@3` injects the interruption at seeded points."
+
+[[step]]
+id = "4.20-capacity-model"
+title = "Capacity is a model with numbers in it, not a feeling"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/lakelet/4.20-capacity-model.md"
+time_hint = "90m"
+concepts = ["cost per event", "retention tradeoff", "model versus measurement"]
+teaches = ["ops/capacity-cost@design"]
+requires = ["perf/bench-budget@operate", "obs/metrics-slo@design"]
+run = { cmd = "cargo test -p lakelet --test spec_capacity" }
+spec = ["spec/4.20/capacity.rs"]
+scaffold = "scaffold/4.20-capacity-model.patch"
+solution = "solutions/4.20-capacity-model.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:bench-budget@10",
+]
+hint = "`docs/capacity.md` answers \"what does a million events a day cost\" from constants the code exports (bytes per sample after encoding, series overhead, retention days), and the budget gate checks those constants against what the store actually wrote — a model that drifts from the measurement is the failure this step is about."
+
+# --------------------------------------------------------------------------------------------
+# Phase E — the operational surface: tiering, reproducibility, rotation, the drill (4.21-4.24).
+# --------------------------------------------------------------------------------------------
+
+[[step]]
+id = "4.21-cold-tiering"
+title = "Cold data leaves the box: tiering behind a port, and the client that speaks S3"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.21-cold-tiering.md"
+time_hint = "150m"
+concepts = ["tier policy", "object-store port", "signed request"]
+teaches = ["store/tiering@apply", "outbound/http-client@design"]
+requires = ["outbound/http-client@apply", "store/retention@apply", "sec/hmac-signing@apply"]
+run = { cmd = "cargo test -p lakelet --test spec_tiering" }
+spec = ["spec/4.21/tiering.rs"]
+scaffold = "scaffold/4.21-cold-tiering.patch"
+solution = "solutions/4.21-cold-tiering.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "slow:conformance@2",
+    "slow:mutants@80",
+]
+hint = "One suite, two implementations of the tier port: the local filesystem and an S3-shaped endpoint the spec starts itself (`KILN_BACKEND=local|s3`, so `conformance.toml` says which two). The HTTP half is what relay/2.7 taught, at design depth: a canonical request, a signature, retries that are safe because the object key is the idempotency key, and a listing that pages."
+
+[[step]]
+id = "4.22-reproducible-build"
+title = "The same source, the same bytes: reproducible builds and the supply chain"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.22-reproducible-build.md"
+time_hint = "150m"
+concepts = ["reproducible build", "pinned toolchain", "policy"]
+teaches = [
+    "build/reproducibility@apply",
+    "repo/toolchain-pinning@design",
+    "ci/pipeline@design",
+    "supply/deny-policy@design",
+    "release/container-image@design",
+]
+requires = [
+    "release/container-image@apply",
+    "repo/toolchain-pinning@apply",
+    "ci/pipeline@apply",
+    "supply/deny-policy@apply",
+    "release/artifacts@apply",
+]
+run = { cmd = "cargo test -p lakelet --test spec_reproducible", timeout = 1800 }
+spec = ["spec/4.22/reproducible.rs"]
+images = ["rust:1.98-alpine", "alpine:3.20"]
+scaffold = "scaffold/4.22-reproducible-build.patch"
+solution = "solutions/4.22-reproducible-build.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "images",
+    "container-repro",
+    "?deny",
+]
+hint = "Two builds from the same tree, compared byte for byte, with the differences that are left named and explained (`docs/build.md`): the toolchain's pin, the path, the timestamp. `docs/supply-chain.md` is the policy a reviewer reads, and `deny.toml` is that policy as a file `cargo-deny` could run (`kiln doctor` says it is not installed here)."
+
+[[step]]
+id = "4.23-secret-rotation"
+title = "Rotation without a gap: two keys valid, one of them preferred"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.23-secret-rotation.md"
+time_hint = "120m"
+concepts = ["overlapping validity", "key ring", "rotation window"]
+teaches = ["sec/secrets-management@design"]
+requires = [
+    "sec/secrets-management@apply",
+    "sec/token-lifetime@apply",
+    "sec/hmac-signing@apply",
+]
+run = { cmd = "cargo test -p lakelet --test spec_rotation" }
+spec = ["spec/4.23/rotation.rs"]
+scaffold = "scaffold/4.23-secret-rotation.patch"
+solution = "solutions/4.23-secret-rotation.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+    "slow:sim@3",
+]
+hint = "A key ring rather than a key: the new one signs, both verify, and the old one leaves only after the longest lifetime a client could still be holding. `slow:sim@3` runs requests across the rotation boundary under three seeds, because \"which key signed this\" is invisible until the clock moves."
+
+[[step]]
+id = "4.24-runbook-drill"
+title = "The runbook is the procedure, and the drill is the proof"
+kind = "design"
+origin = "deepen"
+entry = "docs/steps/en/lakelet/4.24-runbook-drill.md"
+time_hint = "120m"
+concepts = ["runbook", "failure drill", "review"]
+teaches = ["ops/runbook-drill@operate"]
+requires = [
+    "ops/runbook-drill@design",
+    "obs/metrics-slo@design",
+    "ops/backup-restore@apply",
+]
+run = { cmd = "cargo test -p lakelet --test spec_runbook" }
+spec = ["spec/4.24/runbook.rs"]
+scaffold = "scaffold/4.24-runbook-drill.patch"
+solution = "solutions/4.24-runbook-drill.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "links",
+]
+hint = "Which of the twelve things a runbook stage owes is missing is what the drill finds: a command, a signal to watch, the state that says it worked, the rollback, and who is told. `docs/runbook.md` is the procedure, `docs/slo.md` the number it protects, and `tests/runbook_harness.rs` runs the commands the page names against a live store."
