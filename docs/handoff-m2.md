@@ -460,7 +460,7 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | 默认特性全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
-| 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `40/40`；`links` → **84 page(s) · 449 link(s) · 279 external target(s)**，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
+| 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **84 page(s) · 449 link(s) · 279 external target(s)**，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
 | CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）|
 
 ### 4.3 验收演练（已做两腿，原始输出）
@@ -607,7 +607,7 @@ or no finish; the walk took 60s) — no test noticed src/engine/store/postgres.r
 
 ### 5.1 probe 覆盖（T3 新增槽位）
 
-题库从 19 道扩到 **40 道**（`probe --check` → `40 exercise(s) · 40 reference(s) passed`），
+题库从 19 道扩到 **41 道**（`probe --check` → `41 exercise(s) · 41 reference(s) passed`），
 T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（包括 `obs/metrics-slo@design`、
 `obs/structured-logs@design`、`obs/tracing-propagation@operate`、`db/schema-online-evolution@apply`、
 `delivery/idempotency@design` 这五道后补的）；**没出题的槽位与理由**
@@ -651,9 +651,10 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   **留下的窄窗口**：两条**并发**的 claim 仍可能各自读到同一份余量（语句级快照），因此队列瞬时可能超出上限一行；
   彻底修需要按队列串行（例如先 `select … from queues for update`），超出本次范围，记在这里。
   这条也让一个设计代价变具体了：“`conformance` 只写在判端口的步骤上”——3.9 的规格本来只建内存存储，于是**对后端的承诺没有人判**。
-- **`ops/dlq-tooling@operate` 没有同深度的探题**（3.26 作者发现）：`kiln plan` 自己说得很清楚——"there is no exercise at operate; the closest is
-  `kiln probe ops-dlq-tooling.apply` (apply), which re-checks the habit and not this depth"——所以 `kiln skip jobq/3.26-dlq-cli` 必须带 `--force`。
-  §5.1 的探题表里没有这个槽位的行（`probe --check` 仍是 40/40）。要么补一道 operate 深度的题，要么在 §5.1 里写明为什么没有。
+- **`ops/dlq-tooling@operate` 的探题（已补，提交 `course(probes): the operate half of the DLQ slot gets its exercise`）**：3.26 的作者发现这个槽位没有同深度的题，
+  `kiln skip jobq/3.26-dlq-cli` 只能 `--force`。现在补了一道 `ops-dlq-tooling.operate`（6 个用例：一页一页地跑程序、同一 id 在一次 pass 里只动一次、
+  拒绝**按固定顺序**给类别、每次拒绝不碰行也不碰痕迹、pass 可交接、清空有界），`probe --check` 40/40 → **41/41**；`kiln skip jobq/3.26-dlq-cli` 现在说
+  "nothing proven about ops/dlq-tooling yet — `kiln probe ops-dlq-tooling.operate` is what would prove it"，而不是"没有这道题"。
 - **探题的句子与门不一致（收尾时对齐）**：`course/probes/unsafe-budget.apply.rs` 写着“`// SAFETY:` 在**同一行或上面三行**”，
   而 3.24 的规格与 `unsafe-budget@0` 门都要求**在上面**三行内。探题从不测同行注释，所以没有红；对齐它要么改那句话、要么改门的判据（建议改探题那句话，因为门与项目的 `// SAFETY:` 习惯一致）。
 - **3.23 的 `slow:mutants@80` 是 `5/6 (83%)`**（过线但在边上）：它的模块里有一个变异体没有规格能杀。留给收尾时决定是否补一条断言。
