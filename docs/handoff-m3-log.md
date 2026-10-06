@@ -540,3 +540,65 @@ check 4.6 --slow：✓ slow:sim@3  3 seed(s) ran, transcripts 4b891aaf/59a2e06b/
 
 **下一步**：`4.7-columnar-segments`（teach，`store/columnar@apply`：先往返、再判体积 `bytes_per_sample_max`；
 `unsafe-budget@0` 要求项目 manifest 里 `unsafe_code = "deny"`；`zstd` 冷构建离线 4.25 s 已测）。
+
+## 段 12：`lakelet/4.7-columnar-segments`（B2 的第三步，体量最大的一步）
+
+**做了什么**：`store/columnar@apply` 由子 agent 交付（提交 `0813393`，2983 行新增）：14 个用例的规格、
+正文（teach 模板，176 行）、`segment/{mod,encode,decode,compress}.rs`、`docs/format.md`（scaffold 模板，
+学员填、规格读回）、`budget/4.7-columnar-segments.toml`（10 个计数）与课程装置 `tests/budget_segments.rs`；
+`unsafe_code = "deny"` 由 **scaffold** 落进 `[lints.rust]` 标记块（规则 6 允许：这行以后谁都不会改）。
+
+**段格式（`docs/format.md` 的原文布局）**：`LKLS` + 版本 + `COLUMNS=3` + 列块长度 + 压缩长度 +
+zstd 帧 + 4 字节 seal；列块是 `u64` 记录数 + 三列（**series → timestamp → value** 的固定顺序），
+每列 `u8` 标签 + `u32` 长度 + 载荷；标签 `PLAIN=0 / RLE=1 / DELTA=2 / DIC=3`。
+每列**先各自选最短的那种编码**（平局取标签小的），再整块做一次 `zstd`（`LEVEL = 3`）。
+选编码**不看压缩器**（否则字节就成了 zstd 版本的函数，金向量也就钉不住）。
+
+**两条判据的纪律**：① **列块字节由规格里的金向量钉死**（`GOLDEN: [u8; 123]`，逐区域比对并点名移动的是哪一段），
+这是 4.1 给线上协议立的规矩、也是 T4 不带 `semver@baseline` 的理由（plan §7 D-2）；**压缩后的字节不钉**（换一个
+zstd 版本可能产出不同字节，那不是学员的错），只判往返与体积。② 陌生字节是**类型化错误**：规格对一份真段做
+**全部截断点 + 全部单比特翻转**的扫描，每次都要 `Error::Protocol` 且句子非空（还检查这些句子不是同一句）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+selftest：4.1 9/9 · 4.2 10/10 · 4.3 9/9 · 4.4 10/10 · 4.5 10/10 · 4.6 9/9 · 4.7 12/12 must green
+check 4.7 --slow：✓ unsafe-budget@0  0 `unsafe` occurrence(s) in 31 production file(s), and `unsafe_code` is denied in …/app/lakelet/Cargo.toml
+                  ✓ slow:bench-budget@10 10 metric(s) judged against the course baseline (4 within ±10%, 6 at or below an upper bound):
+                    samples 1024, series 8, distinct_values 16, samples_read 2048, mismatches_max 0, column_block_bytes_max 3032,
+                    segment_bytes_max 170, bytes_per_sample_max 0.166, compression_ratio_max 0.0561, flat_column_block_bytes_max 1099
+                  ✓ slow:mutants@80 6/6 mutant(s) killed (100%, needs ≥80%) (6s)
+                  12/12 must gate(s) passed · real 31.2s
+```
+
+**两条演练（都做了红/回滚/绿）**：
+
+```
+(a) 值列按 `==` 分组而不是 `to_bits()`（`-0.0` 吞掉 `0.0`）→ 规格 `13 passed; 1 failed`，失败信息点名
+    `the first difference is Some(Record { series: "cpu,host=h0", ts_millis: -9223372036854775808, value: 0.0 })`；
+    回滚 → 14 passed
+(b) 每列都写成 PLAIN（编码选择被拆掉）→ ✗ slow:bench-budget@10 4 of 10 metric(s) moved out of budget：
+    column_block_bytes_max 29719 ≤ 3100、segment_bytes_max 536 ≤ 200、bytes_per_sample_max 0.5234 ≤ 0.2、
+    flat_column_block_bytes_max 29719 ≤ 1150；**规格同时红 5 例**（金向量钉住了编码）；
+    回滚 → 12/12 must gates passed
+```
+
+**这一段钉下来的五件事**：
+
+1. **每个步骤各自的装置**：4.5 的 `tests/budget.rs` 里没有 `kiln:scaffold:` 块，而 scaffold 只能在标记区内插入，
+   所以 4.7 只能新建自己的 `tests/budget_segments.rs`（`budget/4.7-columnar-segments.toml` 的 `command` 指向它）。
+   这不是权宜：课程拥有的文件若想让后步**追加**指标，就得在建它的时候留一个标记块。已写进 handoff-m3 §1
+   第 7 条——“要共享就留块，不留块就各步一份”。
+2. **一个“等价变异体”被删掉了**：第一次 `--slow` 是 `5/6 (83%)`，唯一幸存的是 delta 解码器里的 `if count == 0`——
+   因为选编码的平局规则永远不会给 delta 列写出零记录，这个分支**不可杀**（杀掉它不改变任何行为）。子 agent 把
+   “空时钟列”的判断上提到 `stamps` 的入口（一处代替一个分支），死分支消失、变异不再等价，于是 `6/6 (100%)`。
+   这是 `mutants` 门的一条真知识：**门能杀的只是会改变行为的改动**，等价变异体的正解是消除等价性，不是写 flaky 用例。
+3. **一个计数上界，来自“绝不 panic”这条不变量**：`decode::records` 在动手分配之前先拒 `count` 大于时钟列能描述的
+   记录数（任一种编码下每条记录至少 1 字节）；否则约 30 字节的坏文件可以让库去要十亿条记录的内存——那比 panic 更糟。
+4. **压缩相关的边界都留了余量**：`segment_bytes_max 200`（实测 170）与 `compression_ratio_max 0.07`（0.0561）
+   随 zstd 版本浮动，所以留 ~18–25% 的松量；列块的计数则是记录的精确函数。
+5. **我的作业书又算错了一次门数**（写 11，实际 12）。加上 4.4 那次（写 12，实际 11），这是第二次凭邻近步骤的清单推门数
+   ——已写成 handoff-m3 §1 第 8 条：**门数一律对着 `track.toml` 数**，别推导。
+
+**下一步**：`4.8-compaction`（B2 最后一步：合并策略作为数据、读者永远看不到半合并的库、`slow:sim@3` 第三个真用户 +
+`bench-budget` 数“每移除一个字节重写了多少”）。
