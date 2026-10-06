@@ -107,6 +107,8 @@ cargo 按**包名+版本**选构建槽、不按目录，所以插桩目录里可
 - **两个时钟**（§4.4 的教训）：单个变异体最多跑 `4 × 未变异基线耗时 + 15s`（再被 `--timeout` 封顶）——变异体只差一个算子，
   超过四倍还在跑就是卡住了；整轮最多 `WALK_BUDGET = 300s`，到点就停止并声明“走路被预算截断”。报告里带这轮花了多少秒。
 - 报告行必须点名存活的变异体（文件、行、列、原文），否则学员不知道该补什么测试。
+- 构建目录同样先**认领**再走（`scratch::claim`，与 `coverage` 同一条规则，见上面 coverage 那节）：两个 kiln 进程同时走变异会互相拿到对方的二进制。
+  **`mutants` 是 must 门**，所以拿不到锁的 `blocked` 会让那一步不通过（`coverage` 是 should，只报告）——并发跑 kiln 时要知道这一点。
 
 **`bench-budget@P`（慢）**
 
@@ -175,6 +177,16 @@ cargo 按**包名+版本**选构建槽、不按目录，所以插桩目录里可
   那个子进程看不到 `LLVM_PROFILE_FILE`，LLVM 会把 profile 写进**它的工作目录**，也就是这次测量的那棵树里。
   门把这些 `.profraw` 一起 merge（`profiles_of_the_run`），并且 `sandbox::copy_project` **不复制** `.profraw`
   （副本给每个文件盖戳，别的运行的 profile 会“比开跑还新”，从而被误当成本次的）。
+- **项目自己的 `rustflags` 是拒绝，不是另一棵树**：门在子进程环境里放 `RUSTFLAGS`，而 cargo 的规则是**环境盖过项目 config**——
+  项目若在 `.cargo/config.toml` 里配了 `build.rustflags` / `target.*.rustflags`，插桩构建就不是学员命令做出的那个构建。
+  门在**构建之前**从项目目录向上走到**课程根（含）**找这两个文件（`config.toml`、`config`），命中就 `blocked` 并点名文件与 key。
+  边界写在函数文档里：**不读**机器的 `$CARGO_HOME/config.toml`（那是机器的私事，为它 block 会指向一个学员在项目里看不见的文件）；
+  项目 config 读不动/解析不了时交给 cargo 自己报错（猜到一棵不存在的树更糟）。
+- **两个共享构建目录是“认领”的，不只是起个名字**（`scratch::claim`，`coverage` 与 `mutants` 都用）：顺序运行安全（副本盖戳保证包被重建），
+  但两个 kiln 进程同时跑会互相拿到对方的产物。认领是 `create_new` 出来的 `<cache>/kiln/<name>.lock`（内容 PID + 时刻），
+  被别人持有就有界等待 **120 s**（250 ms 轮询）后 `blocked` 并点名 lock 文件、PID、持有时长；
+  mtime 超过 **30 min** 的锁视为持有者已死并接管一次（被 SIGKILL 的进程跑不了 `Drop`，没有这条迟早把人卡死）。
+  认领在整个门期间持有：`coverage` 跨插桩构建与导出，`mutants` 跨基线与每一次尝试。
 - 三条正确性规则（都不是整洁问题）：① **副本 + 时间戳**——共享槽里别的沙箱的插桩二进制会拿**别的树**的行数回答
   （实测 3.22 因此 `blocked`，而它的套件其实覆盖了那个模块 64/64）；② **逐 object 导出**——把多个二进制一次交给
   `llvm-cov export` 是「一个二进制的多个 object」的调用形状，会丢掉只有部分二进制携带的文件，并按它碰巧配上的
@@ -490,7 +502,7 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **87 page(s) · 464 link(s) · 283 external target(s)**，`✓ every target resolves`（2026-10-06 复核时的数字）；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
-| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）；子进程 profile 那笔之后又跑一次：**exit 0 · 39 m 22.9 s**，输出同上（kiln 单测 `278 + 21 + 1`）；**方案 ③ 与 review 批次（A/B/C/E）之后的最新一次：exit 0 · 30 m 58.8 s · `27/27 step(s) hold the contract`（kiln 单测 `285 + 21 + 1`）** |
+| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）；子进程 profile 那笔之后又跑一次：**exit 0 · 39 m 22.9 s**，输出同上（kiln 单测 `278 + 21 + 1`）；**方案 ③ 与 review 批次（A/B/C/E）之后：exit 0 · 30 m 58.8 s · `27/27 step(s) hold the contract`（kiln 单测 `285 + 21 + 1`）**；**#5/#6 之后的最新一次：exit 0 · 30 m 19.1 s · `27/27 step(s) hold the contract`（kiln 单测 `291 + 21 + 1`）** |
 
 ### 4.3 验收演练（已做两腿，原始输出）
 
@@ -774,11 +786,19 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   #4/#7（`35ec238`）、#9（`d49b4c1`：`check --slow` 跑与 `verify --slow`/`selftest` 同一集合；
   顺手修了汇总行把“没跑的门”当成“未实现”的两个计数，现在分列 `slow gate(s) skipped` 与 `catalogue gate(s) not implemented yet`）、
   `c9146b2`（探题里还留着一条 `at or above` 的断言文案）。
-  **待定**：#5/#6 一批（见下一条）；**#8 已补**：`cargo xtask ci` → **exit 0 · 30 m 58.8 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq，含本轮 A/B/C/E 与 ②③ 那几笔）。
+  **#5/#6 已落地**：#6（`aab2a6a` + `7f28f45`）在构建前读 `<project>/.cargo/{config.toml,config}` 并向上走到**课程根**，命中 `build.rustflags`/`target.*.rustflags`
+  就 `blocked` 并点名文件与 key（实测：`app/jobq/.cargo/config.toml` 写一个 `[build] rustflags` → `⚠ …sets \`build.rustflags\` …`，里头的 15/15 must 门仍绿；
+  删掉后同一命令 `✓ 307 of 325 (94%)`）；#5（`61b096d`）用 `scratch::claim` 把两个共享构建目录认领起来（`create_new` 的 lock + PID + 时刻，
+  有界等待 120 s → `blocked` 点名持有者，mtime > 30 min 的锁接管一次；实测：活锁 → `⚠ another kiln run holds …（pid 88541, held for 163s）`，
+  6 h 45 m 的陈旧锁 → 被接管并跑完）。两条边界都写进 §1.3。
+  **待定**：无（十项全部有结论）。**#8 已补**：`cargo xtask ci` → **exit 0 · 30 m 58.8 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq，含本轮 A/B/C/E 与 ②③ 那几笔）；
+  **#5/#6 之后又跑一次：exit 0 · 30 m 19.1 s · 同样是 `27/27 step(s) hold the contract`（kiln 单测 `291 + 21 + 1`）**。
   **复核数字**（我独立重取）：`cargo test -p kiln` → **285 + 21 + 1**；`kiln probe --check` → **41/41**；
   尾巴树 `verify jobq --slow --json` → exit 0 · **7 m 21.7 s** · `{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`、
   七条 coverage 与八条 mutants 走法的数字逐条不变（204/204、64/64、237/237、205/215、293/334、307/325、121/141）；
   `check jobq/3.21-coverage-policy --slow` → 1 m 38 s。
+  **D 批次的复核（我独立重取）**：`cargo test -p kiln` → **291 + 21 + 1**；尾巴树 `verify jobq --slow --json` → exit 0 · **8 m 46.7 s** · 27/27 `clean`，
+  七条 coverage 与八条 mutants 数字逐条不变，且**跑完没有 lock 文件残留**（15 次顺序认领/释放都对）。
   **#7 的处理与 review 的建议不同**（它建议列出整块骨架）：骨架是课程的起始材料，它带的那批 stub 大多属于后面的步骤
   （jobq 的骨架含 `src/engine/error.rs`（3.3 的题目）与 `src/bin/jobqd.rs`（很后面）），列进去就会把别步的代码算进第一步的分母——
   正是方案 ③ 刚修掉的缺陷；所以现在是把“骨架步按自己补丁碰过的文件判”写进 `sources.rs` 的文档并用单测钉住。

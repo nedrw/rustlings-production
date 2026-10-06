@@ -26,6 +26,7 @@
 - 第十九段 · 2026-10 · 用户定下 coverage 的模块规则（方案 ③），以及一次被中断的 CI
 - 第二十段 · 2026-10 · “覆盖率为什么不前置”：解释清楚了，不前置
 - 第二十一段 · 2026-10 · 一份独立 review 的十项发现：A/B/C/E 落地，D 待定
+- 第二十二段 · 2026-10 · D 批次：rustflags 的边界与共享构建目录的认领（review 十项收口）
 
 ## 第一段 · 2026-10 · M2 开工：慢闸门分级、两处框架修正、T3 第一步
 
@@ -791,6 +792,30 @@ run C 不覆盖最新 HEAD（它之后又落了 `kiln(gates)…` 一次提交）
   `Path::ends_with` 是按路径组件比的（所以 `xsrc/store.rs` 从来不是误报，只有 `backup/src/store.rs` 那类才是）。
 - **`check --slow` 暴露了两个旧计数错**：汇总行过去把跳过的慢门算成“catalogue gate(s) not implemented yet”——
   学员在快路径上一直看着一行不实的提示；现在按“跑过的门”计数，并把跳过的慢门单独列出来。
+
+## 第二十二段 · 2026-10 · D 批次：rustflags 的边界与共享构建目录的认领（review 十项收口）
+
+### 做了什么
+
+- 用户“修复一下” → 派 worker 做 #6 与 #5（两笔提交），我复核后把 #6 的走查从“项目 + 上一级”扩到“课程根（含）”——
+  worker 自己把 delta 写清楚了：cargo 读所有祖先，仓库根的 config 也在学员的构建里，但一直走到文件系统根会开始读机器/主检出的 config。
+- **#6**（`aab2a6a` + `7f28f45`）：`configured_rustflags` 在构建前读 `<dir>/.cargo/{config.toml,config}`（项目 → 课程根），
+  命中 `build.rustflags` / `target.*.rustflags` 就 `blocked` 并点名文件与 key；不读 `$CARGO_HOME/config.toml`（机器的私事），解析不了的 config 交给 cargo。
+  实测（worker）：`app/jobq/.cargo/config.toml` 写 `[build] rustflags = ["--cfg","jobq_lab"]` →
+  `⚠ slow:?coverage@80 …sets \`build.rustflags\`…`（1 m 45.6 s，15/15 must 门仍绿）；删掉后同一命令 → `✓ 307 of 325 (94%)`（2 m 8.4 s）。
+- **#5**（`61b096d`）：`scratch::claim(name)` 用 `create_new` 拿 `<cache>/kiln/<name>.lock`（PID + 时刻），`Drop` 删除；
+  别人持有 → 等 120 s（250 ms 轮询）→ `blocked` 点名 lock/PID/持有时长；mtime > 30 min 视为死锁、接管一次。两个门在整个运行期间持有认领。
+  实测（worker）：活锁 → `⚠ another kiln run holds …（pid 88541, held for 163s）`；6 h 45 m 的陈旧锁 → 被接管，跑完锁文件消失。
+- **我独立复核**：`cargo test -p kiln` → **291 + 21 + 1**；尾巴树 `verify jobq --slow --json` → exit 0 · **8 m 46.7 s** · 27/27 `clean`，
+  七条 coverage 与八条 mutants 数字逐条不变，**跑完没有 lock 文件残留**（15 次顺序认领/释放都对）；`cargo xtask ci` → **exit 0 · 30 m 19.1 s · 27/27 `hold the contract`**。
+- **review 十项至此全部有结论**：#1/#2/#3/#4/#5/#6/#7/#9 修好，#8 补了 CI 数，#10 按用户决定不做。
+
+### 坑与判读
+
+- **worker 会指出任务书的边界，这是对的**：它没有擅自扩大 rustflags 的走查范围，而是把 delta 写清楚交回来。
+  **扩大观测范围是有代价的决定**（走到文件系统根就会开始读机器/主检出），应该由派单的人来定；我按“到课程根为止 + 写清 CARGO_HOME 边界”定了。
+- **认领改变了 `mutants` 的失败方式**：它是 must 门，拿不到锁的 `blocked` 会让那一步不通过（`14/15 must gate(s) passed`），而 `coverage` 是 should 门、只报告。
+  同一条设计（工具/资源拿不到时 should 不阻塞）没错，但值得知道：**并发跑 kiln 时 mutants 会红**。
 
 ## 第十九段 · 2026-10 · 用户定下 coverage 的模块规则（方案 ③），以及一次被中断的 CI
 
