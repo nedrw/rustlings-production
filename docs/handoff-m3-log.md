@@ -61,3 +61,43 @@ $ kiln probe --check → 41/41
 ```
 
 **下一步**：`lakelet/4.1-ingest-protocol`（正文 + 只读规格 + 参考解 patch），然后 `selftest lakelet/4.1-ingest-protocol`。
+
+## 段 4：第一个真步骤 `lakelet/4.1-ingest-protocol`
+
+**做了什么**：正文（transfer 模板）、`spec/4.1/ingest_protocol.rs`（12 个用例）、
+`solutions/4.1-ingest-protocol.patch`（`proto/frame.rs`、`proto/batch.rs`、`engine/spool.rs`、`service/ingest.rs` 四个实现 + `docs/protocol.md` 一页）、
+`spec/manifest.toml`，以及写规格时被逼出来的**三处骨架修复**（见下）。
+
+**原始结论行**：
+
+```
+$ kiln selftest lakelet/4.1-ingest-protocol --track lakelet
+    scaffold ✓ the spec fails as it must (exit code 101: test a_corrupted_payload_fails_its_checksum… FAILED)
+    solution ✓ reference patch applies
+    solution ✓ the spec passes
+    gates ✓ 9/9 must green
+1/1 step(s) hold the contract … · real 7.03
+$ kiln lint-caps      → 97 capabilities · 136 slots · 119 ledger positions · 97 authored steps · no issues.
+$ kiln i18n status    → structure: 0 error(s) · not authored yet: 23 step body/bodies
+$ kiln probe --check  → 41/41
+$ kiln links          → 91 page(s) · 473 link(s) · 283 external target(s) · 全解析
+$ course 的 200 个 .rs 逐个 rustfmt --check → 0 not formatted
+```
+
+**三处骨架修复（都是实测出来的，不是猜的）**：
+
+1. **夹具的日志不能用 channel 读**：规格每 50 ms 轮询一次时，`mpsc::Receiver::recv_timeout` 路径下
+   三秒内一条新行都没看到；同一份规格改成 `sleep` 后再取，每一行都在。改成“读线程往 `Arc<Mutex<Vec<String>>>`
+   里追加”后两者一致——读日志不能取决于“什么时候看了一眼”。（夹具同时把 daemon 的 **stderr** 也收进来：
+   一个 panic 的 daemon 应该在失败报告里看得见。）
+2. **颜色只能给终端**：daemon 让 `tracing` 给字段名上色后，`accepted=3` 实际是
+   `accepted\x1b[0m\x1b[2m=\x1b[0m3`——人读起来一样，`grep` 与测试读不出来。
+   `logging::init` 现在用 `std::io::IsTerminal` 决定，且夹具把日志格式钉成 `text`（JSON 会把同一个字段写成
+   `"accepted":3`，那是另一种读法）。
+3. **`src/engine/mod.rs` 的文档注释里写了 `crate::service`**，而 3.1 的结构断言读的是**文本**——
+   与 handoff-m2 §3 记下的同一个陷阱（T3 作者也踩过）。已改成“the service layer”。
+
+另外 `src/service/config.rs` 少一个 `;`（`clippy::semicolon_if_nothing_returned`，`@3` 起就红了）、
+`lakeletd.rs` 的信号处理用 `.expect`（`@2` 起禁止在生产目标用），两者都已在骨架里改掉。
+
+**下一步**：B1（4.2 fuzz / 4.3 ADR / 4.4 WAL 恢复），逐步派子 agent；三条新门在 B1 里各自第一次被真步骤用上。
