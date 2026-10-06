@@ -14,5 +14,11 @@
 
 pub mod spool;
 
+// The modules a later step adds are declared inside this block: a scaffold may only write inside a
+// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+// (docs/authoring.md §5).
+// kiln:scaffold:begin
+// kiln:scaffold:end
+
 /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
 pub use spool::Spool;

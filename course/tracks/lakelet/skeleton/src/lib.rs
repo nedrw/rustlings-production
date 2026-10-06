@@ -15,5 +15,11 @@ pub mod error;
 pub mod protocol;
 pub mod service;
 
+// The modules a later step adds are declared inside this block: a scaffold may only write inside a
+// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+// (docs/authoring.md §5).
+// kiln:scaffold:begin
+// kiln:scaffold:end
+
 /// The crate's error type, at the root so a caller writes `lakelet::Error`.
 pub use error::Error;

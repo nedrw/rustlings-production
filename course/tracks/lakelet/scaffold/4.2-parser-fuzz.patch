@@ -1,0 +1,461 @@
+diff --git a/src/protocol/corpus.rs b/src/protocol/corpus.rs
+new file mode 100644
+index 0000000..adbc2a3
+--- /dev/null
++++ b/src/protocol/corpus.rs
+@@ -0,0 +1,155 @@
++//! The regression corpus: the inputs that once broke a parser, kept as text.
++//!
++//! A fuzzer produces two things, and only one of them is a number. The number is how much it
++//! looked; the other is the *input* it fell over — and an input kept in a terminal scrollback, a
++//! fragment of a chat message or a memory of "something about a length field" is not evidence.
++//! This module is the file format those inputs are kept in: one input per line, hex, under
++//! `tests/corpus/`, so a reviewer reads a corpus entry in a diff and an incident review can quote
++//! it.
++//!
++//! Three decisions are in the format:
++//!
++//! * **text, not bytes** — a corpus entry is reviewed by a person, and a `.txt` line survives `git
++//!   diff`, a code review and a copy-paste into an issue where a binary blob does not;
++//! * **one line, one input, and no order of its own** — files are read in path order and lines in
++//!   file order, so two machines replay the same list. A directory listing has no order, and a
++//!   corpus whose replay order changed between machines is a corpus whose failures are not
++//!   reproducible;
++//! * **a missing directory is an empty corpus** — a fuzzer that has found nothing yet is a normal
++//!   state, and "the corpus is empty" is a judgement for whoever is measuring the work, not an
++//!   error from the reader.
++
++use std::path::{Path, PathBuf};
++
++use crate::error::Error;
++
++/// Where the corpus lives, relative to the project root.
++///
++/// One directory per thing that parses: `tests/corpus/parser` is the ingest decoder's and the
++/// sniffer's, and a later step adds its own next to it rather than into it.
++pub const DIR: &str = "tests/corpus";
++
++/// One input out of the corpus, and where it came from.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Case {
++    /// The file it was read from, relative to the directory it was read below.
++    pub file: String,
++    /// The line within that file, 1-based, as an editor counts them.
++    pub line: usize,
++    /// The bytes the line stands for.
++    pub bytes: Vec<u8>,
++}
++
++/// Every `.txt` input below `directory`, in file order and then in line order.
++///
++/// Only `.txt` files are read: a corpus directory also holds the note that explains what it is,
++/// and an explanation is not an input.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when a line is not an even number of hex digits, naming the file and the
++/// line — a corpus entry nobody can read back is worse than a missing one, because it looks like
++/// coverage. [`Error::Config`] when a file or a directory it walks through cannot be read.
++pub fn load(directory: &Path) -> Result<Vec<Case>, Error> {
++    let mut files: Vec<PathBuf> = Vec::new();
++    collect(directory, &mut files)?;
++    files.sort();
++
++    let mut cases = Vec::new();
++    for path in files {
++        let text = std::fs::read_to_string(&path).map_err(|source| Error::Config {
++            path: path.clone(),
++            source: Box::new(source),
++        })?;
++        let file = path
++            .strip_prefix(directory)
++            .unwrap_or(&path)
++            .display()
++            .to_string();
++        for (index, line) in text.lines().enumerate() {
++            let entry = line.trim();
++            if entry.is_empty() || entry.starts_with('#') {
++                continue;
++            }
++            let Some(bytes) = unhex(entry) else {
++                return Err(Error::Invalid {
++                    detail: format!(
++                        "{}/{file}:{} is not a corpus entry: a line is an even number of hex digits \
++                         (`0100000001`), a blank line, or a comment starting with `#`",
++                        directory.display(),
++                        index + 1
++                    ),
++                });
++            };
++            cases.push(Case {
++                file: file.clone(),
++                line: index + 1,
++                bytes,
++            });
++        }
++    }
++    Ok(cases)
++}
++
++/// The line of hex that stands for `bytes` — what an input looks like written down, and what the
++/// fuzzing harness prints when the walk falls over one.
++#[must_use]
++pub fn hex(bytes: &[u8]) -> String {
++    let mut text = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        text.push_str(&format!("{byte:02x}"));
++    }
++    text
++}
++
++/// The bytes a line of hex stands for, or `None` when the line is not one.
++fn unhex(text: &str) -> Option<Vec<u8>> {
++    let digits = text.as_bytes();
++    if !digits.len().is_multiple_of(2) {
++        return None;
++    }
++    let mut bytes = Vec::with_capacity(digits.len() / 2);
++    for &[high, low] in digits.as_chunks::<2>().0 {
++        bytes.push(digit(high)? << 4 | digit(low)?);
++    }
++    Some(bytes)
++}
++
++/// One hex digit, or `None` when the byte is not one.
++///
++/// Written out rather than taken from `u8::from_str_radix`, which also accepts a leading sign: a
++/// corpus line `+f` is not an entry this format has.
++fn digit(byte: u8) -> Option<u8> {
++    let value = (byte as char).to_digit(16)?;
++    u8::try_from(value).ok()
++}
++
++/// Every `.txt` file below `directory`, recursively.
++///
++/// A directory that is not there holds no input and is not an error: the corpus grows as the step
++/// finds things.
++fn collect(directory: &Path, found: &mut Vec<PathBuf>) -> Result<(), Error> {
++    let entries = match std::fs::read_dir(directory) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++        Err(source) => {
++            return Err(Error::Config {
++                path: directory.to_path_buf(),
++                source: Box::new(source),
++            });
++        }
++    };
++    for entry in entries {
++        let entry = entry.map_err(|source| Error::Config {
++            path: directory.to_path_buf(),
++            source: Box::new(source),
++        })?;
++        let path = entry.path();
++        if path.is_dir() {
++            collect(&path, found)?;
++        } else if path.extension().is_some_and(|extension| extension == "txt") {
++            found.push(path);
++        }
++    }
++    Ok(())
++}
+diff --git a/src/protocol/mod.rs b/src/protocol/mod.rs
+index 0bf0d30..2face66 100644
+--- a/src/protocol/mod.rs
++++ b/src/protocol/mod.rs
+@@ -21,4 +21,9 @@ pub mod frame;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.2-parser-fuzz`: the tools around the codec — a scanner that finds the frames inside a
++// raw capture, the seeded walk a fuzzing harness drives, and the corpus those two share.
++pub mod corpus;
++pub mod mutate;
++pub mod sniff;
+ // kiln:scaffold:end
+diff --git a/src/protocol/mutate.rs b/src/protocol/mutate.rs
+new file mode 100644
+index 0000000..279ef81
+--- /dev/null
++++ b/src/protocol/mutate.rs
+@@ -0,0 +1,34 @@
++//! The seeded mutator: the half of a fuzzer that decides which inputs are tried.
++//!
++//! Step `lakelet/4.2-parser-fuzz`. A fuzzer without a mutator is a loop over one input; a fuzzer
++//! whose mutator is not reproducible is a test that passes on Tuesday and fails on Wednesday for
++//! reasons nobody can read. What this module owes the step's harness is the *search*: a stream of
++//! inputs, in an order a seed decides, that stays the same on every machine and in every process.
++//!
++//! This is the one part of the step's tools with no implementation: which mutations a format needs
++//! and how a generator is written are the step's work, and the contracts below are what the spec
++//! and the harness hold the work to.
++
++/// Walk `iterations` mutated inputs past `visit`, starting from `seed`.
++///
++/// Four rules are the walk's answer, and each one is a thing a mutator can get wrong:
++///
++/// * **the same seed walks the same inputs**, here and on any other machine: the generator is part
++///   of the answer, so it may not read the clock, the environment or an address of its own, and it
++///   may not ask a crate for entropy. A generator written out by hand is a few lines, and this
++///   project does not take a dependency it does not need;
++/// * **another seed walks somewhere else**, or the seed is decoration;
++/// * **every mutation kind this format has is in there** — truncation, byte flips, edits to the
++///   length field, inserted junk. They are not interchangeable: a walk that only truncates finds
++///   what a length is about and nothing else, and a walk that only flips bytes never hands anyone
++///   a frame that is cut short;
++/// * **the walk is not all rubbish**: it starts from frames `frame::decode` accepts and leaves
++///   some of them whole, because inputs the decoder *accepts* are how a refusal is told apart from
++///   a parser that has stopped working.
++///
++/// `visit` is handed one input at a time, and every input the walk produces has to reach it: the
++/// harness counts them, and a walk that keeps a promising input to itself has fuzzed nothing.
++pub fn walk(seed: u64, iterations: usize, visit: impl FnMut(&[u8])) {
++    let _ = (seed, iterations, visit);
++    todo!("step lakelet/4.2-parser-fuzz")
++}
+diff --git a/src/protocol/sniff.rs b/src/protocol/sniff.rs
+new file mode 100644
+index 0000000..7d74520
+--- /dev/null
++++ b/src/protocol/sniff.rs
+@@ -0,0 +1,97 @@
++//! Finding the frames inside a raw capture.
++//!
++//! A capture is what a socket, a `tcpdump` file or a store's log leaves behind: bytes, with frames
++//! *somewhere* in them. It is not a stream: a capture may start in the middle of a frame, hold a
++//! connection that died halfway through one, and carry a header the tool that wrote it added. What
++//! step `lakelet/4.1-ingest-protocol` built is the decoder for *one* frame; this module is the
++//! other half of an incident review, the one that answers "which frames are in this file?".
++//!
++//! The scanner is deliberately forgiving and the frame is not: bytes that cannot start a frame are
++//! skipped one at a time, and a candidate becomes a range only when it is a whole frame *this*
++//! protocol's decoder would read — length, version and checksum included. A "sniffer" that
++//! demanded the capture start on a boundary would be a decoder with extra steps, and a sniffer
++//! that trusted a length and a version alone would hand its caller ranges of junk that happen to
++//! look like a header.
++
++use std::ops::Range;
++
++use crate::protocol::frame::{MAX_PAYLOAD, OVERHEAD, VERSION};
++
++/// Bytes a candidate needs before it can be judged: four of length and one of version.
++const HEADER: usize = 5;
++
++/// The four bytes of checksum that close a frame.
++const CHECKSUM: usize = 4;
++
++// The two constants above and the frame module's overhead are two ways of writing one layout:
++// `OVERHEAD` is the header, the payload and the checksum, so the split has to add up to it.
++const _: () = assert!(HEADER + CHECKSUM == OVERHEAD);
++
++/// Every frame in `buffer`, in the order they appear and without overlapping.
++///
++/// One range per frame, from its length field to the byte after its checksum, so
++/// `&buffer[range]` is a whole frame and
++/// [`frame::decode`](crate::protocol::frame::decode) answers
++/// [`Decoded::Frame`](crate::protocol::frame::Decoded::Frame) for it instead of asking for more
++/// bytes.
++///
++/// Two decisions are in the code: **one byte at a time**, because that is what finds a frame that
++/// junk precedes — a scanner that gave up on the rest of the capture after the first byte that was
++/// not a frame would miss everything behind it — and **the checksum decides**, because junk can
++/// look like a header by accident (four bytes that happen to be a small length, a byte that
++/// happens to be [`VERSION`]), and a candidate whose checksum does not match its payload is not a
++/// frame.
++///
++/// # Panics
++///
++/// Never, for any input: a capture is whatever a broken peer or a half-written file left behind,
++/// and the point of scanning one is to learn something rather than to fall over.
++#[must_use]
++pub fn ranges(buffer: &[u8]) -> Vec<Range<usize>> {
++    let mut found = Vec::new();
++    let mut base = 0;
++    let mut window = buffer;
++    while !window.is_empty() {
++        match next_frame(window) {
++            Some((frame, rest)) => {
++                found.push(base..base + frame.len());
++                base += frame.len();
++                window = rest;
++            }
++            None => {
++                // Not a frame: the capture goes on one byte later. That is what makes this a scan
++                // rather than a decoder — junk in front of a frame does not hide it — and it is
++                // also why the scan costs what the capture is long and not what its frames are.
++                let (_, rest) = window.split_at(1);
++                base += 1;
++                window = rest;
++            }
++        }
++    }
++    found
++}
++
++/// The frame at the front of `window`, with what follows it, or `None` when the bytes there are
++/// not a frame.
++fn next_frame(window: &[u8]) -> Option<(&[u8], &[u8])> {
++    let header = window.get(..HEADER)?;
++    let length = u32::from_le_bytes(header.get(..4)?.try_into().ok()?) as usize;
++    if length > MAX_PAYLOAD || header.get(4) != Some(&VERSION) {
++        return None;
++    }
++    // The payload the header declares has to be in the window: a capture can end in the middle of
++    // a frame, and the bytes at the front are then not one.
++    if HEADER + length > window.len() {
++        return None;
++    }
++    let size = OVERHEAD + length;
++    // The frame is the front of the window, and the caller carries on with what is left of it.
++    let (frame, rest) = window.split_at(size);
++    let payload = frame.get(HEADER..size - CHECKSUM)?;
++    let mut stored = [0u8; CHECKSUM];
++    stored.copy_from_slice(frame.get(size - CHECKSUM..)?);
++    if u32::from_le_bytes(stored) != crc32fast::hash(payload) {
++        return None;
++    }
++    Some((frame, rest))
++}
+diff --git a/tests/corpus/parser/README.md b/tests/corpus/parser/README.md
+new file mode 100644
+index 0000000..628944b
+--- /dev/null
++++ b/tests/corpus/parser/README.md
+@@ -0,0 +1,21 @@
++# The parser's corpus
++
++Every `.txt` file here holds corpus entries, one per line:
++
++```text
++# a header that declares one byte of payload, and nothing else
++0100000001
++```
++
++- two hex digits per byte, no separators, nothing else on the line;
++- a blank line, or a line starting with `#`, is a comment;
++- one line is one input: bytes that once made the ingest decoder or the frame scanner misbehave,
++  kept so the same input cannot take anybody by surprise twice.
++
++`cargo test -p lakelet --test fuzz_protocol` replays everything here, and so does the step's spec —
++which refuses a corpus that holds nothing, because an empty corpus is a fuzzer that found nothing
++rather than a parser that survives everything.
++
++Add the input your fuzzer found, not a description of it: the harness prints it, already in this
++format, when a walk falls over one. A corpus entry is a case — the bytes, and a `#` line saying
++which failure they stand for.
+diff --git a/tests/fuzz_protocol.rs b/tests/fuzz_protocol.rs
+new file mode 100644
+index 0000000..0a0a761
+--- /dev/null
++++ b/tests/fuzz_protocol.rs
+@@ -0,0 +1,110 @@
++//! The fuzzing harness for `lakelet/4.2-parser-fuzz`.
++//!
++//! This file is the course's, not the learner's. `cargo test -p lakelet --test fuzz_protocol --
++//! --nocapture` is the command the step's `slow:fuzz` gate runs, and the two lines it prints at
++//! the end are what the gate compares with `course/tracks/lakelet/fuzz/4.2-parser-fuzz.toml`.
++//!
++//! Three things happen here, and each one is a decision:
++//!
++//! * **the search** — `mutate::walk` hands this file inputs, one at a time, and every one of them
++//!   goes to both of the functions a hostile peer points at: `frame::decode` and `sniff::ranges`.
++//!   What is judged below is that the run *finishes*: a panic is the finding, and this file prints
++//!   the input that caused it before it lets the panic through, because a fuzzer that does not say
++//!   which input broke the parser leaves its user to bisect by hand;
++//! * **the corpus** — every input under `tests/corpus/**` is replayed through the same two
++//!   functions. That is what makes a corpus a regression test rather than a folder of souvenirs:
++//!   the input that broke something is run again on every build, and the count of them is part of
++//!   what the gate is shown;
++//! * **the counters** — one `<track>-fuzz <name>=<value>` line per metric, printed at the end.
++//!   `iterations` is what the walk *did*, not what it was asked for: a walk that visits fewer
++//!   inputs than it was given is a walk with a bug in it, and the number says so.
++//!
++//! Nothing here compares a measurement with a bound — the bounds are the course's, in the file
++//! above, and this file only has to be honest about what happened.
++
++use std::panic::{catch_unwind, resume_unwind};
++use std::path::Path;
++
++use lakelet::protocol::{corpus, frame, mutate, sniff};
++
++/// How many inputs one seed's walk is asked for.
++///
++/// The gate's floor is per seed and lives in the course's file (`iterations_min`); this is what
++/// this machine actually walks, and the two are deliberately not the same number: the floor is a
++/// judgement about the search, and this is the search.
++const ITERATIONS: usize = 60_000;
++
++/// The seed a walk uses when the environment names none (`KILN_FUZZ_SEED`).
++const DEFAULT_SEED: u64 = 1;
++
++#[test]
++fn the_walk_and_the_corpus() {
++    let seed = seed();
++    let origin = format!("the walk under seed {seed}");
++    let mut visited = 0usize;
++    let mut accepted = 0usize;
++    let mut ranges = 0usize;
++    mutate::walk(seed, ITERATIONS, |input| {
++        visited += 1;
++        let (decoded, found) = exercise(input, &origin);
++        accepted += usize::from(decoded);
++        ranges += found;
++    });
++
++    let cases = corpus::load(Path::new(corpus::DIR)).unwrap_or_else(|error| {
++        panic!(
++            "the corpus below {} could not be read: {error}",
++            corpus::DIR
++        )
++    });
++    let mut replayed = 0usize;
++    for case in &cases {
++        replayed += 1;
++        // The answers are not this loop's business: a corpus entry is replayed to see that it
++        // does not panic today.
++        let _ = exercise(
++            &case.bytes,
++            &format!("{}/{file}", corpus::DIR, file = case.file),
++        );
++    }
++
++    println!(
++        "fuzz seed={seed} walked {visited} input(s) — {accepted} of them a whole frame for the \
++         decoder, {ranges} range(s) for the scanner — and replayed {replayed} input(s) from {}",
++        corpus::DIR
++    );
++    println!("lakelet-fuzz iterations={visited}");
++    println!("lakelet-fuzz corpus_cases={replayed}");
++}
++
++/// Hand one input to both parsers, and answer what they said about it.
++///
++/// A panic is reported here, with the input, and then let through: this file's job is to find out
++/// that a parser cannot take an input, not to hide it from the gate.
++fn exercise(input: &[u8], origin: &str) -> (bool, usize) {
++    let outcome = catch_unwind(|| {
++        let decoded = frame::decode(input);
++        let scanned = sniff::ranges(input);
++        (matches!(decoded, frame::Decoded::Frame(..)), scanned.len())
++    });
++    match outcome {
++        Ok(answers) => answers,
++        Err(panic) => {
++            println!("fuzz found a panic from {origin} on this input:");
++            println!("{}", corpus::hex(input));
++            resume_unwind(panic);
++        }
++    }
++}
++
++/// The seed this run walks under: `KILN_FUZZ_SEED`, or [`DEFAULT_SEED`] when it says nothing.
++fn seed() -> u64 {
++    match std::env::var("KILN_FUZZ_SEED") {
++        Ok(text) => text.trim().parse().unwrap_or_else(|_| {
++            panic!(
++                "KILN_FUZZ_SEED is `{text}`, which is not a seed: a walk is seeded with a number"
++            )
++        }),
++        Err(_) => DEFAULT_SEED,
++    }
++}

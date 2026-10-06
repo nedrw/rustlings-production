@@ -1,0 +1,18 @@
+# The search that `lakelet/4.2-parser-fuzz` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `fuzz`
+# gate reads *this* copy. The command is the project's own harness (`tests/fuzz_protocol.rs`, which
+# the step's scaffold ships); the gate runs it once per seed below, with `KILN_FUZZ_SEED` set, and
+# every run has to be green — a panic is exactly the finding this step is about.
+#
+# `iterations_min` is a floor on what one seed's walk *reported*, not a target: the reference
+# solution walks 60_000 inputs per seed, and this floor is what a search still has to clear to
+# count as one. `corpus_cases` is how many regression inputs have to be replayed: the reference
+# solution pins one (the input the walk found), and a pinned input that stopped being replayed is a
+# panic that can come back without anybody noticing. Production fuzzing is `cargo-fuzz`; the gate
+# cannot use it (`kiln doctor` reports it as not installed here, and it needs nightly), so the
+# search it judges is the deterministic one this project owns.
+command = "cargo test -p lakelet --test fuzz_protocol -- --nocapture"
+seeds = [1, 7, 20260101]
+iterations_min = 20000
+corpus_cases = 1

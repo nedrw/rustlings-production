@@ -16,3 +16,9 @@
 
 pub mod batch;
 pub mod frame;
+
+// The modules a later step adds are declared inside this block: a scaffold may only write inside a
+// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+// (docs/authoring.md §5).
+// kiln:scaffold:begin
+// kiln:scaffold:end

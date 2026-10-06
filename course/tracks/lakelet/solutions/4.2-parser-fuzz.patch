@@ -1,0 +1,216 @@
+diff --git a/src/protocol/mutate.rs b/src/protocol/mutate.rs
+index 279ef81..cf99b06 100644
+--- a/src/protocol/mutate.rs
++++ b/src/protocol/mutate.rs
+@@ -9,6 +9,22 @@
+ //! and how a generator is written are the step's work, and the contracts below are what the spec
+ //! and the harness hold the work to.
+ 
++use crate::protocol::batch;
++use crate::protocol::frame::{Frame, MAX_PAYLOAD, VERSION};
++
++/// How many mutations one input may take before it is handed over.
++///
++/// Zero is one of the values, and on purpose: an input the walk leaves alone is a frame the
++/// decoder *accepts*, and a walk whose every input is broken says nothing about whether the
++/// decoder still reads what it used to read.
++const MUTATIONS_MAX: usize = 3;
++
++/// Bytes a header takes: four of length and one of version.
++const HEADER: usize = 5;
++
++/// The mutation kinds, in the order the walk picks them.
++const KINDS: usize = 4;
++
+ /// Walk `iterations` mutated inputs past `visit`, starting from `seed`.
+ ///
+ /// Four rules are the walk's answer, and each one is a thing a mutator can get wrong:
+@@ -28,7 +44,149 @@
+ ///
+ /// `visit` is handed one input at a time, and every input the walk produces has to reach it: the
+ /// harness counts them, and a walk that keeps a promising input to itself has fuzzed nothing.
+-pub fn walk(seed: u64, iterations: usize, visit: impl FnMut(&[u8])) {
+-    let _ = (seed, iterations, visit);
+-    todo!("step lakelet/4.2-parser-fuzz")
++pub fn walk(seed: u64, iterations: usize, mut visit: impl FnMut(&[u8])) {
++    let mut rng = Rng::new(seed);
++    for _ in 0..iterations {
++        let mut input = base(&mut rng);
++        let count = rng.below(MUTATIONS_MAX + 1);
++        for _ in 0..count {
++            mutate(&mut rng, &mut input);
++        }
++        visit(&input);
++    }
++}
++
++/// The generator's state: one word, and xorshift64*.
++///
++/// Written out rather than taken from a crate, because a fuzzer's generator is part of its
++/// *evidence*: the same seed has to produce the same inputs in this process, in the next one and
++/// in a report a week later, and a dependency that changes its algorithm in a patch release would
++/// quietly change what a seed means.
++struct Rng {
++    /// The current word.
++    state: u64,
++}
++
++impl Rng {
++    /// A generator for `seed`.
++    fn new(seed: u64) -> Self {
++        // A zero word is xorshift's fixed point, so zero has to be pushed off it or seed 0 would
++        // walk the same input for ever.
++        Self { state: seed | 1 }
++    }
++
++    /// The next word.
++    fn next(&mut self) -> u64 {
++        let mut word = self.state;
++        word ^= word >> 12;
++        word ^= word << 25;
++        word ^= word >> 27;
++        self.state = word;
++        word.wrapping_mul(0x2545_f491_4f6c_dd1d)
++    }
++
++    /// A number below `bound`, which has to be positive.
++    ///
++    /// The modulo's bias is not worth removing: a walk needs a sequence that is the same
++    /// everywhere and long enough to wander, not a sample that is uniform to the last bit.
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++/// A frame a client could have sent: a batch of a few records, framed and checksummed.
++///
++/// The base is what makes the walk a *parser* fuzzer rather than a random-byte generator: every
++/// mutation below starts from bytes this crate's own encoder produced, so the search spends its
++/// time around the edges of a valid frame instead of in inputs no decoder would look at twice.
++fn base(rng: &mut Rng) -> Vec<u8> {
++    let records: Vec<batch::Record> = (0..=rng.below(3))
++        .map(|index| batch::Record {
++            series: format!("cpu,host=h{index}"),
++            ts_millis: 1_700_000_000_000 + index as i64,
++            value: index as f64 * 1.5,
++        })
++        .collect();
++    Frame::new(batch::encode(&records)).encode()
++}
++
++/// One mutation, in place.
++fn mutate(rng: &mut Rng, input: &mut Vec<u8>) {
++    match rng.below(KINDS) {
++        0 => truncate(rng, input),
++        1 => flip(rng, input),
++        2 => claim(rng, input),
++        _ => junk(rng, input),
++    }
++}
++
++/// Cut the input short: the capture that ends in the middle of a frame, which is what a stream
++/// gives a reader when a client dies and what a file gives one when it is truncated.
++fn truncate(rng: &mut Rng, input: &mut Vec<u8>) {
++    if input.is_empty() {
++        return;
++    }
++    input.truncate(rng.below(input.len()));
++}
++
++/// Flip one bit of one byte: a payload whose checksum no longer matches, a length that has stopped
++/// being true, a version that no longer speaks for this build.
++fn flip(rng: &mut Rng, input: &mut [u8]) {
++    if input.is_empty() {
++        return;
++    }
++    let at = rng.below(input.len());
++    let bit = 1u8 << rng.below(8);
++    let Some(byte) = input.get_mut(at) else {
++        return;
++    };
++    *byte ^= bit;
++}
++
++/// Rewrite the length a capture claims about the bytes around it, at a position of the walk's
++/// choosing, with the version byte a header is recognised by.
++///
++/// The interesting lengths are the ones a length-prefixed format's arithmetic trips on: nothing,
++/// one byte, exactly what the buffer holds after the header, a few bytes short of that, one byte
++/// more, the protocol's limit and the limit plus one. A length taken from a random word would be
++/// refused by the limit before any other part of the parser saw it, which is the failure mode of a
++/// mutator that only flips bits.
++fn claim(rng: &mut Rng, input: &mut [u8]) {
++    if input.len() < HEADER {
++        return;
++    }
++    let at = rng.below(input.len() - HEADER + 1);
++    let available = input.len() - at - HEADER;
++    let claimed = claim_length(rng, available);
++    let Some(field) = input.get_mut(at..at + 4) else {
++        return;
++    };
++    field.copy_from_slice(&(claimed as u32).to_le_bytes());
++    let Some(version) = input.get_mut(at + 4) else {
++        return;
++    };
++    *version = VERSION;
++}
++
++/// The length a [`claim`] writes, out of the ones that are worth trying on `available` bytes.
++fn claim_length(rng: &mut Rng, available: usize) -> usize {
++    match rng.below(8) {
++        0 => 0,
++        1 => 1,
++        2 => available,
++        3 => available.saturating_sub(rng.below(9)),
++        4 => available.saturating_add(1),
++        5 => MAX_PAYLOAD,
++        6 => MAX_PAYLOAD + 1,
++        _ => rng.below(MAX_PAYLOAD + 1),
++    }
++}
++
++/// Insert junk: the header a capture tool wrote in front of a frame, the noise a broken link put
++/// between two of them, or bytes of a protocol this decoder does not speak.
++fn junk(rng: &mut Rng, input: &mut Vec<u8>) {
++    let at = rng.below(input.len() + 1);
++    let count = 1 + rng.below(16);
++    let inserted: Vec<u8> = (0..count).map(|_| (rng.next() & 0xff) as u8).collect();
++    input.splice(at..at, inserted);
+ }
+diff --git a/src/protocol/sniff.rs b/src/protocol/sniff.rs
+index 7d74520..7ff5e67 100644
+--- a/src/protocol/sniff.rs
++++ b/src/protocol/sniff.rs
+@@ -79,12 +79,12 @@ fn next_frame(window: &[u8]) -> Option<(&[u8], &[u8])> {
+     if length > MAX_PAYLOAD || header.get(4) != Some(&VERSION) {
+         return None;
+     }
+-    // The payload the header declares has to be in the window: a capture can end in the middle of
+-    // a frame, and the bytes at the front are then not one.
+-    if HEADER + length > window.len() {
++    // The frame the header declares has to be in the window: a capture can end in the middle of a
++    // frame, and the bytes at the front are then not one.
++    let size = OVERHEAD + length;
++    if size > window.len() {
+         return None;
+     }
+-    let size = OVERHEAD + length;
+     // The frame is the front of the window, and the caller carries on with what is left of it.
+     let (frame, rest) = window.split_at(size);
+     let payload = frame.get(HEADER..size - CHECKSUM)?;
+diff --git a/tests/corpus/parser/frame-cut-short-of-its-checksum.txt b/tests/corpus/parser/frame-cut-short-of-its-checksum.txt
+new file mode 100644
+index 0000000..ce3331a
+--- /dev/null
++++ b/tests/corpus/parser/frame-cut-short-of-its-checksum.txt
+@@ -0,0 +1,9 @@
++# The walk found this, and it is the smallest input that still reaches the same place: a capture
++# that ends right after a header which declares an empty payload, so the four bytes of checksum
++# that close the frame never arrived.
++#
++# Before `lakelet/4.2-parser-fuzz` fixed `src/protocol/sniff.rs`, every seed in
++# `course/tracks/lakelet/fuzz/4.2-parser-fuzz.toml` walked into it within the first few thousand
++# inputs: the walk truncates frames, and a capture that ends one to four bytes short of a frame's
++# checksum was cut out of a window that was too small.
++0000000001
