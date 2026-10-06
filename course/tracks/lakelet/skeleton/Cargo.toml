@@ -24,6 +24,15 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 # kiln:scaffold:end
 
+# The test side: a harness a step ships with (`tests/fuzz_protocol.rs`, `tests/sim_wal.rs`) brings
+# its own crates, because a harness is not a dependency of the store. Later scaffolds add them
+# inside the marked block, the same rule as above, which is why the block is here before there is
+# anything to put in it: a scaffold cannot write outside a region the skeleton declared
+# (docs/authoring.md §5.3).
+[dev-dependencies]
+# kiln:scaffold:begin
+# kiln:scaffold:end
+
 # This crate's own lint policy: `lakelet/4.7-columnar-segments` is the step that argues for
 # `unsafe_code = "deny"` (bit packing is where the temptation is), and the block below is where it
 # lands.

@@ -4,7 +4,10 @@
 //! socket: partial reads, a peer that stops mid-frame, a client that sends a length it should not
 //! believe. So [`Service`] starts the real binary, waits until it accepts connections, hands the test
 //! a socket to write raw bytes into, and can stop it the way an orchestrator does (`SIGTERM`) or the
-//! way a power cut does (`SIGKILL`).
+//! way a power cut does (`SIGKILL`). A store outlives the process that wrote it, so a daemon can
+//! also be started again on the same directory ([`Service::restart`]): that pair — a process that
+//! dies and a directory that does not — is what makes a crash something a spec can watch instead of
+//! describe.
 //!
 //! Nothing here sleeps to synchronise, and nothing here knows the protocol: a spec cuts the bytes it
 //! wants to send, and that is exactly the point — a fixture that built "a valid frame" would hide the
@@ -41,6 +44,8 @@ pub struct Service {
     lines: Arc<Mutex<Vec<String>>>,
     address: SocketAddr,
     store: StoreDir,
+    /// The environment this daemon was started with, so a restart starts the same daemon.
+    env: Vec<Var>,
 }
 
 impl Service {
@@ -59,63 +64,47 @@ impl Service {
     #[must_use]
     pub fn start(label: &str, env: &[Var]) -> Self {
         let store = StoreDir::new(label);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_lakeletd"));
-        command
-            .args([
-                "--listen-addr",
-                "127.0.0.1:0",
-                "--store-dir",
-                &store.path().display().to_string(),
-            ])
-            .env_clear()
-            .env("LAKELET_LOG_FORMAT", "text")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for var in env {
-            command.env(&var.name, &var.value);
-        }
-        let mut child = command
-            .spawn()
-            .unwrap_or_else(|error| panic!("the lakeletd binary could not be started: {error}"));
-
-        let stdout = child
-            .stdout
-            .take()
-            .expect("the daemon was started with a pipe");
-        let stderr = child
-            .stderr
-            .take()
-            .expect("the daemon was started with a pipe");
         let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        for stream in [
-            Box::new(stdout) as Box<dyn std::io::Read + Send>,
-            Box::new(stderr),
-        ] {
-            let lines = Arc::clone(&lines);
-            thread::spawn(move || {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stream)
-                    .lines()
-                    .map_while(Result::ok)
-                {
-                    if let Ok(mut lines) = lines.lock() {
-                        lines.push(line);
-                    } else {
-                        break;
-                    }
-                }
-            });
-        }
-
+        let child = start_process(&store, env, &lines);
         let mut service = Self {
             child,
             lines,
             address: SocketAddr::from(([127, 0, 0, 1], 0)),
             store,
+            env: env.to_vec(),
         };
-        service.address = service.wait_for_listening();
-        service.wait_until_ready();
+        service.wait_until_running();
         service
+    }
+
+    /// Stop the daemon the way a crash does, and start it again on the **same** store.
+    ///
+    /// A restart is one new process and one thing carried over: the store directory. Everything the
+    /// old process held in memory is gone, so what answers afterwards is what the store's bytes
+    /// hold — which is the difference `lakelet/4.4-wal-recovery` is about, and the reason this
+    /// fixture can model a crash at all: the directory outlives the process that wrote it.
+    ///
+    /// The lines [`Service::log_lines`] answers are the new process's. Keeping the dead one's would
+    /// let a spec that waits for a line — `store recovered …`, say — be answered by the run *before*
+    /// the restart, which is the line a crash is supposed to make different.
+    #[cfg(unix)]
+    pub fn restart(&mut self) {
+        if self.is_running() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.lines
+            .lock()
+            .expect("the fixture is not poisoned")
+            .clear();
+        self.child = start_process(&self.store, &self.env, &self.lines);
+        self.wait_until_running();
+    }
+
+    /// Wait until the process just started has said where it listens and answers there.
+    fn wait_until_running(&mut self) {
+        self.address = self.wait_for_listening();
+        self.wait_until_ready();
     }
 
     /// The address the daemon announced, read out of its log.
@@ -282,6 +271,61 @@ impl Drop for Service {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Start the daemon on `store` with `env`, and pipe both of its streams into `lines`.
+///
+/// The one place a process is started, so [`Service::start`] and [`Service::restart`] cannot drift
+/// into starting two subtly different daemons: what a restart changes is the process, not the
+/// command line or the store.
+fn start_process(store: &StoreDir, env: &[Var], lines: &Arc<Mutex<Vec<String>>>) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lakeletd"));
+    command
+        .args([
+            "--listen-addr",
+            "127.0.0.1:0",
+            "--store-dir",
+            &store.path().display().to_string(),
+        ])
+        .env_clear()
+        .env("LAKELET_LOG_FORMAT", "text")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for var in env {
+        command.env(&var.name, &var.value);
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("the lakeletd binary could not be started: {error}"));
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("the daemon was started with a pipe");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("the daemon was started with a pipe");
+    for stream in [
+        Box::new(stdout) as Box<dyn std::io::Read + Send>,
+        Box::new(stderr),
+    ] {
+        let lines = Arc::clone(lines);
+        thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Ok(mut lines) = lines.lock() {
+                    lines.push(line);
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+    child
 }
 
 /// The address in the daemon's `listening on <addr>` line, if this is that line.

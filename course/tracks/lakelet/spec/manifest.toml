@@ -9,3 +9,4 @@ format_version = 1
 "spec/4.1/ingest_protocol.rs" = "sha256:0b72f91df6b94d32532c0435b7a244bc59cb17290b5c617249644a0baac8779d"
 "spec/4.2/parser_fuzz.rs" = "sha256:cb5b26fe86f923cb4f6d997dc1c2dc01a12fb6b74a128dbdfe88967fbe3c0c9c"
 "spec/4.3/write_path.rs" = "sha256:370a7a0e3b7d75aeebd7dd6bfe3953e8567388eaeb0a3f03df1bf67afd57c635"
+"spec/4.4/wal_recovery.rs" = "sha256:381075965c01289a0dece3f816f3a5f0d5c13fa98620fbfd277f05d4fae14850"

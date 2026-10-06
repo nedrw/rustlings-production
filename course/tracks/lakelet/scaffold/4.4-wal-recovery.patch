@@ -1,0 +1,1133 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d501f68..e04ab9b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -31,6 +31,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
+ # (docs/authoring.md §5.3).
+ [dev-dependencies]
+ # kiln:scaffold:begin
++# `lakelet/4.4-wal-recovery` runs its crash scenarios under a deterministic simulator, so the seed
++# decides the schedule and the same seed replays byte for byte.
++turmoil = "0.7"
+ # kiln:scaffold:end
+ 
+ # This crate's own lint policy: `lakelet/4.7-columnar-segments` is the step that argues for
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index 61db416..f887113 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -178,4 +178,8 @@ impl Spool {
+ // signatures are declared there so this step's spec can call them; every body is this step's
+ // work.
+ mod durable;
++// `lakelet/4.4-wal-recovery`: what opening a store does about the log a previous process left,
++// and the report it hands to whoever opened it. The signature is declared in the module beside
++// this file; its body is this step's work.
++mod recover;
+ // kiln:scaffold:end
+diff --git a/src/engine/spool/recover.rs b/src/engine/spool/recover.rs
+new file mode 100644
+index 0000000..37b61a8
+--- /dev/null
++++ b/src/engine/spool/recover.rs
+@@ -0,0 +1,33 @@
++//! What opening a store does about the log a previous process left behind.
++//!
++//! Step `lakelet/4.4-wal-recovery`, and the third of that step's three pieces: the bytes are the
++//! log's ([`crate::engine::wal::segment`]), the answer to "which of them proved to be records" is
++//! [`crate::engine::wal::replay`]'s, and this module is what the *store* does with that answer when
++//! it is opened — and what it tells whoever opened it.
++//!
++//! Opening is the only place a recovery can happen: a store that is already running holds offsets
++//! into the file, a session that has answered clients, and a flush boundary; there is no moment in
++//! the middle of that where "what the log proves" can change under it. So `Spool::with_policy`
++//! replays the log before it counts a single byte, and this is where the result is handed back.
++//!
++//! The signature below is this step's contract — the spec calls it, and the daemon reads it to say
++//! what a restart cost — and its body is the step's work.
++
++use crate::engine::wal::replay::Recovered;
++
++use super::Spool;
++
++impl Spool {
++    /// What opening this store had to do: the records replay proved, and the bytes it threw away.
++    ///
++    /// The operator's half of `lakelet/4.4-wal-recovery`, and the reason it is a value rather than a
++    /// log line written here: the engine does not own a log format or a level, and whoever opened
++    /// the store is the one who has to say what it found — the daemon does exactly that
++    /// (`bin/lakeletd.rs`). [`Recovered::discarded`] of zero means the log ended on a record
++    /// boundary, which is the shape a clean stop leaves; anything else is data a crash took, and it
++    /// is the caller's business to say so out loud.
++    #[must_use]
++    pub fn recovered(&self) -> &Recovered {
++        todo!("step lakelet/4.4-wal-recovery")
++    }
++}
+diff --git a/src/engine/wal/checksum.rs b/src/engine/wal/checksum.rs
+new file mode 100644
+index 0000000..21d5694
+--- /dev/null
++++ b/src/engine/wal/checksum.rs
+@@ -0,0 +1,48 @@
++//! What one record's checksum covers.
++//!
++//! Step `lakelet/4.4-wal-recovery`. A checksum is only as good as the bytes it is computed over, and
++//! this module is where that boundary is decided once for the log.
++//!
++//! The decision the step owes, written here: **which bytes must a record's seal cover, for a reader
++//! that has only the bytes in front of it to be able to say "this is a whole record of mine"?**
++//!
++//! The wire format next door (`crate::protocol::frame`) seals the payload alone, and it can: a
++//! stream's reader is handed a length before it needs the payload, and bytes that are not a frame end
++//! the connection, so resynchronising is the sender's problem rather than the reader's. A **file**
++//! has no such luxury. Its reader must find where a record ends from the bytes in front of it, on a
++//! file a crash may have cut in the middle of one — so it is worth writing down here which bytes you
++//! sealed, and what leaving any one of them out would cost. `docs/crash-points.md` point 3 is the
++//! failure this module is the answer to.
++//!
++//! `crc32fast` is the checksum this project already uses (the reason is one line of `Cargo.toml`,
++//! where `lakelet/4.1-ingest-protocol` took the dependency): two checksums in one crate should be one
++//! function, and it is the right one for a torn write, a bit that flipped and a device that wrote
++//! something else.
++
++/// The bytes one seal takes in a record: four, because it is a `u32` little endian.
++///
++/// `segment` is where the record that carries it is laid out, and the spec reads a record's offsets
++/// through this width and the two beside it — so the shape is course content and the arithmetic over
++/// it is this step's work.
++pub const LEN: usize = 4;
++
++/// The seal a record with this `length` and `payload` carries.
++///
++/// `length` is the payload's length as the record states it, in bytes. Which of the two, and which
++/// parts of them, end up inside the seal is the decision above — and the spec holds you to it:
++/// change either one and the seal of a record changes with it.
++#[must_use]
++pub fn seal(length: u32, payload: &[u8]) -> u32 {
++    let _ = (length, payload);
++    todo!("step lakelet/4.4-wal-recovery")
++}
++
++/// `true` when `expected` is the seal these bytes carry.
++///
++/// The one comparison recovery makes, kept here so that "what a record's checksum covers" and
++/// "whether a record's checksum verifies" cannot answer differently.
++#[must_use]
++pub fn verifies(length: u32, payload: &[u8], expected: u32) -> bool {
++    let _ = (length, payload, expected);
++    todo!("step lakelet/4.4-wal-recovery")
++}
+diff --git a/src/engine/wal/mod.rs b/src/engine/wal/mod.rs
+index 7363bbb..18b04c7 100644
+--- a/src/engine/wal/mod.rs
++++ b/src/engine/wal/mod.rs
+@@ -19,4 +19,12 @@
+ pub mod policy;
+ 
+ pub use policy::{Losses, Policy};
++// `lakelet/4.4-wal-recovery`: the log itself — the bytes one record is made of, what its checksum
++// covers, and how a store replays the prefix of them it can prove.
++pub mod checksum;
++pub mod replay;
++pub mod segment;
++
++pub use replay::Recovered;
++pub use segment::Stop;
+ // kiln:scaffold:end
+diff --git a/src/engine/wal/replay.rs b/src/engine/wal/replay.rs
+new file mode 100644
+index 0000000..842235f
+--- /dev/null
++++ b/src/engine/wal/replay.rs
+@@ -0,0 +1,113 @@
++//! Replaying a store: the records its log proves, and what had to be thrown away.
++//!
++//! Step `lakelet/4.4-wal-recovery`. [`segment`] reads the bytes; this module is the answer the store
++//! and the operator need from them — *which* records survived and how much of the file was not one.
++//!
++//! One rule decides the whole walk, and it is the step's central sentence: **replay stops at the
++//! first thing it cannot prove.** Write the argument for it down here, because it is the design
++//! decision of the step and the one a reviewer will push on. The three costs, in the order they cost
++//! somebody, are worth naming in your own words:
++//!
++//! * a log is a **prefix** by construction, so "the record after a bad one" is an offset the bad
++//!   record's length field described — it is not a place in the file, it is a conclusion drawn from
++//!   bytes that have just been shown to be untrustworthy;
++//! * a **gap is worse than a short log**: a store that returns records 1–10, drops 11 and returns 12
++//!   has told every reader the series was continuous, and a wrong answer nobody can see is worse than
++//!   a smaller answer the counts report;
++//! * what follows a tear is **not data**, it is the middle of a record: the rest of that record's
++//!   payload, as much as the device committed.
++//!
++//! So the answer has three parts — the records, the bytes that were proved, and the bytes that were
++//! thrown away — and the store moves the log's end to the first of those numbers, so the next append
++//! continues there instead of writing after bytes nobody can read ([`truncate`], called by
++//! `Spool::with_policy`). That is what makes recovery something a store *does at open* rather than a
++//! report it prints: a tail left in place would stop every later replay at the same byte.
++//!
++//! What recovery deliberately does **not** do: it does not call [`Spool::sync`], it does not flush,
++//! and it does not repair a record. It reads what the device has. Putting bytes on the device is
++//! `lakelet/4.3-write-path-adr`'s decision, and a reader that also wrote would be a reader nobody
++//! could run against a store they care about.
++//!
++//! [`Spool`]: crate::engine::Spool
++//! [`Spool::sync`]: crate::engine::Spool::sync
++
++use std::path::Path;
++
++use crate::error::Error;
++
++use super::segment::Stop;
++
++/// What replaying a store's log proved.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Recovered {
++    /// The records whose seal verified, in the order they were appended.
++    records: Vec<Vec<u8>>,
++    /// Bytes of the log that are proved: the header plus every whole record.
++    bytes: u64,
++    /// Bytes that were not part of a proved record.
++    discarded: u64,
++    /// Why the replay stopped there.
++    stop: Stop,
++}
++
++impl Recovered {
++    /// The records recovery proved, in the order they were appended.
++    #[must_use]
++    pub fn records(&self) -> &[Vec<u8>] {
++        &self.records
++    }
++
++    /// How many bytes of the log are proved: its header plus every whole record.
++    ///
++    /// The offset the store continues at — [`truncate`] cuts the file here, so the next append writes
++    /// after the last record this replay could verify and never over a byte it did.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// How many bytes were **not** part of a proved record.
++    #[must_use]
++    pub fn discarded(&self) -> u64 {
++        self.discarded
++    }
++
++    /// Why the replay stopped where it did.
++    #[must_use]
++    pub fn stop(&self) -> Stop {
++        self.stop
++    }
++}
++
++/// Replay the log of the store in `directory`.
++///
++/// The file is the one `Spool` writes (`crate::engine::spool::FILE`), and a store that has never
++/// accepted anything — no file, or an empty one — answers "no records, nothing discarded", because a
++/// store this process has not written to yet is not a corrupt one. A file that is *not* this store's
++/// log is the other answer: [`Error::Protocol`], never an empty store; [`segment::scan`] is where that
++/// decision is made and its module docs are where the reason is.
++///
++/// Read-only: nothing here changes the file. [`truncate`] is the other half, and keeping the two apart
++/// is what lets a repair tool replay a copy of a store, or ask what a capture of bytes would become,
++/// without touching anything.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the file cannot be read, and [`Error::Protocol`] when what is in it is not
++/// this log.
++pub fn recover(directory: &Path) -> Result<Recovered, Error> {
++    let _ = directory;
++    todo!("step lakelet/4.4-wal-recovery")
++}
++
++/// Cut the log of the store in `directory` back to `bytes`, so the next append continues there.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the file cannot be opened or cannot be cut — a store whose tail cannot be
++/// removed cannot be appended to either, because writing behind bytes nobody can read would hide them
++/// in the middle of the log for good.
++pub fn truncate(directory: &Path, bytes: u64) -> Result<(), Error> {
++    let _ = (directory, bytes);
++    todo!("step lakelet/4.4-wal-recovery")
++}
+diff --git a/src/engine/wal/segment.rs b/src/engine/wal/segment.rs
+new file mode 100644
+index 0000000..8616da2
+--- /dev/null
++++ b/src/engine/wal/segment.rs
+@@ -0,0 +1,165 @@
++//! The bytes a log is made of: a header that says which log this is, and sealed records after it.
++//!
++//! Step `lakelet/4.4-wal-recovery`. This module owns the format — what the bytes are and the walk
++//! that reads them — and [`super::replay`] owns the store-level answer built on it.
++//!
++//! ```text
++//!  0..4        `MAGIC`: the four bytes that say this file is a lakelet log
++//!  4           `VERSION`: the format's version, one byte
++//!  5..         records, one after another, to the end of the file
++//! ```
++//!
++//! ```text
++//!  0..4        u32, little endian: the payload's length in bytes
++//!  4..4+n      the payload
++//!  4+n..8+n    u32, little endian: the record's seal (`checksum::seal(length, payload)`)
++//! ```
++//!
++//! The layout is the course's, because more than this step reads it: the spec reads it through
++//! [`HEADER`], [`LENGTH`] and [`OVERHEAD`], and the step's harness writes logs through
++//! [`super::super::Spool`] and cuts them. What is *yours* is every body below, and the reasoning for
++//! the three choices the layout makes. Write that reasoning down here, next to the bytes it is
++//! about:
++//!
++//! * **the file declares itself first.** Four bytes of magic and a version byte are what make "this
++//!   is not this store's log" a decision instead of a guess. Say what the alternative costs: without
++//!   them, `hi!` and a log whose first write was cut after two bytes are the same bytes, and
++//!   recovery has to choose between calling one of them corrupt and calling the other empty;
++//! * **each record declares itself.** Say why the length and the seal travel *with* the payload,
++//!   rather than in an index, a footer or a side file — and what a store loses when the answer to
++//!   "where does this record end?" is anything but the bytes in front of the reader;
++//! * **the seal covers the length.** `checksum` is where the seal is computed; say here what a
++//!   reader would do with a length that was not covered.
++//!
++//! The header is five bytes and is written with the log's first record, so a store that has accepted
++//! nothing is an empty file — which is also the one file that is not a log *yet* and not a foreign
++//! file either. [`scan`] is where those two are told apart, and it is total: the bytes of any file
++//! are whole records, or a record the write was cut short inside, or something whose seal does not
++//! match. Three answers, and no fourth for "the reader panicked" or "the reader guessed" — a capture
++//! of the bytes a crash left behind is exactly the input this module exists for.
++
++use crate::error::Error;
++
++use super::checksum;
++
++/// The four bytes at the start of every log this build writes.
++pub const MAGIC: [u8; 4] = *b"LKLT";
++
++/// Version of the format above. A file that says anything else is not this build's log.
++pub const VERSION: u8 = 1;
++
++/// The bytes a log starts with: [`MAGIC`], then [`VERSION`].
++pub const HEADER_BYTES: [u8; 5] = [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION];
++
++/// How many bytes of a log come before its first record.
++pub const HEADER: usize = HEADER_BYTES.len();
++
++/// The length one record states in front of its payload: four bytes, little endian.
++pub const LENGTH: usize = 4;
++
++/// Bytes of framing around one record's payload: its [`LENGTH`] and its seal.
++pub const OVERHEAD: usize = LENGTH + checksum::LEN;
++
++/// Where a walk over a log's bytes stopped.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Stop {
++    /// Every byte of the file is whole records: nothing was left over.
++    End,
++    /// The bytes stop inside a record — the file holds fewer than the length states, or the record's
++    /// own framing is cut before the length. A write that was interrupted leaves this, and so does a
++    /// file whose header was cut short.
++    Torn,
++    /// A whole record's worth of bytes is there and is not the record it claims: the seal does not
++    /// match, so these bytes changed after they were written (a bit that flipped, a device that wrote
++    /// something else, a reader looking at the wrong offset).
++    Corrupt,
++}
++
++impl Stop {
++    /// The word a log line, a report and the step's harness call this stop by.
++    ///
++    /// Stable on purpose, like `Policy::name`: `end`, `torn` and `corrupt` are the three things a
++    /// recovery can find, and a report that spelled them differently in two places would make an
++    /// operator compare two words for one fact.
++    #[must_use]
++    pub fn name(&self) -> &'static str {
++        let _ = self;
++        todo!("step lakelet/4.4-wal-recovery")
++    }
++}
++/// What a walk over a log's bytes proved.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Scanned {
++    /// The records whose seal verified, in the order they were written.
++    records: Vec<Vec<u8>>,
++    /// Bytes of the log that are proved: the header plus every whole record.
++    verified: usize,
++    /// Why the walk stopped there.
++    stop: Stop,
++}
++
++impl Scanned {
++    /// The records whose seal verified, in the order they were written.
++    #[must_use]
++    pub fn records(&self) -> &[Vec<u8>] {
++        &self.records
++    }
++
++    /// How many bytes of the log are proved: its header plus every whole record.
++    ///
++    /// The offset the store continues at, and the number `Spool::len` starts from: everything below
++    /// it is a record whose seal verified, and everything above it is bytes no walk could prove.
++    #[must_use]
++    pub fn verified(&self) -> usize {
++        self.verified
++    }
++
++    /// Why the walk stopped where it did.
++    #[must_use]
++    pub fn stop(&self) -> Stop {
++        self.stop
++    }
++}
++
++/// The bytes one record occupies: its length, its payload and its seal.
++///
++/// The length field is 32 bits, so a payload wider than that cannot be described by this format. A
++/// record is written from a frame (`crate::protocol::frame::MAX_PAYLOAD` is a mebibyte), so the two
++/// never meet in this crate.
++#[must_use]
++pub fn encode(payload: &[u8]) -> Vec<u8> {
++    let _ = payload;
++    todo!("step lakelet/4.4-wal-recovery")
++}
++
++/// The bytes a log writes for its **first** record: the header that declares the log, then the
++/// record itself.
++///
++/// The two leave together because a file with a record in it and no header is not a log this module
++/// can read. A store that has accepted nothing holds an empty file, and its first append is what
++/// turns that file into a log.
++#[must_use]
++pub fn introduce(payload: &[u8]) -> Vec<u8> {
++    let _ = payload;
++    todo!("step lakelet/4.4-wal-recovery")
++}
++
++/// Read `bytes` as a log: the records whose seal verifies, and where the walk stopped.
++///
++/// Never panics and never reserves the length a record states — ask the *file* what it holds, before
++/// doing arithmetic on a number that a damaged byte can make arbitrary. A length the bytes cannot
++/// satisfy ends the walk as [`Stop::Torn`], like any other short tail.
++///
++/// An empty file is `Ok` with no records: a store that has accepted nothing is not a foreign file.
++/// Anything else that is not this log is refused — the module docs say why that is a decision.
++///
++/// # Errors
++///
++/// [`Error::Protocol`] when `bytes` is not this store's log at all: it does not start with
++/// [`HEADER_BYTES`], or it announces a format version this build cannot replay. Name what was found
++/// in the sentence: an operator holding a directory they did not expect needs to know which file is
++/// in it.
++pub fn scan(bytes: &[u8]) -> Result<Scanned, Error> {
++    let _ = bytes;
++    todo!("step lakelet/4.4-wal-recovery")
++}
+diff --git a/tests/sim_wal.rs b/tests/sim_wal.rs
+new file mode 100644
+index 0000000..093d941
+--- /dev/null
++++ b/tests/sim_wal.rs
+@@ -0,0 +1,700 @@
++//! The crash schedule `lakelet/4.4-wal-recovery` is judged by: writers, a flusher, and four ways
++//! for a store to die.
++//!
++//! Course content — the step's scaffold ships it, `slow:sim@N` runs it once per seed with
++//! `KILN_SIM_SEED` set, and the gate compares the `lakelet-sim` lines below in the order they were
++//! printed. Two things are therefore strict:
++//!
++//! * **the transcript is the schedule.** Every line is an event the *scenario* observed, and the seed
++//!   decides the order they happen in (`turmoil::Builder::rng_seed`, plus `enable_random_order` so
++//!   that the nodes are stepped in a random order too). Nothing here prints a wall clock, a path, an
++//!   address or the iteration order of a map: the one time that appears is
++//!   `tokio::time::Instant::now() - started`, a **simulated** duration. Formatting an `Instant`
++//!   itself would put the machine's real monotonic base into the transcript, which is how one seed
++//!   starts producing two different runs;
++//! * **the invariant is asserted here, not by the gate.** The gate can only see whether a run passed.
++//!   The claim this step makes — recovery proves exactly the bytes the store promised, and a store
++//!   continues after them — is checked inside the scenario, and a schedule that breaks it fails the
++//!   run with the sentence that says which one.
++//!
++//! # The four deaths, and what each one models
++//!
++//! A store is a `Spool` — the real write path, writing real files — plus this harness's memory of
++//! what it acknowledged. Only the `Spool` is dropped by a death, so the notebook that judges it
++//! outlives the store, the way a test's notes outlive the process they are about.
++//!
++//! * **process death** (`crash process`): the `Spool` is dropped and the file is left exactly as the
++//!   process left it. The kernel outlived the process, so the page cache is intact and *nothing
++//!   written is lost*, whatever the policy is. That claim is what this model exists to test, and it
++//!   is the one an fsync decision cannot take away (`docs/crash-points.md`, point 1);
++//! * **machine death** (`crash machine`): the machine stops after a write and before a flush, so the
++//!   page cache is gone with it and the file is cut to the `durable_offset` the store had promised.
++//!   *Exactly* the unsynced bytes are lost — the model that makes `durable_offset` an observable
++//!   rather than a comment (`docs/crash-points.md`, point 2);
++//! * **machine death during a write** (`crash torn`): the same machine stops while a record is being
++//!   written, so the write arrives only in part and the file is cut *inside* the unsynced tail —
++//!   which is what a device's write cache leaves when it commits some of a write and not the rest
++//!   (`docs/crash-points.md`, point 3). What survives ends in a partial record, and a recovery that
++//!   guesses instead of stopping hands it back;
++//! * **a device that wrote something else** (`crash rewrite`): the write arrived whole and one of
++//!   its bytes is not the byte that was sent — a device whose cache lied, a bus that flipped a bit,
++//!   a sector written from somebody else's buffer. Nothing is lost *physically*: the file is exactly
++//!   as long as the store left it. The seal is the only thing that can tell, and this is the model
++//!   that makes the step's central rule observable under a schedule: a recovery that stops at the
++//!   record it cannot prove answers the records before it, and one that skips ahead to the next
++//!   record it can prove answers a log with a hole in it.
++//!
++//! The last two are the same failure seen twice — a write the machine did not finish, and a write it
++//! finished wrongly — and the checks below keep them apart: a partial record is `torn`, changed
++//! bytes are `corrupt`, and both are answered with the prefix that was proved.
++//!
++//! The store's own durable boundary is the only thing that decides where a death cuts, so a death at
++//! a moment when nothing is unsynced loses nothing. The checks in [`Store::restart`] are written to
++//! hold in that case as well, instead of assuming a loss.
++//!
++//! # Why the flush is a task and not the policy
++//!
++//! The store's own interval policy decides by reading a **real** clock (`Spool::append`,
++//! `lakelet/4.3-write-path-adr`), and a simulated run cannot see that clock: a flush that happened
++//! because the author's machine was loaded is exactly the nondeterminism `slow:sim@N` fails on. So
++//! the store here runs `Policy::Never` and a task of its own syncs every [`FLUSH_MILLIS`]
++//! milliseconds of *simulated* time — the same duty cycle, driven by a clock this scenario owns.
++//! That is `jobq/3.8-clock-injection`'s lesson applied where it bites: a decision that depends on
++//! time has to be handed the clock it may read.
++
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::time::Duration;
++
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::sync::Mutex;
++use turmoil::Builder;
++use turmoil::net::{TcpListener, TcpStream};
++
++use lakelet::engine::Spool;
++use lakelet::engine::spool::FILE;
++use lakelet::engine::wal::Policy;
++use lakelet::engine::wal::replay;
++use lakelet::engine::wal::segment::{self, Stop};
++
++/// The seed this run uses when the judge does not name one.
++const DEFAULT_SEED: u64 = 1;
++/// The variable `slow:sim@N` sets: which schedule this run takes.
++const SEED: &str = "KILN_SIM_SEED";
++/// The store's name and port in the simulated network.
++const HOST: &str = "store";
++const PORT: u16 = 7000;
++/// Writers racing the flusher.
++const WRITERS: usize = 3;
++/// Appends each writer makes.
++const APPENDS: usize = 4;
++/// Bytes one payload has. Not a round number, so a length/payload mix-up cannot pass by accident.
++const PAYLOAD: usize = 41;
++/// How often the store's flusher syncs, in simulated milliseconds.
++const FLUSH_MILLIS: u64 = 40;
++/// How many times it syncs before it stops.
++const FLUSHES: usize = 6;
++/// The writer number the operator appends under, once the writers are gone.
++const OPERATOR: usize = 9;
++
++/// A failure inside the scenario: the one sentence the run reports.
++type Failure = Box<dyn std::error::Error>;
++
++/// The seed this process was asked for.
++fn seed() -> u64 {
++    match std::env::var(SEED) {
++        Ok(text) => text
++            .parse()
++            .unwrap_or_else(|error| panic!("{SEED}=`{text}` is not a number: {error}")),
++        Err(_) => DEFAULT_SEED,
++    }
++}
++
++/// The bytes one append carries, decided by the two numbers that name it: the judge can reconstruct
++/// every payload without reading the log it is judging.
++fn payload(writer: usize, index: usize) -> Vec<u8> {
++    (0..PAYLOAD)
++        .map(|offset| {
++            (writer as u8)
++                .wrapping_mul(11)
++                .wrapping_add((index as u8).wrapping_mul(97))
++                .wrapping_add(offset as u8)
++        })
++        .collect()
++}
++
++/// The value of `key=` in a reply, as a number.
++fn field(reply: &str, key: &str) -> u64 {
++    let (_, rest) = reply
++        .split_once(&format!("{key}="))
++        .unwrap_or_else(|| panic!("the reply `{reply}` carries no `{key}=`"));
++    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
++    digits
++        .parse()
++        .unwrap_or_else(|error| panic!("`{key}=` in `{reply}` is not a number: {error}"))
++}
++
++/// One append the store acknowledged, and whether it survived the last death.
++struct Append {
++    /// How long the log was after it.
++    len: u64,
++    /// What it carried.
++    payload: Vec<u8>,
++    /// `false` once a death took its bytes.
++    alive: bool,
++}
++
++/// The store: the real write path, and what this harness remembers about it.
++struct Store {
++    /// The directory both the dead and the live store write to.
++    directory: PathBuf,
++    /// The write path, or `None` while the store is down.
++    spool: Option<Spool>,
++    /// Every append, in order.
++    appended: Vec<Append>,
++    /// How many writers have reported that they are finished.
++    writers_done: usize,
++    /// How many times the flusher synced.
++    flushes: usize,
++    /// The death the store is waiting to be restarted after: what it was, what the store had
++    /// promised, and how much of the log it left.
++    death: Option<(String, u64, u64)>,
++    /// A failure the flusher hit, which every later command reports.
++    failed: Option<String>,
++}
++
++impl Store {
++    /// Open a store in `directory`.
++    ///
++    /// `Policy::Never`, because this store's flushes are the harness's, on the simulation's clock (the
++    /// module docs say why). `Spool::with_policy` is the write path's own entry point, so the policy
++    /// here is a policy this build can be asked for, not one invented for a test.
++    fn open(directory: PathBuf) -> Result<Self, Failure> {
++        let spool = Spool::with_policy(&directory, Policy::Never)?;
++        Ok(Self {
++            directory,
++            spool: Some(spool),
++            appended: Vec::new(),
++            writers_done: 0,
++            flushes: 0,
++            death: None,
++            failed: None,
++        })
++    }
++
++    /// What the store still holds, in order: the appends no death took.
++    fn alive(&self) -> Vec<Vec<u8>> {
++        self.appended
++            .iter()
++            .filter(|append| append.alive)
++            .map(|append| append.payload.clone())
++            .collect()
++    }
++
++    /// Append one record through the real write path, and answer `(len, durable)`.
++    fn append(&mut self, writer: usize, index: usize) -> Result<(u64, u64), Failure> {
++        let payload = payload(writer, index);
++        let Some(spool) = self.spool.as_mut() else {
++            return Err(format!(
++                "append writer={writer} index={index} arrived at a store that is dead"
++            )
++            .into());
++        };
++        spool.append(&payload)?;
++        let (len, durable) = (spool.len(), spool.durable_offset());
++        self.appended.push(Append {
++            len,
++            payload,
++            alive: true,
++        });
++        println!(
++            "lakelet-sim append writer={writer} index={index} len={len} durable={durable} \
++             records={}",
++            self.appended.len()
++        );
++        Ok((len, durable))
++    }
++
++    /// Flush, the way the store's own interval policy would.
++    fn sync(&mut self, interval: usize) -> Result<(u64, u64), Failure> {
++        let Some(spool) = self.spool.as_mut() else {
++            return Ok((0, 0));
++        };
++        spool.sync()?;
++        let (len, durable) = (spool.len(), spool.durable_offset());
++        self.flushes += 1;
++        println!("lakelet-sim sync interval={interval} len={len} durable={durable}");
++        Ok((len, durable))
++    }
++
++    /// Kill the store the way `kind` models, and answer `(written, durable, kept)`: how long the log
++    /// was, what the store had promised, and how much of it the death left behind.
++    fn crash(&mut self, kind: &str) -> Result<(u64, u64, u64), Failure> {
++        let Some(spool) = self.spool.take() else {
++            return Err("the store was asked to die twice".into());
++        };
++        let (written, durable) = (spool.len(), spool.durable_offset());
++        drop(spool);
++        let kept = match kind {
++            // The process dies; the machine and its page cache are fine, so the file is untouched.
++            "process" => written,
++            // The machine dies: everything the last flush did not cover goes with the page cache.
++            "machine" => durable,
++            // The machine dies inside the write that was in flight: the device had committed some of
++            // the unsynced tail and not the rest of it, so the file is cut inside a record.
++            "torn" => durable + (written - durable) / 2,
++            // The write arrived whole and one of its bytes is not the byte that was sent, so the
++            // file is as long as the store left it and the last record in it is not that record.
++            "rewrite" => {
++                let mut file = std::fs::OpenOptions::new()
++                    .read(true)
++                    .write(true)
++                    .open(self.directory.join(FILE))?;
++                use std::io::{Read, Seek, SeekFrom, Write};
++                // The last record's first payload byte: a record is `[length][payload][seal]`, and
++                // the harness knows both because every append here carries `PAYLOAD` bytes.
++                let at = written - (segment::OVERHEAD + PAYLOAD) as u64 + segment::LENGTH as u64;
++                file.seek(SeekFrom::Start(at))?;
++                let mut byte = [0u8; 1];
++                file.read_exact(&mut byte)?;
++                file.seek(SeekFrom::Start(at))?;
++                file.write_all(&[byte[0] ^ 0xFF])?;
++                file.sync_all()?;
++                written
++            }
++            other => return Err(format!("`{other}` is not a death this harness models").into()),
++        };
++        if kept < written {
++            std::fs::OpenOptions::new()
++                .write(true)
++                .open(self.directory.join(FILE))?
++                .set_len(kept)?;
++        }
++        // What the *device* holds, which is what the next restart judges the replay against: a
++        // record the death cut away is not one the store still has.
++        for append in &mut self.appended {
++            if append.len > kept {
++                append.alive = false;
++            }
++        }
++        self.death = Some((kind.to_owned(), durable, kept));
++        println!(
++            "lakelet-sim crash kind={kind} written={written} durable={durable} kept={kept} lost={}",
++            written - kept
++        );
++        Ok((written, durable, kept))
++    }
++
++    /// Open the store again on the same directory — the call the daemon makes at its third startup
++    /// step — and judge what the log proves against what the store promised before it died.
++    ///
++    /// The replay is read *before* the store is opened, because opening is what takes the refused tail
++    /// out of the file: the numbers reported here are what the bytes proved, and the store is then
++    /// asked for the same records through its own reader. Two readers of one file is the point — the
++    /// write path and the replay disagreeing about the same bytes is a bug, not a difference of
++    /// opinion.
++    fn restart(&mut self) -> Result<(), Failure> {
++        let Some((kind, durable, kept)) = self.death.clone() else {
++            return Err("the store was restarted without having died".into());
++        };
++        let recovered = replay::recover(&self.directory)?;
++        println!(
++            "lakelet-sim recovered kind={kind} records={} bytes={} discarded={} stop={}",
++            recovered.records().len(),
++            recovered.bytes(),
++            recovered.discarded(),
++            recovered.stop().name()
++        );
++        let held = self.alive();
++        let proved: Vec<Vec<u8>> = recovered.records().to_vec();
++        if recovered.bytes() + recovered.discarded() != kept {
++            return Err(format!(
++                "kind={kind}: recovery accounts for {} proved byte(s) and {} discarded, and the death \
++                 left {kept} — every byte of the file is either a record the replay can prove or a \
++                 number it reports",
++                recovered.bytes(),
++                recovered.discarded()
++            )
++            .into());
++        }
++        if recovered.bytes() < durable {
++            return Err(format!(
++                "kind={kind}: the store promised {durable} durable byte(s) and recovery proved only \
++                 {} — a machine may take what was never flushed, and never what was",
++                recovered.bytes()
++            )
++            .into());
++        }
++        if !held.starts_with(&proved) {
++            return Err(format!(
++                "kind={kind}: recovery proved {} record(s) of {:?} byte(s) and the device holds {} of \
++                 {:?} — a prefix of the log is what a death may cost and nothing else. A replay that \
++                 skipped the record it could not prove and answered the ones after it hands back a \
++                 log with a hole in it, and the two lists above are where that shows",
++                proved.len(),
++                proved.iter().map(Vec::len).collect::<Vec<usize>>(),
++                held.len(),
++                held.iter().map(Vec::len).collect::<Vec<usize>>()
++            )
++            .into());
++        }
++        match kind.as_str() {
++            "process" => {
++                if proved != held || recovered.discarded() != 0 || recovered.bytes() != kept {
++                    return Err(format!(
++                        "kind=process: a process died and the page cache did not, so nothing written \
++                         may be lost: {} proved of {kept} written, {} discarded",
++                        recovered.bytes(),
++                        recovered.discarded()
++                    )
++                    .into());
++                }
++            }
++            "machine" => {
++                if proved != held || recovered.discarded() != 0 || recovered.bytes() != durable {
++                    return Err(format!(
++                        "kind=machine: the file was cut to what the store had promised, so the replay \
++                         ends exactly there: {} proved of {durable} promised, {} discarded",
++                        recovered.bytes(),
++                        recovered.discarded()
++                    )
++                    .into());
++                }
++            }
++            "torn" => {
++                if recovered.discarded() > 0 && recovered.stop() != Stop::Torn {
++                    return Err(format!(
++                        "kind=torn: {} byte(s) of a record nobody finished are in the file and the \
++                         walk called that `{}` — a partial record is a torn one, and it is not the \
++                         same answer as a record whose bytes changed",
++                        recovered.discarded(),
++                        recovered.stop().name()
++                    )
++                    .into());
++                }
++            }
++            "rewrite" => {
++                if recovered.discarded() == 0 || recovered.stop() != Stop::Corrupt {
++                    return Err(format!(
++                        "kind=rewrite: a byte of the write that was in flight is not the byte that was \
++                         sent, and the replay says it proved every record ({} discarded, `{}`) — the \
++                         seal is what makes a changed record unprovable, and a recovery that hands it \
++                         back, or that walks past it to the records behind it, is a store answering a \
++                         log nobody wrote",
++                        recovered.discarded(),
++                        recovered.stop().name()
++                    )
++                    .into());
++                }
++            }
++            other => return Err(format!("`{other}` is not a death this harness models").into()),
++        }
++
++        // The notebook follows the bytes from here on: what the replay proved is what this store
++        // holds, and every later phase is judged against that rather than against the file's length.
++        for append in &mut self.appended {
++            if append.len > recovered.bytes() {
++                append.alive = false;
++            }
++        }
++
++        let spool = Spool::open(&self.directory)?;
++        let served = spool.records()?;
++        if served != proved {
++            return Err(format!(
++                "kind={kind}: the reopened store answers {} record(s) where recovery proved {} — the \
++                 write path and the replay disagree about the same bytes",
++                served.len(),
++                proved.len()
++            )
++            .into());
++        }
++        if spool.len() != recovered.bytes() {
++            return Err(format!(
++                "kind={kind}: the reopened store counts {} byte(s) of log where recovery proved {} — a \
++                 store that continued anywhere but the recovered end would write over a record it \
++                 did not lose",
++                spool.len(),
++                recovered.bytes()
++            )
++            .into());
++        }
++        println!(
++            "lakelet-sim verdict kind={kind} records={} bytes={} discarded={} ok=true",
++            recovered.records().len(),
++            recovered.bytes(),
++            recovered.discarded()
++        );
++        self.death = None;
++        self.spool = Some(spool);
++        Ok(())
++    }
++
++    /// What the store holds now, as the scenario's last word.
++    fn verify(&mut self) -> Result<(), Failure> {
++        let alive = self.alive();
++        let Some(spool) = self.spool.as_mut() else {
++            return Err("the scenario asked a dead store for its records".into());
++        };
++        let served = spool.records()?;
++        if served != alive {
++            return Err(format!(
++                "the store serves {} record(s) and was given {}: appending after a recovery has to \
++                 continue after the records it proved, never over them",
++                served.len(),
++                alive.len()
++            )
++            .into());
++        }
++        println!(
++            "lakelet-sim done records={} flushes={} deaths=4",
++            served.len(),
++            self.flushes
++        );
++        Ok(())
++    }
++}
++
++/// One connection to the store, one command per line.
++struct Client {
++    stream: BufReader<TcpStream>,
++}
++
++impl Client {
++    /// Connect, waiting for the store to be listening.
++    async fn connect() -> Result<Self, Failure> {
++        for _ in 0..200 {
++            match TcpStream::connect((HOST, PORT)).await {
++                Ok(socket) => {
++                    return Ok(Self {
++                        stream: BufReader::new(socket),
++                    });
++                }
++                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
++            }
++        }
++        Err(format!("{HOST}:{PORT} never accepted a connection").into())
++    }
++
++    /// Send one command and answer the reply. A command the store refused fails the run.
++    async fn ask(&mut self, command: &str) -> Result<String, Failure> {
++        self.stream.write_all(command.as_bytes()).await?;
++        self.stream.write_all(b"\n").await?;
++        self.stream.flush().await?;
++        let mut text = String::new();
++        if self.stream.read_line(&mut text).await? == 0 {
++            return Err(format!("the store closed the connection at `{command}`").into());
++        }
++        let reply = text.trim_end().to_owned();
++        match reply.strip_prefix("failed ") {
++            Some(reason) => Err(format!("`{command}` was refused: {reason}").into()),
++            None => Ok(reply),
++        }
++    }
++}
++
++/// Read one command and answer the store's reply.
++async fn serve(socket: TcpStream, store: Arc<Mutex<Store>>) -> Result<(), Failure> {
++    let mut stream = BufReader::new(socket);
++    loop {
++        let mut text = String::new();
++        if stream.read_line(&mut text).await? == 0 {
++            return Ok(());
++        }
++        let reply = match command(text.trim(), &store).await {
++            Ok(reply) => reply,
++            Err(error) => format!("failed {error}"),
++        };
++        stream.write_all(reply.as_bytes()).await?;
++        stream.write_all(b"\n").await?;
++        stream.flush().await?;
++    }
++}
++
++/// One command, the one line it answers, and the store work behind it.
++async fn command(text: &str, store: &Arc<Mutex<Store>>) -> Result<String, Failure> {
++    let mut words = text.split_whitespace();
++    let verb = words.next().unwrap_or_default();
++    let mut store = store.lock().await;
++    if let Some(reason) = store.failed.clone() {
++        return Err(reason.into());
++    }
++    match verb {
++        "append" => {
++            let writer = number(words.next(), "writer")?;
++            let index = number(words.next(), "index")?;
++            let (len, durable) = store.append(writer, index)?;
++            Ok(format!("appended len={len} durable={durable}"))
++        }
++        "done" => {
++            store.writers_done += 1;
++            Ok(format!("done writers={}", store.writers_done))
++        }
++        "sync" => {
++            let interval = store.flushes;
++            let (len, durable) = store.sync(interval)?;
++            Ok(format!("synced len={len} durable={durable}"))
++        }
++        "status" => Ok(format!(
++            "status writers={} records={} flushes={}",
++            store.writers_done,
++            store.appended.len(),
++            store.flushes
++        )),
++        "crash" => {
++            let kind = words.next().unwrap_or_default().to_owned();
++            let (written, durable, kept) = store.crash(&kind)?;
++            Ok(format!(
++                "crashed written={written} durable={durable} kept={kept}"
++            ))
++        }
++        "restart" => {
++            store.restart()?;
++            Ok("restarted".to_owned())
++        }
++        "verify" => {
++            store.verify()?;
++            Ok("verified".to_owned())
++        }
++        other => Err(format!("`{other}` is not a command this store speaks").into()),
++    }
++}
++
++/// One whitespace-separated command word, as a number.
++fn number(word: Option<&str>, what: &str) -> Result<usize, Failure> {
++    let Some(word) = word else {
++        return Err(format!("this command needs a {what}").into());
++    };
++    word.parse()
++        .map_err(|error| format!("`{word}` is not a {what}: {error}").into())
++}
++
++/// One append, appended by `writer`, and print when its acknowledgement came back.
++async fn writer(writer: usize, client: &mut Client) -> Result<(), Failure> {
++    let started = tokio::time::Instant::now();
++    for index in 0..APPENDS {
++        client.ask(&format!("append {writer} {index}")).await?;
++        // A simulated duration, never an `Instant`: see the module docs.
++        println!(
++            "lakelet-sim ack writer={writer} index={index} at={:?}",
++            tokio::time::Instant::now() - started
++        );
++    }
++    client.ask(&format!("done {writer}")).await?;
++    Ok(())
++}
++
++#[test]
++fn a_crash_is_a_schedule_and_recovery_proves_what_the_store_promised() {
++    let seed = seed();
++    let directory =
++        std::env::temp_dir().join(format!("lakelet-sim-wal-{}-{seed}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&directory);
++
++    let store = Arc::new(Mutex::new(
++        Store::open(directory.clone()).expect("a directory this process owns is a store"),
++    ));
++
++    let mut builder = Builder::new();
++    builder.rng_seed(seed).enable_random_order();
++    let mut sim = builder.build();
++
++    let hosted = Arc::clone(&store);
++    sim.host(HOST, move || {
++        let store = Arc::clone(&hosted);
++        async move {
++            let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
++            // The store's flush, on the simulation's clock instead of the machine's.
++            let flusher = Arc::clone(&store);
++            tokio::spawn(async move {
++                for interval in 0..FLUSHES {
++                    tokio::time::sleep(Duration::from_millis(FLUSH_MILLIS)).await;
++                    let mut store = flusher.lock().await;
++                    if let Err(error) = store.sync(interval) {
++                        store.failed = Some(format!("the store could not flush: {error}"));
++                    }
++                }
++            });
++            loop {
++                let (socket, _) = listener.accept().await?;
++                let store = Arc::clone(&store);
++                tokio::spawn(async move {
++                    if let Err(error) = serve(socket, store).await {
++                        eprintln!("lakelet-sim a connection ended: {error}");
++                    }
++                });
++            }
++            #[allow(unreachable_code)]
++            Ok(())
++        }
++    });
++
++    for writer_index in 0..WRITERS {
++        sim.client(format!("writer{writer_index}"), async move {
++            let mut client = Client::connect().await?;
++            writer(writer_index, &mut client).await
++        });
++    }
++
++    sim.client("operator", async move {
++        let mut client = Client::connect().await?;
++        // The writers and the flusher first, so the phases after them are the same on every machine:
++        // the seed decides the interleaving, and the scenario decides what happens next.
++        let mut waited = 0;
++        loop {
++            let reply = client.ask("status").await?;
++            if field(&reply, "writers") == WRITERS as u64
++                && field(&reply, "flushes") == FLUSHES as u64
++            {
++                break;
++            }
++            waited += 1;
++            if waited > 200 {
++                return Err(format!("the writers and the flusher never finished: {reply}").into());
++            }
++            tokio::time::sleep(Duration::from_millis(25)).await;
++        }
++
++        // 1. The process dies. Nothing written may be lost: the kernel outlived it.
++        client.ask("crash process").await?;
++        client.ask("restart").await?;
++
++        // 2. The machine dies *during* a write. An odd number of unsynced records is on purpose: the
++        //    cut then lands inside one of them, which is the partial record this model is for.
++        for index in 0..3 {
++            client.ask(&format!("append {OPERATOR} {index}")).await?;
++        }
++        client.ask("crash torn").await?;
++        client.ask("restart").await?;
++
++        // 3. The write arrives whole and one of its bytes is not the byte that was sent. This is the
++        //    death the seal exists for, and the one that tells a replay which stops from a replay
++        //    that walks past what it could not prove.
++        for index in 3..5 {
++            client.ask(&format!("append {OPERATOR} {index}")).await?;
++        }
++        client.ask("crash rewrite").await?;
++        client.ask("restart").await?;
++
++        // 4. The machine dies with nothing flushed since the last sync: the store continuing after a
++        //    recovery has to be durable again before the next death means anything.
++        for index in 5..7 {
++            client.ask(&format!("append {OPERATOR} {index}")).await?;
++        }
++        client.ask("sync").await?;
++        for index in 7..9 {
++            client.ask(&format!("append {OPERATOR} {index}")).await?;
++        }
++        client.ask("crash machine").await?;
++        client.ask("restart").await?;
++
++        // 5. And the store still takes writes, after everything it proved.
++        client.ask(&format!("append {OPERATOR} 9")).await?;
++        client.ask("verify").await?;
++        Ok(())
++    });
++
++    sim.run()
++        .unwrap_or_else(|error| panic!("the simulation did not finish: {error}"));
++    let _ = std::fs::remove_dir_all(&directory);
++}

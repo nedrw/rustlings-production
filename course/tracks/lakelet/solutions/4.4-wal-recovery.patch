@@ -1,0 +1,838 @@
+diff --git a/docs/crash-points.md b/docs/crash-points.md
+index 502e0b4..67f3972 100644
+--- a/docs/crash-points.md
++++ b/docs/crash-points.md
+@@ -5,8 +5,10 @@ sentence: it lists every way the store can stop, and says for each one what is o
+ recovery will see, which policy loses what, and what the operator ends up explaining. The decision
+ these points belong to is [docs/adr/0001-write-path.md](adr/0001-write-path.md), which names the policy
+ this build ships; the policies themselves are [`Policy`](../src/engine/wal/policy.rs), the call that
+-bounds every window below is [`Spool::sync`](../src/engine/spool.rs), and the boundary a recovery
+-replays to is `Spool::durable_offset`.
++bounds every window below is [`Spool::sync`](../src/engine/spool.rs), the bytes each point is about
++are [`segment`](../src/engine/wal/segment.rs), and the replay that turns them into records — up to
++the boundary the write path promised, [`Spool::durable_offset`](../src/engine/spool/durable.rs) — is
++[`replay`](../src/engine/wal/replay.rs).
+ 
+ Two words are used precisely, because most arguments about this are really arguments about them:
+ 
+@@ -19,10 +21,10 @@ Two words are used precisely, because most arguments about this are really argum
+ | - | --------- | ------------ | ---------------- | ------- |
+ | 1 | the process dies | nothing lost | nothing lost | nothing lost |
+ | 2 | the machine dies | nothing lost | ≤ 50 ms lost | everything since the last flush |
+-| 3 | the machine dies mid-write | a torn tail, refused | a torn tail, refused | a torn tail, refused |
++| 3 | the machine dies mid-write | the torn record, replayed past | the torn record, replayed past | the torn record, replayed past |
+ | 4 | the directory entry was never flushed | the whole store | the whole store | the whole store |
+ | 5 | the flush itself fails | "acknowledged" is a question | "acknowledged" is a question | "acknowledged" is a question |
+-| 6 | the process stops cleanly | nothing lost | ≤ 50 ms lost to a *reboot* | everything since the last flush |
++| 6 | the process stops cleanly | nothing lost | nothing lost | nothing lost |
+ 
+ ### 1 — The process dies after the write and before any sync
+ 
+@@ -67,19 +69,22 @@ value.
+ - **On the device:** a record whose tail is whatever the device managed to commit — a prefix of the
+   record, or garbage where the rest of it should be. The device's own write cache decides how much of
+   it survived, and a device that lies about its cache decides it wrongly.
+-- **Recovery sees:** something that is *not a record* on the last line: a length that promises more
+-  bytes than the file holds, or a payload whose checksum does not match. `Spool::records` refuses the
+-  file today (it answers `Error::Protocol` rather than guessing); `lakelet/4.4-wal-recovery` is the
+-  step that replays up to the last whole record and says what it dropped instead of refusing the
+-  store.
++- **Recovery sees:** the last whole record, and after it bytes that are the beginning of a record
++  nobody finished. Every record carries its own length and its own seal, so the replay walks them and
++  stops at the first one it cannot prove: the length promising more than the file holds and the seal
++  that does not match are the same answer — a torn tail, not a corrupt store. The replay keeps every
++  record before that one, throws the rest away, moves the log's end there so the next append writes
++  after the records that survived, and reports the count (`Spool::recovered`, `store recovered
++  records=… bytes=… discarded=…`).
+ - **Who loses what:** all three policies lose the torn record itself — it was never acknowledged
+   unless a flush had already covered it, and `durable_offset` never moved past it. The difference is
+   the *neighbourhood*: `per-record` has at most one such record, `interval(50ms)` has the window's
+-  worth, and `never` has everything since the last flush. The bytes that come back wrong are only ever
+-  visible *after* the truncation point.
+-- **Operator sees:** a store that refuses to start (`protocol error: record 41 says 37 byte(s) and the
+-  file holds 12 after its header`), which is alarming, correct, and temporary until 4.4 teaches the
+-  log to end at the last whole record.
++  worth, and `never` has everything since the last flush. What recovery adds is that the bytes after
++  the tear are *discarded* rather than read: they are the middle of a record, and a record assembled
++  out of them would be a wrong answer that no count reports.
++- **Operator sees:** a store that starts, serves the prefix it could prove, and says what the crash
++  cost in the same breath — `discarded = 0` is a log that ended on a record boundary, and anything
++  else is a number from a log line instead of an afternoon hunched over `xxd`.
+ 
+ ### 4 — The file's data is durable but its directory entry is not
+ 
+@@ -128,17 +133,19 @@ unreachable network volume, a filesystem that has gone read-only on its own.
+ The daemon is asked to stop: `SIGTERM`, a rolling deploy, an operator with `systemctl stop`. Nothing
+ has failed and no client is disconnected without an answer.
+ 
+-- **On the device:** whatever the last flush put there. A clean stop does not flush by itself: the
+-  records written in the current window are still in the page cache, exactly as in point 1.
+-- **Recovery sees:** the whole log, because the kernel survived — and *nothing*, if the machine is
+-  rebooted and loses power before the kernel writes the page cache out. A clean stop is not a crash
+-  point until the reboot that follows it.
+-- **Who loses what:** `per-record` loses nothing at all. `interval(50ms)` loses up to 50 ms of
+-  acknowledged writes to a machine that dies *after* the process stopped cleanly, which is a small
+-  window and an odd one — the operator believed the store had stopped in a known state. `never` loses
+-  everything since the last flush, and a deploy that stops and starts a store regularly is exactly the
+-  sequence that keeps resetting the clock.
+-- **Operator sees:** a `draining` line, exit code 0, and a store that starts with the prefix of the
+-  log that was on the device. If the deployment cares about the window between "stopped" and "the
+-  machine was shut down", it is the *stop path's* business to flush before exiting, not this policy's:
+-  a stop that wants a closed window has to ask for one.
++- **On the device:** everything the store acknowledged, whatever the policy is. The stop path flushes
++  before it exits: `lakelet/4.4-wal-recovery` is where the sentence in `bin/lakeletd.rs` — "stop
++  accepting, flush, log `draining`" — became true instead of aspirational. It costs one flush, once
++  per stop, and the daemon says it happened (`flushed the store written=… durable=…`, two numbers that
++  agree; a pair that does not is a window somebody left open).
++- **Recovery sees:** the whole log, ending on a record boundary, because the kernel survived *and* the
++  bytes were on the device before the process went away. The next start discards nothing. One thing a
++  stop cannot cover: a connection that was still appending while the flush ran — those bytes are in
++  the page cache (point 1), and the next flush or the kernel puts them on the device.
++- **Who loses what:** nothing — none of `per-record`, `interval(50ms)` or `never`, which is the point
++  of paying one flush at a stop. Before `4.4` this row read the other way round: a clean stop did not
++  flush by itself, so `interval(50ms)` lost up to its window and `never` lost everything since the
++  last flush to the reboot that followed, and an operator who believed the store had stopped in a
++  known state had believed the wrong document.
++- **Operator sees:** a `flushed the store` line and then `draining`, exit code 0, and a store that
++  starts with `discarded=0` — a restart after a clean stop costs one replay and no explanation.
+diff --git a/src/bin/lakeletd.rs b/src/bin/lakeletd.rs
+index 7e749e1..03c2fba 100644
+--- a/src/bin/lakeletd.rs
++++ b/src/bin/lakeletd.rs
+@@ -4,10 +4,14 @@
+ //!
+ //! 1. read the settings through the four layers (`--check-config` prints them and exits);
+ //! 2. install the logger;
+-//! 3. open the store — a store that cannot be opened is a *refusal*, before anything listens;
++//! 3. open the store — which replays its log and discards what no append finished
++//!    (`lakelet/4.4-wal-recovery`), logging `store recovered` with what it found; a store that
++//!    cannot be opened is a *refusal*, before anything listens;
+ //! 4. bind the ingest port and log `listening on <addr>`, which is how a test learns the port the
+ //!    kernel handed out (port `0` means only the child knows);
+-//! 5. serve until `SIGTERM` or `SIGINT`, then stop accepting, flush, log `draining` and exit `0`.
++//! 5. serve until `SIGTERM` or `SIGINT`, then stop accepting, **flush** — which is what makes the
++//!    clean stop in `docs/crash-points.md` point 6 a closed window rather than a promise — log
++//!    `draining`, and exit `0`.
+ 
+ use std::process::ExitCode;
+ use std::sync::Arc;
+@@ -54,6 +58,21 @@ async fn run() -> Result<(), lakelet::Error> {
+     logging::init(&config)?;
+ 
+     let store = Arc::new(Mutex::new(Spool::open(&config.store_dir)?));
++    {
++        // `lakelet/4.4-wal-recovery`: a store is recovered when it is opened, and what that had to
++        // throw away is the first thing an operator wants to know about a restart. `discarded = 0`
++        // is a log that ended on a record boundary; anything else is bytes no append finished, named
++        // with the count instead of silently dropped. One line per start, in the same shape as the
++        // lines around it (`obs/structured-logs@design`): fields a collector can read, no prose.
++        let spool = store.lock().await;
++        let recovered = spool.recovered();
++        tracing::info!(
++            records = recovered.records().len(),
++            bytes = recovered.bytes(),
++            discarded = recovered.discarded(),
++            "store recovered"
++        );
++    }
+     let listener = TcpListener::bind(&config.listen_addr)
+         .await
+         .map_err(|error| lakelet::Error::Store {
+@@ -84,7 +103,24 @@ async fn run() -> Result<(), lakelet::Error> {
+         }
+     };
+ 
+-    let served = ingest::serve(listener, store, shutdown).await;
++    let served = ingest::serve(listener, Arc::clone(&store), shutdown).await;
++    // The stop path's own promise, and `lakelet/4.4-wal-recovery` is where it becomes true: whatever
++    // the policy is, a clean stop waits for the device once, so the window the write path left open
++    // is closed before the process goes (`docs/crash-points.md`, point 6). It costs one flush — on
++    // the machine this was authored on, 4.1 ms — once per stop, and it is what makes a restart after
++    // `SIGTERM` a log that ends on a record boundary.
++    {
++        let mut spool = store.lock().await;
++        let written = spool.len();
++        spool.sync()?;
++        // Both numbers, because the *pair* is the claim: a stop that flushed prints them equal, and
++        // `durable` behind `written` is a window that is still open.
++        tracing::info!(
++            written,
++            durable = spool.durable_offset(),
++            "flushed the store"
++        );
++    }
+     println!("draining");
+     served
+ }
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index f887113..f5ce43d 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -21,15 +21,19 @@
+ //! does not make and a recovery cannot survive without. The argument for the policy this build ships
+ //! is `docs/adr/0001-write-path.md`, and what each policy accepts losing is `docs/crash-points.md`.
+ //!
+-//! Those accessors are declared beside this file, in `spool/durable.rs`: this file owns the record
+-//! format and the call that answers a client, and the module beside it owns what the bytes mean to
+-//! the device.
++//! Those accessors are declared beside this file, in `spool/durable.rs`: this file owns what an
++//! append *does* — open, write, and the call that answers a client — and the module beside it owns
++//! what the bytes mean to the device. The bytes themselves are `4.4`'s:
++//! `crate::engine::wal::segment` writes and reads them, and `crate::engine::wal::replay` answers what
++//! a store's file proves.
+ 
+ use std::io::Write;
+ use std::path::{Path, PathBuf};
+ use std::time::{Duration, Instant};
+ 
+ use crate::engine::wal::Policy;
++use crate::engine::wal::replay::Recovered;
++use crate::engine::wal::segment::{self, Stop};
+ use crate::error::Error;
+ 
+ /// One `Error::Store` around an I/O failure.
+@@ -39,19 +43,6 @@ fn store(source: std::io::Error) -> Error {
+     }
+ }
+ 
+-/// One `Error::Protocol` with `detail` filled in.
+-fn protocol(detail: String) -> Error {
+-    Error::Protocol { detail }
+-}
+-
+-/// The `u32` at `offset`, or `None` when the bytes do not hold four of them there.
+-fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+-    let slice = bytes.get(offset..offset + 4)?;
+-    let mut array = [0u8; 4];
+-    array.copy_from_slice(slice);
+-    Some(u32::from_le_bytes(array))
+-}
+-
+ /// The name of the file inside the store directory.
+ pub const FILE: &str = "ingest.log";
+ 
+@@ -68,6 +59,8 @@ pub struct Spool {
+     durable: u64,
+     /// When the last flush happened, so an interval policy can elide the next one.
+     last_sync: Instant,
++    /// What opening this store had to do about the log a previous process left (`4.4`).
++    recovered: Recovered,
+ }
+ 
+ impl Spool {
+@@ -111,11 +104,17 @@ impl Spool {
+             .append(true)
+             .open(self.path())
+             .map_err(store)?;
+-        file.write_all(&(payload.len() as u32).to_le_bytes())
+-            .map_err(store)?;
+-        file.write_all(payload).map_err(store)?;
++        // `lakelet/4.4-wal-recovery`: the bytes are `segment`'s — a length, the payload, and a seal
++        // over both — and a log that does not exist yet is declared by the record that starts it, so
++        // a store that has accepted nothing stays an empty file.
++        let record = if self.len == 0 {
++            segment::introduce(payload)
++        } else {
++            segment::encode(payload)
++        };
++        file.write_all(&record).map_err(store)?;
+         drop(file);
+-        self.len += payload.len() as u64 + 4;
++        self.len += record.len() as u64;
+ 
+         // Written, and now the decision: whether this call waits for the device is the policy's
+         // answer, and it is a decision with a number attached (a flush costs milliseconds here, and a
+@@ -139,33 +138,38 @@ impl Spool {
+     /// [`Error::Store`] when the file cannot be read, and [`Error::Protocol`] when what is in it is
+     /// not the record format this module writes — a reader that guesses is how a corrupt store
+     /// becomes a corrupt *answer*.
++    ///
++    /// The tail a crash left behind is that second case rather than a shorter list of records:
++    /// `lakelet/4.4-wal-recovery` makes opening a store cut the unproved bytes, so a store that has
++    /// been opened reads back whole, and one that was cut *while open* says so instead of answering
++    /// a prefix nobody asked for. `replay::recover` is the reader that answers the prefix.
+     pub fn records(&self) -> Result<Vec<Vec<u8>>, Error> {
+         let bytes = match std::fs::read(self.path()) {
+             Ok(bytes) => bytes,
+             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+             Err(error) => return Err(store(error)),
+         };
+-        let mut records = Vec::new();
+-        let mut cursor = 0usize;
+-        while cursor < bytes.len() {
+-            let length = u32_at(&bytes, cursor).ok_or_else(|| {
+-                protocol(format!(
+-                    "a record header is four bytes and the file ends with {} byte(s) of one",
+-                    bytes.len() - cursor
+-                ))
+-            })? as usize;
+-            let start = cursor + 4;
+-            let record = bytes.get(start..start + length).ok_or_else(|| {
+-                protocol(format!(
+-                    "record {} says {length} byte(s) and the file holds {} after its header",
+-                    records.len(),
+-                    bytes.len().saturating_sub(start)
+-                ))
+-            })?;
+-            records.push(record.to_vec());
+-            cursor = start + length;
++        // `lakelet/4.4-wal-recovery`: the reader is the one the writer is, so a record comes back
++        // only once its seal has verified. What a crash left behind is *not* a shorter answer this
++        // call may quietly hand out: a caller reading a store whose file a crash cut mid-record gets
++        // the same `Error::Protocol` it has always got, and `replay::recover` is the reader that
++        // answers a prefix instead — because opening the store is what cuts the tail, and this
++        // reader is not the one that opens it.
++        let scanned = segment::scan(&bytes)?;
++        if scanned.stop() != Stop::End {
++            let unproved = bytes.len().saturating_sub(scanned.verified());
++            return Err(Error::Protocol {
++                detail: format!(
++                    "the log holds {} byte(s) of whole records and then {unproved} byte(s) that are \
++                     not one, which is a `{}` — this store has not been opened since its file was \
++                     cut or changed, and a reader that guessed would hand back a shorter log as if \
++                     it were the whole one",
++                    scanned.verified(),
++                    scanned.stop().name()
++                ),
++            });
+         }
+-        Ok(records)
++        Ok(scanned.records().to_vec())
+     }
+ }
+ 
+diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
+index 41c5036..00bc26e 100644
+--- a/src/engine/spool/durable.rs
++++ b/src/engine/spool/durable.rs
+@@ -7,12 +7,17 @@
+ //! build ships is `docs/adr/0001-write-path.md`, and what each policy accepts losing is
+ //! `docs/crash-points.md`.
+ //!
++//! `lakelet/4.4-wal-recovery` lands on the same call from the other side: opening a store replays
++//! what the log proves, cuts the bytes no append finished, and starts the counters at that boundary.
++//! What that found is handed back by the module beside this one, `spool/recover.rs`.
++//!
+ //! [`Spool::records`]: super::Spool::records
+ 
+ use std::path::PathBuf;
+ use std::time::Instant;
+ 
+ use crate::engine::wal::Policy;
++use crate::engine::wal::replay;
+ use crate::error::Error;
+ 
+ use super::{FILE, Spool, store};
+@@ -43,17 +48,32 @@ impl Spool {
+             .map_err(store)?
+             .sync_all()
+             .map_err(store)?;
+-        // Whatever a previous process left is taken as given: this spool's counters start where the
+-        // file it opened starts, and only its own writes move them.
+-        let len = std::fs::metadata(directory.join(FILE))
+-            .map_err(store)?
+-            .len();
++
++        // `lakelet/4.4-wal-recovery`: opening a store *is* recovering it. A process that died left
++        // its records in the page cache and they are all here; a machine that died left whatever its
++        // last flush covered, possibly with a record the power cut in half at the end of that. The
++        // second case is the one that needs a reader who refuses to guess, and the answer is the
++        // prefix whose seals verify.
++        let recovered = replay::recover(&directory)?;
++        // And then the store has to be *usable*, not merely read: the bytes a crash left behind are
++        // not records, and appending behind them would bury them in the middle of the log, where
++        // every later replay stops at the same byte for good. Cutting the file to the proved prefix
++        // is how recovery leaves a store that can take the next append — refusing to start would be
++        // the other way, and a store that refuses to start after a crash has lost the data *and* the
++        // service.
++        if recovered.discarded() != 0 {
++            replay::truncate(&directory, recovered.bytes())?;
++        }
++        // What a previous process left, as far as this one can prove it: the counters start at the
++        // recovered end of the log, and only this spool's own writes move them from there.
++        let len = recovered.bytes();
+         Ok(Self {
+             directory,
+             policy,
+             len,
+             durable: len,
+             last_sync: Instant::now(),
++            recovered,
+         })
+     }
+ 
+@@ -81,10 +101,11 @@ impl Spool {
+     /// How many bytes are known to be on the device.
+     ///
+     /// A prefix of what was written: everything below it has been through a flush the device said it
+-    /// had, and everything above it may not survive the *machine* stopping. It starts at the size
+-    /// the file had when this spool opened it — bytes a previous process left are taken as given,
+-    /// and whether that process's tail survived is `lakelet/4.4-wal-recovery`'s question — and it
+-    /// moves in one step per successful [`Spool::sync`], never before one.
++    /// had, and everything above it may not survive the *machine* stopping. It starts at the
++    /// **recovered** end of the log — the bytes a previous process left that replay could prove
++    /// (`lakelet/4.4-wal-recovery`); a tail no append finished is not this spool's to keep, and
++    /// leaving it in place would put every later append behind bytes nobody can read — and it moves
++    /// in one step per successful [`Spool::sync`], never before one.
+     #[must_use]
+     pub fn durable_offset(&self) -> u64 {
+         self.durable
+diff --git a/src/engine/spool/recover.rs b/src/engine/spool/recover.rs
+index 37b61a8..140d0df 100644
+--- a/src/engine/spool/recover.rs
++++ b/src/engine/spool/recover.rs
+@@ -10,8 +10,10 @@
+ //! the middle of that where "what the log proves" can change under it. So `Spool::with_policy`
+ //! replays the log before it counts a single byte, and this is where the result is handed back.
+ //!
+-//! The signature below is this step's contract — the spec calls it, and the daemon reads it to say
+-//! what a restart cost — and its body is the step's work.
++//! What a caller does with a non-zero [`Recovered::discarded`] is the caller's decision, and this
++//! build's is written down in `bin/lakeletd.rs`: the daemon logs it, because that number is the only
++//! trace a crash leaves. The store has already made itself usable by the time it is handed back —
++//! refusing to open would lose the data *and* the service.
+ 
+ use crate::engine::wal::replay::Recovered;
+ 
+@@ -28,6 +30,6 @@ impl Spool {
+     /// is the caller's business to say so out loud.
+     #[must_use]
+     pub fn recovered(&self) -> &Recovered {
+-        todo!("step lakelet/4.4-wal-recovery")
++        &self.recovered
+     }
+ }
+diff --git a/src/engine/wal/checksum.rs b/src/engine/wal/checksum.rs
+index 21d5694..aa59dc0 100644
+--- a/src/engine/wal/checksum.rs
++++ b/src/engine/wal/checksum.rs
+@@ -1,23 +1,24 @@
+ //! What one record's checksum covers.
+ //!
+ //! Step `lakelet/4.4-wal-recovery`. A checksum is only as good as the bytes it is computed over, and
+-//! this module is where that boundary is decided once for the log.
++//! this module is where that boundary is written down once: a record's **seal** covers its length
++//! *and* its payload.
+ //!
+-//! The decision the step owes, written here: **which bytes must a record's seal cover, for a reader
+-//! that has only the bytes in front of it to be able to say "this is a whole record of mine"?**
++//! The wire format next door (`crate::protocol::frame`) seals the payload alone, and the difference
++//! is what a reader of each one has to decide. A stream has a reader that is handed the length before
++//! it needs the payload, and bytes that are not a frame end the connection: how the sender resumes
++//! is the sender's problem. A **file** has a reader that must decide where a record *ends* from the
++//! bytes in front of it, on a file a crash may have cut in the middle of one — so the length is part
++//! of what has to be proved. If the seal ignored it, a record whose length field was damaged could
++//! still "verify" whenever the bytes that length then pointed at happened to carry the seal of
++//! something else, and recovery would hand back a prefix of somebody else's bytes as a record.
++//! Covering the length costs nothing — it is already in the record — and makes that impossible.
+ //!
+-//! The wire format next door (`crate::protocol::frame`) seals the payload alone, and it can: a
+-//! stream's reader is handed a length before it needs the payload, and bytes that are not a frame end
+-//! the connection, so resynchronising is the sender's problem rather than the reader's. A **file**
+-//! has no such luxury. Its reader must find where a record ends from the bytes in front of it, on a
+-//! file a crash may have cut in the middle of one — so it is worth writing down here which bytes you
+-//! sealed, and what leaving any one of them out would cost. `docs/crash-points.md` point 3 is the
+-//! failure this module is the answer to.
+-//!
+-//! `crc32fast` is the checksum this project already uses (the reason is one line of `Cargo.toml`,
+-//! where `lakelet/4.1-ingest-protocol` took the dependency): two checksums in one crate should be one
+-//! function, and it is the right one for a torn write, a bit that flipped and a device that wrote
+-//! something else.
++//! The function is the CRC-32 the ingest path already uses (`crc32fast`): one checksum for the two
++//! formats in this project, and the right one for the job here, which is to catch a write that was
++//! cut short, a bit that flipped and a device that wrote something else. It does **not** resist
++//! somebody choosing the bytes: a log that has to stay honest against a forger needs a MAC, and that
++//! is a decision about an adversary this store does not have.
+ 
+ /// The bytes one seal takes in a record: four, because it is a `u32` little endian.
+ ///
+@@ -28,13 +29,14 @@ pub const LEN: usize = 4;
+ 
+ /// The seal a record with this `length` and `payload` carries.
+ ///
+-/// `length` is the payload's length as the record states it, in bytes. Which of the two, and which
+-/// parts of them, end up inside the seal is the decision above — and the spec holds you to it:
+-/// change either one and the seal of a record changes with it.
++/// `length` is the payload's length as the record states it, in bytes. Both it and every byte of the
++/// payload are covered — every byte that decides how far this record reaches.
+ #[must_use]
+ pub fn seal(length: u32, payload: &[u8]) -> u32 {
+-    let _ = (length, payload);
+-    todo!("step lakelet/4.4-wal-recovery")
++    let mut hasher = crc32fast::Hasher::new();
++    hasher.update(&length.to_le_bytes());
++    hasher.update(payload);
++    hasher.finalize()
+ }
+ 
+ /// `true` when `expected` is the seal these bytes carry.
+@@ -43,6 +45,5 @@ pub fn seal(length: u32, payload: &[u8]) -> u32 {
+ /// "whether a record's checksum verifies" cannot answer differently.
+ #[must_use]
+ pub fn verifies(length: u32, payload: &[u8], expected: u32) -> bool {
+-    let _ = (length, payload, expected);
+-    todo!("step lakelet/4.4-wal-recovery")
++    seal(length, payload) == expected
+ }
+diff --git a/src/engine/wal/replay.rs b/src/engine/wal/replay.rs
+index 842235f..15ff4f3 100644
+--- a/src/engine/wal/replay.rs
++++ b/src/engine/wal/replay.rs
+@@ -3,25 +3,27 @@
+ //! Step `lakelet/4.4-wal-recovery`. [`segment`] reads the bytes; this module is the answer the store
+ //! and the operator need from them — *which* records survived and how much of the file was not one.
+ //!
+-//! One rule decides the whole walk, and it is the step's central sentence: **replay stops at the
+-//! first thing it cannot prove.** Write the argument for it down here, because it is the design
+-//! decision of the step and the one a reviewer will push on. The three costs, in the order they cost
+-//! somebody, are worth naming in your own words:
++//! One rule decides the whole walk, and it is the difference between a log and a guess: **replay
++//! stops at the first thing it cannot prove.** A record whose seal does not verify ends the replay.
++//! Recovery does not skip it and read on, does not hand it back and let a caller decide, and does not
++//! repair the bytes. Three reasons, in the order they cost somebody:
+ //!
+-//! * a log is a **prefix** by construction, so "the record after a bad one" is an offset the bad
+-//!   record's length field described — it is not a place in the file, it is a conclusion drawn from
+-//!   bytes that have just been shown to be untrustworthy;
+-//! * a **gap is worse than a short log**: a store that returns records 1–10, drops 11 and returns 12
+-//!   has told every reader the series was continuous, and a wrong answer nobody can see is worse than
+-//!   a smaller answer the counts report;
+-//! * what follows a tear is **not data**, it is the middle of a record: the rest of that record's
+-//!   payload, as much as the device committed.
++//! * **a log is a prefix by construction.** Every append lands after the one before it, so the record
++//!   after a bad one sits at an offset the bad record's length described. Skipping ahead is trusting
++//!   the length field of a record that has just been shown to be untrustworthy; "the next record" is
++//!   not a place in the file, it is a conclusion drawn from bytes we could not verify;
++//! * **a gap is worse than a short log.** A store that returns records 1–10, drops 11 and returns 12
++//!   has told every reader that the series was continuous. Losing a tail is a smaller answer that the
++//!   counts report; inventing continuity is a wrong answer nobody can see;
++//! * **what follows a tear is not data, it is the middle of one.** The bytes after a cut record are
++//!   the rest of *that* record's payload, as much as the device committed. Anything "found" there is
++//!   a coincidence of a length field read at the wrong offset.
+ //!
+ //! So the answer has three parts — the records, the bytes that were proved, and the bytes that were
+ //! thrown away — and the store moves the log's end to the first of those numbers, so the next append
+-//! continues there instead of writing after bytes nobody can read ([`truncate`], called by
+-//! `Spool::with_policy`). That is what makes recovery something a store *does at open* rather than a
+-//! report it prints: a tail left in place would stop every later replay at the same byte.
++//! continues there instead of writing after bytes nobody can read. That is what makes recovery
++//! something a store *does at open* rather than a report it prints: a tail left in place would stop
++//! every later replay at the same byte.
+ //!
+ //! What recovery deliberately does **not** do: it does not call [`Spool::sync`], it does not flush,
+ //! and it does not repair a record. It reads what the device has. Putting bytes on the device is
+@@ -33,9 +35,10 @@
+ 
+ use std::path::Path;
+ 
++use crate::engine::spool::FILE;
+ use crate::error::Error;
+ 
+-use super::segment::Stop;
++use super::segment::{self, Stop};
+ 
+ /// What replaying a store's log proved.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -81,23 +84,36 @@ impl Recovered {
+ 
+ /// Replay the log of the store in `directory`.
+ ///
+-/// The file is the one `Spool` writes (`crate::engine::spool::FILE`), and a store that has never
+-/// accepted anything — no file, or an empty one — answers "no records, nothing discarded", because a
+-/// store this process has not written to yet is not a corrupt one. A file that is *not* this store's
+-/// log is the other answer: [`Error::Protocol`], never an empty store; [`segment::scan`] is where that
+-/// decision is made and its module docs are where the reason is.
++/// The file is the one [`Spool`] writes ([`FILE`]), and a store that has never accepted anything —
++/// no file, or an empty one — answers "no records, nothing discarded", because a store this process
++/// has not written to yet is not a corrupt one. A file that is *not* this store's log is the other
++/// answer: [`Error::Protocol`], never an empty store (why: [`segment::scan`]).
+ ///
+-/// Read-only: nothing here changes the file. [`truncate`] is the other half, and keeping the two apart
+-/// is what lets a repair tool replay a copy of a store, or ask what a capture of bytes would become,
+-/// without touching anything.
++/// Read-only: nothing here changes the file. [`truncate`] is the other half, and keeping the two
++/// apart is what lets a repair tool replay a copy of a store, or ask what a capture of bytes would
++/// become, without touching anything.
+ ///
+ /// # Errors
+ ///
+ /// [`Error::Store`] when the file cannot be read, and [`Error::Protocol`] when what is in it is not
+ /// this log.
+ pub fn recover(directory: &Path) -> Result<Recovered, Error> {
+-    let _ = directory;
+-    todo!("step lakelet/4.4-wal-recovery")
++    let bytes = match std::fs::read(directory.join(FILE)) {
++        Ok(bytes) => bytes,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
++        Err(error) => {
++            return Err(Error::Store {
++                source: Box::new(error),
++            });
++        }
++    };
++    let scanned = segment::scan(&bytes)?;
++    Ok(Recovered {
++        records: scanned.records().to_vec(),
++        bytes: scanned.verified() as u64,
++        discarded: bytes.len().saturating_sub(scanned.verified()) as u64,
++        stop: scanned.stop(),
++    })
+ }
+ 
+ /// Cut the log of the store in `directory` back to `bytes`, so the next append continues there.
+@@ -108,6 +124,11 @@ pub fn recover(directory: &Path) -> Result<Recovered, Error> {
+ /// removed cannot be appended to either, because writing behind bytes nobody can read would hide them
+ /// in the middle of the log for good.
+ pub fn truncate(directory: &Path, bytes: u64) -> Result<(), Error> {
+-    let _ = (directory, bytes);
+-    todo!("step lakelet/4.4-wal-recovery")
++    std::fs::OpenOptions::new()
++        .write(true)
++        .open(directory.join(FILE))
++        .and_then(|file| file.set_len(bytes))
++        .map_err(|error| Error::Store {
++            source: Box::new(error),
++        })
+ }
+diff --git a/src/engine/wal/segment.rs b/src/engine/wal/segment.rs
+index 8616da2..13431a7 100644
+--- a/src/engine/wal/segment.rs
++++ b/src/engine/wal/segment.rs
+@@ -15,28 +15,26 @@
+ //!  4+n..8+n    u32, little endian: the record's seal (`checksum::seal(length, payload)`)
+ //! ```
+ //!
+-//! The layout is the course's, because more than this step reads it: the spec reads it through
+-//! [`HEADER`], [`LENGTH`] and [`OVERHEAD`], and the step's harness writes logs through
+-//! [`super::super::Spool`] and cuts them. What is *yours* is every body below, and the reasoning for
+-//! the three choices the layout makes. Write that reasoning down here, next to the bytes it is
+-//! about:
++//! Three choices in that layout are worth their reasons, because each one is a thing a format can
++//! get wrong:
+ //!
+-//! * **the file declares itself first.** Four bytes of magic and a version byte are what make "this
+-//!   is not this store's log" a decision instead of a guess. Say what the alternative costs: without
+-//!   them, `hi!` and a log whose first write was cut after two bytes are the same bytes, and
+-//!   recovery has to choose between calling one of them corrupt and calling the other empty;
+-//! * **each record declares itself.** Say why the length and the seal travel *with* the payload,
+-//!   rather than in an index, a footer or a side file — and what a store loses when the answer to
+-//!   "where does this record end?" is anything but the bytes in front of the reader;
+-//! * **the seal covers the length.** `checksum` is where the seal is computed; say here what a
+-//!   reader would do with a length that was not covered.
++//! * **the file declares itself.** Four bytes of magic and a version are what make "this is not this
++//!   store's log" a *decision* instead of a guess: a file that does not start with them is refused
++//!   with a typed error, and a file that does is replayed — so a directory holding somebody else's
++//!   file cannot be read as a store with no records in it. Without the header those two are the same
++//!   bytes: `hi!` and a log whose first write was cut after two bytes;
++//! * **each record declares itself.** The length and the seal travel *with* the record, so a reader
++//!   needs no index, no directory and no side file to know where a record ends — which is what makes
++//!   a store recoverable from the bytes actually on the device and nothing else;
++//! * **the seal covers the length.** Why, and what it would cost to leave it out, is
++//!   [`checksum`]'s subject; this module is where the bytes are laid out that way.
+ //!
+ //! The header is five bytes and is written with the log's first record, so a store that has accepted
+-//! nothing is an empty file — which is also the one file that is not a log *yet* and not a foreign
+-//! file either. [`scan`] is where those two are told apart, and it is total: the bytes of any file
+-//! are whole records, or a record the write was cut short inside, or something whose seal does not
+-//! match. Three answers, and no fourth for "the reader panicked" or "the reader guessed" — a capture
+-//! of the bytes a crash left behind is exactly the input this module exists for.
++//! nothing is an **empty file** — which is also the one file that is not a log *yet* and is not
++//! foreign either. The walk below is total: the bytes of any file are whole records, or a record the
++//! write was cut short inside, or something whose seal does not match. Three answers, and no fourth
++//! for "the reader panicked" or "the reader guessed": a capture of the bytes a crash left behind is
++//! exactly the input this module exists for.
+ 
+ use crate::error::Error;
+ 
+@@ -83,10 +81,14 @@ impl Stop {
+     /// operator compare two words for one fact.
+     #[must_use]
+     pub fn name(&self) -> &'static str {
+-        let _ = self;
+-        todo!("step lakelet/4.4-wal-recovery")
++        match self {
++            Stop::End => "end",
++            Stop::Torn => "torn",
++            Stop::Corrupt => "corrupt",
++        }
+     }
+ }
++
+ /// What a walk over a log's bytes proved.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Scanned {
+@@ -106,9 +108,6 @@ impl Scanned {
+     }
+ 
+     /// How many bytes of the log are proved: its header plus every whole record.
+-    ///
+-    /// The offset the store continues at, and the number `Spool::len` starts from: everything below
+-    /// it is a record whose seal verified, and everything above it is bytes no walk could prove.
+     #[must_use]
+     pub fn verified(&self) -> usize {
+         self.verified
+@@ -128,8 +127,9 @@ impl Scanned {
+ /// never meet in this crate.
+ #[must_use]
+ pub fn encode(payload: &[u8]) -> Vec<u8> {
+-    let _ = payload;
+-    todo!("step lakelet/4.4-wal-recovery")
++    let mut bytes = Vec::with_capacity(OVERHEAD + payload.len());
++    push_record(&mut bytes, payload);
++    bytes
+ }
+ 
+ /// The bytes a log writes for its **first** record: the header that declares the log, then the
+@@ -140,26 +140,141 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
+ /// turns that file into a log.
+ #[must_use]
+ pub fn introduce(payload: &[u8]) -> Vec<u8> {
+-    let _ = payload;
+-    todo!("step lakelet/4.4-wal-recovery")
++    let mut bytes = Vec::with_capacity(HEADER + OVERHEAD + payload.len());
++    bytes.extend_from_slice(&HEADER_BYTES);
++    push_record(&mut bytes, payload);
++    bytes
+ }
+ 
+ /// Read `bytes` as a log: the records whose seal verifies, and where the walk stopped.
+ ///
+-/// Never panics and never reserves the length a record states — ask the *file* what it holds, before
+-/// doing arithmetic on a number that a damaged byte can make arbitrary. A length the bytes cannot
+-/// satisfy ends the walk as [`Stop::Torn`], like any other short tail.
++/// Never panics and never reserves the length a record states: a length the bytes cannot satisfy ends
++/// the walk as [`Stop::Torn`], like any other short tail. The question is asked of the file's own
++/// size *before* any arithmetic on the number the field claims, so a damaged field cannot wrap an
++/// address — it can only fail that comparison.
+ ///
+ /// An empty file is `Ok` with no records: a store that has accepted nothing is not a foreign file.
+-/// Anything else that is not this log is refused — the module docs say why that is a decision.
++/// Anything else that is not this log is refused — see the module docs for why that is a decision and
++/// not a guess.
+ ///
+ /// # Errors
+ ///
+ /// [`Error::Protocol`] when `bytes` is not this store's log at all: it does not start with
+-/// [`HEADER_BYTES`], or it announces a format version this build cannot replay. Name what was found
+-/// in the sentence: an operator holding a directory they did not expect needs to know which file is
+-/// in it.
++/// [`HEADER_BYTES`], or it announces a format version this build cannot replay.
+ pub fn scan(bytes: &[u8]) -> Result<Scanned, Error> {
+-    let _ = bytes;
+-    todo!("step lakelet/4.4-wal-recovery")
++    if bytes.is_empty() {
++        return Ok(stopped(Vec::new(), 0, Stop::End));
++    }
++    let Some(header) = bytes.first_chunk::<HEADER>() else {
++        // Shorter than a header: the bytes that are here have to be the beginning of one, or this is
++        // not a log. A crash during the very first append leaves exactly the first case.
++        if !HEADER_BYTES.starts_with(bytes) {
++            return Err(not_this_log(bytes));
++        }
++        return Ok(stopped(Vec::new(), 0, Stop::Torn));
++    };
++    if header != &HEADER_BYTES {
++        return Err(not_this_log(bytes));
++    }
++
++    let mut records: Vec<Vec<u8>> = Vec::new();
++    let mut cursor = HEADER;
++    let mut stop = Stop::End;
++    while cursor < bytes.len() {
++        // Every read below answers `None` and none of them can panic. A record states its own length,
++        // and what the file holds is what decides whether that record is there — so the length is
++        // used through `checked_add`: on a target where a `u32` can be wider than an address, a
++        // damaged field has to fail a check rather than wrap one.
++        let Some(stated) = u32_at(bytes, cursor) else {
++            // Fewer than four bytes left: the length field itself was cut.
++            stop = Stop::Torn;
++            break;
++        };
++        let Some(start) = cursor.checked_add(LENGTH) else {
++            stop = Stop::Torn;
++            break;
++        };
++        let Some(end) = start.checked_add(stated as usize) else {
++            stop = Stop::Torn;
++            break;
++        };
++        let Some(payload) = bytes.get(start..end) else {
++            // The payload is short: the write that left this file was cut inside it.
++            stop = Stop::Torn;
++            break;
++        };
++        let Some(expected) = u32_at(bytes, end) else {
++            // The payload is here and the seal is not: the same cut, four bytes further on.
++            stop = Stop::Torn;
++            break;
++        };
++        if !checksum::verifies(stated, payload, expected) {
++            stop = Stop::Corrupt;
++            break;
++        }
++        records.push(payload.to_vec());
++        // Past this record: the bytes that were read as its seal end it.
++        cursor = end + checksum::LEN;
++    }
++    Ok(stopped(records, cursor, stop))
++}
++
++/// Append one sealed record to `bytes`.
++fn push_record(bytes: &mut Vec<u8>, payload: &[u8]) {
++    let length = payload.len() as u32;
++    bytes.extend_from_slice(&length.to_le_bytes());
++    bytes.extend_from_slice(payload);
++    bytes.extend_from_slice(&checksum::seal(length, payload).to_le_bytes());
++}
++
++/// The `u32` these four bytes are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset + LENGTH)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// One walk's answer, built in one place so the ends of this module cannot disagree about the shape.
++fn stopped(records: Vec<Vec<u8>>, verified: usize, stop: Stop) -> Scanned {
++    Scanned {
++        records,
++        verified,
++        stop,
++    }
++}
++
++/// The file's first bytes as `4c 4b 4c 54`, for a message that shows what was found.
++fn shown(bytes: &[u8]) -> String {
++    bytes
++        .iter()
++        .take(HEADER)
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<Vec<String>>()
++        .join(" ")
++}
++
++/// The refusal for a file that is not this store's log.
++///
++/// The name of the error is the point: `Error::Protocol` says "these bytes are not what you think
++/// they are" and a caller can answer it by *looking at the directory*, where an empty store would be
++/// the same shape as a successful one and would silently drop whatever the directory really holds.
++///
++/// Two sentences live here because an operator holding a directory they did not expect needs to know
++/// which of the two this is: a file that was never a log, or a log of a version this build cannot
++/// replay. Both are the same refusal to a caller and a different afternoon to a person.
++fn not_this_log(found: &[u8]) -> Error {
++    let detail = match found.get(MAGIC.len()) {
++        Some(version) if found.starts_with(&MAGIC) => format!(
++            "the file says this log is format version {version} and this build writes version \
++             {VERSION} — a log it cannot replay is not a log it may guess at"
++        ),
++        _ => format!(
++            "the file starts with `{}` and a store's log starts with `{}` — this is not this store's \
++             log, and it is refused rather than read as a store with no records in it",
++            shown(found),
++            shown(&HEADER_BYTES)
++        ),
++    };
++    Error::Protocol { detail }
+ }

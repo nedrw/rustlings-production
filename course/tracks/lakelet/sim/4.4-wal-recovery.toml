@@ -1,0 +1,26 @@
+# The crash schedules `lakelet/4.4-wal-recovery` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_wal.rs`, which this
+# step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set, and every run
+# has to be green — a scenario that holds under one interleaving and breaks under another is exactly
+# the bug this gate is about.
+#
+# `seeds` is three schedules and the count is the judgement: `slow:sim@3` asks for at least three, and
+# the gate also demands that at least two of them produce *different* transcripts, so a harness that
+# ignored the seed would fail rather than pass three times. The schedules themselves are what makes
+# that interesting here: the seed decides when each writer's record reaches the store, and therefore
+# which records a flush covered when the store dies. A machine death that lands on a record boundary
+# and one that lands inside a record are two different recoveries, and the seeds are what walk both.
+# One of the harness's four deaths changes a byte of the write that was in flight instead of cutting
+# the file, which is what makes a replay that skips the record it cannot prove — and answers the
+# records behind it — fail *here* as well as in the spec, under every seed.
+#
+# `replay = 1` is the seed that is run *twice*: the two transcripts have to be byte-identical. That is
+# the property the step's harness is written for — every line it prints is a count or a simulated
+# duration, never a wall clock or an address — and a scenario that fails it is a flaky test wearing a
+# simulation's name. Seed `1` is also the default the harness uses when nothing sets `KILN_SIM_SEED`,
+# so a learner running the file by hand sees the schedule this gate replays.
+command = "cargo test -p lakelet --test sim_wal -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
