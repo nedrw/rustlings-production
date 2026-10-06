@@ -1,8 +1,8 @@
 diff --git a/docs/adr/0001-write-path.md b/docs/adr/0001-write-path.md
-index ec821f9..eb45e71 100644
+index ec821f9..dc9ad67 100644
 --- a/docs/adr/0001-write-path.md
 +++ b/docs/adr/0001-write-path.md
-@@ -1,33 +1,267 @@
+@@ -1,33 +1,280 @@
 -# 0001 — <the decision in one line, as a sentence somebody could disagree with>
 +# 0001 — An acknowledged record is on the device within 50 ms
  
@@ -179,12 +179,25 @@ index ec821f9..eb45e71 100644
 +microseconds), and flushing once per 20 records costs 5051 µs for the batch — of which 4.7 ms is the
 +flush and the rest is the twenty appends.
 +
-+The `fsync` line is the reason this record spends a paragraph on which call was measured. Rust's
-+`sync_all` and `sync_data` both take ~4.2 ms here, because on macOS both end in a call that waits for
-+the device (`F_FULLFSYNC`; Apple's manual is explicit that plain `fsync` is allowed to return with the
-+bytes still in the drive's cache). A raw `fsync(2)` returns in **52 µs** — eighty times faster, and it
-+is not durability. A store that measures `fsync` and calls the result "one device flush" measures the
-+wrong syscall, and then derives a number that is wrong in the direction that loses data.
++The `fsync` line is the reason this record spends a paragraph on which call was measured, and the
++two 4.2 ms lines above — `sync_all` at 4173 µs, `sync_data` at 4152 µs, half a percent apart — are
++not a coincidence to wave away: on this platform they are the same syscall. That is not folklore, and
++it is not inferred from the numbers agreeing — it is in the source of the toolchain this was measured
++with. With rustc 1.98.1, whose `rust-src` component is installed, the file below
++`$(rustc --print sysroot)` holds it:
++
++    library/std/src/sys/fs/unix.rs
++
++`File::fsync` there calls `os_fsync` and `File::datasync` calls `os_datasync`, and under
++`#[cfg(target_vendor = "apple")]` **both** of those are `libc::fcntl(fd, libc::F_FULLFSYNC)` (lines
++1413 and 1427 of that file, each with its own `os_*` at 1418 and 1432). `sync_data` promises to skip
++metadata that does not matter for reading the bytes back, and on Apple targets it cannot: the only
++`os_datasync` that calls `fdatasync` is behind the `#[cfg(any(target_os = "freebsd", "linux", …))]`
++beside it, and macOS is not in that list. Apple's manual is the other half of this: plain `fsync(2)`
++is allowed to return with the bytes still in the drive's cache, so a raw `fsync(2)` returns in
++**52 µs** — eighty times faster, and it is not durability. A store that measures `fsync` and calls the
++result "one device flush" measures the wrong syscall, and then derives a number that is wrong in the
++direction that loses data.
 +
 +### The derivation
 +
@@ -460,19 +473,10 @@ index 42d8ac0..502e0b4 100644
 +  machine was shut down", it is the *stop path's* business to flush before exiting, not this policy's:
 +  a stop that wants a closed window has to ask for one.
 diff --git a/src/engine/spool.rs b/src/engine/spool.rs
-index e37fbf3..8d19b3b 100644
+index 8b744c8..61db416 100644
 --- a/src/engine/spool.rs
 +++ b/src/engine/spool.rs
-@@ -4,7 +4,7 @@
- //! accepted frame, in the order the frames were accepted — and the steps after it harden exactly
- //! this file rather than inventing a second one:
- //!
--//! * `4.3` decides when it is flushed to the device (`WalPolicy`) and writes the decision down;
-+//! * `4.3` decides when it is flushed to the device ([`Policy`]) and writes the decision down;
- //! * `4.4` gives each record its own checksum, so a process killed mid-write leaves something the
- //!   next start can recognise as a torn tail instead of a plausible record;
- //! * `4.5` starts writing batches into it, and counts what that costs.
-@@ -12,10 +12,19 @@
+@@ -13,10 +13,23 @@
  //! The contract a spec leans on is small on purpose: [`Spool::append`] may only report success once
  //! the record is readable by [`Spool::records`], and [`Spool::records`] answers what was appended, in
  //! order, never what was appended and then lost to a bug in the reader.
@@ -483,6 +487,10 @@ index e37fbf3..8d19b3b 100644
 +//! device, and deliberately different under one that does not — a distinction the operating system
 +//! does not make and a recovery cannot survive without. The argument for the policy this build ships
 +//! is `docs/adr/0001-write-path.md`, and what each policy accepts losing is `docs/crash-points.md`.
++//!
++//! Those accessors are declared beside this file, in `spool/durable.rs`: this file owns the record
++//! format and the call that answers a client, and the module beside it owns what the bytes mean to
++//! the device.
  
  use std::io::Write;
  use std::path::{Path, PathBuf};
@@ -492,7 +500,7 @@ index e37fbf3..8d19b3b 100644
  use crate::error::Error;
  
  /// One `Error::Store` around an I/O failure.
-@@ -46,26 +55,67 @@ pub const FILE: &str = "ingest.log";
+@@ -47,26 +60,28 @@ pub const FILE: &str = "ingest.log";
  pub struct Spool {
      /// Directory this spool owns (`store.dir` in the configuration).
      directory: PathBuf,
@@ -519,110 +527,26 @@ index e37fbf3..8d19b3b 100644
 +    /// [`Error::Store`] when the directory cannot be created, the file cannot be created, or the
 +    /// store directory cannot be flushed after the file is created.
      pub fn open(directory: impl Into<PathBuf>) -> Result<Self, Error> {
-+        Self::with_policy(directory, Policy::DEFAULT)
-+    }
-+
-+    /// Open (or create) the store directory, with the policy that decides when an append waits.
-+    ///
-+    /// # Errors
-+    ///
-+    /// [`Error::Store`] when the directory cannot be created, the file cannot be created, or the
-+    /// store directory cannot be flushed after the file is created — a file whose *name* is not on
-+    /// the device is a file a machine death can take away entirely, with its acknowledged records
-+    /// inside it (`docs/crash-points.md`, point 4).
-+    pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
-         let directory = directory.into();
-         std::fs::create_dir_all(&directory).map_err(store)?;
+-        let directory = directory.into();
+-        std::fs::create_dir_all(&directory).map_err(store)?;
 -        let spool = Self { directory };
-         // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
-         // "no such file": those are different situations, and the reader should not have to guess.
-         std::fs::OpenOptions::new()
-             .create(true)
-             .append(true)
+-        // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
+-        // "no such file": those are different situations, and the reader should not have to guess.
+-        std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
 -            .open(spool.path())
-+            .open(directory.join(FILE))
-+            .map_err(store)?;
-+        // A file's data and the directory entry that names it are two different writes, and only the
-+        // second one makes the store *exist* after a crash. It costs one flush per store, here, at
-+        // open — which is why the write path never has to pay it again.
-+        std::fs::File::open(&directory)
-+            .map_err(store)?
-+            .sync_all()
-             .map_err(store)?;
+-            .map_err(store)?;
 -        Ok(spool)
-+        // Whatever a previous process left is taken as given: this spool's counters start where the
-+        // file it opened starts, and only its own writes move them.
-+        let len = std::fs::metadata(directory.join(FILE))
-+            .map_err(store)?
-+            .len();
-+        Ok(Self {
-+            directory,
-+            policy,
-+            len,
-+            durable: len,
-+            last_sync: Instant::now(),
-+        })
++        Self::with_policy(directory, Policy::DEFAULT)
      }
  
      /// The directory this spool writes to.
-@@ -80,11 +130,66 @@ impl Spool {
+@@ -81,11 +96,13 @@ impl Spool {
          self.directory.join(FILE)
      }
  
 -    /// Append one accepted payload, and answer only once it can be read back.
-+    /// The policy this spool obeys.
-+    #[must_use]
-+    pub fn policy(&self) -> Policy {
-+        self.policy
-+    }
-+
-+    /// How many bytes of records this spool has written.
-+    ///
-+    /// Everything counted here is readable by [`Spool::records`] right away; not all of it is on the
-+    /// device. See [`Spool::durable_offset`] for the part that is.
-+    #[must_use]
-+    pub fn len(&self) -> u64 {
-+        self.len
-+    }
-+
-+    /// `true` when this spool has written nothing yet.
-+    #[must_use]
-+    pub fn is_empty(&self) -> bool {
-+        self.len == 0
-+    }
-+
-+    /// How many bytes are known to be on the device.
-+    ///
-+    /// A prefix of what was written: everything below it has been through a flush the device said it
-+    /// had, and everything above it may not survive the *machine* stopping. It starts at the size the
-+    /// file had when this spool opened it — bytes a previous process left are taken as given, and
-+    /// whether that process's tail survived is `lakelet/4.4-wal-recovery`'s question — and it moves
-+    /// in one step per successful [`Spool::sync`], never before one.
-+    #[must_use]
-+    pub fn durable_offset(&self) -> u64 {
-+        self.durable
-+    }
-+
-+    /// Flush what this spool has written, and only then believe it.
-+    ///
-+    /// # Errors
-+    ///
-+    /// [`Error::Store`] when the file cannot be opened or the device refuses the flush. A flush that
-+    /// failed does not move [`Spool::durable_offset`]: the boundary has to name the last flush that
-+    /// *succeeded*, or the recovery built on it invents records that were never on the device.
-+    pub fn sync(&mut self) -> Result<(), Error> {
-+        let file = std::fs::OpenOptions::new()
-+            .write(true)
-+            .open(self.path())
-+            .map_err(store)?;
-+        // `sync_all` and not `fsync`: the decision record measured both on this machine, and only the
-+        // first one waits for the device.
-+        file.sync_all().map_err(store)?;
-+        self.durable = self.len;
-+        self.last_sync = Instant::now();
-+        Ok(())
-+    }
-+
 +    /// Append one accepted payload, and answer only once it can be read back and the policy says so.
      ///
      /// # Errors
@@ -634,7 +558,7 @@ index e37fbf3..8d19b3b 100644
      pub fn append(&mut self, payload: &[u8]) -> Result<(), Error> {
          // One open per append, which is honest about what an append *costs*: `lakelet/4.5-batch-writes`
          // is the step that makes this a batch, and the counters there are what say whether it worked.
-@@ -96,9 +201,21 @@ impl Spool {
+@@ -97,9 +114,21 @@ impl Spool {
          file.write_all(&(payload.len() as u32).to_le_bytes())
              .map_err(store)?;
          file.write_all(payload).map_err(store)?;
@@ -659,6 +583,116 @@ index e37fbf3..8d19b3b 100644
          Ok(())
      }
  
+diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
+index 8aee399..41c5036 100644
+--- a/src/engine/spool/durable.rs
++++ b/src/engine/spool/durable.rs
+@@ -7,17 +7,15 @@
+ //! build ships is `docs/adr/0001-write-path.md`, and what each policy accepts losing is
+ //! `docs/crash-points.md`.
+ //!
+-//! The signatures below are this step's contract — the spec calls them, so they are declared here
+-//! and not left to be invented. Every body is the step's work.
+-//!
+ //! [`Spool::records`]: super::Spool::records
+ 
+ use std::path::PathBuf;
++use std::time::Instant;
+ 
+ use crate::engine::wal::Policy;
+ use crate::error::Error;
+ 
+-use super::Spool;
++use super::{FILE, Spool, store};
+ 
+ impl Spool {
+     /// Open (or create) the store directory, with the policy that decides when an append waits.
+@@ -29,14 +27,40 @@ impl Spool {
+     /// the device is a file a machine death can take away entirely, with its acknowledged records
+     /// inside it (`docs/crash-points.md`, point 4).
+     pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
+-        let _ = (directory, policy);
+-        todo!("step lakelet/4.3-write-path-adr")
++        let directory = directory.into();
++        std::fs::create_dir_all(&directory).map_err(store)?;
++        // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
++        // "no such file": those are different situations, and the reader should not have to guess.
++        std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(directory.join(FILE))
++            .map_err(store)?;
++        // A file's data and the directory entry that names it are two different writes, and only the
++        // second one makes the store *exist* after a crash. It costs one flush per store, here, at
++        // open — which is why the write path never has to pay it again.
++        std::fs::File::open(&directory)
++            .map_err(store)?
++            .sync_all()
++            .map_err(store)?;
++        // Whatever a previous process left is taken as given: this spool's counters start where the
++        // file it opened starts, and only its own writes move them.
++        let len = std::fs::metadata(directory.join(FILE))
++            .map_err(store)?
++            .len();
++        Ok(Self {
++            directory,
++            policy,
++            len,
++            durable: len,
++            last_sync: Instant::now(),
++        })
+     }
+ 
+     /// The policy this spool obeys.
+     #[must_use]
+     pub fn policy(&self) -> Policy {
+-        todo!("step lakelet/4.3-write-path-adr")
++        self.policy
+     }
+ 
+     /// How many bytes of records this spool has written.
+@@ -45,13 +69,13 @@ impl Spool {
+     /// device. See [`Spool::durable_offset`] for the part that is.
+     #[must_use]
+     pub fn len(&self) -> u64 {
+-        todo!("step lakelet/4.3-write-path-adr")
++        self.len
+     }
+ 
+     /// `true` when this spool has written nothing yet.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("step lakelet/4.3-write-path-adr")
++        self.len == 0
+     }
+ 
+     /// How many bytes are known to be on the device.
+@@ -63,7 +87,7 @@ impl Spool {
+     /// moves in one step per successful [`Spool::sync`], never before one.
+     #[must_use]
+     pub fn durable_offset(&self) -> u64 {
+-        todo!("step lakelet/4.3-write-path-adr")
++        self.durable
+     }
+ 
+     /// Flush what this spool has written, and only then believe it.
+@@ -74,6 +98,15 @@ impl Spool {
+     /// failed does not move [`Spool::durable_offset`]: the boundary has to name the last flush that
+     /// *succeeded*, or the recovery built on it invents records that were never on the device.
+     pub fn sync(&mut self) -> Result<(), Error> {
+-        todo!("step lakelet/4.3-write-path-adr")
++        let file = std::fs::OpenOptions::new()
++            .write(true)
++            .open(self.path())
++            .map_err(store)?;
++        // `sync_all` and not `fsync`: the decision record measured both on this machine, and only the
++        // first one waits for the device.
++        file.sync_all().map_err(store)?;
++        self.durable = self.len;
++        self.last_sync = Instant::now();
++        Ok(())
+     }
+ }
 diff --git a/src/engine/wal/policy.rs b/src/engine/wal/policy.rs
 index cbc8ccd..1e86ef5 100644
 --- a/src/engine/wal/policy.rs

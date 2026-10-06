@@ -109,6 +109,105 @@ index c81a6f0..3d0aeea 100644
  // kiln:scaffold:end
  
  /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index 3759ea4..8b744c8 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -144,4 +144,9 @@ impl Spool {
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.3-write-path-adr`: the durability half of this write path — the policy it obeys,
++// the boundary that says what is already on the device, and the call that moves it. The
++// signatures are declared there so this step's spec can call them; every body is this step's
++// work.
++mod durable;
+ // kiln:scaffold:end
+diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
+new file mode 100644
+index 0000000..8aee399
+--- /dev/null
++++ b/src/engine/spool/durable.rs
+@@ -0,0 +1,79 @@
++//! The durability half of the write path: what the bytes [`Spool`] wrote mean to the *device*.
++//!
++//! Step `lakelet/4.3-write-path-adr`. [`Spool::append`] answers a client once the record is
++//! readable by [`Spool::records`]; whether it has also waited for the device is the policy this
++//! module holds, and the boundary between "written" and "durable" is the prefix
++//! `lakelet/4.4-wal-recovery` replays to. The value is [`Policy`], the argument for the one this
++//! build ships is `docs/adr/0001-write-path.md`, and what each policy accepts losing is
++//! `docs/crash-points.md`.
++//!
++//! The signatures below are this step's contract — the spec calls them, so they are declared here
++//! and not left to be invented. Every body is the step's work.
++//!
++//! [`Spool::records`]: super::Spool::records
++
++use std::path::PathBuf;
++
++use crate::engine::wal::Policy;
++use crate::error::Error;
++
++use super::Spool;
++
++impl Spool {
++    /// Open (or create) the store directory, with the policy that decides when an append waits.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the directory cannot be created, the file cannot be created, or the
++    /// store directory cannot be flushed after the file is created — a file whose *name* is not on
++    /// the device is a file a machine death can take away entirely, with its acknowledged records
++    /// inside it (`docs/crash-points.md`, point 4).
++    pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
++        let _ = (directory, policy);
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// The policy this spool obeys.
++    #[must_use]
++    pub fn policy(&self) -> Policy {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// How many bytes of records this spool has written.
++    ///
++    /// Everything counted here is readable by [`Spool::records`] right away; not all of it is on the
++    /// device. See [`Spool::durable_offset`] for the part that is.
++    #[must_use]
++    pub fn len(&self) -> u64 {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// `true` when this spool has written nothing yet.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// How many bytes are known to be on the device.
++    ///
++    /// A prefix of what was written: everything below it has been through a flush the device said it
++    /// had, and everything above it may not survive the *machine* stopping. It starts at the size
++    /// the file had when this spool opened it — bytes a previous process left are taken as given,
++    /// and whether that process's tail survived is `lakelet/4.4-wal-recovery`'s question — and it
++    /// moves in one step per successful [`Spool::sync`], never before one.
++    #[must_use]
++    pub fn durable_offset(&self) -> u64 {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// Flush what this spool has written, and only then believe it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the file cannot be opened or the device refuses the flush. A flush that
++    /// failed does not move [`Spool::durable_offset`]: the boundary has to name the last flush that
++    /// *succeeded*, or the recovery built on it invents records that were never on the device.
++    pub fn sync(&mut self) -> Result<(), Error> {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++}
 diff --git a/src/engine/wal/mod.rs b/src/engine/wal/mod.rs
 new file mode 100644
 index 0000000..7363bbb

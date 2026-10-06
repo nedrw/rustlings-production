@@ -1,10 +1,11 @@
 //! The write path as it is before there is a log: an append-only file of accepted payloads.
 //!
 //! Step `lakelet/4.1-ingest-protocol` gives this file its shape — one length-prefixed record per
-//! accepted frame, in the order the frames were accepted — and the steps after it harden exactly
-//! this file rather than inventing a second one:
+//! accepted frame, in the order the frames were accepted — and the steps after it harden this write
+//! path rather than inventing a second one:
 //!
-//! * `4.3` decides when it is flushed to the device (`WalPolicy`) and writes the decision down;
+//! * `4.3` decides when it is flushed to the device (`Policy`) and writes the decision down — the
+//!   code that obeys it is the module beside this one, `spool/durable.rs`;
 //! * `4.4` gives each record its own checksum, so a process killed mid-write leaves something the
 //!   next start can recognise as a torn tail instead of a plausible record;
 //! * `4.5` starts writing batches into it, and counts what that costs.
@@ -71,3 +72,9 @@ impl Spool {
         todo!("step lakelet/4.1-ingest-protocol")
     }
 }
+
+// The modules a later step adds are declared inside this block: a scaffold may only write inside a
+// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+// (docs/authoring.md §5).
+// kiln:scaffold:begin
+// kiln:scaffold:end
