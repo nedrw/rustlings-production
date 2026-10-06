@@ -5,7 +5,7 @@
 //! a harness (`tests/budget.rs`) that prints counts rather than times — statements per batch, cells
 //! scanned, the ratio between two sizes — and the course keeps the number each count must stay near,
 //! in `course/tracks/<track>/budget/<step-id>.toml` (handoff M2 §1). The gate runs the command that
-//! file names, reads the `jobq-budget <name>=<value>` lines it prints, and compares:
+//! file names, reads the `<track>-budget <name>=<value>` lines it prints, and compares:
 //!
 //! * every metric has to stay within ±P% of its baseline, so a count that doubles is a failure while
 //!   a count that wobbles by a few percent is not;
@@ -17,20 +17,20 @@
 //!
 //! Nothing here measures wall-clock time. A count is the same number on a busy machine as on an idle
 //! one, which is the difference between a gate a learner trusts and a gate they learn to re-run.
+//!
+//! The line format, the prefix and the course-side file are shared with `soak`, `fuzz` and `sim`
+//! ([`crate::gates::harness`]) — including the reason the prefix carries the track id: T4's harnesses
+//! print `lakelet-budget`, and the first version of this gate would have read `jobq-budget` over them.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::error::{KilnError, Result};
+use crate::error::Result;
+use crate::gates::harness::{self, Bounds, Measured, number};
 use crate::gates::runner::{GateContext, output_detail};
-use crate::gates::sources;
 use crate::gates::{GateOutcome, GateSpec};
 use crate::process;
-
-/// The prefix every harness line starts with.
-pub const PREFIX: &str = "jobq-budget";
 
 /// The course-side baseline of one step.
 #[derive(Debug, Deserialize)]
@@ -39,16 +39,7 @@ struct Baseline {
     /// Command that prints the counts, run in the learner's project.
     command: String,
     /// Baseline value per metric name.
-    metric: BTreeMap<String, f64>,
-}
-
-/// One measurement out of a harness run.
-#[derive(Debug, Clone, PartialEq)]
-struct Measured {
-    /// Metric name, as the harness spells it.
-    name: String,
-    /// Value the harness reported.
-    value: f64,
+    metric: Bounds,
 }
 
 /// Judge the step's counts against the course baseline.
@@ -58,42 +49,24 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         return Ok(GateOutcome::blocked(ctx.missing_project()));
     };
 
-    let baseline_path = sources::course_file(
-        &ctx.track.dir(ctx.course.root()),
-        ctx.step,
-        "budget",
-        "toml",
-    );
-    let text = match std::fs::read_to_string(&baseline_path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GateOutcome::blocked(format!(
-                "{} has no bench baseline for {}, so there is nothing to compare against — this is \
-                 course content that is not written yet, not a failure of yours",
-                ctx.step.qualified_id(),
-                baseline_path.display()
-            )));
-        }
-        Err(source) => {
-            return Err(KilnError::Read {
-                path: baseline_path,
-                source,
-            });
-        }
+    let Some((baseline_path, baseline)) = harness::parameters::<Baseline>(ctx, "budget")? else {
+        return Ok(GateOutcome::blocked(format!(
+            "{} has no bench baseline for {}, so there is nothing to compare against — this is \
+             course content that is not written yet, not a failure of yours",
+            ctx.step.qualified_id(),
+            harness::parameter_path(ctx, "budget").display()
+        )));
     };
-    let baseline: Baseline = toml::from_str(&text).map_err(|source| KilnError::Metadata {
-        path: baseline_path.clone(),
-        source,
-    })?;
 
+    let prefix = harness::prefix(ctx, "budget");
     let ran = process::run_line(&baseline.command, project, ctx.timeout)?;
-    let measured = match measurements(&ran.stdout) {
+    let measured = match harness::measurements(&ran.stdout, &prefix) {
         Ok(measured) => measured,
         Err(detail) => return Ok(GateOutcome::blocked(detail)),
     };
     if measured.is_empty() {
         return Ok(GateOutcome::blocked(format!(
-            "`{}` printed no `{PREFIX} <name>=<value>` line, so nothing could be compared — the \
+            "`{}` printed no `{prefix} <name>=<value>` line, so nothing could be compared — the \
              harness the course scaffolds for this step (`tests/budget.rs`) is what prints them:\n    {}",
             baseline.command,
             output_detail(&ran)
@@ -108,45 +81,10 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     ))
 }
 
-/// The measurements in a harness's stdout, or the reason none could be read.
-///
-/// A malformed line is reported rather than skipped: a harness that prints `jobq-budget scan=abc` is
-/// broken in a way the learner has to see, and pretending it printed nothing would hide it.
-fn measurements(stdout: &str) -> std::result::Result<Vec<Measured>, String> {
-    let mut found: Vec<Measured> = Vec::new();
-    for line in stdout.lines() {
-        let Some(rest) = line.trim().strip_prefix(PREFIX) else {
-            continue;
-        };
-        let Some((name, value)) = rest.trim().split_once('=') else {
-            return Err(format!(
-                "`{}` is not a `{PREFIX} <name>=<value>` line — the harness prints one metric per \
-                 line, and this gate cannot guess what it meant",
-                line.trim()
-            ));
-        };
-        let value = value.trim();
-        let Ok(parsed) = value.parse::<f64>() else {
-            return Err(format!(
-                "the harness reported `{name}=`, and `{value}` is not a number — every `{PREFIX}` \
-                 line carries a count, not prose"
-            ));
-        };
-        // A repeated name is the harness's last word on the metric, which is what a reader of its
-        // output would take it to be.
-        found.retain(|measurement| measurement.name != name);
-        found.push(Measured {
-            name: name.trim().to_owned(),
-            value: parsed,
-        });
-    }
-    Ok(found)
-}
-
 /// Compare every baseline metric with what the harness measured.
 fn compare(
     percent: f64,
-    baseline: &BTreeMap<String, f64>,
+    baseline: &Bounds,
     measured: &[Measured],
     baseline_path: &Path,
 ) -> GateOutcome {
@@ -223,23 +161,14 @@ fn compare(
     ))
 }
 
-/// A number as a report writes it: `12`, not `12.0`.
-fn number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gates::Outcome;
 
     /// A baseline of two counts and one upper bound, as the course writes it.
-    fn baseline() -> BTreeMap<String, f64> {
-        BTreeMap::from([
+    fn baseline() -> Bounds {
+        Bounds::from([
             ("claim_statements".to_owned(), 12.0),
             ("scan_cells".to_owned(), 340.0),
             ("scale_ratio_max".to_owned(), 2.2),
@@ -247,7 +176,7 @@ mod tests {
     }
 
     fn result(stdout: &str) -> GateOutcome {
-        let measured = measurements(stdout).expect("the fixture harness output parses");
+        let measured = harness::measurements(stdout, "jobq-budget").expect("the fixture parses");
         assert!(!measured.is_empty(), "the fixture has a metric");
         compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"))
     }
@@ -299,7 +228,8 @@ mod tests {
 
     #[test]
     fn a_metric_the_harness_forgot_is_blocked_and_named() {
-        let measured = measurements("jobq-budget claim_statements=12\n").expect("parses");
+        let measured = harness::measurements("jobq-budget claim_statements=12\n", "jobq-budget")
+            .expect("parses");
         let outcome = compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"));
         assert_eq!(outcome.outcome, Outcome::Blocked);
         assert!(outcome.detail.contains("scan_cells"), "{}", outcome.detail);
@@ -312,9 +242,10 @@ mod tests {
 
     #[test]
     fn a_metric_with_no_baseline_is_not_judged() {
-        let measured = measurements(
+        let measured = harness::measurements(
             "jobq-budget claim_statements=12\njobq-budget scan_cells=340\n\
              jobq-budget scale_ratio_max=1.0\njobq-budget peak_rss=999999\n",
+            "jobq-budget",
         )
         .expect("parses");
         let outcome = compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"));
@@ -324,12 +255,14 @@ mod tests {
 
     #[test]
     fn a_line_that_is_not_a_count_is_reported_not_ignored() {
-        let error = measurements("jobq-budget scan_cells=fast\n").expect_err("not a number");
+        let error = harness::measurements("jobq-budget scan_cells=fast\n", "jobq-budget")
+            .expect_err("not a number");
         assert!(error.contains("not a number"), "{error}");
-        let error = measurements("jobq-budget just-a-word\n").expect_err("not a metric");
-        assert!(error.contains(PREFIX), "{error}");
+        let error = harness::measurements("jobq-budget just-a-word\n", "jobq-budget")
+            .expect_err("not a metric");
+        assert!(error.contains("jobq-budget"), "{error}");
         assert!(
-            measurements("nothing to see\n")
+            harness::measurements("nothing to see\n", "jobq-budget")
                 .expect("no metrics")
                 .is_empty(),
             "a run without metrics is not an error here: the caller reports it"

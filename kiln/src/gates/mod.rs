@@ -20,8 +20,9 @@
 //!
 //! This module owns the grammar and the catalogue; running a gate belongs to the modules that
 //! implement one ([`fmt`], [`clippy`], [`mutants`], [`budget`] …), the little bit of source reading
-//! the textual gates share lives in [`lexer`] and [`sources`], the copy of the project a gate that
-//! builds in one starts from lives in [`sandbox`], and probing a tool belongs to
+//! the textual gates share lives in [`lexer`] and [`sources`], the counter harnesses the slow gates
+//! judge (their line format, their course-side parameter files) share [`harness`], the copy of the
+//! project a gate that builds in one starts from lives in [`sandbox`], and probing a tool belongs to
 //! [`tool`] — which now answers for the few tools a gate still needs, since the slow gates judge with
 //! `cargo`, `rustc` and the course's own files (handoff M2 §1). `kiln lint-caps` solves the same
 //! problem for capability metadata instead of code.
@@ -41,6 +42,8 @@ pub mod coverage;
 pub mod docs_public;
 pub mod exit_code;
 pub mod fmt;
+pub mod fuzz;
+pub mod harness;
 pub mod i18n;
 pub mod images;
 pub mod lexer;
@@ -51,6 +54,8 @@ pub mod registry;
 pub mod runner;
 pub mod sandbox;
 pub mod semver;
+pub mod sim;
+pub mod soak;
 pub mod sources;
 pub mod spec_integrity;
 pub mod tool;

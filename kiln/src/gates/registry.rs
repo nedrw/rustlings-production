@@ -279,15 +279,30 @@ static CATALOGUE: &[GateDef] = &[
         name: "sim",
         tool: None,
         purpose: "distributed behaviour is deterministic under a seed",
-        run: None,
-        status: GateStatus::Pending("T4/T5"),
+        // The seeds are a course file and the judgement is the transcript the step's own suite prints
+        // under each of them (handoff M3 §4.1): the simulator itself is a dev-dependency of the
+        // project, so this gate needs nothing outside the toolchain.
+        run: Some(crate::gates::sim::run),
+        status: GateStatus::Ready,
     },
     GateDef {
         name: "soak",
         tool: None,
         purpose: "no leaks or pile-ups over a long run",
-        run: None,
-        status: GateStatus::Pending("T4"),
+        // Judge the leak, not the minutes: the course file sets a floor on the cycles and an upper
+        // bound per live counter, and the wall clock is reported as evidence only (handoff M3 §4.2).
+        run: Some(crate::gates::soak::run),
+        status: GateStatus::Ready,
+    },
+    GateDef {
+        name: "fuzz",
+        tool: None,
+        purpose: "a seeded search finds the parser's edges, and every pinned input still replays",
+        // `cargo-fuzz` needs nightly and is not part of the toolchain baseline, so it cannot be a
+        // `must` gate (plan §10); what the gate judges is the step's own harness: mutations performed
+        // per seed, and regression inputs replayed out of the count the course file pins.
+        run: Some(crate::gates::fuzz::run),
+        status: GateStatus::Ready,
     },
 ];
 
@@ -383,6 +398,9 @@ mod tests {
                 "bench-budget",
                 "unsafe-budget",
                 "semver",
+                "sim",
+                "soak",
+                "fuzz",
             ],
             "a gate moved between ready and pending"
         );

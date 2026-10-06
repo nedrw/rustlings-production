@@ -26,6 +26,7 @@
 use serde::Deserialize;
 
 use crate::error::Result;
+use crate::gates::harness;
 use crate::gates::runner::GateContext;
 use crate::gates::{GateOutcome, GateSpec};
 use crate::process::{self, Ran};
@@ -35,9 +36,6 @@ pub const FILE: &str = "conformance.toml";
 
 /// The environment variable the spec's store factory reads to pick an implementation.
 pub const BACKEND: &str = "KILN_BACKEND";
-
-/// What a Rust program prints when it panics, which is how a failing spec announces itself.
-const PANIC: &str = "panicked at";
 
 /// The declaration, as `conformance.toml` writes it.
 ///
@@ -135,30 +133,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 fn attempt(backend: &str, ran: &Ran) -> Attempt {
     Attempt {
         backend: backend.to_owned(),
-        failure: (!ran.success()).then(|| reason(ran)),
-    }
-}
-
-/// One line saying why a backend's run did not pass.
-///
-/// A failing `cargo test` says two things: cargo prints `error: test failed …` on stderr, and the test
-/// harness prints the panic that caused it on stdout, a few lines further in, under a `---- <test>
-/// stdout ----` heading. The panic is the part worth quoting, so it is looked for first; a run that
-/// failed without one — a compile error, a process killed by a signal — falls back to the first line
-/// that is not cargo's own narration about its progress (`runner::failure_detail` takes the first line
-/// of stderr, which under contention is `Blocking waiting for file lock …`).
-fn reason(ran: &Ran) -> String {
-    if ran.timed_out {
-        return format!("timed out after {:?}", ran.elapsed);
-    }
-    let output = format!("{}{}", ran.stdout, ran.stderr);
-    let lines = || output.lines().map(str::trim);
-    let said = lines()
-        .find(|line| line.contains(PANIC))
-        .or_else(|| lines().find(|line| !line.is_empty() && !process::is_progress(line)));
-    match said {
-        Some(said) => format!("{}: {said}", process::exit_code_text(ran.code)),
-        None => process::exit_code_text(ran.code).to_owned(),
+        failure: (!ran.success()).then(|| harness::failure_reason(ran)),
     }
 }
 

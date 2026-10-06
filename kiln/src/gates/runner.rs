@@ -273,7 +273,8 @@ mod tests {
     fn the_catalogue_declares_which_gates_are_pending_and_why() {
         // A pending gate must say why it is not implemented, because `kiln check` prints the reason
         // instead of a verdict. The slow gates left this list when M2 brought their implementations
-        // (handoff M2 §1); what is left is either enforced elsewhere or deliberately not built yet.
+        // (handoff M2 §1) and `sim`/`soak` followed in M3, alongside the new `fuzz`; what is left is
+        // either enforced elsewhere or deliberately not built yet.
         let pending: Vec<(&str, &str)> = catalogue()
             .iter()
             .filter_map(|gate| match gate.status {
@@ -283,7 +284,7 @@ mod tests {
             .collect();
         assert_eq!(
             pending.iter().map(|(name, _)| *name).collect::<Vec<&str>>(),
-            ["timeout", "deny", "sim", "soak"],
+            ["timeout", "deny"],
             "a gate moved between ready and pending"
         );
         for (name, reason) in &pending {

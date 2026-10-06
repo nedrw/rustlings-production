@@ -847,11 +847,14 @@ pub fn cells_examined(n: u32) -> u32 {
 "#;
 
 /// The harness the course scaffolds: counts, never times.
+///
+/// The prefix carries the track (`mailer-budget`), which is what the gate derives from the track
+/// metadata: the fixture runs under the mailer track, so it prints mailer's name.
 const BUDGET_HARNESS: &str = r#"
 #[test]
 fn prints_the_counts() {
     let cells = {crate}::cells_examined(1024);
-    println!("jobq-budget scan_cells={cells}");
+    println!("mailer-budget scan_cells={cells}");
 }
 "#;
 
