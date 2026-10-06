@@ -12,7 +12,7 @@
 //!
 //! The run: the step's own `run.cmd` under `RUSTFLAGS=-C instrument-coverage`, with
 //! `LLVM_PROFILE_FILE` pointing into a scratch directory; then `llvm-profdata merge -sparse`, then
-//! `llvm-cov export --summary` over the test binaries cargo produced. Both the profiles and the merged
+//! `llvm-cov export --summary-only` over the test binaries cargo produced. Both the profiles and the merged
 //! data are removed with the scratch directory when the gate ends. The instrumented objects do *not*
 //! live in the ordinary build directory — a different `RUSTFLAGS` is a different build, and putting it
 //! there would make every ordinary build that follows recompile the project (measured: 22 s cold on the
@@ -52,17 +52,21 @@ pub struct Tools {
     pub cov: PathBuf,
 }
 
-/// Find the LLVM tools of the *active* toolchain, when this machine has them.
+/// Find the LLVM tools of the toolchain that compiles `project`, when this machine has them.
 ///
-/// `rustc --print sysroot` and `rustc -vV` answer where they are: `rustup component add
+/// The two `rustc` questions are asked **in the project's directory**, because that is where the
+/// toolchain pin applies: a project with a `rust-toolchain.toml` compiles with the toolchain that
+/// file names, and asking the same questions in a scratch directory answers about whatever the
+/// machine made default instead. That is not a detail — it is the difference between measuring the
+/// profile this run writes and reading it with another LLVM.
+///
+/// `rustc --print sysroot` and `rustc -vV` answer where the tools are: `rustup component add
 /// llvm-tools-preview` installs them under `lib/rustlib/<host>/bin` of the sysroot whose rustc is
 /// compiling this run. Looking on `PATH` instead would happily find a system clang of a different
 /// version, and a profile written by one LLVM read by another is a measurement nobody should trust.
-#[must_use]
-pub fn tools(timeout: Duration) -> Option<Tools> {
-    let dir = std::env::temp_dir();
-    let sysroot = process::run("rustc", &["--print", "sysroot"], &dir, timeout).ok()?;
-    let verbose = process::run("rustc", &["-vV"], &dir, timeout).ok()?;
+pub fn tools(project: &Path, timeout: Duration) -> Option<Tools> {
+    let sysroot = process::run("rustc", &["--print", "sysroot"], project, timeout).ok()?;
+    let verbose = process::run("rustc", &["-vV"], project, timeout).ok()?;
     tool_paths(&sysroot.stdout, &verbose.stdout)
 }
 
@@ -105,7 +109,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     };
     // The tools first: on a machine without them nothing else matters, and the answer has to be the
     // install line rather than a run nobody can measure.
-    let Some(tools) = tools(ctx.probe_timeout()) else {
+    let Some(tools) = tools(project, ctx.probe_timeout()) else {
         return Ok(GateOutcome::blocked(MISSING));
     };
 
@@ -179,7 +183,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // deps directory holds besides this run's test binaries costs nothing.
     let mut export_args: Vec<String> = vec![
         "export".to_owned(),
-        "--summary".to_owned(),
+        "--summary-only".to_owned(),
         "--instr-profile".to_owned(),
         lossy(&merged),
     ];
@@ -192,7 +196,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     )?;
     if !exported.success() {
         return Ok(GateOutcome::blocked(format!(
-            "`llvm-cov export --summary` could not read this run's profile:\n    {}",
+            "`llvm-cov export --summary-only` could not read this run's profile:\n    {}",
             output_detail(&exported)
         )));
     }
@@ -264,7 +268,7 @@ struct Coverage {
     files: Vec<String>,
 }
 
-/// What an `llvm-cov export --summary` document carries.
+/// What an `llvm-cov export --summary-only` document carries.
 #[derive(Debug, Deserialize)]
 struct Export {
     /// One entry per object file handed to `llvm-cov`.
@@ -309,7 +313,7 @@ struct Lines {
 fn summary(document: &str, project: &Path, module: &[String]) -> Result<Coverage> {
     let export: Export = serde_json::from_str(document).map_err(|source| {
         KilnError::Invalid(format!(
-            "`llvm-cov export --summary` answered with something this build cannot read: {source}"
+            "`llvm-cov export --summary-only` answered with something this build cannot read: {source}"
         ))
     })?;
     let mut coverage = Coverage::default();
@@ -383,7 +387,7 @@ mod tests {
     use crate::gates::Outcome;
     use crate::test_support::TempDir;
 
-    /// An `llvm-cov export --summary` document with two files, one of them the step's.
+    /// An `llvm-cov export --summary-only` document with two files, one of them the step's.
     const EXPORT: &str = r#"{
       "data": [
         {
@@ -494,7 +498,12 @@ mod tests {
     fn a_populated_toolchain_answers_with_files_that_exist() {
         // Machine-honest: this either finds the component or reports that it is missing, and both are
         // correct answers. What it may not do is name a path that is not there.
-        if let Some(tools) = tools(Duration::from_secs(30)) {
+        // The probe runs in a directory that is a Rust project (this repository), because that is
+        // where a toolchain pin would apply — the same reason the gate asks in the project it judges.
+        let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("kiln lives one directory below the repository root");
+        if let Some(tools) = tools(project, Duration::from_secs(30)) {
             assert!(tools.profdata.is_file(), "{}", tools.profdata.display());
             assert!(tools.cov.is_file(), "{}", tools.cov.display());
         }

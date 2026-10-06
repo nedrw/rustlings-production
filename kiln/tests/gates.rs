@@ -1314,7 +1314,10 @@ fn coverage_measures_the_step_module_or_names_the_component_to_install() {
     // `coverage` is the one slow gate that is a `should`, and this is why: the LLVM tools come from a
     // rustup component rather than from the toolchain baseline, so a machine without them gets the
     // install line and no red step (plan §10).
-    if kiln::gates::coverage::tools(Duration::from_secs(30)).is_none() {
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("kiln lives one directory below the repository root");
+    if kiln::gates::coverage::tools(project, Duration::from_secs(30)).is_none() {
         assert_eq!(
             outcomes(&results),
             [Outcome::Blocked],
