@@ -128,7 +128,7 @@ impl Flags {
                 "--config" => flags.config = Some(PathBuf::from(value(&mut args, "--config")?)),
                 "--listen-addr" => flags.listen_addr = Some(value(&mut args, "--listen-addr")?),
                 "--store-dir" => {
-                    flags.store_dir = Some(PathBuf::from(value(&mut args, "--store-dir")?))
+                    flags.store_dir = Some(PathBuf::from(value(&mut args, "--store-dir")?));
                 }
                 "--log-level" => flags.log_level = Some(value(&mut args, "--log-level")?),
                 "--log-format" => flags.log_format = Some(value(&mut args, "--log-format")?),

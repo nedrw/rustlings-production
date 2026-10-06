@@ -1,0 +1,671 @@
+diff --git a/docs/protocol.md b/docs/protocol.md
+new file mode 100644
+index 0000000..107f00d
+--- /dev/null
++++ b/docs/protocol.md
+@@ -0,0 +1,74 @@
++# The ingest protocol
++
++`lakelet` accepts telemetry over TCP, as frames of bytes. This page is the contract: what a client
++writes, what the daemon refuses, and why the two are the same on every machine.
++
++The decoder lives in [`src/protocol/frame.rs`](../src/protocol/frame.rs) and the record format in
++[`src/protocol/batch.rs`](../src/protocol/batch.rs). If this page and those files disagree, the files
++are right and this page is a bug.
++
++## A frame
++
++```text
++ 0       4       5                    5+n      9+n
++ +-------+-------+---------------------+--------+
++ | length|version| payload (n bytes)   | crc32  |
++ +-------+-------+---------------------+--------+
++  u32 LE   u8         n bytes           u32 LE
++```
++
++- **length** is the payload's length in bytes — not the frame's. A reader can decide how much more to
++  read from those four bytes alone, before it has any payload at all.
++- **version** is `1`. It sits here, in front of the payload, so a build that does not speak a
++  version refuses the frame as soon as the fifth byte arrives, instead of buffering a payload it
++  cannot parse.
++- **payload** is opaque to the framing layer.
++- **crc32** covers the payload only. A corrupted length therefore cannot make the checksum pass by
++  accident: the length is what decides where the payload ends, and the checksum then disagrees.
++
++Nine bytes of framing, and the largest payload is `MAX_PAYLOAD` (1 MiB). A length above that is
++refused *before* any buffer is reserved for it: the limit exists so that a peer cannot choose how much
++memory this process holds.
++
++## A payload
++
++```text
++ 0..4   count: u32 LE
++ then, per record:
++   u16 LE  name length
++   bytes   series name (UTF-8, e.g. "cpu,host=h0")
++   i64 LE  timestamp, milliseconds since the Unix epoch
++   f64 LE  value
++```
++
++A batch is all of it or none of it. A payload whose count promises more records than the bytes carry,
++a record that ends in the middle of its value, a series name that is not UTF-8, an empty series name,
++and bytes left over after the last record are all refused with a sentence saying which one it was.
++`lakelet/4.7-columnar-segments` replaces this layout *inside the store*; the wire keeps this one,
++because a wire format nobody can debug by hand is a wire format nobody debugs at 3am.
++
++## What a peer can do to us
++
++The decoder answers three ways, and the difference matters to whoever writes the next client:
++
++| What arrived | The answer | Why |
++| --- | --- | --- |
++| fewer bytes than a frame | `Incomplete { needed }` | `needed` is how many more will be enough — read that many, not one byte more |
++| a length above 1 MiB | `Invalid` | refused before the payload is reserved |
++| a version that is not 1 | `Invalid` | refused from the header alone |
++| a payload whose checksum does not match | `Invalid` | the sentence names both numbers |
++| a whole frame | `Frame(frame, consumed)` | `consumed` may be less than the buffer: two frames can arrive in one read |
++
++A refusal ends the connection. After bytes that are not a frame, nothing that follows can be trusted
++to start at a boundary, so the daemon counts the frame, logs the reason, and closes — one client's
++garbage is not the process's problem.
++
++## What is not here yet
++
++- no compression: `lakelet/4.7-columnar-segments` is where bytes get smaller;
++- no acknowledgement: a client knows a frame was stored because the daemon answered `accepted` on its
++  connection, not because the frame carried an id — per-batch acknowledgement is
++  `lakelet/4.5-batch-writes`' subject, where batching makes it worth the round trip;
++- no backpressure: a client that sends faster than the store can write is
++  `lakelet/4.6-ingest-backpressure`'s subject;
++- version negotiation: a version this build does not speak is refused, not downgraded.
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index 0823f40..e37fbf3 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -13,10 +13,31 @@
+ //! the record is readable by [`Spool::records`], and [`Spool::records`] answers what was appended, in
+ //! order, never what was appended and then lost to a bug in the reader.
+ 
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ 
+ use crate::error::Error;
+ 
++/// One `Error::Store` around an I/O failure.
++fn store(source: std::io::Error) -> Error {
++    Error::Store {
++        source: Box::new(source),
++    }
++}
++
++/// One `Error::Protocol` with `detail` filled in.
++fn protocol(detail: String) -> Error {
++    Error::Protocol { detail }
++}
++
++/// The `u32` at `offset`, or `None` when the bytes do not hold four of them there.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset + 4)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
+ /// The name of the file inside the store directory.
+ pub const FILE: &str = "ingest.log";
+ 
+@@ -34,8 +55,17 @@ impl Spool {
+     ///
+     /// [`Error::Store`] when the directory cannot be created or written to.
+     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, Error> {
+-        let _ = directory.into();
+-        todo!("step lakelet/4.1-ingest-protocol")
++        let directory = directory.into();
++        std::fs::create_dir_all(&directory).map_err(store)?;
++        let spool = Self { directory };
++        // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
++        // "no such file": those are different situations, and the reader should not have to guess.
++        std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(spool.path())
++            .map_err(store)?;
++        Ok(spool)
+     }
+ 
+     /// The directory this spool writes to.
+@@ -56,8 +86,20 @@ impl Spool {
+     ///
+     /// [`Error::Store`] when the record cannot be written.
+     pub fn append(&mut self, payload: &[u8]) -> Result<(), Error> {
+-        let _ = payload;
+-        todo!("step lakelet/4.1-ingest-protocol")
++        // One open per append, which is honest about what an append *costs*: `lakelet/4.5-batch-writes`
++        // is the step that makes this a batch, and the counters there are what say whether it worked.
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(self.path())
++            .map_err(store)?;
++        file.write_all(&(payload.len() as u32).to_le_bytes())
++            .map_err(store)?;
++        file.write_all(payload).map_err(store)?;
++        // Written, not yet durable: whether this call waits for the device is
++        // `lakelet/4.3-write-path-adr`'s decision, and it is a decision with a number attached
++        // (`fsync` per record costs milliseconds, and a store that fsyncs per sample cannot keep up).
++        Ok(())
+     }
+ 
+     /// Every record the file holds, in the order it was appended.
+@@ -68,6 +110,31 @@ impl Spool {
+     /// not the record format this module writes — a reader that guesses is how a corrupt store
+     /// becomes a corrupt *answer*.
+     pub fn records(&self) -> Result<Vec<Vec<u8>>, Error> {
+-        todo!("step lakelet/4.1-ingest-protocol")
++        let bytes = match std::fs::read(self.path()) {
++            Ok(bytes) => bytes,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
++            Err(error) => return Err(store(error)),
++        };
++        let mut records = Vec::new();
++        let mut cursor = 0usize;
++        while cursor < bytes.len() {
++            let length = u32_at(&bytes, cursor).ok_or_else(|| {
++                protocol(format!(
++                    "a record header is four bytes and the file ends with {} byte(s) of one",
++                    bytes.len() - cursor
++                ))
++            })? as usize;
++            let start = cursor + 4;
++            let record = bytes.get(start..start + length).ok_or_else(|| {
++                protocol(format!(
++                    "record {} says {length} byte(s) and the file holds {} after its header",
++                    records.len(),
++                    bytes.len().saturating_sub(start)
++                ))
++            })?;
++            records.push(record.to_vec());
++            cursor = start + length;
++        }
++        Ok(records)
+     }
+ }
+diff --git a/src/protocol/batch.rs b/src/protocol/batch.rs
+index a127f9b..0b8dcff 100644
+--- a/src/protocol/batch.rs
++++ b/src/protocol/batch.rs
+@@ -29,8 +29,16 @@ pub struct Record {
+ /// Encode records into a payload.
+ #[must_use]
+ pub fn encode(records: &[Record]) -> Vec<u8> {
+-    let _ = records;
+-    todo!("step lakelet/4.1-ingest-protocol")
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
++    for record in records {
++        let name = record.series.as_bytes();
++        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
++        bytes.extend_from_slice(name);
++        bytes.extend_from_slice(&record.ts_millis.to_le_bytes());
++        bytes.extend_from_slice(&record.value.to_le_bytes());
++    }
++    bytes
+ }
+ 
+ /// Read a payload into the records it carries.
+@@ -41,6 +49,106 @@ pub fn encode(records: &[Record]) -> Vec<u8> {
+ /// when the payload ends in the middle of a record — a batch is all of it or none of it, because a
+ /// half-written batch is exactly what a store must never accept as a whole.
+ pub fn decode(payload: &[u8]) -> Result<Vec<Record>, Error> {
+-    let _ = payload;
+-    todo!("step lakelet/4.1-ingest-protocol")
++    let Some(count) = u32_at(payload, 0) else {
++        return Err(rejected(format!(
++            "a batch starts with a four-byte count and this payload holds {} byte(s)",
++            payload.len()
++        )));
++    };
++    let mut cursor = 4usize;
++    // The count is the sender's claim, so the capacity it reserves is bounded by what the bytes can
++    // possibly hold: a record is at least `2 + 0 + 8 + 8` bytes, and a peer that says "four billion
++    // records" about a twelve-byte payload must not be given four billion records' worth of memory.
++    let mut records: Vec<Record> =
++        Vec::with_capacity((count as usize).min(payload.len().saturating_sub(4) / SMALLEST_RECORD));
++    for index in 0..count {
++        let name_length = u16_at(payload, cursor).ok_or_else(|| {
++            rejected(format!(
++                "record {index} of {count} ends before its series name: the payload holds {} byte(s) \
++                 and the name should start at {cursor}",
++                payload.len()
++            ))
++        })? as usize;
++        if name_length == 0 {
++            return Err(rejected(format!(
++                "record {index} of {count} has an empty series name, and a value that belongs to no \
++                 series cannot be stored"
++            )));
++        }
++        let name_at = cursor + 2;
++        let name_bytes = payload.get(name_at..name_at + name_length).ok_or_else(|| {
++            rejected(format!(
++                "record {index} of {count} says its series name is {name_length} byte(s) long and the \
++                 payload holds {} of them",
++                payload.len().saturating_sub(name_at)
++            ))
++        })?;
++        let series = std::str::from_utf8(name_bytes)
++            .map_err(|error| rejected(format!("record {index} of {count}: {error}")))?
++            .to_owned();
++        let timestamp_at = name_at + name_length;
++        let ts_millis = i64_at(payload, timestamp_at).ok_or_else(|| {
++            rejected(format!(
++                "record {index} of {count} ends before its timestamp"
++            ))
++        })?;
++        let value_at = timestamp_at + 8;
++        let value = f64_at(payload, value_at)
++            .ok_or_else(|| rejected(format!("record {index} of {count} ends before its value")))?;
++        records.push(Record {
++            series,
++            ts_millis,
++            value,
++        });
++        cursor = value_at + 8;
++    }
++    if cursor != payload.len() {
++        return Err(rejected(format!(
++            "the batch carries {count} record(s) and {} byte(s) are left over after them, which is \
++             not a count anybody can act on",
++            payload.len() - cursor
++        )));
++    }
++    Ok(records)
++}
++
++/// The smallest a record can be: two bytes of name length, no name, eight of timestamp, eight of
++/// value. Used only to bound an allocation, never to validate a record.
++const SMALLEST_RECORD: usize = 2 + 8 + 8;
++
++/// One `Error::Protocol` with `detail` filled in.
++fn rejected(detail: String) -> Error {
++    Error::Protocol { detail }
++}
++
++/// The `u32` at `offset`, or `None` when the payload does not hold four bytes there.
++fn u32_at(payload: &[u8], offset: usize) -> Option<u32> {
++    let bytes = payload.get(offset..offset + 4)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(bytes);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The `u16` at `offset`.
++fn u16_at(payload: &[u8], offset: usize) -> Option<u16> {
++    let bytes = payload.get(offset..offset + 2)?;
++    let mut array = [0u8; 2];
++    array.copy_from_slice(bytes);
++    Some(u16::from_le_bytes(array))
++}
++
++/// The `i64` at `offset`.
++fn i64_at(payload: &[u8], offset: usize) -> Option<i64> {
++    let bytes = payload.get(offset..offset + 8)?;
++    let mut array = [0u8; 8];
++    array.copy_from_slice(bytes);
++    Some(i64::from_le_bytes(array))
++}
++
++/// The `f64` at `offset`.
++fn f64_at(payload: &[u8], offset: usize) -> Option<f64> {
++    let bytes = payload.get(offset..offset + 8)?;
++    let mut array = [0u8; 8];
++    array.copy_from_slice(bytes);
++    Some(f64::from_le_bytes(array))
+ }
+diff --git a/src/protocol/frame.rs b/src/protocol/frame.rs
+index 6ce2273..e6f173b 100644
+--- a/src/protocol/frame.rs
++++ b/src/protocol/frame.rs
+@@ -64,8 +64,12 @@ impl Frame {
+     /// The bytes to write on the wire: [`OVERHEAD`] plus the payload.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        let _ = self;
+-        todo!("step lakelet/4.1-ingest-protocol")
++        let mut bytes = Vec::with_capacity(OVERHEAD + self.payload.len());
++        bytes.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
++        bytes.push(self.version);
++        bytes.extend_from_slice(&self.payload);
++        bytes.extend_from_slice(&crc32fast::hash(&self.payload).to_le_bytes());
++        bytes
+     }
+ }
+ 
+@@ -76,6 +80,102 @@ impl Frame {
+ /// difference between a protocol and a remote memory exhaustion.
+ #[must_use]
+ pub fn decode(buffer: &[u8]) -> Decoded {
+-    let _ = buffer;
+-    todo!("step lakelet/4.1-ingest-protocol")
++    let Some(length) = u32_at(buffer, 0) else {
++        return Decoded::Incomplete {
++            needed: 4usize.saturating_sub(buffer.len()),
++        };
++    };
++    let length = length as usize;
++    if length > MAX_PAYLOAD {
++        return Decoded::Invalid {
++            reason: format!(
++                "a payload of {length} bytes is above this protocol's limit of {MAX_PAYLOAD}"
++            ),
++        };
++    }
++
++    // The version lives in the fifth byte, and it is read as soon as that byte is here: a frame this
++    // build cannot parse is refused before its payload is buffered, not after.
++    let Some(version) = buffer.get(4).copied() else {
++        return Decoded::Incomplete { needed: 1 };
++    };
++    if version != VERSION {
++        return Decoded::Invalid {
++            reason: format!(
++                "frame version {version} is not {VERSION}, which is what this build speaks"
++            ),
++        };
++    }
++
++    let total = OVERHEAD + length;
++    if buffer.len() < total {
++        return Decoded::Incomplete {
++            needed: total - buffer.len(),
++        };
++    }
++    let (Some(payload), Some(expected)) = (buffer.get(5..5 + length), u32_at(buffer, 5 + length))
++    else {
++        return Decoded::Incomplete {
++            needed: total.saturating_sub(buffer.len()),
++        };
++    };
++
++    let computed = crc32fast::hash(payload);
++    if computed != expected {
++        return Decoded::Invalid {
++            reason: format!(
++                "the payload carries checksum {expected:#010x} and {computed:#010x} was computed \
++                 over its {} byte(s)",
++                payload.len()
++            ),
++        };
++    }
++    Decoded::Frame(
++        Frame {
++            version,
++            payload: payload.to_vec(),
++        },
++        total,
++    )
++}
++
++/// The `u32` at `offset`, or `None` when the buffer does not hold four bytes there.
++fn u32_at(buffer: &[u8], offset: usize) -> Option<u32> {
++    let bytes = buffer.get(offset..offset + 4)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(bytes);
++    Some(u32::from_le_bytes(array))
++}
++
++/// Read frames out of `buffer` until it runs out, and answer how many bytes were consumed.
++///
++/// A connection loop needs both answers: the frames that were whole and the prefix that was not, so
++/// the next read appends to it instead of starting again. A refusal ends the walk — a stream cannot
++/// be resynchronised after bytes that are not a frame, and whatever follows cannot be trusted to
++/// start at a boundary.
++///
++/// # Errors
++///
++/// [`crate::Error::Protocol`] for the first [`Decoded::Invalid`], naming the byte it was found at.
++pub fn read_all(buffer: &[u8]) -> Result<(Vec<Frame>, usize), crate::Error> {
++    let mut frames = Vec::new();
++    let mut cursor = 0;
++    loop {
++        let rest = buffer.get(cursor..).unwrap_or_default();
++        if rest.is_empty() {
++            return Ok((frames, cursor));
++        }
++        match decode(rest) {
++            Decoded::Frame(frame, used) => {
++                frames.push(frame);
++                cursor += used;
++            }
++            Decoded::Incomplete { .. } => return Ok((frames, cursor)),
++            Decoded::Invalid { reason } => {
++                return Err(crate::Error::Protocol {
++                    detail: format!("at byte {cursor} of the buffer: {reason}"),
++                });
++            }
++        }
++    }
+ }
+diff --git a/src/service/ingest.rs b/src/service/ingest.rs
+index 8a0ed1a..05bc50c 100644
+--- a/src/service/ingest.rs
++++ b/src/service/ingest.rs
+@@ -14,15 +14,23 @@
+ //!   back.
+ //!
+ //! The connection's counters are logged (`accepted`, `rejected`, `bytes`) because that is how an
+-//! operator sees a client that is sending garbage, and the spec reads those lines.
++//! operator sees a client that is sending garbage, and the spec reads those lines. A connection that
++//! carried nothing — a port probe, a health check — is logged at `debug` instead: an operator's log
++//! should not grow a line per readiness check.
++//!
++//! One task per connection, because a client that sends half a frame and then simply stays connected
++//! must not hold up the next client. What *bounds* how many of those run at once is
++//! `lakelet/4.6-ingest-backpressure`'s subject, not this step's.
+ 
+ use std::sync::Arc;
+ 
++use tokio::io::AsyncReadExt;
+ use tokio::net::TcpListener;
+ use tokio::sync::Mutex;
+ 
+ use crate::engine::Spool;
+ use crate::error::Error;
++use crate::protocol::frame;
+ 
+ /// How many bytes are read from a connection at a time.
+ ///
+@@ -31,15 +39,65 @@ use crate::error::Error;
+ /// megabyte is one that holds a megabyte per idle connection.
+ pub const READ_CHUNK: usize = 64 * 1024;
+ 
+-/// Counters one connection (and the daemon) reports.
+-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++/// How much a connection may buffer before it gives the memory back.
++///
++/// A frame is at most [`frame::MAX_PAYLOAD`] plus its framing, so a buffer above this is not a frame
++/// being assembled: it is a peer that sent less than a frame and then megabytes of something else.
++const MAX_PENDING: usize = 2 * frame::MAX_PAYLOAD + frame::OVERHEAD;
++
++/// Counters the daemon reports.
++///
++/// Atomics rather than a `Mutex<Counters>`: connections run in their own tasks, and a counter that
++/// has to be locked is a counter that serialises the very thing it is counting.
++#[derive(Debug, Default)]
+ pub struct Counters {
+     /// Frames accepted and stored.
+-    pub accepted: u64,
++    accepted: std::sync::atomic::AtomicU64,
+     /// Frames refused, with the reason in the log.
+-    pub rejected: u64,
++    rejected: std::sync::atomic::AtomicU64,
+     /// Payload bytes stored.
+-    pub bytes: u64,
++    bytes: std::sync::atomic::AtomicU64,
++}
++
++impl Counters {
++    /// Frames accepted so far.
++    #[must_use]
++    pub fn accepted(&self) -> u64 {
++        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Frames refused so far.
++    #[must_use]
++    pub fn rejected(&self) -> u64 {
++        self.rejected.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Payload bytes stored so far.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Add one connection's tally to the daemon's.
++    fn add(&self, tally: Tally) {
++        self.accepted
++            .fetch_add(tally.accepted, std::sync::atomic::Ordering::Relaxed);
++        self.rejected
++            .fetch_add(tally.rejected, std::sync::atomic::Ordering::Relaxed);
++        self.bytes
++            .fetch_add(tally.bytes, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++/// What one connection did.
++#[derive(Debug, Default, Clone, Copy)]
++struct Tally {
++    /// Frames accepted and stored.
++    accepted: u64,
++    /// Frames refused.
++    rejected: u64,
++    /// Payload bytes stored.
++    bytes: u64,
+ }
+ 
+ /// Serve connections until `shutdown` resolves.
+@@ -47,17 +105,112 @@ pub struct Counters {
+ /// # Errors
+ ///
+ /// [`Error::Store`] when the store cannot be written to (which is fatal: a store that cannot store
+-/// must not keep accepting), and [`Error::Protocol`] only for a failure of the listener itself — a
+-/// peer that sends nonsense closes its own connection and is counted instead.
+-///
+-/// # Panics
+-///
+-/// Never: the loop's job is to keep one bad client from ending the process.
++/// must not keep accepting) and when the listener itself fails. A peer that sends nonsense closes
++/// its own connection and is counted instead — the loop's job is to keep one bad client from ending
++/// the process.
+ pub async fn serve(
+     listener: TcpListener,
+-    _store: Arc<Mutex<Spool>>,
+-    _shutdown: impl std::future::Future<Output = ()>,
++    store: Arc<Mutex<Spool>>,
++    shutdown: impl std::future::Future<Output = ()>,
+ ) -> Result<(), Error> {
+-    let _ = listener;
+-    todo!("step lakelet/4.1-ingest-protocol")
++    let mut shutdown = std::pin::pin!(shutdown);
++    let counters = Arc::new(Counters::default());
++
++    loop {
++        tokio::select! {
++            () = &mut shutdown => {
++                tracing::info!(
++                    accepted = counters.accepted(),
++                    rejected = counters.rejected(),
++                    bytes = counters.bytes(),
++                    "stopped accepting"
++                );
++                return Ok(());
++            }
++            accepted = listener.accept() => {
++                let (socket, peer) = accepted.map_err(|error| Error::Store {
++                    source: Box::new(error),
++                })?;
++                tracing::debug!(%peer, "connection accepted");
++                let store = Arc::clone(&store);
++                let counters = Arc::clone(&counters);
++                tokio::spawn(async move {
++                    if let Err(error) = connection(socket, store, &counters).await {
++                        tracing::warn!(%error, "connection ended badly");
++                    }
++                });
++            }
++        }
++    }
++}
++
++/// Read one connection until its client goes away.
++///
++/// The loop is where a stream has to be treated like a stream: `read` answers what has arrived, so
++/// what did not fit a frame stays in `pending` and the next read appends to it. A refusal is final
++/// for this connection — after bytes that are not a frame, nothing that follows can be trusted to
++/// start at a boundary — so the frame is counted, the reason is logged, and the connection ends
++/// without taking the process with it.
++async fn connection(
++    mut socket: tokio::net::TcpStream,
++    store: Arc<Mutex<Spool>>,
++    counters: &Counters,
++) -> Result<(), Error> {
++    let mut pending: Vec<u8> = Vec::new();
++    let mut chunk = vec![0u8; READ_CHUNK];
++    let mut tally = Tally::default();
++
++    let outcome = 'connection: loop {
++        let read = match socket.read(&mut chunk).await {
++            Ok(0) => break Ok(()),
++            Ok(read) => read,
++            Err(error) => {
++                tracing::debug!(%error, "connection read failed");
++                break Ok(());
++            }
++        };
++        let Some(bytes) = chunk.get(..read) else {
++            break Ok(());
++        };
++        pending.extend_from_slice(bytes);
++
++        // One call decides the whole buffer: the frames that are whole, and how many bytes they used
++        // — so what did not fit stays in `pending` and the next read appends to it, instead of the
++        // stream being re-parsed from the start on every chunk.
++        match frame::read_all(&pending) {
++            Ok((frames, consumed)) => {
++                for frame in frames {
++                    let mut spool = store.lock().await;
++                    spool.append(&frame.payload)?;
++                    tally.accepted += 1;
++                    tally.bytes += frame.payload.len() as u64;
++                }
++                pending.drain(..consumed);
++            }
++            Err(error) => {
++                tally.rejected += 1;
++                tracing::warn!(reason = %error, "frame rejected");
++                // Nothing after a refusal can be trusted to start at a frame boundary, and a buffer
++                // that only grows is how one client ends the process.
++                pending.clear();
++                break 'connection Ok(());
++            }
++        }
++        if pending.capacity() > MAX_PENDING {
++            pending.shrink_to(READ_CHUNK);
++        }
++    };
++
++    counters.add(tally);
++    if tally.accepted + tally.rejected > 0 {
++        tracing::info!(
++            accepted = tally.accepted,
++            rejected = tally.rejected,
++            bytes = tally.bytes,
++            "connection closed"
++        );
++    } else {
++        tracing::debug!("connection closed without traffic");
++    }
++    outcome
+ }

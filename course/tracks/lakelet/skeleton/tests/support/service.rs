@@ -7,16 +7,21 @@
 //! way a power cut does (`SIGKILL`).
 //!
 //! Nothing here sleeps to synchronise, and nothing here knows the protocol: a spec cuts the bytes it
-//! wants to send, and that is exactly the point — a fixture that built "a valid frame" would hide
-//! the difference between a frame the course defines and a frame the fixture happens to agree with.
+//! wants to send, and that is exactly the point — a fixture that built "a valid frame" would hide the
+//! difference between a frame the course defines and a frame the fixture happens to agree with.
+//!
+//! The lines are kept in a buffer the reader threads append to, not in a channel the test drains.
+//! That is a measured decision: with a channel, a spec that polled every 50 ms saw nothing for three
+//! seconds while the same spec, sleeping instead, saw every line — reading a log must not depend on
+//! when somebody looked. Both streams land in the same buffer, because a daemon that panics says so
+//! on stderr and a failure report that only quoted stdout would show an empty log and no reason.
 
 #![allow(dead_code)] // a spec uses the part of this harness it needs, not all of it
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,10 +37,8 @@ const RETRY: Duration = Duration::from_millis(20);
 /// The daemon under test: a process, its store, and the lines it printed.
 pub struct Service {
     child: Child,
-    lines: Receiver<String>,
-    /// Lines read while waiting for the address announcement. [`Service::log_lines`] hands these back
-    /// before whatever is still in the channel, so a test sees every line in order.
-    early: Mutex<Vec<String>>,
+    /// Every line the daemon has printed so far, in order.
+    lines: Arc<Mutex<Vec<String>>>,
     address: SocketAddr,
     store: StoreDir,
 }
@@ -47,6 +50,12 @@ impl Service {
     /// spec that does the same. The kernel hands one to *this* child, and the child says which.
     /// `env_clear` is deliberate too: a spec that depends on a setting the machine happens to have is
     /// a spec that passes here and fails there.
+    ///
+    /// The log **format** is pinned to `text` here, because the specs read the counters out of the
+    /// lines and a JSON line spells them `"accepted":3`. Pinning it in the fixture keeps that a
+    /// property of how the tests are written rather than of what the daemon defaults to — and a spec
+    /// that wants to check the JSON format passes its own `LAKELET_LOG_FORMAT` (the last value wins,
+    /// since `env` is applied after this one).
     #[must_use]
     pub fn start(label: &str, env: &[Var]) -> Self {
         let store = StoreDir::new(label);
@@ -59,7 +68,9 @@ impl Service {
                 &store.path().display().to_string(),
             ])
             .env_clear()
-            .stdout(Stdio::piped());
+            .env("LAKELET_LOG_FORMAT", "text")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for var in env {
             command.env(&var.name, &var.value);
         }
@@ -71,23 +82,34 @@ impl Service {
             .stdout
             .take()
             .expect("the daemon was started with a pipe");
-        let (sender, lines) = mpsc::channel();
-        thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout)
-                .lines()
-                .map_while(Result::ok)
-            {
-                if sender.send(line).is_err() {
-                    break;
+        let stderr = child
+            .stderr
+            .take()
+            .expect("the daemon was started with a pipe");
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        for stream in [
+            Box::new(stdout) as Box<dyn std::io::Read + Send>,
+            Box::new(stderr),
+        ] {
+            let lines = Arc::clone(&lines);
+            thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stream)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    if let Ok(mut lines) = lines.lock() {
+                        lines.push(line);
+                    } else {
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         let mut service = Self {
             child,
             lines,
-            early: Mutex::new(Vec::new()),
             address: SocketAddr::from(([127, 0, 0, 1], 0)),
             store,
         };
@@ -100,38 +122,21 @@ impl Service {
     fn wait_for_listening(&mut self) -> SocketAddr {
         let deadline = Instant::now() + DEADLINE;
         loop {
-            match self.lines.recv_timeout(RETRY) {
-                Ok(line) => {
-                    let address = listening_address(&line);
-                    self.early
-                        .lock()
-                        .expect("the fixture is not poisoned")
-                        .push(line);
-                    if let Some(address) = address {
-                        return address;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!(
-                        "the daemon stopped before it said where it listens: {:?}",
-                        self.log_lines()
-                    );
-                }
+            let lines = self.log_lines();
+            if let Some(address) = lines.iter().find_map(|line| listening_address(line)) {
+                return address;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
                 panic!(
-                    "the daemon exited with {} before it said where it listens: {:?}",
-                    status.code().unwrap_or(-1),
-                    self.log_lines()
+                    "the daemon exited with {} before it said where it listens: {lines:?}",
+                    status.code().unwrap_or(-1)
                 );
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "the daemon did not say where it listens within {DEADLINE:?}: {:?}",
-                    self.log_lines()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon did not say where it listens within {DEADLINE:?}: {lines:?}"
+            );
+            thread::sleep(RETRY);
         }
     }
 
@@ -150,13 +155,12 @@ impl Service {
             if TcpStream::connect(self.address).is_ok() {
                 return;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "the daemon at {} never started accepting connections: {:?}",
-                    self.address,
-                    self.log_lines()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon at {} never started accepting connections: {:?}",
+                self.address,
+                self.log_lines()
+            );
             thread::sleep(RETRY);
         }
     }
@@ -188,23 +192,18 @@ impl Service {
             .unwrap_or_else(|error| panic!("the bytes could not be flushed: {error}"));
     }
 
-    /// Send bytes, leave the connection open, and answer the socket so a spec can half-close it.
+    /// Open a connection and answer the socket, so a spec can hold one open or half-close it.
     pub fn connect(&self) -> TcpStream {
         TcpStream::connect(self.address)
             .unwrap_or_else(|error| panic!("the ingest port refused a connection: {error}"))
     }
 
-    /// The lines the daemon has printed so far.
+    /// The lines the daemon has printed so far, in order.
     pub fn log_lines(&self) -> Vec<String> {
-        let mut lines = self
-            .early
+        self.lines
             .lock()
             .expect("the fixture is not poisoned")
-            .clone();
-        while let Ok(line) = self.lines.recv_timeout(RETRY) {
-            lines.push(line);
-        }
-        lines
+            .clone()
     }
 
     /// Wait until a line containing `needle` was printed, and answer it.
@@ -291,5 +290,5 @@ impl Drop for Service {
 /// report, which is what makes a daemon that prints the wrong thing fail with its own log quoted.
 fn listening_address(line: &str) -> Option<SocketAddr> {
     let (_, address) = line.split_once("listening on ")?;
-    address.trim().split_whitespace().next()?.parse().ok()
+    address.split_whitespace().next()?.parse().ok()
 }

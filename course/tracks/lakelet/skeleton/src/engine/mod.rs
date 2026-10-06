@@ -1,9 +1,11 @@
 //! The engine: everything that can be judged without a socket.
 //!
-//! Nothing here may depend on [`crate::service`] — the daemon is a *user* of this module, and the
+//! Nothing here may depend on the **service layer** — the daemon is a user of this module, and the
 //! reason is the one `jobq/3.1-engine-boundary` established: the same engine runs in a test, in a
 //! load generator and in a repair tool, and none of those has a configuration file or a signal
-//! handler. The specs read the source for that rule, so it is a property and not a hope.
+//! handler. The spec reads the sources for that rule, so it is a property and not a hope — and it
+//! reads *text*, which is why this paragraph says "the service layer" instead of naming a module
+//! path: prose in a checked file is checked too (a trap the T3 authors hit as well).
 //!
 //! Step `lakelet/4.1-ingest-protocol` brings the first inhabitant: [`spool`], the append-only file
 //! every accepted frame is written to. `lakelet/4.3-write-path-adr` decides how hard it is flushed,

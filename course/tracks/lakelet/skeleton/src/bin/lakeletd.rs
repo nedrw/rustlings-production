@@ -67,11 +67,17 @@ async fn run() -> Result<(), lakelet::Error> {
     tracing::info!(store = %config.store_dir.display(), "store opened");
     println!("listening on {address}");
 
-    let shutdown = async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("the SIGTERM handler is installed before any connection is accepted");
-        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("the SIGINT handler is installed before any connection is accepted");
+    // Both handlers are installed *before* the first connection is accepted, and failing to install
+    // one is a startup failure: a daemon that cannot be asked to stop is a daemon nobody can operate.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| lakelet::Error::Store {
+            source: Box::new(error),
+        })?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|error| lakelet::Error::Store {
+            source: Box::new(error),
+        })?;
+    let shutdown = async move {
         tokio::select! {
             _ = term.recv() => tracing::info!("SIGTERM"),
             _ = int.recv() => tracing::info!("SIGINT"),
