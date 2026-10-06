@@ -233,6 +233,8 @@ track 骨架的规则与 patch 的规则一样）。
    `missing_docs`/`unsafe_code`）；放 `unwrap_used` 或 `print_stdout` 会让第一条测试断言就编译不过。
 5. **闸门有两种作用域**（见 plan.md §6）：持久属性（`spec-integrity`/`fmt`/`clippy@N`/`no-todo`/`docs:public`/`exit-code`/`i18n`/`caps`）一旦引入就贯穿后续；
    步骤作用域属性（`images`/`container-repro`/`links`）只写给拥有那个产物的步骤。回归保护靠 `verify` 跑遍每步自己的闸门，不靠列表无限稀释。
+   **引入它的那一步就是它开始生效的那一步**（`?coverage@N` 从 T3·3.21 起）：想提前某个门，先读 plan.md §6 里
+   “门的起点是能力，不是日程表”那段——那里写了为什么提前是内容工作而不是配置。
 6. 闸门与 `selftest` 同步演化：`cargo xtask ci` 会跑 `kiln selftest`，所以在 CI 变绿之前，每一步都必须满足「scaffold 上必败 / 参考解上必全绿」。
    本机新增工具链依赖时（`cargo-mutants` 这类），先让 `kiln doctor` 能报出来，再把闸门写进 `track.toml`。
 
