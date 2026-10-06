@@ -5,10 +5,14 @@
 //! toolchain baseline, so a machine without them reports [`GateOutcome::blocked`] with the command
 //! that installs them (plan §10). A missing tool never fails a step.
 //!
-//! What it measures is deliberately narrow: the `.rs` files under `src/` that this step's
-//! reference-solution patch touches ([`sources::production_sources`]), not the whole crate. A single
-//! percentage over a whole library says nothing about the step — the step is one module, and that is
-//! the module whose error branches and `match` arms the specs were supposed to reach.
+//! What it measures is deliberately narrow: the `.rs` files under `src/` that this step
+//! *introduces* ([`sources::introduced_sources`] — the files its scaffold and its reference solution
+//! create), not the whole crate. A single percentage over a whole library says nothing about the
+//! step — the step is one module, and that is the module whose error branches and `match` arms the
+//! specs were supposed to reach. A file an earlier step wrote is not part of it even when this step
+//! edits it: its lines are exercised by that step's suite, so counting them would report this step's
+//! suite as bad at something it was never about (handoff M2 §5.2: `jobq/3.26-dlq-cli` read 37% over a
+//! module of other steps' files and 90% over the file it brings).
 //!
 //! The run: the step's own `run.cmd` under `RUSTFLAGS=-C instrument-coverage`, with
 //! `LLVM_PROFILE_FILE` pointing into a scratch directory; then `llvm-profdata merge -sparse`, then one
@@ -124,11 +128,11 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         return Ok(GateOutcome::blocked(ctx.missing_project()));
     };
     let track_dir = ctx.track.dir(ctx.course.root());
-    let module = sources::production_sources(&track_dir, ctx.step)?;
+    let module = sources::introduced_sources(&track_dir, ctx.step)?;
     if module.is_empty() {
         return Ok(GateOutcome::blocked(format!(
-            "{}'s reference solution touches no production source under `src/`, so there is no module \
-             to measure",
+            "{} introduces no production source under `src/` and its patch touches none, so there is \
+             no module to measure",
             ctx.step.qualified_id()
         )));
     }
