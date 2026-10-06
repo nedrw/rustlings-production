@@ -92,6 +92,13 @@ const DETAIL_LINES: usize = 8;
 /// Whole words that become another whole word when they stand alone.
 const WORDS: &[(&str, &str)] = &[("true", "false"), ("false", "true")];
 
+/// The build directory a mutant walk keeps: the copy's own, claimed for as long as it walks.
+///
+/// Shared between runs because the dependencies in it are what a walk after it reuses ([`scratch::cache`]),
+/// and claimed because a walk and any other build in one directory would be served each other's
+/// artifacts ([`scratch::claim`]).
+const TARGET_DIR: &str = "mutants-target";
+
 /// One textual change to one line of one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Mutant {
@@ -212,7 +219,19 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // different tree. The directory persists, so the baseline and the attempts after it reuse what
     // they compiled — and the copy is stamped fresh, so a build from an earlier run is never
     // mistaken for this one's.
-    let target = scratch::cache("mutants-target")?;
+    //
+    // Persisting is also why it is *claimed* first, for the whole walk: two kiln processes building
+    // in it at once would be served each other's artifacts, and the mutant verdicts would then be
+    // about another tree (see [`scratch::claim`]).
+    let Some(_claim) = scratch::claim(TARGET_DIR)? else {
+        return Ok(GateOutcome::blocked(format!(
+            "{} — two mutant walks in one build directory would serve each other's artifacts, so this \
+             gate did not build there; wait for that run to finish, or delete the file if that run is \
+             gone",
+            scratch::contended(TARGET_DIR)
+        )));
+    };
+    let target = scratch::cache(TARGET_DIR)?;
     let environment = [("CARGO_TARGET_DIR".to_owned(), target.display().to_string())];
 
     let baseline = process::run_line_with_env(&command, &copy, ctx.timeout, &environment)?;

@@ -82,6 +82,13 @@ const PROFILE: &str = ".profraw";
 /// step" and starts being "not readable".
 const IGNORED_SOURCES: &str = r"(\.cargo/registry|/rustlib/|/rustup/toolchains/)";
 
+/// The build directory an instrumented run keeps: `coverage`'s own, and claimed while it is used.
+///
+/// A different `RUSTFLAGS` is a different build, so this cannot be the directory the learner's own
+/// commands use — and it is *shared between runs* because the dependencies in it are what a run
+/// after it reuses ([`scratch::cache`], [`scratch::claim`]).
+const TARGET_DIR: &str = "coverage-target";
+
 /// The two binaries a coverage run needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tools {
@@ -177,13 +184,25 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         path: profiles.clone(),
         source,
     })?;
+    // The build directory is shared between runs, so it is claimed before anything is built and held
+    // for the whole gate: cargo picks an artifact by package *name and version*, so a second kiln
+    // process building in it would be served this run's binaries — or leave its own for this one —
+    // and the percentage would be about a tree nobody has (see [`scratch::claim`]).
+    let Some(_claim) = scratch::claim(TARGET_DIR)? else {
+        return Ok(GateOutcome::blocked(format!(
+            "{} — two coverage runs in one build directory would serve each other's artifacts, so \
+             this gate did not build there; wait for that run to finish, or delete the file if that \
+             run is gone",
+            scratch::contended(TARGET_DIR)
+        )));
+    };
     // An instrumented build gets a build directory of its own, and it *keeps* it (`scratch::cache`
     // rather than the per-run scratch): a different `RUSTFLAGS` is a different build, so sharing the
     // ordinary directory would throw away every artifact the learner's next command needs (measured:
     // a cold rebuild of this project is 22 s, and the ordinary build would pay it again). Keeping it
     // also makes the gate's own second run incremental — the copy's stamps rebuild the *package*, and
     // the dependencies, which are not in the copied tree, stay as cargo left them.
-    let target = scratch::cache("coverage-target")?;
+    let target = scratch::cache(TARGET_DIR)?;
     let environment = [
         ("RUSTFLAGS".to_owned(), instrumented()),
         ("CARGO_TARGET_DIR".to_owned(), target.display().to_string()),
