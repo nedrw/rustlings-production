@@ -1,6 +1,6 @@
 //! probe = "unsafe/budget@apply"
 //! title = "Deny by default, and write down every exception"
-//! hint = "Count the word `unsafe` in production lines only, insist on a `// SAFETY:` comment with a reason in the three lines above, and refuse a crate whose lint policy does not deny by default."
+//! hint = "Count the word `unsafe` in production lines only, insist on a `// SAFETY:` comment with a reason on one of the three lines above the use (a marker on the same line does not count), and refuse a crate whose lint policy does not deny by default."
 //!
 //! Step `jobq/3.24-unsafe-budget` is a policy expressed as three facts, and the gate that checks them
 //! is a text scan plus the compiler (handoff-m2 §1.3):
@@ -12,10 +12,11 @@
 //!    have;
 //! 2. **the budget is a number.** `unsafe-budget@0` is what `jobq/3.24` ships: zero uses in
 //!    production code, and allowing one costs a raised number and a review conversation;
-//! 3. **every use carries a reason, in the three lines above it.** `// SAFETY:` followed by *what
-//!    would break if it were wrong* — not "this is safe", not an empty marker. The comment is the
-//!    only place a future reader can find out why the `unsafe` is there, and a bare marker is a
-//!    comment that looks like evidence and says nothing.
+//! 3. **every use carries a reason, on one of the three lines above it.** `// SAFETY:` followed by
+//!    *what would break if it were wrong* — not "this is safe", not an empty marker. A marker on the
+//!    use's own line does not count and a marker below never does, because the window is the lines
+//!    *above* the use. The comment is the only place a future reader can find out why the `unsafe`
+//!    is there, and a bare marker is a comment that looks like evidence and says nothing.
 //!
 //! The rule about *which* lines count is the one that makes the number mean something: `#[cfg(test)]`
 //! modules are not production code, and an `unsafe` in a test is a different statement from an
@@ -35,12 +36,13 @@
 //! ## What the tests ask
 //!
 //! The count is the *word* `unsafe` — `unsafe_code` in a lint attribute is not a use of it. A
-//! `// SAFETY:` comment in the occurrence's own line or the three above documents it, and one four
-//! lines above does not. A bare `// SAFETY:` with no reason is not documentation, and it does not
-//! borrow a reason from further up. A `#[cfg(test)]` module is skipped wherever it is in the file,
-//! nested blocks included. Then the policy: a crate that does not deny by default cannot pass on the
-//! strength of its comments, going over the budget names the count, and the three refusals come in
-//! the order a reader fixes them — the policy, the comment, the number.
+//! `// SAFETY:` comment on one of the three lines above the occurrence documents it; a marker on the
+//! occurrence's own line does not, and neither does one four lines above. A bare `// SAFETY:` with no
+//! reason is not documentation, and it does not borrow a reason from further up. A `#[cfg(test)]`
+//! module is skipped wherever it is in the file, nested blocks included. Then the policy: a crate
+//! that does not deny by default cannot pass on the strength of its comments, going over the budget
+//! names the count, and the three refusals come in the order a reader fixes them — the policy, the
+//! comment, the number.
 //!
 //! ## Where this is honest, and where it is not
 //!
@@ -61,7 +63,8 @@
 pub struct Occurrence {
     /// Line number, counting from 1.
     pub line: u32,
-    /// Whether a `// SAFETY:` comment with a reason is in this line or the three above it.
+    /// Whether a `// SAFETY:` comment with a reason is on one of the three lines above it. A marker
+    /// on the occurrence's own line is not above it, and does not document the use.
     pub documented: bool,
     /// The reason, when there is one.
     pub safety: Option<String>,
@@ -107,9 +110,10 @@ pub enum Refused {
 /// Audit one file: every `unsafe` in its production lines, and whether each is documented.
 ///
 /// "Production lines" means everything outside a `#[cfg(test)]` module, wherever that module sits in
-/// the file. An occurrence is documented when the nearest `// SAFETY:` at or above it — within three
-/// lines — carries a reason: a bare marker is not one, and it does not fall through to an older
-/// comment, because the line a reader looks at first is the line immediately above.
+/// the file. An occurrence is documented when the nearest `// SAFETY:` among the three lines above it
+/// carries a reason: the occurrence's own line is not above it, a bare marker is not a reason, and it
+/// does not fall through to an older comment, because the line a reader looks at first is the line
+/// immediately above.
 #[must_use]
 pub fn audit(file: &str, source: &str, denies_by_default: bool) -> Audit {
     let lines: Vec<&str> = source.lines().collect();
@@ -189,9 +193,12 @@ fn word_at(line: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// The reason the nearest `// SAFETY:` at or above `index` gives, when it gives one.
+/// The reason the nearest `// SAFETY:` in the three lines above `index` gives, when it gives one.
+///
+/// Strictly above, which is the gate's window (`unsafe-budget`): the occurrence's own line is not
+/// one of the lines a reason may sit on, and a marker below it never is.
 fn reason_above(lines: &[&str], index: usize) -> Option<String> {
-    let nearest = (index.saturating_sub(3)..=index)
+    let nearest = (index.saturating_sub(3)..index)
         .rev()
         .find(|above| lines[*above].trim_start().starts_with("// SAFETY:"))?;
     let reason = lines[nearest]
@@ -449,6 +456,32 @@ unsafe fn after_the_tests() {}
                 line: 1
             }),
             "then the comment: a `// SAFETY:` below the line it is about is not above it"
+        );
+
+        // And the other end of the same window: a marker documents the lines *above* it, so one
+        // written on the occurrence's own line documents nothing. The scan counts the word wherever
+        // it is written — in the marker line itself too, which the module's stated narrowing allows
+        // — so this file holds one occurrence and the only marker anywhere near it, and the answer
+        // has to be "not documented".
+        let same_line = [audit(
+            "src/lib.rs",
+            "// SAFETY: the unsafe call below is sound\n",
+            true,
+        )];
+        assert!(
+            !same_line[0].occurrences[0].documented,
+            "the marker is on the occurrence's own line, which is not one of the three lines above \
+             it: {:?}",
+            same_line[0].occurrences
+        );
+        assert_eq!(
+            check(&same_line, 0),
+            Err(Refused::Undocumented {
+                file: "src/lib.rs".to_owned(),
+                line: 1
+            }),
+            "so the use comes back undocumented, and the refusal names the use rather than the \
+             comment"
         );
 
         let written = [audit(
