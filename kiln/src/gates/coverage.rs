@@ -21,7 +21,10 @@
 //! instrumented objects do *not* live in the ordinary build directory — a different `RUSTFLAGS` is a
 //! different build, and putting it there would make every ordinary build that follows recompile the
 //! project (measured: 22 s cold on the machine this was written on). They get a cache directory of their
-//! own, which also means the gate's second run is incremental.
+//! own, which also means the gate's second run is incremental. A project whose *own* cargo config
+//! sets `rustflags` is refused before any of that ([`configured_rustflags`]): the environment wins
+//! over the config, so the instrumented build would not be the build the learner's own commands
+//! make, and a percentage about a build nobody has is the one answer this gate must not give.
 //!
 //! "Every profile the run wrote" includes the ones its children chose ([`profiles_of_the_run`]): a
 //! suite that judges a command line starts the binary with an environment of its own (`env_clear`),
@@ -143,6 +146,20 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
             ctx.step.qualified_id()
         )));
     };
+    // A project that carries `rustflags` in its own cargo config cannot be measured here: this gate
+    // sets `RUSTFLAGS` in the child environment, cargo lets the environment win over the config, and
+    // the build would therefore not be the one the project's own commands make (see
+    // [`configured_rustflags`]). Refused before anything is built, because the alternative is a
+    // percentage about a tree nobody has.
+    if let Some((file, key)) = configured_rustflags(project) {
+        return Ok(GateOutcome::blocked(format!(
+            "{} sets `{key}`, and `RUSTFLAGS` in the environment wins over a project's cargo config \
+             — the instrumented build would have flags your own commands never use, so this gate \
+             will not report a percentage about a different build; move those flags to the command \
+             that needs them (or drop them) and run the step again",
+            file.display()
+        )));
+    }
     // The tools first: on a machine without them nothing else matters, and the answer has to be the
     // install line rather than a run nobody can measure.
     let Some(tools) = tools(project, ctx.probe_timeout()) else {
@@ -275,6 +292,63 @@ fn instrumented() -> String {
     format!("{} -C instrument-coverage", existing.trim())
         .trim()
         .to_owned()
+}
+
+/// The project's own `rustflags`, when a cargo config it carries sets any: the file, and the key.
+///
+/// [`instrumented`] puts `RUSTFLAGS` into the child environment, and cargo's rule is that the
+/// **environment wins over a project's config** — so a project that configures `[build] rustflags`
+/// (or `[target.…] rustflags`) is built by this gate with flags its own commands never use. That is
+/// not a measurement with a caveat, it is a percentage about a tree nobody has (review finding #6,
+/// handoff M2 §5.2), and the gate cannot merge two flag sets it does not understand. So the caller
+/// refuses the run instead of answering about the wrong build.
+///
+/// Cargo reads configuration from the directory its command runs in and from that directory's
+/// ancestors, which is why the project's own `.cargo/` and the `.cargo/` of the directory above it
+/// are both read: this course's projects live at `app/<track>`, one level below the repository root,
+/// so those are the two places a project of this course carries a config. Both spellings cargo
+/// accepts are looked for, and a config that cannot be read or parsed is left to cargo — it reports
+/// its own error about the file, and a gate that guessed at a broken one would answer about a build
+/// that does not exist either.
+fn configured_rustflags(project: &Path) -> Option<(PathBuf, String)> {
+    let mut directories: Vec<&Path> = vec![project];
+    if let Some(parent) = project.parent() {
+        directories.push(parent);
+    }
+    directories.into_iter().find_map(|directory| {
+        ["config.toml", "config"]
+            .iter()
+            .find_map(|name| rustflags_in(&directory.join(".cargo").join(name)))
+    })
+}
+
+/// The `rustflags` key of one cargo config file, when it has one.
+fn rustflags_in(file: &Path) -> Option<(PathBuf, String)> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let config: toml::Value = toml::from_str(&text).ok()?;
+    key_setting(&config).map(|key| (file.to_path_buf(), key))
+}
+
+/// Which key of a parsed cargo config sets `rustflags`, named the way the file writes it.
+fn key_setting(config: &toml::Value) -> Option<String> {
+    if config
+        .get("build")
+        .and_then(|build| build.get("rustflags"))
+        .is_some()
+    {
+        return Some("build.rustflags".to_owned());
+    }
+    // Every `[target.…]` entry: a triple, a `cfg(…)` expression, or a literal like `unix`. A table
+    // that names `rustflags` is a finding whether the flags are a list or a table of their own.
+    config
+        .get("target")?
+        .as_table()?
+        .iter()
+        .find_map(|(name, entry)| {
+            entry
+                .get("rustflags")
+                .map(|_| format!("target.{name}.rustflags"))
+        })
 }
 
 /// Every profile file a run wrote: the ones the gate asked for, and the ones its children chose.
@@ -760,6 +834,83 @@ mod tests {
         let error = summary("not json", Path::new("/work"), &[]).expect_err("not an export");
         assert!(error.to_string().contains("llvm-cov export"), "{error}");
         assert!(summary("{\"data\": []}", Path::new("/work"), &[]).is_ok());
+    }
+
+    #[test]
+    fn a_project_that_configures_its_own_rustflags_is_refused_not_measured() {
+        // The environment wins over the config, so an instrumented build of this project is not the
+        // build its own commands make. The gate has to *find* those flags (review finding #6) rather
+        // than report a percentage about that build.
+        let temp = TempDir::new("coverage-rustflags");
+        let project = temp.path().join("app/jobq");
+        std::fs::create_dir_all(&project).unwrap();
+        assert_eq!(
+            configured_rustflags(&project),
+            None,
+            "no `.cargo/` at all: nothing to find"
+        );
+
+        temp.write(
+            "app/jobq/.cargo/config.toml",
+            "[build]\nrustflags = [\"--cfg\", \"x\"]\n",
+        );
+        let (file, key) = configured_rustflags(&project).expect("`[build] rustflags` is found");
+        assert_eq!(key, "build.rustflags");
+        assert_eq!(file, project.join(".cargo/config.toml"));
+
+        // The other shape: a target section rather than `build`, named by a `cfg(…)` expression.
+        temp.write(
+            "app/jobq/.cargo/config.toml",
+            "[target.'cfg(unix)']\nrustflags = [\"-C\", \"opt-level=1\"]\n",
+        );
+        let (_, key) = configured_rustflags(&project).expect("a target's rustflags is found");
+        assert_eq!(key, "target.cfg(unix).rustflags");
+
+        // `config` is the other file name cargo accepts, and a table of its own under the target is
+        // a config that sets the key too.
+        std::fs::remove_file(project.join(".cargo/config.toml")).unwrap();
+        temp.write("app/jobq/.cargo/config", "[target.'cfg(unix)'.rustflags]\n");
+        let (file, key) = configured_rustflags(&project).expect("the dotted form is found too");
+        assert_eq!(key, "target.cfg(unix).rustflags");
+        assert_eq!(file, project.join(".cargo/config"));
+    }
+
+    #[test]
+    fn the_directory_above_the_project_is_read_as_well() {
+        // Cargo reads the config of the directory its command runs in and of that directory's
+        // ancestors, and this course's projects live at `app/<track>` — so a config in `app/` is one
+        // the learner's own commands use and the copy the gate builds in does not have.
+        let temp = TempDir::new("coverage-rustflags-parent");
+        let project = temp.path().join("app/jobq");
+        std::fs::create_dir_all(&project).unwrap();
+        temp.write(
+            "app/jobq/.cargo/config.toml",
+            "[build]\njobs = 4\n[alias]\ncheck = \"clippy\"\n",
+        );
+        assert_eq!(
+            configured_rustflags(&project),
+            None,
+            "keys that are not `rustflags` are not flags"
+        );
+
+        temp.write(
+            "app/.cargo/config.toml",
+            "[build]\nrustflags = \"-C target-cpu=native\"\n",
+        );
+        let (file, key) = configured_rustflags(&project).expect("the directory above sets them");
+        assert_eq!(key, "build.rustflags");
+        assert_eq!(file, temp.path().join("app/.cargo/config.toml"));
+    }
+
+    #[test]
+    fn a_config_cargo_cannot_read_is_left_to_cargo() {
+        // Not this gate's answer to give: cargo reports its own error about a file it cannot parse,
+        // and a gate that guessed at a broken one would answer about a build that does not exist
+        // either. Unreadable and unparsable are the same answer as no config at all.
+        let temp = TempDir::new("coverage-rustflags-broken");
+        let project = temp.path().join("app/jobq");
+        temp.write("app/jobq/.cargo/config.toml", "[build\nrustflags = \n");
+        assert_eq!(configured_rustflags(&project), None);
     }
 
     #[test]
