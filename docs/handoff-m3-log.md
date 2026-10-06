@@ -180,3 +180,52 @@ $ kiln run   → test result: ok. 7 passed · $ kiln check --slow → 10/10 must
 **下一步**：B1 的后两步——`4.3-write-path-adr`（`store/wal-recovery@aware`：fsync 策略作为数据 + ADR + 崩溃点表）
 与 `4.4-wal-recovery`（`store/wal-recovery@apply`：torn-write 恢复 + `slow:sim@3`，turmoil 第一次上场），
 然后给开发者一份 B1 检查点报告。
+
+## 段 6：为 4.4 提前做的 `sim` 探针（turmoil 0.7 的种子能力）
+
+**为什么先做**：`slow:sim@3` 的判据里有一条是“至少两个种子给出**不同**的 transcript”。4.4 是这条门第一次
+被真步骤用上，而“turmoil 的调度真的会随种子变吗”是设计的前提——如果它不变，4.4 的场景就只能靠**场景自己**
+的随机（自研 RNG）来造多样性，写法完全不同。所以先拿一个一次性探针在 `/private/tmp/simprobe` 里测掉
+（不是课程内容，不进仓库）。
+
+**探针是什么**：4.4 场景的缩影——一个 store 宿主在模拟网络上应答，3 个 writer 各自往返 4 次，
+transcript 记下每个事件的观察顺序与**模拟**时钟；用 `turmoil::Builder::new().rng_seed(seed).enable_random_order()`
+建场景，同一场景跑两遍（同种子）与三个种子各跑一遍。
+
+**原始结论行**（`/private/tmp/simprobe`，`cargo test -q --offline -- --nocapture`，0.02 s）：
+
+```
+same seed: 94288898bf44b93b == 94288898bf44b93b
+--- transcript under seed 1 (first run) ---
+store 100
+store 200
+writer2 200 acked 200 at 28ms
+writer1 100 acked 100 at 31ms
+…（共 24 行）
+seed 1 vs seed 7: 24 vs 24 line(s), first difference at Some(1)
+  seed 1: store 200
+  seed 7: store 0
+digests: [94288898bf44b93b, 84a6e3eaa0081a1d, 6c741d597ac261f3] · distinct: 3
+```
+
+三个种子给出三个不同的 transcript（≥2 满足），同一个种子逐字节重放（transcript 的**顺序**就是种子决定的）。
+
+**探针测出来的四件事（写进 4.4 的作业书）**：
+
+1. **种子入口是 `Builder::rng_seed(u64)`**（`turmoil 0.7.2`，`src/builder.rs`）：它同时决定模拟网络的消息
+   延迟（默认 0–100 ms 的指数分布）与**tokio 运行时的任务顺序**（`src/rt.rs` 把同一个种子交给
+   `tokio::runtime::RngSeed`）；`enable_random_order()` 再把“多节点按随机顺序推进”打开。两者都要，否则
+   transcript 可能对种子不敏感。
+2. **用 `turmoil::net::{TcpListener, TcpStream}`，不要用 `tokio::net::*`**：用 tokio 的类型必须先
+   `enable_tokio_io()`，而那之后就落到真地址上——探针实测 `10.0.0.2:7000` → `AddrNotAvailable`、
+   `0.0.0.0:7000` → `AddrInUse`。turmoil 的写法是宿主 `bind("0.0.0.0:PORT")`、客户端按**宿主名**连
+   （`TcpStream::connect(("store", 7000))`），名字由模拟 DNS 解析。
+3. **transcript 只能用“模拟量”拼**：`tokio::time::Instant` 的 `Debug`/`Display` 里带着**真实**单调钟的基准，
+   所以 `format!("{now:?}")` 让同一个种子产出两份不同的 transcript（实测
+   `14487320894099136627` vs `17704257869642287446`）；改成 `Instant::now() - started`（模拟的 `Duration`）
+   之后同种子逐字节一致。**这正是 `slow:sim@3` 的“同种子重放”要抓的东西**，4.4 的 TRAP 该点名它。
+4. **装置要打印 `<track>-sim …` 行**（`lakelet-sim flush segment=7 records=128`）：`kiln` 的 transcript 就是
+   这些行**按顺序**（`harness::transcript` 按前缀筛、去掉尾部空行），digest 是它的前 8 个十六进制字符。
+   顺序就是判据，别排序、别只打印汇总数。
+
+**下一步**：4.3 交付后按这份契约写 4.4 的作业书（`slow:sim@3` + `slow:mutants@80` + `slow:?coverage@80`）。
