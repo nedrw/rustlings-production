@@ -783,3 +783,39 @@ fn the_page_states_the_change_the_plan_and_the_rate() {
          procedure the middle phase exists for"
     );
 }
+
+/// A change whose batch size is zero still advances.
+///
+/// `with_batch(0)` is what somebody types when they mean "let the system decide", and the answer is
+/// one row a batch: a plan that made batches of no rows would be a loop that never advances, and the
+/// deadline below is what turns that into a failure a reader can act on rather than a judge that
+/// waits for its own timeout.
+#[test]
+fn a_plan_for_a_zero_batch_still_advances() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let plan = Change::new(TABLE, COLUMN, COMPUTED, queue())
+            .with_batch(0)
+            .with_interval(Duration::seconds(INTERVAL_SECONDS))
+            .plan(ROWS, now());
+        let _ = sender.send((plan.len(), plan.rows(), plan.burst()));
+    });
+    let (batches, rows, burst) = receiver.recv_timeout(std::time::Duration::from_secs(5)).expect(
+        "a plan for a zero batch has to finish: a width of no rows is a loop that never advances, \
+         and a migration that hangs is worse than one that refuses",
+    );
+    assert_eq!(
+        batches, ROWS as usize,
+        "one row a batch is the only width that both advances and stays inside the row the change \
+         is meant to keep small"
+    );
+    assert_eq!(
+        rows, ROWS,
+        "and every row is in exactly one of those batches"
+    );
+    assert_eq!(
+        burst, 1,
+        "the rate is unchanged by the width: one batch due per interval, so the plan stays a \
+         trickle rather than a burst"
+    );
+}

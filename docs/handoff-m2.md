@@ -625,6 +625,10 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 | `delivery/dlq@operate`（3.16） | 与 `ops-dlq-tooling.apply` 同一步同一件事 |
 | `ops/runbook-drill@design`（3.27） | 证据是一页文档 + 对它的评审，探针只能查步骤表的形状 |
 
+**已补的两道**（原表里没有题的槽位，后来补上了）：`obs/metrics-slo@design`、`obs/structured-logs@design`、
+`obs/tracing-propagation@operate`、`db/schema-online-evolution@apply`、`delivery/idempotency@design`（题库扩到 40），
+以及 `ops/dlq-tooling@operate`（题库扩到 **41**，题目 `ops-dlq-tooling.operate`：一页一页地跑那份程序）。
+
 ### 5.2 其他
 
 - **durable 那一半套件需要 `--features postgres`，这是设计而不是缺陷。** 15 个 spec target 里有 9 个按设计点名
