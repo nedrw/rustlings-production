@@ -11,13 +11,13 @@
 //! the module whose error branches and `match` arms the specs were supposed to reach.
 //!
 //! The run: the step's own `run.cmd` under `RUSTFLAGS=-C instrument-coverage`, with
-//! `LLVM_PROFILE_FILE` pointing into a scratch directory; then `llvm-profdata merge -sparse`, then
-//! `llvm-cov export --summary-only` over the test binaries cargo produced. Both the profiles and the merged
-//! data are removed with the scratch directory when the gate ends. The instrumented objects do *not*
-//! live in the ordinary build directory — a different `RUSTFLAGS` is a different build, and putting it
-//! there would make every ordinary build that follows recompile the project (measured: 22 s cold on the
-//! machine this was written on). They get a cache directory of their own, which also means the gate's
-//! second run is incremental.
+//! `LLVM_PROFILE_FILE` pointing into a scratch directory; then `llvm-profdata merge -sparse`, then one
+//! `llvm-cov export --summary-only` per object cargo linked, folded into one number ([`Coverage`]).
+//! Both the profiles and the merged data are removed with the scratch directory when the gate ends. The
+//! instrumented objects do *not* live in the ordinary build directory — a different `RUSTFLAGS` is a
+//! different build, and putting it there would make every ordinary build that follows recompile the
+//! project (measured: 22 s cold on the machine this was written on). They get a cache directory of their
+//! own, which also means the gate's second run is incremental.
 //!
 //! The run happens in a **copy** of the project, stamped fresh ([`sandbox::copy_project`]), and that is
 //! a correctness rule rather than tidiness: cargo keys a build slot by package *name and version* rather
@@ -31,10 +31,16 @@
 //! rebuild (handoff M2 §1.3). The build directory stays the gate's own, so the ordinary build the
 //! learner's next command needs is untouched either way.
 //!
+//! Only the objects *this run* linked are read ([`executables`]), and each is read on its own: the
+//! profile's files have to be this copy's, and the answer about a file has to come from the object that
+//! carries it — an `export` of several binaries at once is a document about none of them (measured, see
+//! the comments there).
+//!
 //! Facts about the machine are reported as blocks, not failures: no tools, no profile data, no test
 //! binary, an unreadable export, or an instrumented spec run that did not pass would each mean a
 //! number that describes something other than the learner's code.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -206,35 +212,45 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
             deps.display()
         )));
     }
-    // Every executable this run left, at once: the objects carry one coverage mapping each, and
-    // `llvm-cov` reads them together with the merged profile.
-    let mut export_args: Vec<String> = vec![
-        "export".to_owned(),
-        "--summary-only".to_owned(),
-        // Only this tree's own files. The document otherwise carries every dependency's sources and
-        // the toolchain's, which is both noise the gate filters out anyway and — measured — more than
-        // kiln's own 256 KiB capture cap: a truncated document is an export this gate cannot read at
-        // all, and the flag is the difference between a measurement and a parse error.
-        "--ignore-filename-regex".to_owned(),
-        IGNORED_SOURCES.to_owned(),
-        "--instr-profile".to_owned(),
-        lossy(&merged),
-    ];
-    export_args.extend(objects.iter().map(|object| lossy(object)));
-    let exported = process::run(
-        &lossy(&tools.cov),
-        &borrowed(&export_args),
-        &measured,
-        ctx.timeout,
-    )?;
-    if !exported.success() {
-        return Ok(GateOutcome::blocked(format!(
-            "`llvm-cov export --summary-only` could not read this run's profile:\n    {}",
-            output_detail(&exported)
-        )));
+    // One `llvm-cov export` per object, folded together here: see [`Coverage::absorb`]. Handing them
+    // all to a single `export` is not an equivalent shortcut — that is the call shape for one binary
+    // split into several object files, and with several *binaries* it silently loses the files only
+    // some of them carry (measured: the module of `jobq/3.22-bench-budget` is `src/engine/budget.rs`,
+    // which is linked into that step's spec binary and into none of the crate's three bins, so the
+    // export answered "the profile has no executable line for the step's module" for a step whose
+    // suite covers that module 64/64).
+    let mut coverage = Coverage::default();
+    for object in &objects {
+        let export_args: Vec<String> = vec![
+            "export".to_owned(),
+            "--summary-only".to_owned(),
+            // Only this tree's own files. The document otherwise carries every dependency's sources
+            // and the toolchain's, which is both noise the gate filters out anyway and — measured —
+            // more than kiln's own 256 KiB capture cap: a truncated document is an export this gate
+            // cannot read at all, and the flag is the difference between a measurement and a parse
+            // error.
+            "--ignore-filename-regex".to_owned(),
+            IGNORED_SOURCES.to_owned(),
+            "--instr-profile".to_owned(),
+            lossy(&merged),
+            lossy(object),
+        ];
+        let exported = process::run(
+            &lossy(&tools.cov),
+            &borrowed(&export_args),
+            &measured,
+            ctx.timeout,
+        )?;
+        if !exported.success() {
+            return Ok(GateOutcome::blocked(format!(
+                "`llvm-cov export --summary-only` could not read this run's profile against {}:\n    {}",
+                object.display(),
+                output_detail(&exported)
+            )));
+        }
+        coverage.absorb(summary(&exported.stdout, &measured, &module)?);
     }
 
-    let coverage = summary(&exported.stdout, &measured, &module)?;
     Ok(judge(required, &coverage, &module, &measured))
 }
 
@@ -306,24 +322,55 @@ fn executables(directory: &Path, since: SystemTime) -> Vec<PathBuf> {
     found
 }
 
-/// One line coverage number over the step's module.
+/// One line coverage number over the step's module, gathered from every object the run left.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Coverage {
-    /// Executable lines in the module's files.
-    lines: u64,
-    /// Lines the run executed.
-    covered: u64,
-    /// The module's files the export had data for.
-    files: Vec<String>,
-    /// Module line(s) the export named *outside* the copy this run measured.
+    /// The module's files the exports had data for, with the counts of the object that covered each
+    /// of them most (see [`Coverage::absorb`]).
+    files: BTreeMap<String, Lines>,
+    /// Module line(s) the exports named *outside* the copy this run measured.
     ///
     /// This used to be a guard against a number from another sandbox (cargo keys a build slot by
     /// package name and version, so a tree that had built before this one could answer here). The
-    /// run now builds in a copy of this step's own tree, stamped fresh, so there is no other tree
-    /// left to answer; what is counted here is a fault rather than a foreign measurement — a path
-    /// that ends with the module's name and does not live in the copy, which means the profile came
-    /// from something other than this run.
+    /// run now builds in a copy of this step's own tree, stamped fresh, and is read back against the
+    /// objects *that run* linked, so there is no other tree left to answer; what is counted here is a
+    /// fault rather than a foreign measurement — a path that ends with the module's name and does not
+    /// live in the copy, which means the profile came from something other than this run.
     foreign: u64,
+}
+
+impl Coverage {
+    /// Executable lines in the module's files.
+    fn lines(&self) -> u64 {
+        self.files.values().map(|lines| lines.count).sum()
+    }
+
+    /// Lines of them the run executed.
+    fn covered(&self) -> u64 {
+        self.files.values().map(|lines| lines.covered).sum()
+    }
+
+    /// Fold another object's view of the module into this one.
+    ///
+    /// The same file is compiled into every object that links the code it belongs to: a library file
+    /// is in the crate's bins *and* in the test binaries, and each of them says something different
+    /// about it — a binary that was built and never run reports every line of it uncovered, and no two
+    /// compilations of one file map the same lines (the test build has the file's own `#[cfg(test)]`
+    /// code, a bin's copy has whatever the linker kept). The best view wins: the one that covered the
+    /// file most, and among those the one whose mapping is most complete (`(covered, count)`, so an
+    /// uncovered file is counted as the file the run's build holds rather than as the part of it one
+    /// object happened to keep). Summing the views instead would count the file once per object:
+    /// `src/lib.rs` is one small file and four objects, and a percentage over four copies of it is not
+    /// a number about anything.
+    fn absorb(&mut self, other: Self) {
+        self.foreign += other.foreign;
+        for (file, lines) in other.files {
+            let seen = self.files.entry(file).or_insert(lines);
+            if (lines.covered, lines.count) > (seen.covered, seen.count) {
+                *seen = lines;
+            }
+        }
+    }
 }
 
 /// What an `llvm-cov export --summary-only` document carries.
@@ -358,8 +405,8 @@ struct Summary {
     lines: Lines,
 }
 
-/// Line counts.
-#[derive(Debug, Deserialize)]
+/// Line counts of one file.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 struct Lines {
     /// Lines that could be executed.
     count: u64,
@@ -367,7 +414,7 @@ struct Lines {
     covered: u64,
 }
 
-/// Line coverage of the step's module, out of an export document.
+/// Line coverage of the step's module, out of one object's export document.
 ///
 /// `measured` is the root the profile's files have to live under — the copy this run built in — and
 /// `module` holds the step's files as paths relative to it.
@@ -395,11 +442,7 @@ fn summary(document: &str, measured: &Path, module: &[String]) -> Result<Coverag
             coverage.foreign += 1;
             continue;
         }
-        coverage.lines += file.summary.lines.count;
-        coverage.covered += file.summary.lines.covered;
-        if !coverage.files.iter().any(|seen| seen == relative) {
-            coverage.files.push(relative.clone());
-        }
+        coverage.files.insert(relative.clone(), file.summary.lines);
     }
     Ok(coverage)
 }
@@ -417,9 +460,10 @@ fn resolved(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The gate's answer, from what the export says about the module.
+/// The gate's answer, from what the exports say about the module.
 fn judge(required: u32, coverage: &Coverage, module: &[String], measured: &Path) -> GateOutcome {
-    if coverage.lines == 0 && coverage.foreign > 0 {
+    let (lines, covered) = (coverage.lines(), coverage.covered());
+    if lines == 0 && coverage.foreign > 0 {
         return GateOutcome::blocked(format!(
             "the profile names {} line(s) of this step's module outside the copy this run measured \
              ({}), so the instrumented build was not this run's: every file of that copy is stamped \
@@ -431,17 +475,17 @@ fn judge(required: u32, coverage: &Coverage, module: &[String], measured: &Path)
             module.join(", ")
         ));
     }
-    if coverage.lines == 0 {
+    if lines == 0 {
         return GateOutcome::blocked(format!(
             "the profile has no executable line for the step's module ({}), so coverage cannot be \
              measured — the spec run's binaries do not carry this module's coverage data",
             module.join(", ")
         ));
     }
-    let measured = coverage.covered * 100 / coverage.lines;
+    let percent = covered * 100 / lines;
     let unmeasured: Vec<&str> = module
         .iter()
-        .filter(|relative| !coverage.files.iter().any(|seen| seen == *relative))
+        .filter(|relative| !coverage.files.contains_key(*relative))
         .map(String::as_str)
         .collect();
     let note = if unmeasured.is_empty() {
@@ -449,18 +493,21 @@ fn judge(required: u32, coverage: &Coverage, module: &[String], measured: &Path)
     } else {
         format!(" (no data for {})", unmeasured.join(", "))
     };
-    if coverage.covered * 100 >= u64::from(required) * coverage.lines {
+    if covered * 100 >= u64::from(required) * lines {
         return GateOutcome::passed(format!(
-            "{} of {} line(s) of this step's module are covered ({measured}% ≥ {required}%){note}",
-            coverage.covered, coverage.lines
+            "{covered} of {lines} line(s) of this step's module are covered ({percent}% ≥ \
+             {required}%){note}"
         ));
     }
     GateOutcome::failed(format!(
-        "line coverage of this step's module is {measured}% ({} of {} line(s)), below the \
+        "line coverage of this step's module is {percent}% ({covered} of {lines} line(s)), below the \
          {required}% this step asks for — the suite reaches {} and misses the rest{note}",
-        coverage.covered,
-        coverage.lines,
-        coverage.files.join(", ")
+        coverage
+            .files
+            .keys()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(", ")
     ))
 }
 
@@ -507,9 +554,9 @@ mod tests {
     fn only_the_steps_module_counts_towards_its_coverage() {
         let module = ["src/store.rs".to_owned(), "src/queue.rs".to_owned()];
         let coverage = summary(EXPORT, Path::new(MEASURED), &module).expect("the fixture reads");
-        assert_eq!(coverage.lines, 40, "main.rs is not part of this step");
-        assert_eq!(coverage.covered, 34);
-        assert_eq!(coverage.files, ["src/store.rs"]);
+        assert_eq!(coverage.lines(), 40, "main.rs is not part of this step");
+        assert_eq!(coverage.covered(), 34);
+        assert_eq!(coverage.files.keys().collect::<Vec<_>>(), ["src/store.rs"]);
 
         let passed = judge(80, &coverage, &module, Path::new(MEASURED));
         assert_eq!(passed.outcome, Outcome::Passed);
@@ -526,13 +573,49 @@ mod tests {
     }
 
     #[test]
+    fn the_best_view_of_a_file_is_the_one_that_counts() {
+        // What several objects of one run say about one file: the library is linked into every
+        // binary, a binary that was built and never run reports all of it uncovered, and no two
+        // compilations map the same lines (the test build holds the file's own `#[cfg(test)]` code,
+        // a bin's copy whatever the linker kept). The file is counted once, as the best view of it.
+        let view = |count: u64, covered: u64| {
+            let document = EXPORT.replace(
+                "\"count\": 40, \"covered\": 34",
+                &format!("\"count\": {count}, \"covered\": {covered}"),
+            );
+            summary(&document, Path::new(MEASURED), &["src/store.rs".to_owned()])
+                .expect("the fixture reads")
+        };
+        let exercised = view(40, 34);
+        let smaller = view(30, 0);
+        let built_only = view(40, 0);
+
+        let mut coverage = built_only.clone();
+        coverage.absorb(exercised.clone());
+        assert_eq!(coverage.lines(), 40, "one file, counted once");
+        assert_eq!(coverage.covered(), 34, "the view that ran is the one kept");
+
+        // A view that covered nothing does not win over one that did, and among the views that
+        // covered nothing the most complete mapping of the file is the one that counts — a
+        // compilation that kept less of the file is not a smaller file.
+        let mut coverage = smaller.clone();
+        coverage.absorb(built_only.clone());
+        assert_eq!((coverage.lines(), coverage.covered()), (40, 0));
+
+        let mut coverage = exercised;
+        coverage.absorb(built_only);
+        coverage.absorb(smaller);
+        assert_eq!((coverage.lines(), coverage.covered()), (40, 34));
+    }
+
+    #[test]
     fn a_module_named_outside_the_copy_is_reported_as_a_fault_not_as_a_number() {
         // What the copy turns from a routine answer into a fault: the same file name, one directory
         // over — a profile that cannot come from the run this gate made.
         let foreign = EXPORT.replace(MEASURED, "/work/other-sandbox/project");
         let module = ["src/store.rs".to_owned()];
         let coverage = summary(&foreign, Path::new(MEASURED), &module).expect("the fixture reads");
-        assert_eq!(coverage.lines, 0);
+        assert_eq!(coverage.lines(), 0);
         assert_eq!(coverage.foreign, 1);
 
         let outcome = judge(1, &coverage, &module, Path::new(MEASURED));
@@ -548,7 +631,7 @@ mod tests {
     fn a_module_with_no_data_is_blocked_not_passed() {
         let coverage = summary(EXPORT, Path::new(MEASURED), &["src/other.rs".to_owned()])
             .expect("the fixture reads");
-        assert_eq!(coverage.lines, 0);
+        assert_eq!(coverage.lines(), 0);
         let outcome = judge(
             1,
             &coverage,
