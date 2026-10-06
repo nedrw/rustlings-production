@@ -166,7 +166,11 @@ cargo 按**包名+版本**选构建槽、不按目录，所以插桩目录里可
   `RUSTFLAGS="-C instrument-coverage"`（拼在项目自己的 flags 后，不覆盖）+ `LLVM_PROFILE_FILE` 跑本步 `run.cmd`，
   `llvm-profdata merge -sparse`，然后**对这次运行链接的每个 object 各做一次 `llvm-cov export --summary-only`**
   （`--ignore-filename-regex` 只留本棵树），同一文件取「覆盖最多、其次映射最全」的那份视图，
-  只判**本步模块**（= 本步参考解补丁碰过的生产 `.rs` 文件）的行覆盖 ≥ N%。
+  只判**本步模块**的行覆盖 ≥ N%。**模块 = 这一步「带进来的」东西**（`sources::introduced_sources`）：
+  它的 scaffold 或参考解**新建**的 `src/**.rs`；一步什么都没新建时（只改学员已有的文件）回退到补丁碰过的文件。
+  理由与另一门的分工写在一起：`coverage` 问的是“这一步的套件有没有走到这一步自己的代码”，而更早步骤写下的文件不是这一步的代码——
+  它的行走不到由那一步的套件负责（实测：`jobq/3.26-dlq-cli` 的旧口径 37%，未覆盖的 1071 行里 1015 行在 `postgres.rs`/`memory.rs`/`cli/mod.rs`，
+  换成“带进来的模块”后是 94%）；`mutants` 则故意保留“补丁碰过的整份文件”（采样得宽是它的目的，§1.3 的 mutants 一节与 §5.2）。
 - **子进程写的数据也算这次的**：规格若用 `env_clear` 启动真二进制（`jobq/3.15`、`jobq/3.26` 就是这样判“命令行”的——脚本看到什么环境是接口的一部分），
   那个子进程看不到 `LLVM_PROFILE_FILE`，LLVM 会把 profile 写进**它的工作目录**，也就是这次测量的那棵树里。
   门把这些 `.profraw` 一起 merge（`profiles_of_the_run`），并且 `sandbox::copy_project` **不复制** `.profraw`
@@ -480,8 +484,8 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.23 `13/13` · 3.24 `12/12` · 3.25 `13/13` · 3.26 `15/15` · 3.27 `13/13` must gates，全部 `hold the contract`（3.23 曾因共享构建槽在 `conformance@2` 上假红，根因见 §5.2，已修） |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`**。2026-10-06（coverage 改动落地后）我复跑一次：**exit 0 · 8 m 41.0 s**，八个 `mutants` 走法与上表逐条一致；再把**子进程的 profile** 算进来后复跑：**exit 0 · 8 m 23.8 s**，3.26 的模块由 918/2438 变 **1367/2438**（见 §5.2 的 ⑧） |
-| 七个 `slow:?coverage@80`（副本 + 逐 object 导出 + 子进程 profile 的实现） | 3.21 **100%**（204/204）、3.22 **100%**（64/64，修前是 `blocked`）、3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）都 ≥80%；**3.26 56%（1367/2438）低于它自己声明的 80%**（修前 37%，其中它自己的文件 `src/cli/dlq.rs` 被报成 0/199）——剩下的缺口是 `src/cli/**` 与 `src/engine/store/*` 里更早步骤拥有的代码，见 §5.2 的待定项（should 门，不影响 `clean`） |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`**。2026-10-06（coverage 改动落地后）我复跑一次：**exit 0 · 8 m 41.0 s**，八个 `mutants` 走法与上表逐条一致；再把**子进程的 profile** 算进来后复跑：**exit 0 · 8 m 23.8 s**，3.26 的模块由 918/2438 变 **1367/2438**（见 §5.2 的 ⑧）；模块改成“本步带进来的”后又跑一次：**exit 0 · 8 m 33.1 s · 没有一条 should 是红的** |
+| 七个 `slow:?coverage@80`（副本 + 逐 object 导出 + 子进程 profile + 「本步带进来的模块」） | 3.21 **100%**（204/204）、3.22 **100%**（64/64，修前是 `blocked`）、3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.26 **94%**（307/325，模块收窄前是 37%/56%，见 §5.2）、3.27 **85%**（121/141）——**七个全过，没有一条 should 是红的** |
 | 默认特性全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
@@ -718,7 +722,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
   ② ~~`ops/dlq-tooling@operate` 的同深度探题~~ **已补**（`ops-dlq-tooling.operate`，题库 41 道）；
   ③ ~~`coverage` 的插桩构建跑进项目副本~~ **已做**（2026-10-06，提交 `fa8f996` + `44bbc52`，见下一条）；
-  ④ **待用户定：3.26 的 `slow:?coverage@80` 在参考解上红（⑧ 修后是 56%）**，见下文与 §4.2。
+  ④ ~~待用户定：3.26 的 `slow:?coverage@80` 在参考解上红~~ **已定并已做**（2026-10-06，用户选方案 ③，提交 `7c6bcb4`）：模块改成“本步带进来的文件”，3.26 从 56% 变 **94%**，见下文。
 - **`coverage` 的真缺陷（都已修，八条）**。第一批（`b37e5e2` + `8f7363e`，2026-10）：
    ① 门把 `rustc` 探针跑在临时目录，那里 `rust-toolchain.toml` 不生效 → 问的是默认工具链，于是为 pinned 工具链装了工具的机器上永远 `blocked`（更糟：默认工具链恰有工具时会用**另一个 LLVM**读 profile）；
    ② `llvm-cov export` 在 LLVM 22 里是 `--summary-only`，不是 `--summary`；
@@ -742,15 +746,13 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）、**3.26 由 37%（918/2438）到 56%（1367/2438）**（⑧ 的功劳，见下）。
   两个数字变化都不是调参：3.21 的旧值来自「多二进制一次导出」配上的一个**没跑过的** bin 的视图（同一个文件三个视图是 204/204、197/131、165/204）；
   3.26 的分母由 2345 变 2438，因为旧值是合并调用对同一批文件的混合映射，而新值按「一个文件只数一次」相加。
-- **待用户定：3.26 的 coverage 与「模块 = 补丁碰过的整份文件」这条规则冲突。** 3.26 的补丁要碰 `src/cli/mod.rs`、
-  `src/engine/store/{memory,postgres,mod}.rs`、`src/engine/operator.rs`，而那些文件的绝大部分行是**更早的步骤**拥有的、只由那几步的规格驱动，
-  所以这一步的模块到不了 80%（⑧ 修完是 **56%**：它自己的文件 `src/cli/dlq.rs` **181/199 = 90%**，而剩下 1071 行未覆盖里有 1015 行
-  落在 `postgres.rs`（528）、`memory.rs`（255）、`cli/mod.rs`（232）这三个更早步骤拥有的大文件里；数字是真的，不是缺陷）。三个选项：
-  ① 保持现状，把这件事写进 3.26 的正文（学员会看到一条永远红的 should 行）；
-  ② 让**步骤自己声明模块**（元数据给出文件清单，默认仍是补丁碰过的文件；`lint-caps` 校验它是补丁文件的子集），3.26 声明 `src/cli/dlq.rs` 等；
-  ③ 把 coverage 的模块收窄成「这一步**新建**的文件；没有新建时回退到碰过的文件」（3.26 → `src/cli/dlq.rs`）。
-  **我建议 ②**：它是唯一能推广到 M3 的规则（M3 的步骤同样会改共享文件），而 ③ 会把“只改共享文件”的步骤的度量留空。
-  在用户定之前按现状记录：`verify` 的 `clean: true` 不受 should 门影响，3.26 的 must 门全绿。
+- **coverage 的模块改成“这一步带进来的文件”（用户 2026-10-06 选方案 ③，提交 `7c6bcb4`）**：`sources::introduced_sources` 取
+  **scaffold 或参考解新建**的 `src/**.rs`；什么都没新建时回退到补丁碰过的文件。`mutants` 故意不变（还是补丁碰过的整份文件）——
+  它问的是“套件会不会发现行为被改坏”，采样得宽就是它的目的（3.26 那三条补上的用例就来自只被它改过的文件）。
+  效果（尾巴树 `verify jobq --slow` → exit 0 · 8 m 33.1 s）：3.26 **307/325 = 94%**（模块 = `src/engine/operator.rs`（scaffold 新建）
+  + `src/cli/dlq.rs`（参考解新建）），七个 coverage 门全过、**没有一条 should 是红的**；其余六步的数字不变
+  （它们的模块本来就≈它们新建的那一个文件，只是不再带 `src/engine/mod.rs`）。
+  留给 M3 的一向：只改共享文件、什么都不新建的步骤会退回到旧口径（它是一步 should 门，而且 M3 的作者可以自己声明一个不同形状的步骤）。
 - **3.23 的 `slow:mutants@80` 已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
   存活变异体是 `schema.rs:238:36` 的 `self.batch.max(1)`（`1` → `0`），症状是**死循环**；新用例把 `plan()` 放进带上限的线程里（5 s 截止），
   于是一个“永不推进的宽度”变成**失败的断言**而不是挂死——强制把阈值提到 `@101` 复核时读到 `0 of 6 mutant(s) survived (100% killed)`。
