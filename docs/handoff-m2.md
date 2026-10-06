@@ -65,7 +65,7 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 | `no-todo` / `docs:public` | 同一套 clippy 机制（不同 `-D` 集合） | 与上一行共享产物 | 同上 |
 | `slow:conformance@2` | 同一条 `run.cmd` 跑两遍（memory + postgres） | 0.2 s + 7.5 s ≈ **8 s** | 每个 durable 用例自己起一个容器 |
 | `slow:bench-budget@P` | 跑预算命令一次 | 一次构建 + 跑 ≈ 2.5 s + 基准自身时间 | 一次 cargo |
-| `slow:?coverage@N` | 带 `-C instrument-coverage` 的构建 + 分析 | 本机 blocked（无 llvm-tools）；若真跑：一次冷重建 **22 s**（现在有自己的目录，见下） | 一次完整重建 |
+| `slow:?coverage@N` | 复一份项目（实测 23 ms）→ 在副本里带 `-C instrument-coverage` 跑本步 `run.cmd` → merge → 对**这次链接的每个 object** 各一次 `llvm-cov export` | **1.5–2.5 s/步**（7 个 coverage 步；整条 27 步 `verify --slow` 8 m 40.0 s → 8 m 50.8 / 8 m 57.3 s，我复核一次 8 m 41.0 s） | 复制 + 一次**包**重建（依赖留在缓存里：依赖 rlib 的时间戳跨步不变）+ 每 object 一次 export（~60 ms） |
 | `slow:mutants@N` | 基线 1 次 + 最多 12 次尝试 + 收尾 1 次，每次都重建+链接+跑 | 走完 12 次尝试 **60 s**（≈ 5 s/次，含一次卡死被 25 s 拒掉） | 尝试次数 × 一次 cargo |
 
 一个 `selftest` 的固定成本 ≈ 首次建项目 + 快门那 10 项（合计约 15 s）：热缓存下 3.5（11 个门）**19.7 s**、
@@ -77,6 +77,12 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 换 `RUSTFLAGS` 就是换一次构建，以前它用沙箱共享目录，会把普通构建的产物扔掉（下一步命令付 22 s）；
 现在它在 `<cache>/kiln/coverage-target` 里建，第二次跑还是增量的。这靠 `process::prepared` 的一条规则：
 **调用方点名的 `CARGO_TARGET_DIR` 优先于沙箱默认值**（沙箱共享目录是默认值，不是命令）。
+
+**`coverage` 在项目的副本里构建、而不是原地**（提交 `kiln(coverage): the instrumented build runs in a copy of the
+project` + `kiln(coverage): read this run's objects, one export each`，2026-10-06）：理由与 `mutants` 同一条——
+cargo 按**包名+版本**选构建槽、不按目录，所以插桩目录里可能是**另一个沙箱**留下的二进制，它记的是那棵树的行数。
+复制 + 盖时间戳（`gates/sandbox.rs`，两个门共用；副本也把工具链 pin 带进去）让产物只能是这次运行的。
+这条修好后 3.22 才有数字；副本还逼出另外几个真缺陷（路径按解析后比较、逐 object 导出、只读这次运行的 object），见 §5.2。
 
 **`mutants@N`（慢，限本步模块）**
 
@@ -153,10 +159,23 @@ M1 留下的环境事实全部继续有效（worktree 里不许生成 `target/`�
 
 **`coverage@N`（慢，should）**
 
-- 工具链里找 `llvm-profdata`/`llvm-cov`（`rustc --print sysroot` + `lib/rustlib/<host>/bin/`）。
-- 找到：`RUSTFLAGS="-C instrument-coverage"` + `LLVM_PROFILE_FILE` 跑本步 `run.cmd`，merge 后导出
-  `--summary`，只判**本步模块**（= 本步参考解补丁碰过的生产 `.rs` 文件）的行覆盖 ≥ N%。
-  找不到：`blocked` + `rustup component add llvm-tools-preview`。
+- 工具链里找 `llvm-profdata`/`llvm-cov`（`rustc --print sysroot` + `lib/rustlib/<host>/bin/`）；两个 `rustc` 问题
+  都在**项目目录**里问（`rust-toolchain.toml` 只在项目所在的目录树上生效）。找不到：`blocked` +
+  `rustup component add llvm-tools-preview`（`MISSING` 是这条指令的原文）。
+- 找到：项目先被复制成一份**盖过时间戳**的副本（`gates/sandbox.rs`），在副本里用
+  `RUSTFLAGS="-C instrument-coverage"`（拼在项目自己的 flags 后，不覆盖）+ `LLVM_PROFILE_FILE` 跑本步 `run.cmd`，
+  `llvm-profdata merge -sparse`，然后**对这次运行链接的每个 object 各做一次 `llvm-cov export --summary-only`**
+  （`--ignore-filename-regex` 只留本棵树），同一文件取「覆盖最多、其次映射最全」的那份视图，
+  只判**本步模块**（= 本步参考解补丁碰过的生产 `.rs` 文件）的行覆盖 ≥ N%。
+- 三条正确性规则（都不是整洁问题）：① **副本 + 时间戳**——共享槽里别的沙箱的插桩二进制会拿**别的树**的行数回答
+  （实测 3.22 因此 `blocked`，而它的套件其实覆盖了那个模块 64/64）；② **逐 object 导出**——把多个二进制一次交给
+  `llvm-cov export` 是「一个二进制的多个 object」的调用形状，会丢掉只有部分二进制携带的文件，并按它碰巧配上的
+  那个 object 回答一个文件；③ **只读这次运行链接的 object**（`target/debug/deps` 里可执行且 `mtime ≥ 运行前一刻`），
+  因为插桩目录是跨步共享的。
+- 副本也带走**工具链 pin**（向上找最近的 `rust-toolchain.toml`），否则副本用机器默认工具链编译、却用 pinned 工具链的
+  `llvm-cov` 读 profile。
+- 路径按**解析后**的形式比较（`/var` 与 `/private/var` 是同一个文件）：编译期烘进 object 的是解析后的路径，
+  按文本前缀比会把门自己副本的文件判成“别的树”。模块路径落在副本外**且**一行也没测到时给 `blocked`（这是故障，不是数字）。
 
 ### 1.4 must 慢闸门在 CI 里怎么可复现
 
@@ -303,7 +322,8 @@ app/jobq/
   （cargo 按包名+版本选构建槽，否则最后一个变异体二进制会发给学员自己的下一次 `cargo test`）；
   ② 沙箱副本的文件时间戳要往前推一秒（`fs::copy` 会带原时间戳，cargo 判新鲜度后默默用陈旧二进制）；
   ③ `coverage` 的「工具在位」路径**在本机没有端到端验证过**（`llvm-tools-preview` 未装）：集成测试断言
-  的是诚实的 `blocked` + 安装行，测量逻辑用合成文档单位测试。
+  的是诚实的 `blocked` + 安装行，测量逻辑用合成文档单位测试。（**2026-10 已解决**：装上组件、测量路径端到端跑通，
+  过程中修掉两批共七个真缺陷，见 §5.2；集成测试现在要求 `Passed | Failed` **且报告里带一个 `%`**。）
 - **重建 `dead_letters` 与 `replay` 是端口的事，且语义已被 3.16 钉死**（提交 `course(jobq/3.16-dlq-tooling)`）：
   死信不是一个新表，是 `failed` 里的行（`dead_letters()` 返回一个 `JobFilter` 视图，不是取行口）；重放是
   **另一个生命**而不是一次状态迁移（`transition` 里没有这个目的地，合法）；`revived(job, now)` 是唯一算术：
@@ -456,12 +476,13 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest`（每步两遍，第二遍全新缓存） | 3.1 `8/8` · 3.2 `9/9` · 3.3 `9/9` · 3.4 `9/9` · 3.5 `11/11` · 3.6 `11/11` · 3.7 `11/11` · 3.8 `9/9` · 3.9 `11/11` · 3.10 `9/9` · 3.11 `11/11` · 3.12 `11/11` · 3.13 `10/10` · 3.14 `10/10` · 3.15 `10/10` · 3.16 `11/11` · 3.17 `10/10` · 3.18 `10/10` · 3.19 `9/9` · 3.20 `10/10` · 3.21 `11/11` · 3.22 `12/12` · 3.23 `13/13` · 3.24 `12/12` · 3.25 `13/13` · 3.26 `15/15` · 3.27 `13/13` must gates，全部 `hold the contract`（3.23 曾因共享构建槽在 `conformance@2` 上假红，根因见 §5.2，已修） |
-| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`** |
+| 全步判定 | 在 `skip` 出的尾巴树上 `kiln verify jobq --slow --json` → **`{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`**（22 步 3 m 17 s、23 步 6 m 1 s、24 步 5 m 15 s、25/26 步 5–6 m、27 步 5 m 级；3.25 的 `mutants` `6/6` 38 s、3.26 `6/6` 26 s、3.27 `6/6` 13 s）。六个步骤的 `slow:conformance@2` 都是 `2 backend(s) pass the same suite: memory ✓, postgres ✓`；**3.20 的 `slow:mutants@80` 是 `6/6 mutant(s) killed (100%, needs ≥80%) (the walk took 9s)`**。2026-10-06（coverage 改动落地后）我复跑一次：**exit 0 · 8 m 41.0 s**，八个 `mutants` 走法与上表逐条一致 |
+| 七个 `slow:?coverage@80`（副本 + 逐 object 导出的实现） | 3.21 **100%**（204/204）、3.22 **100%**（64/64，修前是 `blocked`）、3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）都 ≥80%；**3.26 37%（918/2438）低于它自己声明的 80%**——模块含 `src/cli/**` 与 `src/engine/store/*` 里更早步骤拥有的代码，见 §5.2 的待定项（should 门，不影响 `clean`） |
 | 默认特性全量套件 | `cargo test -p jobq` → **210 passed · 0 failed**（81 → 99 → 116 → 134 → 154 → 164 → 173 → 187 → 199 → 210）|
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
-| 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **84 page(s) · 449 link(s) · 279 external target(s)**，`✓ every target resolves`；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
-| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）|
+| 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **87 page(s) · 464 link(s) · 283 external target(s)**，`✓ every target resolves`（2026-10-06 复核时的数字）；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
+| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）|
 
 ### 4.3 验收演练（已做两腿，原始输出）
 
@@ -642,7 +663,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   留给 M2 之后（3.24/3.25 的步骤书里不要再把它当成缺陷重报）。
 - **`kiln verify <track>` 判的是 `app/<track>` 里的真实项目**：worktree 里没有 `app/` 时逐个报
   `app/jobq does not exist yet`（`0/0 judged`）。取“全步判定”的数字要先铺树（§4.1 的第 1 步），再在那棵树里跑；
-  本次是 15/15。
+  本次是 **27/27**（§4.2）。
 - **历史噪声未清理**：`9d9cceb..` 之间曾有 5 个 `wip(...)` staging 提交（作业者拿提交当检查点），最终树干净、补丁可
   精确重现；要发布就把那 9 个提交压成两个步骤提交——**未经确认不要重写 `main`**（它会同步到用户主检出）。
 - **真缺陷（已修，提交 `jobq(3.9): the cap bounds the rows a claim takes, not just the count`）**：**durable 的每队列在飞上限（cap）没有真正限住一次领取的行数**。`postgres.rs` 的 cap 判据是
@@ -691,13 +712,35 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 - **M2 收尾（已做完的）**：验收演练五条腿全有原始行（§4.3）；`cargo xtask ci` → exit 0（`27/27 step(s) hold the contract`，32 m 12 s）；
   `docs/t3-jobq.md` 已写（与 `t1-mailer.md`/`t2-relay.md` 同构）；`README.md` 的 track 表与 Status、`plan.md` §11、`curriculum.md` §8 的数字已同步。
 - **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
-  ② ~~`ops/dlq-tooling@operate` 的同深度探题~~ **已补**（`ops-dlq-tooling.operate`，题库 41 道）；③ **`coverage` 测量路径已跑通**（装了 `llvm-tools-preview`），并找出四个真缺陷（`kiln(coverage)` 两笔）：
+  ② ~~`ops/dlq-tooling@operate` 的同深度探题~~ **已补**（`ops-dlq-tooling.operate`，题库 41 道）；
+  ③ ~~`coverage` 的插桩构建跑进项目副本~~ **已做**（2026-10-06，提交 `fa8f996` + `44bbc52`，见下一条）；
+  ④ **待用户定：3.26 的 `slow:?coverage@80` 在参考解上红（37%）**，见下文与 §4.2。
+- **`coverage` 的两批真缺陷（都已修）**。第一批（`b37e5e2` + `8f7363e`，2026-10）：
    ① 门把 `rustc` 探针跑在临时目录，那里 `rust-toolchain.toml` 不生效 → 问的是默认工具链，于是为 pinned 工具链装了工具的机器上永远 `blocked`（更糟：默认工具链恰有工具时会用**另一个 LLVM**读 profile）；
    ② `llvm-cov export` 在 LLVM 22 里是 `--summary-only`，不是 `--summary`；
    ③ 导出文档含所有依赖源码 → 超过 kiln 的 256 KiB 读取上限 → 截断后解析失败；现在只留本棵树（`--ignore-filename-regex`）；
-   ④ 共享构建槽让插桩结果来自**另一个沙箱** → 现在守卫：模块路径不落在本棵树内判 `blocked` 并说明，而不是给别的树的百分比。
-   **第一份真实覆盖数字**（should 门）：3.21 **80%**（165/204 刚好在线）、3.23 **100%**、3.24 **95%**、3.25 **87%**、3.27 **85%**、**3.26 只有 36%（847/2345，模块含 `src/cli/**` 而规格驱动的是库那层）**、3.22 `blocked`。
-   **待做**：让插桩构建跑在项目副本里（像 mutants），共享槽就彻底不参与。
-  ④ 3.23 的 `slow:mutants@80` **已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
-     存活变异体是 `schema.rs:238:36` 的 `self.batch.max(1)`（`1` → `0`），症状是**死循环**；新用例把 `plan()` 放进带上限的线程里（5 s 截止），
-     于是一个“永不推进的宽度”变成**失败的断言**而不是挂死——强制把阈值提到 `@101` 复核时读到 `0 of 6 mutant(s) survived (100% killed)`。
+   ④ 共享构建槽让插桩结果来自**另一个沙箱** → 当时加了守卫（模块路径不落在本棵树内判 `blocked` 并说明），第五个缺陷把它变成故障检查。
+   **第一批数字**（should 门）：3.21 **80%**（165/204 刚好在线）、3.23 **100%**、3.24 **95%**、3.25 **87%**、3.27 **85%**、3.26 只有 36%（847/2345）、3.22 `blocked`。
+  第二批（`fa8f996` + `44bbc52`，2026-10-06，子 agent 施工、我独立复核）：
+   ⑤ **共享槽**：插桩构建搬进项目的**副本**（`gates/sandbox.rs`，与 `mutants` 共用：复制 + 盖时间戳 + 带工具链 pin），共享槽从此不参与；
+      3.22 的 `blocked` 随之消失——它的模块 `src/engine/budget.rs` 是这一步**新建**的文件，而旧产物来自没有它的那棵树（这是第一批 ④ 的真正修法）。
+   ⑥ **路径要按解析后的形式比**：编译器记的是**解析后**的路径（`/var/folders` → `/private/var/folders`），而守卫按**文本**前缀比，于是门把自己副本的文件判成“别的树”
+      （集成测试一直被迫接受 `blocked` 就是这个原因）。
+   ⑦ **多个二进制一次 `llvm-cov export`** 是「一个二进制的多个 object」的调用形状——它会丢掉只有部分二进制携带的文件（3.22 的 `budget.rs`），
+      并让同一个文件按它碰巧配上的那个 object 回答；同理，共享目录里**历次运行**的插桩产物也会被配到这次的 profile 上（报出一棵已删除的树，全未覆盖）。
+      现在逐 object 导出、同一文件取「覆盖最多、其次映射最全」的那份视图，且只读**这次运行**链接的 object（`mtime ≥ 运行前一刻`）。
+  **修后的数字**（我复跑 `verify jobq --slow --json`：exit 0 · 8 m 41.0 s，与施工者两次 8 m 50.8 / 8 m 57.3 s 逐条一致）：3.21 **100%**（204/204）、3.22 **100%**（64/64）、
+  3.23 **100%**（237/237）、3.24 **95%**（205/215）、3.25 **87%**（293/334）、3.27 **85%**（121/141）、**3.26 37%（918/2438）**。
+  两个数字变化都不是调参：3.21 的旧值来自「多二进制一次导出」配上的一个**没跑过的** bin 的视图（同一个文件三个视图是 204/204、197/131、165/204）；
+  3.26 的分母由 2345 变 2438，因为旧值是合并调用对同一批文件的混合映射，而新值按「一个文件只数一次」相加。
+- **待用户定：3.26 的 coverage 与「模块 = 补丁碰过的整份文件」这条规则冲突。** 3.26 的补丁要碰 `src/cli/mod.rs`、
+  `src/engine/store/{memory,postgres,mod}.rs`、`src/engine/operator.rs`，而那些文件的绝大部分行是**更早的步骤**拥有的、只由那几步的规格驱动，
+  所以这一步的模块天然到不了 80%（37% 是真实数字，不是缺陷；`mutants` 那边同样的粒度问题是靠给 3.26 的规格补用例解决的，见 §1.3）。三个选项：
+  ① 保持现状，把这件事写进 3.26 的正文（学员会看到一条永远红的 should 行）；
+  ② 让**步骤自己声明模块**（元数据给出文件清单，默认仍是补丁碰过的文件；`lint-caps` 校验它是补丁文件的子集），3.26 声明 `src/cli/dlq.rs` 等；
+  ③ 把 coverage 的模块收窄成「这一步**新建**的文件；没有新建时回退到碰过的文件」（3.26 → `src/cli/dlq.rs`）。
+  **我建议 ②**：它是唯一能推广到 M3 的规则（M3 的步骤同样会改共享文件），而 ③ 会把“只改共享文件”的步骤的度量留空。
+  在用户定之前按现状记录：`verify` 的 `clean: true` 不受 should 门影响，3.26 的 must 门全绿。
+- **3.23 的 `slow:mutants@80` 已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
+  存活变异体是 `schema.rs:238:36` 的 `self.batch.max(1)`（`1` → `0`），症状是**死循环**；新用例把 `plan()` 放进带上限的线程里（5 s 截止），
+  于是一个“永不推进的宽度”变成**失败的断言**而不是挂死——强制把阈值提到 `@101` 复核时读到 `0 of 6 mutant(s) survived (100% killed)`。
