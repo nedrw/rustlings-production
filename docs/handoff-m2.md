@@ -692,4 +692,6 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   `docs/t3-jobq.md` 已写（与 `t1-mailer.md`/`t2-relay.md` 同构）；`README.md` 的 track 表与 Status、`plan.md` §11、`curriculum.md` §8 的数字已同步。
 - **M2 收尾（仍未做/未定）**：① 历史上那 5 个 `wip(...)` staging 提交要不要压掉（**要用户确认**，会重写 `main`）；
   ② `ops/dlq-tooling@operate` 的同深度探题（要么补一道，要么在 §5.1 写明为什么没有）；③ `coverage` 装上 `llvm-tools-preview` 后那条测量路径的端到端验证；
-  ④ 3.23 的 `slow:mutants@80` 83% 要不要补一条断言（过线但在边上）。
+  ④ ~~3.23 的 `slow:mutants@80` 83%~~ **已补到 100%**（提交 `course(jobq/3.23): a plan for a zero batch still advances`）：
+     存活变异体是 `schema.rs:238:36` 的 `self.batch.max(1)`（`1` → `0`），症状是**死循环**；新用例把 `plan()` 放进带上限的线程里（5 s 截止），
+     于是一个“永不推进的宽度”变成**失败的断言**而不是挂死——强制把阈值提到 `@101` 复核时读到 `0 of 6 mutant(s) survived (100% killed)`。
