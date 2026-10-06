@@ -1,0 +1,291 @@
+diff --git a/docs/adr/0001-write-path.md b/docs/adr/0001-write-path.md
+new file mode 100644
+index 0000000..ec821f9
+--- /dev/null
++++ b/docs/adr/0001-write-path.md
+@@ -0,0 +1,33 @@
++# 0001 — <the decision in one line, as a sentence somebody could disagree with>
++
++- **Status:** accepted (step `lakelet/4.3-write-path-adr`)
++- **Context:** the decision lives in [`src/engine/wal/policy.rs`](../../src/engine/wal/policy.rs) as
++  `Policy`, the write path that obeys it is [`src/engine/spool.rs`](../../src/engine/spool.rs), and
++  the crashes it accepts are [docs/crash-points.md](../crash-points.md).
++
++## Decision
++
++<Which policy this build ships, spelled exactly the way `Policy::describe()` spells it, and what that
++promises a client. The number belongs in this paragraph: a reader must not be able to take the promise
++without it.>
++
++### The measurement
++
++<The machine, the date, the raw command and its output, and the arithmetic that turns the measurement
++into the number above. A number without its derivation is a preference, and the derivation is what
++lets the next person disagree with it.>
++
++## Alternatives
++
++<Every answer that lost, and the reason it lost — one paragraph each. The other policies are
++alternatives; so is any mechanism you considered and rejected. An alternative that "seemed worse" is
++not a reason; say what it costs.>
++
++## Consequences
++
++<What this decision makes true, what it costs, and what a later step has to keep true because of it.>
++
++## What would make us revisit this
++
++<The measurement that would change the answer, and the contract that would move the number. Not "if it
++turns out to be wrong": which number, and what it would have to be.>
+diff --git a/docs/crash-points.md b/docs/crash-points.md
+new file mode 100644
+index 0000000..42d8ac0
+--- /dev/null
++++ b/docs/crash-points.md
+@@ -0,0 +1,52 @@
++# Crash points: what is on the device when a client has been told "stored"
++
++`Spool::append` answers a client once the record is written and readable. This page is the rest of that
++sentence: it lists every way the store can stop, and says for each one what is on the device, what
++recovery will see, which policy loses what, and what the operator ends up explaining. The decision
++these points belong to is [docs/adr/0001-write-path.md](adr/0001-write-path.md), which names the policy
++this build ships; the policies themselves are [`Policy`](../src/engine/wal/policy.rs) and the call that
++bounds every window below is [`Spool::sync`](../src/engine/spool.rs).
++
++Two words are used precisely, and most arguments about this are really arguments about them:
++
++- **written** — the bytes are in the operating system's page cache, any reader on this machine sees
++  them, and a process death does not take them;
++- **durable** — a flush this store asked for was answered by the device.
++
++| # | the crash | which policies lose what |
++| - | --------- | ------------------------ |
++| 1 | the process dies | |
++| 2 | the machine dies | |
++| 3 | the machine dies mid-write | |
++| 4 | the directory entry was never flushed | |
++| 5 | the flush itself fails | |
++| 6 | the process stops cleanly | |
++
++### 1 — The process dies after the write and before any sync
++
++<What is on the device, what recovery sees, which policies lose what here, and what the operator
++observes. The first two points on this page differ only in *which* thing died, and the difference is
++the whole point of the page.>
++
++### 2 — The machine dies after the write and before any sync
++
++<Same four questions. Name the policies and the bound each one puts on the loss.>
++
++### 3 — The machine dies during a write (a torn record)
++
++<Same four questions. Say what the last record looks like on the device, and what a reader can and
++cannot tell about it without a checksum.>
++
++### 4 — The file's data is durable but its directory entry is not
++
++<Same four questions. Say which write makes a store *exist* for a reader, and which one does not.>
++
++### 5 — The flush itself fails (the device, not the store)
++
++<Same four questions. Say what "acknowledged" turns into when the device answers a flush with an error,
++and what the store has to stop claiming.>
++
++### 6 — The process stops cleanly (SIGTERM, and what "clean" is worth)
++
++<Same four questions. A clean stop is not a crash — say what it does and does not put on the device,
++and which window survives into the reboot that follows it.>
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index c81a6f0..3d0aeea 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -18,6 +18,9 @@ pub mod spool;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.3-write-path-adr`: the decision about when the write path waits for the device,
++// as a value the code carries and the documents name.
++pub mod wal;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/wal/mod.rs b/src/engine/wal/mod.rs
+new file mode 100644
+index 0000000..7363bbb
+--- /dev/null
++++ b/src/engine/wal/mod.rs
+@@ -0,0 +1,22 @@
++//! The write-ahead side of the store: what the engine keeps when the process that wrote it is gone.
++//!
++//! Step `lakelet/4.3-write-path-adr` opens this module with its first inhabitant, [`policy`]: the
++//! answer to "when does the write path wait for the device?", as a value the code carries and the
++//! documents name. `lakelet/4.4-wal-recovery` is what turns the append-only file [`Spool`] writes
++//! into a *log* — segments, a checksum per record, replay up to the boundary the write path
++//! promised — and it declares its modules in the block below.
++//!
++//! The decision, the measurement behind it and the crash points it accepts are
++//! `docs/adr/0001-write-path.md` and `docs/crash-points.md`. This module is the value half of them,
++//! which is what makes the table and the build unable to drift apart.
++//!
++//! [`Spool`]: crate::engine::Spool
++
++// The modules a later step adds are declared inside this block: a scaffold may only write inside a
++// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
++// (docs/authoring.md §5).
++// kiln:scaffold:begin
++pub mod policy;
++
++pub use policy::{Losses, Policy};
++// kiln:scaffold:end
+diff --git a/src/engine/wal/policy.rs b/src/engine/wal/policy.rs
+new file mode 100644
+index 0000000..cbc8ccd
+--- /dev/null
++++ b/src/engine/wal/policy.rs
+@@ -0,0 +1,146 @@
++//! When the write path waits for the device — as a value, because a decision nobody can point at is
++//! a decision nobody keeps.
++//!
++//! Step `lakelet/4.3-write-path-adr`. An ingest accepts a record and answers the client that sent
++//! it; between those two facts sits a choice with a number attached: how long the store may hold an
++//! acknowledged record in the operating system's page cache before it is on the device. This module
++//! is that choice as code — [`Policy`], the three answers, and [`Losses`], what each of them gives up
++//! when the *machine* stops. (A process that dies loses none of it: the kernel still holds the bytes
++//! and the file is intact. Every word in this module about losing is about the host, or the device,
++//! which is the case that makes the policy a decision.)
++//!
++//! Two properties are why this is a module and not a match arm somewhere:
++//!
++//! * **the decision is a value** — [`Policy::DEFAULT`] is what this build does, [`Policy::ALL`] is
++//!   what it can be asked for, and [`Policy::parse`] is how a document spells one;
++//! * **the decision is checkable against its own argument** — every policy answers what it loses, and
++//!   `docs/crash-points.md` has to name every policy in `ALL`. Drift between the table an operator
++//!   reads and the value the build ships is the failure this shape exists to prevent.
++//!
++//! The argument itself — what one durable write costs on the machine this was measured on, why the
++//! default interval is the number it is, and what each policy accepts losing — is
++//! `docs/adr/0001-write-path.md`. If that page and this module disagree, the module wins and the page
++//! is a bug; the step's spec is what holds the two together.
++//!
++//! Every body below is this step's work. The doc comments are the contract the step's spec and
++//! documents hold the work to, including the two constants: what this build *does* and what it can be
++//! asked for are decisions, not defaults somebody else already made.
++
++use crate::error::Error;
++
++/// When the write path waits for the device.
++///
++/// Every answer here is a price and a loss, and the two are one fact seen from two sides: the more
++/// often the store waits, the less a machine death can take and the less work the store gets done.
++/// Each variant's own documentation owes both sentences, with the number this machine measured —
++/// that documentation is what the crash-point list is written against and what an operator reads.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Policy {
++    /// Wait inside every append, before answering the client.
++    ///
++    /// Document what this costs — how often the store waits for the device, with the cost of one
++    /// wait measured on this machine — and what it loses, which is the question this variant's
++    /// counterpart below answers.
++    PerRecord,
++
++    /// Wait at most once per `millis`, eliding the flush while the interval has not passed.
++    ///
++    /// Document what this costs (a flush per interval: a duty cycle rather than a per-record tax)
++    /// and what it loses (a window of acknowledged writes, bounded by this number).
++    Interval {
++        /// The most time an acknowledged record may sit unflushed, in milliseconds.
++        millis: u64,
++    },
++
++    /// Never wait; the operating system flushes when it decides to.
++    ///
++    /// Document what this costs (nothing at the write path — which is the trap) and what it loses
++    /// (everything written since a flush nobody in this process asked for).
++    Never,
++}
++
++/// What a policy gives up when the **machine** stops — the half of the decision a table can hold.
++///
++/// The variants answer the question `Policy::losses` has to answer for every policy, in a form a
++/// document and a spec can both compare: nothing, a window that is known, and a window nobody can
++/// bound. The variants are the shape; which policy maps to which is the step's work.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Losses {
++    /// Nothing that was acknowledged. A policy with this answer has already waited for the device,
++    /// so a machine death takes only what no client was told about.
++    Nothing,
++    /// A window of acknowledged writes, bounded by `millis` of them.
++    BoundedBy {
++        /// The interval the policy waits at most, in milliseconds.
++        millis: u64,
++    },
++    /// Everything written since the last flush the operating system made on its own schedule.
++    EverythingSinceTheLastFlush,
++}
++
++impl Policy {
++    /// Every policy this build can be asked for.
++    ///
++    /// The list is the enum's public shape: a policy that exists but is not here cannot be named by a
++    /// document, and a policy that is here owes a unique [`Policy::name`]. A policy this build can be
++    /// asked for and that is missing from this list is the drift the step's spec looks for, in both
++    /// directions — the crash-point list has to name every policy in here, and nothing else.
++    pub const ALL: &'static [Policy] = &[Policy::PerRecord, Policy::Never];
++
++    /// What this build does when nothing says otherwise.
++    ///
++    /// The value below is the tempting answer and not the decision: waiting for the device inside
++    /// every append is safe and is a store that cannot keep up with an ingest, and never waiting is a
++    /// store nobody can defend. Replace it with the policy you can argue for from a measurement, and
++    /// put the argument, the raw command and the numbers in `docs/adr/0001-write-path.md` — the
++    /// step's spec checks that this constant and that page name the same policy.
++    pub const DEFAULT: Policy = Policy::PerRecord;
++
++    /// The kind of policy, as a document or a log line names it.
++    ///
++    /// Stable on purpose: the crash-point table, the decision record and a reviewer's `grep` all
++    /// spell a policy this way, so the string is part of the API rather than a display choice. The
++    /// spec reads these strings out of the two documents by them.
++    #[must_use]
++    pub fn name(&self) -> &'static str {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// The whole policy, including the number an interval carries.
++    ///
++    /// The spelling a document uses when the *number* matters (an interval carries its `millis` in
++    /// it; the other two answers are spelled exactly as [`Policy::name`] spells them), and the
++    /// spelling [`Policy::parse`] has to read back.
++    #[must_use]
++    pub fn describe(&self) -> String {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// Read a policy back from [`Policy::describe`]'s spelling.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when `text` is not a policy this build knows, with a sentence naming the
++    /// ones it does: a store that quietly falls back to a default on a typo is a store whose
++    /// durability cannot be read off its configuration, and `Error::Invalid` is what tells a caller
++    /// this was the value's fault rather than the store's.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        let _ = text;
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// What this policy gives up when the machine stops.
++    #[must_use]
++    pub fn losses(&self) -> Losses {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++
++    /// `true` when an append has waited for the device before it answered.
++    ///
++    /// The flag a caller branches on, and the other view of [`Policy::losses`]: a policy that loses
++    /// acknowledged records is a policy that did not wait for them.
++    #[must_use]
++    pub fn syncs_per_record(&self) -> bool {
++        todo!("step lakelet/4.3-write-path-adr")
++    }
++}

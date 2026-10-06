@@ -145,7 +145,7 @@ gates = [
     "exit-code",
     "links",
 ]
-hint = "The decision is a value in the code (`WalPolicy`) and a sentence in `docs/adr/0001-write-path.md`, and the spec checks that the two agree: the crash-point table says what each policy loses, and the enum says which one this build uses."
+hint = "The decision is a value in the code (`Policy`) and a sentence in `docs/adr/0001-write-path.md`, and the spec checks that the two agree: the crash-point table says what each policy loses, and the enum says which one this build uses."
 
 [[step]]
 id = "4.4-wal-recovery"

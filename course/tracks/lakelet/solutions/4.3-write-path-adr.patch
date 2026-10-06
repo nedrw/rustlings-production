@@ -1,0 +1,842 @@
+diff --git a/docs/adr/0001-write-path.md b/docs/adr/0001-write-path.md
+index ec821f9..eb45e71 100644
+--- a/docs/adr/0001-write-path.md
++++ b/docs/adr/0001-write-path.md
+@@ -1,33 +1,267 @@
+-# 0001 — <the decision in one line, as a sentence somebody could disagree with>
++# 0001 — An acknowledged record is on the device within 50 ms
+ 
+ - **Status:** accepted (step `lakelet/4.3-write-path-adr`)
+ - **Context:** the decision lives in [`src/engine/wal/policy.rs`](../../src/engine/wal/policy.rs) as
+-  `Policy`, the write path that obeys it is [`src/engine/spool.rs`](../../src/engine/spool.rs), and
+-  the crashes it accepts are [docs/crash-points.md](../crash-points.md).
++  `Policy` (`Policy::DEFAULT` is `interval(50ms)`), the write path that obeys it is
++  [`src/engine/spool.rs`](../../src/engine/spool.rs), and the crashes this accepts are
++  [docs/crash-points.md](../crash-points.md). The number below was measured, not chosen: the raw
++  command and its output are in this record.
+ 
+ ## Decision
+ 
+-<Which policy this build ships, spelled exactly the way `Policy::describe()` spells it, and what that
+-promises a client. The number belongs in this paragraph: a reader must not be able to take the promise
+-without it.>
++The store waits for the device **at most once every 50 ms**. `Policy::DEFAULT` is
++`Policy::Interval { millis: 50 }`, which is the same value in the spelling the code, the log line and
++this page share: `interval(50ms)`.
++
++What that means for a client: when `Spool::append` answers, the record is written and readable, and it
++is on the device **within 50 ms** of that answer, or the store has failed. What it means for an
++operator: a machine death can take at most 50 ms of acknowledged writes with it, and a *process* death
++can take none at all (the page cache and the file survive it, which is why `docs/crash-points.md`
++distinguishes the two).
++
++The other two answers in `Policy::ALL` are the two this decision is between, and both lose:
++
++- `per-record` waits for the device inside every append. It loses nothing to a machine death, and it
++  caps the store at **about 240 records/s** on the machine measured here (4.173 ms per durable write),
++  which is not a telemetry ingest;
++- `never` never waits. It costs the write path nothing and gives up an unbounded window: whatever the
++  kernel had not written when the machine stopped, which is a number nobody can tell a client
++  afterwards.
+ 
+ ### The measurement
+ 
+-<The machine, the date, the raw command and its output, and the arithmetic that turns the measurement
+-into the number above. A number without its derivation is a preference, and the derivation is what
+-lets the next person disagree with it.>
++**Machine:** `Mac14,2` (Apple M2, 8 cores), macOS 26.6.2 (build 25G83), APFS, rustc 1.98.1.
++**Date:** 2026-10-06. **What was measured:** the write path's own calls — open the file in append
++mode, write a 4-byte length and a 37-byte payload, close it, then flush, which is the shape
++`Spool::append` and `Spool::sync` spend.
++
++The raw command, in a throwaway crate under `/private/tmp` with its own target directory:
++
++```sh
++mkdir -p /private/tmp/fsync-probe/src && cd /private/tmp/fsync-probe
++cat > Cargo.toml <<'EOF'
++[package]
++name = "fsync-probe"
++version = "0.1.0"
++edition = "2024"
++
++[workspace]
++EOF
++cat > src/main.rs <<'EOF'
++use std::io::Write;
++use std::path::Path;
++use std::time::Instant;
++
++const PAYLOAD: usize = 37;
++const SAMPLES: usize = 2000;
++
++const SYNC_ALL: &str = "sync_all";
++const SYNC_DATA: &str = "sync_data";
++const RAW_FSYNC: &str = "fsync";
++
++unsafe extern "C" {
++    fn fsync(fd: i32) -> i32;
++}
++
++fn append(path: &Path, payload: &[u8]) {
++    let mut file = std::fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(path)
++        .expect("open");
++    file.write_all(&(payload.len() as u32).to_le_bytes())
++        .expect("length");
++    file.write_all(payload).expect("payload");
++}
++
++fn flush(path: &Path, how: &str) {
++    let file = std::fs::OpenOptions::new()
++        .write(true)
++        .open(path)
++        .expect("open for flush");
++    match how {
++        SYNC_ALL => file.sync_all().expect("sync_all"),
++        SYNC_DATA => file.sync_data().expect("sync_data"),
++        // The call Apple's manual says may return before the drive has the bytes.
++        _ => {
++            use std::os::fd::AsRawFd;
++            let result = unsafe { fsync(file.as_raw_fd()) };
++            assert_eq!(result, 0, "fsync failed");
++        }
++    }
++}
++
++fn report(what: &str, mut micros: Vec<u128>) {
++    micros.sort_unstable();
++    let total: u128 = micros.iter().sum();
++    println!(
++        "{what}: n={} mean={}us p50={}us p95={}us p99={}us",
++        micros.len(),
++        total / micros.len() as u128,
++        micros[micros.len() / 2],
++        micros[micros.len() * 95 / 100],
++        micros[micros.len() * 99 / 100],
++    );
++}
++
++fn main() {
++    let payload: Vec<u8> = (0..PAYLOAD).map(|i| i as u8).collect();
++    let root = Path::new("/private/tmp/fsync-probe/data");
++    let _ = std::fs::remove_dir_all(root);
++    std::fs::create_dir_all(root).expect("directory");
++
++    // One record at a time, waiting for the device: what `Policy::PerRecord` pays.
++    for how in [SYNC_ALL, SYNC_DATA, RAW_FSYNC] {
++        let path = root.join(format!("{how}.log"));
++        let mut sample = Vec::with_capacity(SAMPLES);
++        for _ in 0..SAMPLES {
++            let started = Instant::now();
++            append(&path, &payload);
++            flush(&path, how);
++            sample.push(started.elapsed().as_micros());
++        }
++        report(&format!("append + {how}, one record at a time"), sample);
++    }
++
++    // Writing without waiting for anything: what the write path itself costs.
++    let never = root.join("never.log");
++    let mut sample = Vec::with_capacity(SAMPLES);
++    for _ in 0..SAMPLES {
++        let started = Instant::now();
++        append(&never, &payload);
++        sample.push(started.elapsed().as_micros());
++    }
++    report("append only, no flush", sample);
++
++    // A window's worth of records, then one flush: what an interval policy pays.
++    let batched = root.join("batched.log");
++    let mut sample = Vec::with_capacity(SAMPLES / 20);
++    for _ in 0..SAMPLES / 20 {
++        let started = Instant::now();
++        for _ in 0..20 {
++            append(&batched, &payload);
++        }
++        flush(&batched, SYNC_ALL);
++        sample.push(started.elapsed().as_micros());
++    }
++    report("append 20 records, then one sync_all", sample);
++}
++EOF
++CARGO_TARGET_DIR=/private/tmp/fsync-probe-target cargo run -q --release
++```
++
++Its output, verbatim:
++
++```text
++append + sync_all, one record at a time: n=2000 mean=4173us p50=4075us p95=5045us p99=5369us
++append + sync_data, one record at a time: n=2000 mean=4152us p50=4074us p95=4980us p99=5132us
++append + fsync, one record at a time: n=2000 mean=52us p50=45us p95=86us p99=158us
++append only, no flush: n=2000 mean=19us p50=18us p95=24us p99=34us
++append 20 records, then one sync_all: n=100 mean=5051us p50=5041us p95=6932us p99=7080us
++```
++
++Read out: **one durable record costs 4.173 ms** (median 4075 µs), writing without waiting costs 19 µs
++(an earlier pass on the same machine measured 40 µs, so treat the write path's own cost as tens of
++microseconds), and flushing once per 20 records costs 5051 µs for the batch — of which 4.7 ms is the
++flush and the rest is the twenty appends.
++
++The `fsync` line is the reason this record spends a paragraph on which call was measured. Rust's
++`sync_all` and `sync_data` both take ~4.2 ms here, because on macOS both end in a call that waits for
++the device (`F_FULLFSYNC`; Apple's manual is explicit that plain `fsync` is allowed to return with the
++bytes still in the drive's cache). A raw `fsync(2)` returns in **52 µs** — eighty times faster, and it
++is not durability. A store that measures `fsync` and calls the result "one device flush" measures the
++wrong syscall, and then derives a number that is wrong in the direction that loses data.
++
++### The derivation
++
++One flush costs 4.173 ms, so an interval `I` spends `4.173 / I` of one thread on durability and bounds
++a machine-death loss to `I` milliseconds of acknowledged writes. This record commits to one rule:
++**the device may own at most a tenth of the wall clock**, which needs `I >= 41.7 ms`; rounded up to a
++number a human says out loud, that is **50 ms**:
++
++- **cost:** at most 20 flushes/s, about 83 ms of every second — 8% of one thread, on a store that also
++  parses frames, writes files and answers queries;
++- **loss:** at most 50 ms of acknowledged writes. At the 19 µs this run measured for a bare append
++  that is about 2,600 records (1,250 if the append really costs 40 µs); for a client scraping every
++  15 s it is whatever arrived inside one measure interval, and the alternative — `never` — is *every*
++  write since the last flush the kernel felt like making.
++
++Rejected numbers, and why: **1 ms** would ask the device to flush more often than it can flush, which
++makes the interval a `per-record` policy with a lie in its name; **200 ms** is defensible but loses
++four measure intervals' worth of writes to buy 2% more CPU; **10 ms** is the compromise nobody asked
++for — worse than `per-record` on cost and worse than 50 ms on loss. The measured number is the input
++and the choice of a tenth is a judgement, which is why both are written here where they can be
++disagreed with.
+ 
+ ## Alternatives
+ 
+-<Every answer that lost, and the reason it lost — one paragraph each. The other policies are
+-alternatives; so is any mechanism you considered and rejected. An alternative that "seemed worse" is
+-not a reason; say what it costs.>
++**`per-record` — wait inside every append.** The safest answer, and the one every durability tutorial
++suggests first. It loses nothing to a machine death, and 4.173 ms per record means the store's ceiling
++is about 240 records/s: the ingest becomes a queue whose depth grows with the fleet, and the response
++to load stops being a backpressure decision and becomes a refusal. Rejected because a telemetry store
++that cannot keep up is not durable in any sense an operator can use — and because the 50 ms window
++costs less than the write amplification this step avoids.
++
++**`never` — let the operating system decide.** The fastest answer, and the one that shows up in a hurry
++as `PRAGMA synchronous = OFF` or `innodb_flush_log_at_trx_commit = 0`. It is not a durability policy at
++all: the window is whatever the kernel's dirty-page writeback decided, so the store cannot say what an
++acknowledged record means, cannot bound an incident, and cannot tell a client that lost data what to
++re-send. Rejected for the same reason "eventually" is not a promise.
++
++**Flush every N records instead of every I milliseconds.** Easier to reason about at a fixed rate (one
++flush per 1,000 records) and wrong in both directions: at 10 records/s it is a 100-second window, at
++100,000 records/s a 10 ms one. A bound that moves with load is a bound nobody can plan against, and
++the cost is a duration, so the decision is a duration.
++
++**`fdatasync` / `O_DSYNC` per record, as the cheap version of `per-record`.** On Linux this is a real
++optimisation: `fdatasync` skips metadata that does not matter for reading the data back. It does not
++change the decision here, because the per-record answer is rejected for the *rate* of waiting rather
++than the cost of one wait — and on the machine measured even `sync_data` waits (4152 µs). The
++mechanism is worth knowing and it is not a way out of this choice.
++
++**Group commit — one flush for all the records that happen to be waiting.** What a database does, and
++what the interval is a crude version of: the interval *is* the group, the records in it are whoever
++arrived, and the cost is one flush. A real group commit, where writers join an in-flight flush instead
++of waiting for the next one, is `lakelet/4.5-batch-writes`' subject and it needs this number. Rejected
++*here* only because a batching writer is different machinery, not a different decision.
++
++**Publish the number as a configuration key.** A `store.fsync = "interval(50ms)"` line in
++`lakelet.toml` would let a deployment choose, at the price of every deployment having its own answer to
++"what does this store promise?" — and every page that describes the store would have to say "it
++depends". `Policy::parse` exists so that the documents can spell a policy the way the code does; when
++a second policy has to be selectable for a real reason, that is a configuration change with a record
++of its own.
+ 
+ ## Consequences
+ 
+-<What this decision makes true, what it costs, and what a later step has to keep true because of it.>
++- **"Stored" means "on the device within 50 ms", not "on the device".** The difference is recoverable —
++  the record is readable the instant `append` returns, so a process crash loses nothing — and it is
++  real: a host that loses power takes the last 50 ms of acknowledged writes with it.
++- **The store's throughput ceiling stops being the disk.** A flush is amortised over a window of
++  records instead of paid per record, which is what makes `4.5` (batched writes) and `4.7` (columnar
++  segments) worth building: they change how much work fits in a window.
++- **`durable_offset()` is a number and has to stay true.** It moves only when a flush has succeeded,
++  and it is what `lakelet/4.4-wal-recovery` replays to when it decides which acknowledged records a
++  torn tail took. A boundary that is hopeful rather than true produces a recovery that either loses
++  acknowledged records or invents them.
++- **The window is a duty cycle, so the device is part of the contract.** A slower device — a spinning
++  disk, a network filesystem, a noisy neighbour — makes 50 ms a bigger fraction of the wall clock.
++  That is why the measurement is in this record, and why the number is revisited when the device in
++  production is not the device it was measured on.
++- **A failed flush is an incident, not a retry.** If the device refuses the flush the store cannot
++  claim durability at all and the boundary stops moving: the fifth crash point in
++  [docs/crash-points.md](../crash-points.md) is where that is written down, and it is why `sync`
++  returns a `Result` instead of being best-effort.
++- **The directory entry is paid once, at open.** Flushing the file's bytes does not make its *name*
++  durable; the store directory is flushed when the file is created, which is why `Spool::with_policy`
++  makes one extra call at startup and none afterwards.
+ 
+ ## What would make us revisit this
+ 
+-<The measurement that would change the answer, and the contract that would move the number. Not "if it
+-turns out to be wrong": which number, and what it would have to be.>
++A device whose durable write costs tens of microseconds instead of 4.173 ms (persistent memory, a
++battery-backed write cache, a filesystem with a cheaper barrier) would make `per-record` affordable and
++this record wrong: `Policy::ALL` already carries that answer, and moving `Policy::DEFAULT` to it is a
++one-line change plus a new record. A client contract that cannot tolerate 50 ms of loss (a billing
++meter, an audit log) moves the number down; a store that ingests a handful of records per second has
++no reason not to pay per record. What does *not* change the decision is an incident: an incident gives
++a number to put in the derivation, which is the point of writing the derivation down.
+diff --git a/docs/crash-points.md b/docs/crash-points.md
+index 42d8ac0..502e0b4 100644
+--- a/docs/crash-points.md
++++ b/docs/crash-points.md
+@@ -4,49 +4,141 @@
+ sentence: it lists every way the store can stop, and says for each one what is on the device, what
+ recovery will see, which policy loses what, and what the operator ends up explaining. The decision
+ these points belong to is [docs/adr/0001-write-path.md](adr/0001-write-path.md), which names the policy
+-this build ships; the policies themselves are [`Policy`](../src/engine/wal/policy.rs) and the call that
+-bounds every window below is [`Spool::sync`](../src/engine/spool.rs).
+-
+-Two words are used precisely, and most arguments about this are really arguments about them:
+-
+-- **written** — the bytes are in the operating system's page cache, any reader on this machine sees
+-  them, and a process death does not take them;
+-- **durable** — a flush this store asked for was answered by the device.
+-
+-| # | the crash | which policies lose what |
+-| - | --------- | ------------------------ |
+-| 1 | the process dies | |
+-| 2 | the machine dies | |
+-| 3 | the machine dies mid-write | |
+-| 4 | the directory entry was never flushed | |
+-| 5 | the flush itself fails | |
+-| 6 | the process stops cleanly | |
++this build ships; the policies themselves are [`Policy`](../src/engine/wal/policy.rs), the call that
++bounds every window below is [`Spool::sync`](../src/engine/spool.rs), and the boundary a recovery
++replays to is `Spool::durable_offset`.
++
++Two words are used precisely, because most arguments about this are really arguments about them:
++
++- **written** — the bytes are in the operating system's page cache. Any reader in this machine sees
++  them. A *process* death does not take them;
++- **durable** — a flush of this store's own asked the device for them, and the device said it had
++  them. Only that survives the *machine* dying.
++
++| # | the crash | `per-record` | `interval(50ms)` | `never` |
++| - | --------- | ------------ | ---------------- | ------- |
++| 1 | the process dies | nothing lost | nothing lost | nothing lost |
++| 2 | the machine dies | nothing lost | ≤ 50 ms lost | everything since the last flush |
++| 3 | the machine dies mid-write | a torn tail, refused | a torn tail, refused | a torn tail, refused |
++| 4 | the directory entry was never flushed | the whole store | the whole store | the whole store |
++| 5 | the flush itself fails | "acknowledged" is a question | "acknowledged" is a question | "acknowledged" is a question |
++| 6 | the process stops cleanly | nothing lost | ≤ 50 ms lost to a *reboot* | everything since the last flush |
+ 
+ ### 1 — The process dies after the write and before any sync
+ 
+-<What is on the device, what recovery sees, which policies lose what here, and what the operator
+-observes. The first two points on this page differ only in *which* thing died, and the difference is
+-the whole point of the page.>
++`kill -9`, a panic in an unrelated task, an OOM kill, a container that is stopped mid-connection.
++
++- **On the device:** nothing of the records written since the last flush — but that is the wrong place
++  to look. The bytes are in the kernel's page cache, the file's length includes them, and the kernel
++  owns them until it decides to write them out or the machine stops.
++- **Recovery sees:** every record the store acknowledged, in order, and nothing of a frame that was
++  half received. The kernel outlived the process, so the page cache is intact.
++- **Who loses what:** nobody. `per-record`, `interval(50ms)` and `never` all lose nothing here, because
++  nothing was lost: the page cache is not the write path's to lose. This is the crash that teaches the
++  difference between the two words above, and the one that makes "we fsync so that a crash cannot lose
++  data" a sentence about *which* crash.
++- **Operator sees:** a process that starts, recovers a whole log, and serves; no data re-sent by any
++  client. The interesting question is what the process was doing, not what it lost.
+ 
+ ### 2 — The machine dies after the write and before any sync
+ 
+-<Same four questions. Name the policies and the bound each one puts on the loss.>
++Power loss, a kernel panic, a hypervisor that takes the VM away, a `reboot -f`.
++
++- **On the device:** every record durable as of the last successful flush, and nothing else. The page
++  cache is gone with the machine, so anything written and not flushed is gone too — including records
++  whose clients were already answered.
++- **Recovery sees:** a prefix of the log ending at the last flush. Whether the *file* holds more than
++  that depends on the device's own write cache, which is why a torn tail (point 3) is the next point
++  and not an afterthought.
++- **Who loses what:** `per-record` loses nothing — it flushed before it answered. `interval(50ms)`
++  loses the acknowledged writes of the last window, at most 50 ms of them. `never` loses everything
++  written since the last flush the *operating system* made on its own schedule, which nobody can
++  bound: it might be 30 seconds, it might be several minutes on an idle machine.
++- **Operator sees:** a store that starts with fewer records than its clients sent, and no way to tell
++  the difference between "the last 50 ms are missing" and "the store is broken" without this page. The
++  clients that lost data have to be found and told, which is the cost of the policies that lose it.
+ 
+ ### 3 — The machine dies during a write (a torn record)
+ 
+-<Same four questions. Say what the last record looks like on the device, and what a reader can and
+-cannot tell about it without a checksum.>
++The power goes while a record's bytes are being written, so the file ends in the middle of one: the
++length prefix is there and the payload is short, or the payload is there and half of it is another
++value.
++
++- **On the device:** a record whose tail is whatever the device managed to commit — a prefix of the
++  record, or garbage where the rest of it should be. The device's own write cache decides how much of
++  it survived, and a device that lies about its cache decides it wrongly.
++- **Recovery sees:** something that is *not a record* on the last line: a length that promises more
++  bytes than the file holds, or a payload whose checksum does not match. `Spool::records` refuses the
++  file today (it answers `Error::Protocol` rather than guessing); `lakelet/4.4-wal-recovery` is the
++  step that replays up to the last whole record and says what it dropped instead of refusing the
++  store.
++- **Who loses what:** all three policies lose the torn record itself — it was never acknowledged
++  unless a flush had already covered it, and `durable_offset` never moved past it. The difference is
++  the *neighbourhood*: `per-record` has at most one such record, `interval(50ms)` has the window's
++  worth, and `never` has everything since the last flush. The bytes that come back wrong are only ever
++  visible *after* the truncation point.
++- **Operator sees:** a store that refuses to start (`protocol error: record 41 says 37 byte(s) and the
++  file holds 12 after its header`), which is alarming, correct, and temporary until 4.4 teaches the
++  log to end at the last whole record.
+ 
+ ### 4 — The file's data is durable but its directory entry is not
+ 
+-<Same four questions. Say which write makes a store *exist* for a reader, and which one does not.>
++The store directory was created, the file inside it was created, bytes were written and flushed — and
++the *directory* was never flushed. A machine death between those two facts takes the file's name with
++it.
++
++- **On the device:** the file's data blocks, with no directory entry that names them: from any reader's
++  point of view the store is not there at all, and the space it occupies is reclaimed as the filesystem
++  sees fit.
++- **Recovery sees:** nothing at all. There is no file to replay on a filesystem where the entry was
++  lost — the failure is not a missing tail but a missing store, which is why it is worse than every
++  other point on this page.
++- **Who loses what:** all of them, and it is the one point on this page where the *choice of policy*
++  does not matter even a little: `per-record`, `interval(50ms)` and `never` are equally gone. Data that
++  was flushed is not data that was named.
++- **Operator sees:** an empty store directory on a machine that was serving a moment ago, with the
++  data unrecoverable and the flush that "succeeded" having nothing to point at. The store pays this
++  once, when it creates the file: `Spool::with_policy` flushes the store directory after creating the
++  file, so this point is a fixed cost at startup rather than a window that stays open.
+ 
+ ### 5 — The flush itself fails (the device, not the store)
+ 
+-<Same four questions. Say what "acknowledged" turns into when the device answers a flush with an error,
+-and what the store has to stop claiming.>
++The device reports an error when it is asked to flush: a failing disk, a full filesystem, an
++unreachable network volume, a filesystem that has gone read-only on its own.
++
++- **On the device:** unknown, and that is the point. The bytes may be there, they may not, and the
++  store has no way to find out — a failed flush is not "no answer", it is "no answer that can be
++  trusted".
++- **Recovery sees:** whatever the device actually kept, which may be less than the log's length and
++  more than the last flush. A record that was written but not flushed may or may not be there, and its
++  *contents* may be a prefix.
++- **Who loses what:** every policy is in the same position, and the one that *looked* safest is the
++  most affected: `per-record` answered a client and then failed to flush, so it has told somebody
++  "stored" about a record it can no longer vouch for; `interval(50ms)` and `never` at least never
++  claimed the window was closed. The honest sentence for all three is that `sync` returned an error
++  and the boundary did not move: `durable_offset` still names the last flush that succeeded, and a
++  client's acknowledged records above it are in doubt.
++- **Operator sees:** a store error on the write path (`store error: ...`) and `durable_offset` that has
++  stopped advancing while `len` keeps growing — the two numbers are the diagnosis. The response is not
++  a retry loop: it is stopping the write path, because a store that cannot flush cannot keep accepting,
++  and every acknowledgment after that point is a claim nobody can check.
+ 
+ ### 6 — The process stops cleanly (SIGTERM, and what "clean" is worth)
+ 
+-<Same four questions. A clean stop is not a crash — say what it does and does not put on the device,
+-and which window survives into the reboot that follows it.>
++The daemon is asked to stop: `SIGTERM`, a rolling deploy, an operator with `systemctl stop`. Nothing
++has failed and no client is disconnected without an answer.
++
++- **On the device:** whatever the last flush put there. A clean stop does not flush by itself: the
++  records written in the current window are still in the page cache, exactly as in point 1.
++- **Recovery sees:** the whole log, because the kernel survived — and *nothing*, if the machine is
++  rebooted and loses power before the kernel writes the page cache out. A clean stop is not a crash
++  point until the reboot that follows it.
++- **Who loses what:** `per-record` loses nothing at all. `interval(50ms)` loses up to 50 ms of
++  acknowledged writes to a machine that dies *after* the process stopped cleanly, which is a small
++  window and an odd one — the operator believed the store had stopped in a known state. `never` loses
++  everything since the last flush, and a deploy that stops and starts a store regularly is exactly the
++  sequence that keeps resetting the clock.
++- **Operator sees:** a `draining` line, exit code 0, and a store that starts with the prefix of the
++  log that was on the device. If the deployment cares about the window between "stopped" and "the
++  machine was shut down", it is the *stop path's* business to flush before exiting, not this policy's:
++  a stop that wants a closed window has to ask for one.
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index e37fbf3..8d19b3b 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -4,7 +4,7 @@
+ //! accepted frame, in the order the frames were accepted — and the steps after it harden exactly
+ //! this file rather than inventing a second one:
+ //!
+-//! * `4.3` decides when it is flushed to the device (`WalPolicy`) and writes the decision down;
++//! * `4.3` decides when it is flushed to the device ([`Policy`]) and writes the decision down;
+ //! * `4.4` gives each record its own checksum, so a process killed mid-write leaves something the
+ //!   next start can recognise as a torn tail instead of a plausible record;
+ //! * `4.5` starts writing batches into it, and counts what that costs.
+@@ -12,10 +12,19 @@
+ //! The contract a spec leans on is small on purpose: [`Spool::append`] may only report success once
+ //! the record is readable by [`Spool::records`], and [`Spool::records`] answers what was appended, in
+ //! order, never what was appended and then lost to a bug in the reader.
++//!
++//! `4.3` adds the second half of that contract, and it is about **where** the bytes are:
++//! [`Spool::len`] counts what this spool has written and [`Spool::durable_offset`] counts what is
++//! known to be on the device. The two are equal after an append under a policy that waits for the
++//! device, and deliberately different under one that does not — a distinction the operating system
++//! does not make and a recovery cannot survive without. The argument for the policy this build ships
++//! is `docs/adr/0001-write-path.md`, and what each policy accepts losing is `docs/crash-points.md`.
+ 
+ use std::io::Write;
+ use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
+ 
++use crate::engine::wal::Policy;
+ use crate::error::Error;
+ 
+ /// One `Error::Store` around an I/O failure.
+@@ -46,26 +55,67 @@ pub const FILE: &str = "ingest.log";
+ pub struct Spool {
+     /// Directory this spool owns (`store.dir` in the configuration).
+     directory: PathBuf,
++    /// When this spool waits for the device — the decision this file obeys.
++    policy: Policy,
++    /// How many bytes of records this spool has written.
++    len: u64,
++    /// How many of them are known to be on the device.
++    durable: u64,
++    /// When the last flush happened, so an interval policy can elide the next one.
++    last_sync: Instant,
+ }
+ 
+ impl Spool {
+-    /// Open (or create) the store directory.
++    /// Open (or create) the store directory, with this build's default policy.
++    ///
++    /// This is the call the daemon makes, so [`Policy::DEFAULT`] is what a deployment gets; a caller
++    /// that wants another answer asks [`Spool::with_policy`].
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Store`] when the directory cannot be created or written to.
++    /// [`Error::Store`] when the directory cannot be created, the file cannot be created, or the
++    /// store directory cannot be flushed after the file is created.
+     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, Error> {
++        Self::with_policy(directory, Policy::DEFAULT)
++    }
++
++    /// Open (or create) the store directory, with the policy that decides when an append waits.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the directory cannot be created, the file cannot be created, or the
++    /// store directory cannot be flushed after the file is created — a file whose *name* is not on
++    /// the device is a file a machine death can take away entirely, with its acknowledged records
++    /// inside it (`docs/crash-points.md`, point 4).
++    pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
+         let directory = directory.into();
+         std::fs::create_dir_all(&directory).map_err(store)?;
+-        let spool = Self { directory };
+         // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
+         // "no such file": those are different situations, and the reader should not have to guess.
+         std::fs::OpenOptions::new()
+             .create(true)
+             .append(true)
+-            .open(spool.path())
++            .open(directory.join(FILE))
++            .map_err(store)?;
++        // A file's data and the directory entry that names it are two different writes, and only the
++        // second one makes the store *exist* after a crash. It costs one flush per store, here, at
++        // open — which is why the write path never has to pay it again.
++        std::fs::File::open(&directory)
++            .map_err(store)?
++            .sync_all()
+             .map_err(store)?;
+-        Ok(spool)
++        // Whatever a previous process left is taken as given: this spool's counters start where the
++        // file it opened starts, and only its own writes move them.
++        let len = std::fs::metadata(directory.join(FILE))
++            .map_err(store)?
++            .len();
++        Ok(Self {
++            directory,
++            policy,
++            len,
++            durable: len,
++            last_sync: Instant::now(),
++        })
+     }
+ 
+     /// The directory this spool writes to.
+@@ -80,11 +130,66 @@ impl Spool {
+         self.directory.join(FILE)
+     }
+ 
+-    /// Append one accepted payload, and answer only once it can be read back.
++    /// The policy this spool obeys.
++    #[must_use]
++    pub fn policy(&self) -> Policy {
++        self.policy
++    }
++
++    /// How many bytes of records this spool has written.
++    ///
++    /// Everything counted here is readable by [`Spool::records`] right away; not all of it is on the
++    /// device. See [`Spool::durable_offset`] for the part that is.
++    #[must_use]
++    pub fn len(&self) -> u64 {
++        self.len
++    }
++
++    /// `true` when this spool has written nothing yet.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.len == 0
++    }
++
++    /// How many bytes are known to be on the device.
++    ///
++    /// A prefix of what was written: everything below it has been through a flush the device said it
++    /// had, and everything above it may not survive the *machine* stopping. It starts at the size the
++    /// file had when this spool opened it — bytes a previous process left are taken as given, and
++    /// whether that process's tail survived is `lakelet/4.4-wal-recovery`'s question — and it moves
++    /// in one step per successful [`Spool::sync`], never before one.
++    #[must_use]
++    pub fn durable_offset(&self) -> u64 {
++        self.durable
++    }
++
++    /// Flush what this spool has written, and only then believe it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the file cannot be opened or the device refuses the flush. A flush that
++    /// failed does not move [`Spool::durable_offset`]: the boundary has to name the last flush that
++    /// *succeeded*, or the recovery built on it invents records that were never on the device.
++    pub fn sync(&mut self) -> Result<(), Error> {
++        let file = std::fs::OpenOptions::new()
++            .write(true)
++            .open(self.path())
++            .map_err(store)?;
++        // `sync_all` and not `fsync`: the decision record measured both on this machine, and only the
++        // first one waits for the device.
++        file.sync_all().map_err(store)?;
++        self.durable = self.len;
++        self.last_sync = Instant::now();
++        Ok(())
++    }
++
++    /// Append one accepted payload, and answer only once it can be read back and the policy says so.
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Store`] when the record cannot be written.
++    /// [`Error::Store`] when the record cannot be written, or when the policy waited for the device
++    /// and the device refused it — which is a failure of the acknowledgment, not of the record: the
++    /// bytes of a refused flush are readable and no client should be told they are safe.
+     pub fn append(&mut self, payload: &[u8]) -> Result<(), Error> {
+         // One open per append, which is honest about what an append *costs*: `lakelet/4.5-batch-writes`
+         // is the step that makes this a batch, and the counters there are what say whether it worked.
+@@ -96,9 +201,21 @@ impl Spool {
+         file.write_all(&(payload.len() as u32).to_le_bytes())
+             .map_err(store)?;
+         file.write_all(payload).map_err(store)?;
+-        // Written, not yet durable: whether this call waits for the device is
+-        // `lakelet/4.3-write-path-adr`'s decision, and it is a decision with a number attached
+-        // (`fsync` per record costs milliseconds, and a store that fsyncs per sample cannot keep up).
++        drop(file);
++        self.len += payload.len() as u64 + 4;
++
++        // Written, and now the decision: whether this call waits for the device is the policy's
++        // answer, and it is a decision with a number attached (a flush costs milliseconds here, and a
++        // store that waits per record cannot keep up — `docs/adr/0001-write-path.md`).
++        match self.policy {
++            Policy::PerRecord => self.sync()?,
++            Policy::Interval { millis } => {
++                if self.last_sync.elapsed() >= Duration::from_millis(millis) {
++                    self.sync()?;
++                }
++            }
++            Policy::Never => {}
++        }
+         Ok(())
+     }
+ 
+diff --git a/src/engine/wal/policy.rs b/src/engine/wal/policy.rs
+index cbc8ccd..1e86ef5 100644
+--- a/src/engine/wal/policy.rs
++++ b/src/engine/wal/policy.rs
+@@ -21,10 +21,6 @@
+ //! default interval is the number it is, and what each policy accepts losing — is
+ //! `docs/adr/0001-write-path.md`. If that page and this module disagree, the module wins and the page
+ //! is a bug; the step's spec is what holds the two together.
+-//!
+-//! Every body below is this step's work. The doc comments are the contract the step's spec and
+-//! documents hold the work to, including the two constants: what this build *does* and what it can be
+-//! asked for are decisions, not defaults somebody else already made.
+ 
+ use crate::error::Error;
+ 
+@@ -32,21 +28,23 @@ use crate::error::Error;
+ ///
+ /// Every answer here is a price and a loss, and the two are one fact seen from two sides: the more
+ /// often the store waits, the less a machine death can take and the less work the store gets done.
+-/// Each variant's own documentation owes both sentences, with the number this machine measured —
+-/// that documentation is what the crash-point list is written against and what an operator reads.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Policy {
+     /// Wait inside every append, before answering the client.
+     ///
+-    /// Document what this costs — how often the store waits for the device, with the cost of one
+-    /// wait measured on this machine — and what it loses, which is the question this variant's
+-    /// counterpart below answers.
++    /// **Costs** one device flush per record. On the machine the decision record measured, that is
++    /// 4.1 ms, which caps this store at about 240 records/s no matter how many clients are writing —
++    /// the ingest loop is waiting for the disk one sample at a time.
++    /// **Loses** nothing: a record a client was told about is on the device before the answer.
+     PerRecord,
+ 
+     /// Wait at most once per `millis`, eliding the flush while the interval has not passed.
+     ///
+-    /// Document what this costs (a flush per interval: a duty cycle rather than a per-record tax)
+-    /// and what it loses (a window of acknowledged writes, bounded by this number).
++    /// **Costs** one device flush per interval, so the price is a duty cycle
++    /// (flush cost divided by `millis`) rather than a per-record tax.
++    /// **Loses**, when the machine stops, every acknowledged record written since the last flush:
++    /// bounded by `millis` of writes — a duration, not a count, because the count is however many
++    /// records the ingest managed in that window.
+     Interval {
+         /// The most time an acknowledged record may sit unflushed, in milliseconds.
+         millis: u64,
+@@ -54,16 +52,18 @@ pub enum Policy {
+ 
+     /// Never wait; the operating system flushes when it decides to.
+     ///
+-    /// Document what this costs (nothing at the write path — which is the trap) and what it loses
+-    /// (everything written since a flush nobody in this process asked for).
++    /// **Costs** nothing at the write path, and that is the trap: the bytes sit in the page cache,
++    /// which is exactly where an operating system puts them before a machine that is about to die.
++    /// **Loses**, when the machine stops, everything written since the last flush — the last flush
++    /// being whatever the kernel decided it had time for. Nothing anywhere knows how big that window
++    /// was, which is why an operator cannot be told what "acknowledged" meant.
+     Never,
+ }
+ 
+ /// What a policy gives up when the **machine** stops — the half of the decision a table can hold.
+ ///
+-/// The variants answer the question `Policy::losses` has to answer for every policy, in a form a
+-/// document and a spec can both compare: nothing, a window that is known, and a window nobody can
+-/// bound. The variants are the shape; which policy maps to which is the step's work.
++/// The variants are ordered by what they cost an operator, not by how bad they sound: nothing, a
++/// window that is known, and a window nobody can bound.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Losses {
+     /// Nothing that was acknowledged. A policy with this answer has already waited for the device,
+@@ -82,38 +82,41 @@ impl Policy {
+     /// Every policy this build can be asked for.
+     ///
+     /// The list is the enum's public shape: a policy that exists but is not here cannot be named by a
+-    /// document, and a policy that is here owes a unique [`Policy::name`]. A policy this build can be
+-    /// asked for and that is missing from this list is the drift the step's spec looks for, in both
+-    /// directions — the crash-point list has to name every policy in here, and nothing else.
+-    pub const ALL: &'static [Policy] = &[Policy::PerRecord, Policy::Never];
++    /// document, and a policy that is here owes a unique [`Policy::name`].
++    pub const ALL: &'static [Policy] = &[Policy::PerRecord, Policy::DEFAULT, Policy::Never];
+ 
+     /// What this build does when nothing says otherwise.
+     ///
+-    /// The value below is the tempting answer and not the decision: waiting for the device inside
+-    /// every append is safe and is a store that cannot keep up with an ingest, and never waiting is a
+-    /// store nobody can defend. Replace it with the policy you can argue for from a measurement, and
+-    /// put the argument, the raw command and the numbers in `docs/adr/0001-write-path.md` — the
+-    /// step's spec checks that this constant and that page name the same policy.
+-    pub const DEFAULT: Policy = Policy::PerRecord;
++    /// Derived, not invented: one durable write costs 4.1 ms on the machine
++    /// `docs/adr/0001-write-path.md` measured, and a 50 ms interval keeps the device busy for about
++    /// 8% of the wall clock while bounding what a machine death can take to a 50 ms window of
++    /// acknowledged writes. The measurement, the arithmetic and the rejected numbers are in that
++    /// record, which names this value by [`Policy::describe`].
++    pub const DEFAULT: Policy = Policy::Interval { millis: 50 };
+ 
+     /// The kind of policy, as a document or a log line names it.
+     ///
+     /// Stable on purpose: the crash-point table, the decision record and a reviewer's `grep` all
+-    /// spell a policy this way, so the string is part of the API rather than a display choice. The
+-    /// spec reads these strings out of the two documents by them.
++    /// spell a policy this way, so the string is part of the API rather than a display choice.
+     #[must_use]
+     pub fn name(&self) -> &'static str {
+-        todo!("step lakelet/4.3-write-path-adr")
++        match self {
++            Policy::PerRecord => "per-record",
++            Policy::Interval { .. } => "interval",
++            Policy::Never => "never",
++        }
+     }
+ 
+     /// The whole policy, including the number an interval carries.
+     ///
+-    /// The spelling a document uses when the *number* matters (an interval carries its `millis` in
+-    /// it; the other two answers are spelled exactly as [`Policy::name`] spells them), and the
+-    /// spelling [`Policy::parse`] has to read back.
++    /// This is the spelling a configuration file, a decision record and an incident note use when the
++    /// *number* matters, and [`Policy::parse`] reads it back.
+     #[must_use]
+     pub fn describe(&self) -> String {
+-        todo!("step lakelet/4.3-write-path-adr")
++        match self {
++            Policy::Interval { millis } => format!("{}({millis}ms)", self.name()),
++            other => other.name().to_owned(),
++        }
+     }
+ 
+     /// Read a policy back from [`Policy::describe`]'s spelling.
+@@ -125,14 +128,28 @@ impl Policy {
+     /// durability cannot be read off its configuration, and `Error::Invalid` is what tells a caller
+     /// this was the value's fault rather than the store's.
+     pub fn parse(text: &str) -> Result<Self, Error> {
+-        let _ = text;
+-        todo!("step lakelet/4.3-write-path-adr")
++        if let Some(millis) = text
++            .strip_prefix("interval(")
++            .and_then(|rest| rest.strip_suffix("ms)"))
++            .and_then(|number| number.parse::<u64>().ok())
++        {
++            return Ok(Policy::Interval { millis });
++        }
++        match text {
++            "per-record" => Ok(Policy::PerRecord),
++            "never" => Ok(Policy::Never),
++            other => Err(not_a_policy(other)),
++        }
+     }
+ 
+     /// What this policy gives up when the machine stops.
+     #[must_use]
+     pub fn losses(&self) -> Losses {
+-        todo!("step lakelet/4.3-write-path-adr")
++        match self {
++            Policy::PerRecord => Losses::Nothing,
++            Policy::Interval { millis } => Losses::BoundedBy { millis: *millis },
++            Policy::Never => Losses::EverythingSinceTheLastFlush,
++        }
+     }
+ 
+     /// `true` when an append has waited for the device before it answered.
+@@ -141,6 +158,18 @@ impl Policy {
+     /// acknowledged records is a policy that did not wait for them.
+     #[must_use]
+     pub fn syncs_per_record(&self) -> bool {
+-        todo!("step lakelet/4.3-write-path-adr")
++        matches!(self, Policy::PerRecord)
++    }
++}
++
++/// The refusal [`Policy::parse`] answers with, naming every policy this build knows.
++fn not_a_policy(text: &str) -> Error {
++    let allowed = Policy::ALL
++        .iter()
++        .map(Policy::describe)
++        .collect::<Vec<String>>()
++        .join(", ");
++    Error::Invalid {
++        detail: format!("`{text}` is not a fsync policy: use {allowed}"),
+     }
+ }
