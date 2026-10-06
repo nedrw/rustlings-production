@@ -230,7 +230,7 @@ unsafe fn after_the_tests() {}
                 .map(|occurrence| (occurrence.line, occurrence.documented))
                 .collect::<Vec<(u32, bool)>>(),
             vec![(2, true), (5, false), (10, false)],
-            "the reason is found at or above, within three lines: {:?}",
+            "the reason is found on one of the three lines above: {:?}",
             report.occurrences
         );
         assert_eq!(
