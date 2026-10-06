@@ -602,3 +602,79 @@ check 4.7 --slow：✓ unsafe-budget@0  0 `unsafe` occurrence(s) in 31 productio
 
 **下一步**：`4.8-compaction`（B2 最后一步：合并策略作为数据、读者永远看不到半合并的库、`slow:sim@3` 第三个真用户 +
 `bench-budget` 数“每移除一个字节重写了多少”）。
+
+## 段 13：`lakelet/4.8-compaction`（B2 收官；`kiln verify` 第一次真跑）
+
+**做了什么**：`store/compaction@design` 由子 agent 交付（提交 `4a946e0`，4103 行新增）：14 个用例的规格、
+正文（teach 模板，222 行）、`compaction/{mod,plan,snapshot}.rs`、课程装置 `tests/{sim,budget}_compaction.rs`、
+`budget/4.8-compaction.toml`（13 计数）与 `sim/4.8-compaction.toml`；scaffold 纯加法（0 删除行），
+`src/engine/mod.rs` 的标记块里只插了 `pub mod compaction;`。**4.8 不交项目页面**，所以它的门里没有 `links`
+——`links` 判的是**项目里的 markdown**，而这一步的三份“文档”是课程页、模块文档与被规格读回的常量。
+
+**这一步的四条不变量**：① **合并计划是值**（`Policy { width, ratio }` + `&[SegmentInfo]` → `Plan`，无 I/O；
+规则是“**最旧的**一段**连续**、两两大小都在 `ratio` 倍以内的 `width` 个段”，取且仅取 `width` 个——从不并一个，
+也从不并整层）；② **读者看不到半合并**（`Snapshot` 认的是一个 `Arc<Set>`，被替换的文件**退休**到最后一个认它的
+读者松手为止）；③ **五个阶段、两个世界**（新段写完+落盘 → manifest 写 `pending`、flush、rename、目录 flush →
+旧文件退休；`planned/written/durable` 崩 → 就是合并前的库，`swapped/retired` 崩 → 新的那套；**绝不留缝、绝不重复**）；
+④ 重写是个数字（`bytes_rewritten_per_byte_removed_max` 打头，`records_lost_max = 0` 是守恒式）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+selftest：4.1 9/9 · 4.2 10/10 · 4.3 9/9 · 4.4 10/10 · 4.5 10/10 · 4.6 9/9 · 4.7 12/12 · 4.8 10/10 must green
+check 4.8 --slow：✓ slow:sim@3  3 seed(s) ran, transcripts 21de1955/630e6a63/95af3e2e — seed 1 replayed identically (3s)
+                  ✓ slow:bench-budget@10 13 metric(s) judged against the course baseline (7 within ±10%, 6 at or below an upper bound):
+                    segments_sealed 16, records_sealed 2048, merges 5, segments_after 1, files_removed 15, plan_left_max 0,
+                    records_kept 2048, records_lost_max 0, bytes_after_max 5700, bytes_rewritten_max 12029, bytes_removed 2412,
+                    bytes_rewritten_per_byte_removed_max 4.9871, refused_max 0
+                  10/10 must gate(s) passed · real 9.8s
+```
+
+**`kiln verify lakelet` 第一次真跑**（8 步有内容、16 步没有；快车道，24.5 s）：
+
+```
+$ kiln verify lakelet
+8/8 judged step(s) pass · 0 failed · 0 not prepared · 16 without content
+nothing failed yet — but not everything was judged either
+$ kiln verify lakelet --json | tail
+…,"totals":{"blocked":0,"clean":false,"failed":0,"not_authored":16,"passed":8,"steps":24},"track":"lakelet"}
+```
+
+这正是 M3 收尾那条验收命令的形状（届时要是 `{"passed":24,"failed":0,"blocked":0,"not_authored":0,"clean":true}`），
+现在把 `not_authored` 从 16 往 0 推的过程有了可重放的读数。
+
+**演练（我只做了核心那条，红/回滚/绿都取了行）**——把“退休”换成**在换 manifest 时立刻删掉旧文件**（合并对读者变成两步可见）：
+
+```
+spec → FAILED. 12 passed; 2 failed：点名 a_reader_that_took_a_snapshot_before_the_swap_answers_the_same_after_it
+       与 a_merge_keeps_every_record_once_in_the_same_order
+sim  → ✗ slow:sim@3 3 of 3 seed(s) did not pass：三个种子都在
+       `a_merge_is_a_schedule_and_a_reader_never_sees_half_of_one`（tests/sim_compaction.rs:841）panic
+回滚 → spec 14 passed；sim 回到 21de1955/630e6a63/95af3e2e；10/10 must gates passed
+```
+
+子 agent 另做了两条：把策略改成“每次合并并掉所有段”→ `✗ slow:bench-budget@10`（`merges is 16 … ≤ 5`、
+`bytes_rewritten_per_byte_removed_max is 37.8109 → ≤ 7`）；在 bytes 落盘之前就让合并可见 → 五阶段用例在
+`written` 处红（`the manifest says segment 4 is 196 byte(s) and …/0000000004.lks holds 98`），`sim@3` 三种子全红。
+
+**这一段钉下来的四件事**：
+
+1. **manifest 是“整文件 + rename”**，用 4.4 的 `checksum` 封口，逐段记 `(index, bytes, records)`；`pending` →
+   flush → rename → 目录 flush 三步的顺序**就是**崩溃点。子 agent 明确拒绝了文本索引（崩在中间会读成一个**更小**
+   的库＝一个洞）与“manifest 也是日志”（真实，但那是另一步的事）。
+2. **退休给最后一个读者**：在换的时候删会打断跨换的读者（演练 a 实测），永不删则目录无限长；所以 `Set::drop`
+   来删。快照持有的是**段集合**而不是记录（否则一次查询要把库拷一份）。
+3. **装置里的死法是 `mem::forget` 而不是 drop**（进程死不会跑析构），而且**什么都不放回**：前三个阶段断言
+   “索引没被动过”，而不是把 manifest 写回去——后者会把演练 (a) 的那类缺陷**盖住**。
+4. **一条环境教训**：在 Delta 工作树里写一个**未跟踪的作者目录**会让工作树的终端停止物化（“the checkout kept
+   changing”），子 agent 因此把作者工作挪到了 `/private/tmp/d48` 并把那个目录删掉。已写进 handoff-m3 §1 第 9 条：
+   **作者工作一律在 `/private/tmp`，不要在仓库里留未跟踪的暂存目录**。
+
+**下一步**：B2（4.5–4.8）结束，给开发者 B2 检查点报告；随后 B3 从 `4.9-retention` 开始
+（“旧数据没了”是两半的断言：比 cutoff 旧的全部不可达、比它新的一个都没被碰；计数说一个保留期回收了多少字节，
+测试说哪些段因为读者还握着而删不掉）。
+
+另外，`kiln verify lakelet` 的快车道已经在 8/24 步的树上跑过一次（段 13）：`8/8 judged step(s) pass · 0 failed ·
+0 not prepared · 16 without content`，JSON 的 totals 是 `{"blocked":0,"clean":false,"failed":0,"not_authored":16,
+"passed":8,"steps":24}`——收尾那条验收（`passed: 24, not_authored: 0, clean: true`）的形状已经验过，剩下的只是把
+`not_authored` 推到 0。
