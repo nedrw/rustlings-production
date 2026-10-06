@@ -1,7 +1,9 @@
 # M3 计划：T4 `lakelet`（24 步）+ 容器与性能基建
 
-> 状态：**待拍板**——§7 的六个决策点定了就按 §8 的批次开工。这份文件是给评审看的计划，不是施工记录；
-> 施工记录按 M2 的习惯写进 [handoff-m3.md](handoff-m3.md) 与 [handoff-m3-log.md](handoff-m3-log.md)（收尾时产出）。
+> 状态：**已开工**——§7 的六个决策点已由开发者拍板（全部按推荐：D-1(a)…D-6(a)），施工记录按 M2 的习惯写进
+> [handoff-m3.md](handoff-m3.md) 与 [handoff-m3-log.md](handoff-m3-log.md)（收尾时产出）。
+> 开工后的实测若与本文不符，以本文为准改实测——已改过两处：`dtrace` 其实存在（是非 root 拒绝），
+> 以及 `fuzz` 的语料钉在规格里而不是目录里（见 §4.3、§5 C5）。
 >
 > 入口上下文：plan.md §6（闸门）/§7（课程体系）/§11（里程碑）、curriculum.md §9（T4 的 24 行）、
 > [handoff-m2.md](handoff-m2.md)（M2 的契约与实测数字，§1 的三条原则、§3.5 的步骤作者作业书）、
@@ -28,7 +30,7 @@
 | `datafusion 55`（无默认特性 + parquet） | 240 个包，冷构建 **62.1 s**，194 个 rlib；**它自己拉 parquet 59**，与 `arrow 56` 版本错位 | 同上 |
 | MinIO 镜像 | **拿不到**：`minio/minio:latest` 直连 docker.io → `requested access to the resource is denied`；`docker.1ms.run/minio/minio` → `manifest unknown`；`docker.m.daocloud.io/minio/minio` → `denied`（各 2–4 s 就回错） | 三条路由都试过，见 §7 D-3 |
 | 本机镜像清单 | 15 个引用：`postgres:17-alpine`、`alpine:3.20`、`debian:bookworm-slim`、`rust:1.98-alpine/slim`、`rust:1.88-bookworm`、`axllent/mailpit:v1.21`、两个 `localhost/kiln-*`、两个 `<none>`；**没有对象存储** | `docker images` |
-| 本机剖析工具 | `sample`（macOS 自带）**不需要 sudo**，实测对一个用户进程 2 秒采样出了 68 917 字节的可读报告；`dtrace` **不存在** → 装着 `cargo-flamegraph` 也跑不了；`samply`/`perf` 未装 | `/usr/bin/sample <pid> 2 -file …`（exit 0） |
+| 本机剖析工具 | `sample`（macOS 自带）**不需要 sudo**，实测对一个用户进程 2 秒采样出了 68 917 字节的可读报告；`dtrace`（`/usr/sbin/dtrace`）**存在但非 root 会拒绝**：`dtrace: failed to initialize dtrace: DTrace requires additional privileges` → 装着的 `cargo-flamegraph` 在本机是陷阱；`samply`/`perf` 未装 | `/usr/bin/sample <pid> 2 -file …`（exit 0）、`dtrace -n 'BEGIN { exit(0) }'` |
 | 默认工具链 | `rustc/cargo 1.98.1`（与 `rust-toolchain.toml` 同一把），所以上面三条依赖探针的数字就是课程工具链的数字 | `rustc --version`（在 `/private/tmp`） |
 | `kiln images` | 每个**步骤**一行（`postgres:17-alpine` 重复 30+ 行），没有去重、没有“离线可行”汇总 | `kiln images` |
 | `kiln skip` | **没有 `--track`**，只有 `--all`（走默认 track）——M2 §4.1 铺尾巴树要按路径序逐个 skip，就是这个原因 | `kiln skip --help` |
@@ -161,11 +163,12 @@ rss_growth_bytes_max = 120000000
 
 ### 4.3 `slow:fuzz@N`（must，慢）——种子 fuzz（M3 新增的第三条，见 §7 D-4）
 
-课程侧文件 `course/tracks/lakelet/fuzz/<step-id>.toml`：`command`、`iterations_min`、`seeds = [...]`、`corpus = "tests/corpus/*.bin"`。
-判据：命令绿（= 没有 panic）+ 装置报的 `iterations >= iterations_min` + **课程语料里的每一份输入都被消费过**
-（`corpus_cases >= 目录里的文件数`）。语料本身是**只读课程文件**（`course/tracks/lakelet/corpus/4.2/*.bin`，进 `spec-integrity` 的哈希清单），
-所以“fuzz 找到过的那个 panic”是一个可复现的输入，而不是一句回忆。生产工具 `cargo-fuzz` 不由闸门驱动（本机没有、且要 nightly）：
-`doctor` 报它，4.2 的正文点名它。
+课程侧文件 `fuzz/<step>.toml`：`command`、`iterations_min`、`seeds = [...]`、`corpus_cases`。
+判据：命令绿（= 没有 panic）+ 装置报的 `iterations >= iterations_min` + **装置报的重放条数 ≥ `corpus_cases`**。
+语料**钉在规格里**（`spec/4.2/parser_fuzz.rs` 里的字节常量，只读、哈希钉死），条数写在课程侧文件：
+把字节放在目录里会逼出一个“课程→项目”的复制机制，而规格本来就会被拷进项目、并被 `spec-integrity` 管住——
+所以“fuzz 找到过的那个 panic”是一个可复现的输入，而不是一句回忆。生产工具 `cargo-fuzz` 不由闸门驱动
+（本机没有、且要 nightly）：`doctor` 报它，4.2 的正文点名它。
 
 ### 4.4 三条门在注册表里的位置
 
@@ -176,11 +179,11 @@ rss_growth_bytes_max = 120000000
 
 | # | 改什么 | 为什么（证据/理由） |
 | --- | --- | --- |
-| C1 | `kiln images` 按**去重后的声明引用**报：每个引用一行（解析到本地哪个名字、被多少步骤需要、步骤名截断），末尾给一行 `declared 4 image(s): 4 present → 本机可以离线跑不依赖网络的步骤` | 今天 `postgres:17-alpine` 重复 30+ 行，真正的信息（4 个引用全在）被埋掉 |
-| C2 | 容器**运行**探测：`runtime::detect` 现在只问 `info`；加一个“真起一个容器”的探测（用已预拉的最小镜像，15 s 上限，结果在当前会话的 scratch 里缓存），`doctor` 报 `✓ containers can start (alpine:3.20, 0.7s)` | 这个模块自己的信条就是“探测靠运行”（compose 的 `version` 成功而 `config` 失败就是这样查出来的）；`info` 成功不等于能起容器 |
-| C3 | `kiln images pull`：先打印计划（声明 → 解析名 → 有/缺）、只拉缺的、去重、末尾汇总；有缺项时以非 0 退出（这只是命令，不是闸门） | 与 C1 同一份数据；M3 的“镜像预拉”要能被人手工重放 |
+| C1 | `kiln images` 按**去重后的声明引用**报：每个引用一行（解析到本地哪个名字、被哪些步骤需要、头三个 + 计数），末尾给一行 `4 declared image(s): 4 present — a step can start its container without the network once its image is here` | 今天 `postgres:17-alpine` 重复 35 行，真正的信息被埋掉（实测：改后 4 行 + 一行结论） |
+| C2 | 容器**运行**探测：`runtime::smoke` 挑一个已预拉的“安静”镜像跑 `<engine> run --rm <local> true`（15 s 上限），`doctor` 与 `kiln images` 都报 `✓ containers can start (podman \`alpine:3.20\`, 0.2s)` | 这个模块自己的信条就是“探测靠运行”（compose 的 `version` 成功而 `config` 失败就是这样查出来的）；`info` 成功不等于能起容器。候选镜像限定入口点是 shell 的那些，否则 `postgres:17-alpine` 会让探测因为与引擎无关的原因失败 |
+| C3 | `kiln images pull`：先打印计划（声明 → 解析名 → 有/缺）、只拉缺的（已按引用去重）、末尾汇总；有缺项时以非 0 退出（这只是命令，不是闸门） | 与 C1 同一份数据；M3 的“镜像预拉”要能被人手工重放 |
 | C4 | `kiln skip --track <id>`（`--all` 也认 `--track`） | M2 §4.1 的验收演练只能按路径序逐个 skip 15 步来铺尾巴树；T4 的验收（§9）要铺 24 步 |
-| C5 | `doctor` 增一节 **profilers**：`sample`（macOS，实测可用）、`samply`（未装 → 安装行）、`cargo-flamegraph`（装着，但本机 `dtrace` 不存在 → 直说它跑不了）、`perf`（Linux） | 4.16 要教“给出可复现的剖析结论”，学员第一步会问“我用哪个”；答案必须是这台机器的实测结果，而不是通用建议 |
+| C5 | `doctor` 增一节 **profilers**：`sample`（macOS，实测可用）、`samply`（未装 → 安装行）、`cargo-flamegraph`（**跑一次 `dtrace -n 'BEGIN { exit(0) }'` 才知道**它在本机能不能用：这里被拒 → 报 `!` 并说明原因）、`perf`（仅 Linux 才提） | 4.16 要教“给出可复现的剖析结论”，学员第一步会问“我用哪个”；答案必须是这台机器的实测结果，而不是通用建议。**实测修正**：`dtrace` 是存在的（`/usr/sbin/dtrace`），拒绝的是权限；所以这一节的做法是“跑一下”，不是“找一下” |
 | C6 | 无网快路径写进文档并留一条可重放的验收命令（`CARGO_NET_OFFLINE=true` + 私有 `XDG_CACHE_HOME` + 已预拉镜像 → T4 快路径绿） | plan §11 的 M3 验收项；M2 只有“镜像在不在”的检查，没有“真能离线跑”的演练 |
 
 **不做**（也是决定）：不给 4.16 加 `?profile` 形状的 should 门。剖析工具的可用性随平台变化（本机 `dtrace` 都没有），

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::cmd::Session;
 use crate::error::{EXIT_ERROR, EXIT_OK, Result};
 use crate::gates::tool::{self, Tool};
+use crate::process;
 use crate::runtime::{self, Engine, RuntimeReport};
 
 /// How long each probe may take.
@@ -51,6 +52,15 @@ pub fn run(session: &Session) -> Result<u8> {
 
     println!("\ncargo tools");
     let (blocked, warned) = cargo_tools();
+    blockers += blocked;
+    warnings += warned;
+
+    // `lakelet/4.16-profiling` asks for a profile and a conclusion drawn from it, and the answer to
+    // "with what" is different on every platform. The course's own must-half does not need any of
+    // these tools (it judges attribution counters, plan §6), so this section is a map rather than a
+    // requirement: it says which route works *here*, measured by looking, and which one is a trap.
+    println!("\nprofilers");
+    let (blocked, warned) = profilers();
     blockers += blocked;
     warnings += warned;
 
@@ -166,7 +176,19 @@ fn containers(report: &RuntimeReport) -> Tally {
     let mut blockers = 0;
     let mut warnings = 0;
     match report.preferred {
-        Some(engine) => println!("  → using `{}`", engine.binary()),
+        Some(engine) => {
+            println!("  → using `{}`", engine.binary());
+            // Asking the engine what it is (`info`) is not the same as one container that starts:
+            // `docker compose version` answered on this machine while `docker compose config` could
+            // not configure a project, and `podman info` answers while its machine is still booting.
+            let smoke = runtime::smoke(engine, PROBE_TIMEOUT);
+            if smoke.started {
+                println!("  ✓ {}", smoke.detail);
+            } else {
+                println!("  ! {}", smoke.detail);
+                warnings += 1;
+            }
+        }
         None => {
             println!("  ✗ no container engine works: container steps cannot run");
             blockers += 1;
@@ -199,6 +221,98 @@ fn cargo_tools() -> Tally {
     (0, warnings)
 }
 
+/// Which sampler works on this machine, and which one only looks like it does.
+///
+/// Nothing here is a blocker: `perf/profiling@operate` is judged by the counters a harness prints
+/// (`bench-budget`) and by the page a learner draws from them, so a machine without a sampling
+/// profiler can still finish the step. What a learner cannot afford is spending an hour on a tool
+/// that was never going to run: `cargo-flamegraph` is installed here and drives `dtrace`, which is
+/// not, and `perf` is a Linux program. Saying so is the whole point of the section.
+fn profilers() -> Tally {
+    let mut warnings = 0;
+
+    // The platform sampler: part of macOS, needs no root for a process you own.
+    match process::locate("sample") {
+        Some(path) => {
+            println!(
+                "  ✓ sample ({}) — `sample <pid> <seconds> -file out.txt` works on your own \
+                 processes without root",
+                path.display()
+            );
+        }
+        None => println!("  · sample — not on PATH (this is not macOS)"),
+    }
+
+    // `samply` is the portable answer; the course names it, and this machine does not have it.
+    match process::locate("samply") {
+        Some(path) => println!("  ✓ samply ({})", path.display()),
+        None => {
+            println!("  ✗ samply — no such command (cargo install samply --locked)");
+            println!(
+                "      needed for a flame graph you can open and share; the platform sampler \
+                 above is what works here"
+            );
+        }
+    }
+
+    // Installed and unusable is the interesting case, and the reason this section exists: on this
+    // machine `cargo-flamegraph` is there and `dtrace` is there, and a non-root `dtrace` answers
+    // "DTrace requires additional privileges". Probing by running is the only way to know.
+    if let Some(path) = process::locate("cargo-flamegraph") {
+        match dtrace_runs() {
+            Some(true) => println!("  ✓ cargo flamegraph ({})", path.display()),
+            Some(false) => {
+                println!(
+                    "  ! cargo flamegraph ({}) is installed and cannot run here: it drives \
+                     `dtrace`, and a `dtrace` this user can start refuses with \"DTrace requires \
+                     additional privileges\"",
+                    path.display()
+                );
+                warnings += 1;
+            }
+            None => println!(
+                "  ✓ cargo flamegraph ({}) — `dtrace` is not on this platform, which is what \
+                 cargo-flamegraph needs on Linux too",
+                path.display()
+            ),
+        }
+    } else {
+        println!("  ✗ cargo flamegraph — no such command (cargo install flamegraph --locked)");
+    }
+
+    // `perf` is Linux's sampler. Reporting it as missing on macOS would be noise, not a finding.
+    if cfg!(target_os = "linux") {
+        match process::locate("perf") {
+            Some(path) => println!("  ✓ perf ({})", path.display()),
+            None => {
+                println!("  ✗ perf — no such command (install linux-tools for your kernel)");
+                warnings += 1;
+            }
+        }
+    }
+
+    (0, warnings)
+}
+
+/// Whether `dtrace` can start here, as far as a probe can tell.
+///
+/// `Some(true)` when a trivial `dtrace` script ran, `Some(false)` when it is present and refused
+/// (macOS refuses without root: "DTrace requires additional privileges"), and `None` when there is no
+/// `dtrace` on this platform at all — which is not a defect, since `cargo-flamegraph` only needs it on
+/// macOS.
+fn dtrace_runs() -> Option<bool> {
+    process::locate("dtrace")?;
+    let ran = process::run(
+        "dtrace",
+        &["-n", "BEGIN { exit(0) }"],
+        &std::env::temp_dir(),
+        PROBE_TIMEOUT,
+    )
+    .ok()?;
+    Some(ran.success() && !ran.stderr.contains("privileges"))
+}
+
+/// The registry mirror, the cargo source replacement, and every image the authored steps declare.
 fn registry(session: &Session) -> Tally {
     let mut warnings = 0;
     let mirror = std::env::var("KILN_REGISTRY_MIRROR").ok();
@@ -230,19 +344,15 @@ fn registry(session: &Session) -> Tally {
     }
 
     println!("  images declared by the authored tracks:");
-    let mut images = 0;
-    for track in session.course().tracks() {
-        for step in &track.step {
-            for image in &step.images {
-                images += 1;
-                let resolved = mirror
-                    .as_deref()
-                    .map_or_else(|| image.clone(), |mirror| format!("{mirror}/{image}"));
-                println!("    {resolved}  ({} step {})", track.id, step.id);
-            }
-        }
+    let declared = runtime::declared_images(session.course());
+    for image in &declared {
+        let resolved = mirror.as_deref().map_or_else(
+            || image.reference.clone(),
+            |mirror| format!("{mirror}/{}", image.reference),
+        );
+        println!("    {resolved}  ({} step(s))", image.steps.len());
     }
-    if images == 0 {
+    if declared.is_empty() {
         println!("    none declared in the authored metadata yet");
     }
     (0, warnings)

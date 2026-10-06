@@ -9,22 +9,33 @@
 //! The reference solution is applied on the way past. That is not a shortcut for the learner — it is
 //! what keeps the project compiling for the steps after it, exactly as a scaffold does. The
 //! application is recorded (`solution_applied`), so nothing downstream can mistake it for work.
+//!
+//! `--track` names the track to walk, like every other command that walks one. It is how a track that
+//! is not the course's default gets built up for `kiln verify --track <track>`: the acceptance drill
+//! of a track asks for its whole tail tree, and walking a track's own steps one at a time used to need
+//! them spelled out in path order (handoff M2 §4.1).
 
-use crate::cmd::{Session, plan};
+use crate::cmd::{Session, list, plan};
 use crate::error::{EXIT_FAILED, EXIT_OK, KilnError, Result};
-use crate::info::Step;
+use crate::info::{Step, Track};
 use crate::probe::{self, Probe};
 use crate::project;
 
 /// Skip one step, or every step `plan --fast` would skip.
-pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: bool) -> Result<u8> {
+pub fn run(
+    session: &mut Session,
+    reference: Option<&str>,
+    all: bool,
+    force: bool,
+    track: Option<&str>,
+) -> Result<u8> {
+    let track = named_track(session, track)?;
     if all {
         if reference.is_some() {
             return Err(KilnError::Invalid(
                 "`kiln skip --all` walks a whole track: it takes no step id".to_owned(),
             ));
         }
-        let track = session.course().default_track()?.clone();
         // One read of the catalogue for the whole pass: the verdicts and the refusal messages both
         // name an exercise only when one exists (kiln/src/cmd/plan.rs).
         let probes = probe::load(&session.course().dir())?;
@@ -54,12 +65,39 @@ pub fn run(session: &mut Session, reference: Option<&str>, all: bool, force: boo
         return Ok(EXIT_OK);
     }
 
-    let step = super::resolve_step(session, reference)?;
+    let step = match reference {
+        Some(reference) => super::resolve_step(session, Some(reference))?,
+        None => list::first_unfinished(&track, session.state())
+            .cloned()
+            .ok_or_else(|| {
+                KilnError::Invalid(format!(
+                    "every step of `{}` is done — name a step explicitly, or start the next track",
+                    track.id
+                ))
+            })?,
+    };
+    if step.track != track.id {
+        return Err(KilnError::Invalid(format!(
+            "{} is a step of `{}`, and `--track {}` was asked for — name a step of that track, or \
+             drop the flag",
+            step.qualified_id(),
+            step.track,
+            track.id
+        )));
+    }
     let probes = probe::load(&session.course().dir())?;
     if skip_one(session, &step, &probes, force)? {
         Ok(EXIT_OK)
     } else {
         Ok(EXIT_FAILED)
+    }
+}
+
+/// The track a skip walks: the one `--track` names, or the course's default.
+fn named_track(session: &Session, track: Option<&str>) -> Result<Track> {
+    match track {
+        Some(id) => Ok(session.course().track(id)?.clone()),
+        None => Ok(session.course().default_track()?.clone()),
     }
 }
 

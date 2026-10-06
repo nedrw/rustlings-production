@@ -300,6 +300,148 @@ impl ImageReport {
     }
 }
 
+/// One image the authored metadata declares, and the steps that declare it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredImage {
+    /// Reference as the steps wrote it (`postgres:17-alpine`).
+    pub reference: String,
+    /// Qualified ids of the steps that need it, in track order.
+    pub steps: Vec<String>,
+}
+
+/// Every image the authored metadata declares, grouped by reference, in first-seen order.
+///
+/// Grouped because one image is normally needed by many steps (`postgres:17-alpine` is declared by
+/// thirty of them), and a report that repeats the same answer thirty times buries the one line that
+/// matters: whether anything is missing. The steps are kept, because "which step needs this" is the
+/// question a learner asks when a container step will not start.
+#[must_use]
+pub fn declared_images(course: &crate::info::Course) -> Vec<DeclaredImage> {
+    let mut declarations: Vec<(String, String)> = Vec::new();
+    for track in course.tracks() {
+        for step in &track.step {
+            for image in &step.images {
+                declarations.push((image.trim().to_owned(), step.qualified_id()));
+            }
+        }
+    }
+    group(declarations)
+}
+
+/// Group `(reference, step)` pairs the way the reports want them.
+///
+/// Kept apart from the walk over the metadata so the rule can be checked without a course on disk:
+/// first-seen order, one entry per reference, every step that names it in track order.
+fn group(declarations: Vec<(String, String)>) -> Vec<DeclaredImage> {
+    let mut found: Vec<DeclaredImage> = Vec::new();
+    for (reference, step) in declarations {
+        match found.iter_mut().find(|seen| seen.reference == reference) {
+            Some(seen) => seen.steps.push(step),
+            None => found.push(DeclaredImage {
+                reference,
+                steps: vec![step],
+            }),
+        }
+    }
+    found
+}
+
+/// What a run-probe of the container engine found.
+///
+/// Detection asks the engine what it is (`info`), and a reply is not the same as a container that
+/// starts: on this machine's history, `docker compose version` answered while `docker compose config`
+/// could not configure a project, and `podman info` answers while the machine is booting. The probe
+/// below is the doctrine of this module applied to the engine itself — **probe by running**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmokeReport {
+    /// Image the probe ran, when one cheap enough to try was here.
+    pub image: Option<String>,
+    /// `true` when a container started and its command exited 0.
+    pub started: bool,
+    /// One line for a report.
+    pub detail: String,
+}
+
+/// Images small and quiet enough to prove the engine works by running one command in one of them.
+///
+/// Only images whose entrypoint is a shell that can run `true` are listed: an image whose entrypoint
+/// is its own service (`postgres:17-alpine`) would fail the probe for a reason that has nothing to do
+/// with the engine, and "the engine is broken" is exactly the wrong lesson to take from that.
+const SMOKE_CANDIDATES: &[&str] = &[
+    "alpine:3.20",
+    "alpine",
+    "debian:bookworm-slim",
+    "rust:1.98-alpine",
+    "rust:1.98-slim",
+];
+
+/// Start one container to find out whether the engine can start one at all.
+///
+/// The probe is bounded by `timeout` and by [`SMOKE_CANDIDATES`]: when none of those images is in the
+/// local store, the report says so instead of pulling anything (nothing in this course reaches the
+/// network to answer a question about the machine).
+#[must_use]
+pub fn smoke(engine: Engine, timeout: Duration) -> SmokeReport {
+    let candidates: Vec<String> = SMOKE_CANDIDATES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    let Ok(reports) = images(engine, &candidates, timeout) else {
+        return SmokeReport {
+            image: None,
+            started: false,
+            detail: format!("`{} images` could not be asked", engine.binary()),
+        };
+    };
+    let Some(present) = reports.iter().find(|report| report.is_present()) else {
+        return SmokeReport {
+            image: None,
+            started: false,
+            detail: format!(
+                "no small image to try (looked for {}): `kiln images pull` fetches the ones the \
+                 steps declare",
+                SMOKE_CANDIDATES.join(", ")
+            ),
+        };
+    };
+    // The name the store actually has it under: a mirrored image is `docker.1ms.run/library/alpine:3.20`
+    // here, and naming the declared one would make the engine try to resolve a name it does not know.
+    let local = present
+        .local
+        .clone()
+        .unwrap_or_else(|| present.declared.clone());
+    let args = ["run", "--rm", local.as_str(), "true"];
+    let ran = match process::run(engine.binary(), &args, &std::env::temp_dir(), timeout) {
+        Ok(ran) => ran,
+        Err(error) => {
+            return SmokeReport {
+                image: Some(present.declared.clone()),
+                started: false,
+                detail: format!("`{}` did not run: {error}", engine.binary()),
+            };
+        }
+    };
+    SmokeReport {
+        image: Some(present.declared.clone()),
+        started: ran.success(),
+        detail: if ran.success() {
+            format!(
+                "containers can start ({} `{}`, {:.1}s)",
+                engine.binary(),
+                present.declared,
+                ran.elapsed.as_secs_f64()
+            )
+        } else {
+            format!(
+                "a container did not start: `{}` exited {} — {}",
+                process::command_line(engine.binary(), &args),
+                process::exit_code_text(ran.code),
+                ran.summary()
+            )
+        },
+    }
+}
+
 /// Where every declared image is, locally.
 ///
 /// # Errors
@@ -562,5 +704,43 @@ mod tests {
                 .contains("not on PATH"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn declared_images_are_grouped_by_reference_and_keep_their_steps() {
+        // The shape the authored metadata actually has: one image named by many steps, in track
+        // order. Thirty rows of `postgres:17-alpine` is what this replaced.
+        let grouped = group(vec![
+            (
+                "postgres:17-alpine".to_owned(),
+                "mailer/1.9-postgres".to_owned(),
+            ),
+            ("alpine:3.20".to_owned(), "mailer/1.21-container".to_owned()),
+            (
+                "postgres:17-alpine".to_owned(),
+                "relay/2.1-project-skeleton".to_owned(),
+            ),
+            (
+                "alpine:3.20".to_owned(),
+                "lakelet/4.22-reproducible-build".to_owned(),
+            ),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].reference, "postgres:17-alpine");
+        assert_eq!(
+            grouped[0].steps,
+            ["mailer/1.9-postgres", "relay/2.1-project-skeleton"]
+        );
+        assert_eq!(grouped[1].reference, "alpine:3.20");
+        assert_eq!(grouped[1].steps.len(), 2);
+
+        // A declaration with surrounding whitespace is the same reference, not a second one.
+        let trimmed = group(vec![
+            ("alpine:3.20".to_owned(), "a/1.1-step".to_owned()),
+            ("alpine:3.20".to_owned(), "b/2.1-step".to_owned()),
+        ]);
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].steps.len(), 2);
+        assert!(group(Vec::new()).is_empty());
     }
 }

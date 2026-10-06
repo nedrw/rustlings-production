@@ -122,17 +122,21 @@ pub enum Command {
     /// A skip is recorded, never passed off as progress: `kiln list` shows the step as `»` and
     /// `kiln reset <step>` puts it back on the list.
     Skip {
-        /// Step to skip (default: the first step `plan --fast` would skip).
+        /// Step to skip (default: the first unfinished step of the track).
         #[arg(value_name = "STEP")]
         step: Option<String>,
 
-        /// Skip every step of the default track that a passed probe has proven.
+        /// Skip every step that a passed probe has proven.
         #[arg(long)]
         all: bool,
 
         /// Skip without probe evidence, recording that you did.
         #[arg(long)]
         force: bool,
+
+        /// Track to walk (default: the course's default track).
+        #[arg(long, value_name = "TRACK")]
+        track: Option<String>,
     },
 
     /// Re-check a capability with a 3–10 minute exercise (spaced repetition, plan §10).
@@ -351,9 +355,18 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Caps { track }) => caps::run(&session, track.as_deref()),
         Some(Command::LintCaps) => lint_caps::run(&session),
         Some(Command::Plan { track, fast }) => plan::run(&session, track.as_deref(), *fast),
-        Some(Command::Skip { step, all, force }) => {
-            skip::run(&mut session, step.as_deref(), *all, *force)
-        }
+        Some(Command::Skip {
+            step,
+            all,
+            force,
+            track,
+        }) => skip::run(
+            &mut session,
+            step.as_deref(),
+            *all,
+            *force,
+            track.as_deref(),
+        ),
         Some(Command::Probe {
             capability,
             solution,
@@ -814,6 +827,57 @@ mod command_line_tests {
         assert!(
             matches!(cli.command, Some(Command::Check { slow: false, .. })),
             "plain `check` stays on the fast path"
+        );
+    }
+
+    /// `skip --track` exists, and it reaches the command: building up a track that is not the
+    /// course's default is what `kiln verify --track <track>` needs before it can judge one
+    /// (handoff M2 §4.1 walked fifteen steps in path order for exactly this).
+    #[test]
+    fn skip_takes_the_track_flag() {
+        let cli = Cli::try_parse_from(["kiln", "skip", "--track", "lakelet"])
+            .expect("the command line parses");
+        match cli.command {
+            Some(Command::Skip {
+                step, track, all, ..
+            }) => {
+                assert_eq!(track.as_deref(), Some("lakelet"));
+                assert_eq!(
+                    step, None,
+                    "with no step, the track's first unfinished one is meant"
+                );
+                assert!(!all);
+            }
+            other => panic!("expected `skip`, got {other:?}"),
+        }
+
+        // `--all` walks the track it was given, and the flag stays optional.
+        let cli = Cli::try_parse_from(["kiln", "skip", "--all", "--track", "lakelet", "--force"])
+            .expect("the command line parses");
+        assert!(
+            matches!(
+                cli.command,
+                Some(Command::Skip {
+                    all: true,
+                    force: true,
+                    track: Some(ref track),
+                    ..
+                }) if track == "lakelet"
+            ),
+            "`skip --all --track <id>` parses"
+        );
+        let cli = Cli::try_parse_from(["kiln", "skip", "3.5-store-port-conformance"])
+            .expect("the command line parses");
+        assert!(
+            matches!(
+                cli.command,
+                Some(Command::Skip {
+                    track: None,
+                    all: false,
+                    ..
+                })
+            ),
+            "a bare `skip` still means the default track"
         );
     }
 }

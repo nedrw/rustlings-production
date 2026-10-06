@@ -5,18 +5,23 @@
 //! what is already here", and `pull` is the one that fetches what is missing — one command for all
 //! of it, so a learner does not collect `podman pull` lines from four different steps.
 //!
+//! The report is grouped by **image**, not by step: `postgres:17-alpine` is declared by thirty steps
+//! and printing it thirty times buries the answer to the only question here. It ends with the two
+//! lines that make the offline case decidable: how many declared images are present, and whether the
+//! engine can actually *start* one (probed by running, per this module's doctrine — an engine that
+//! answers `info` is not necessarily an engine that starts containers).
+//!
 //! Exit codes follow the rest of the runner: `0` everything is here, `1` something is missing (the
 //! detail says which command fetches it), `2` nothing could be judged because no engine answered.
 
 use crate::cmd::Session;
 use crate::error::{EXIT_ERROR, EXIT_FAILED, EXIT_OK, Result};
-use crate::info::Step;
 use crate::process;
-use crate::runtime::{self, Engine, ImageReport};
+use crate::runtime::{self, DeclaredImage, Engine, ImageReport};
 
 /// What `kiln images` was asked to do.
 pub fn run(session: &Session, pull: bool) -> Result<u8> {
-    let declared = declared_images(session);
+    let declared = runtime::declared_images(session.course());
     if declared.is_empty() {
         println!("no step of the authored tracks declares an image yet");
         return Ok(EXIT_OK);
@@ -27,43 +32,57 @@ pub fn run(session: &Session, pull: bool) -> Result<u8> {
             "no container engine answered: install podman (or docker) and run `kiln doctor`.\n\n\
              The images these steps declare:"
         );
-        for (_, image) in &declared {
-            println!("  {image}");
+        for image in &declared {
+            println!("  {}", image.reference);
         }
         return Ok(EXIT_ERROR);
     };
 
     println!(
-        "images declared by the authored steps (`{}`):",
+        "images declared by the authored steps (`{}`), grouped by image:",
         engine.name()
     );
     report_mirror();
 
     // One listing answers for every image: the engine is asked once, not once per step.
-    let wanted: Vec<String> = declared.iter().map(|(_, image)| image.clone()).collect();
+    let wanted: Vec<String> = declared
+        .iter()
+        .map(|image| image.reference.clone())
+        .collect();
     let reports = runtime::images(engine, &wanted, session.timeout())?;
     let mut missing = Vec::new();
-    for ((step, _), report) in declared.iter().zip(reports) {
+    for (image, report) in declared.iter().zip(&reports) {
         println!(
             "  {} {}",
             if report.is_present() { "✓" } else { "✗" },
             report.line(engine)
         );
-        println!("      needed by {}", step.qualified_id());
+        println!("      needed by {}", needed(image));
         if !report.is_present() {
-            missing.push(report);
+            missing.push(report.clone());
         }
     }
 
+    let present = declared.len() - missing.len();
+    println!(
+        "\n{} declared image(s): {present} present{} — a step can start its container without the \
+         network once its image is here",
+        declared.len(),
+        if missing.is_empty() {
+            String::new()
+        } else {
+            format!(", {} missing", missing.len())
+        }
+    );
+    report_smoke(engine, session);
+
     if missing.is_empty() {
-        println!("\nevery declared image is in the local image store");
         return Ok(EXIT_OK);
     }
     if !pull {
         println!(
-            "\n{} missing — `kiln images pull` fetches {} in one go",
-            plural(missing.len()),
-            if missing.len() == 1 { "it" } else { "them" }
+            "\n{missing_count} — `kiln images pull` fetches them in one go",
+            missing_count = plural(missing.len())
         );
         return Ok(EXIT_FAILED);
     }
@@ -73,6 +92,31 @@ pub fn run(session: &Session, pull: bool) -> Result<u8> {
         return Ok(EXIT_FAILED);
     }
     Ok(EXIT_OK)
+}
+
+/// Say whether the engine can start a container, once, after the listing.
+fn report_smoke(engine: Engine, session: &Session) {
+    let smoke = runtime::smoke(engine, session.timeout());
+    let marker = if smoke.started { "✓" } else { "!" };
+    println!("  {marker} {}", smoke.detail);
+}
+
+/// The steps that need one image, first three by name and a count for the rest.
+fn needed(image: &DeclaredImage) -> String {
+    const SHOWN: usize = 3;
+    let shown = image
+        .steps
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<String>>()
+        .join(", ");
+    let rest = image.steps.len().saturating_sub(SHOWN);
+    if rest == 0 {
+        format!("{shown} ({} step(s))", image.steps.len())
+    } else {
+        format!("{shown} and {rest} more ({} step(s))", image.steps.len())
+    }
 }
 
 /// Pull every image that is not here yet, in the order the steps declare them.
@@ -106,17 +150,13 @@ fn fetch(engine: Engine, missing: &[ImageReport], session: &Session) -> Result<u
     Ok(failed)
 }
 
-/// Every image the authored steps declare, with the step that declares it.
-fn declared_images(session: &Session) -> Vec<(&Step, String)> {
-    let mut images = Vec::new();
-    for track in session.course().tracks() {
-        for step in &track.step {
-            for image in &step.images {
-                images.push((step, image.clone()));
-            }
-        }
+/// `<n> image is` / `<n> images are`.
+fn plural(count: usize) -> String {
+    if count == 1 {
+        "1 image is".to_owned()
+    } else {
+        format!("{count} images are")
     }
-    images
 }
 
 /// Say which mirror pulls go through, because it decides the name a pull uses.
@@ -127,14 +167,5 @@ fn report_mirror() {
             "KILN_REGISTRY_MIRROR is not set: pulls go to the registry a step names, which is slow \
              or unreachable on some networks"
         ),
-    }
-}
-
-/// `<n> image`, `<n> images`.
-fn plural(count: usize) -> String {
-    if count == 1 {
-        "1 image is".to_owned()
-    } else {
-        format!("{count} images are")
     }
 }
