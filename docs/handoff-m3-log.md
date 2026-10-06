@@ -410,3 +410,69 @@ sim（app/lakelet 里）：seed 1 跑两遍 → 54 行 `lakelet-sim` 逐字节�
 **下一步**：B1 到此结束（4.1–4.4）。给开发者 B1 检查点报告；随后 B2 从 `4.5-batch-writes` 开始
 （`io/batching@design`、`slow:bench-budget@10` 第一次上场，车道是计数不是时间：`<track>-budget <name>=<value>`
 + 课程侧 `budget/4.5-batch-writes.toml` 的 `[metric]` 基线，`_max` 结尾的只许变小）。
+
+## 段 10：`lakelet/4.5-batch-writes`（B2 的第一步，`bench-budget` 第一次上场）
+
+**做了什么**：`io/batching@design` 由子 agent 交付（提交 `68983ed`，1853 行新增）：12 个用例的规格、正文
+（teach 模板，173 行）、`budget/4.5-batch-writes.toml`（41 行）、scaffold（新建 `flush/{mod,batcher}.rs`、
+`spool/batch.rs`、课程装置 `tests/budget.rs`、`docs/write-amplification.md` 模板）与参考解。**骨架没动**
+（两个插入点 `src/engine/mod.rs`、`src/engine/spool.rs` 的标记块都已经在）。
+
+**这一步的四条不变量**：① 批量改的是**调用次数**，不是字节也不是顺序——N 个载荷写成 N 条记录、一次 open
+一次 write，`records()`/`scan`/`recover` 看到的与 N 次单独 append 逐字节相同；② **确认不得越过写**：守护
+进程把同一轮里到的帧一起写，但只有写完之后才答复（4.1 的承诺）；③ 计数器是这一课本身，且**可观测**；
+④ 写放大是个数字（`bytes_per_payload`），**这一步没有任何判据是时间**（M2 §1.1）。
+
+**计数器的契约**（`flush::Stats`，`Spool::stats()` 读；只有 `pub(crate) charge`/`charge_sync` 能改，
+调用方无法虚报）：
+
+| 存取器 | 计什么 |
+| --- | --- |
+| `records()` | 这条写路径写过的记录数 |
+| `bytes()` | 写下去的字节（含 framing 与首记录的 5 字节头） |
+| `calls()` | **每次 open 与每次 write 各算一次**（一个批量 = 2） |
+| `syncs()` | 设备**答应了**的刷盘次数 |
+| `batches()` | 真写了东西的批次（空批次不算） |
+
+守护进程停机时多一行 `store write cost records=… bytes=… batches=… calls=… syncs=…`（打印在停机自己那次
+flush **之前**，所以 `syncs` 是 append 要求的次数）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+selftest：4.1 9/9 · 4.2 10/10 · 4.3 9/9 · 4.4 10/10 · 4.5 10/10 must green（五份都 hold the contract）
+check 4.5 --slow：✓ slow:bench-budget@10 11 metric(s) judged against the course baseline
+                    (8 within ±10%, 3 at or below an upper bound): records_64 64, calls_64 2,
+                    bytes_64 4613, records_128 128, calls_128 2, bytes_128 9221, bytes_per_payload 1.1262,
+                    calls_per_record_max 0.0312, calls_ratio_max 1, fsyncs_per_batch 1, appends_calls_max 128
+                  10/10 must gate(s) passed · real 11.6s
+演练（把批量写改回 4.1 的形状：一条记录一次 open+write，字节与顺序故意不动）：
+  ✗ slow:bench-budget@10 4 of 11 metric(s) moved out of budget：calls_64 is 128, 126 of the baseline 2
+    (more than ±10%)；calls_128 is 256, 254 …；calls_per_record_max is 2 and has to stay ≤ 0.034
+    (it is an upper bound)；calls_ratio_max is 2 and has to stay ≤ 1.1 (it is an upper bound)
+  **9/10 must gate(s) passed —— 规格全绿**：等值测试看不见“几条记录几次调用”，这正是这一门存在的理由
+回滚 → ✓ 11 metric(s) · 10/10 must gate(s) passed
+全局：lint-caps no issues · links 95 page(s) · i18n 0 error · probe 41/41 · cargo test -p kiln 318+21+1
+```
+
+**这一段钉下来的四件事**：
+
+1. **`bench-budget` 的通过行说错了规则**（子 agent 报告里点出来的框架缺陷）：三个 `_max` 指标被判的是
+   “≤ 上界”，而报告把 11 个指标都说成“within ±10%”。已修（提交 `1ec9258`）：
+   `11 metric(s) judged against the course baseline (8 within ±10%, 3 at or below an upper bound)`，并加一条
+   用例把两条规则都钉住。**这类“报告说错了判据”比判错本身更坏**——学员会照着报告去改错的东西。
+2. **`calls` 的口径**：open 与 write 各计一次（一个批量 = 2）。作业书里“write calls (opens included)”有歧义，
+   子 agent 选了“包含 open”并写在页面与表里；我接受这个口径——**把 open 计进去才抓得住“一条记录一次
+   open”**（演练里 `calls_per_record_max` 从 0.0312 变成 2 就是这个效果）。
+3. **比计划多一个模块**：`src/engine/spool/batch.rs`（计划只列了 `flush/{mod,batcher}.rs`）。理由是规则 6
+   （可被改写的桩不能靠插入）+ 一个批量要动的 `len`/`last_sync`/`policy` 是 `spool.rs` 的私有字段；形状与
+   4.3/4.4 的 `spool/*.rs` 一致。`flush` 拥有分组与记账，`spool/batch` 拥有那一次调用。
+4. **批量的边界 = 一次读到的分片**（`READ_CHUNK`，64 KiB），而不是定时/定量的后台任务：后者会破坏“确认不得
+   越过写”（除非调用方阻塞），而那正是 4.6 要处理的有界队列——页面里写明了这个交棒。
+
+另外记一条不算问题的事实：scaffold 态会带三个 `dead_code` 警告（`todo!()` 体意味着没人调用
+`append_batch`/`charge`/`charge_sync`）。`selftest` 只在解完的树上跑门，所以无害；不要靠加 `#[allow]` 去
+“修”它（那是把 `clippy@4` 的下一条规则拆掉）。
+
+**下一步**：`4.6-ingest-backpressure`（`async/backpressure@design`：`Block`/`DropNewest`/`DropOldest`/`Sample`
+四种策略各带丢弃计数 + `slow:sim@3` 三种子；“谁被丢掉”是依赖调度的答案，也是 plan §9 演练第 3 条的落点）。

@@ -45,3 +45,6 @@
    （这是对的），所以作者改了 `tests/sim_wal.rs` 这类 scaffold 送进项目的文件之后，门判的是旧副本——实测
    （4.4）：digests 从 `5dd009a0/eddf61b3/fd32e3d5` 变成 `1fcbf0d8/9938dcf4/a4486a02`，中间只做了“删掉
    `app/lakelet/tests/sim_wal.rs` 再 `kiln run`”这件事。本地复验前先删那一份（或换一棵 scratch 树）。
+6. **写 RECALL 前先查 `course/capabilities.toml`**：每个能力按深度写着是哪一步建立的
+   （`[capability."async/backpressure"]` → `apply = "relay/2.14"`），所以 `requires` 里每一项对应的
+   `<能力>@<深度> — <track>/<step>` 一查即得，不用逐个 `track.toml` 翻。
