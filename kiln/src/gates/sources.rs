@@ -54,6 +54,14 @@ pub fn production_sources(track_dir: &Path, step: &Step) -> Result<Vec<String>> 
 /// A step that introduces no file at all — it changes only what the learner already owns
 /// (authoring.md §5) — falls back to the files its patch touches: the alternative is no measurement
 /// at all, and a step whose whole work is an edit is answerable for the file it edits.
+///
+/// A **skeleton** scaffold falls back the same way, deliberately. The skeleton is the material the
+/// stage starts from, not something the step brings: it carries a stub for every module the track
+/// will ever have, most of them owned by later steps (measured on the shape of `jobq`: the skeleton
+/// holds `src/engine/error.rs`, which `jobq/3.3` is about, and `src/bin/jobqd.rs`, which arrives
+/// much later). Measuring the whole skeleton would put those stubs in the denominator — the defect
+/// this rule exists to remove. What the step brings is what its own patch touches, which for a first
+/// step is the part it makes work.
 pub fn introduced_sources(track_dir: &Path, step: &Step) -> Result<Vec<String>> {
     let mut introduced: Vec<String> = Vec::new();
     if let Some(Scaffold::Patch(scaffold)) = project::load_scaffold(track_dir, step)? {
@@ -334,6 +342,37 @@ mod tests {
             introduced_sources(&track_dir, &step).expect("the patch parses"),
             ["src/store.rs"],
             "an edit-only step is answerable for the file it edits"
+        );
+    }
+
+    #[test]
+    fn a_skeleton_step_is_measured_over_what_its_own_patch_touches() {
+        // The skeleton is the stage's starting material, and it holds a stub for every module the
+        // track will ever have — including the ones later steps are about. Counting them here would
+        // be the defect the "what the step brings" rule exists to remove.
+        let (temp, step) = fixture_parts(
+            "sources-skeleton",
+            Some("skeleton"),
+            Some("solutions/3.22-bench-budget.patch"),
+        );
+        let track_dir = temp.path().join("course/tracks/mailer");
+        temp.write(
+            "course/tracks/mailer/skeleton/src/lib.rs",
+            "pub fn f() {}\n",
+        );
+        temp.write(
+            "course/tracks/mailer/skeleton/src/engine/error.rs",
+            "// a later step's subject\n",
+        );
+        temp.write(
+            "course/tracks/mailer/solutions/3.22-bench-budget.patch",
+            MODIFIES,
+        );
+
+        assert_eq!(
+            introduced_sources(&track_dir, &step).expect("the patches parse"),
+            ["src/store.rs"],
+            "the file the step's own work is in, not the skeleton's stubs"
         );
     }
 

@@ -57,10 +57,32 @@ pub fn copy_project(from: &Path, to: &Path) -> Result<()> {
 
 /// Copy one directory of a project, recursively, without what a build regenerates.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    let mut walked = std::collections::HashSet::new();
+    copy_into(from, to, &mut walked)
+}
+
+/// The recursion, carrying the directories already walked.
+///
+/// `walked` exists for one case: a symbolic link to a directory. `entry.file_type()` reports a link
+/// as neither a file nor a directory, so a link used to be skipped in silence — a project whose
+/// source or fixture is linked lost it in the copy, and the run then failed or measured a tree with
+/// a hole in it. The classification is therefore [`std::fs::metadata`], which follows the link (a
+/// link to a file is a file, with the target's contents), and the guard is what keeps a link that
+/// points back at a directory above it from recursing until the disk is full.
+fn copy_into(
+    from: &Path,
+    to: &Path,
+    walked: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
     std::fs::create_dir_all(to).map_err(|source| KilnError::Write {
         path: to.to_path_buf(),
         source,
     })?;
+    if let Ok(canonical) = std::fs::canonicalize(from)
+        && !walked.insert(canonical)
+    {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(from).map_err(|source| KilnError::Read {
         path: from.to_path_buf(),
         source,
@@ -73,18 +95,21 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         let name = entry.file_name();
         // The three directories that are large and regenerable: cargo's build output, the version
         // control history, and kiln's own state (a probe copy below `.kiln/` carries a build
-        // directory of its own, which the run it belongs to is the only one that can use).
+        // directory of its own, which the run it belongs to is the only one that can use). The name
+        // is the link's own either way: a link *called* `target` is the build directory.
         if matches!(name.to_str(), Some("target" | ".git" | ".kiln")) {
             continue;
         }
         let source_path = entry.path();
         let target_path = to.join(&name);
-        let Ok(kind) = entry.file_type() else {
+        // `metadata`, not `file_type`: see the doc above. A link with nothing behind it has nothing
+        // to copy and is left out, like an entry this process cannot stat at all.
+        let Ok(metadata) = std::fs::metadata(&source_path) else {
             continue;
         };
-        if kind.is_dir() {
-            copy_tree(&source_path, &target_path)?;
-        } else if kind.is_file() {
+        if metadata.is_dir() {
+            copy_into(&source_path, &target_path, walked)?;
+        } else if metadata.is_file() {
             // A profile file is not source: it is the data of a run this project knows nothing
             // about, and a measurement that merged it would be about that run.
             if source_path
@@ -202,6 +227,32 @@ mod tests {
         assert!(
             !copy.join("default_1_0_2.profraw").exists(),
             "another run's profile data was copied into the measurement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_file_comes_with_the_copy_and_a_link_to_a_parent_does_not_recurse_forever() {
+        // A link is neither a file nor a directory to `entry.file_type()`, which is how one used to
+        // disappear from the copy in silence; and following links means the walk has to survive a
+        // link that points back at a directory it already walked.
+        let temp = TempDir::new("sandbox-links");
+        let project = project(&temp);
+        let copy = temp.path().join("sandbox/project");
+        std::os::unix::fs::symlink(project.join("src/lib.rs"), project.join("linked.rs"))
+            .expect("the fixture can make a link");
+        std::os::unix::fs::symlink(&project, project.join("loop"))
+            .expect("the fixture can make a link");
+
+        copy_project(&project, &copy).expect("the copy is writable");
+
+        assert_eq!(
+            std::fs::read_to_string(copy.join("linked.rs")).expect("the linked file is copied"),
+            "pub fn f() {}\n"
+        );
+        assert!(
+            !copy.join("loop/loop").exists(),
+            "a link back up the tree must not be descended into twice"
         );
     }
 
