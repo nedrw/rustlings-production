@@ -1,0 +1,530 @@
+diff --git a/docs/write-amplification.md b/docs/write-amplification.md
+new file mode 100644
+index 0000000..1fd4cfb
+--- /dev/null
++++ b/docs/write-amplification.md
+@@ -0,0 +1,64 @@
++# Write amplification: the same bytes, fewer calls
++
++A record of a 64-byte payload costs 72 bytes in the log — four for its length, four for the
++[seal](../src/engine/wal/segment.rs) over both — and that arithmetic belongs to the format, not to
++the write path. What the write path decides is how many times it asks the kernel to do something
++about those bytes, and the shape it has had since `lakelet/4.1-ingest-protocol` is *twice per
++record*: one open and one write inside [`Spool::append`](../src/engine/spool.rs), plus one device
++call per record under a policy that waits.
++
++<!-- TODO: say why the calls are the cost and not the bytes, in numbers this repository has already
++measured — what one device flush costs (`adr/0001-write-path.md`) and what that does to a store that
++waits per record, and then what the open and the write cost when they are paid once per record
++instead of once per batch. Name the syscall count that went down, and the bytes that did not. -->
++
++## The counters
++
++The write path counts what it costs. The counters live in
++[`src/engine/flush/batcher.rs`](../src/engine/flush/batcher.rs) and are read through
++`Spool::stats`:
++
++| counter | what it counts |
++| --- | --- |
++| `records` | TODO |
++| `bytes` | TODO |
++| `calls` | TODO |
++| `syncs` | TODO |
++| `batches` | TODO |
++
++<!-- TODO: one row per counter, with what it counts and where it is charged — a counter the caller
++increments reports what the caller believes, not what the syscall did. Then say which of the five a
++batch of N records changes and which ones it leaves alone. -->
++
++## The budget
++
++| metric | what it counts | baseline |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++
++<!-- TODO: one row per metric `tests/budget.rs` prints, with the baseline
++`course/tracks/lakelet/budget/4.5-batch-writes.toml` records for it. The names in this table are the
++ones the harness prints and the one the course's baseline is written in, and the spec compares this
++page with that list. Say what the two batch sizes are, why the counts are taken at both of them at
++all, and which of the metrics is an upper bound rather than a target — the one a cost that grows
++with the batch size fails. -->
++
++## The promise batching must not break
++
++<!-- TODO: `Spool::append` answers once the record is readable (`crash-points.md`). Say what that
++becomes when one call carries N records, and what a batch that answered first and wrote afterwards
++would look like from the outside: the line the daemon prints
++([`src/bin/lakeletd.rs`](../src/bin/lakeletd.rs)) and the spec case that would notice. -->
++
++## How this is checked
++
++<!-- TODO: the command that prints the numbers, the gate that compares them with the baseline, and
++what the gate answers for a metric the harness did not print. Link what you are describing:
++[tests/budget.rs](../tests/budget.rs), [src/engine/spool/batch.rs](../src/engine/spool/batch.rs),
++[the policy](../src/engine/wal/policy.rs). -->
++
++## Where this comes from
++
++<!-- TODO: what production write paths do about the same cost — group commit, `writev`, `O_APPEND`,
++a buffered writer — and what each one buys. Say which of them this project uses and which it does
++not, and which step makes the batch size a bounded decision. -->
+diff --git a/src/engine/flush/batcher.rs b/src/engine/flush/batcher.rs
+new file mode 100644
+index 0000000..75fdcd4
+--- /dev/null
++++ b/src/engine/flush/batcher.rs
+@@ -0,0 +1,150 @@
++//! The payloads that arrive together, and what writing them cost.
++//!
++//! Step `lakelet/4.5-batch-writes`. `lakelet/4.1-ingest-protocol` made an append a promise: the
++//! record is written before the caller who sent it is answered. This file is where a *group* of
++//! those promises is made at once — the frames one turn of an event loop delivered, written as one
++//! batch — without moving the write behind the answer it replaces.
++//!
++//! The two shapes below are the whole contract:
++//!
++//! * [`Batcher`] holds payloads and remembers the order they arrived in. Holding is not writing:
++//!   nothing is on the file until [`Batcher::flush`] is called, which is what lets a caller write a
++//!   turn's worth of frames in one call instead of one call each;
++//! * [`Stats`] is what those calls have cost so far. It is charged where the calls happen, never by
++//!   the caller: a counter the caller increments reports what the caller believes it did.
++//!
++//! Back-pressure is deliberately absent. What a process does when payloads arrive faster than a
++//! batch can be written is `lakelet/4.6-ingest-backpressure`, and this file is only about what one
++//! call costs.
++
++use crate::engine::Spool;
++use crate::error::Error;
++
++/// What the write path has cost so far, counted.
++///
++/// Counters and never durations: a count is the same number on a loaded machine as on an idle one,
++/// and this value is what the step's page and the course's budget are written in.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Stats {
++    /// Records written.
++    records: u64,
++    /// Bytes written, the framing of every record included.
++    bytes: u64,
++    /// Calls made to write them: every open and every write.
++    calls: u64,
++    /// Device flushes the policy asked for.
++    syncs: u64,
++    /// Batches written. A batch that carried nothing is not one.
++    batches: u64,
++}
++
++impl Stats {
++    /// Records the write path has written.
++    #[must_use]
++    pub fn records(&self) -> u64 {
++        self.records
++    }
++
++    /// Bytes the write path has written, the framing of every record included.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// Calls the write path made to put those bytes on the file: every open and every write.
++    ///
++    /// This is the number batching moves. The bytes are the ones N separate appends would have
++    /// written and the order is the same; how they were handed to the kernel is what changed.
++    #[must_use]
++    pub fn calls(&self) -> u64 {
++        self.calls
++    }
++
++    /// Device flushes this write path's policy asked for.
++    #[must_use]
++    pub fn syncs(&self) -> u64 {
++        self.syncs
++    }
++
++    /// Batches the write path has written.
++    #[must_use]
++    pub fn batches(&self) -> u64 {
++        self.batches
++    }
++
++    /// Charge one batch to the write path.
++    ///
++    /// Called by the write path itself, at the moment the calls are made, which is the only place
++    /// that can count them: `records` is how many payloads the batch carried, `bytes` how many bytes
++    /// reached the file, and `calls` the opens and writes it took to put them there.
++    pub(crate) fn charge(&mut self, records: u64, bytes: u64, calls: u64) {
++        self.records += records;
++        self.bytes += bytes;
++        self.calls += calls;
++        self.batches += 1;
++    }
++
++    /// Charge one device flush: the call `Spool::sync` made, counted when it *succeeded*.
++    pub(crate) fn charge_sync(&mut self) {
++        self.syncs += 1;
++    }
++}
++
++/// The payloads that arrived together, waiting for the one call that writes them.
++#[derive(Debug, Clone, Default)]
++pub struct Batcher {
++    /// The payloads, in the order they arrived; empty between a flush and the next turn.
++    pending: Vec<Vec<u8>>,
++}
++
++impl Batcher {
++    /// An empty batch.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Add one payload to the batch being assembled, in the order it arrived.
++    ///
++    /// Nothing is written here: this is the half of the promise that lets a caller hold a turn's
++    /// frames, and [`Batcher::flush`] is the half that keeps it.
++    pub fn push(&mut self, payload: impl Into<Vec<u8>>) {
++        self.pending.push(payload.into());
++    }
++
++    /// How many payloads are waiting.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.pending.len()
++    }
++
++    /// `true` when nothing is waiting, which is the one case where flushing writes nothing.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.pending.is_empty()
++    }
++
++    /// Write every payload that is waiting as **one batch**, and answer once they are readable.
++    ///
++    /// One call into the write path, whatever the batch is worth: the payloads leave in the order
++    /// they arrived, as the records [`crate::engine::wal::segment`] defines, and this call answers
++    /// after the bytes are on the file — the promise [`Spool::append`] makes, made once for the
++    /// group instead of once per payload.
++    ///
++    /// An empty batch is not a write: nothing is opened, nothing is counted, and a caller that
++    /// flushes a turn in which nothing arrived pays nothing for it. A batch that could not be
++    /// written keeps its payloads: this type does not decide for its caller whether a failed write
++    /// is retried.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the batch cannot be written, or when the policy waited for the device
++    /// and the device refused it — the same failures [`Spool::append`] reports, for the same reason:
++    /// the bytes of a refused flush are readable and no client should be told they are safe.
++    ///
++    /// [`Spool::append`]: crate::engine::Spool::append
++    pub fn flush(&mut self, spool: &mut Spool) -> Result<(), Error> {
++        let _ = spool;
++        todo!("step lakelet/4.5-batch-writes")
++    }
++}
+diff --git a/src/engine/flush/mod.rs b/src/engine/flush/mod.rs
+new file mode 100644
+index 0000000..48c805f
+--- /dev/null
++++ b/src/engine/flush/mod.rs
+@@ -0,0 +1,30 @@
++//! What the write path costs, and the one thing that decides it: how many payloads share a call.
++//!
++//! Step `lakelet/4.5-batch-writes`. The store has written one record per append since
++//! `lakelet/4.1-ingest-protocol`, which means one open and one write per record — and that is the
++//! cost this module is about. Not the bytes that end up on the device: the number of calls it took
++//! to put them there. A device flush costs milliseconds and `lakelet/4.3-write-path-adr` measured
++//! one, but a write syscall and the open in front of it are not free either, and the same bytes
++//! cost less when they are handed to the kernel in one piece.
++//!
++//! Two things live here, and the split is the step:
++//!
++//! * [`Batcher`] is the payloads that arrived together and the one call that writes them once the
++//!   caller says the turn is over. It is what makes "these frames were one batch" a value a caller
++//!   can hold, and it is how a daemon keeps the promise [`Spool::append`] has always made: nothing
++//!   is answered before it is written, and a group is written before *any* of it is answered;
++//! * [`Stats`] is what the write path has cost, counted — records, bytes, calls (the opens
++//!   included), device flushes and batches. Those are the numbers this step's page and the course's
++//!   budget are written in, so that "it got faster" is a claim somebody can check instead of an
++//!   impression.
++//!
++//! What is deliberately **not** here: the bytes one record is made of
++//! ([`crate::engine::wal::segment`]), the decision about waiting for the device
++//! ([`crate::engine::wal::Policy`]) and the log itself — [`crate::engine::spool`] owns that, and a
++//! batch reaches it through one call.
++//!
++//! [`Spool::append`]: crate::engine::Spool::append
++
++pub mod batcher;
++
++pub use batcher::{Batcher, Stats};
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 3d0aeea..679e429 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -21,6 +21,9 @@ pub mod spool;
+ // `lakelet/4.3-write-path-adr`: the decision about when the write path waits for the device,
+ // as a value the code carries and the documents name.
+ pub mod wal;
++// `lakelet/4.5-batch-writes`: what the write path costs, and the one thing that decides it —
++// how many payloads share a call. The counters a page and a budget are written in live here.
++pub mod flush;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index f5ce43d..77ba3d5 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -186,4 +186,8 @@ mod durable;
+ // and the report it hands to whoever opened it. The signature is declared in the module beside
+ // this file; its body is this step's work.
+ mod recover;
++// `lakelet/4.5-batch-writes`: what an append does when it carries many records instead of one.
++// The signature is declared there so the batch's caller can be written against it; its body is
++// this step's work.
++mod batch;
+ // kiln:scaffold:end
+diff --git a/src/engine/spool/batch.rs b/src/engine/spool/batch.rs
+new file mode 100644
+index 0000000..cdeea4e
+--- /dev/null
++++ b/src/engine/spool/batch.rs
+@@ -0,0 +1,61 @@
++//! The batch half of the write path: what an append does when it carries many records instead of one.
++//!
++//! Step `lakelet/4.5-batch-writes`. `lakelet/4.1-ingest-protocol` fixed what an append *means* —
++//! [`Spool::append`] answers once the record is readable — and `lakelet/4.3-write-path-adr` fixed
++//! when it waits for the device. What neither of them decided is how many records one call
++//! *writes*, and the answer so far has been one: the write path opens the file, writes a single
++//! record and drops the handle, which is honest about what an append costs and is exactly the shape
++//! this step exists to change.
++//!
++//! The rules this file holds, and the ones [`crate::engine::flush::Batcher`] is built on:
++//!
++//! * **N payloads are N records**, in the order they were given, in the one format
++//!   [`crate::engine::wal::segment`] already defines — so [`Spool::records`], the wal's
++//!   [`scan`](crate::engine::wal::segment::scan) and
++//!   [`replay`](crate::engine::wal::replay::recover) see exactly what N separate appends would have
++//!   produced, byte for byte;
++//! * **one open and one write**, whatever N is, plus one device flush when the policy asks for one:
++//!   the bytes do not change, the number of calls does;
++//! * **the call answers after the bytes are written**, like every other append in this store, so
++//!   nothing that was answered can sit behind a write that has not happened yet.
++//!
++//! What this file deliberately does not own: the policy (`4.3`), what opening a store recovers
++//! (`4.4`), and how large a batch may get — whoever assembles one decides that, and
++//! `lakelet/4.6-ingest-backpressure` is the step where it becomes bounded on purpose.
++
++use crate::engine::flush::Stats;
++use crate::error::Error;
++
++use super::Spool;
++
++impl Spool {
++    /// Write `payloads` as **one batch**: one open, one write, N records in the order given.
++    ///
++    /// This is the call the step is about. The payloads are *borrowed* — a batch is a list of them,
++    /// not a copy of the data — and nothing about the record format is decided here: the bytes are
++    /// [`crate::engine::wal::segment`]'s, and a log that does not exist yet is declared by the
++    /// record that starts it. Nothing about the device is decided here either: whether this call
++    /// waits for a flush is the policy, asked once for the batch instead of once per record.
++    ///
++    /// An empty batch writes nothing at all: no open, no write, no counter moved.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the bytes cannot be written, or when the policy waited for the device
++    /// and the device refused the flush.
++    pub(crate) fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<(), Error> {
++        let _ = payloads;
++        todo!("step lakelet/4.5-batch-writes")
++    }
++
++    /// What this write path has cost since this process opened the store.
++    ///
++    /// The counters [`crate::engine::flush::Stats`] holds, charged where the calls happen. A store
++    /// opened on a log an earlier process wrote starts them at zero: the bytes a crash left are not
++    /// this write path's work, and counting them would make two runs of one workload report two
++    /// different numbers.
++    #[must_use]
++    pub fn stats(&self) -> Stats {
++        todo!("step lakelet/4.5-batch-writes")
++    }
++}
+diff --git a/tests/budget.rs b/tests/budget.rs
+new file mode 100644
+index 0000000..219164d
+--- /dev/null
++++ b/tests/budget.rs
+@@ -0,0 +1,168 @@
++//! The write-amplification budget's harness for `lakelet/4.5-batch-writes`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.5-batch-writes
++//! --slow` runs, and the numbers it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.5-batch-writes.toml` — the same records written as one batch and
++//! one append at a time, at two batch sizes.
++//!
++//! What it measures is **calls, never the clock**: how many calls the write path made and how many
++//! bytes it wrote, counted by the write path itself. A count is the same number on a loaded machine
++//! as on an idle one, which is why `kiln`'s budget gate compares counts and why no run of this file
++//! can flake because something else was compiling.
++//! `cargo test -p lakelet --test budget -- --nocapture` prints the lines by hand; the
++//! `lakelet-budget` prefix is what the gate reads.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness that a learner can break by editing their own fixture would judge
++//! the fixture instead of the write path.
++
++use std::path::PathBuf;
++
++use lakelet::engine::Spool;
++use lakelet::engine::flush::Batcher;
++use lakelet::engine::wal::Policy;
++
++/// The payload every record carries, in bytes.
++const PAYLOAD: usize = 64;
++
++/// The batch the counts are taken on; twice this is the second size.
++///
++/// Two sizes rather than one, because the cost this step is about is the one that follows the
++/// workload: a total at one size cannot tell a batch from a loop over records, and the pair can.
++const BATCH: usize = 64;
++
++/// The second size, and the one the growth guard is taken at.
++const WIDER: usize = 2 * BATCH;
++
++/// The workload: `count` payloads, each one its own bytes.
++///
++/// Derived from the payload's index rather than zero-filled, so a batcher that reordered two
++/// payloads, dropped one or wrote one of them twice cannot pass by agreeing with a pattern.
++fn workload(count: usize) -> Vec<Vec<u8>> {
++    (0..count)
++        .map(|index| {
++            (0..PAYLOAD)
++                .map(|offset| (index as u8).wrapping_mul(31).wrapping_add(offset as u8))
++                .collect()
++        })
++        .collect()
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++/// One ratio line, to four decimals — a ratio of two counts, so it is as steady as they are.
++fn ratio(name: &str, value: f64) {
++    println!("lakelet-budget {name}={value:.4}");
++}
++
++/// Push `payloads` into a batch and write them through `spool` as one call.
++fn batch(spool: &mut Spool, payloads: &[Vec<u8>]) {
++    let mut batcher = Batcher::new();
++    for payload in payloads {
++        batcher.push(payload.as_slice());
++    }
++    batcher
++        .flush(spool)
++        .unwrap_or_else(|error| panic!("a batch of {} records: {error}", payloads.len()));
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("lakelet-budget-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Open a store in it, obeying `policy`.
++    fn store(&self, policy: Policy) -> Spool {
++        Spool::with_policy(self.path.as_path(), policy).unwrap_or_else(|error| {
++            panic!(
++                "{} is a store the write path can open: {error}",
++                self.path.display()
++            )
++        })
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++#[test]
++fn the_write_path_budget() {
++    let records = workload(WIDER);
++
++    // One batch of BATCH records, with no device call in the way: this is what batching changes.
++    let batched = Dir::new("batched");
++    let mut spool = batched.store(Policy::Never);
++    batch(&mut spool, &records[..BATCH]);
++    let small = spool.stats();
++
++    // The same records at twice the batch size, in a store of their own, so both pairs of counts
++    // come from the same work and a cost that follows the size has somewhere to show up.
++    let wider = Dir::new("wider");
++    let mut spool = wider.store(Policy::Never);
++    batch(&mut spool, &records);
++    let large = spool.stats();
++
++    // The same BATCH records, one append at a time: the shape `lakelet/4.1-ingest-protocol` left
++    // behind, and the contrast the counts above are about.
++    let separate = Dir::new("separate");
++    let mut spool = separate.store(Policy::Never);
++    for payload in &records[..BATCH] {
++        spool
++            .append(payload)
++            .unwrap_or_else(|error| panic!("one record of {BATCH}: {error}"));
++    }
++    let one_at_a_time = spool.stats();
++
++    // And one batch under a policy that waits for the device, which is where the third call a batch
++    // can make — the flush — is counted.
++    let durable = Dir::new("durable");
++    let mut spool = durable.store(Policy::PerRecord);
++    batch(&mut spool, &records[..BATCH]);
++    let waited = spool.stats();
++
++    metric(&format!("records_{BATCH}"), small.records());
++    metric(&format!("calls_{BATCH}"), small.calls());
++    metric(&format!("bytes_{BATCH}"), small.bytes());
++    metric(&format!("records_{WIDER}"), large.records());
++    metric(&format!("calls_{WIDER}"), large.calls());
++    metric(&format!("bytes_{WIDER}"), large.bytes());
++    // Write amplification, in the shape this step is about: bytes the write path wrote per payload
++    // byte. The framing of a record and the log's header are the whole of the difference from one.
++    ratio(
++        "bytes_per_payload",
++        small.bytes() as f64 / (BATCH * PAYLOAD) as f64,
++    );
++    // The calls one record costs, and the guard: it may only go down, so a write path that adds a
++    // call per batch is red while a cheaper one — `writev`, a held-open handle — is not.
++    ratio(
++        "calls_per_record_max",
++        small.calls() as f64 / small.records() as f64,
++    );
++    // The same guard across the two sizes: a cost that follows the batch size instead of the work.
++    ratio(
++        "calls_ratio_max",
++        large.calls() as f64 / small.calls() as f64,
++    );
++    // Device calls one batch costs under a policy that waits for every record.
++    metric("fsyncs_per_batch", waited.syncs());
++    // And the shape being replaced: BATCH records written one append at a time. The same bytes.
++    metric("appends_calls_max", one_at_a_time.calls());
++}

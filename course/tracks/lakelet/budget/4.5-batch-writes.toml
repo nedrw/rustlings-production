@@ -1,0 +1,41 @@
+# The write-amplification budget of `lakelet/4.5-batch-writes`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness (`tests/budget.rs`,
+# which the step's scaffold ships); the metrics are the lines it prints, and every one of them is a
+# count rather than a time — the write path counts its own calls, and a count is the same number on a
+# loaded machine as on an idle one, which is why this lane judges counts at all (handoff M2 §1.1).
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: `calls_per_record_max` is "no worse than this", not "about this", so a write path that
+# got cheaper passes and one that pays for another call fails.
+command = "cargo test -p lakelet --test budget -- --nocapture"
+
+[metric]
+# Records the harness's one batch wrote: 64 payloads of 64 bytes, as one call.
+records_64 = 64
+# What that batch cost: its open and its write. Two, whatever the batch size is.
+calls_64 = 2
+# What it wrote: 64 records of `[length][payload][seal]` (4 + 64 + 4 bytes each) behind the log's
+# five-byte header, so 5 + 64 × 72.
+bytes_64 = 4613
+# The same batch at twice the size: the pair is what shows a cost that follows the batch size
+# instead of the work, and it is the same two calls.
+records_128 = 128
+calls_128 = 2
+bytes_128 = 9221
+# Write amplification in the shape this step is about: bytes written per payload byte, 4613/4096.
+# The eight bytes of framing per record and the five bytes of header are the whole of it over 1.0.
+bytes_per_payload = 1.1262
+# The calls one record costs at a batch of 64: 2/64 = 0.03125, printed rounded. An upper bound, so a
+# cheaper write path passes; the bound is a tenth over the measurement and still below one extra
+# call per batch (3/64 = 0.047), which is the defect it is there to catch.
+calls_per_record_max = 0.034
+# Calls at twice the batch size over calls at one batch: one. A cost that follows the size is what
+# the pair of sizes exists to show, and the tenth of slack is room for how the two are wired.
+calls_ratio_max = 1.1
+# Device calls one batch of 64 costs under the `per-record` policy: one, and not one per record.
+fsyncs_per_batch = 1
+# The shape being replaced, for contrast: the same 64 records written one append at a time — 64
+# opens and 64 writes. An upper bound, so a cheaper single-record path (a held-open handle) passes.
+appends_calls_max = 140

@@ -1,0 +1,480 @@
+diff --git a/docs/write-amplification.md b/docs/write-amplification.md
+index 1fd4cfb..44816f7 100644
+--- a/docs/write-amplification.md
++++ b/docs/write-amplification.md
+@@ -1,16 +1,34 @@
+ # Write amplification: the same bytes, fewer calls
+ 
+ A record of a 64-byte payload costs 72 bytes in the log — four for its length, four for the
+-[seal](../src/engine/wal/segment.rs) over both — and that arithmetic belongs to the format, not to
+-the write path. What the write path decides is how many times it asks the kernel to do something
+-about those bytes, and the shape it has had since `lakelet/4.1-ingest-protocol` is *twice per
+-record*: one open and one write inside [`Spool::append`](../src/engine/spool.rs), plus one device
+-call per record under a policy that waits.
++[seal](../src/engine/wal/segment.rs) over both — and that arithmetic belongs to the format. What the
++write path decides is how often it asks the kernel to do something about those bytes, and the shape
++it had since `lakelet/4.1-ingest-protocol` was *twice per record*: one `open` and one `write` inside
++[`Spool::append`](../src/engine/spool.rs), plus one device call per record under a policy that waits
++for one. `lakelet/4.5-batch-writes` keeps the same path and changes the unit: the payloads that
++arrived together go out through [one open and one write](../src/engine/spool/batch.rs), as the
++records the format already defines, in the order they were given.
+ 
+-<!-- TODO: say why the calls are the cost and not the bytes, in numbers this repository has already
+-measured — what one device flush costs (`adr/0001-write-path.md`) and what that does to a store that
+-waits per record, and then what the open and the write cost when they are paid once per record
+-instead of once per batch. Name the syscall count that went down, and the bytes that did not. -->
++## Why the calls are the cost
++
++The three calls an append makes do not cost the same, and only one of them is about the disk:
++
++- **the device flush** is milliseconds. [The decision record](adr/0001-write-path.md) measured
++  4.1 ms for one `sync_all` on the machine it was authored on, which caps a store that waits per
++  record at roughly 240 records/s however much bandwidth the device has. Waiting once per *batch* is
++  what makes the interval policy's duty cycle cheap instead of a per-record tax.
++- **the open and the write** are microseconds, and they are paid per **call** and not per byte. An
++  `open` walks the path, takes the inode lock and allocates a descriptor; a `write` copies the bytes
++  into the page cache. Sixty-four records as one batch pay them twice — one open, one write — where
++  sixty-four appends pay them a hundred and twenty-eight times, for exactly the same 4 613 bytes.
++
++So the arithmetic of this step is: **the number of calls goes down with the batch size, and the
++bytes and the order do not.** A batch of N payloads is N records of `[length][payload][seal]` behind
++the log's five-byte header — the file N separate appends would have written, byte for byte — handed
++to one `write`. The format did not have to move for the cost to; what moved is how many times the
++write path talked to the kernel. Write amplification is the number that says so out loud: **bytes
++written per payload byte**, which is 4613/4096 ≈ 1.126 for 64-byte payloads and would not change at
++all if the batching were undone. The calls per record would, from 2/64 to 2.
+ 
+ ## The counters
+ 
+@@ -20,45 +38,87 @@ The write path counts what it costs. The counters live in
+ 
+ | counter | what it counts |
+ | --- | --- |
+-| `records` | TODO |
+-| `bytes` | TODO |
+-| `calls` | TODO |
+-| `syncs` | TODO |
+-| `batches` | TODO |
++| `records` | Records the write path has written — one per payload, whatever a batch carries. |
++| `bytes` | Bytes written, the framing of every record included: the numerator of write amplification. |
++| `calls` | The write path's own calls: the open and the write of each batch, and nothing else. |
++| `syncs` | Device flushes the policy asked for and the device answered. |
++| `batches` | Batches written. A batch that carried nothing is not one. |
+ 
+-<!-- TODO: one row per counter, with what it counts and where it is charged — a counter the caller
+-increments reports what the caller believes, not what the syscall did. Then say which of the five a
+-batch of N records changes and which ones it leaves alone. -->
++Every one of them is charged in `append_batch`, where the calls are made, and `syncs` in
++`Spool::sync`, after the device answered. That placement is the point: a counter incremented by the
++*caller* reports what the caller believes it did, and a write path that opened the file once per
++record would go on reporting two calls per batch. A batch of N records moves `records` by N, `bytes`
++by the records' size, `calls` by two and `batches` by one, and leaves `syncs` to the policy. The
++counters start at zero when a process opens a store: the bytes a crash left ([what opening
++recovers](crash-points.md)) are readable and are not this write path's work.
+ 
+ ## The budget
+ 
+ | metric | what it counts | baseline |
+ | --- | --- | --- |
+-| TODO | TODO | TODO |
++| `records_64` | Records the harness's one batch wrote, at a batch of 64. | 64 |
++| `calls_64` | What that batch cost: its open and its write. | 2 |
++| `bytes_64` | What it wrote: 64 records of 72 bytes behind the five-byte header. | 4 613 |
++| `records_128` | The same batch at twice the size. | 128 |
++| `calls_128` | Its calls — the same two. | 2 |
++| `bytes_128` | Its bytes — twice as many. | 9 221 |
++| `bytes_per_payload` | Write amplification at a batch of 64: bytes written per payload byte. | 1.1262 |
++| `calls_per_record_max` | Calls per record, 2/64. An **upper bound**. | 0.034 |
++| `calls_ratio_max` | Calls at 128 records over calls at 64. An **upper bound**. | 1.1 |
++| `fsyncs_per_batch` | Device calls one batch of 64 costs under `per-record`. | 1 |
++| `appends_calls_max` | The same 64 records written one append at a time. An **upper bound**. | 140 |
+ 
+-<!-- TODO: one row per metric `tests/budget.rs` prints, with the baseline
+-`course/tracks/lakelet/budget/4.5-batch-writes.toml` records for it. The names in this table are the
+-ones the harness prints and the one the course's baseline is written in, and the spec compares this
+-page with that list. Say what the two batch sizes are, why the counts are taken at both of them at
+-all, and which of the metrics is an upper bound rather than a target — the one a cost that grows
+-with the batch size fails. -->
++The counts are taken at **two batch sizes** because the cost this step is about is the one that
++follows the workload: at a single size, a batch and a loop over records are the same number of bytes
++and the ratio between the two sizes is what tells them apart. The two `_max` metrics are upper
++bounds rather than targets — a write path that got cheaper is a write path that passed — and the
++third one, `appends_calls_max`, is the shape being replaced, printed for contrast: the same records,
++sixty-four opens and sixty-four writes.
+ 
+ ## The promise batching must not break
+ 
+-<!-- TODO: `Spool::append` answers once the record is readable (`crash-points.md`). Say what that
+-becomes when one call carries N records, and what a batch that answered first and wrote afterwards
+-would look like from the outside: the line the daemon prints
+-([`src/bin/lakeletd.rs`](../src/bin/lakeletd.rs)) and the spec case that would notice. -->
++[`Spool::append`](../src/engine/spool.rs) answers a client once its record is readable. Batching
++makes that promise once per *group*, and a group is only a group if the write happens before any of
++it is answered: the frames one turn of the daemon's loop decoded are written as one batch and counted
++as accepted afterwards ([`src/service/ingest.rs`](../src/service/ingest.rs)). A batcher that
++acknowledged first and wrote later — on a timer, on the next turn, from a background task — would
++pass every test that only asks what ended up on the file, and it is the defect this page is written
++against. What it looks like from the outside is two things, both of them checks: a reader that opens
++the log the moment the daemon says `connection closed accepted=…` finds fewer records than it was
++told about, and the counters the daemon prints at a stop
++([`src/bin/lakeletd.rs`](../src/bin/lakeletd.rs), `store write cost records=… bytes=… batches=…
++calls=… syncs=…`) report more calls than the frames were worth. The spec drives both.
+ 
+ ## How this is checked
+ 
+-<!-- TODO: the command that prints the numbers, the gate that compares them with the baseline, and
+-what the gate answers for a metric the harness did not print. Link what you are describing:
+-[tests/budget.rs](../tests/budget.rs), [src/engine/spool/batch.rs](../src/engine/spool/batch.rs),
+-[the policy](../src/engine/wal/policy.rs). -->
++```
++cargo test -p lakelet --test budget -- --nocapture
++```
++
++prints the numbers ([the harness](../tests/budget.rs), which the step's scaffold ships), and `kiln
++check lakelet/4.5-batch-writes --slow` runs the `bench-budget` gate, which compares every one of them
++with `course/tracks/lakelet/budget/4.5-batch-writes.toml` within ±10%. A metric the harness does not
++print at all is reported as `blocked` rather than as a pass, because a harness that stopped
++measuring something is not a step that got cheaper. Nothing in the gate looks at a clock: the counts
++come from the write path, so the verdict is the same on a loaded machine as on an idle one — which is
++also why the drill is to undo the batching and watch the calls move, not to time anything.
+ 
+ ## Where this comes from
+ 
+-<!-- TODO: what production write paths do about the same cost — group commit, `writev`, `O_APPEND`,
+-a buffered writer — and what each one buys. Say which of them this project uses and which it does
+-not, and which step makes the batch size a bounded decision. -->
++- **Group commit** is the database version of this page: PostgreSQL (`commit_delay`,
++  `CommitTsControlLock`), InnoDB's `innodb_flush_log_at_trx_commit` and MySQL's binlog group commit
++  all make one device call serve many transactions, and all of them trade the same thing — a client
++  waits for a batch mate instead of for the device alone.
++- **`writev(2)`** is how a writer hands many buffers to one write call without copying them into one
++  buffer first. This project assembles the batch into one buffer instead, because the batch is
++  bounded by the read chunk (64 KiB) and one copy there costs less than the bookkeeping, but the
++  syscall count is the same either way — and that is the number the budget is written in.
++- **`O_APPEND`** is what makes the batch's single write land at the end of the log without a seek or
++  a lock of our own, and it is why two processes appending to one file cannot interleave inside a
++  record. **`BufWriter`** is the other end of the same idea: fewer, larger writes, at the cost of a
++  copy and of bytes that are not written yet when the caller believes they are.
++- [`docs/protocol.md`](protocol.md) is where the payload size comes from, and
++  [`wal::Policy`](../src/engine/wal/policy.rs) is where the decision to wait — or not — is written
++  down.
++- `lakelet/4.6-ingest-backpressure` is the next question this one leaves open: a batch is bounded by
++  the turn it was assembled in, and nothing yet bounds how many frames arrive in one turn.
+diff --git a/src/bin/lakeletd.rs b/src/bin/lakeletd.rs
+index 03c2fba..0a2eda9 100644
+--- a/src/bin/lakeletd.rs
++++ b/src/bin/lakeletd.rs
+@@ -9,9 +9,10 @@
+ //!    cannot be opened is a *refusal*, before anything listens;
+ //! 4. bind the ingest port and log `listening on <addr>`, which is how a test learns the port the
+ //!    kernel handed out (port `0` means only the child knows);
+-//! 5. serve until `SIGTERM` or `SIGINT`, then stop accepting, **flush** — which is what makes the
+-//!    clean stop in `docs/crash-points.md` point 6 a closed window rather than a promise — log
+-//!    `draining`, and exit `0`.
++//! 5. serve until `SIGTERM` or `SIGINT`, then stop accepting, report what the write path cost
++//!    (counted, never timed — `lakelet/4.5-batch-writes`), **flush** — which is what makes the clean
++//!    stop in `docs/crash-points.md` point 6 a closed window rather than a promise — log `draining`,
++//!    and exit `0`.
+ 
+ use std::process::ExitCode;
+ use std::sync::Arc;
+@@ -111,6 +112,19 @@ async fn run() -> Result<(), lakelet::Error> {
+     // `SIGTERM` a log that ends on a record boundary.
+     {
+         let mut spool = store.lock().await;
++        // `lakelet/4.5-batch-writes`: what the write path cost this run, in the counters it keeps.
++        // Printed *before* the stop's own flush, so `syncs` is what the appends asked for and not
++        // what stopping costs — the next line is that other fact. One line per start and one per
++        // stop, fields a collector can read, no prose (`obs/structured-logs@design`).
++        let stats = spool.stats();
++        tracing::info!(
++            records = stats.records(),
++            bytes = stats.bytes(),
++            batches = stats.batches(),
++            calls = stats.calls(),
++            syncs = stats.syncs(),
++            "store write cost"
++        );
+         let written = spool.len();
+         spool.sync()?;
+         // Both numbers, because the *pair* is the claim: a stop that flushed prints them equal, and
+diff --git a/src/engine/flush/batcher.rs b/src/engine/flush/batcher.rs
+index 75fdcd4..5879a5b 100644
+--- a/src/engine/flush/batcher.rs
++++ b/src/engine/flush/batcher.rs
+@@ -144,7 +144,17 @@ impl Batcher {
+     ///
+     /// [`Spool::append`]: crate::engine::Spool::append
+     pub fn flush(&mut self, spool: &mut Spool) -> Result<(), Error> {
+-        let _ = spool;
+-        todo!("step lakelet/4.5-batch-writes")
++        // Nothing waiting is not a write: no open, no write, and this caller pays nothing for a
++        // turn in which nothing arrived.
++        if self.pending.is_empty() {
++            return Ok(());
++        }
++        // One call into the write path, and it answers only once the bytes are readable — which is
++        // what keeps `4.1`'s promise for the group: no payload in this batch is answered before the
++        // record that carries it exists.
++        let payloads: Vec<&[u8]> = self.pending.iter().map(Vec::as_slice).collect();
++        spool.append_batch(&payloads)?;
++        self.pending.clear();
++        Ok(())
+     }
+ }
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index 77ba3d5..bb6cc46 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -27,10 +27,10 @@
+ //! `crate::engine::wal::segment` writes and reads them, and `crate::engine::wal::replay` answers what
+ //! a store's file proves.
+ 
+-use std::io::Write;
+ use std::path::{Path, PathBuf};
+-use std::time::{Duration, Instant};
++use std::time::Instant;
+ 
++use crate::engine::flush::Stats;
+ use crate::engine::wal::Policy;
+ use crate::engine::wal::replay::Recovered;
+ use crate::engine::wal::segment::{self, Stop};
+@@ -61,6 +61,8 @@ pub struct Spool {
+     last_sync: Instant,
+     /// What opening this store had to do about the log a previous process left (`4.4`).
+     recovered: Recovered,
++    /// What this write path has cost since this process opened the store (`4.5`).
++    stats: Stats,
+ }
+ 
+ impl Spool {
+@@ -91,44 +93,19 @@ impl Spool {
+ 
+     /// Append one accepted payload, and answer only once it can be read back and the policy says so.
+     ///
++    /// One record is a **batch of one** (`lakelet/4.5-batch-writes`): the write path has a single
++    /// shape — assemble the records, open once, write once, then ask the policy — and a caller with
++    /// a single payload should not have to assemble a group to use it. That shape is why a batch of
++    /// sixty-four records pays for one open and one write instead of sixty-four of each, and why
++    /// [`Spool::stats`] is worth reading.
++    ///
+     /// # Errors
+     ///
+     /// [`Error::Store`] when the record cannot be written, or when the policy waited for the device
+     /// and the device refused it — which is a failure of the acknowledgment, not of the record: the
+     /// bytes of a refused flush are readable and no client should be told they are safe.
+     pub fn append(&mut self, payload: &[u8]) -> Result<(), Error> {
+-        // One open per append, which is honest about what an append *costs*: `lakelet/4.5-batch-writes`
+-        // is the step that makes this a batch, and the counters there are what say whether it worked.
+-        let mut file = std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(self.path())
+-            .map_err(store)?;
+-        // `lakelet/4.4-wal-recovery`: the bytes are `segment`'s — a length, the payload, and a seal
+-        // over both — and a log that does not exist yet is declared by the record that starts it, so
+-        // a store that has accepted nothing stays an empty file.
+-        let record = if self.len == 0 {
+-            segment::introduce(payload)
+-        } else {
+-            segment::encode(payload)
+-        };
+-        file.write_all(&record).map_err(store)?;
+-        drop(file);
+-        self.len += record.len() as u64;
+-
+-        // Written, and now the decision: whether this call waits for the device is the policy's
+-        // answer, and it is a decision with a number attached (a flush costs milliseconds here, and a
+-        // store that waits per record cannot keep up — `docs/adr/0001-write-path.md`).
+-        match self.policy {
+-            Policy::PerRecord => self.sync()?,
+-            Policy::Interval { millis } => {
+-                if self.last_sync.elapsed() >= Duration::from_millis(millis) {
+-                    self.sync()?;
+-                }
+-            }
+-            Policy::Never => {}
+-        }
+-        Ok(())
++        self.append_batch(std::slice::from_ref(&payload))
+     }
+ 
+     /// Every record the file holds, in the order it was appended.
+diff --git a/src/engine/spool/batch.rs b/src/engine/spool/batch.rs
+index cdeea4e..d3fa0f1 100644
+--- a/src/engine/spool/batch.rs
++++ b/src/engine/spool/batch.rs
+@@ -23,10 +23,15 @@
+ //! (`4.4`), and how large a batch may get — whoever assembles one decides that, and
+ //! `lakelet/4.6-ingest-backpressure` is the step where it becomes bounded on purpose.
+ 
++use std::io::Write;
++use std::time::Duration;
++
+ use crate::engine::flush::Stats;
++use crate::engine::wal::Policy;
++use crate::engine::wal::segment;
+ use crate::error::Error;
+ 
+-use super::Spool;
++use super::{Spool, store};
+ 
+ impl Spool {
+     /// Write `payloads` as **one batch**: one open, one write, N records in the order given.
+@@ -44,8 +49,62 @@ impl Spool {
+     /// [`Error::Store`] when the bytes cannot be written, or when the policy waited for the device
+     /// and the device refused the flush.
+     pub(crate) fn append_batch(&mut self, payloads: &[&[u8]]) -> Result<(), Error> {
+-        let _ = payloads;
+-        todo!("step lakelet/4.5-batch-writes")
++        // Nothing to write is not a batch: no open, no write, no counter moved. A store that
++        // touched the file for an empty group would pay for a call that wrote nothing, and the
++        // counts are what this step is judged by.
++        if payloads.is_empty() {
++            return Ok(());
++        }
++
++        // The bytes are `4.4`'s and nothing here decides what they are: a log that does not exist
++        // yet is declared by its first record, every record after that is `encode`, and the whole
++        // batch is assembled into *one* buffer. That buffer is what makes the batch one write, and
++        // building it in order is what makes N payloads N records — this loop may not skip, sort,
++        // merge or deduplicate one of them.
++        let mut bytes: Vec<u8> = Vec::new();
++        for payload in payloads {
++            // The log's header travels with its first record and only with it. `self.len` is moved
++            // once, after the batch, so the buffer is what says which record is the first one.
++            let record = if self.len == 0 && bytes.is_empty() {
++                segment::introduce(payload)
++            } else {
++                segment::encode(payload)
++            };
++            bytes.extend_from_slice(&record);
++        }
++
++        // One open and one write, whatever N is. They are counted here, where they are made, and
++        // charged once the batch is on the file: a count charged by the caller reports two calls
++        // for a write path that opened the file once per record, which is the defect this step
++        // exists to catch.
++        let mut calls = 0;
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(self.path())
++            .map_err(store)?;
++        calls += 1;
++        file.write_all(&bytes).map_err(store)?;
++        calls += 1;
++        drop(file);
++        self.len += bytes.len() as u64;
++        self.stats
++            .charge(payloads.len() as u64, bytes.len() as u64, calls);
++
++        // And then the decision `4.3` owns, asked once for the batch instead of once per record:
++        // whether this call waits for the device is the policy's answer, and waiting once for
++        // sixty-four records rather than sixty-four times is what makes a store that keeps up
++        // possible at all (`docs/adr/0001-write-path.md`).
++        match self.policy {
++            Policy::PerRecord => self.sync()?,
++            Policy::Interval { millis } => {
++                if self.last_sync.elapsed() >= Duration::from_millis(millis) {
++                    self.sync()?;
++                }
++            }
++            Policy::Never => {}
++        }
++        Ok(())
+     }
+ 
+     /// What this write path has cost since this process opened the store.
+@@ -56,6 +115,6 @@ impl Spool {
+     /// different numbers.
+     #[must_use]
+     pub fn stats(&self) -> Stats {
+-        todo!("step lakelet/4.5-batch-writes")
++        self.stats
+     }
+ }
+diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
+index 00bc26e..0b56c1c 100644
+--- a/src/engine/spool/durable.rs
++++ b/src/engine/spool/durable.rs
+@@ -16,6 +16,7 @@
+ use std::path::PathBuf;
+ use std::time::Instant;
+ 
++use crate::engine::flush::Stats;
+ use crate::engine::wal::Policy;
+ use crate::engine::wal::replay;
+ use crate::error::Error;
+@@ -74,6 +75,10 @@ impl Spool {
+             durable: len,
+             last_sync: Instant::now(),
+             recovered,
++            // `lakelet/4.5-batch-writes`: the counters start where this process starts. The bytes a
++            // crash left are readable and are not this write path's work, so counting them would
++            // make two runs of one workload report two different numbers.
++            stats: Stats::default(),
+         })
+     }
+ 
+@@ -128,6 +133,9 @@ impl Spool {
+         file.sync_all().map_err(store)?;
+         self.durable = self.len;
+         self.last_sync = Instant::now();
++        // Counted after the device answered, like `durable_offset` moves: a flush that failed is
++        // not a flush, and `lakelet/4.5-batch-writes` reports this number to an operator.
++        self.stats.charge_sync();
+         Ok(())
+     }
+ }
+diff --git a/src/service/ingest.rs b/src/service/ingest.rs
+index 05bc50c..90d97b7 100644
+--- a/src/service/ingest.rs
++++ b/src/service/ingest.rs
+@@ -11,7 +11,10 @@
+ //!   allocation and not after;
+ //! * every accepted payload goes to the store exactly once, and an accepted payload is one the
+ //!   client is allowed to believe is safe: [`Spool::append`] answers only when the record can be read
+-//!   back.
++//!   back. `lakelet/4.5-batch-writes` moves the *grouping* and not the promise: the frames one turn
++//!   of this loop decoded are written as one batch, and the batch is written before any of those
++//!   frames is counted as accepted — a loop that answered first and wrote afterwards would be the
++//!   defect that step exists to prevent.
+ //!
+ //! The connection's counters are logged (`accepted`, `rejected`, `bytes`) because that is how an
+ //! operator sees a client that is sending garbage, and the spec reads those lines. A connection that
+@@ -29,6 +32,7 @@ use tokio::net::TcpListener;
+ use tokio::sync::Mutex;
+ 
+ use crate::engine::Spool;
++use crate::engine::flush::Batcher;
+ use crate::error::Error;
+ use crate::protocol::frame;
+ 
+@@ -179,12 +183,22 @@ async fn connection(
+         // stream being re-parsed from the start on every chunk.
+         match frame::read_all(&pending) {
+             Ok((frames, consumed)) => {
++                // `lakelet/4.5-batch-writes`: everything this turn delivered is one batch, so the
++                // store is opened and written once for it instead of once per frame. The `?` is
++                // deliberate — a store that cannot write is not a store that may keep accepting —
++                // and the tally moves *after* the flush, because a frame this loop counts as
++                // accepted is one whose record the store can already read back.
++                let mut batch = Batcher::new();
++                let mut payload_bytes = 0;
+                 for frame in frames {
+-                    let mut spool = store.lock().await;
+-                    spool.append(&frame.payload)?;
+-                    tally.accepted += 1;
+-                    tally.bytes += frame.payload.len() as u64;
++                    payload_bytes += frame.payload.len() as u64;
++                    batch.push(frame.payload);
+                 }
++                let accepted = batch.len() as u64;
++                let mut spool = store.lock().await;
++                batch.flush(&mut spool)?;
++                tally.accepted += accepted;
++                tally.bytes += payload_bytes;
+                 pending.drain(..consumed);
+             }
+             Err(error) => {
