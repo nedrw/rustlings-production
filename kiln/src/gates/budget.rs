@@ -109,6 +109,11 @@ fn compare(
 
     let mut failures: Vec<String> = Vec::new();
     let mut judged: Vec<String> = Vec::new();
+    // Two rules are in play whenever the table carries an upper bound, and the pass line has to say so:
+    // a `_max` metric is judged `≤ bound`, not `±P%`, and a report that calls both of them "within
+    // ±P%" tells the learner the wrong thing about the metric that was measured (4.5's `--slow` run
+    // printed it that way).
+    let mut bounded = 0usize;
     for measurement in measured {
         let Some(limit) = baseline.get(&measurement.name) else {
             // A metric the course never measured has nothing to be compared against. Saying so here
@@ -122,6 +127,7 @@ fn compare(
             number(measurement.value)
         ));
         if measurement.name.ends_with("_max") {
+            bounded += 1;
             if measurement.value > *limit {
                 failures.push(format!(
                     "{} is {} and has to stay ≤ {} (it is an upper bound)",
@@ -154,9 +160,12 @@ fn compare(
         ));
     }
     GateOutcome::passed(format!(
-        "{} metric(s) within ±{}% of the course baseline: {}",
+        "{} metric(s) judged against the course baseline ({} within ±{}%, {} at or below an upper \
+         bound): {}",
         judged.len(),
+        judged.len() - bounded,
         number(percent),
+        bounded,
         judged.join(", ")
     ))
 }
@@ -194,6 +203,24 @@ mod tests {
             passed.detail
         );
         assert!(passed.detail.contains("±10%"), "{}", passed.detail);
+    }
+
+    #[test]
+    fn a_pass_line_names_both_rules_when_the_table_has_an_upper_bound() {
+        // The table is two counts and one `_max`: a report that said "3 metric(s) within ±10%" would be
+        // telling the reader that the upper bound was judged by the percentage rule, which it is not.
+        let passed = result(
+            "jobq-budget claim_statements=12\njobq-budget scan_cells=352\n\
+             jobq-budget scale_ratio_max=2.0\n",
+        );
+        assert_eq!(passed.outcome, Outcome::Passed);
+        assert!(
+            passed.detail.contains("2 within ±10%") && passed
+                .detail
+                .contains("1 at or below an upper bound"),
+            "{}",
+            passed.detail
+        );
     }
 
     #[test]
