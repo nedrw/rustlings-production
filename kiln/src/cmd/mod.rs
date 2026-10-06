@@ -180,6 +180,10 @@ pub enum Command {
         /// Step to check (default: the first unfinished step).
         #[arg(value_name = "STEP")]
         step: Option<String>,
+
+        /// Also run the gates marked `slow` (mutants, coverage, soak, …).
+        #[arg(long)]
+        slow: bool,
     },
 
     /// Print a step's hint and where to read more.
@@ -365,7 +369,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Review { due }) => review::run(&session, *due),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
-        Some(Command::Check { step }) => check::run(&mut session, step.as_deref()),
+        Some(Command::Check { step, slow }) => check::run(&mut session, step.as_deref(), *slow),
         Some(Command::Hint { step }) => hint::run(&session, step.as_deref()),
         Some(Command::Reset { step }) => reset::run(&mut session, step.as_deref()),
         Some(Command::Solution { step }) => solution::run(&mut session, step.as_deref()),
@@ -782,6 +786,35 @@ impl Session {
         })?;
         let dir = self.project_dir(step)?;
         process::run_line(&run.cmd, &dir, step.deadline(self.timeout))
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    /// `check --slow` exists, and it reaches the command: a learner or an author can see one
+    /// step's slow gates without judging a whole track (handoff M2 §5.2, the review's item 9).
+    #[test]
+    fn check_takes_the_slow_flag() {
+        let cli = Cli::try_parse_from(["kiln", "check", "jobq/3.26-dlq-cli", "--slow"])
+            .expect("the command line parses");
+        match cli.command {
+            Some(Command::Check { step, slow }) => {
+                assert_eq!(step.as_deref(), Some("jobq/3.26-dlq-cli"));
+                assert!(slow, "the flag reaches the command");
+            }
+            other => panic!("expected `check`, got {other:?}"),
+        }
+
+        // And it is off by default: the fast path is what a learner runs between edits.
+        let cli = Cli::try_parse_from(["kiln", "check"]).expect("the command line parses");
+        assert!(
+            matches!(cli.command, Some(Command::Check { slow: false, .. })),
+            "plain `check` stays on the fast path"
+        );
     }
 }
 

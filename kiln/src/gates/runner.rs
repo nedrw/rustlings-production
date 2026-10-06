@@ -117,7 +117,10 @@ fn run_one(ctx: &GateContext<'_>, spec: &GateSpec, run_slow: bool) -> GateResult
     };
 
     if spec.slow && !run_slow {
-        return skip("slow gate: only run by `kiln verify --slow` and `selftest`".to_owned());
+        return skip(
+            "slow gate: only run by `kiln verify --slow`, `kiln check --slow` and `selftest`"
+                .to_owned(),
+        );
     }
 
     let Some(definition) = lookup(&spec.name) else {

@@ -3,6 +3,11 @@
 //! `run` answers "does the step work?", `check` answers "would this pass review?" (plan §3 D3).
 //! Gates that are catalogued but not implemented, or that a later milestone brings, are reported
 //! as pending — never as passes — and only `must` gates can stop the step.
+//!
+//! `--slow` asks for the slow gates too (`mutants`, `coverage`, `bench-budget`, `conformance` …),
+//! which is the same set `verify --slow` and `selftest` run. Without it they are skipped with a
+//! line that says so: the fast path is what a learner runs between edits, and a slow gate would
+//! cost minutes (handoff M2 §1.3).
 
 use crate::cmd::Session;
 use crate::error::{EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, Result};
@@ -11,7 +16,7 @@ use crate::project;
 use crate::spec;
 
 /// Run the gates of one step.
-pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
+pub fn run(session: &mut Session, reference: Option<&str>, run_slow: bool) -> Result<u8> {
     let step = super::resolve_step(session, reference)?;
     super::run::print_step_header(session, &step)?;
 
@@ -32,13 +37,22 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
     super::run::print_preparation(&project::prepare(session.course(), track, &step)?);
 
     println!();
-    let results = session.gates(&step, false)?;
+    let results = session.gates(&step, run_slow)?;
     for result in &results {
         println!("{}", result.line());
     }
 
     let passed = all_must_passed(&results);
-    let must_declared = step.must_gates().count();
+    // Every count is over the gates that *ran*: with `--slow` the slow ones ran and belong in the
+    // fraction, and without it a skipped gate is not "not implemented" — it is skipped, which is a
+    // different sentence and a different number (a slow run and a typo in a gate name must not look
+    // alike in the summary a learner reads).
+    let must_ran = results
+        .iter()
+        .filter(|gate| {
+            gate.spec.tier == crate::gates::Tier::Must && gate.outcome != Outcome::Pending
+        })
+        .count();
     let must_passed = results
         .iter()
         .filter(|gate| {
@@ -46,13 +60,19 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         })
         .count();
     let blocking = results.iter().filter(|gate| gate.breaks_the_step()).count();
-    let should = results
+    let should_ran = results
         .iter()
-        .filter(|gate| gate.spec.tier == crate::gates::Tier::Should)
+        .filter(|gate| {
+            gate.spec.tier == crate::gates::Tier::Should && gate.outcome != Outcome::Pending
+        })
         .count();
-    let pending = results
+    let skipped = results
         .iter()
-        .filter(|gate| gate.outcome == Outcome::Pending)
+        .filter(|gate| gate.outcome == Outcome::Pending && gate.spec.slow)
+        .count();
+    let unknown = results
+        .iter()
+        .filter(|gate| gate.outcome == Outcome::Pending && !gate.spec.slow)
         .count();
 
     // `check` looks at the spec files too (the `spec-integrity` gate), so the honesty marker is
@@ -74,8 +94,8 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
 
     println!();
     println!(
-        "{must_passed}/{must_declared} must gates passed · {should} should gates run · {pending} \
-         catalogue gate(s) not implemented yet"
+        "{must_passed}/{must_ran} must gate(s) passed · {should_ran} should gate(s) run · {skipped} \
+         slow gate(s) skipped · {unknown} catalogue gate(s) not implemented yet"
     );
     if passed {
         println!(
