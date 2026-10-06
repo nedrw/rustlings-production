@@ -42,13 +42,14 @@
 //! rebuild (handoff M2 §1.3). The build directory stays the gate's own, so the ordinary build the
 //! learner's next command needs is untouched either way.
 //!
-//! Only the objects *this run* linked are read ([`executables`]), and each is read on its own: the
-//! profile's files have to be this copy's, and the answer about a file has to come from the object that
-//! carries it — an `export` of several binaries at once is a document about none of them (measured, see
-//! the comments there).
+//! Only the objects *this run* linked are read ([`executables_of_the_run`]) — from both directories
+//! cargo links a binary into: `target/debug/deps` for the test binaries, and the build root for the
+//! binary a spec spawns — and each is read on its own: the profile's files have to be this copy's, and
+//! the answer about a file has to come from the object that carries it — an `export` of several
+//! binaries at once is a document about none of them (measured, see the comments there).
 //!
-//! Facts about the machine are reported as blocks, not failures: no tools, no profile data, no test
-//! binary, an unreadable export, or an instrumented spec run that did not pass would each mean a
+//! Facts about the machine are reported as blocks, not failures: no tools, no profile data, no
+//! executable, an unreadable export, or an instrumented spec run that did not pass would each mean a
 //! number that describes something other than the learner's code.
 
 use std::collections::BTreeMap;
@@ -178,7 +179,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         ),
     ];
     // The instant before the run: everything cargo links from here on is this copy's, and everything
-    // older in the shared directory belongs to a run that came before (see [`executables`]).
+    // older in the shared directory belongs to a run that came before (see [`executables_of_the_run`]).
     let started = SystemTime::now();
     let ran = process::run_line_with_env(&run.cmd, &measured, ctx.timeout, &environment)?;
     if !ran.success() {
@@ -214,13 +215,13 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
-    let deps = target.join("debug").join("deps");
-    let objects = executables(&deps, started);
+    let debug = target.join("debug");
+    let objects = executables_of_the_run(&debug, started);
     if objects.is_empty() {
         return Ok(GateOutcome::blocked(format!(
-            "no test binary under {} was linked by this run — profile data can only be read back 
+            "no executable under {} was linked by this run — profile data can only be read back 
              against the binaries it came from, and this run left none",
-            deps.display()
+            debug.display()
         )));
     }
     // One `llvm-cov export` per object, folded together here: see [`Coverage::absorb`]. Handing them
@@ -395,6 +396,28 @@ fn executables(directory: &Path, since: SystemTime) -> Vec<PathBuf> {
     found
 }
 
+/// Every executable this run linked under the build root (`target/debug`), in path order.
+///
+/// Both directories cargo links a binary into are read, and both are needed. A test binary lands in
+/// `deps/` under a hashed name; the binary a package *declares* (`[[bin]]`, so `target/debug/<bin>`)
+/// lands in the build root itself. The second one is the binary a spec **spawns** — `jobq/3.26-dlq-cli`
+/// runs `jobq` with an environment it picks itself — and the module that step brings is reached by
+/// that binary, so reading `deps/` alone leaves the measurement depending on luck: cargo happens to
+/// also build a **test-harness copy** of a `[[bin]]` target into `deps/`, and that copy carries the
+/// same code. It is a copy cargo makes for its own reasons, not part of the interface this gate may
+/// rely on: a target declared with `harness = false`, or a cargo that stops making it, turns the same
+/// measurement into a `blocked` or into a denominator made of the subset one harness copy kept.
+/// Reading the build root changes no number today — `jobq/3.26-dlq-cli`'s `src/cli/dlq.rs` stays at
+/// 181/199, the value the harness copy was already answering with — and that is the point: the
+/// number comes from the binary the suite runs instead of from a copy of it.
+fn executables_of_the_run(build_root: &Path, since: SystemTime) -> Vec<PathBuf> {
+    let mut found = executables(&build_root.join("deps"), since);
+    found.extend(executables(build_root, since));
+    found.sort();
+    found.dedup();
+    found
+}
+
 /// One line coverage number over the step's module, gathered from every object the run left.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Coverage {
@@ -490,7 +513,9 @@ struct Lines {
 /// Line coverage of the step's module, out of one object's export document.
 ///
 /// `measured` is the root the profile's files have to live under — the copy this run built in — and
-/// `module` holds the step's files as paths relative to it.
+/// `module` holds the step's files as paths relative to it. A file of the export is a file of the
+/// module when its path relative to that root *is* the path the module names: ending with that path
+/// is not the same thing as being it.
 fn summary(document: &str, measured: &Path, module: &[String]) -> Result<Coverage> {
     let export: Export = serde_json::from_str(document).map_err(|source| {
         KilnError::Invalid(format!(
@@ -503,18 +528,29 @@ fn summary(document: &str, measured: &Path, module: &[String]) -> Result<Coverag
         // The export answers with the path the compiler used, which is absolute; joining keeps a
         // relative one working too, because `join` replaces the path when it is already absolute.
         let absolute = measured.join(&file.filename);
+        let path = resolved(&absolute);
+        // A path that ends with the module's name and does not live in the copy this run built in is
+        // a build of something else: counting it would report another tree's lines as this step's.
+        let Ok(rest) = path.strip_prefix(&root) else {
+            if module
+                .iter()
+                .any(|relative| absolute.ends_with(relative.as_str()))
+            {
+                coverage.foreign += 1;
+            }
+            continue;
+        };
+        // A path that ends with the module's path is not the module's file. The copy this run builds
+        // in can hold `backup/src/cli/dlq.rs` where the module is `src/cli/dlq.rs`, and a suffix test
+        // counts that second file, and its lines, in a denominator that has one file in it. The file
+        // is this file when the path relative to the copy *is* the path the module names, and nothing
+        // else counts.
         let Some(relative) = module
             .iter()
-            .find(|relative| absolute.ends_with(relative.as_str()))
+            .find(|relative| rest == Path::new(relative.as_str()))
         else {
             continue;
         };
-        // A path that ends with the module's name but does not live in the copy this run built in is
-        // a build of something else: counting it would report another tree's lines as this step's.
-        if !resolved(&absolute).starts_with(&root) {
-            coverage.foreign += 1;
-            continue;
-        }
         coverage.files.insert(relative.clone(), file.summary.lines);
     }
     Ok(coverage)
@@ -800,6 +836,103 @@ mod tests {
                 .len(),
             1,
             "the gate's own directory holds none here, and the stray one is the run's"
+        );
+    }
+
+    /// The objects of a run, out of a build root: the test binaries cargo leaves in `deps/` *and*
+    /// the binary a package declares, which cargo leaves in the build root itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_binary_a_spec_spawns_is_read_from_the_build_root_and_not_from_a_copy_of_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new("coverage-objects");
+        let debug = temp.path().join("debug");
+        // The test binary of the run, next to the `.d` file cargo also writes there.
+        let harness = crate::test_support::write(&debug, "deps/jobq-1a2b3c4d", "");
+        let build_root_binary = crate::test_support::write(&debug, "jobq", "");
+        // Left over from an earlier run of another tree: never this run's object.
+        let yesterday = crate::test_support::write(&debug, "jobq-yesterday", "");
+        // Written by the same run, and not an object: a `.d` file is not executable.
+        let data = crate::test_support::write(&debug, "jobq.d", "target/debug/jobq: src/main.rs\n");
+        for path in [&harness, &build_root_binary, &yesterday] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("the fixture can be made executable");
+        }
+
+        let since = SystemTime::now();
+        let fresh = since + Duration::from_secs(1);
+        stamp(&harness, fresh);
+        stamp(&build_root_binary, fresh);
+        stamp(&data, fresh);
+        stamp(&yesterday, since - Duration::from_secs(86_400));
+
+        let found = executables_of_the_run(&debug, since);
+        assert_eq!(
+            found,
+            vec![harness.clone(), build_root_binary.clone()],
+            "the run's two executables: the test binary in `deps/` and the binary a spec spawns in \
+             the build root, and neither the older one nor the data file written beside it"
+        );
+        assert!(
+            !found.contains(&data),
+            "a `.d` file is not an object: the executable bit is what tells them apart"
+        );
+    }
+
+    #[test]
+    fn a_module_file_of_the_copy_is_the_file_the_module_names() {
+        // The copy a run builds in can hold a file at the module's path under a directory of its own:
+        // `backup/src/store.rs` where the module is `src/store.rs`. Counting it adds a second, larger
+        // file to a denominator that has one file in it.
+        let temp = TempDir::new("coverage-module");
+        let project = temp.path().join("project");
+        crate::test_support::write(&project, "src/store.rs", "pub fn get() {}\n");
+        crate::test_support::write(&project, "backup/src/store.rs", "pub fn get() {}\n");
+        // And the shape only a *byte* suffix would keep: `xsrc/store.rs` does not end with the
+        // module's path component by component, so it is here to stay that way if the comparison is
+        // ever rewritten as a string test.
+        crate::test_support::write(&project, "xsrc/store.rs", "pub fn get() {}\n");
+        let module = ["src/store.rs".to_owned()];
+        let document = format!(
+            r#"{{"data": [{{"files": [
+              {{"filename": "{project}/src/store.rs",
+                "summary": {{"lines": {{"count": 40, "covered": 34}}}}}},
+              {{"filename": "{project}/backup/src/store.rs",
+                "summary": {{"lines": {{"count": 90, "covered": 90}}}}}},
+              {{"filename": "{project}/xsrc/store.rs",
+                "summary": {{"lines": {{"count": 99, "covered": 99}}}}}}
+            ]}}]}}"#,
+            project = project.display()
+        );
+
+        let coverage = summary(&document, &project, &module).expect("the fixture reads");
+        assert_eq!(
+            coverage.files.keys().collect::<Vec<_>>(),
+            ["src/store.rs"],
+            "the module is one file, and the copy that carries the same tail is not it"
+        );
+        assert_eq!(
+            (coverage.lines(), coverage.covered()),
+            (40, 34),
+            "so the number is the module's own lines, not the backup copy's"
+        );
+        assert_eq!(coverage.foreign, 0);
+
+        // A module file that is not in the copy is still the fault it was, not a number: it has to
+        // be a file of the tree this run built in. `other-sandbox/project` is not one.
+        let outside = format!(
+            r#"{{"data": [{{"files": [
+              {{"filename": "{other}/src/store.rs",
+                "summary": {{"lines": {{"count": 40, "covered": 34}}}}}}
+            ]}}]}}"#,
+            other = temp.path().join("other-sandbox/project").display()
+        );
+        let coverage = summary(&outside, &project, &module).expect("the fixture reads");
+        assert_eq!(coverage.lines(), 0);
+        assert_eq!(
+            coverage.foreign, 1,
+            "a module file outside the copy is the fault `judge` reports, not a measurement"
         );
     }
 
