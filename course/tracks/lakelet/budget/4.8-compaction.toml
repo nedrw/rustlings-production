@@ -1,0 +1,58 @@
+# The rewrite budget of `lakelet/4.8-compaction`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_compaction.rs`, which this step's scaffold ships); the metrics are the lines it
+# prints, and every one of them is a count, a byte total or a ratio of two counts rather than a time
+# — a count is the same number on a loaded machine as on an idle one, which is why this lane judges
+# counts at all (handoff M2 §1.1).
+#
+# What the harness does: it seals sixteen comparable segments of a high-cardinality workload and then
+# merges until the policy has nothing left to do. The workload is deliberately one a merge cannot
+# compress its way out of — the series names and the clock are structure, the values are not — because
+# on data that compresses well across a merge the bytes written come back with interest and a
+# *rewrite* budget would be measuring `zstd` instead of the policy.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: “no worse than this”, not “about this”, so a store that came out smaller, or a pass that
+# wrote less to get there, passes and only a bigger one fails.
+command = "cargo test -p lakelet --test budget_compaction -- --nocapture"
+
+[metric]
+# The workload: segments sealed and records in them. Counts of the shape of the store, judged within
+# ±10% so that a store with nothing in it cannot pass a byte bound, and so that a `seal` that wrote
+# the wrong number of records is caught before anything is merged.
+segments_sealed = 16
+records_sealed = 2048
+# The policy's own answer on this store, and the counts a policy's lean shows up in. The shipped
+# policy (four segments within a factor of two) gets there in five merges and leaves one file;
+# merging pairs answers `merges = 14` and taking eight at a time answers `merges = 2` with two files
+# left — a policy that is too eager and a policy that is too lazy, each failing a different count.
+merges = 5
+segments_after = 1
+files_removed = 15
+# Nothing left to merge when the pass stopped asking. An upper bound of zero: a policy that still had
+# a plan after the harness's sixteen calls is a policy that never settles, whatever its bytes say.
+plan_left_max = 0
+# Every record that was sealed comes back, once, in order: `records_kept` is that count and
+# `records_lost_max` counts the ones that did not, or that came back as something else. The bound of
+# zero is the point — a merge that removed bytes by dropping records would pass every byte count in
+# this file.
+records_kept = 2048
+records_lost_max = 0
+# The bytes: what the store holds after the pass (5 700 on the reference solution, bound at 6 300),
+# what the merges wrote to get there (12 029, bound at 15 000), and what the store stopped holding
+# (2 412, the difference of two counts rather than a number the store reported). The bounds carry
+# more slack than the counts do because a `zstd` release may answer different bytes for the same
+# input, and the course never pins a compressor's output.
+bytes_after_max = 6300
+bytes_rewritten_max = 15000
+bytes_removed = 2412
+# The number this lane exists for: bytes written by merges per byte the store stopped holding.
+# 4.9871 on the reference solution, bound at 7.0. An upper bound, so a policy that rewrites less for
+# the same work passes; the bound is 40% over the measurement and well below what eagerness costs —
+# merging pairs costs about ten here, and merging the whole store on every call costs about forty.
+bytes_rewritten_per_byte_removed_max = 7.0
+# A store that refused something is a store this lane cannot judge by bytes alone. An upper bound of
+# zero, so the failure a refusal causes is named as a refusal as well as by the counts it moved.
+refused_max = 0

@@ -13,3 +13,4 @@ format_version = 1
 "spec/4.5/batch_writes.rs" = "sha256:a4a83d86080e534f1d87445002911e404fa85a0cf2979be2a6bd858a53630002"
 "spec/4.6/backpressure.rs" = "sha256:5db018f680b47deb2f65bd5f5ad690b4245e9d916237d41df12f21e85b4e742c"
 "spec/4.7/columnar_segments.rs" = "sha256:c3b1fa3f76b3a6aed5c941c1bd88830d1b68ce1c9884b2c2d09b69b18e3b7a3b"
+"spec/4.8/compaction.rs" = "sha256:4a644e44b6978f404a6211971e313cef8926f39ea9ce99628122b3a68edc94f8"

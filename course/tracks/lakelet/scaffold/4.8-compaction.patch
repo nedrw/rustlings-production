@@ -1,0 +1,2085 @@
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+new file mode 100644
+index 0000000..8975ac5
+--- /dev/null
++++ b/src/engine/compaction/mod.rs
+@@ -0,0 +1,531 @@
++//! The closed segments a store is made of, and the one operation that changes them: a merge.
++//!
++//! Step `lakelet/4.8-compaction`. `lakelet/4.7-columnar-segments` gave the store a file worth
++//! keeping — records laid out by column, compressed, sealed — and said what it deliberately does
++//! not decide: *how many records one segment holds, and when a new one starts*. Both answers are
++//! this module's. A flush closes a segment ([`Segments::seal`]), and a store that only ever closed
++//! them would pay for every flush twice: a reader opens one more file per flush, and two segments
++//! holding the same series share nothing — not a dictionary, not a run, not a `zstd` frame. A merge
++//! is what fixes that ([`Segments::merge`]), and the decision of *which* segments it takes is
++//! [`plan`]'s, as data.
++//!
++//! # What the store is
++//!
++//! ```text
++//!  <store>/ingest.log                 the log (`lakelet/4.1-ingest-protocol` … `4.4-wal-recovery`)
++//!  <store>/segments/<n>.lks           one closed segment per file, named by its ordinal
++//!  <store>/segments.manifest          what the store is: an epoch and the segments it is made of
++//!  <store>/segments.manifest.pending  a manifest being written (see the swap, below)
++//! ```
++//!
++//! **The manifest is the store.** Not the directory listing, not the newest file: a segment counts
++//! exactly when the manifest names it, in the order it is listed, and everything else in
++//! `segments/` is an orphan a crash left behind. That is what makes a merge something a reader
++//! cannot catch half-done — the file set changes in one step, and the step is the manifest being
++//! replaced — and it is what makes recovering from a crash one rule instead of one rule per stage:
++//! *read the manifest, delete what it does not name*. A segment whose file is not the length the
++//! manifest states is refused rather than read, because an index that disagrees with its files is a
++//! store nobody can answer from: answering without that segment would answer a *hole*.
++//!
++//! # The five stages of a merge, and what a crash at each one leaves
++//!
++//! | stage | what is on the device | what the store is after a restart |
++//! | ----- | --------------------- | --------------------------------- |
++//! | `planned` | nothing: a plan is a value and no file was touched | the store it already was |
++//! | `written` | the new segment's file, in whatever part the device committed | the store it already was — the file is an orphan |
++//! | `durable` | the new segment, whole and flushed; the manifest does not name it | the store it already was — a whole orphan is still an orphan |
++//! | `swapped` | the manifest names the new set; the segments it replaced may still be there | the new set, and the leftovers go with the next open |
++//! | `retired` | the segments it replaced are gone | the new set |
++//!
++//! The stages between `planned` and `swapped` are [`Segments::merge`], the swap is
++//! [`Segments::install`], and `retired` is what a [`Snapshot`] does when the last reader that named
++//! the old set lets go. Every crash point above lands in one of two worlds — the old set or the new
++//! one — and never in between, which is the property this module is shaped around: **no accepted
++//! record is lost by a merge, and no reader sees it twice**.
++//!
++//! Two orderings make that true, and both are in the code rather than in a comment. The new segment
++//! is written *and flushed* before the manifest names it, so a crash cannot leave a store whose
++//! index points at bytes the device never kept; and the manifest is written to [`PENDING`] and
++//! renamed onto [`MANIFEST`], so a reader of the manifest sees the old one or the new one and never
++//! a half-written mix. A rename is atomic and a write is not, which is the whole reason the
++//! manifest is a whole file replaced rather than a file appended to.
++//!
++//! # What this module does not do
++//!
++//! A merge keeps every record it takes, in the order it found them: this store has no key that a
++//! later record could shadow, and nothing here deletes a record — `lakelet/4.9-retention` is where
++//! "remove" gets a second meaning, and it will have to say what happens to a record a merge is in
++//! the middle of copying. Nor does this module decide *when* a merge runs: [`Segments::compact`] is
++//! the whole job in one call for a background task, and `lakelet/4.11-query-engine` is what reads
++//! the segments a snapshot names when a query arrives.
++
++pub mod plan;
++pub mod snapshot;
++
++pub use plan::{Plan, Policy, SegmentInfo};
++pub use snapshot::Snapshot;
++
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use crate::engine::segment;
++use crate::engine::wal::checksum;
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++use snapshot::Set;
++
++/// The directory inside the store directory that holds the closed segments.
++pub const DIRECTORY: &str = "segments";
++
++/// The file the store's segments are named in, at the top of the store directory.
++pub const MANIFEST: &str = "segments.manifest";
++
++/// The name a manifest is written under before it is renamed onto [`MANIFEST`].
++///
++/// A manifest is never edited in place: it is written whole here, flushed, and renamed. A crash
++/// therefore leaves either the manifest that was or the one being written, and the name below is
++/// the half-state a reader must never be handed — which is why an open deletes it.
++pub const PENDING: &str = "segments.manifest.pending";
++
++/// The extension a segment's file carries.
++pub const EXTENSION: &str = "lks";
++
++/// How many digits a segment's file name has, so a directory listing is in the manifest's order.
++const DIGITS: usize = 10;
++
++/// The file one segment's bytes live in: `<directory>/segments/<index>.lks`.
++///
++/// Public because the layout is part of what this store *is* — a repair tool, an operator with
++/// `ls`, and a test that has to damage a file all need to name one — and because the naming rule is
++/// what makes a directory listing readable in the order the manifest lists the segments.
++#[must_use]
++pub fn file_of(directory: &Path, index: u64) -> PathBuf {
++    directory.join(DIRECTORY).join(file_name(index))
++}
++
++/// What the store is: an epoch, and the segments it is made of, oldest first.
++///
++/// The epoch changes every time the store changes shape — a segment is closed, a merge is
++/// installed — and it is the number a [`Snapshot`] carries, so "these two readers saw the same
++/// store" is a comparison rather than an argument.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Manifest {
++    /// How many times the store has changed shape.
++    epoch: u64,
++    /// The segments, in the order their records were accepted.
++    segments: Vec<SegmentInfo>,
++}
++
++impl Manifest {
++    /// An empty store: no segments, and an epoch nothing has happened at yet.
++    fn empty() -> Self {
++        Self {
++            epoch: 0,
++            segments: Vec::new(),
++        }
++    }
++
++    /// How many times the store has changed shape.
++    #[must_use]
++    pub fn epoch(&self) -> u64 {
++        self.epoch
++    }
++
++    /// The segments that are the store, oldest first.
++    #[must_use]
++    pub fn segments(&self) -> &[SegmentInfo] {
++        &self.segments
++    }
++
++    /// `true` when the store holds no segments at all.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.segments.is_empty()
++    }
++
++    /// How many records the store holds, from the index alone.
++    ///
++    /// A number a caller asks for cheaply — how much a query will walk, how much memory an answer
++    /// might take — and the reason a segment's record count is written into the manifest when the
++    /// segment is closed: counting them any other way is reading every file this index exists to
++    /// avoid reading.
++    #[must_use]
++    pub fn records(&self) -> u64 {
++        self.segments
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.records))
++    }
++
++    /// How many bytes the store's segments cost together, from the index alone.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.segments
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.bytes))
++    }
++
++    /// This manifest as the bytes that go in the file.
++    ///
++    /// The layout is this module's own business — nothing outside the store reads the manifest — so
++    /// the only promises are the ones [`Manifest::decode`] keeps: whole or refused, and the same
++    /// segments back.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this store holds so many segments that the count, or the body it
++    /// seals, does not fit the four bytes the layout gives it — a store no machine can have.
++    fn encode(&self) -> Result<Vec<u8>, Error> {
++        let _ = self;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// The manifest these bytes are, or a refusal naming what disagreed.
++    ///
++    /// Four comparisons and nothing clever: the magic and the version, the seal over the body, the
++    /// length the file has against the length the header states, and — after all of that — that the
++    /// bytes left are exactly the entries the count promises. A manifest a crash cut, or a device
++    /// changed, is a *refusal*: the alternative is reading it as a store with fewer segments, which
++    /// is a hole in every answer this store would give from then on.
++    fn decode(bytes: &[u8], path: &Path) -> Result<Self, Error> {
++        let _ = (bytes, path);
++        todo!("step lakelet/4.8-compaction")
++    }
++}
++
++/// The segments a store is made of, and what may change them.
++#[derive(Debug)]
++pub struct Segments {
++    /// The store directory: this module's files live at the top of it and below [`DIRECTORY`].
++    directory: PathBuf,
++    /// The rule a plan is made by.
++    policy: Policy,
++    /// The set the manifest names: what a [`Snapshot`] taken now holds.
++    current: Arc<Set>,
++    /// The ordinal the next segment gets — always past every index the manifest has ever named, so
++    /// a segment this store writes can never be confused with one a crash left behind.
++    next: u64,
++    /// The index of a merge that has been written and not installed yet, if there is one.
++    pending: Option<u64>,
++}
++
++impl Segments {
++    /// Open (or create) the segment store in `directory`, with the policy this build ships.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the store or its segment directory cannot be created or read, and
++    /// [`Error::Protocol`] when the manifest is not this build's manifest or a segment it names is
++    /// not the length the manifest states.
++    pub fn open(directory: impl Into<PathBuf>) -> Result<Self, Error> {
++        Self::with_policy(directory, Policy::DEFAULT)
++    }
++
++    /// Open (or create) the segment store in `directory`, with `policy` deciding what it merges.
++    ///
++    /// Opening is also what finishes the merge a crash interrupted, and it needs no case for which
++    /// stage that crash reached: the manifest names one set of segments, every file name in
++    /// `segments/` that the manifest does not name is an orphan, and an orphan is deleted. What the
++    /// manifest *does* name is checked against the files — a store with a segment whose bytes are
++    /// not the length the index states refuses to open, because the alternative is answering with a
++    /// hole in it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the directory cannot be created, read or flushed, and
++    /// [`Error::Protocol`] when the manifest or a segment it names is not what this build wrote.
++    pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
++        let _ = (directory, policy);
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// The directory this store's segments live in.
++    #[must_use]
++    pub fn directory(&self) -> &Path {
++        &self.directory
++    }
++
++    /// The rule this store plans its merges by.
++    #[must_use]
++    pub fn policy(&self) -> Policy {
++        self.policy
++    }
++
++    /// What the store is: the epoch, and the segments it is made of.
++    #[must_use]
++    pub fn manifest(&self) -> &Manifest {
++        self.current.manifest()
++    }
++
++    /// What a reader holds: the segments that are the store right now, and the promise that they
++    /// are still there — and still this set — however many merges happen while the reader reads.
++    #[must_use]
++    pub fn snapshot(&self) -> Snapshot {
++        Snapshot::of(Arc::clone(&self.current))
++    }
++
++    /// Close `records` into a new segment, and make it part of the store.
++    ///
++    /// This is the call a flush ends with: the records a batch wrote are a segment, on the device,
++    /// named by the manifest in the position their records were accepted in. Like a merge it has an
++    /// order — the bytes are written and flushed *before* the manifest names them — so a crash
++    /// leaves either a store without the segment (and an orphan file) or a store with it, and never
++    /// a name pointing at bytes the device has not kept.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when `records` is empty — a segment holds records, and a store that made a
++    /// file out of nothing would carry it for ever — and everything the segment writer and the
++    /// manifest writer refuse.
++    pub fn seal(&mut self, records: &[Record]) -> Result<u64, Error> {
++        let _ = records;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// The merge this store's policy would do next, from the manifest alone.
++    ///
++    /// No side effect and no file read: the sizes and counts a plan is made from are what the
++    /// manifest already holds ([`Policy::plan`]).
++    #[must_use]
++    pub fn plan(&self) -> Plan {
++        let _ = self;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// Write what `plan` asks for: read its segments in order, write them into one new segment, and
++    /// flush it.
++    ///
++    /// Nothing the store *is* changes here. The new file exists and is on the device, the manifest
++    /// does not name it, and a crash at this point leaves exactly that — a whole segment nobody
++    /// names, which the next open deletes. The reason the writing and the becoming are two calls is
++    /// that a merge takes as long as it takes: [`Segments::merge`] is the work, and
++    /// [`Segments::install`] is the one step a reader can be in the middle of.
++    ///
++    /// One merge at a time: a `Merge` names a file that is not the store yet, and a second merge
++    /// would write over it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the plan is empty, names a segment the manifest does not have, or
++    /// names segments that are no longer one run — a plan is a value taken at a moment, and a store
++    /// that carried out a stale one would write a segment holding records out of order. Everything
++    /// the segment reader, the segment writer and the device refuse is an [`Error::Store`].
++    pub fn merge(&mut self, plan: &Plan) -> Result<Merge, Error> {
++        let _ = plan;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// Make the merge `ran` the store: one manifest, written whole and renamed into place.
++    ///
++    /// This is the step a reader cannot be in the middle of, and it is one call because it is one
++    /// thing: the manifest naming the new set replaces the manifest that named the old one. The
++    /// segments it replaced are *retired* rather than deleted — the last [`Snapshot`] that named
++    /// them deletes them — which is what lets a read that began before this call answer the same
++    /// thing as one that ran entirely before it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this store has no merge in flight at `ran`'s index, and
++    /// [`Error::Store`] when the manifest cannot be written or put in place.
++    pub fn install(&mut self, ran: Merge) -> Result<MergeReport, Error> {
++        let _ = ran;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// The whole job in one call — plan, merge, install — for the caller that has nothing to decide:
++    /// a background task, a test, a repair tool.
++    ///
++    /// `None` means the policy has nothing left to merge, which is the answer such a caller loops on
++    /// until a flush gives it something again. `Some(report)` is what one merge cost.
++    ///
++    /// # Errors
++    ///
++    /// Everything [`Segments::merge`] and [`Segments::install`] refuse.
++    pub fn compact(&mut self) -> Result<Option<MergeReport>, Error> {
++        let _ = self;
++        todo!("step lakelet/4.8-compaction")
++    }
++
++    /// Put a manifest in place: written to [`PENDING`], flushed, renamed onto [`MANIFEST`], and the
++    /// directory flushed after the rename.
++    ///
++    /// Three writes, in this order, and the order is the crash point: the bytes, then the name that
++    /// makes them the store, then the directory entry that keeps the name. A crash before the rename
++    /// leaves the manifest that was — the file below is an orphan the next open deletes — and a
++    /// crash after it leaves the new one, so a reader of the manifest is never handed a
++    /// half-written index.
++    fn write_manifest(&self, manifest: Manifest) -> Result<(), Error> {
++        let _ = manifest;
++        todo!("step lakelet/4.8-compaction")
++    }
++}
++
++/// A merge that has been written and made durable, and is not the store yet.
++///
++/// The value [`Segments::merge`] answers with and [`Segments::install`] takes: the stage between
++/// "the new segment is on the device" and "the store is the new set". Holding it is holding a file
++/// nobody names, which is why it is `#[must_use]`: installing it makes the store the new set, and
++/// dropping it leaves an orphan for the next open to delete.
++#[derive(Debug, Clone, PartialEq, Eq)]
++#[must_use = "a merge that is never installed leaves a segment nobody names: install it, or the next open deletes it"]
++pub struct Merge {
++    /// The epoch the store would have if this merge were installed.
++    epoch: u64,
++    /// The new segment's ordinal.
++    index: u64,
++    /// Its file.
++    file: PathBuf,
++    /// The segments it replaces, oldest first.
++    taken: Vec<u64>,
++    /// How many bytes its file holds.
++    bytes: u64,
++    /// How many bytes the segments it replaces hold together.
++    bytes_in: u64,
++    /// How many records it holds.
++    records: u64,
++    /// How many segments the store was made of when this merge was planned.
++    segments_before: usize,
++}
++
++impl Merge {
++    /// The epoch the store would have if this merge were installed.
++    #[must_use]
++    pub fn epoch(&self) -> u64 {
++        self.epoch
++    }
++
++    /// The new segment's ordinal — the index it has in the manifest once installed.
++    #[must_use]
++    pub fn index(&self) -> u64 {
++        self.index
++    }
++
++    /// The file the new segment was written to.
++    #[must_use]
++    pub fn file(&self) -> &Path {
++        &self.file
++    }
++
++    /// The segments this merge replaces, oldest first.
++    #[must_use]
++    pub fn taken(&self) -> &[u64] {
++        &self.taken
++    }
++
++    /// How many bytes its file holds.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// How many bytes the segments it replaces hold together.
++    #[must_use]
++    pub fn bytes_in(&self) -> u64 {
++        self.bytes_in
++    }
++
++    /// How many records it holds.
++    #[must_use]
++    pub fn records(&self) -> u64 {
++        self.records
++    }
++}
++
++/// What one merge cost and what it changed, in counts.
++///
++/// The report a store's own bookkeeping is written in: how many files it took, how many bytes went
++/// in and came out, how many records came through. A merge that rewrote the store over and over
++/// would show up here as a [`MergeReport::bytes_removed`] of nothing against a
++/// [`MergeReport::bytes_out`] of everything, which is what `tests/budget_compaction.rs` measures and
++/// the step's page argues about.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct MergeReport {
++    /// The epoch the store moved to.
++    epoch: u64,
++    /// The segment the merge wrote.
++    wrote: u64,
++    /// The segments it replaced.
++    merged: Vec<u64>,
++    /// What those segments cost.
++    bytes_in: u64,
++    /// What the segment that replaced them costs.
++    bytes_out: u64,
++    /// How many records came through.
++    records: u64,
++    /// How many segments the store was made of.
++    segments_before: usize,
++    /// How many it is made of now.
++    segments_after: usize,
++}
++
++impl MergeReport {
++    /// The epoch the store moved to.
++    #[must_use]
++    pub fn epoch(&self) -> u64 {
++        self.epoch
++    }
++
++    /// The segment the merge wrote — its ordinal, which is the index it has in the manifest.
++    #[must_use]
++    pub fn wrote(&self) -> u64 {
++        self.wrote
++    }
++
++    /// The segments it replaced, oldest first.
++    #[must_use]
++    pub fn merged(&self) -> &[u64] {
++        &self.merged
++    }
++
++    /// What those segments cost together.
++    #[must_use]
++    pub fn bytes_in(&self) -> u64 {
++        self.bytes_in
++    }
++
++    /// What the segment that replaced them costs.
++    #[must_use]
++    pub fn bytes_out(&self) -> u64 {
++        self.bytes_out
++    }
++
++    /// How many bytes the store stopped holding: what went in, less what came out.
++    ///
++    /// Zero when a merge wrote back at least as much as it took — which is not a failure of the
++    /// merge (every record is still there) and is exactly what this number is for: it is the half of
++    /// write amplification a policy decides, and the budget lane reads it against
++    /// [`MergeReport::bytes_out`].
++    #[must_use]
++    pub fn bytes_removed(&self) -> u64 {
++        self.bytes_in.saturating_sub(self.bytes_out)
++    }
++
++    /// How many records came through.
++    #[must_use]
++    pub fn records(&self) -> u64 {
++        self.records
++    }
++
++    /// How many segments the store was made of before the merge.
++    #[must_use]
++    pub fn segments_before(&self) -> usize {
++        self.segments_before
++    }
++
++    /// How many it is made of after it.
++    #[must_use]
++    pub fn segments_after(&self) -> usize {
++        self.segments_after
++    }
++
++    /// How many files the store stopped keeping: the count a reader pays for, moved.
++    #[must_use]
++    pub fn files_removed(&self) -> usize {
++        self.segments_before.saturating_sub(self.segments_after)
++    }
++}
++
++/// The name a segment's file has.
++fn file_name(index: u64) -> String {
++    format!("{index:0DIGITS$}.{EXTENSION}")
++}
+diff --git a/src/engine/compaction/plan.rs b/src/engine/compaction/plan.rs
+new file mode 100644
+index 0000000..2a973fd
+--- /dev/null
++++ b/src/engine/compaction/plan.rs
+@@ -0,0 +1,190 @@
++//! The merge policy as a value: *which* segments a merge would take, decided from their sizes and
++//! counts, touching no file at all.
++//!
++//! Step `lakelet/4.8-compaction`, and the half of it that needs no disk. Every flush closes a
++//! segment (`lakelet/4.7-columnar-segments`), so a store that only ever appends them pays for
++//! every flush twice: a reader opens one more file when it answers, and the columns of two
++//! segments that hold the same series cannot share anything — not a dictionary, not a run, not a
++//! `zstd` frame. What fixes that is a merge, and *which* segments a merge takes is a decision with
++//! a price on both sides: merging too eagerly rewrites bytes that were already written once, and
++//! merging too lazily leaves a reader opening a hundred files to answer one query. This module is
++//! that decision as data — [`Policy`] and a list of [`SegmentInfo`] in, a [`Plan`] out — so that
++//! what the store *would* do can be judged without a store and without a side effect.
++//!
++//! # The rule this build ships
++//!
++//! **Size tiering**, in one sentence: *a plan takes the oldest run of `width` consecutive segments
++//! whose sizes are all within a factor of `ratio` of each other.* Four words in it carry the whole
++//! design, and each one is a thing a policy can get wrong:
++//!
++//! * **sizes, not records** — the cost of a merge is bytes read and bytes written, and the cost of
++//!   *not* merging is files a reader opens; a segment's record count is what a plan reports so that
++//!   a caller can say what the merge is about, but the decision is made from bytes;
++//! * **comparable, both ways** — a run extends while the next segment's size is within `ratio` of
++//!   the run's smallest *and* of its largest. One direction is not enough: with a segment ten times
++//!   the size of its neighbours, a rule that only compared the newcomer with the smallest would
++//!   keep extending the run and merge a small file into a large one, which is the rewrite this
++//!   whole design is trying to avoid;
++//! * **consecutive** — the manifest's order is the order the records were accepted in, and a merge
++//!   writes one segment where its inputs were. A run that skipped a segment would move that
++//!   segment's records behind records that came after them, so a plan is a contiguous run or it is
++//!   not a plan;
++//! * **oldest** — of the runs that qualify, the plan takes the one that starts first. Those
++//!   segments were written first, they are the ones a reader has been opening longest, and a
++//!   policy that picked the *youngest* run would leave the old ones to grow old forever.
++//!
++//! A plan takes exactly `width` segments, never a whole tier: a merge whose cost followed the size
++//! of the tier would depend on how long the store had been running, and a store that pays an
++//! unbounded cost because it has been up for a month is a store that stalls. A merge of one
++//! segment is not a plan either — it rewrites bytes and removes none.
++
++/// One segment as a plan sees it: what it is called, how many bytes it costs, what it holds.
++///
++/// This is the manifest's view of a segment (`lakelet/4.8-compaction`), which is why a plan can be
++/// made without opening a single file: the size and the record count are what the store wrote down
++/// when it closed the segment, and a decision that had to read every file it is deciding about
++/// would pay the cost it is trying to avoid.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SegmentInfo {
++    /// The segment's ordinal. Its file is this number inside the store's segment directory, and the
++    /// manifest lists segments by it in the order their records were accepted.
++    pub index: u64,
++    /// How many bytes its file holds.
++    pub bytes: u64,
++    /// How many records it holds.
++    pub records: u64,
++}
++
++impl SegmentInfo {
++    /// One segment, as the store writes it into the manifest.
++    #[must_use]
++    pub const fn new(index: u64, bytes: u64, records: u64) -> Self {
++        Self {
++            index,
++            bytes,
++            records,
++        }
++    }
++}
++
++/// The rule this store merges by: `width` segments whose sizes are within `ratio` of each other.
++///
++/// A policy is data on purpose. The numbers are a decision somebody has to defend — this build's
++/// are in [`Policy::DEFAULT`] and in the step's page, and `tests/budget_compaction.rs` measures what
++/// they answer on a store of comparable segments — and the rule around them is
++/// [`Policy::plan`]'s, which is the part every policy shares.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Policy {
++    /// How many segments one merge takes.
++    width: usize,
++    /// How far two segments' sizes may be apart, as a factor, and still be one merge's inputs.
++    ratio: u64,
++}
++
++impl Policy {
++    /// The policy this build ships: four segments whose sizes are within a factor of two.
++    ///
++    /// Both numbers were measured rather than picked, and `tests/budget_compaction.rs` prints the
++    /// numbers they answer on sixteen comparable segments (five merges, one file left, and the
++    /// bytes rewritten per byte removed in `budget/4.8-compaction.toml`). The two directions of
++    /// getting them wrong are a bound and a file count: merging two segments at a time lowers the
++    /// file count fastest and rewrites the store about four times for every byte it removes, and a
++    /// width of eight spends a store's whole read bandwidth on one call and leaves the last three
++    /// segments of a store that only ever holds seven to grow old unmerged. A factor of two is what
++    /// makes the merged segment leave its tier — four equal segments of `s` bytes became about
++    /// `3.2 s`, which is not comparable with `s` — so the next merge happens in the next tier
++    /// instead of rewriting what the last one wrote.
++    pub const DEFAULT: Policy = Policy { width: 4, ratio: 2 };
++
++    /// A policy with these numbers.
++    ///
++    /// A `width` below two is treated as two when a plan is made (`Policy::plan`): rewriting one
++    /// file into one file costs bytes and removes none.
++    #[must_use]
++    pub const fn new(width: usize, ratio: u64) -> Self {
++        Self { width, ratio }
++    }
++
++    /// How many segments one merge takes.
++    #[must_use]
++    pub const fn width(&self) -> usize {
++        self.width
++    }
++
++    /// How far apart two segments' sizes may be and still be one merge's inputs.
++    #[must_use]
++    pub const fn ratio(&self) -> u64 {
++        self.ratio
++    }
++
++    /// The merge this policy would do next: the oldest run of [`Policy::width`] consecutive segments
++    /// whose sizes are all within [`Policy::ratio`] of each other.
++    ///
++    /// The answer is data and this call has no side effect: it may be asked twice, asked about a
++    /// store that is being merged by somebody else, or asked by a test that has no store at all. A
++    /// plan that names segments the store no longer has is refused at the moment it is carried out
++    /// (`Segments::merge`) rather than repaired here, because a planner cannot promise what the
++    /// store looks like when the merge starts.
++    #[must_use]
++    pub fn plan(&self, segments: &[SegmentInfo]) -> Plan {
++        let _ = (self, segments);
++        todo!("step lakelet/4.8-compaction")
++    }
++}
++
++/// What one merge would take: a contiguous run of segments, oldest first, and what they cost.
++///
++/// The plan is a value a caller can hold, log, or refuse. Its segments are indices into the
++/// manifest's order, and they are ascending because the run it describes is contiguous — the
++/// property that lets a merge write one segment without moving a record in front of another.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Plan {
++    /// The segments the merge would take, in the manifest's order.
++    segments: Vec<u64>,
++    /// What those segments hold, added up.
++    bytes: u64,
++    /// How many records that is.
++    records: u64,
++}
++
++impl Plan {
++    /// No merge: there is no run of this policy's shape in the store.
++    #[must_use]
++    pub const fn empty() -> Self {
++        Self {
++            segments: Vec::new(),
++            bytes: 0,
++            records: 0,
++        }
++    }
++
++    /// `true` when this plan is no merge at all.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.segments.is_empty()
++    }
++
++    /// The segments the merge would take, in the manifest's order.
++    #[must_use]
++    pub fn segments(&self) -> &[u64] {
++        &self.segments
++    }
++
++    /// How many segments that is.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.segments.len()
++    }
++
++    /// How many bytes those segments cost together.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// How many records they hold together.
++    #[must_use]
++    pub fn records(&self) -> u64 {
++        self.records
++    }
++}
+diff --git a/src/engine/compaction/snapshot.rs b/src/engine/compaction/snapshot.rs
+new file mode 100644
+index 0000000..bb53a9e
+--- /dev/null
++++ b/src/engine/compaction/snapshot.rs
+@@ -0,0 +1,162 @@
++//! What a reader holds while a merge happens: the set of segments that *were* the store.
++//!
++//! Step `lakelet/4.8-compaction`. A merge takes several segments and leaves one, and the moment
++//! that becomes true is the moment a reader may not be in the middle of: a query that walked half
++//! of the old set and then half of the new one would answer a record twice, or answer neither copy
++//! of it, and no count would tell anybody. So a read is not "read the newest segments" — it is
++//! **take a snapshot and read that**: a value naming the segments that were the store when the read
++//! began, in their order, and that goes on naming them however many merges happen beside it.
++//!
++//! ```text
++//!   reader                    store                        disk
++//!   ──────                    ─────                        ────
++//!   snapshot()  ───────────▶  set: epoch 7, [3,4,5,6]
++//!   │                                                     segments 3,4,5,6
++//!   │                         merge + install ────────▶   manifest: epoch 8, [7]
++//!   │                         (3,4,5,6 are retired)       segments 7, 3,4,5,6
++//!   records()   ───────────▶  3,4,5,6 — still there, because this snapshot holds them
++//!   drop()                                                segments 7 (3,4,5,6 are gone)
++//! ```
++//!
++//! The last line is the half nobody writes by accident: the files a merge replaces may only leave
++//! the disk once the last reader that named them has finished, which is why a snapshot holds more
++//! than a list of paths — it holds the *set*, and the set is what deletes the retired files when it
++//! is the last one left. A store that deleted them at the swap would answer a reader that began
++//! before it with whatever the operating system did to a file that no longer has a name.
++//!
++//! The order a snapshot reads in is the manifest's order: oldest segment first, in the order the
++//! records were accepted, which is the order a merge preserves and the order the store answers in.
++//! Nothing here sorts, groups or filters — `lakelet/4.9-retention` is where a record can stop being
++//! an answer, and `lakelet/4.11-query-engine` is where one is asked for.
++
++use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
++
++use crate::engine::segment;
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++use super::plan::SegmentInfo;
++use super::{Manifest, file_of};
++
++/// The segments one read is allowed to see, and the files that may not leave while it does.
++///
++/// Private to the module: a caller holds a [`Snapshot`], which is this set behind an [`Arc`], and
++/// the store holds the same `Arc`. The moment both let go, the files a merge retired are deleted —
++/// so a reader that outlives a merge neither reads a half-store nor keeps a file alive forever.
++///
++/// The fields below are a suggestion rather than a contract: what this type has to do is in the
++/// module docs and in its own, and a store that keeps its readers whole some other way is a store
++/// whose spec still passes — the spec only ever holds a [`Snapshot`].
++#[derive(Debug)]
++pub(super) struct Set {
++    /// The store directory the segments live under.
++    directory: PathBuf,
++    /// The manifest this set is: the epoch and the segments that were the store.
++    manifest: Manifest,
++    /// Files this set may delete once nobody is reading it (a merge's inputs, retired).
++    retired: Mutex<Vec<PathBuf>>,
++}
++
++impl Set {
++    /// The set the manifest names, with nothing retired yet.
++    pub(super) fn new(directory: PathBuf, manifest: Manifest) -> Self {
++        Self {
++            directory,
++            manifest,
++            retired: Mutex::new(Vec::new()),
++        }
++    }
++
++    /// The manifest this set is.
++    pub(super) fn manifest(&self) -> &Manifest {
++        &self.manifest
++    }
++
++    /// Hand this set the files a merge replaced. They go when the last reader of this set does.
++    pub(super) fn retire(&self, indices: &[u64]) {
++        let _ = (self, indices);
++        todo!("step lakelet/4.8-compaction")
++    }
++}
++
++impl Drop for Set {
++    fn drop(&mut self) {
++        todo!("step lakelet/4.8-compaction")
++    }
++}
++
++/// What a reader holds: the segments that were the store when it took this snapshot.
++///
++/// Cheap to take and cheap to drop, and it answers the same thing whatever happens to the store
++/// beside it — that is the whole contract, and it is why a query takes one at the beginning and
++/// keeps it: a snapshot is the difference between "the answer" and "whatever the store happened to
++/// look like while I was asking".
++#[derive(Debug, Clone)]
++pub struct Snapshot {
++    /// The set this snapshot names.
++    held: Arc<Set>,
++}
++
++impl Snapshot {
++    /// A snapshot of the set `held` names.
++    pub(super) fn of(held: Arc<Set>) -> Self {
++        Self { held }
++    }
++
++    /// The epoch of the manifest this snapshot took: the number that changes when a merge is
++    /// installed, so two snapshots are two views of the same store exactly when they agree on it.
++    #[must_use]
++    pub fn epoch(&self) -> u64 {
++        self.held.manifest().epoch()
++    }
++
++    /// The segments this snapshot reads, oldest first.
++    #[must_use]
++    pub fn segments(&self) -> &[SegmentInfo] {
++        self.held.manifest().segments()
++    }
++
++    /// How many records this snapshot will hand back, from the manifest alone.
++    ///
++    /// The number a caller needs *before* it reads — how much memory an answer will take, whether a
++    /// query can be answered from one file — and the reason the manifest keeps each segment's
++    /// record count: counting them by reading every segment would be the cost this store is trying
++    /// to avoid.
++    #[must_use]
++    pub fn len(&self) -> u64 {
++        self.held.manifest().records()
++    }
++
++    /// `true` when this snapshot holds no records at all.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    /// How many bytes its segments cost together, from the manifest alone.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.held.manifest().bytes()
++    }
++
++    /// Every record this snapshot names, in order: one segment after another, each one's records as
++    /// they were written.
++    ///
++    /// A segment here is read through `lakelet/4.7-columnar-segments`' reader, which refuses bytes
++    /// that are not the format — so a damaged file ends this call with an error naming it, and never
++    /// with the records that happened to be readable before it. An answer with a hole in it is the
++    /// one outcome a store may not produce, and the manifest's own record count is checked against
++    /// what each file actually holds for the same reason: an index that disagrees with its files is
++    /// a store nobody can query.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when a segment's file cannot be read, and everything
++    /// [`segment::read`](crate::engine::segment::read) refuses — a segment that is not this build's
++    /// format, was cut, or was changed after it was written.
++    pub fn records(&self) -> Result<Vec<Record>, Error> {
++        let _ = self;
++        todo!("step lakelet/4.8-compaction")
++    }
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 13e2c79..60c3756 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -27,6 +27,10 @@ pub mod flush;
+ // `lakelet/4.7-columnar-segments`: what a flush writes — the same records, laid out by column and
+ // compressed, in a closed file a reader can be handed on its own. The layout is `docs/format.md`.
+ pub mod segment;
++// `lakelet/4.8-compaction`: what the closed segments are, and the one operation that changes them
++// — a merge a reader never sees half-done. The policy is a value (`plan`), the store is the
++// manifest (`mod`), and what a reader holds while a merge happens is a snapshot.
++pub mod compaction;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/tests/budget_compaction.rs b/tests/budget_compaction.rs
+new file mode 100644
+index 0000000..2668f83
+--- /dev/null
++++ b/tests/budget_compaction.rs
+@@ -0,0 +1,314 @@
++//! The rewrite budget's harness for `lakelet/4.8-compaction`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.8-compaction
++//! --slow` runs, and the counts it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.8-compaction.toml`.
++//!
++//! What it measures is **bytes and files, never the clock**: a store of sixteen comparable segments
++//! is compacted until the policy has nothing left to do, and what that cost is a set of counts — how
++//! many merges it took, how many files are left, how many bytes were written, and how many of them
++//! the store stopped holding. A count is the same number on a loaded machine as on an idle one,
++//! which is why `kiln`'s budget gate compares counts (`handoff M2 §1.1`) and why no run of this file
++//! can flake because something else was compiling. `cargo test -p lakelet --test budget_compaction
++//! -- --nocapture` prints the lines by hand; the `lakelet-budget` prefix is what the gate reads.
++//!
++//! The number this lane exists for is `bytes_rewritten_per_byte_removed_max`: a merge writes bytes
++//! that were already written once, in exchange for the store's files becoming fewer and its
++//! encodings becoming better. **Too eager a policy** — merging every pair of vaguely similar
++//! segments as soon as there are two, or merging the whole store on every call — spends that write
++//! bandwidth over and over and removes almost nothing, which is the failure this bound names; **too
++//! lazy a policy** leaves `segments_after` high (`merges` and the file count are where a policy's
++//! lean shows up as a count). The baselines are the policy `Policy::DEFAULT` ships with answering a
++//! store of this shape, and the step's page argues both directions.
++//!
++//! The workload is deliberately **not** one a merge can compress its way out of: the series names
++//! and the clock are structure, but the values are high-cardinality, so the value column is written
++//! plain and a merge's saving is the framing and the dictionary it shares. A workload that
++//! compresses well across a merge makes write amplification look like a bargain (`4.7`'s own
++//! budget measures that), and this lane is about the price.
++//!
++//! The records are checked as well as counted: `records_kept` has to be every record that was
++//! sealed, in the order it was sealed, and `records_lost_max` counts the ones that were not. A merge
++//! that removed bytes by dropping records would pass every byte bound in this file, which is why the
++//! conservation count is here.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness a learner can break by editing their own fixture would judge the
++//! fixture instead of the store.
++
++use std::path::PathBuf;
++
++use lakelet::engine::compaction::{Segments, file_of};
++use lakelet::protocol::batch::Record;
++
++/// Segments the store is built from before anything is merged.
++const SEGMENTS: usize = 16;
++
++/// Records one sealed segment holds.
++const PER_SEGMENT: usize = 128;
++
++/// Series the workload spreads its segments over: one series per segment, cycling.
++const SERIES: usize = 4;
++
++/// Milliseconds between two samples of one series: a clock that advances by a constant step.
++const STEP: i64 = 1000;
++
++/// The first timestamp of every series, so the workload is the same on every machine.
++const EPOCH: i64 = 1_700_000_000_000;
++
++/// How many merges one pass may take before it stops asking.
++///
++/// Larger than the number a policy needs for this store (sixteen segments, four at a time, is five
++/// merges and then one file) so that a policy which never settles is *measured* rather than allowed
++/// to run for ever: a merge of one file into one file removes nothing, and a pass that kept asking
++/// would rewrite the whole store once per call until this bound stopped it.
++const LIMIT: usize = 16;
++
++/// The name of one series: a metric and its labels, as a client writes them.
++fn name(series: usize) -> String {
++    format!("cpu,host=h{series}")
++}
++
++/// The records one sealed segment holds: one series' window of `PER_SEGMENT` samples.
++///
++/// The clock steps inside the window and starts again in the next one, and the values are
++/// high-cardinality — no two samples share a bit pattern, so the value column is plain and a merge
++/// cannot make it smaller. What a merge saves on this workload is the series name written once
++/// instead of four times, the segment header, and the `zstd` frame: about a third of the store,
++/// which is what `bytes_removed` counts.
++fn segment_records(index: usize) -> Vec<Record> {
++    (0..PER_SEGMENT)
++        .map(|offset| Record {
++            series: name(index % SERIES),
++            ts_millis: EPOCH + offset as i64 * STEP,
++            value: value_of(index * PER_SEGMENT + offset),
++        })
++        .collect()
++}
++
++/// The value of sample `position`: distinct bit patterns, and no structure a column can exploit.
++///
++/// A store of temperature readings compresses across a merge — the same series, a clock that keeps
++/// stepping, values that hold still. A store of latency quantiles does not, and it is the second
++/// store this lane is written for: on the first one, the bytes a merge writes come back with
++/// interest, and a *rewrite* budget would be measuring the compressor instead of the policy.
++fn value_of(position: usize) -> f64 {
++    let mixed = (position as u64).wrapping_mul(2_654_435_761) % 100_003;
++    mixed as f64 / 8.0
++}
++
++/// Every record the store is given, in the order it is given them.
++fn given() -> Vec<Record> {
++    (0..SEGMENTS).flat_map(segment_records).collect()
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("lakelet-compaction-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    fn path(&self) -> &PathBuf {
++        &self.path
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// What one pass over the store cost, counted.
++struct Pass {
++    /// Segments the store was built from.
++    sealed: u64,
++    /// Records they held.
++    records: u64,
++    /// Merges that happened before the policy had nothing left to do (or [`LIMIT`] stopped it).
++    merges: u64,
++    /// Segments the store is made of at the end.
++    after: u64,
++    /// Files the store stopped keeping.
++    removed: u64,
++    /// Bytes the store's segments cost before any merge.
++    bytes_before: u64,
++    /// Bytes they cost after.
++    bytes_after: u64,
++    /// Bytes the merges wrote.
++    rewritten: u64,
++    /// Records the store hands back at the end.
++    kept: u64,
++    /// Records that did not come back, or came back as something else.
++    lost: u64,
++    /// Whether the policy had nothing left to merge when the pass stopped asking.
++    settled: bool,
++    /// Something the store refused, counted rather than raised: a store that cannot do this is what
++    /// the gate's counts are for.
++    refused: u64,
++}
++
++/// Build a store of [`SEGMENTS`] sealed segments, merge until the policy is done, and count it.
++///
++/// The failures are counted rather than raised for the reason `tests/budget_segments.rs` counts its
++/// own: this file's numbers are what a gate compares, and a harness that panicked would report
++/// nothing at all instead of the count that moved.
++fn pass() -> Pass {
++    let directory = Dir::new("budget");
++    let mut counted = Pass {
++        sealed: 0,
++        records: 0,
++        merges: 0,
++        after: 0,
++        removed: 0,
++        bytes_before: 0,
++        bytes_after: 0,
++        rewritten: 0,
++        kept: 0,
++        lost: 0,
++        settled: false,
++        refused: 0,
++    };
++    let mut store = match Segments::open(directory.path()) {
++        Ok(store) => store,
++        Err(error) => {
++            eprintln!("the store could not be opened: {error}");
++            return counted;
++        }
++    };
++    for index in 0..SEGMENTS {
++        let records = segment_records(index);
++        if let Err(error) = store.seal(&records) {
++            eprintln!("segment {index} could not be sealed: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        counted.sealed += 1;
++        counted.records += records.len() as u64;
++        let file = file_of(directory.path(), counted.sealed - 1);
++        counted.bytes_before += std::fs::metadata(file).map_or(0, |metadata| metadata.len());
++    }
++    let before = store.manifest().segments().len() as u64;
++
++    for _ in 0..LIMIT {
++        match store.compact() {
++            Ok(Some(report)) => {
++                counted.merges += 1;
++                counted.rewritten += report.bytes_out();
++            }
++            Ok(None) => {
++                counted.settled = true;
++                break;
++            }
++            Err(error) => {
++                eprintln!("a merge was refused: {error}");
++                counted.refused += 1;
++                break;
++            }
++        }
++    }
++
++    counted.after = store.manifest().segments().len() as u64;
++    counted.removed = before.saturating_sub(counted.after);
++    counted.bytes_after = store.manifest().bytes();
++    match store.snapshot().records() {
++        Ok(read) => {
++            let wanted = given();
++            counted.kept = read.len() as u64;
++            counted.lost = (wanted.len().saturating_sub(read.len())) as u64
++                + read
++                    .iter()
++                    .zip(&wanted)
++                    .filter(|(read, wanted)| {
++                        read.series != wanted.series
++                            || read.ts_millis != wanted.ts_millis
++                            || read.value.to_bits() != wanted.value.to_bits()
++                    })
++                    .count() as u64;
++        }
++        Err(error) => {
++            eprintln!("the store could not be read back: {error}");
++            counted.refused += 1;
++            counted.lost = SEGMENTS as u64 * PER_SEGMENT as u64;
++        }
++    }
++    counted
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++/// One ratio line, to four decimals — a ratio of two counts, so it is as steady as they are.
++fn ratio(name: &str, value: f64) {
++    println!("lakelet-budget {name}={value:.4}");
++}
++
++#[test]
++fn the_compaction_rewrite_budget() {
++    let counted = pass();
++
++    // What the workload was, so a store with nothing in it cannot pass a byte bound: the shape is
++    // counted as well as the cost.
++    metric("segments_sealed", counted.sealed);
++    metric("records_sealed", counted.records);
++
++    // What the merge did to the store: how many calls the policy needed, how many files it left,
++    // and how many it removed. Fewer files is what a reader pays for, so a policy that is too lazy
++    // fails here, and a policy that merges pairs answers `merges = 14` where this build's answers
++    // five.
++    metric("merges", counted.merges);
++    metric("segments_after", counted.after);
++    metric("files_removed", counted.removed);
++    // Nothing left to merge when the pass stopped asking. An upper bound of zero: a policy that
++    // still had a plan after [`LIMIT`] calls is a policy that never settles, whatever its byte
++    // counts say.
++    metric("plan_left_max", u64::from(!counted.settled));
++
++    // And what it did to the records: every one that was sealed comes back, once, in order. The
++    // bound of zero is the point — a merge that removed bytes by dropping records would pass every
++    // byte count in this file.
++    metric("records_kept", counted.kept);
++    metric("records_lost_max", counted.lost);
++
++    // The bytes. `bytes_after_max` and `bytes_rewritten_max` are upper bounds: a store that came
++    // out smaller, or a pass that wrote less to get there, passes, and only a bigger one fails.
++    // `bytes_removed` is the difference of two counts rather than a number the store reported, so a
++    // store that lost track of its own files cannot hide in it.
++    metric("bytes_after_max", counted.bytes_after);
++    metric("bytes_rewritten_max", counted.rewritten);
++    metric(
++        "bytes_removed",
++        counted.bytes_before.saturating_sub(counted.bytes_after),
++    );
++
++    // The number this lane exists for: bytes written by merges per byte the store stopped holding.
++    // An upper bound, so a policy that rewrites less for the same work passes and only a more
++    // expensive one fails — merging pairs costs about ten here and merging the whole store on every
++    // call costs about forty.
++    ratio(
++        "bytes_rewritten_per_byte_removed_max",
++        counted.rewritten as f64
++            / counted
++                .bytes_before
++                .saturating_sub(counted.bytes_after)
++                .max(1) as f64,
++    );
++
++    // A store that refused something is a store this lane cannot judge by bytes alone: a merge error
++    // shows up as the counts moving, and this says why in one line.
++    metric("refused_max", counted.refused);
++}
+diff --git a/tests/sim_compaction.rs b/tests/sim_compaction.rs
+new file mode 100644
+index 0000000..0a5f84f
+--- /dev/null
++++ b/tests/sim_compaction.rs
+@@ -0,0 +1,843 @@
++//! The merge schedules `lakelet/4.8-compaction` is judged by: readers that hold a snapshot across a
++//! merge, and five ways for a store to die in the middle of one.
++//!
++//! Course content — the step's scaffold ships it, `slow:sim@N` runs it once per seed with
++//! `KILN_SIM_SEED` set, and the gate compares the `lakelet-sim` lines below in the order they were
++//! printed. Two things are therefore strict:
++//!
++//! * **the transcript is the schedule.** Every line is an event this scenario observed, and the seed
++//!   decides the order they happen in (`turmoil::Builder::rng_seed`, plus `enable_random_order` so
++//!   the nodes are stepped in a random order too). Which reader is inside a read when a merge starts,
++//!   and which of them asks next, is exactly the answer that depends on that order — and a merge
++//!   beside a reader is what this step is about. Nothing here prints a wall clock, a path, an
++//!   address or a record's own value: the digests are of the records, the numbers are counts;
++//! * **the invariants are asserted here, not by the gate.** The gate can only see whether a run
++//!   passed. Three claims are checked inside the scenario, and a schedule that breaks one fails the
++//!   run with the sentence that says which:
++//!   1. **every acknowledged record is answered exactly once, in order.** The notebook is what this
++//!      harness sealed; a reader's records are compared with its prefix, record for record, and a
++//!      merge that lost or duplicated one fails the run that saw it;
++//!   2. **a reader that began before the swap answers what a reader that ran entirely before it
++//!      answered.** A reader holds its snapshot across the merge, and the digest of its answer is
++//!      compared with the digest of the last reader that named the same epoch;
++//!   3. **a crash at each stage of a merge leaves one of the two worlds.** After a death the store is
++//!      reopened and has to be the set it was or the set the merge would make, with the notebook
++//!      intact and the directory holding exactly the segments the manifest names.
++//!
++//! # What the five deaths model
++//!
++//! A store here is a `Segments` — the real files, the real manifest, real flushes — plus this
++//! harness's notebook of what it sealed. Only the notebook outlives a death, the way a test's notes
++//! outlive the process they are about, and every death is modelled by *leaking* the store instead of
++//! dropping it: a process death runs no destructors, so the files a merge had retired stay on the
++//! disk for the next open to find. That is the one thing a model like this can get wrong, and it is
++//! the difference between a crash and a clean stop.
++//!
++//! Nothing here puts a manifest back either. What a death takes is the part of a write the device
++//! never committed — so the three stages before the swap are modelled by simply not installing, and
++//! a merge that made itself visible while it wrote its segment dies here rather than being tidied up
++//! by this harness. The `world=` field of the `restart` line is where that shows: it is checked
++//! against the stage that killed the store, not against what the code chose to do.
++//!
++//! * **`planned`** (`crash planned`): the plan was made and nothing else happened. A plan is a
++//!   value; the store on the disk is the store it was;
++//! * **`written`** (`crash written`): the process died while the new segment was being written, so
++//!   the file is there in the part the device committed and the manifest does not name it. A device
++//!   that commits part of a write is what a write cache is, and this is `lakelet/4.4-wal-recovery`'s
++//!   torn record one level up — except that a segment is *whole or refused*, so this file is never
++//!   read at all: it is an orphan;
++//! * **`durable`** (`crash durable`): the new segment is whole and flushed, and the process died
++//!   before the manifest was replaced. A whole segment nobody names is still nobody's segment;
++//! * **`swapped`** (`crash swapped`): the manifest names the new set and the segments it replaced
++//!   are still on the disk, because a reader was still holding them when the process died. The store
++//!   is the *new* set — there is no third world — and the leftovers are cleaned by the next open;
++//! * **`retired`** (`crash retired`): the merge is complete, and the old segments were deleted
++//!   before the death. The store is the new set with nothing left over.
++//!
++//! # Why the seed is not in the transcript
++//!
++//! `slow:sim@N` demands that at least two seeds produce different transcripts — three identical ones
++//! would mean the suite never read the seed — so the seed is deliberately kept out of every line:
++//! what tells the seeds apart is the order of the lines, not a number spell out in the first one.
++//!
++//! # The lines the gate reads
++//!
++//! * `sealed` — a flush closed a segment, with what it holds and where the store is now;
++//! * `begin` / `read` — a reader took a snapshot, and what it answered from it; `same` when the
++//!   epoch it named had already been answered by another reader, with the digest that has to match;
++//! * `merge` — one merge, in counts: what it took, what it wrote, what the store stopped holding,
++//!   and how many files are on the disk while a reader still names the old set;
++//! * `crash` / `restart` — the stage a store died at, and the world it came back as;
++//! * `verify` / `done` — the store's own account at the end: every record once, in order.
++
++use std::collections::HashMap;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::Duration;
++
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::sync::Mutex;
++use turmoil::Builder;
++use turmoil::net::{TcpListener, TcpStream};
++
++use lakelet::engine::compaction::{DIRECTORY, Segments, Snapshot};
++use lakelet::protocol::batch::Record;
++
++/// The seed this run uses when the judge does not name one.
++const DEFAULT_SEED: u64 = 1;
++
++/// The variable `slow:sim@N` sets: which schedule this run takes.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The store's name and port in the simulated network.
++const HOST: &str = "store";
++const PORT: u16 = 7000;
++
++/// Records one sealed segment holds.
++const PER_SEGMENT: usize = 32;
++
++/// Series the records are spread over.
++const SERIES: usize = 4;
++
++/// Segments the store is built from before the readers start.
++const SEGMENTS: usize = 8;
++
++/// Segments each crash phase seals before it interrupts a merge.
++const MORE: usize = 4;
++
++/// Readers racing the merges.
++const READERS: [&str; 2] = ["spanning", "steady"];
++
++/// Rounds each reader reads.
++const ROUNDS: usize = 3;
++
++/// How long a client waits between two polls of the host's status, in simulated milliseconds.
++const POLL: Duration = Duration::from_millis(10);
++
++/// The stages of a merge this scenario kills a store at, in the order it walks them.
++const STAGES: [&str; 5] = ["planned", "written", "durable", "swapped", "retired"];
++
++/// A failure inside the scenario: the one sentence the run reports.
++type Failure = Box<dyn std::error::Error>;
++
++/// The seed this process was asked for.
++fn seed() -> u64 {
++    match std::env::var(SEED) {
++        Ok(text) => text
++            .parse()
++            .unwrap_or_else(|error| panic!("{SEED}=`{text}` is not a number: {error}")),
++        Err(_) => DEFAULT_SEED,
++    }
++}
++
++/// The records one sealed segment holds, decided by the two numbers that name them: the judge can
++/// rebuild every record the store was given without reading the store it is judging.
++fn records_for(index: usize) -> Vec<Record> {
++    let first = index * PER_SEGMENT;
++    (0..PER_SEGMENT)
++        .map(|offset| Record {
++            series: format!("sim,host=h{},seg={index}", (first + offset) % SERIES),
++            ts_millis: 1_700_000_000_000 + (first + offset) as i64 * 1_000,
++            value: ((first + offset) % 1_024) as f64 / 8.0,
++        })
++        .collect()
++}
++
++/// A digest of a record list: the value compared by bits, so `-0.0` and `NaN` are the values they
++/// are and not whatever a comparison says.
++///
++/// One number rather than the records themselves, because a transcript is compared between runs and
++/// a schedule's digest is what makes two reads comparable; the algorithm is FNV-1a, written out so
++/// that this file depends on nothing but the standard library.
++fn digest(records: &[Record]) -> u64 {
++    records
++        .iter()
++        .fold(0xcbf2_9ce4_8422_2325u64, |hash, record| {
++            let hash = mix(hash, record.series.as_bytes());
++            let hash = mix(hash, &[0]);
++            let hash = mix(hash, &record.ts_millis.to_le_bytes());
++            mix(hash, &record.value.to_bits().to_le_bytes())
++        })
++}
++
++/// One FNV-1a step: `bytes` folded into `hash`.
++fn mix(hash: u64, bytes: &[u8]) -> u64 {
++    let mut hash = hash;
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++/// `true` when every record is the same record, in the same order.
++fn same(left: &[Record], right: &[Record]) -> bool {
++    left.len() == right.len()
++        && left.iter().zip(right).all(|(left, right)| {
++            left.series == right.series
++                && left.ts_millis == right.ts_millis
++                && left.value.to_bits() == right.value.to_bits()
++        })
++}
++
++/// One whitespace-separated command word, as a number.
++fn number(word: Option<&str>, what: &str) -> Result<usize, Failure> {
++    let Some(word) = word else {
++        return Err(format!("this command needs a {what}").into());
++    };
++    word.parse()
++        .map_err(|error| format!("`{word}` is not a {what}: {error}").into())
++}
++
++/// A list of segment ordinals, as a transcript line spells it.
++fn list(indices: &[u64]) -> String {
++    indices
++        .iter()
++        .map(u64::to_string)
++        .collect::<Vec<String>>()
++        .join(",")
++}
++
++/// How many files the store's segment directory holds.
++fn files_in(directory: &Path) -> u64 {
++    std::fs::read_dir(directory.join(DIRECTORY))
++        .map(|entries| entries.filter_map(std::result::Result::ok).count() as u64)
++        .unwrap_or(0)
++}
++
++/// One reader's held snapshot, and how many records it named when it took it.
++struct Held {
++    /// What the reader is reading.
++    snapshot: Snapshot,
++    /// How many records its manifest said the store held.
++    records: u64,
++}
++
++/// The store the scenario drives: the real segment store, the notebook of what it was given, and
++/// what the readers are holding.
++struct Host {
++    /// The store directory, which outlives every store (and every death) in this scenario.
++    directory: PathBuf,
++    /// The store, or `None` between a death and the restart after it.
++    store: Option<Segments>,
++    /// Every record that was sealed, in the order it was sealed: what the store owes a reader.
++    notebook: Vec<Record>,
++    /// How many segments have been sealed, which is the ordinal the next one gets.
++    sealed: u64,
++    /// What each reader took and has not let go of.
++    held: HashMap<String, Held>,
++    /// The digest each epoch has been answered with, so two readers of one store are comparable.
++    answers: HashMap<u64, u64>,
++    /// The stage of the last death, for the restart to name.
++    stage: String,
++    /// The epoch the store has after that death, which is one of the two worlds.
++    world: u64,
++    /// Which of the two worlds that epoch is: the set of segments the store had, or the one the
++    /// merge would have made.
++    world_name: &'static str,
++    /// How many merges happened.
++    merges: u64,
++    /// How many deaths happened.
++    deaths: u64,
++    /// How many reads answered.
++    reads: u64,
++    /// How many readers have said they are finished.
++    finished: usize,
++    /// How many clients have connected, the controller included.
++    clients: u64,
++    /// Which merge the readers wait for before finishing a crossing read.
++    phase: u64,
++    /// A failure somewhere in the host, which every later command reports.
++    failed: Option<String>,
++}
++
++impl Host {
++    /// A host with an empty store and an empty notebook.
++    fn open(directory: PathBuf) -> Result<Self, Failure> {
++        let store = Segments::open(&directory)?;
++        Ok(Self {
++            directory,
++            store: Some(store),
++            notebook: Vec::new(),
++            sealed: 0,
++            held: HashMap::new(),
++            answers: HashMap::new(),
++            stage: String::new(),
++            world: 0,
++            world_name: "old",
++            merges: 0,
++            deaths: 0,
++            reads: 0,
++            finished: 0,
++            clients: 0,
++            phase: 0,
++            failed: None,
++        })
++    }
++
++    /// The store, or the failure that says why there is none.
++    fn live(&mut self) -> Result<&mut Segments, Failure> {
++        match self.store.as_mut() {
++            Some(store) => Ok(store),
++            None => Err(
++                "the store is down: this command arrived after a death and before the \
++                         restart that brings it back"
++                    .into(),
++            ),
++        }
++    }
++
++    /// What the store answers right now, checked against the notebook.
++    ///
++    /// The whole of the first invariant, in one call: a reader of the store gets every record that
++    /// was sealed, once, in the order it was sealed. A merge that dropped one, wrote one twice or
++    /// put one behind another fails here with the counts in the sentence.
++    fn answers_the_notebook(&mut self) -> Result<u64, Failure> {
++        let store = self.live()?;
++        let read = store.snapshot().records()?;
++        if !same(&read, &self.notebook) {
++            return Err(format!(
++                "the store answered {} record(s) where {} were sealed: every acknowledged record \
++                 appears exactly once across what a snapshot names, in the order the store \
++                 accepted it — and a merge is the one thing that can put a record behind another, \
++                 hand it back twice, or drop it",
++                read.len(),
++                self.notebook.len()
++            )
++            .into());
++        }
++        Ok(read.len() as u64)
++    }
++
++    /// Seal `count` more segments, and say what the store is afterwards.
++    fn seal(&mut self, count: usize) -> Result<String, Failure> {
++        let mut sealed = Vec::new();
++        for _ in 0..count {
++            let index = self.sealed;
++            let records = records_for(index as usize);
++            let store = self.live()?;
++            store.seal(&records)?;
++            self.notebook.extend(records);
++            self.sealed += 1;
++            sealed.push(index);
++            let (epoch, segments, bytes) = {
++                let store = self.live()?;
++                let manifest = store.manifest();
++                (
++                    manifest.epoch(),
++                    manifest.segments().len(),
++                    manifest.bytes(),
++                )
++            };
++            println!(
++                "lakelet-sim sealed segment={index} records={PER_SEGMENT} bytes={bytes} epoch={epoch} \
++                 segments={segments} files={}",
++                files_in(&self.directory)
++            );
++        }
++        Ok(format!("sealed={count}"))
++    }
++
++    /// One merge, with the store's own policy deciding what to take.
++    fn merge(&mut self) -> Result<String, Failure> {
++        let plan = self.live()?.plan();
++        if plan.is_empty() {
++            return Err(
++                "the store's policy has nothing to merge, so there is no merge to watch: a \
++                        scenario that asks for one anyway is a scenario that is not measuring \
++                        anything"
++                    .into(),
++            );
++        }
++        let report = self
++            .live()?
++            .compact()?
++            .ok_or("a plan that is not empty is a merge")?;
++        self.merges += 1;
++        self.phase += 1;
++        println!(
++            "lakelet-sim merge epoch={} into={} taken={} bytes_in={} bytes_out={} removed={} \
++             records={} segments={} files={}",
++            report.epoch(),
++            report.wrote(),
++            list(report.merged()),
++            report.bytes_in(),
++            report.bytes_out(),
++            report.bytes_removed(),
++            report.records(),
++            report.segments_after(),
++            files_in(&self.directory)
++        );
++        self.answers_the_notebook()?;
++        Ok(format!("merged into={}", report.wrote()))
++    }
++
++    /// Kill the store at one stage of a merge and leave the disk where that stage leaves it.
++    fn crash(&mut self, stage: &str) -> Result<String, Failure> {
++        if !STAGES.contains(&stage) {
++            return Err(format!("`{stage}` is not a stage a merge has").into());
++        }
++        let before = self.live()?.manifest().epoch();
++        let plan = self.live()?.plan();
++        if plan.is_empty() {
++            return Err(format!(
++                "stage {stage}: the store's policy has nothing to merge, so there is no merge to \
++                 interrupt"
++            )
++            .into());
++        }
++        let mut written = None;
++        match stage {
++            // The plan is a value and nothing else happened: no file was touched, and the store on
++            // the disk is the store it was.
++            "planned" => {}
++            "written" => {
++                let ran = self.live()?.merge(&plan)?;
++                written = Some(ran.index());
++                // The device committed part of the write and not the rest, which is the disk a kill
++                // inside a write leaves. Nothing reads it: the manifest does not name it.
++                let cut = std::fs::metadata(ran.file())
++                    .map_err(|error| format!("the new segment is a file: {error}"))?
++                    .len()
++                    / 2;
++                let file = std::fs::OpenOptions::new()
++                    .write(true)
++                    .open(ran.file())
++                    .map_err(|error| format!("the new segment opens for the cut: {error}"))?;
++                file.set_len(cut)
++                    .map_err(|error| format!("the write is cut short: {error}"))?;
++                file.sync_all()
++                    .map_err(|error| format!("the cut reaches the device: {error}"))?;
++            }
++            "durable" => {
++                let ran = self.live()?.merge(&plan)?;
++                written = Some(ran.index());
++            }
++            "swapped" | "retired" => {
++                // A reader is holding the old set: it is what keeps the segments a merge replaced on
++                // the disk, and leaking it below is what makes that a *death* rather than a clean
++                // stop.
++                let lingering = self.live()?.snapshot();
++                let ran = self.live()?.merge(&plan)?;
++                written = Some(ran.index());
++                self.live()?.install(ran)?;
++                self.merges += 1;
++                if stage == "swapped" {
++                    std::mem::forget(lingering);
++                } else {
++                    drop(lingering);
++                }
++            }
++            _ => {}
++        }
++        // Nothing is put back. What a death takes is the part of a write the device never
++        // committed, and the manifest is exactly what the stages before the swap have not touched:
++        // a merge that made itself visible while it wrote its segment dies here instead of being
++        // tidied up by this harness, which is the difference between modelling a crash and
++        // describing one.
++        self.deaths += 1;
++        let swapped = matches!(stage, "swapped" | "retired");
++        self.world = if swapped { before + 1 } else { before };
++        self.world_name = if swapped { "new" } else { "old" };
++        self.stage = stage.to_owned();
++        let epoch = self.live()?.manifest().epoch();
++        println!(
++            "lakelet-sim crash stage={stage} index={} epoch={epoch} files={}",
++            written.unwrap_or(0),
++            files_in(&self.directory)
++        );
++        Ok(format!("crashed stage={stage}"))
++    }
++
++    /// Bring the store back after a death, and check which world it is.
++    ///
++    /// The store and every snapshot are *leaked* rather than dropped: a process death runs no
++    /// destructors, and a store that tidied up its replaced segments on the way out would be a
++    /// clean stop wearing a crash's name. What the next open finds is therefore what the death left.
++    fn restart(&mut self) -> Result<String, Failure> {
++        if let Some(store) = self.store.take() {
++            std::mem::forget(store);
++        }
++        for (_, held) in self.held.drain() {
++            std::mem::forget(held.snapshot);
++        }
++        let store = Segments::open(&self.directory)?;
++        let (epoch, segments, records) = {
++            let manifest = store.manifest();
++            (
++                manifest.epoch(),
++                manifest.segments().len(),
++                manifest.records(),
++            )
++        };
++        self.store = Some(store);
++        let answered = self.answers_the_notebook()?;
++        let files = files_in(&self.directory);
++        if files != segments as u64 {
++            return Err(format!(
++                "stage {}: the directory holds {files} file(s) and the manifest names {segments} — \
++                 opening a store is what finishes the merge a crash interrupted, and what is left \
++                 behind is a segment nobody installed or a segment a merge replaced, neither of \
++                 which the manifest names",
++                self.stage
++            )
++            .into());
++        }
++        if epoch != self.world {
++            return Err(format!(
++                "stage {}: the store came back at epoch {epoch} and this stage leaves epoch {} — a \
++                 crash in the middle of a merge leaves the old set of segments or the new one, and \
++                 the epoch is which of the two it is",
++                self.stage, self.world
++            )
++            .into());
++        }
++        println!(
++            "lakelet-sim restart stage={} world={} epoch={epoch} segments={segments} records={records} \
++             answered={answered} files={files}",
++            self.stage, self.world_name
++        );
++        Ok(format!("restarted epoch={epoch}"))
++    }
++
++    /// A reader takes a snapshot and holds it.
++    fn begin(&mut self, reader: &str) -> Result<String, Failure> {
++        if self.held.contains_key(reader) {
++            return Err(format!("reader {reader} is already holding a snapshot").into());
++        }
++        let snapshot = self.live()?.snapshot();
++        let records = snapshot.len();
++        let epoch = snapshot.epoch();
++        let segments = snapshot.segments().len();
++        self.held
++            .insert(reader.to_owned(), Held { snapshot, records });
++        println!(
++            "lakelet-sim begin reader={reader} epoch={epoch} segments={segments} records={records}"
++        );
++        Ok(format!("holding epoch={epoch}"))
++    }
++
++    /// A reader reads what it holds, checks it against the notebook, and lets go.
++    fn end(&mut self, reader: &str) -> Result<String, Failure> {
++        let Some(held) = self.held.remove(reader) else {
++            return Err(format!("reader {reader} is holding no snapshot to end").into());
++        };
++        let read = held.snapshot.records()?;
++        if read.len() as u64 != held.records {
++            return Err(format!(
++                "reader {reader}: the snapshot named {} record(s) and answered {} — the manifest is \
++                 the store's index, and a reader that answers a different number than it named is \
++                 reading a store nobody wrote",
++                held.records,
++                read.len()
++            )
++            .into());
++        }
++        if read.len() > self.notebook.len() || !same(&read, &self.notebook[..read.len()]) {
++            return Err(format!(
++                "reader {reader}: the snapshot answered {} record(s) and the notebook holds {} — \
++                 what a reader gets is the prefix of the store it named, record for record",
++                read.len(),
++                self.notebook.len()
++            )
++            .into());
++        }
++        let epoch = held.snapshot.epoch();
++        let segments = held.snapshot.segments().len();
++        let digest = digest(&read);
++        // The snapshot is dropped by the line above, so the file count here is what the store
++        // holds once this reader has let go of what it named — the number the deferral is about.
++        println!(
++            "lakelet-sim read reader={reader} epoch={epoch} segments={segments} records={} \
++             digest={digest:016x} files={}",
++            read.len(),
++            files_in(&self.directory)
++        );
++        // The claim this step is about, as a number: two readers that named the same store answer
++        // the same thing, whether a merge happened between them or not.
++        match self.answers.get(&epoch) {
++            Some(before) if *before != digest => {
++                return Err(format!(
++                    "reader {reader}: epoch {epoch} answered {digest:016x} and a reader that ran \
++                     entirely before it answered {before:016x} — a read that began before the swap \
++                     answers exactly what a read that ran entirely before the swap answered, and \
++                     the same records six ways is not the same store",
++                )
++                .into());
++            }
++            Some(before) => println!(
++                "lakelet-sim same epoch={epoch} digest={before:016x} reads={}",
++                self.reads + 1
++            ),
++            None => {
++                self.answers.insert(epoch, digest);
++            }
++        }
++        self.reads += 1;
++        Ok(format!("read records={}", read.len()))
++    }
++}
++
++/// One connection to the host, one command per line.
++struct Client {
++    stream: BufReader<TcpStream>,
++}
++
++impl Client {
++    /// Connect, waiting for the host to be listening.
++    async fn connect() -> Result<Self, Failure> {
++        for _ in 0..200 {
++            match TcpStream::connect((HOST, PORT)).await {
++                Ok(socket) => {
++                    return Ok(Self {
++                        stream: BufReader::new(socket),
++                    });
++                }
++                Err(_) => tokio::time::sleep(POLL).await,
++            }
++        }
++        Err(format!("{HOST}:{PORT} never accepted a connection").into())
++    }
++
++    /// Send one command and answer the reply. A command the host refused fails the run.
++    async fn ask(&mut self, command: &str) -> Result<String, Failure> {
++        self.stream.write_all(command.as_bytes()).await?;
++        self.stream.write_all(b"\n").await?;
++        self.stream.flush().await?;
++        let mut text = String::new();
++        if self.stream.read_line(&mut text).await? == 0 {
++            return Err(format!("the host closed the connection at `{command}`").into());
++        }
++        let reply = text.trim_end().to_owned();
++        match reply.strip_prefix("failed ") {
++            Some(reason) => Err(format!("`{command}` was refused: {reason}").into()),
++            None => Ok(reply),
++        }
++    }
++}
++
++/// Poll the host's status until the reply carries `needle`, or fail after `tries` looks.
++///
++/// Polling a condition instead of sleeping for a guessed duration is the rule every fixture in this
++/// course follows, and the bound is the other half of it: a scenario that waits for ever reports
++/// nothing, and the gate would call it a timeout instead of a run that never got there.
++async fn wait_for(client: &mut Client, needle: &str, tries: usize) -> Result<String, Failure> {
++    for _ in 0..tries {
++        let reply = client.ask("status").await?;
++        if reply.contains(needle) {
++            return Ok(reply);
++        }
++        tokio::time::sleep(POLL).await;
++    }
++    Err(format!("the host never said `{needle}`").into())
++}
++
++/// The host's own view, which is what the clients poll to stay in step.
++fn status(host: &Host) -> String {
++    match &host.store {
++        Some(store) => {
++            let manifest = store.manifest();
++            format!(
++                "status phase={} clients={} sealed={} epoch={} segments={} records={} held={} \
++                 merges={} deaths={} reads={} finished={}",
++                host.phase,
++                host.clients,
++                host.sealed,
++                manifest.epoch(),
++                manifest.segments().len(),
++                manifest.records(),
++                host.held.len(),
++                host.merges,
++                host.deaths,
++                host.reads,
++                host.finished
++            )
++        }
++        None => format!(
++            "status phase={} clients={} sealed={} down deaths={} reads={} finished={}",
++            host.phase, host.clients, host.sealed, host.deaths, host.reads, host.finished
++        ),
++    }
++}
++
++/// Read one command and answer the host's reply.
++async fn serve(socket: TcpStream, host: Arc<Mutex<Host>>) -> Result<(), Failure> {
++    {
++        host.lock().await.clients += 1;
++    }
++    let mut stream = BufReader::new(socket);
++    loop {
++        let mut text = String::new();
++        if stream.read_line(&mut text).await? == 0 {
++            return Ok(());
++        }
++        let reply = match command(text.trim(), &host).await {
++            Ok(reply) => reply,
++            Err(error) => format!("failed {error}"),
++        };
++        stream.write_all(reply.as_bytes()).await?;
++        stream.write_all(b"\n").await?;
++        stream.flush().await?;
++    }
++}
++
++/// One command, the one line it answers, and the work behind it.
++async fn command(text: &str, host: &Arc<Mutex<Host>>) -> Result<String, Failure> {
++    let mut words = text.split_whitespace();
++    let verb = words.next().unwrap_or_default();
++    let mut host = host.lock().await;
++    if let Some(reason) = host.failed.clone() {
++        return Err(reason.into());
++    }
++    match verb {
++        "status" => Ok(status(&host)),
++        "seal" => {
++            let count = number(words.next(), "count")?;
++            host.seal(count)
++        }
++        "merge" => host.merge(),
++        "crash" => {
++            let stage = words.next().unwrap_or_default().to_owned();
++            host.crash(&stage)
++        }
++        "restart" => host.restart(),
++        "begin" => {
++            let reader = words.next().unwrap_or_default().to_owned();
++            host.begin(&reader)
++        }
++        "end" => {
++            let reader = words.next().unwrap_or_default().to_owned();
++            host.end(&reader)
++        }
++        "done" => {
++            host.finished += 1;
++            Ok(format!("finished={}", host.finished))
++        }
++        "verify" => {
++            let answered = host.answers_the_notebook()?;
++            let (epoch, segments) = {
++                let manifest = host.live()?.manifest();
++                (manifest.epoch(), manifest.segments().len())
++            };
++            let digest = digest(&host.notebook);
++            println!(
++                "lakelet-sim verify epoch={epoch} segments={segments} records={answered} \
++                 digest={digest:016x} reads={} merges={} deaths={}",
++                host.reads, host.merges, host.deaths
++            );
++            Ok(format!("verified records={answered}"))
++        }
++        other => Err(format!("`{other}` is not a command this store speaks").into()),
++    }
++}
++
++/// One reader: it takes a snapshot, reads it, and lets go — `ROUNDS` times.
++///
++/// The first reader holds its first snapshot until a merge has happened beside it (`phase=1`), which
++/// is the schedule this step is judged on: a read that began before the swap and ends after it. Every
++/// other read is whatever the seed makes of two readers racing one writer.
++async fn read(name: &str, crossing: bool) -> Result<(), Failure> {
++    let mut client = Client::connect().await?;
++    // The store before the first seal is a real store with nothing in it, and reading it would be
++    // six lines about an empty list: a reader starts when there is something to read.
++    wait_for(&mut client, &format!("sealed={SEGMENTS}"), 4_000).await?;
++    for round in 0..ROUNDS {
++        client.ask(&format!("begin {name}")).await?;
++        if crossing && round == 0 {
++            wait_for(&mut client, "phase=1", 4_000).await?;
++        } else {
++            // One turn of the scheduler: the other reader and the controller are running beside
++            // this one, and which of them gets there first is the seed's business.
++            client.ask("status").await?;
++        }
++        client.ask(&format!("end {name}")).await?;
++    }
++    client.ask(&format!("done {name}")).await?;
++    Ok(())
++}
++
++/// The controller: build the store, merge while a reader is inside a read, and walk the deaths.
++async fn control() -> Result<(), Failure> {
++    let mut client = Client::connect().await?;
++    // Every client before the first seal: a merge judged against a storm that had not started yet
++    // would say something about the schedule that is not true of the schedule.
++    wait_for(
++        &mut client,
++        &format!("clients={}", READERS.len() + 1),
++        2_000,
++    )
++    .await?;
++
++    client.ask(&format!("seal {SEGMENTS}")).await?;
++    // The first merge waits for a reader to be holding a snapshot: that is the read this step is
++    // about, and it is the one the controller can guarantee rather than hope for.
++    wait_for(&mut client, "held=1", 4_000).await?;
++    client.ask("merge").await?;
++    // The readers finish before the deaths start: a process that dies takes its readers with it, and
++    // a reader still holding a snapshot when the store is reopened would be measuring this harness
++    // rather than the store.
++    wait_for(&mut client, &format!("finished={}", READERS.len()), 4_000).await?;
++
++    for stage in STAGES {
++        client.ask(&format!("seal {MORE}")).await?;
++        client.ask(&format!("crash {stage}")).await?;
++        client.ask("restart").await?;
++    }
++    client.ask("verify").await?;
++    Ok(())
++}
++
++#[test]
++fn a_merge_is_a_schedule_and_a_reader_never_sees_half_of_one() {
++    let seed = seed();
++    let directory = std::env::temp_dir().join(format!(
++        "lakelet-sim-compaction-{}-{seed}",
++        std::process::id()
++    ));
++    let _ = std::fs::remove_dir_all(&directory);
++
++    let host = Arc::new(Mutex::new(
++        Host::open(directory.clone()).expect("a directory this process owns is a store"),
++    ));
++
++    let mut builder = Builder::new();
++    builder.rng_seed(seed).enable_random_order();
++    let mut sim = builder.build();
++
++    let hosted = Arc::clone(&host);
++    sim.host(HOST, move || {
++        let host = Arc::clone(&hosted);
++        async move {
++            let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
++            loop {
++                let (socket, _) = listener.accept().await?;
++                let host = Arc::clone(&host);
++                tokio::spawn(async move {
++                    if let Err(error) = serve(socket, host).await {
++                        eprintln!("lakelet-sim a connection ended: {error}");
++                    }
++                });
++            }
++            #[allow(unreachable_code)]
++            Ok(())
++        }
++    });
++
++    // The seed is deliberately *not* in the transcript: the gate compares transcripts, and a
++    // transcript whose first line spells the seed would make two seeds look different without any
++    // event having differed. What tells the seeds apart here is the order of the lines below.
++    println!(
++        "lakelet-sim started segments={SEGMENTS} records={} readers={}",
++        SEGMENTS * PER_SEGMENT,
++        READERS.len()
++    );
++    for (number, reader) in READERS.iter().enumerate() {
++        let name = (*reader).to_owned();
++        sim.client(name.clone(), async move { read(&name, number == 0).await });
++    }
++    sim.client("controller", async move { control().await });
++
++    sim.run()
++        .unwrap_or_else(|error| panic!("the simulation did not finish: {error}"));
++    let _ = std::fs::remove_dir_all(&directory);
++}

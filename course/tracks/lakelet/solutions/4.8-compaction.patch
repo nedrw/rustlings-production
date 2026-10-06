@@ -1,0 +1,738 @@
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+index 8975ac5..4543ed8 100644
+--- a/src/engine/compaction/mod.rs
++++ b/src/engine/compaction/mod.rs
+@@ -94,6 +94,18 @@ pub const EXTENSION: &str = "lks";
+ /// How many digits a segment's file name has, so a directory listing is in the manifest's order.
+ const DIGITS: usize = 10;
+ 
++/// The four bytes in front of every manifest this build writes.
++const MAGIC: [u8; 4] = *b"LKLM";
++
++/// The manifest layout's version.
++const VERSION: u8 = 1;
++
++/// The bytes one entry of a manifest takes: an index, a length and a record count.
++const ENTRY: usize = 24;
++
++/// The bytes before a manifest's first entry: [`MAGIC`], [`VERSION`], the epoch and the count.
++const HEADER: usize = MAGIC.len() + 1 + 8 + 4;
++
+ /// The file one segment's bytes live in: `<directory>/segments/<index>.lks`.
+ ///
+ /// Public because the layout is part of what this store *is* — a repair tool, an operator with
+@@ -176,8 +188,37 @@ impl Manifest {
+     /// [`Error::Invalid`] when this store holds so many segments that the count, or the body it
+     /// seals, does not fit the four bytes the layout gives it — a store no machine can have.
+     fn encode(&self) -> Result<Vec<u8>, Error> {
+-        let _ = self;
+-        todo!("step lakelet/4.8-compaction")
++        let count = u32::try_from(self.segments.len()).map_err(|_| Error::Invalid {
++            detail: format!(
++                "this store holds {} segments and a manifest states its count in four bytes — a \
++                 store this large has to change the manifest's layout, and this build cannot write \
++                 one it could not read back",
++                self.segments.len()
++            ),
++        })?;
++        let mut body = Vec::with_capacity(HEADER + self.segments.len() * ENTRY + checksum::LEN);
++        body.extend_from_slice(&MAGIC);
++        body.push(VERSION);
++        body.extend_from_slice(&self.epoch.to_le_bytes());
++        body.extend_from_slice(&count.to_le_bytes());
++        for info in &self.segments {
++            body.extend_from_slice(&info.index.to_le_bytes());
++            body.extend_from_slice(&info.bytes.to_le_bytes());
++            body.extend_from_slice(&info.records.to_le_bytes());
++        }
++        // One seal over the whole body, in the shape the log and a segment use: a length and the
++        // bytes it covers. A manifest a device changed is a manifest whose segments cannot be
++        // trusted, and every number in it is a claim about a file.
++        let length = u32::try_from(body.len()).map_err(|_| Error::Invalid {
++            detail: format!(
++                "a manifest of {} segments does not fit the four-byte length this layout seals with",
++                self.segments.len()
++            ),
++        })?;
++        let seal = checksum::seal(length, &body);
++        let mut bytes = body;
++        bytes.extend_from_slice(&seal.to_le_bytes());
++        Ok(bytes)
+     }
+ 
+     /// The manifest these bytes are, or a refusal naming what disagreed.
+@@ -188,8 +229,100 @@ impl Manifest {
+     /// changed, is a *refusal*: the alternative is reading it as a store with fewer segments, which
+     /// is a hole in every answer this store would give from then on.
+     fn decode(bytes: &[u8], path: &Path) -> Result<Self, Error> {
+-        let _ = (bytes, path);
+-        todo!("step lakelet/4.8-compaction")
++        let at_least = HEADER + checksum::LEN;
++        if bytes.len() < at_least {
++            return Err(refused(format!(
++                "{} holds {} byte(s) and a manifest is at least {at_least}: a store cannot be named \
++                 by bytes this short, and reading them as a store with no segments would answer a \
++                 hole",
++                path.display(),
++                bytes.len()
++            )));
++        }
++        let header = bytes.get(..HEADER).unwrap_or_default();
++        if !header.starts_with(&MAGIC) {
++            return Err(refused(format!(
++                "{} starts with `{}` and a manifest starts with `{}` — this is not this store's \
++                 manifest, and it is refused rather than read as one naming no segments",
++                path.display(),
++                shown(header),
++                shown(&MAGIC)
++            )));
++        }
++        let Some(version) = bytes.get(MAGIC.len()) else {
++            return Err(refused(format!("{} has no version byte", path.display())));
++        };
++        if *version != VERSION {
++            return Err(refused(format!(
++                "{} says it is manifest layout version {version} and this build writes version \
++                 {VERSION}",
++                path.display()
++            )));
++        }
++        let Some(epoch) = u64_at(bytes, MAGIC.len() + 1) else {
++            return Err(refused(format!("{} has no epoch", path.display())));
++        };
++        let Some(count) = u32_at(bytes, MAGIC.len() + 1 + 8) else {
++            return Err(refused(format!("{} has no entry count", path.display())));
++        };
++        let stated = (count as usize)
++            .checked_mul(ENTRY)
++            .and_then(|entries| entries.checked_add(HEADER))
++            .ok_or_else(|| {
++                refused(format!(
++                    "{} says it holds {count} entries, which is more than this machine can address",
++                    path.display()
++                ))
++            })?;
++        let body = bytes.get(..stated).ok_or_else(|| {
++            refused(format!(
++                "{} says it holds {count} entr(ies), needing {stated} bytes, and the file has {} — \
++                 it was cut, and a cut index is not a smaller store",
++                path.display(),
++                bytes.len()
++            ))
++        })?;
++        let Some(seal) = u32_at(bytes, stated) else {
++            return Err(refused(format!(
++                "{} ends after its entries with no seal — an index nobody proved is one a reader \
++                 may not act on",
++                path.display()
++            )));
++        };
++        if !checksum::verifies(stated as u32, body, seal) {
++            return Err(refused(format!(
++                "the seal of {} is {seal} and the {stated} bytes it covers compute {} — this index \
++                 changed after it was written",
++                path.display(),
++                checksum::seal(stated as u32, body)
++            )));
++        }
++        let sealed = stated + checksum::LEN;
++        if bytes.len() != sealed {
++            return Err(refused(format!(
++                "{}'s entries and seal end at {sealed} bytes and the file holds {} — the bytes \
++                 after it are no part of an index this build wrote",
++                path.display(),
++                bytes.len()
++            )));
++        }
++        let mut segments = Vec::with_capacity(count as usize);
++        for number in 0..count as usize {
++            let at = HEADER + number * ENTRY;
++            let (Some(index), Some(length), Some(records)) = (
++                u64_at(bytes, at),
++                u64_at(bytes, at + 8),
++                u64_at(bytes, at + 16),
++            ) else {
++                return Err(refused(format!(
++                    "{}'s entry {number} is cut: an index with a half-written entry is an index \
++                     nobody can act on",
++                    path.display()
++                )));
++            };
++            segments.push(SegmentInfo::new(index, length, records));
++        }
++        Ok(Self { epoch, segments })
+     }
+ }
+ 
+@@ -235,8 +368,34 @@ impl Segments {
+     /// [`Error::Store`] when the directory cannot be created, read or flushed, and
+     /// [`Error::Protocol`] when the manifest or a segment it names is not what this build wrote.
+     pub fn with_policy(directory: impl Into<PathBuf>, policy: Policy) -> Result<Self, Error> {
+-        let _ = (directory, policy);
+-        todo!("step lakelet/4.8-compaction")
++        let directory = directory.into();
++        std::fs::create_dir_all(directory.join(DIRECTORY)).map_err(store)?;
++        // A file's *name* is a write of its own (`docs/crash-points.md`, point 4): a directory
++        // whose entry for the segments was never flushed is a store that comes back without them.
++        flush(&directory)?;
++
++        let manifest = read_manifest(&directory)?;
++        // Everything the manifest does not name is a crash's leftover: a segment a merge wrote and
++        // never installed, a segment a merge replaced and did not delete, and the half-written
++        // manifest of an interrupted swap. All three are the same kind of thing — bytes nobody
++        // names — and they all go, which is what makes recovery from *any* merge stage one rule.
++        discard(&directory, &manifest)?;
++        for info in manifest.segments() {
++            check(&directory, info)?;
++        }
++        let next = manifest
++            .segments()
++            .iter()
++            .map(|info| info.index)
++            .max()
++            .map_or(0, |index| index + 1);
++        Ok(Self {
++            current: Arc::new(Set::new(directory.clone(), manifest)),
++            directory,
++            policy,
++            next,
++            pending: None,
++        })
+     }
+ 
+     /// The directory this store's segments live in.
+@@ -278,8 +437,33 @@ impl Segments {
+     /// file out of nothing would carry it for ever — and everything the segment writer and the
+     /// manifest writer refuse.
+     pub fn seal(&mut self, records: &[Record]) -> Result<u64, Error> {
+-        let _ = records;
+-        todo!("step lakelet/4.8-compaction")
++        if records.is_empty() {
++            return Err(Error::Invalid {
++                detail: "a flush with no records in it is not a segment: `seal` closes what a \
++                         flush wrote, and a file holding nothing is one a plan would have to carry \
++                         for ever"
++                    .to_owned(),
++            });
++        }
++        let index = self.next;
++        let path = file_of(&self.directory, index);
++        segment::write(&path, records)?;
++        flush(&path)?;
++        let info = SegmentInfo::new(index, length_of(&path)?, records.len() as u64);
++        let mut segments = self.current.manifest().segments().to_vec();
++        segments.push(info);
++        let manifest = Manifest {
++            epoch: self.current.manifest().epoch() + 1,
++            segments,
++        };
++        self.write_manifest(manifest.clone())?;
++        // From here the closed segment is the store's: a reader that took a snapshot before this
++        // call goes on reading the set it named, which does not hold the new segment — and neither
++        // does it miss a record, because the records in it are ones the store accepted after that
++        // reader began.
++        self.current = Arc::new(Set::new(self.directory.clone(), manifest));
++        self.next = index + 1;
++        Ok(index)
+     }
+ 
+     /// The merge this store's policy would do next, from the manifest alone.
+@@ -288,8 +472,7 @@ impl Segments {
+     /// manifest already holds ([`Policy::plan`]).
+     #[must_use]
+     pub fn plan(&self) -> Plan {
+-        let _ = self;
+-        todo!("step lakelet/4.8-compaction")
++        self.policy.plan(self.current.manifest().segments())
+     }
+ 
+     /// Write what `plan` asks for: read its segments in order, write them into one new segment, and
+@@ -311,8 +494,82 @@ impl Segments {
+     /// that carried out a stale one would write a segment holding records out of order. Everything
+     /// the segment reader, the segment writer and the device refuse is an [`Error::Store`].
+     pub fn merge(&mut self, plan: &Plan) -> Result<Merge, Error> {
+-        let _ = plan;
+-        todo!("step lakelet/4.8-compaction")
++        if plan.is_empty() {
++            return Err(Error::Invalid {
++                detail: "a merge needs segments to take: an empty plan is what a caller tests for \
++                         with `Plan::is_empty`, and merging it would write a file that holds \
++                         nothing"
++                    .to_owned(),
++            });
++        }
++        if let Some(index) = self.pending {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "segment {index} has been written and not installed yet: a `Merge` names a file \
++                     that is not the store, and writing a second one would write over it"
++                ),
++            });
++        }
++        let segments = self.current.manifest().segments();
++        let mut positions: Vec<usize> = Vec::with_capacity(plan.len());
++        for index in plan.segments() {
++            let Some(position) = segments.iter().position(|info| info.index == *index) else {
++                return Err(Error::Invalid {
++                    detail: format!(
++                        "the plan names segment {index} and the manifest does not have it: a plan \
++                         is a value taken at a moment, and a merge of segments that are already \
++                         gone is a caller that has to ask again"
++                    ),
++                });
++            };
++            positions.push(position);
++        }
++        positions.sort_unstable();
++        let mut previous: Option<usize> = None;
++        for position in &positions {
++            if previous.is_some_and(|last| *position != last + 1) {
++                return Err(Error::Invalid {
++                    detail: "the plan's segments are no longer one run of the manifest: a merge \
++                             writes one segment where its inputs were, so a plan that skips a \
++                             segment would put that segment's records behind records that came \
++                             after them"
++                        .to_owned(),
++                });
++            }
++            previous = Some(*position);
++        }
++
++        // Read first, write second: a merge that failed halfway through its inputs must not leave a
++        // file holding part of them, because a segment is the one thing in this store that cannot be
++        // a prefix.
++        let mut records: Vec<Record> = Vec::with_capacity(plan.records() as usize);
++        let mut taken: Vec<u64> = Vec::with_capacity(positions.len());
++        let mut bytes_in = 0u64;
++        for position in &positions {
++            let Some(info) = segments.get(*position) else {
++                continue;
++            };
++            records.extend(segment::read(&file_of(&self.directory, info.index))?);
++            taken.push(info.index);
++            bytes_in += info.bytes;
++        }
++
++        let index = self.next;
++        let file = file_of(&self.directory, index);
++        segment::write(&file, &records)?;
++        flush(&file)?;
++        let ran = Merge {
++            epoch: self.current.manifest().epoch() + 1,
++            index,
++            file,
++            taken,
++            bytes: length_of(&file_of(&self.directory, index))?,
++            bytes_in,
++            records: records.len() as u64,
++            segments_before: segments.len(),
++        };
++        self.pending = Some(index);
++        Ok(ran)
+     }
+ 
+     /// Make the merge `ran` the store: one manifest, written whole and renamed into place.
+@@ -328,8 +585,64 @@ impl Segments {
+     /// [`Error::Invalid`] when this store has no merge in flight at `ran`'s index, and
+     /// [`Error::Store`] when the manifest cannot be written or put in place.
+     pub fn install(&mut self, ran: Merge) -> Result<MergeReport, Error> {
+-        let _ = ran;
+-        todo!("step lakelet/4.8-compaction")
++        if self.pending != Some(ran.index) {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "this store has no merge in flight that wrote segment {}, so it cannot be \
++                     installed: `install` takes the value `merge` returned, and installing one \
++                     twice would name a segment the store never wrote",
++                    ran.index
++                ),
++            });
++        }
++        let before = self.current.manifest().segments().to_vec();
++        let mut segments: Vec<SegmentInfo> = Vec::with_capacity(before.len());
++        let mut placed = false;
++        for info in &before {
++            if ran.taken.contains(&info.index) {
++                // The new segment sits where its inputs did, which is what keeps the store's order
++                // the order the records were accepted in.
++                if !placed {
++                    segments.push(SegmentInfo::new(ran.index, ran.bytes, ran.records));
++                    placed = true;
++                }
++                continue;
++            }
++            segments.push(*info);
++        }
++        if !placed {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "the merge that wrote segment {} names no segment of the manifest, so \
++                     installing it would add a segment without taking anything away",
++                    ran.index
++                ),
++            });
++        }
++        let after = segments.len();
++        let manifest = Manifest {
++            epoch: ran.epoch,
++            segments,
++        };
++        self.write_manifest(manifest.clone())?;
++        let installed = Arc::new(Set::new(self.directory.clone(), manifest));
++        let replaced = std::mem::replace(&mut self.current, installed);
++        replaced.retire(&ran.taken);
++        // If no snapshot names the old set any more, this is what deletes its files — and if one
++        // does, they are still there and still readable, which is the whole point.
++        drop(replaced);
++        self.pending = None;
++        self.next = ran.index + 1;
++        Ok(MergeReport {
++            epoch: ran.epoch,
++            wrote: ran.index,
++            merged: ran.taken,
++            bytes_in: ran.bytes_in,
++            bytes_out: ran.bytes,
++            records: ran.records,
++            segments_before: ran.segments_before,
++            segments_after: after,
++        })
+     }
+ 
+     /// The whole job in one call — plan, merge, install — for the caller that has nothing to decide:
+@@ -342,8 +655,12 @@ impl Segments {
+     ///
+     /// Everything [`Segments::merge`] and [`Segments::install`] refuse.
+     pub fn compact(&mut self) -> Result<Option<MergeReport>, Error> {
+-        let _ = self;
+-        todo!("step lakelet/4.8-compaction")
++        let plan = self.plan();
++        if plan.is_empty() {
++            return Ok(None);
++        }
++        let ran = self.merge(&plan)?;
++        self.install(ran).map(Some)
+     }
+ 
+     /// Put a manifest in place: written to [`PENDING`], flushed, renamed onto [`MANIFEST`], and the
+@@ -355,8 +672,11 @@ impl Segments {
+     /// crash after it leaves the new one, so a reader of the manifest is never handed a
+     /// half-written index.
+     fn write_manifest(&self, manifest: Manifest) -> Result<(), Error> {
+-        let _ = manifest;
+-        todo!("step lakelet/4.8-compaction")
++        let pending = self.directory.join(PENDING);
++        std::fs::write(&pending, manifest.encode()?).map_err(store)?;
++        flush(&pending)?;
++        std::fs::rename(&pending, self.directory.join(MANIFEST)).map_err(store)?;
++        flush(&self.directory)
+     }
+ }
+ 
+@@ -525,7 +845,135 @@ impl MergeReport {
+     }
+ }
+ 
++/// One `Error::Store` around an I/O failure.
++fn store(source: std::io::Error) -> Error {
++    Error::Store {
++        source: Box::new(source),
++    }
++}
++
++/// One `Error::Protocol` about a manifest or a segment that is not what the store wrote.
++fn refused(detail: String) -> Error {
++    Error::Protocol { detail }
++}
++
++/// Wait for the device on `path`: `sync_all`, not `fsync`, for the reason
++/// `docs/adr/0001-write-path.md` measured.
++fn flush(path: &Path) -> Result<(), Error> {
++    std::fs::File::open(path)
++        .map_err(store)?
++        .sync_all()
++        .map_err(store)
++}
++
++/// How many bytes the file at `path` holds.
++fn length_of(path: &Path) -> Result<u64, Error> {
++    std::fs::metadata(path)
++        .map(|metadata| metadata.len())
++        .map_err(store)
++}
++
++/// The manifest this store directory holds, or an empty one when it holds no manifest at all.
++///
++/// A directory with no manifest is a store that has closed no segment yet — not a store whose index
++/// went missing, because the index is *created* by the first seal, and the directory is what a store
++/// that has accepted one frame has. A manifest that is there and cannot be read is a different
++/// answer: this returns an error, because guessing would be a store with a hole in it.
++fn read_manifest(directory: &Path) -> Result<Manifest, Error> {
++    let path = directory.join(MANIFEST);
++    match std::fs::read(&path) {
++        Ok(bytes) => Manifest::decode(&bytes, &path),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::empty()),
++        Err(error) => Err(store(error)),
++    }
++}
++
++/// Delete what the manifest does not name: the segment of a merge no crash installed, the segments
++/// of a merge whose deletion a crash interrupted, and the manifest a swap did not finish.
++fn discard(directory: &Path, manifest: &Manifest) -> Result<(), Error> {
++    let _ = std::fs::remove_file(directory.join(PENDING));
++    let names: Vec<String> = manifest
++        .segments()
++        .iter()
++        .map(|info| file_name(info.index))
++        .collect();
++    let entries = match std::fs::read_dir(directory.join(DIRECTORY)) {
++        Ok(entries) => entries,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++        Err(error) => return Err(store(error)),
++    };
++    for entry in entries {
++        let entry = entry.map_err(store)?;
++        let name = entry.file_name();
++        let name = name.to_string_lossy().into_owned();
++        if names.contains(&name) {
++            continue;
++        }
++        std::fs::remove_file(entry.path()).map_err(store)?;
++    }
++    Ok(())
++}
++
++/// Check one segment the manifest names: it is there, and it is the length the index states.
++///
++/// The check is the index's own promise kept — a segment whose bytes are not all there is a store
++/// that cannot answer without a hole — and it costs one `stat` rather than a decode, because a store
++/// on a machine with a hundred segments is opened far more often than it is read.
++fn check(directory: &Path, info: &SegmentInfo) -> Result<(), Error> {
++    let path = file_of(directory, info.index);
++    let metadata = std::fs::metadata(&path).map_err(|error| {
++        if error.kind() == std::io::ErrorKind::NotFound {
++            refused(format!(
++                "the manifest names segment {} and {} does not exist: an index that names a file \
++                 nobody kept is a store whose answers would have a hole in them",
++                info.index,
++                path.display()
++            ))
++        } else {
++            store(error)
++        }
++    })?;
++    if metadata.len() != info.bytes {
++        return Err(refused(format!(
++            "the manifest says segment {} is {} byte(s) and {} holds {} — a segment that is not the \
++             length the index states is one this store may not read, because reading it would \
++             answer a shorter store",
++            info.index,
++            info.bytes,
++            path.display(),
++            metadata.len()
++        )));
++    }
++    Ok(())
++}
++
+ /// The name a segment's file has.
+ fn file_name(index: u64) -> String {
+     format!("{index:0DIGITS$}.{EXTENSION}")
+ }
++
++/// The `u32` four bytes at `offset` are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset.checked_add(4)?)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The `u64` eight bytes at `offset` are, little endian, or `None` when there are not eight.
++fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
++    let slice = bytes.get(offset..offset.checked_add(8)?)?;
++    let mut array = [0u8; 8];
++    array.copy_from_slice(slice);
++    Some(u64::from_le_bytes(array))
++}
++
++/// The first bytes of a file, as hex, for a message that shows what was found.
++fn shown(bytes: &[u8]) -> String {
++    bytes
++        .iter()
++        .take(MAGIC.len())
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<Vec<String>>()
++        .join(" ")
++}
+diff --git a/src/engine/compaction/plan.rs b/src/engine/compaction/plan.rs
+index 2a973fd..0cc5c6d 100644
+--- a/src/engine/compaction/plan.rs
++++ b/src/engine/compaction/plan.rs
+@@ -127,11 +127,53 @@ impl Policy {
+     /// store looks like when the merge starts.
+     #[must_use]
+     pub fn plan(&self, segments: &[SegmentInfo]) -> Plan {
+-        let _ = (self, segments);
+-        todo!("step lakelet/4.8-compaction")
++        let width = self.width.max(2);
++        let ratio = self.ratio.max(1);
++        let mut start = 0;
++        while let Some(run) = segments.get(start..) {
++            if run.len() < width {
++                break;
++            }
++            let Some(first) = run.first() else {
++                break;
++            };
++            // A run is extended while the next segment is comparable with *both* ends of it: the
++            // smallest keeps a run from swallowing a file that is too large to share its frame,
++            // and the largest keeps it from swallowing one that is too small to be worth its own.
++            let mut smallest = first.bytes;
++            let mut largest = first.bytes;
++            let mut length = 1usize;
++            while let Some(next) = run.get(length) {
++                if !comparable(next.bytes, smallest, largest, ratio) {
++                    break;
++                }
++                smallest = smallest.min(next.bytes);
++                largest = largest.max(next.bytes);
++                length += 1;
++            }
++            if length >= width {
++                let Some(taken) = run.get(..width) else {
++                    break;
++                };
++                return Plan::of(taken);
++            }
++            start += 1;
++        }
++        Plan::empty()
+     }
+ }
+ 
++/// `true` when a segment of `size` bytes belongs in a run holding `smallest` and `largest`.
++///
++/// Both ends are compared, and the multiplication is done in `u128`: a size and a ratio are both
++/// numbers a caller could make large, and a policy that overflowed would answer a plan nobody could
++/// compute by hand.
++fn comparable(size: u64, smallest: u64, largest: u64, ratio: u64) -> bool {
++    let size = u128::from(size);
++    let ratio = u128::from(ratio);
++    size <= u128::from(smallest) * ratio && size * ratio >= u128::from(largest)
++}
++
+ /// What one merge would take: a contiguous run of segments, oldest first, and what they cost.
+ ///
+ /// The plan is a value a caller can hold, log, or refuse. Its segments are indices into the
+@@ -158,6 +200,25 @@ impl Plan {
+         }
+     }
+ 
++    /// One merge, over the run of `segments` (which is taken as it is given: this is the step's own
++    /// construction, not a second rule about which runs are allowed).
++    ///
++    /// The two totals saturate rather than wrap: they are a report of what a merge would read, and a
++    /// store whose segments add up past what a `u64` can say is a store whose *plan* must not be the
++    /// thing that fails — every number here is still a number somebody can read.
++    #[must_use]
++    fn of(segments: &[SegmentInfo]) -> Self {
++        Self {
++            segments: segments.iter().map(|info| info.index).collect(),
++            bytes: segments
++                .iter()
++                .fold(0u64, |total, info| total.saturating_add(info.bytes)),
++            records: segments
++                .iter()
++                .fold(0u64, |total, info| total.saturating_add(info.records)),
++        }
++    }
++
+     /// `true` when this plan is no merge at all.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+diff --git a/src/engine/compaction/snapshot.rs b/src/engine/compaction/snapshot.rs
+index bb53a9e..35309d8 100644
+--- a/src/engine/compaction/snapshot.rs
++++ b/src/engine/compaction/snapshot.rs
+@@ -42,12 +42,9 @@ use super::{Manifest, file_of};
+ /// The segments one read is allowed to see, and the files that may not leave while it does.
+ ///
+ /// Private to the module: a caller holds a [`Snapshot`], which is this set behind an [`Arc`], and
+-/// the store holds the same `Arc`. The moment both let go, the files a merge retired are deleted —
+-/// so a reader that outlives a merge neither reads a half-store nor keeps a file alive forever.
+-///
+-/// The fields below are a suggestion rather than a contract: what this type has to do is in the
+-/// module docs and in its own, and a store that keeps its readers whole some other way is a store
+-/// whose spec still passes — the spec only ever holds a [`Snapshot`].
++/// the store holds the same `Arc` as its current manifest. The moment both let go, the files a
++/// merge retired are deleted — so a reader that outlives a merge neither reads a half-store nor
++/// keeps a file alive forever.
+ #[derive(Debug)]
+ pub(super) struct Set {
+     /// The store directory the segments live under.
+@@ -75,14 +72,33 @@ impl Set {
+ 
+     /// Hand this set the files a merge replaced. They go when the last reader of this set does.
+     pub(super) fn retire(&self, indices: &[u64]) {
+-        let _ = (self, indices);
+-        todo!("step lakelet/4.8-compaction")
++        let mut retired = self.lock();
++        for index in indices {
++            retired.push(file_of(&self.directory, *index));
++        }
++    }
++
++    /// The retired list, read through a poisoned lock rather than around it.
++    ///
++    /// A panic while a retirement was being recorded does not make the files any less retired, and
++    /// refusing to look would leak them for the life of the process — which for a store is a disk
++    /// that fills up without a single error in the log.
++    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
++        match self.retired.lock() {
++            Ok(files) => files,
++            Err(poisoned) => poisoned.into_inner(),
++        }
+     }
+ }
+ 
+ impl Drop for Set {
+     fn drop(&mut self) {
+-        todo!("step lakelet/4.8-compaction")
++        for path in self.lock().iter() {
++            // A file that cannot be deleted is not an error here: it is an *orphan*, which is the
++            // one thing the next open of this store knows how to deal with, and a store that
++            // refused to stop because a cleanup did not work would be worse than a full disk.
++            let _ = std::fs::remove_file(path);
++        }
+     }
+ }
+ 
+@@ -156,7 +172,26 @@ impl Snapshot {
+     /// [`segment::read`](crate::engine::segment::read) refuses — a segment that is not this build's
+     /// format, was cut, or was changed after it was written.
+     pub fn records(&self) -> Result<Vec<Record>, Error> {
+-        let _ = self;
+-        todo!("step lakelet/4.8-compaction")
++        let mut records = Vec::new();
++        for info in self.segments() {
++            let path = file_of(&self.held.directory, info.index);
++            let read = segment::read(&path)?;
++            if read.len() as u64 != info.records {
++                return Err(Error::Protocol {
++                    detail: format!(
++                        "the manifest says segment {} holds {} record(s) and {} holds {} — the \
++                         manifest is the store's index, and an index that disagrees with its files \
++                         is a store that cannot be queried without guessing which of the two is \
++                         right",
++                        info.index,
++                        info.records,
++                        path.display(),
++                        read.len()
++                    ),
++                });
++            }
++            records.extend(read);
++        }
++        Ok(records)
+     }
+ }

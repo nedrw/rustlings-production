@@ -1,0 +1,27 @@
+# The merge schedules `lakelet/4.8-compaction` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_compaction.rs`, which
+# this step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set, and
+# every run has to be green — a scenario that holds under one interleaving and breaks under another
+# is exactly the bug this gate is about.
+#
+# `seeds` is three schedules and the count is the judgement: `slow:sim@3` asks for at least three, and
+# the gate also demands that at least two of them produce *different* transcripts, so a harness that
+# ignored the seed would fail rather than pass three times. What the schedules decide here is **which
+# reader is inside a read when a merge starts**: the seed steers two readers and the controller past
+# each other, so in one schedule a snapshot is taken before the swap and read after it while in
+# another the same reader finishes first — and the `files=` field of the transcript is where the
+# difference shows, because the segments a merge replaced stay on the disk until the last reader that
+# named them lets go. Five deaths are walked in every schedule (planned, written, durable, swapped,
+# retired: one rule, one line each in the harness); what the seed moves is what the readers were
+# doing beside them.
+#
+# `replay = 1` is the seed that is run *twice*: the two transcripts have to be byte-identical. That is
+# the property the harness is written for — every line is a count, a record digest or an event, never
+# a wall clock, a path or an address — and a scenario that fails it is a flaky test wearing a
+# simulation's name. Seed `1` is also the default the harness uses when nothing sets `KILN_SIM_SEED`,
+# so a learner running the file by hand sees the schedule this gate replays.
+command = "cargo test -p lakelet --test sim_compaction -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
