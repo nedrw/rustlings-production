@@ -43,6 +43,13 @@ pub const MISSING: &str = "llvm-profdata/llvm-cov are not in the active toolchai
 /// The suffix the profile files of a run carry.
 const PROFILE: &str = ".profraw";
 
+/// Sources the export leaves out: everything outside the tree being measured.
+///
+/// A dependency's line counts say nothing about the step's module, and the document that carries
+/// them is big enough to hit the runner's capture cap — where the answer stops being "not this
+/// step" and starts being "not readable".
+const IGNORED_SOURCES: &str = r"(\.cargo/registry|/rustlib/|/rustup/toolchains/)";
+
 /// The two binaries a coverage run needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tools {
@@ -184,6 +191,12 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     let mut export_args: Vec<String> = vec![
         "export".to_owned(),
         "--summary-only".to_owned(),
+        // Only this tree's own files. The document otherwise carries every dependency's sources and
+        // the toolchain's, which is both noise the gate filters out anyway and — measured — more than
+        // kiln's own 256 KiB capture cap: a truncated document is an export this gate cannot read at
+        // all, and the flag is the difference between a measurement and a parse error.
+        "--ignore-filename-regex".to_owned(),
+        IGNORED_SOURCES.to_owned(),
         "--instr-profile".to_owned(),
         lossy(&merged),
     ];
@@ -266,6 +279,13 @@ struct Coverage {
     covered: u64,
     /// The module's files the export had data for.
     files: Vec<String>,
+    /// Module line(s) the export named *outside* this tree.
+    ///
+    /// cargo keys a build slot by package name and version, so an instrumented run in another copy of
+    /// this project can answer here — with that copy's line counts. A path that ends with the module's
+    /// name but lives somewhere else is that case, and a number about another tree is worse than no
+    /// number.
+    foreign: u64,
 }
 
 /// What an `llvm-cov export --summary-only` document carries.
@@ -327,6 +347,12 @@ fn summary(document: &str, project: &Path, module: &[String]) -> Result<Coverage
         else {
             continue;
         };
+        // A path that ends with the module's name but does not live in the tree being judged is a
+        // build of another copy: counting it would report another tree's lines as this step's.
+        if !absolute.starts_with(project) {
+            coverage.foreign += 1;
+            continue;
+        }
         coverage.lines += file.summary.lines.count;
         coverage.covered += file.summary.lines.covered;
         if !coverage.files.iter().any(|seen| seen == relative) {
@@ -338,6 +364,15 @@ fn summary(document: &str, project: &Path, module: &[String]) -> Result<Coverage
 
 /// The gate's answer, from what the export says about the module.
 fn judge(required: u32, coverage: &Coverage, module: &[String]) -> GateOutcome {
+    if coverage.lines == 0 && coverage.foreign > 0 {
+        return GateOutcome::blocked(format!(
+            "the profile names {} line(s) of this step's module in a *different* tree, so the \
+             instrumented build came from another copy of this project — cargo keys a build slot by \
+             package name and version, and a percentage about another tree is not this step's number. \
+             Clear the gate's build directory (or the sandbox it shares) and run again",
+            coverage.foreign
+        ));
+    }
     if coverage.lines == 0 {
         return GateOutcome::blocked(format!(
             "the profile has no executable line for the step's module ({}), so coverage cannot be \
