@@ -101,3 +101,82 @@ $ course 的 200 个 .rs 逐个 rustfmt --check → 0 not formatted
 `lakeletd.rs` 的信号处理用 `.expect`（`@2` 起禁止在生产目标用），两者都已在骨架里改掉。
 
 **下一步**：B1（4.2 fuzz / 4.3 ADR / 4.4 WAL 恢复），逐步派子 agent；三条新门在 B1 里各自第一次被真步骤用上。
+
+## 段 5：`lakelet/4.2-parser-fuzz`（B1 的第一步）
+
+**做了什么**：`test/fuzzing@apply` 这一步由子 agent 交付，11 个文件、1203 行新增（提交 `2132813`），
+我复核后在它之上补了三处一致性修正（见下）。这一步的机关是**骨架里种的一个 panic**：
+
+- `scaffold/4.2-parser-fuzz.patch`（纯新增：5 个新文件 + `src/protocol/mod.rs` 标记块里插 3 行）：装置
+  `tests/fuzz_protocol.rs`（把 `mutate::walk` 的每个输入同时喂给 `frame::decode` 与 `sniff::ranges`，重放
+  `tests/corpus/**`，打印 `lakelet-fuzz iterations=<n>` / `corpus_cases=<n>`，踩到 panic 时**先把输入按语料格式
+  打出来**再 `resume_unwind`）；语料读取器 `src/protocol/corpus.rs`；`mutate.rs` 的契约 + `todo!()`；以及
+  **埋着 bug 的扫描器** `src/protocol/sniff.rs`——它只确认“头里声明的 *payload* 在窗口里”，然后按
+  `OVERHEAD + length`（整帧）去 `split_at`，于是“payload 到齐、校验和差 1–4 字节”的 capture 会 panic；
+- `solutions/4.2-parser-fuzz.patch`：手写 xorshift64* 的变器（截断 / 翻位 / 改长度字段 / 插垃圾）、一行的修法
+  （比帧自己的 `size`）、以及最小化语料条目 `tests/corpus/parser/frame-cut-short-of-its-checksum.txt`（`0000000001`）；
+- `spec/4.2/parser_fuzz.rs` 7 个用例 + `fuzz/4.2-parser-fuzz.toml`（3 种子、`iterations_min = 20000`、`corpus_cases = 1`）。
+
+**原始结论行**（本机 rustc 1.98.1，我在自己的构建上重取）：
+
+```
+$ CARGO_TARGET_DIR=/private/tmp/kiln-verify-target cargo build -q -p kiln                     → exit 0
+$ kiln selftest lakelet/4.2-parser-fuzz --track lakelet
+    ✓ lakelet/4.1-ingest-protocol (setup)
+    scaffold ✓ the spec fails as it must (exit code 101: test the_same_seed_walks_the_same_inputs … FAILED)
+    solution ✓ reference patch applies · solution ✓ the spec passes · gates ✓ 10/10 must green
+  1/1 step(s) hold the contract … · real 34.2s
+$ kiln lint-caps      → 97 capabilities · 136 slots · 119 ledger positions · 97 authored steps · no issues.
+$ kiln links          → 92 page(s) · 473 link(s) · 283 external target(s) 全解析
+$ kiln i18n status    → structure: 0 error(s) · not authored yet: 22 step body/bodies
+$ kiln probe --check  → 41/41
+```
+
+慢门与演练（在 scratch 副本 `/private/tmp/m3-check` 里做，理由见下）：
+
+```
+$ kiln check lakelet/4.2-parser-fuzz --slow
+    ✓ slow:fuzz@3    3 seed(s) ran, 60000/60000/60000 mutation(s) each, 1 of 1 regression input(s) replayed (the walk took 1s)
+    ✓ slow:?coverage@80 194 of 211 line(s) of this step's module are covered (91% ≥ 80%)
+  10/10 must gate(s) passed · 1 should gate(s) run · real 16.8s
+
+把 bug 种回去（把参考解的那一行反向打回 app/lakelet）：
+$ kiln run lakelet/4.2-parser-fuzz        → test result: FAILED. 5 passed; 2 failed
+$ kiln check lakelet/4.2-parser-fuzz --slow
+    ✗ slow:fuzz@3  3 of 3 seed(s) did not pass: seed 1 ✗ (exit code 101: panicked at src/protocol/sniff.rs:89:32:), seed 7 ✗ (…), seed 20260101 ✗ (…)
+回滚后：
+$ kiln run   → test result: ok. 7 passed · $ kiln check --slow → 10/10 must gate(s) passed
+```
+
+这条“种回去→红，回滚→绿”就是 plan §9 的**演练第 4 条**（“注入一个未分类的截断帧 → fuzz/spec 红；回滚 → 绿”），
+在这一段里先做掉了一次。
+
+**这一段钉下来的四件事**：
+
+1. **语料的落点被推翻了，方向与直觉相反**：`m3-plan.md` §4.3 原稿把“fuzz 找到过的那个输入”钉成规格里的字节常量
+   （理由：怕目录方案逼出一个“课程→项目”的复制机制）。实测下来目录方案**不需要**复制机制——骨架本来就要把读取器与
+   README 送进项目，*条目*由学员跑搜索时自己写出来；而把出事的形状写进规格（学员必须读的契约）等于把答案摊开，
+   与这一步的过关条件（“fuzz 找到过至少一个 panic 并修掉”）冲突。回归网改由**规格把装置走出来的每一个输入都喂给
+   扫描器** + “解码器三个答案都要出现”承担（实测：种回 bug 后规格两条用例红）。随之把三处“语料钉在规格里”的措辞
+   改掉：`docs/m3-plan.md` §4.3 与开头那行状态注、`docs/plan.md` §6 的 `fuzz@N` 一行、以及
+   `kiln/src/gates/fuzz.rs` 的门头/字段文档/报告行（`pinned input(s)` → `regression input(s)`）——
+   **闸门现在只认条数（装置报的重放数 vs 课程侧地板），不认语料在哪、也不认它的形状**，别的 track 的 fuzz 步
+   可以把语料放在自己挑的地方。
+2. **`cargo test -p kiln` 里有两条自 B0c 起就红的快照断言**，是 B0c 的漏项，不是本步引入的：
+   `caps::lint::tests::the_repository_course_is_clean` 断言 `authored_steps == 22 + 24 + 27`（现在 97，
+   实得 `left: 97, right: 73`）、`info::tests::the_repository_course_loads` 断言 `tracks().len() == 3`（现在 4）。
+   已改成 `22 + 24 + 27 + 24` 与 `4`，并把 lakelet 的 `24 步 / app/lakelet / index 4` 断言补进 info 的那条测试。
+   **教训**：这两条测试读的是课程树，所以**每一批收尾都要跑 `cargo test -p kiln`，即使那一批没碰 `kiln/**`**。
+   （`cargo xtask ci` 会跑到它们，所以收尾那一关本来也会红——但红了半条 track 才发现。）
+3. **慢门验证不能在活的工作树里做**：`kiln` 会从子进程环境里清掉 `CARGO_TARGET_DIR`（M2 §5.2 的有意行为，实测过），
+   于是 `kiln run/solution/check` 把构建落在**工作树的 `app/lakelet/target/`**（4.2 那次落了 387 MB）。工作树里
+   不许出现 `target/`（Delta VFS 会卡），所以慢门验证一律在 scratch 副本里做；`kiln selftest` 是例外，它自己在
+   `/var/folders/...` 建沙箱，在工作树里跑是安全的。已写进 [handoff-m3.md](handoff-m3.md) §1。
+4. **骨架补了 5 个空的 `kiln:scaffold:` 块**（`src/lib.rs`、`src/{protocol,engine,service}/mod.rs`、
+   `tests/support/mod.rs`）：`kiln` 拒绝在标记区之外插入，而 lakelet 骨架原来一个块都没有——这一轨后面 22 步
+   每次新增模块都会撞同一堵墙（4.4 的 `tests/support/tier.rs`、4.10 的 `src/cli/**` 都要）。骨架仍然
+   `cargo build` + `cargo test --no-run` + `cargo fmt` 后逐字节不变（4.1 的 selftest 作为 setup 复跑过）。
+
+**下一步**：B1 的后两步——`4.3-write-path-adr`（`store/wal-recovery@aware`：fsync 策略作为数据 + ADR + 崩溃点表）
+与 `4.4-wal-recovery`（`store/wal-recovery@apply`：torn-write 恢复 + `slow:sim@3`，turmoil 第一次上场），
+然后给开发者一份 B1 检查点报告。

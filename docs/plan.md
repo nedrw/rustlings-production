@@ -232,7 +232,7 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 | `bench-budget@P`（slow） | 计数预算在课程基线的 ±P% 内 | `kiln/src/gates/budget.rs` + `course/tracks/jobq/budget/<step>.toml`（判计数，不判墙钟） | T3·3.22 |
 | `sim@N`（slow） | 确定性模拟：同一套件在 ≥N 个种子下跑，每个种子绿、指定种子重放两遍的摘要逐字节一致、且种子之间真的产生不同结果 | `kiln/src/gates/sim.rs`：课程侧 `course/tracks/<track>/sim/<step-id>.toml` 给种子表与命令，闸门带 `KILN_SIM_SEED` 重跑本步套件（与 3.5 的 `KILN_BACKEND` 同一机制） | T4·4.4 |
 | `soak@N`（slow） | 长跑无泄漏、无堆积：循环数达到地板，且每个活计数在课程上界内 | `kiln/src/gates/soak.rs`：课程侧 `soak/<step-id>.toml` 给 `cycles_min` 与每个计数的上界；**墙钟只作证据、不当判据**（handoff M3 §4.2） | T4·4.17 |
-| `fuzz@N`（slow） | 种子搜索跑够次数，且每一步钉住的回归输入都被重放过 | `kiln/src/gates/fuzz.rs`：课程侧 `fuzz/<step-id>.toml` 给种子、`iterations_min` 与语料条数；`cargo-fuzz` 是生产里的做法，不进闸门 | T4·4.2 |
+| `fuzz@N`（slow） | 种子搜索跑够次数，且课程侧文件要求的那几条回归输入都被重放过 | `kiln/src/gates/fuzz.rs`：课程侧 `fuzz/<step-id>.toml` 给种子、`iterations_min` 与语料条数（语料在哪、什么形状是那一步自己的事）；`cargo-fuzz` 是生产里的做法，不进闸门 | T4·4.2 |
 | `?deny`（**should**） | 许可/版本/来源策略 | `cargo-deny`；未装时 `blocked` + `cargo install cargo-deny --locked` | T2 末 |
 | `unsafe-budget@N` | 无未注明 unsafe | `kiln/src/gates/unsafe_budget.rs`：源码里的 `unsafe` 计数 + 每处 `// SAFETY:` + `unsafe_code = "deny"` | T3·3.24 |
 | `semver@baseline` | 公开 API 与基线兼容 | `kiln/src/gates/semver.rs`：用 `rustc` 编译课程基线见证文件（`cargo-semver-checks` 是生产里的做法，不进闸门） | T3·3.2 |
