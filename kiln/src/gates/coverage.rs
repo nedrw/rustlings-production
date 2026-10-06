@@ -19,6 +19,13 @@
 //! project (measured: 22 s cold on the machine this was written on). They get a cache directory of their
 //! own, which also means the gate's second run is incremental.
 //!
+//! "Every profile the run wrote" includes the ones its children chose ([`profiles_of_the_run`]): a
+//! suite that judges a command line starts the binary with an environment of its own (`env_clear`),
+//! and that child never sees `LLVM_PROFILE_FILE` — it writes LLVM's default name into its working
+//! directory, inside the tree this gate measured. Those profiles are this run's; not reading them
+//! reported the file `jobq/3.26-dlq-cli` is about as `0 of 199 line(s)` for a suite that drives it on
+//! every case (handoff M2 §5.2).
+//!
 //! The run happens in a **copy** of the project, stamped fresh ([`sandbox::copy_project`]), and that is
 //! a correctness rule rather than tidiness: cargo keys a build slot by package *name and version* rather
 //! than by the directory a package lives in, so a binary in the shared cache can be one an earlier
@@ -178,7 +185,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
-    let raw = profiles_written(&profiles)?;
+    let raw = profiles_of_the_run(&profiles, &measured, started)?;
     if raw.is_empty() {
         return Ok(GateOutcome::blocked(format!(
             "the instrumented run wrote no `{PROFILE}` data, so there is nothing to measure — the \
@@ -265,6 +272,29 @@ fn instrumented() -> String {
         .to_owned()
 }
 
+/// Every profile file a run wrote: the ones the gate asked for, and the ones its children chose.
+///
+/// The gate points `LLVM_PROFILE_FILE` into a directory of its own, so a process that inherits the
+/// environment writes where it is told. A process a *suite* starts with an environment it picks
+/// itself does not: `env_clear` is how a spec that judges a command line asks what a script sees
+/// (`jobq/3.15-cli-contract`, `jobq/3.26-dlq-cli`), and a child that never sees the variable writes
+/// LLVM's default name — in its working directory, which is inside the tree this run measured.
+/// Measured (handoff M2 §5.2): `jobq/3.26-dlq-cli` is that shape, and the file its suite drives on
+/// every case was reported as `0 of 199 line(s)`, because the coverage of the real binary was in
+/// the project root and nowhere the gate looked.
+///
+/// Only this run's files: the copy a run builds in holds no profile file at all ([`sandbox::copy_project`]
+/// leaves them behind), so the ones a walk finds are the ones a process of this run wrote, and the
+/// timestamp test is a second lock on the same door. `target/` is skipped with the reason it is
+/// skipped everywhere else — it is not part of the copy, and a build directory is not source.
+fn profiles_of_the_run(directory: &Path, tree: &Path, since: SystemTime) -> Result<Vec<PathBuf>> {
+    let mut found = profiles_written(directory)?;
+    found.extend(stray_profiles(tree, since)?);
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
 /// Every profile file a run wrote, in path order.
 fn profiles_written(directory: &Path) -> Result<Vec<PathBuf>> {
     let entries = std::fs::read_dir(directory).map_err(|source| KilnError::Read {
@@ -278,15 +308,54 @@ fn profiles_written(directory: &Path) -> Result<Vec<PathBuf>> {
             source,
         })?;
         let path = entry.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "profraw")
-        {
+        if is_profile(&path) {
             found.push(path);
         }
     }
     found.sort();
     Ok(found)
+}
+
+/// The profile files of a tree that `since` did not come after, in path order.
+fn stray_profiles(tree: &Path, since: SystemTime) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut queue = vec![tree.to_path_buf()];
+    while let Some(directory) = queue.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|source| KilnError::Read {
+            path: directory.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| KilnError::Read {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                queue.push(path);
+            } else if is_profile(&path)
+                && std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| modified >= since)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Is this file a profile one of the run's processes wrote?
+fn is_profile(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "profraw")
 }
 
 /// Every runnable file of a target directory that `since` did not come after, in path order.
@@ -690,6 +759,54 @@ mod tests {
         let flags = instrumented();
         assert!(flags.ends_with("-C instrument-coverage"), "{flags}");
         assert!(!flags.starts_with(' '), "{flags}");
+    }
+
+    #[test]
+    fn a_child_that_did_not_inherit_the_profile_variable_is_still_this_runs_data() {
+        // The shape of `jobq/3.26-dlq-cli`: the suite starts the real binary with `env_clear`, so
+        // `LLVM_PROFILE_FILE` never reaches it and the profile lands in the tree under LLVM's default
+        // name. That file is this run's, and leaving it out reports the step's own module as uncovered.
+        let temp = TempDir::new("coverage-stray");
+        let tree = temp.path().join("project");
+        crate::test_support::write(&tree, "src/lib.rs", "pub fn f() {}\n");
+        crate::test_support::write(&tree, "default_1_0_2.profraw", "the real binary's data\n");
+        crate::test_support::write(&tree, "target/debug/x.profraw", "a build directory\n");
+        crate::test_support::write(&tree, "yesterday.profraw", "an earlier run's data\n");
+        // The directory the gate points `LLVM_PROFILE_FILE` at: it exists, and this run put nothing
+        // in it, which is the case the stray file is there for.
+        std::fs::create_dir_all(tree.join("profiles")).expect("the fixture directory is writable");
+        let since = SystemTime::now();
+        let fresh = since + Duration::from_secs(1);
+        stamp(&tree.join("default_1_0_2.profraw"), fresh);
+        stamp(&tree.join("target/debug/x.profraw"), fresh);
+        stamp(
+            &tree.join("yesterday.profraw"),
+            since - Duration::from_secs(86_400),
+        );
+
+        let found = stray_profiles(&tree, since).expect("the tree is readable");
+        assert_eq!(
+            found,
+            vec![tree.join("default_1_0_2.profraw")],
+            "the run's own profile data, not another run's and not a build directory"
+        );
+        assert_eq!(
+            profiles_of_the_run(&tree.join("profiles"), &tree, since)
+                .expect("the tree is readable")
+                .len(),
+            1,
+            "the gate's own directory holds none here, and the stray one is the run's"
+        );
+    }
+
+    /// Put a file's modification time where the test needs it.
+    fn stamp(path: &Path, when: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("the fixture file is writable")
+            .set_modified(when)
+            .expect("the fixture timestamp is settable");
     }
 
     #[test]

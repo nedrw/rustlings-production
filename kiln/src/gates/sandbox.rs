@@ -17,6 +17,11 @@
 //! `kiln selftest` states for its sandbox, and the one that keeps a profile written in the copy
 //! readable by the tools of the toolchain the gate probed.
 //!
+//! Profile files (`.profraw`) are left behind with them, and for a reason of this file's own: a
+//! gate that reads a profile out of the copy would otherwise merge data of a run nobody here knows
+//! about — a learner's own coverage run, whose file would travel into the copy and be stamped as
+//! fresh as everything else. Only files a run *writes* under the copy are that run's data.
+//!
 //! # The stamp
 //!
 //! [`make_fresh`] sets every copied file's modification time ahead of the clock, and it is cargo's
@@ -80,6 +85,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         if kind.is_dir() {
             copy_tree(&source_path, &target_path)?;
         } else if kind.is_file() {
+            // A profile file is not source: it is the data of a run this project knows nothing
+            // about, and a measurement that merged it would be about that run.
+            if source_path
+                .extension()
+                .is_some_and(|part| part == "profraw")
+            {
+                continue;
+            }
             // Byte for byte: a project may hold images, fixtures or a lock file, and none of them is
             // text this gate has an opinion about.
             std::fs::copy(&source_path, &target_path).map_err(|source| KilnError::Write {
@@ -167,6 +180,7 @@ mod tests {
         crate::test_support::write(&project, "target/debug/jobq", "an artifact\n");
         crate::test_support::write(&project, ".git/HEAD", "ref: refs/heads/main\n");
         crate::test_support::write(&project, ".kiln/probes/x/src/lib.rs", "a probe\n");
+        crate::test_support::write(&project, "default_1_0_2.profraw", "another run's data\n");
         project
     }
 
@@ -185,6 +199,10 @@ mod tests {
                 "{left_behind}/ was copied"
             );
         }
+        assert!(
+            !copy.join("default_1_0_2.profraw").exists(),
+            "another run's profile data was copied into the measurement"
+        );
     }
 
     #[test]
