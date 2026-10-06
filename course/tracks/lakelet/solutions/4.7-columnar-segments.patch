@@ -1,0 +1,1178 @@
+diff --git a/docs/format.md b/docs/format.md
+index c448411..e3f9606 100644
+--- a/docs/format.md
++++ b/docs/format.md
+@@ -5,80 +5,170 @@ column instead of by row and compressed as one block. It is an artefact somebody
+ to read — a repair tool, a compaction pass, an operator with `xxd` — so this page is the contract,
+ and the code is [the column block](../src/engine/segment/encode.rs), [the reader](../src/engine/segment/decode.rs),
+ [the compressor](../src/engine/segment/compress.rs) and [the file](../src/engine/segment/mod.rs) around them.
+-If this page and those files disagree, the files are right and this page is a bug. The wire format is
+-*not* this one: a client still sends rows, and [the ingest protocol](protocol.md) still describes
+-them.
++If this page and those files disagree, the files are right and this page is a bug.
+ 
+-<!-- TODO: say what a segment is *for* in one paragraph, in the numbers this step is about: what a
+-row of `series` + `ts_millis` + `value` costs, what the same records cost here, and which of the two
+-the store keeps. Name the direction the two formats run in — rows on the wire, columns on the device
+-— and why that is not a contradiction. -->
++A segment keeps the **series** in one stream, the **timestamp** in a second and the **value** in a
++third, and that is the whole idea. A row of `series` + `ts_millis` + `value` costs twenty-four bytes
++before anything is asked of it: eight for the clock, eight for the value, and eight for a short name
++and its length. Twenty-four bytes a row is 2.1 GB a day per thousand samples a second, and almost
++none of it is information — the same series repeats in every row, a clock advances by a nearly
++constant step, and a temperature holds still for a while. Laid out by column, each of those three
++redundancies is something an encoding can name, and the arithmetic of the page below is what a store
++buys by naming them.
++
++The wire format is *not* this one: a client still sends rows, and [the ingest protocol](protocol.md)
++still describes them. Rows are what a peer can debug at 3am; columns are what a device can afford to
++keep.
+ 
+ ## The file
+ 
+ ```text
+-<!-- TODO: the header, byte by byte: the magic, the version, the column count, the column block's
+-length, and then the one sealed block. Say what each field is for, and what a reader does with it
+-before it trusts anything. -->
++ 0..4        4c 4b 4c 53        `MAGIC`: the bytes `LKLS`
++ 4           01                 `VERSION`: the layout below, version 1
++ 5           03                 `COLUMNS`: three column streams
++ 6..10       u32 LE             the length of the column block, before compression
++ 10..14      u32 LE             the length of the compressed bytes (c)
++ 14..14+c    c bytes            the column block, one `zstd` frame
++ 14+c..18+c  u32 LE             the seal over the two fields above
+ ```
+ 
+-<!-- TODO: why the file declares itself (four bytes of magic and a version, the discipline
+-`4.4-wal-recovery` brought to the log), and why a segment has no prefix to recover: it is closed, so
+-it is whole or refused. Say what the seal covers and which checksum it is. -->
++Five things are decisions rather than accidents:
++
++- **the file declares itself.** `LKLS` and a version are what make "this is not this build's
++  segment" a *decision*; without them a foreign file and a segment whose first write was cut are the
++  same bytes, and a reader would answer "a store with no records in it".
++- **the seal is the one the log uses.** It is [the record seal](../src/engine/wal/checksum.rs)'s CRC-32
++  over the compressed length *and* the compressed bytes, in the shape a record already has — one
++  checksum for the two formats in this project, covering every byte that decides how far the block
++  reaches.
++- **every byte is checked by one of four comparisons.** The first six are compared with the header,
++  the compressed length and the bytes are covered by the seal, the block length is compared with what
++  the frame actually decompressed to, and a file with anything after the seal is refused.
++- **the block states its uncompressed length.** A reader choosing how much memory to ask for has to
++  know before it asks: the length is in the header, the decompressor is handed it as a limit, and the
++  result is compared with it. A file cannot choose this process's allocation.
++- **a segment is whole or refused.** A log is replayed to a prefix because it is still being
++  appended to; nothing is being appended to a segment, so it has no prefix to offer. A cut segment is
++  an error, never a shorter store.
+ 
+ ## The column block
+ 
+ ```text
+-<!-- TODO: the block before compression: the record count, then one framed column per entry of the
+-column order. Give the tag, the length and the payload offsets. -->
++ 0..8    u64 LE   how many records every column holds
++ then one framed column per entry of the order below:
++   +0     u8       the tag: which encoding this column uses
++   +1..5  u32 LE   the length of the payload that follows
++   +5..   bytes    the payload
++```
++
++The column order is **fixed**: series, then timestamp, then value. A reader that wants the values
++still walks the framing of the two columns before them, which is the price of writing every column's
++length in front of it — and the reason `lakelet/4.11-query-engine` will be able to say which columns
++it read. A file whose column count is not three, or whose columns are in another order, is not this
++build's segment.
++
++The **golden vector** the spec pins is the column block of four records, and it is here so that a
++reader can check the layout without a decoder:
++
++```text
++ 04 00 00 00 00 00 00 00                 four records
++ 03 3a 00 00 00                          series: tag 3, 58 bytes
++   02 00 00 00                            two names
++   0f 00 "cpu,host=web-01"                the first, fifteen bytes
++   0f 00 "cpu,host=web-02"                the second
++   02 00 00 00                            two runs
++   02 00 00 00 00 00 00 00                twice entry 0
++   02 00 00 00 01 00 00 00                then twice entry 1
++ 02 0e 00 00 00                          timestamp: tag 2, 14 bytes
++   00 68 e5 cf 8b 01 00 00                1 700 000 000 000, as an i64
++   d0 0f d0 0f d0 0f                      d0 0f is zigzag(1000), three times
++ 01 1c 00 00 00                          value: tag 1, 28 bytes
++   02 00 00 00                            two runs
++   02 00 00 00 00 00 00 00 00 00 f8 3f    twice 1.5
++   02 00 00 00 00 00 00 00 00 00 00 80    twice -0.0
+ ```
+ 
+-<!-- TODO: the column order, and why it is that order. Say what a reader that wants only the value
+-column pays for it. State that the bytes on this page are the bytes the golden vector in
+-`spec/4.7/columnar_segments.rs` spells out. -->
++One hundred and twenty-three bytes for four records: the block does not claim to be small, it claims
++to be *readable*, and it is what a reader of a failing case gets to compare against.
+ 
+ ## The encodings
+ 
+ | tag | name | payload | which column speaks it |
+ | --- | --- | --- | --- |
+-| TODO | TODO | TODO | TODO |
++| 0 | `PLAIN` | one value after another, at its own width | every column |
++| 1 | `RLE` | `u32` runs, then per run `u32` length + one value | the value column |
++| 2 | `DELTA` | `i64` first timestamp, then one zigzag varint per step | the timestamp column |
++| 3 | `DIC` | `u32` names (each `u16` length + UTF-8 bytes), then `u32` runs of `u32` length + `u32` entry | the series column |
+ 
+-<!-- TODO: one row per tag: its number, its constant's name, its payload layout byte by byte (the
+-widths: a `u16` name length, `i64` timestamps, the eight bytes of an `f64`'s bits), and which column
+-may use it. Say what the varint in the delta encoding is — zigzag, seven bits per byte — and why the
+-difference is taken and put back with wrapping arithmetic. -->
++A column's *width* is its own: a value is the eight bytes of an `f64`'s bits, a timestamp eight bytes
++of `i64`, a series entry a `u16` length in front of its bytes. The varint in `DELTA` is zigzag over
++the difference — `(d << 1) ^ (d >> 63)` — written seven bits per byte with the high bit set on every
++byte but the last, so a step of zero is one byte, a step of a second is two and a stamp is eight.
+ 
+ ## How an encoding is chosen
+ 
+-<!-- TODO: the rule, in one sentence, and what it means for a tie. Say what the choice is *not*
+-allowed to look at — the compressed size — and why a format whose bytes depend on a compressor's
+-release is a format nobody can pin. -->
++Each column speaks two of the four — series `DIC` and `PLAIN`, timestamp `DELTA` and `PLAIN`, value
++`RLE` and `PLAIN` — and the encoder writes the **shorter payload**; when the two are exactly the same
++length, the encoding with the **lower tag** wins, which is `PLAIN`. That rule is the whole of the
++format's freedom, and it is what makes the bytes a function of the records: the same four records
++produce the golden vector above on every machine and in every build.
++
++The choice looks at the encoded payload and never at the compressed size. Choosing by compressing all
++the candidates would make the bytes depend on the `zstd` release, and a format whose bytes move when a
++dependency is upgraded is a format nobody can pin.
+ 
+ ## The values that break a careless encoder
+ 
+-<!-- TODO: the edge cases the spec's round trip is built on, and what each one does to an encoder
+-that was written in a hurry: `i64::MIN` next to `i64::MAX` under a delta encoding, `-0.0` and `NaN`
+-under a run-length encoding that compares with `==`, `±inf` and a `NaN` payload under anything that
+-goes through a decimal or a comparison. One paragraph each, phrased as the failure, not as advice.
+--->
++**`i64::MIN` next to `i64::MAX`.** Their difference is not an `i64`, so a delta encoding that wrote
++`b - a` panics in a debug build and wraps in a release one — and the two builds then write different
++files for the same records. The subtraction is `wrapping_sub` and the reader's addition is
++`wrapping_add`, which is the identity for every pair of `i64`s: `i64::MIN` after `i64::MAX` is a round
++trip, not an arithmetic fault.
++
++**`-0.0` and `NaN`.** A run-length encoding groups equal values, and `f64`'s `==` is not equality of
++bits: it calls `-0.0` and `0.0` equal — so the sign of a zero is lost, and a store that hands back
++`0.0` for `-0.0` is wrong in a way no later step can repair — and it never calls `NaN` equal to
++itself, so a flat line of `NaN` grows a run per sample instead of one. The comparison is on
++`to_bits()`.
++
++**`±inf` and a `NaN` payload.** `to_bits` and `from_bits` are the only route that carries every
++`f64` there is through a file unchanged: a value that went through a decimal or an arithmetic
++comparison would come back as a different bit pattern, and the spec's round trip compares bits.
+ 
+ ## What a reader refuses
+ 
+-<!-- TODO: the four inputs [the reader](../src/engine/segment/decode.rs) is handed — a file this
+-build wrote, a file somebody else wrote, a truncated one and a corrupted one — and what each of the
+-last three gets: a typed error that names what disagreed, never a panic and never the records that
+-happened to decode before the bytes ran out. Name the error variant. -->
++[The reader](../src/engine/segment/decode.rs) is handed four kinds of input, and only the first is a
++segment:
++
++| what was handed to it | what comes back |
++| --- | --- |
++| a file this build wrote | the records, in the order they were written |
++| a file somebody else wrote | `Error::Protocol` naming the header it found and the one it expected |
++| a truncated one | `Error::Protocol` naming where the bytes ran out |
++| one with a flipped bit | `Error::Protocol` naming the seal, because every byte is covered |
++
++Never a panic, and never the records that happened to decode before the bytes ran out: a reader that
++answered with a prefix would hand back a shorter segment as if it were this one.
+ 
+ ## The size budget
+ 
+ | metric | what it counts | baseline |
+ | --- | --- | --- |
+-| TODO | TODO | TODO |
+-
+-<!-- TODO: one row per metric `tests/budget_segments.rs` prints, with the baseline
+-`course/tracks/lakelet/budget/4.7-columnar-segments.toml` records for it. Say which of them are upper
+-bounds rather than targets, what the two workloads are, and which counts show that the workload had
+-something in it. The names here are the ones the harness prints and the baseline is written in. -->
++| `samples` | records the telemetry workload holds | 1024 |
++| `series` | distinct series in it | 8 |
++| `distinct_values` | distinct value bit patterns in it | 16 |
++| `samples_read` | records that came back out of both segments | 2048 |
++| `mismatches_max` | records that did not come back, or came back different | 0 |
++| `column_block_bytes_max` | the telemetry workload's columns, before compression | 3100 |
++| `segment_bytes_max` | the file that holds them | 200 |
++| `bytes_per_sample_max` | the file over the samples, the number this step exists for | 0.20 |
++| `compression_ratio_max` | the file over the column block it came from | 0.07 |
++| `flat_column_block_bytes_max` | one series, one clock, one value, repeated 1024 times | 1150 |
++
++The last five are **upper bounds** rather than targets: they may go down and may not go up, so a
++cheaper encoding — a run-length of the deltas, a dictionary for the values — passes this lane and a
++bigger one fails it. The first five are counts of the workload itself, which is what keeps a small
++file from being an empty one; `mismatches_max` at zero is the round trip, measured by the same run.
+ 
+ The numbers come from the project's own harness:
+ 
+@@ -86,12 +176,17 @@ The numbers come from the project's own harness:
+ cargo test -p lakelet --test budget_segments -- --nocapture
+ ```
+ 
+-<!-- TODO: name the gate that compares those lines with the baseline (`kiln check
+-lakelet/4.7-columnar-segments --slow`), and say what it does with a metric the harness stopped
+-printing. Link [the harness](../tests/budget_segments.rs). -->
++[The harness](../tests/budget_segments.rs) is the course's file, and it prints `<name>=<value>` lines
++rather than times, because a count is the same number on a loaded machine as on an idle one. `kiln
++check lakelet/4.7-columnar-segments --slow` compares them with
++`course/tracks/lakelet/budget/4.7-columnar-segments.toml` under the `bench-budget` gate, and a metric
++the harness stopped printing is reported as a broken harness rather than as a missing answer.
+ 
+ ## What is not here yet
+ 
+-<!-- TODO: the two questions this format leaves open — who decides how many records one segment
+-holds, and what happens when two segments hold the same series — and the steps that own them. Name
+-`lakelet/4.8-compaction` and the reader promise it has to keep. -->
++Who decides how many records a segment holds, and what happens when two segments hold the same
++series, are open questions. `lakelet/4.8-compaction` owns both: it rewrites segments while readers
++keep reading, and its promise is that a query started before a merge and finished after it answers
++exactly what one that ran entirely before the merge would have. Nothing in this format prevents that
++— a segment is immutable, closed and self-describing — but nothing here decides when one ends
++either.
+diff --git a/src/engine/segment/compress.rs b/src/engine/segment/compress.rs
+index 70782aa..2147fc7 100644
+--- a/src/engine/segment/compress.rs
++++ b/src/engine/segment/compress.rs
+@@ -47,8 +47,9 @@ pub const LEVEL: i32 = 3;
+ /// [`Error::Store`] when the compressor itself fails — which for a block that fits in memory means
+ /// the machine refused an allocation, not that the records were unusual.
+ pub fn compress(block: &[u8]) -> Result<Vec<u8>, Error> {
+-    let _ = block;
+-    todo!("step lakelet/4.7-columnar-segments")
++    zstd::bulk::compress(block, LEVEL).map_err(|source| Error::Store {
++        source: Box::new(source),
++    })
+ }
+ 
+ /// Decompress one block, refusing to produce more than `limit` bytes.
+@@ -57,8 +58,13 @@ pub fn compress(block: &[u8]) -> Result<Vec<u8>, Error> {
+ ///
+ /// [`Error::Protocol`] when the bytes are not a `zstd` frame, when the frame is cut short, and when
+ /// it decompresses to more than `limit` — the three ways a file that someone else wrote can be
+-/// something other than what the segment around it claims.
++/// something other than what the segment around it claims. The compressor's own error text stays in
++/// the sentence, because "the frame is incomplete" and "the destination is too small" are two
++/// different afternoons for whoever is holding the file.
+ pub fn decompress(frame: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
+-    let _ = (frame, limit);
+-    todo!("step lakelet/4.7-columnar-segments")
++    zstd::bulk::decompress(frame, limit).map_err(|source| Error::Protocol {
++        detail: format!(
++            "this block is not a `zstd` frame that decompresses to at most {limit} byte(s): {source}"
++        ),
++    })
+ }
+diff --git a/src/engine/segment/decode.rs b/src/engine/segment/decode.rs
+index e5bd62e..d01bf5f 100644
+--- a/src/engine/segment/decode.rs
++++ b/src/engine/segment/decode.rs
+@@ -14,14 +14,17 @@
+ //!   by number, rather than decoded as whatever its payload looks like;
+ //! * **the lengths.** Every length in the block is compared with the bytes actually there before it
+ //!   is used as an end, an offset or a capacity: a block that states a payload longer than it is, a
+-//!   count no bytes can satisfy, or a run longer than the records left is a refusal. Nothing here
+-//!   can reserve what a damaged field claims, which is what keeps a corrupt file from becoming an
+-//!   allocation;
++//!   count no bytes can satisfy, or a run longer than the records left is a refusal. The record count
++//!   is checked the same way and for the same reason — a clock column costs at least one byte a
++//!   record whichever encoding it speaks, so a block cannot claim more records than its own
++//!   timestamp bytes could describe, and no `Vec` here is grown by a number a stranger chose;
+ //! * **the agreement between the columns.** A series column that runs to 900 records, a timestamp
+ //!   column of 1000 and a value column of 4 is not three answers, it is one damaged block: the
+ //!   count in the block's first eight bytes is what every column has to add up to, and a column
+ //!   that adds up to anything else is refused.
+ 
++use crate::engine::segment::encode;
++use crate::engine::segment::encode::{DELTA, DIC, NAME, PLAIN, RLE};
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+ 
+@@ -34,6 +37,479 @@ use crate::protocol::batch::Record;
+ /// which part of it disagreed, because the reader of a failing case in the field is a person with a
+ /// hex dump and no debugger.
+ pub fn records(block: &[u8]) -> Result<Vec<Record>, Error> {
+-    let _ = block;
+-    todo!("step lakelet/4.7-columnar-segments")
++    let Some(count) = u64_at(block, 0).map(|value| value as usize) else {
++        return Err(refused(format!(
++            "a column block starts with an eight-byte record count and these bytes hold {}",
++            block.len()
++        )));
++    };
++    let mut cursor = encode::COUNT;
++    let series = framed(block, cursor, "series")?;
++    cursor = series.next;
++    let timestamp = framed(block, cursor, "timestamp")?;
++    cursor = timestamp.next;
++    let value = framed(block, cursor, "value")?;
++    cursor = value.next;
++    if cursor != block.len() {
++        return Err(refused(format!(
++            "the columns end at byte {cursor} and the block holds {} — the {} byte(s) after them \
++             are no column, and reading the block as if they were would be guessing at where it \
++             stops",
++            block.len(),
++            block.len().saturating_sub(cursor)
++        )));
++    }
++    // The count is a claim until the bytes behind it are counted. Both encodings the timestamp column
++    // speaks cost at least one byte a record — eight bytes of stamp each, or eight for the first and
++    // a varint of at least a byte for every step after it — so a clock column cannot be shorter than
++    // the records it describes. A block that says otherwise is refused *here*, before a single
++    // record is built: a count nobody checked is how thirty bytes of a corrupt file turn into an
++    // allocation the machine cannot serve.
++    if count > timestamp.payload.len() {
++        return Err(refused(format!(
++            "the block states {count} record(s) and its timestamp column holds {} byte(s) — a clock \
++             column costs at least one byte a record, so these bytes cannot describe that many \
++             records",
++            timestamp.payload.len()
++        )));
++    }
++
++    let names = names(series.tag, series.payload, count)?;
++    let stamps = stamps(timestamp.tag, timestamp.payload, count)?;
++    let bits = values(value.tag, value.payload, count)?;
++    Ok(names
++        .into_iter()
++        .zip(stamps)
++        .zip(bits)
++        .map(|((series, ts_millis), bits)| Record {
++            series,
++            ts_millis,
++            // `from_bits`, not a parse or a comparison: every `f64` there is survives the round trip
++            // exactly, a `NaN` payload and the sign of a zero included.
++            value: f64::from_bits(bits),
++        })
++        .collect())
++}
++
++/// One column's framing, read back: its tag, its payload and where the next column starts.
++struct Framed<'a> {
++    /// Which encoding the column was written with.
++    tag: u8,
++    /// The column's payload, exactly as it was framed.
++    payload: &'a [u8],
++    /// Byte after the payload: where the next column's tag is.
++    next: usize,
++}
++
++/// Read one framed column at `at`, or refuse by naming the column.
++fn framed<'a>(block: &'a [u8], at: usize, column: &str) -> Result<Framed<'a>, Error> {
++    let Some(tag) = block.get(at).copied() else {
++        return Err(refused(format!(
++            "the {column} column's tag would be at byte {at} and the block holds {} — the column(s) \
++             before it did not end where they said",
++            block.len()
++        )));
++    };
++    let Some(length) = at
++        .checked_add(encode::TAG)
++        .and_then(|offset| u32_at(block, offset))
++        .map(|value| value as usize)
++    else {
++        return Err(refused(format!(
++            "the {column} column states its payload's length at byte {} and the block does not hold \
++             four bytes there",
++            at + encode::TAG
++        )));
++    };
++    let start = at + encode::FRAME;
++    let Some(end) = start.checked_add(length) else {
++        return Err(refused(format!(
++            "the {column} column says its payload is {length} bytes, which starting at {start} runs \
++             past the end of this machine's addresses"
++        )));
++    };
++    let Some(payload) = block.get(start..end) else {
++        return Err(refused(format!(
++            "the {column} column says its payload is {length} bytes and the block holds {} from \
++             byte {start}",
++            block.len().saturating_sub(start)
++        )));
++    };
++    Ok(Framed {
++        tag,
++        payload,
++        next: end,
++    })
++}
++
++/// The series column's names, `count` of them, in order.
++fn names(tag: u8, payload: &[u8], count: usize) -> Result<Vec<String>, Error> {
++    match tag {
++        PLAIN => {
++            let mut names = Vec::with_capacity(count.min(payload.len()));
++            let mut cursor = 0usize;
++            for _ in 0..count {
++                let (name, next) = name_at(payload, cursor)?;
++                names.push(name.to_owned());
++                cursor = next;
++            }
++            consumed(payload, cursor, "series")?;
++            Ok(names)
++        }
++        DIC => {
++            let Some(entries) = u32_at(payload, 0).map(|value| value as usize) else {
++                return Err(refused(
++                    "a series dictionary starts with a four-byte name count and the payload does not \
++                     hold four bytes",
++                ));
++            };
++            let mut dictionary: Vec<String> = Vec::with_capacity(entries.min(payload.len()));
++            let mut cursor = encode::LENGTH;
++            for _ in 0..entries {
++                let (name, next) = name_at(payload, cursor)?;
++                dictionary.push(name.to_owned());
++                cursor = next;
++            }
++            let Some(run_count) = u32_at(payload, cursor).map(|value| value as usize) else {
++                return Err(refused(format!(
++                    "the series dictionary's {entries} name(s) end at byte {cursor} and the payload \
++                     holds no four-byte run count there"
++                )));
++            };
++            cursor += encode::LENGTH;
++            let mut series: Vec<String> = Vec::with_capacity(count.min(payload.len()));
++            for _ in 0..run_count {
++                let (Some(length), Some(number)) =
++                    (u32_at(payload, cursor), number_at(payload, cursor))
++                else {
++                    return Err(refused(format!(
++                        "the series column states {run_count} run(s) and the one at byte {cursor} \
++                         is cut before its eight bytes"
++                    )));
++                };
++                let length = length as usize;
++                let number = number as usize;
++                if number >= dictionary.len() {
++                    return Err(refused(format!(
++                        "the series run at byte {cursor} names entry {number} and the dictionary \
++                         holds {} name(s)",
++                        dictionary.len()
++                    )));
++                }
++                let Some(total) = series.len().checked_add(length) else {
++                    return Err(refused(format!(
++                        "the series run at byte {cursor} is longer than this machine can address"
++                    )));
++                };
++                if total > count {
++                    return Err(refused(format!(
++                        "the series runs add up to more than the {count} record(s) the block states \
++                         — a run that outlives the records it describes is a damaged block"
++                    )));
++                }
++                let Some(name) = dictionary.get(number) else {
++                    return Err(refused(format!(
++                        "the series run at byte {cursor} names entry {number}"
++                    )));
++                };
++                series.resize(total, name.clone());
++                cursor += encode::LENGTH * 2;
++            }
++            consumed(payload, cursor, "series")?;
++            if series.len() != count {
++                return Err(refused(format!(
++                    "the series runs add up to {} record(s) and the block states {count}",
++                    series.len()
++                )));
++            }
++            Ok(series)
++        }
++        other => Err(other_tag("series", other)),
++    }
++}
++
++/// The timestamp column's values, `count` of them, in order.
++fn stamps(tag: u8, payload: &[u8], count: usize) -> Result<Vec<i64>, Error> {
++    // A timestamp column with no records is a column with no bytes: both encodings it speaks write
++    // eight bytes per record and nothing else, so the empty column is answered once here instead of
++    // in each arm — and a payload that is not empty under a count of zero is a damaged column, not
++    // an empty one. The other two columns cannot say this: a dictionary of no names still has its
++    // name table, and a run-length of no runs still has its count.
++    if count == 0 {
++        consumed(payload, 0, "timestamp")?;
++        return Ok(Vec::new());
++    }
++    match tag {
++        PLAIN => {
++            let Some(used) = count.checked_mul(size_of::<i64>()) else {
++                return Err(refused(format!(
++                    "the timestamp column says it is plain with {count} record(s), which is more \
++                     bytes than this machine can address"
++                )));
++            };
++            let mut stamps = Vec::with_capacity(count.min(payload.len()));
++            for index in 0..count {
++                let at = index * size_of::<i64>();
++                let Some(stamp) = i64_at(payload, at) else {
++                    return Err(refused(format!(
++                        "the timestamp column is plain and states {count} record(s): the eight bytes \
++                         at byte {at} are not there, and the payload holds {}",
++                        payload.len()
++                    )));
++                };
++                stamps.push(stamp);
++            }
++            consumed(payload, used, "timestamp")?;
++            Ok(stamps)
++        }
++        DELTA => {
++            let Some(first) = i64_at(payload, 0) else {
++                return Err(refused(
++                    "a delta-encoded timestamp column starts with its first stamp in eight bytes and \
++                     the payload does not hold them",
++                ));
++            };
++            let mut stamps = Vec::with_capacity(count.min(payload.len()));
++            stamps.push(first);
++            let mut cursor = size_of::<i64>();
++            let mut previous = first;
++            for _ in 1..count {
++                let (value, next) = varint(payload, cursor)?;
++                // The step is put back the way it was taken: `wrapping_add` of a wrapped difference is
++                // the identity for every pair of `i64`s, which is what makes `i64::MIN` next to
++                // `i64::MAX` a round trip instead of an arithmetic fault.
++                previous = previous.wrapping_add(zigzag_decode(value));
++                stamps.push(previous);
++                cursor = next;
++            }
++            consumed(payload, cursor, "timestamp")?;
++            Ok(stamps)
++        }
++        other => Err(other_tag("timestamp", other)),
++    }
++}
++
++/// The value column's bit patterns, `count` of them, in order.
++fn values(tag: u8, payload: &[u8], count: usize) -> Result<Vec<u64>, Error> {
++    match tag {
++        PLAIN => {
++            let Some(used) = count.checked_mul(size_of::<u64>()) else {
++                return Err(refused(format!(
++                    "the value column says it is plain with {count} record(s), which is more bytes \
++                     than this machine can address"
++                )));
++            };
++            let mut values = Vec::with_capacity(count.min(payload.len()));
++            for index in 0..count {
++                let at = index * size_of::<u64>();
++                let Some(bits) = u64_at(payload, at) else {
++                    return Err(refused(format!(
++                        "the value column is plain and states {count} record(s): the eight bytes at \
++                         byte {at} are not there, and the payload holds {}",
++                        payload.len()
++                    )));
++                };
++                values.push(bits);
++            }
++            consumed(payload, used, "value")?;
++            Ok(values)
++        }
++        RLE => {
++            let Some(run_count) = u32_at(payload, 0).map(|value| value as usize) else {
++                return Err(refused(
++                    "a run-length value column starts with a four-byte run count and the payload does \
++                     not hold four bytes",
++                ));
++            };
++            let mut values: Vec<u64> = Vec::with_capacity(count.min(payload.len()));
++            let mut cursor = encode::LENGTH;
++            for _ in 0..run_count {
++                let (Some(length), Some(bits)) =
++                    (u32_at(payload, cursor), bits_at(payload, cursor))
++                else {
++                    return Err(refused(format!(
++                        "the value column states {run_count} run(s) and the one at byte {cursor} is \
++                         cut before its twelve bytes"
++                    )));
++                };
++                let length = length as usize;
++                let Some(total) = values.len().checked_add(length) else {
++                    return Err(refused(format!(
++                        "the value run at byte {cursor} is longer than this machine can address"
++                    )));
++                };
++                if total > count {
++                    return Err(refused(format!(
++                        "the value runs add up to more than the {count} record(s) the block states — \
++                         a run that outlives the records it describes is a damaged block"
++                    )));
++                }
++                values.resize(total, bits);
++                cursor += encode::LENGTH + size_of::<u64>();
++            }
++            consumed(payload, cursor, "value")?;
++            Ok(values)
++        }
++        other => Err(other_tag("value", other)),
++    }
++}
++
++/// One series name at `at`: its length as a `u16`, then its bytes.
++///
++/// Every refusal names the byte the name starts at, because that is what the person holding the hex
++/// dump has: an ordinal would have to be counted from the start of the payload, which is exactly the
++/// work the reader is trying not to do by hand.
++fn name_at(payload: &[u8], at: usize) -> Result<(&str, usize), Error> {
++    let Some(length) = u16_at(payload, at).map(|value| value as usize) else {
++        return Err(refused(format!(
++            "a series name starts at byte {at} and the payload does not hold the two bytes of its \
++             length"
++        )));
++    };
++    let start = at + NAME;
++    let Some(end) = start.checked_add(length) else {
++        return Err(refused(format!(
++            "the series name at byte {at} says it is {length} bytes, which is further than this \
++             machine can address"
++        )));
++    };
++    let Some(name) = payload.get(start..end) else {
++        return Err(refused(format!(
++            "the series name at byte {at} says it is {length} bytes and the payload holds {} from \
++             byte {start}",
++            payload.len().saturating_sub(start)
++        )));
++    };
++    if name.is_empty() {
++        return Err(refused(format!(
++            "the series name at byte {at} is empty — a record's series is a metric and its labels, \
++             and a name no client can write is not one a segment may hold"
++        )));
++    }
++    let name = std::str::from_utf8(name).map_err(|error| {
++        refused(format!(
++            "the series name at byte {at} is not UTF-8: {error}"
++        ))
++    })?;
++    Ok((name, end))
++}
++
++/// The entry number a series run names, at the offset a run starts at.
++fn number_at(payload: &[u8], at: usize) -> Option<u32> {
++    at.checked_add(encode::LENGTH)
++        .and_then(|offset| u32_at(payload, offset))
++}
++
++/// The bit pattern a value run carries, at the offset the run starts at.
++fn bits_at(payload: &[u8], at: usize) -> Option<u64> {
++    at.checked_add(encode::LENGTH)
++        .and_then(|offset| u64_at(payload, offset))
++}
++
++/// Read one unsigned varint at `at`, or refuse naming the byte it starts at.
++fn varint(payload: &[u8], at: usize) -> Result<(u64, usize), Error> {
++    let mut value = 0u64;
++    let mut shift = 0u32;
++    let mut cursor = at;
++    loop {
++        let Some(byte) = payload.get(cursor).copied() else {
++            return Err(refused(format!(
++                "the delta that starts at byte {at} runs past the end of the payload — a varint whose \
++                 last byte is missing is not a stamp this reader may guess at"
++            )));
++        };
++        cursor += 1;
++        if shift > 63 {
++            return Err(refused(format!(
++                "the delta at byte {at} is longer than the eight bytes a varint of an `i64` can \
++                 occupy"
++            )));
++        }
++        let bits = u64::from(byte & 0x7f);
++        if shift == 63 && bits > 1 {
++            return Err(refused(format!(
++                "the delta at byte {at} carries bits above the 64th — the difference of two `i64`s \
++                 is not this"
++            )));
++        }
++        value |= bits << shift;
++        if byte & 0x80 == 0 {
++            return Ok((value, cursor));
++        }
++        shift += 7;
++    }
++}
++
++/// `Ok` when the payload holds exactly `used` bytes, and a refusal naming the column otherwise.
++fn consumed(payload: &[u8], used: usize, column: &str) -> Result<(), Error> {
++    if used == payload.len() {
++        return Ok(());
++    }
++    if used > payload.len() {
++        return Err(refused(format!(
++            "the {column} column's payload ends after {used} bytes and it holds {} — the column is \
++             cut, and a reader that answered with the part it could read would hand back a shorter \
++             segment as if it were this one",
++            payload.len()
++        )));
++    }
++    Err(refused(format!(
++        "the {column} column's payload is {} bytes and its records use {used} — the rest is no \
++         column, so the block is not the layout this build writes",
++        payload.len()
++    )))
++}
++
++/// The refusal for a tag this build does not speak, phrased so the column and the number are both in
++/// the sentence.
++fn other_tag(column: &str, tag: u8) -> Error {
++    refused(format!(
++        "the {column} column's tag is {tag} and this build writes {PLAIN} (plain), {RLE} \
++         (run-length), {DELTA} (delta) and {DIC} (dictionary) — a tag nobody wrote is a block from \
++         another build, not one to decode as whatever it looks like"
++    ))
++}
++
++/// The signed difference an unsigned varint carried.
++fn zigzag_decode(value: u64) -> i64 {
++    ((value >> 1) as i64) ^ -((value & 1) as i64)
++}
++
++/// The `u16` these two bytes are, little endian, or `None` when there are not two of them.
++fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
++    let slice = bytes.get(offset..offset.checked_add(NAME)?)?;
++    let mut array = [0u8; NAME];
++    array.copy_from_slice(slice);
++    Some(u16::from_le_bytes(array))
++}
++
++/// The `u32` these four bytes are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset.checked_add(encode::LENGTH)?)?;
++    let mut array = [0u8; encode::LENGTH];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The `u64` these eight bytes are, little endian, or `None` when there are not eight of them.
++fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
++    let slice = bytes.get(offset..offset.checked_add(size_of::<u64>())?)?;
++    let mut array = [0u8; size_of::<u64>()];
++    array.copy_from_slice(slice);
++    Some(u64::from_le_bytes(array))
++}
++
++/// The `i64` these eight bytes are, little endian, or `None` when there are not eight of them.
++fn i64_at(bytes: &[u8], offset: usize) -> Option<i64> {
++    let slice = bytes.get(offset..offset.checked_add(size_of::<i64>())?)?;
++    let mut array = [0u8; size_of::<i64>()];
++    array.copy_from_slice(slice);
++    Some(i64::from_le_bytes(array))
++}
++
++/// One `Error::Protocol` about these bytes.
++fn refused(detail: impl Into<String>) -> Error {
++    Error::Protocol {
++        detail: detail.into(),
++    }
+ }
+diff --git a/src/engine/segment/encode.rs b/src/engine/segment/encode.rs
+index bce33a7..e1b4228 100644
+--- a/src/engine/segment/encode.rs
++++ b/src/engine/segment/encode.rs
+@@ -50,11 +50,8 @@
+ //!   equal to itself (so a constant `NaN` series never collapses). The comparison here is on
+ //!   `to_bits()`, which is also the only route that carries `±inf` and a `NaN` payload through
+ //!   unchanged.
+-//!
+-//! # Errors
+-//!
+-//! None of this file's calls can fail: a `Vec` of bytes is not a place failures come from. Reading
+-//! the block back is [`super::decode`]'s, and that one can fail in every way a file can.
++
++use std::collections::HashMap;
+ 
+ use crate::engine::segment::COLUMNS;
+ use crate::protocol::batch::Record;
+@@ -111,6 +108,179 @@ pub const DIC: u8 = 3;
+ /// [`crate::engine::segment::decode::records`].
+ #[must_use]
+ pub fn column_block(records: &[Record]) -> Vec<u8> {
+-    let _ = records;
+-    todo!("step lakelet/4.7-columnar-segments")
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&(records.len() as u64).to_le_bytes());
++    push_column(&mut bytes, series(records));
++    push_column(&mut bytes, timestamp(records));
++    push_column(&mut bytes, value(records));
++    bytes
++}
++
++/// Append one framed column: its tag, its payload's length, then the payload.
++fn push_column(bytes: &mut Vec<u8>, column: (u8, Vec<u8>)) {
++    let (tag, payload) = column;
++    bytes.push(tag);
++    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
++    bytes.extend_from_slice(&payload);
++}
++
++/// The rule the format is free to choose with: the shorter of the two payloads, and [`PLAIN`] when
++/// they are the same length.
++///
++/// Written once and used by all three columns, so that "which encoding did this column get" has one
++/// answer in one place instead of three that can drift — and so that a tie is decided by a rule a
++/// reader can check (`PLAIN` is the lower tag), not by which branch the code happens to try first.
++fn choose(plain: Vec<u8>, encoded: (u8, Vec<u8>)) -> (u8, Vec<u8>) {
++    if encoded.1.len() < plain.len() {
++        encoded
++    } else {
++        (PLAIN, plain)
++    }
++}
++
++/// The series column: a dictionary of the names that appear, and one id per record.
++fn series(records: &[Record]) -> (u8, Vec<u8>) {
++    choose(plain_series(records), (DIC, dictionary(records)))
++}
++
++/// Every record's name, in full, one after another — the layout a dictionary has to beat.
++fn plain_series(records: &[Record]) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    for record in records {
++        push_name(&mut bytes, &record.series);
++    }
++    bytes
++}
++
++/// The dictionary, then the ids as runs.
++///
++/// The entries are numbered in the order the names first appear, which is what makes this function a
++/// function: a `HashMap`'s iteration order decides nothing here, because the map is only asked where
++/// a name was already numbered. Run-length-encoding the id stream is the other half of the claim —
++/// the series column of one series is one run, whatever the segment's length.
++fn dictionary(records: &[Record]) -> Vec<u8> {
++    let mut numbers: HashMap<&str, u32> = HashMap::new();
++    let mut names: Vec<&str> = Vec::new();
++    let mut runs: Vec<(u32, u32)> = Vec::new();
++    for record in records {
++        let number = match numbers.get(record.series.as_str()) {
++            Some(number) => *number,
++            None => {
++                let number = names.len() as u32;
++                names.push(&record.series);
++                numbers.insert(&record.series, number);
++                number
++            }
++        };
++        match runs.last_mut() {
++            Some((length, last)) if *last == number => *length += 1,
++            _ => runs.push((1, number)),
++        }
++    }
++
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&(names.len() as u32).to_le_bytes());
++    for name in &names {
++        push_name(&mut bytes, name);
++    }
++    bytes.extend_from_slice(&(runs.len() as u32).to_le_bytes());
++    for (length, number) in runs {
++        bytes.extend_from_slice(&length.to_le_bytes());
++        bytes.extend_from_slice(&number.to_le_bytes());
++    }
++    bytes
++}
++
++/// The timestamp column: the first stamp in full, then the steps between the rest, as varints.
++fn timestamp(records: &[Record]) -> (u8, Vec<u8>) {
++    choose(plain_timestamp(records), (DELTA, deltas(records)))
++}
++
++/// Every timestamp, eight bytes each — the layout a delta has to beat.
++fn plain_timestamp(records: &[Record]) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(records.len() * size_of::<i64>());
++    for record in records {
++        bytes.extend_from_slice(&record.ts_millis.to_le_bytes());
++    }
++    bytes
++}
++
++/// The first stamp, then one zigzag varint per step.
++///
++/// The steps are `wrapping_sub`, and the reader puts them back with `wrapping_add`: the difference of
++/// two timestamps of this type need not be one, and `i64::MAX` next to `i64::MIN` is the case this
++/// build's own spec writes down. A step of zero is one byte, a step of a second is two, and a stamp
++/// eight — which is the whole arithmetic of the encoding.
++fn deltas(records: &[Record]) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    let Some((first, rest)) = records.split_first() else {
++        return bytes;
++    };
++    bytes.extend_from_slice(&first.ts_millis.to_le_bytes());
++    let mut previous = first.ts_millis;
++    for record in rest {
++        push_varint(&mut bytes, zigzag(record.ts_millis.wrapping_sub(previous)));
++        previous = record.ts_millis;
++    }
++    bytes
++}
++
++/// The value column: runs of equal *bits*, because a value is a bit pattern and not a number a
++/// comparison is allowed to reinterpret.
++fn value(records: &[Record]) -> (u8, Vec<u8>) {
++    choose(plain_value(records), (RLE, runs(records)))
++}
++
++/// Every value, as the eight bytes of its bits — the layout a run-length has to beat.
++fn plain_value(records: &[Record]) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(records.len() * size_of::<u64>());
++    for record in records {
++        bytes.extend_from_slice(&record.value.to_bits().to_le_bytes());
++    }
++    bytes
++}
++
++/// The value column as runs of equal bits.
++///
++/// The comparison is `to_bits()`, never `==`: `-0.0 == 0.0` would merge two records whose values
++/// differ, and `NaN != NaN` would leave a flat line of `NaN` as one run per sample. Bit patterns are
++/// also what makes the round trip exact for every `f64` there is, the signalling ones included.
++fn runs(records: &[Record]) -> Vec<u8> {
++    let mut runs: Vec<(u32, u64)> = Vec::new();
++    for record in records {
++        let bits = record.value.to_bits();
++        match runs.last_mut() {
++            Some((length, last)) if *last == bits => *length += 1,
++            _ => runs.push((1, bits)),
++        }
++    }
++
++    let mut bytes = Vec::new();
++    bytes.extend_from_slice(&(runs.len() as u32).to_le_bytes());
++    for (length, bits) in runs {
++        bytes.extend_from_slice(&length.to_le_bytes());
++        bytes.extend_from_slice(&bits.to_le_bytes());
++    }
++    bytes
++}
++
++/// Append one series name: its length as a `u16`, then its bytes.
++fn push_name(bytes: &mut Vec<u8>, name: &str) {
++    let name = name.as_bytes();
++    bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
++    bytes.extend_from_slice(name);
++}
++
++/// The value a signed difference is carried as: its size first, its sign in the low bit.
++fn zigzag(delta: i64) -> u64 {
++    ((delta << 1) ^ (delta >> 63)) as u64
++}
++
++/// Append one unsigned number, seven bits per byte, high bit set on every byte but the last.
++fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
++    while value >= 0x80 {
++        bytes.push((value as u8) | 0x80);
++        value >>= 7;
++    }
++    bytes.push(value as u8);
+ }
+diff --git a/src/engine/segment/mod.rs b/src/engine/segment/mod.rs
+index d4f1886..48007d3 100644
+--- a/src/engine/segment/mod.rs
++++ b/src/engine/segment/mod.rs
+@@ -87,8 +87,20 @@ pub const MIN_BYTES: usize = HEADER + LENGTH + checksum::LEN;
+ /// [`Error::Store`] when the compressor refuses — which for a block that fits in memory means the
+ /// machine refused an allocation, not that the records were unusual.
+ pub fn encode(records: &[Record]) -> Result<Vec<u8>, Error> {
+-    let _ = records;
+-    todo!("step lakelet/4.7-columnar-segments")
++    let block = encode::column_block(records);
++    let compressed = compress::compress(&block)?;
++    let mut bytes = Vec::with_capacity(HEADER + LENGTH + compressed.len() + checksum::LEN);
++    bytes.extend_from_slice(&HEADER_BYTES);
++    bytes.extend_from_slice(&(block.len() as u32).to_le_bytes());
++    // The sealed block is the shape `wal::segment` gives a record, with the column block where the
++    // payload goes: a length, the bytes, and the seal over both. The length a reader uses as a
++    // decompression limit is the header's — a compressed length says nothing about how much output
++    // the frame describes.
++    let length = compressed.len() as u32;
++    bytes.extend_from_slice(&length.to_le_bytes());
++    bytes.extend_from_slice(&compressed);
++    bytes.extend_from_slice(&checksum::seal(length, &compressed).to_le_bytes());
++    Ok(bytes)
+ }
+ 
+ /// Read the records out of one segment's bytes.
+@@ -97,14 +109,87 @@ pub fn encode(records: &[Record]) -> Result<Vec<u8>, Error> {
+ /// a file somebody else wrote, a cut one or a corrupted one, and every one of those is either
+ /// records or a typed error naming what failed.
+ ///
++/// Every byte of the file is checked by one of four comparisons, which is why this list is short:
++/// the header's first six bytes are compared with [`HEADER_BYTES`], the compressed length and the
++/// compressed bytes are covered by the seal, the block length is compared with what the frame
++/// actually decompressed to, and a file holding more than the length and the seal it states is
++/// refused rather than read as a segment with something appended to it.
++///
+ /// # Errors
+ ///
+ /// [`Error::Protocol`] when the bytes are not this build's segment: a header that does not say so, a
+ /// block whose seal does not verify, a block that does not decompress to the length the header
+ /// promised, or a column block that is not the layout [`encode`] writes.
+ pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, Error> {
+-    let _ = bytes;
+-    todo!("step lakelet/4.7-columnar-segments")
++    if bytes.len() < MIN_BYTES {
++        return Err(refused(format!(
++            "a segment is at least {MIN_BYTES} bytes and this file holds {} — the header, a \
++             compressed block and its seal are what make these bytes a segment at all",
++            bytes.len()
++        )));
++    }
++    let Some(header) = bytes.get(..HEADER_BYTES.len()) else {
++        return Err(not_this_segment(bytes));
++    };
++    if header != HEADER_BYTES {
++        return Err(not_this_segment(bytes));
++    }
++    let Some(block_length) = u32_at(bytes, HEADER_BYTES.len()).map(|value| value as usize) else {
++        return Err(not_this_segment(bytes));
++    };
++    let Some(compressed_length) = u32_at(bytes, HEADER) else {
++        return Err(not_this_segment(bytes));
++    };
++    let start = HEADER + LENGTH;
++    let Some(end) = start.checked_add(compressed_length as usize) else {
++        return Err(refused(format!(
++            "the block says it is {compressed_length} compressed bytes, which starting at {start} \
++             runs past the end of this machine's addresses — this file was not written by a writer \
++             of this format"
++        )));
++    };
++    let Some(compressed) = bytes.get(start..end) else {
++        return Err(refused(format!(
++            "the block says it is {compressed_length} compressed bytes and the file holds {} from \
++             offset {start} — the rest of it is missing, so this segment is cut rather than read",
++            bytes.len().saturating_sub(start)
++        )));
++    };
++    let Some(seal) = u32_at(bytes, end) else {
++        return Err(refused(format!(
++            "the compressed block ends at {end} and the file holds no seal after it — a segment \
++             whose bytes nobody proved is not one a reader may answer from"
++        )));
++    };
++    if !checksum::verifies(compressed_length, compressed, seal) {
++        return Err(refused(format!(
++            "the seal of this segment is {seal} and the {compressed_length} bytes it covers compute \
++             {} — these bytes changed after they were written, and a reader that decompressed them \
++             anyway would answer with a segment nobody wrote",
++            checksum::seal(compressed_length, compressed)
++        )));
++    }
++    let sealed = end + checksum::LEN;
++    if bytes.len() != sealed {
++        return Err(refused(format!(
++            "this segment's header, block and seal end at {sealed} bytes and the file holds {} — \
++             the {} byte(s) after it are no part of the segment, and reading the file as if they \
++             were would be guessing at where it stops",
++            bytes.len(),
++            bytes.len().saturating_sub(sealed)
++        )));
++    }
++
++    let block = compress::decompress(compressed, block_length)?;
++    if block.len() != block_length {
++        return Err(refused(format!(
++            "the header states a {block_length}-byte column block and the frame decompressed to {} \
++             — the header's length is what a reader is asked to reserve, so a block that does not \
++             match it is refused",
++            block.len()
++        )));
++    }
++    decode::records(&block)
+ }
+ 
+ /// Write `records` into `path` as one segment, replacing whatever is there.
+@@ -113,20 +198,74 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, Error> {
+ /// [`decode`] refuses it instead of reading it as a store with no records in it. The directory is
+ /// the caller's business — this call does not create it.
+ ///
++/// Nothing here waits for a device. A segment is not the log: `lakelet/4.3-write-path-adr` decided
++/// what an *append* costs and what a store that has answered a client owes the device, and this file
++/// is written once, in full, by whoever decided it was time to close it. Making one durable is a
++/// whole-directory decision — the log, the segments and the order they were written in — and
++/// `lakelet/4.8-compaction` is the step that owns it.
++///
+ /// # Errors
+ ///
+-/// [`Error::Store`] when the file cannot be written or flushed.
++/// [`Error::Store`] when the file cannot be written, and everything [`encode`] refuses.
+ pub fn write(path: &Path, records: &[Record]) -> Result<(), Error> {
+-    let _ = (path, records);
+-    todo!("step lakelet/4.7-columnar-segments")
++    let bytes = encode(records)?;
++    std::fs::write(path, bytes).map_err(|source| Error::Store {
++        source: Box::new(source),
++    })
+ }
+ 
+ /// Read the records out of the segment at `path`.
+ ///
+ /// # Errors
+ ///
+-/// [`Error::Store`] when the file cannot be read, and everything [`decode`] refuses.
++/// [`Error::Store`] when the file cannot be read — a missing file included, because a path that was
++/// named as a segment is a segment somebody expected to be there — and everything [`decode`]
++/// refuses.
+ pub fn read(path: &Path) -> Result<Vec<Record>, Error> {
+-    let _ = path;
+-    todo!("step lakelet/4.7-columnar-segments")
++    let bytes = std::fs::read(path).map_err(|source| Error::Store {
++        source: Box::new(source),
++    })?;
++    decode(&bytes)
++}
++
++/// The `u32` these four bytes are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset.checked_add(LENGTH)?)?;
++    let mut array = [0u8; LENGTH];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The first bytes of a file, as hex, for a message that shows what was found.
++fn shown(bytes: &[u8]) -> String {
++    bytes
++        .iter()
++        .take(HEADER_BYTES.len())
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<Vec<String>>()
++        .join(" ")
++}
++
++/// The refusal for bytes that are not this build's segment, phrased for whoever has the file.
++fn not_this_segment(bytes: &[u8]) -> Error {
++    let detail = match bytes.get(MAGIC.len()) {
++        Some(version) if bytes.starts_with(&MAGIC) => format!(
++            "the file says this segment is layout version {version} and this build writes version \
++             {VERSION} — a segment it cannot read is not one it may guess at"
++        ),
++        _ => format!(
++            "the file starts with `{}` and a segment starts with `{}` — this is not this store's \
++             segment, and it is refused rather than read as one holding no records",
++            shown(bytes),
++            shown(&HEADER_BYTES)
++        ),
++    };
++    refused(detail)
++}
++
++/// One `Error::Protocol` about these bytes.
++fn refused(detail: impl Into<String>) -> Error {
++    Error::Protocol {
++        detail: detail.into(),
++    }
+ }

@@ -1,0 +1,756 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e04ab9b..659597b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,6 +22,10 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-
+ toml = "0.9.8"
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
++# `lakelet/4.7-columnar-segments`: the block compressor a segment file is written with. Columns make
++# the representation small, this makes the bytes small, and it is the same format the `zstd` command
++# line writes — so a segment can be looked at with a tool that is not this project.
++zstd = "0.13"
+ # kiln:scaffold:end
+ 
+ # The test side: a harness a step ships with (`tests/fuzz_protocol.rs`, `tests/sim_wal.rs`) brings
+@@ -41,6 +45,7 @@ turmoil = "0.7"
+ # lands.
+ [lints.rust]
+ # kiln:scaffold:begin
++unsafe_code = "deny"
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+diff --git a/docs/format.md b/docs/format.md
+new file mode 100644
+index 0000000..c448411
+--- /dev/null
++++ b/docs/format.md
+@@ -0,0 +1,97 @@
++# The segment format
++
++A **segment** is the file a flush writes: a batch of samples, closed, with its records laid out by
++column instead of by row and compressed as one block. It is an artefact somebody else has to be able
++to read — a repair tool, a compaction pass, an operator with `xxd` — so this page is the contract,
++and the code is [the column block](../src/engine/segment/encode.rs), [the reader](../src/engine/segment/decode.rs),
++[the compressor](../src/engine/segment/compress.rs) and [the file](../src/engine/segment/mod.rs) around them.
++If this page and those files disagree, the files are right and this page is a bug. The wire format is
++*not* this one: a client still sends rows, and [the ingest protocol](protocol.md) still describes
++them.
++
++<!-- TODO: say what a segment is *for* in one paragraph, in the numbers this step is about: what a
++row of `series` + `ts_millis` + `value` costs, what the same records cost here, and which of the two
++the store keeps. Name the direction the two formats run in — rows on the wire, columns on the device
++— and why that is not a contradiction. -->
++
++## The file
++
++```text
++<!-- TODO: the header, byte by byte: the magic, the version, the column count, the column block's
++length, and then the one sealed block. Say what each field is for, and what a reader does with it
++before it trusts anything. -->
++```
++
++<!-- TODO: why the file declares itself (four bytes of magic and a version, the discipline
++`4.4-wal-recovery` brought to the log), and why a segment has no prefix to recover: it is closed, so
++it is whole or refused. Say what the seal covers and which checksum it is. -->
++
++## The column block
++
++```text
++<!-- TODO: the block before compression: the record count, then one framed column per entry of the
++column order. Give the tag, the length and the payload offsets. -->
++```
++
++<!-- TODO: the column order, and why it is that order. Say what a reader that wants only the value
++column pays for it. State that the bytes on this page are the bytes the golden vector in
++`spec/4.7/columnar_segments.rs` spells out. -->
++
++## The encodings
++
++| tag | name | payload | which column speaks it |
++| --- | --- | --- | --- |
++| TODO | TODO | TODO | TODO |
++
++<!-- TODO: one row per tag: its number, its constant's name, its payload layout byte by byte (the
++widths: a `u16` name length, `i64` timestamps, the eight bytes of an `f64`'s bits), and which column
++may use it. Say what the varint in the delta encoding is — zigzag, seven bits per byte — and why the
++difference is taken and put back with wrapping arithmetic. -->
++
++## How an encoding is chosen
++
++<!-- TODO: the rule, in one sentence, and what it means for a tie. Say what the choice is *not*
++allowed to look at — the compressed size — and why a format whose bytes depend on a compressor's
++release is a format nobody can pin. -->
++
++## The values that break a careless encoder
++
++<!-- TODO: the edge cases the spec's round trip is built on, and what each one does to an encoder
++that was written in a hurry: `i64::MIN` next to `i64::MAX` under a delta encoding, `-0.0` and `NaN`
++under a run-length encoding that compares with `==`, `±inf` and a `NaN` payload under anything that
++goes through a decimal or a comparison. One paragraph each, phrased as the failure, not as advice.
++-->
++
++## What a reader refuses
++
++<!-- TODO: the four inputs [the reader](../src/engine/segment/decode.rs) is handed — a file this
++build wrote, a file somebody else wrote, a truncated one and a corrupted one — and what each of the
++last three gets: a typed error that names what disagreed, never a panic and never the records that
++happened to decode before the bytes ran out. Name the error variant. -->
++
++## The size budget
++
++| metric | what it counts | baseline |
++| --- | --- | --- |
++| TODO | TODO | TODO |
++
++<!-- TODO: one row per metric `tests/budget_segments.rs` prints, with the baseline
++`course/tracks/lakelet/budget/4.7-columnar-segments.toml` records for it. Say which of them are upper
++bounds rather than targets, what the two workloads are, and which counts show that the workload had
++something in it. The names here are the ones the harness prints and the baseline is written in. -->
++
++The numbers come from the project's own harness:
++
++```sh
++cargo test -p lakelet --test budget_segments -- --nocapture
++```
++
++<!-- TODO: name the gate that compares those lines with the baseline (`kiln check
++lakelet/4.7-columnar-segments --slow`), and say what it does with a metric the harness stopped
++printing. Link [the harness](../tests/budget_segments.rs). -->
++
++## What is not here yet
++
++<!-- TODO: the two questions this format leaves open — who decides how many records one segment
++holds, and what happens when two segments hold the same series — and the steps that own them. Name
++`lakelet/4.8-compaction` and the reader promise it has to keep. -->
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 679e429..13e2c79 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -24,6 +24,9 @@ pub mod wal;
+ // `lakelet/4.5-batch-writes`: what the write path costs, and the one thing that decides it —
+ // how many payloads share a call. The counters a page and a budget are written in live here.
+ pub mod flush;
++// `lakelet/4.7-columnar-segments`: what a flush writes — the same records, laid out by column and
++// compressed, in a closed file a reader can be handed on its own. The layout is `docs/format.md`.
++pub mod segment;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/segment/compress.rs b/src/engine/segment/compress.rs
+new file mode 100644
+index 0000000..70782aa
+--- /dev/null
++++ b/src/engine/segment/compress.rs
+@@ -0,0 +1,64 @@
++//! The block compressor: what turns a column block into the bytes a segment file carries.
++//!
++//! Step `lakelet/4.7-columnar-segments`. Columns are how the *representation* gets small — a series
++//! written once and counted, a clock written as its steps, a flat line written as one run — and this
++//! is the second half of the same claim: the bytes that remain are still full of the repetition a
++//! telemetry block has, and a general-purpose compressor finds what the encodings above did not.
++//! The two are not alternatives. `zstd` at its default level compresses a block that has already
++//! been delta-encoded and run-length-encoded far better than it compresses the rows it came from,
++//! and it is the reason a segment file is smaller than the sum of its columns.
++//!
++//! ```text
++//!  in:   the column block, `encode::column_block`
++//!  out:  one `zstd` frame, at [`LEVEL`]
++//! ```
++//!
++//! Two things this module deliberately does **not** promise, because both are the point of the gate
++//! that judges it:
++//!
++//! * **the compressed bytes are not a format.** `zstd` may answer different bytes for the same input
++//!   after a release, so a segment is judged by the round trip and by its size and never by a pinned
++//!   compressed vector — a course is not allowed to fail a learner for a dependency's choice;
++//! * **a smaller file is not the claim on its own.** [`LEVEL`] is a fixed number rather than a knob
++//!   to be tuned until the budget passes: a level a deployment could raise is a trade between time
++//!   and bytes, and `lakelet/4.16-profiling` is where a decision like that gets measured.
++//!
++//! # Why the decompressor is given a limit
++//!
++//! Whoever decompresses a file is choosing how much memory to spend on the file's behalf, and a
++//! compressed block can describe far more output than it costs to store. So the call takes the
++//! **length the segment header promised** as its limit, and a frame that would decompress to more
++//! than that is a refusal: a damaged or hostile file gets to fail a check instead of choosing this
++//! process's allocation.
++
++use crate::error::Error;
++
++/// The `zstd` level every segment is compressed at.
++///
++/// Chosen once, here, because it is a number a reader of the format needs to be able to find: a
++/// deployment that raised it would write segments this build still reads — the frame says how it was
++/// compressed — but the *pages* about the format would be describing a build nobody runs.
++pub const LEVEL: i32 = 3;
++
++/// Compress one column block into the bytes a segment file carries.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the compressor itself fails — which for a block that fits in memory means
++/// the machine refused an allocation, not that the records were unusual.
++pub fn compress(block: &[u8]) -> Result<Vec<u8>, Error> {
++    let _ = block;
++    todo!("step lakelet/4.7-columnar-segments")
++}
++
++/// Decompress one block, refusing to produce more than `limit` bytes.
++///
++/// # Errors
++///
++/// [`Error::Protocol`] when the bytes are not a `zstd` frame, when the frame is cut short, and when
++/// it decompresses to more than `limit` — the three ways a file that someone else wrote can be
++/// something other than what the segment around it claims.
++pub fn decompress(frame: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
++    let _ = (frame, limit);
++    todo!("step lakelet/4.7-columnar-segments")
++}
+diff --git a/src/engine/segment/decode.rs b/src/engine/segment/decode.rs
+new file mode 100644
+index 0000000..e5bd62e
+--- /dev/null
++++ b/src/engine/segment/decode.rs
+@@ -0,0 +1,39 @@
++//! Reading a column block back into the records it holds.
++//!
++//! Step `lakelet/4.7-columnar-segments`. [`records`] is the inverse of
++//! [`crate::engine::segment::encode::column_block`], and it is the half of the format that decides
++//! what a *stranger's bytes* do. The rule it obeys is `lakelet/4.4-wal-recovery`'s, applied to a
++//! closed artefact: there is no prefix to fall back on, so a block is either the whole layout
++//! `4.7` writes or a refusal that names what was wrong — never a panic, and never the records it
++//! happened to get through before the bytes ran out.
++//!
++//! Three things are checked before anything is trusted, because each one is how a reader turns a
++//! corrupt file into a corrupt *answer*:
++//!
++//! * **the tag.** A column whose tag is not one [`crate::engine::segment::encode`] writes is refused
++//!   by number, rather than decoded as whatever its payload looks like;
++//! * **the lengths.** Every length in the block is compared with the bytes actually there before it
++//!   is used as an end, an offset or a capacity: a block that states a payload longer than it is, a
++//!   count no bytes can satisfy, or a run longer than the records left is a refusal. Nothing here
++//!   can reserve what a damaged field claims, which is what keeps a corrupt file from becoming an
++//!   allocation;
++//! * **the agreement between the columns.** A series column that runs to 900 records, a timestamp
++//!   column of 1000 and a value column of 4 is not three answers, it is one damaged block: the
++//!   count in the block's first eight bytes is what every column has to add up to, and a column
++//!   that adds up to anything else is refused.
++
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++/// The records a column block holds, in the order they were encoded.
++///
++/// # Errors
++///
++/// [`Error::Protocol`] when `block` is not the layout
++/// [`crate::engine::segment::encode::column_block`] writes — the sentence names which column and
++/// which part of it disagreed, because the reader of a failing case in the field is a person with a
++/// hex dump and no debugger.
++pub fn records(block: &[u8]) -> Result<Vec<Record>, Error> {
++    let _ = block;
++    todo!("step lakelet/4.7-columnar-segments")
++}
+diff --git a/src/engine/segment/encode.rs b/src/engine/segment/encode.rs
+new file mode 100644
+index 0000000..bce33a7
+--- /dev/null
++++ b/src/engine/segment/encode.rs
+@@ -0,0 +1,116 @@
++//! The column block: what a segment's records are before anything compresses them.
++//!
++//! Step `lakelet/4.7-columnar-segments`. This file owns the bytes that the golden vector in
++//! `spec/4.7/columnar_segments.rs` spells out, and `docs/format.md` is the same layout in prose. A
++//! segment's *file* adds a header and a `zstd` frame around what is written here ([`super`]); this
++//! is the part that has to stay readable by hand, because it is the part a mistake is visible in.
++//!
++//! ```text
++//!  0..8        u64, little endian: how many records every column holds
++//!  then one framed column per entry of [`ORDER`], in that order:
++//!    +0        u8: the column's tag — which of the four encodings below it uses
++//!    +1..5     u32, little endian: the length of the payload that follows
++//!    +5..      the payload
++//! ```
++//!
++//! # The four encodings
++//!
++//! | tag | name | payload | speaks for |
++//! | --- | --- | --- | --- |
++//! | 0 | [`PLAIN`] | one value after another, at its own width | every column |
++//! | 1 | [`RLE`] | `u32` runs, then per run `u32` length + one value | the value column |
++//! | 2 | [`DELTA`] | `i64` first timestamp, then one zigzag varint per step | the timestamp column |
++//! | 3 | [`DIC`] | `u32` names, then `u32` runs of entry ids | the series column |
++//!
++//! A column's *width* is its own: a value is the eight bytes of an `f64`'s bits, a timestamp eight
++//! bytes of `i64`, and a series entry a `u16` length in front of UTF-8 bytes.
++//!
++//! # How an encoding is chosen
++//!
++//! Each column speaks two of the four — the series column [`DIC`] and [`PLAIN`], the timestamp
++//! column [`DELTA`] and [`PLAIN`], the value column [`RLE`] and [`PLAIN`] — and the encoder writes
++//! the **shorter** of the two payloads. When both come out the same length, the encoding with the
++//! **lower tag** wins, which is [`PLAIN`]. That rule is the whole of the format's freedom: given the
++//! same records, the bytes are the same on every machine, and the golden vector is the proof.
++//!
++//! The rule is about the encoded payload, never about what a compressor would do with it: choosing
++//! an encoding by compressing all of them would make the bytes depend on the `zstd` release, and a
++//! format whose bytes move under a dependency upgrade is a format nobody can pin.
++//!
++//! # The values that break a careless encoder
++//!
++//! * **A delta that does not fit.** Timestamps are milliseconds, so an `i64` reaches 292 million
++//!   years either side of the epoch — and two of them at opposite ends have a difference that is not
++//!   an `i64`. `4.7`'s own edge case is `i64::MIN` next to `i64::MAX`. The subtraction has to be
++//!   `wrapping_sub` and the addition `wrapping_add` (the zigzag varint carries the wrapped value
++//!   exactly), because plain `-` panics in a debug build and wraps silently in a release one — the
++//!   two builds writing different files is the worst answer of the three;
++//! * **A run that is not a run.** [`RLE`] groups equal values, and `f64`'s `==` is not equality of
++//!   bits: it calls `-0.0` and `0.0` equal (so the sign of a zero is lost) and never calls `NaN`
++//!   equal to itself (so a constant `NaN` series never collapses). The comparison here is on
++//!   `to_bits()`, which is also the only route that carries `±inf` and a `NaN` payload through
++//!   unchanged.
++//!
++//! # Errors
++//!
++//! None of this file's calls can fail: a `Vec` of bytes is not a place failures come from. Reading
++//! the block back is [`super::decode`]'s, and that one can fail in every way a file can.
++
++use crate::engine::segment::COLUMNS;
++use crate::protocol::batch::Record;
++
++/// The columns of a segment, in the order the column block writes them.
++///
++/// The order is part of the format: a reader that wants the values still walks the series column and
++/// the timestamp column's framing to find them, and a file whose columns are in another order is not
++/// this build's segment (`lakelet/4.11-query-engine` is where that walk becomes a query plan's
++/// business).
++pub const ORDER: [&str; COLUMNS as usize] = ["series", "timestamp", "value"];
++
++/// Bytes of the tag in front of every column: which encoding it uses.
++pub const TAG: usize = 1;
++
++/// The length in front of every column's payload, and every count inside one: `u32`, little endian.
++pub const LENGTH: usize = 4;
++
++/// The length in front of a series name: a `u16`, little endian.
++pub const NAME: usize = 2;
++
++/// Bytes of framing a column occupies before its payload.
++pub const FRAME: usize = TAG + LENGTH;
++
++/// The record count in front of the columns: eight bytes, little endian.
++///
++/// Every column has to add up to this number ([`crate::engine::segment::decode`]), which is what
++/// makes the three streams one block instead of three files that happen to be next to each other.
++pub const COUNT: usize = 8;
++
++/// Tag 0: the values one after another, at their own width. The encoding every column speaks, and
++/// the winner of a tie.
++pub const PLAIN: u8 = 0;
++
++/// Tag 1: `u32` runs, then per run a `u32` length and one value. The value column's encoding, and
++/// the reason a constant series costs twelve bytes instead of eight kilobytes.
++pub const RLE: u8 = 1;
++
++/// Tag 2: an `i64` first timestamp, then one zigzag varint per step (the difference from the
++/// timestamp before it, `wrapping_sub`, `(d << 1) ^ (d >> 63)`, seven bits per byte, high bit set on
++/// every byte but the last). The timestamp column's encoding, and the reason an hour of one-second
++/// samples is not eight bytes each.
++pub const DELTA: u8 = 2;
++
++/// Tag 3: `u32` names, then for each `u16` length and UTF-8 bytes, then `u32` runs of `u32` length
++/// and `u32` entry index. The series column's encoding, and the reason the same series repeated
++/// costs one byte a sample instead of the name again.
++pub const DIC: u8 = 3;
++
++/// The column block of `records`: every record, laid out by column, uncompressed.
++///
++/// This is the function the format is: given the same records it answers the same bytes, which is
++/// what the golden vector pins and what `docs/format.md` describes. The decoder's inverse is
++/// [`crate::engine::segment::decode::records`].
++#[must_use]
++pub fn column_block(records: &[Record]) -> Vec<u8> {
++    let _ = records;
++    todo!("step lakelet/4.7-columnar-segments")
++}
+diff --git a/src/engine/segment/mod.rs b/src/engine/segment/mod.rs
+new file mode 100644
+index 0000000..d4f1886
+--- /dev/null
++++ b/src/engine/segment/mod.rs
+@@ -0,0 +1,132 @@
++//! A segment: the closed file a flush writes, with its records laid out in **columns**.
++//!
++//! Step `lakelet/4.7-columnar-segments`. `lakelet/4.5-batch-writes` made one call write a group of
++//! records and counted what it cost; what it did not change is what those records *look like* once
++//! they are on the device. So far they are rows: every record carries its own series name, its own
++//! timestamp and its own eight-byte value, and a telemetry series pays that at every sample. This
++//! module is the other layout — the series in one stream, the timestamps in another, the values in a
++//! third, each encoded against the redundancy it actually has — and `docs/format.md` is where that
++//! layout is written down, because a format nobody else can read is a bug with a deadline.
++//!
++//! ```text
++//!  0..4         `MAGIC`: the four bytes that say this file is a lakelet segment
++//!  4            `VERSION`: the layout's version, one byte
++//!  5            `COLUMNS`: how many column streams follow, one byte — this build writes 3
++//!  6..10        u32, little endian: the **column block**'s length, before compression
++//!  10..         one sealed block, in the shape `wal::segment` gives a record:
++//!                 10..14      u32, little endian: the compressed length (c)
++//!                 14..14+c    the compressed column block: one `zstd` frame
++//!                 14+c..18+c  u32, little endian: the seal over the two above
++//! ```
++//!
++//! The column order is **fixed**, and it is the order a query wants it in: series, timestamp,
++//! value. A reader that needs one column still walks the framing of the ones before it, which is
++//! the price of writing every column's length in front of it — and the reason
++//! `lakelet/4.11-query-engine` will be able to say which columns it read.
++//!
++//! Three choices in that layout are worth their reasons, because each one is a thing a file format
++//! can get wrong:
++//!
++//! * **the file declares itself.** [`MAGIC`], [`VERSION`] and [`COLUMNS`] are what make "this is not
++//!   this build's segment" a *decision* instead of a guess — the discipline
++//!   `lakelet/4.4-wal-recovery` brought to the log, applied to a closed artefact. And a segment is
++//!   either whole or refused: a log is replayed to a prefix, a segment has no prefix to offer,
++//!   because nothing is being appended to it;
++//! * **every byte is checked.** The column block travels as one sealed blob
++//!   (`wal::checksum`), and the header's own fields are each compared with the bytes around them: a
++//!   byte that flipped, a file that was cut short and a file that is somebody else's are three
++//!   refusals, and none of them is a shorter answer;
++//! * **the block states its uncompressed length.** A reader of a compressed blob has to know how
++//!   much memory it is being asked for *before* it asks, so the length is in the header and the
++//!   decompressor is handed it as a limit: a file cannot choose this process's allocation, and a
++//!   byte that flipped there is refused by the length comparison after the block decompresses.
++//!
++//! What this module deliberately does not decide: how many records one segment holds, or when a new
++//! one starts (`lakelet/4.8-compaction`), and when bytes reach the device
++//! (`lakelet/4.3-write-path-adr` owns that for the log; a segment is written whole, because half a
++//! segment is not a segment).
++
++pub mod compress;
++pub mod decode;
++pub mod encode;
++
++use std::path::Path;
++
++use crate::engine::wal::checksum;
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++/// The four bytes at the start of every segment this build writes.
++pub const MAGIC: [u8; 4] = *b"LKLS";
++
++/// Version of the layout above. A file that says anything else is not this build's segment.
++pub const VERSION: u8 = 1;
++
++/// How many column streams a segment holds, in the fixed order [`encode::ORDER`] states.
++pub const COLUMNS: u8 = 3;
++
++/// The bytes a segment starts with: [`MAGIC`], [`VERSION`] and [`COLUMNS`].
++pub const HEADER_BYTES: [u8; 6] = [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], VERSION, COLUMNS];
++
++/// The length field in front of the column block: four bytes, little endian.
++pub const LENGTH: usize = 4;
++
++/// How many bytes of a segment come before its sealed block: the header and that length.
++pub const HEADER: usize = HEADER_BYTES.len() + LENGTH;
++
++/// The shortest thing that can be a segment: the header, an empty block and its seal.
++pub const MIN_BYTES: usize = HEADER + LENGTH + checksum::LEN;
++
++/// The bytes of one segment: every record it holds, encoded by columns and compressed.
++///
++/// The whole file is built here and written by [`write`], so that a caller can compare two segments
++/// or hand the bytes somewhere else without a filesystem in the way. Nothing here touches a disk.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the compressor refuses — which for a block that fits in memory means the
++/// machine refused an allocation, not that the records were unusual.
++pub fn encode(records: &[Record]) -> Result<Vec<u8>, Error> {
++    let _ = records;
++    todo!("step lakelet/4.7-columnar-segments")
++}
++
++/// Read the records out of one segment's bytes.
++///
++/// The inverse of [`encode`], and the only reader: it is handed the bytes of a file this step wrote,
++/// a file somebody else wrote, a cut one or a corrupted one, and every one of those is either
++/// records or a typed error naming what failed.
++///
++/// # Errors
++///
++/// [`Error::Protocol`] when the bytes are not this build's segment: a header that does not say so, a
++/// block whose seal does not verify, a block that does not decompress to the length the header
++/// promised, or a column block that is not the layout [`encode`] writes.
++pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, Error> {
++    let _ = bytes;
++    todo!("step lakelet/4.7-columnar-segments")
++}
++
++/// Write `records` into `path` as one segment, replacing whatever is there.
++///
++/// A segment is written whole: the empty file an interrupted write would leave is not a segment, and
++/// [`decode`] refuses it instead of reading it as a store with no records in it. The directory is
++/// the caller's business — this call does not create it.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the file cannot be written or flushed.
++pub fn write(path: &Path, records: &[Record]) -> Result<(), Error> {
++    let _ = (path, records);
++    todo!("step lakelet/4.7-columnar-segments")
++}
++
++/// Read the records out of the segment at `path`.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the file cannot be read, and everything [`decode`] refuses.
++pub fn read(path: &Path) -> Result<Vec<Record>, Error> {
++    let _ = path;
++    todo!("step lakelet/4.7-columnar-segments")
++}
+diff --git a/tests/budget_segments.rs b/tests/budget_segments.rs
+new file mode 100644
+index 0000000..fc3bd49
+--- /dev/null
++++ b/tests/budget_segments.rs
+@@ -0,0 +1,235 @@
++//! The size budget's harness for `lakelet/4.7-columnar-segments`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.7-columnar-segments
++//! --slow` runs, and the counts it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.7-columnar-segments.toml`.
++//!
++//! What it measures is **bytes, never the clock**: how much a segment costs for a workload whose
++//! shape is counted as well, so that a small file cannot come from a workload that had nothing in
++//! it. A byte count is the same number on a loaded machine as on an idle one, which is why `kiln`'s
++//! budget gate compares counts (`handoff M2 §1.1`) and why no run of this file can flake because
++//! something else was compiling. `cargo test -p lakelet --test budget_segments -- --nocapture`
++//! prints the lines by hand; the `lakelet-budget` prefix is what the gate reads.
++//!
++//! Two workloads, because one shape cannot say what the encoding is for:
++//!
++//! * **a block of telemetry** — many series, each with its own run of consecutive timestamps and
++//!   values that hold still for a while. This is what a flush of an ingest batch looks like, and it
++//!   is the shape the counts are taken on;
++//! * **a flat line** — one series, one timestamp, one value, repeated. Nothing about it is
++//!   redundant in the *rows*, and everything about it is redundant in the *columns*, which is the
++//!   encoding's whole claim stated as a number. Its metric is the column block and not the file on
++//!   purpose: a compressor would have made the rows small too, so the file would not say whether the
++//!   encodings did anything.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness a learner can break by editing their own fixture would judge the
++//! fixture instead of the segment.
++
++use std::path::PathBuf;
++
++use lakelet::engine::segment;
++use lakelet::engine::segment::encode;
++use lakelet::protocol::batch::Record;
++
++/// Records in each workload.
++const SAMPLES: usize = 1024;
++
++/// Series the block workload spreads them over.
++const SERIES: usize = 8;
++
++/// Distinct values the block workload's value column holds, cycled through.
++const VALUES: usize = 16;
++
++/// How many samples in a row share one value, which is what a run-length column is for.
++const RUN: usize = 16;
++
++/// Milliseconds between two samples of one series: a clock that advances by a nearly constant step.
++const STEP: i64 = 1000;
++
++/// The first timestamp of every series, so the workload is the same on every machine.
++const EPOCH: i64 = 1_700_000_000_000;
++
++/// The name of one series: a metric and its labels, as a client writes them.
++fn name(series: usize) -> String {
++    format!("cpu,host=h{series}")
++}
++
++/// A block of telemetry: `SAMPLES` records over `SERIES` series, in the order a flush writes them.
++///
++/// Series-major — one series' whole run of samples, then the next — which is what makes the series
++/// column long runs of one id instead of an id alternating with every record. The value within a
++/// series steps every [`RUN`] samples, so the value column has runs a run-length encoding can
++/// collapse, and the timestamps advance by [`STEP`] with one backward jump at each series boundary:
++/// the two shapes a delta encoding has to get right.
++fn block() -> Vec<Record> {
++    let per_series = SAMPLES / SERIES;
++    let mut records = Vec::with_capacity(SAMPLES);
++    for series in 0..SERIES {
++        for index in 0..per_series {
++            records.push(Record {
++                series: name(series),
++                ts_millis: EPOCH + index as i64 * STEP,
++                value: ((index / RUN) % VALUES) as f64,
++            });
++        }
++    }
++    records
++}
++
++/// The same number of records with nothing redundant in them: one series, one timestamp, one value.
++fn flat() -> Vec<Record> {
++    (0..SAMPLES)
++        .map(|_| Record {
++            series: name(0),
++            ts_millis: EPOCH,
++            value: 1.5,
++        })
++        .collect()
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the segment is written.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("lakelet-segment-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the segment of this workload goes.
++    fn file(&self) -> PathBuf {
++        self.path.join("segment")
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// What one workload cost, counted.
++struct Measured {
++    /// Bytes of the column block: what the encodings produced, before anything compresses it.
++    block: u64,
++    /// Bytes of the segment file: the header, the compressed block and the seal.
++    file: u64,
++    /// Records that came back out of the file.
++    read: u64,
++    /// Records that did not come back, or that came back as something else.
++    mismatches: u64,
++}
++
++/// Write `records` as a segment in a directory of its own, read it back, and count what it cost.
++///
++/// The two failures that are the learner's are counted rather than raised: a segment that cannot be
++/// written or read leaves `read` at zero and every record a mismatch, which the budget gate reports
++/// as the count that moved — a harness that panicked instead would have its numbers read as missing.
++fn measure(label: &str, records: &[Record]) -> Measured {
++    let directory = Dir::new(label);
++    let file = directory.file();
++    let block = encode::column_block(records).len() as u64;
++    if let Err(error) = segment::write(&file, records) {
++        eprintln!("the segment of {label} could not be written: {error}");
++        return Measured {
++            block,
++            file: 0,
++            read: 0,
++            mismatches: records.len() as u64,
++        };
++    }
++    let file_bytes = std::fs::metadata(&file).map_or(0, |metadata| metadata.len());
++    let read = match segment::read(&file) {
++        Ok(read) => read,
++        Err(error) => {
++            eprintln!("the segment of {label} could not be read: {error}");
++            return Measured {
++                block,
++                file: file_bytes,
++                read: 0,
++                mismatches: records.len() as u64,
++            };
++        }
++    };
++    let mismatches = read
++        .iter()
++        .zip(records)
++        .filter(|(read, written)| !same(read, written))
++        .count() as u64;
++    let missing = records.len().saturating_sub(read.len()) as u64;
++    Measured {
++        block,
++        file: file_bytes,
++        read: read.len() as u64,
++        mismatches: mismatches + missing,
++    }
++}
++
++/// `true` when a record came back exactly as it went in — every bit of the value included, because
++/// `-0.0` and `NaN` are values this step's own edge cases are about.
++fn same(read: &Record, written: &Record) -> bool {
++    read.series == written.series
++        && read.ts_millis == written.ts_millis
++        && read.value.to_bits() == written.value.to_bits()
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++/// One ratio line, to four decimals — a ratio of two counts, so it is as steady as they are.
++fn ratio(name: &str, value: f64) {
++    println!("lakelet-budget {name}={value:.4}");
++}
++
++#[test]
++fn the_segment_size_budget() {
++    let telemetry = block();
++    let measured = measure("block", &telemetry);
++
++    // The flat line: one series, one timestamp, one value, repeated. Its rows have no redundancy at
++    // all and its columns have nothing else, which is the claim the encodings make — taken before
++    // the compressor so that the number is about the encodings.
++    let flat = flat();
++    let flat_measured = measure("flat", &flat);
++
++    // What the workload was, so a small file cannot come from an empty one: the shape is counted,
++    // and so is the answer that every record of both workloads came back out of its file.
++    metric("samples", telemetry.len() as u64);
++    metric("series", SERIES as u64);
++    metric("distinct_values", VALUES as u64);
++    metric("samples_read", measured.read + flat_measured.read);
++    metric(
++        "mismatches_max",
++        measured.mismatches + flat_measured.mismatches,
++    );
++
++    // The size itself, at both layers: what the encodings produced and what the file weighs. An
++    // upper bound either way, so a cheaper encoding — a run-length of the deltas, a dictionary for
++    // the values — passes and only a bigger one fails.
++    metric("column_block_bytes_max", measured.block);
++    metric("segment_bytes_max", measured.file);
++    // The number this step exists for, in the unit that survives a change of workload: bytes on the
++    // device per sample stored.
++    ratio(
++        "bytes_per_sample_max",
++        measured.file as f64 / telemetry.len() as f64,
++    );
++    // And what the compressor bought: the file over the column block it came from.
++    ratio(
++        "compression_ratio_max",
++        measured.file as f64 / measured.block.max(1) as f64,
++    );
++    // The flat line's columns, which is where the encodings have to answer for themselves.
++    metric("flat_column_block_bytes_max", flat_measured.block);
++}

@@ -1,0 +1,56 @@
+# The size budget of `lakelet/4.7-columnar-segments`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_segments.rs`, which the step's scaffold ships); the metrics are the lines it prints,
+# and every one of them is a count or a byte total rather than a time — a count is the same number on
+# a loaded machine as on an idle one, which is why this lane judges counts at all (handoff M2 §1.1).
+#
+# An encoded column block is a deterministic function of the records, so the metrics about it are
+# exact; the compressed file is not (a `zstd` release may answer different bytes for the same input),
+# which is why the byte totals below carry more slack than the counts do, and why the course never
+# pins the compressed bytes themselves. A metric whose name ends in `_max` is an **upper bound**: "no
+# worse than this", not "about this", so an encoding that got *cheaper* — a run-length over the
+# deltas, a dictionary over the values — passes and only a bigger one fails.
+command = "cargo test -p lakelet --test budget_segments -- --nocapture"
+
+[metric]
+# The telemetry workload: records, distinct series and distinct value bit patterns. Counts of the
+# workload and judged within ±10%, because their job is to keep a small file from being an empty one:
+# a segment of six records would pass every bound below.
+samples = 1024
+series = 8
+distinct_values = 16
+# Records that came back out of both workloads' segments (the telemetry block and the flat line, 1024
+# each), read back through the file rather than through the encoder: the round trip is what makes the
+# byte count worth comparing at all.
+samples_read = 2048
+# And the records that did not, counted. An upper bound of zero: a single record that came back
+# different — `-0.0` that lost its sign, a `NaN` that came back as another `NaN` — fails this lane
+# before any size is judged.
+mismatches_max = 0
+# The telemetry workload's columns before compression: 3 032 bytes on the reference solution, and an
+# upper bound of 3 100. The number is exact for this format (the encodings are chosen by payload
+# length, so the same records give the same bytes everywhere), and the 2% is room for a build that
+# reaches for the same bytes in a different order.
+column_block_bytes_max = 3100
+# The file those columns travel in: 170 bytes on the reference solution, bound at 200 — a header, one
+# `zstd` frame and a seal. The slack is what a different `zstd` release may cost, and it is 18%
+# rather than the 10% the counts get because the compressor's output is not this project's decision.
+segment_bytes_max = 200
+# The number this step exists for: bytes on the device per sample stored. 0.1660 on the reference
+# solution, bound at 0.20. The same records cost 24 bytes a sample as rows — a row is eight bytes of
+# clock, eight of value and the name — so the bound is what "columnar plus a block compressor is
+# worth an order of magnitude" reads as when it is a number.
+bytes_per_sample_max = 0.20
+# What the compressor bought on that workload: the file over the column block it came from, 0.0561 on
+# the reference solution, bound at 0.07. An upper bound, so a better compressor (or a higher level)
+# passes; the bound exists because a `level` tuned until this metric passed would be a knob nobody
+# chose.
+compression_ratio_max = 0.07
+# The flat line — one series, one timestamp, one value repeated 1 024 times — measured on the *column
+# block*, so the number is about the encodings and not about `zstd` (a compressor makes the rows of
+# a flat line small too). 1 099 bytes on the reference solution against 29 719 with every column
+# written plain, bound at 1 150: the run-length and delta encodings are the whole of that difference,
+# and the drill that undoes them is what this bound is for.
+flat_column_block_bytes_max = 1150
