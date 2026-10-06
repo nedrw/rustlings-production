@@ -1,0 +1,1143 @@
+diff --git a/src/service/backpressure.rs b/src/service/backpressure.rs
+new file mode 100644
+index 0000000..a31928a
+--- /dev/null
++++ b/src/service/backpressure.rs
+@@ -0,0 +1,379 @@
++//! The bound between accepting a frame and writing it, and the decision overload makes.
++//!
++//! Step `lakelet/4.6-ingest-backpressure`. `lakelet/4.1-ingest-protocol` made the frame the unit the
++//! client is answered about, and `lakelet/4.5-batch-writes` made it the unit the write path writes;
++//! what neither decided is how *much* may sit between the two. That is this file, and it is three
++//! things:
++//!
++//! * [`Queue`] is a bounded queue of frames between the accept loop and the write path. Its bound is
++//!   a number the deployment chooses ([`DEFAULT_CAPACITY`] is what it gets when nobody says), and
++//!   nothing a producer does may make the queue hold more than that;
++//! * [`Policy`] is what the queue does when a frame arrives and the bound is reached: wait for room,
++//!   refuse the arrival, or take the frame that has been waiting longest back. `Sample` is the one
++//!   policy that is a *rate* rather than a bound — it drops frames without the queue being full,
++//!   because what it protects is the write path's throughput and not the memory;
++//! * [`Tally`] is what one caller is told: the frames it offered that were written, and the ones the
++//!   queue dropped — including frames a later decision took back while they were still queued. A
++//!   caller that reads its own tally therefore cannot acknowledge a frame the queue dropped, whoever
++//!   offered it.
++//!
++//! The conservation law the whole file is built around, and the one the spec checks per policy:
++//!
++//! ```text
++//! offered == accepted + dropped     every frame offered is either the queue's or dropped
++//! accepted == written + queued      at rest: the queue owes a write for what the writer has not
++//!                                   written yet
++//! ```
++//!
++//! `accepted` counts the frames the queue took in and has not dropped again, so a frame that was
++//! queued and later evicted leaves `accepted` with it. The two equations are one statement, and the
++//! second is what makes "a dropped frame is never acknowledged" checkable rather than promised.
++//!
++//! Both of them are statements about the queue *at rest*, and the two moments where that is not the
++//! case are worth naming: a frame a `Block` producer is still waiting to hand over is offered and not
++//! yet decided, and a frame the writer has taken is written when it says so and not when it was
++//! handed over. Neither window can move an acknowledgement ahead of a write, which is the promise
++//! these counters exist to make checkable.
++//!
++//! What this file deliberately does not own: the bytes of a record
++//! ([`crate::engine::wal::segment`]), when an append waits for the device
++//! ([`crate::engine::wal::Policy`]) and what a write costs ([`crate::engine::flush`]). A frame
++//! reaches the write path through one call, and this file only decides when that call happens and
++//! what the daemon does when it cannot keep up.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use crate::error::Error;
++
++/// One unit of the queue: the payload of one frame.
++///
++/// The frame is the unit because it is the unit everywhere else in this project: the bytes the client
++/// sent and the daemon answers for (`lakelet/4.1-ingest-protocol`), and the bytes the write path
++/// writes as one record (`lakelet/4.5-batch-writes`). A frame carries one or more samples, and they
++/// share the frame's decision — a frame the queue drops is a frame whose samples were never written,
++/// because half a frame is not a batch this daemon writes.
++pub type Payload = Vec<u8>;
++
++/// What the fraction `Sample` keeps is worth: one arriving frame in four is taken in, and the rest
++/// are dropped.
++///
++/// A constant rather than a configuration key: the *decision* is what a deployment chooses — four
++/// policies with four different costs — and the rate at which one of them thins a stream is stated
++/// here, in one place, next to the policy that uses it. Turning it into a key is a one-line change
++/// the day a deployment needs two of them.
++pub const SAMPLE_KEEP: u64 = 4;
++
++/// The capacity a queue gets when no configuration layer names one, in frames.
++///
++/// A frame's payload is bounded by [`crate::protocol::frame::MAX_PAYLOAD`], so this number is the
++/// difference between a few hundred kibibytes of ordinary telemetry and a gigabyte of the largest
++/// frames the protocol allows — which is why `lakelet/4.6-ingest-backpressure` makes it a setting a
++/// deployment owns instead of a constant the code believes is right for everyone.
++pub const DEFAULT_CAPACITY: usize = 1024;
++
++/// The policy a queue gets when no configuration layer names one.
++///
++/// `Block`, because a default must not lose data: a deployment that would rather drop frames than
++/// make its producers wait is saying something about its workload, and it says it in
++/// `queue.policy`.
++pub const DEFAULT_POLICY: Policy = Policy::Block;
++
++/// What a queue does when a frame arrives and the bound is reached.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Policy {
++    /// Wait for room, then take the frame in. Nothing is ever dropped and the producer is what feels
++    /// the overload — the only policy under which `dropped` stays at zero.
++    Block,
++    /// Refuse the arriving frame. The producer is answered, and counted, instead of made to wait.
++    DropNewest,
++    /// Take the arriving frame in and drop the frame that has been waiting longest. Nothing is
++    /// refused, and the loss lands on data that arrived earlier.
++    DropOldest,
++    /// Take one arriving frame in [`SAMPLE_KEEP`] and refuse the rest, whether or not there is room.
++    /// What survives is a thinned stream rather than a complete one, and which frames survive depends
++    /// on the order they arrived in — which is the schedule's business.
++    Sample,
++}
++
++impl Policy {
++    /// The text form, as the configuration file writes it.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Policy::Block => "block",
++            Policy::DropNewest => "drop-newest",
++            Policy::DropOldest => "drop-oldest",
++            Policy::Sample => "sample",
++        }
++    }
++
++    /// Read the text form.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] for anything but those four names, so a typo in a configuration file is
++    /// answered with a sentence listing what this build speaks, instead of a queue that silently
++    /// decides something nobody chose.
++    pub fn parse(text: &str) -> Result<Self, Error> {
++        match text {
++            "block" => Ok(Policy::Block),
++            "drop-newest" => Ok(Policy::DropNewest),
++            "drop-oldest" => Ok(Policy::DropOldest),
++            "sample" => Ok(Policy::Sample),
++            other => Err(Error::Invalid {
++                detail: format!(
++                    "`{other}` is not a queue policy: use `block`, `drop-newest`, `drop-oldest` or \
++                     `sample`"
++                ),
++            }),
++        }
++    }
++}
++
++/// What the queue has seen and done, counted.
++///
++/// Counters and never durations: the same numbers on a loaded machine as on an idle one, which is
++/// what makes them something a gate can compare (`handoff M2 §1.1`) and a page can state.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Stats {
++    /// Frames offered to the queue.
++    offered: u64,
++    /// Frames the queue took in and has not dropped again: what it owes a write for.
++    accepted: u64,
++    /// Frames the queue dropped: refusals, and frames a policy took back while they were queued.
++    dropped: u64,
++    /// Frames the write path wrote out of this queue.
++    written: u64,
++}
++
++impl Stats {
++    /// Frames offered to the queue, counted once each before any policy decided anything.
++    #[must_use]
++    pub fn offered(&self) -> u64 {
++        self.offered
++    }
++
++    /// Frames the queue took in and has not dropped again.
++    ///
++    /// The counter the conservation law is written with: `offered == accepted + dropped`, and at rest
++    /// `accepted == written + queued`. A frame an eviction took back leaves this counter again,
++    /// because the queue no longer owes a write for it.
++    #[must_use]
++    pub fn accepted(&self) -> u64 {
++        self.accepted
++    }
++
++    /// Frames the queue dropped.
++    #[must_use]
++    pub fn dropped(&self) -> u64 {
++        self.dropped
++    }
++
++    /// Frames the write path wrote.
++    #[must_use]
++    pub fn written(&self) -> u64 {
++        self.written
++    }
++}
++
++/// What a caller is told about the frames it offered.
++///
++/// A caller keeps one of these, hands a clone to every [`Queue::offer`], and reads it when it has to
++/// say what happened: at the end of a connection, at the end of a run. Only the queue moves the
++/// counters, because only the queue knows the two moments — a frame is `written` when the write path
++/// wrote it, and `dropped` when a policy refused it *or* took it back while it was still queued.
++///
++/// That is the promise `lakelet/4.1-ingest-protocol` made about an accepted frame, made checkable: a
++/// caller that offered `n` frames and reads its tally after [`Queue::settled`] finds
++/// `written + dropped == n`, so it cannot report a frame the queue dropped as one that was stored,
++/// whatever the policy did and whoever offered the frame.
++#[derive(Debug, Default)]
++pub struct Tally {
++    /// Frames offered through this tally that are on the file.
++    written: AtomicU64,
++    /// Frames offered through this tally that the queue dropped.
++    dropped: AtomicU64,
++    /// Payload bytes of the written frames.
++    bytes: AtomicU64,
++}
++
++impl Tally {
++    /// A tally with nothing on it.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Frames offered through this tally that the write path has written.
++    #[must_use]
++    pub fn written(&self) -> u64 {
++        self.written.load(Ordering::Relaxed)
++    }
++
++    /// Frames offered through this tally that the queue dropped.
++    ///
++    /// A refusal is visible at the [`Queue::offer`] that caused it; a frame the queue took in and an
++    /// eviction later took back is not, which is the whole reason this counter exists.
++    #[must_use]
++    pub fn dropped(&self) -> u64 {
++        self.dropped.load(Ordering::Relaxed)
++    }
++
++    /// Payload bytes of the frames offered through this tally that were written.
++    #[must_use]
++    pub fn bytes(&self) -> u64 {
++        self.bytes.load(Ordering::Relaxed)
++    }
++}
++
++/// What the queue did with one offered frame.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Decision {
++    /// The frame is the queue's now. The writer will write it unless a later decision takes it back
++    /// while it is still queued; the caller's [`Tally`] is charged when either happens.
++    Accepted,
++    /// The policy refused the frame, which comes back here: nothing was queued, nothing will be
++    /// written, and the caller's tally counts it as dropped.
++    Refused(Payload),
++    /// The frame was taken in, and `evicted` — a frame that was still queued, and that comes back
++    /// here — was dropped to make room for it. Which of the two was lost is the difference between
++    /// this and [`Decision::Refused`], and it is why this is not a boolean.
++    Evicted(Payload),
++}
++
++/// The bounded queue between accepting a frame and writing it.
++///
++/// One of these is the daemon's whole memory budget between the socket and the log: at most
++/// [`Queue::capacity`] frames are waiting at once, plus the one batch the writer has taken and not yet
++/// written, which is bounded by the same number.
++///
++/// **The state is yours.** This file declares no fields, because where the bound lives is the first
++/// decision of the step: the bound *is* the number of frames the queue is holding, and a second
++/// number that tracks the same thing — a counter beside the deque, a permit pool that is not the
++/// slots — is a second number that can disagree with it. A lock this queue takes is a lock it must
++/// not hold across an `await`: a producer parked on the bound must not be holding what the writer
++/// needs to free a slot.
++pub struct Queue {
++    // The state this step designs: the bound, the frames waiting, and whatever `Block` parks on.
++}
++
++impl Queue {
++    /// A queue that holds at most `capacity` frames and decides with `policy`.
++    ///
++    /// The two numbers are a deployment's (`service::config` reads them from the four layers, and the
++    /// step's page says which key each one comes from); this call is where they become a bound and a
++    /// decision.
++    ///
++    /// A capacity of zero is not a queue that refuses everything: the configuration layer turns it
++    /// into a refusal with a sentence naming the key, and this call is only reached with a capacity
++    /// of at least one.
++    #[must_use]
++    pub fn new(capacity: usize, policy: Policy) -> Arc<Self> {
++        let _ = (capacity, policy);
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// How many frames may be waiting at once.
++    #[must_use]
++    pub fn capacity(&self) -> usize {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// What this queue does when a frame arrives and nothing has room.
++    #[must_use]
++    pub fn policy(&self) -> Policy {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// How many frames are waiting for the writer right now.
++    #[must_use]
++    pub fn depth(&self) -> usize {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// The tally: what this queue has seen and what it did with it.
++    #[must_use]
++    pub fn stats(&self) -> Stats {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// Offer the frames one turn delivered, in order: the decision this step is about.
++    ///
++    /// The turn is the unit the accept loop hands over — what one read delivered, which is what
++    /// `lakelet/4.5-batch-writes` made the unit of a *write* — and every frame in it is decided, in
++    /// order, before the writer is told anything. A writer that woke in the middle of a turn would
++    /// write that turn as two batches, and the batch size would stop being a number anybody chose.
++    ///
++    /// What the [`Policy`] does with each frame:
++    ///
++    /// * [`Policy::Block`] waits for room and takes the frame in, so nothing is dropped and the
++    ///   producer is what feels the overload;
++    /// * [`Policy::DropNewest`] refuses the arrival when nothing has room;
++    /// * [`Policy::DropOldest`] always takes the arrival in, dropping the frame that has been waiting
++    ///   longest to make room for it — never one the write path already wrote, because the queue only
++    ///   holds frames nobody has written;
++    /// * [`Policy::Sample`] takes one arrival in [`SAMPLE_KEEP`] and refuses the rest, and makes room
++    ///   for a kept arrival the way `DropOldest` does.
++    ///
++    /// Answers one [`Decision`] per frame, in the order the frames were given. Every frame is counted
++    /// as offered here, whether the queue takes it, drops it, or makes this producer wait for room —
++    /// which is why a checkpoint taken while a producer is waiting sees `offered` ahead of
++    /// `accepted + dropped`: the frame is in neither column yet.
++    ///
++    /// The caller's [`Tally`] is charged exactly once for every frame, whatever happened to it — a
++    /// write later, or a drop now — so `offered == written + dropped` holds for the caller and not
++    /// only for the queue.
++    pub async fn offer(&self, frames: Vec<Payload>, tally: Arc<Tally>) -> Vec<Decision> {
++        let _ = (frames, tally);
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// The writer's side: the frames to write next, oldest first.
++    ///
++    /// Waits until there is something to write, and answers everything the queue holds *at that
++    /// moment* — so the size of one write is the queue's decision and not this loop's
++    /// (`lakelet/4.5-batch-writes`), and the queue's bound is what makes that number a deployment's
++    /// instead of whatever arrived in one turn.
++    ///
++    /// Answers `None` once the queue is closed *and* empty, which is what ends a writer's loop.
++    pub async fn take(&self) -> Option<Vec<Payload>> {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// The writer's side, after the write: `count` frames taken by [`Queue::take`] are on the file.
++    ///
++    /// Deliberately a separate call from [`Queue::take`]: a frame is written when the write path says
++    /// so, and a queue that moved this counter when it *handed the frames over* would be reporting an
++    /// intention as an outcome. It is also where the callers' [`Tally`] counters move, which is what
++    /// lets a caller say what it stored without reading the file.
++    pub fn wrote(&self, count: usize) {
++        let _ = count;
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// Wait until every frame offered so far has been written or dropped.
++    ///
++    /// Two things wait for this. A connection waits before it reports what it accepted, because a
++    /// frame it counted as accepted is one the client is allowed to believe is safe
++    /// (`lakelet/4.1-ingest-protocol`) and the write now happens somewhere else; and a stop path waits
++    /// after closing the queue, because a daemon that abandons what it accepted is the same lie one
++    /// level up.
++    ///
++    /// This says nothing about frames offered *after* the call started: a queue under a producer that
++    /// never stops is never settled, which is the truth about it. The condition is the counters
++    /// themselves — every frame offered has been resolved, so nothing is waiting and nothing is being
++    /// written.
++    pub async fn settled(&self) {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++
++    /// Stop taking frames in. What is already queued is still written.
++    ///
++    /// This is how a daemon stops accepting without losing what it accepted: every later
++    /// [`Queue::offer`] is refused (and counted as an arrival the queue did not take), and
++    /// [`Queue::take`] answers `None` once nothing is left.
++    pub fn close(&self) {
++        todo!("step lakelet/4.6-ingest-backpressure")
++    }
++}
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 332cbf9..3ce7b97 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -68,6 +68,16 @@ pub struct Config {
+     // diffs that text between two machines, so a key appears in it when it is added and never
+     // leaves it.
+     // kiln:scaffold:begin
++    /// How many frames the queue between accepting and writing may hold at once
++    /// (`lakelet/4.6-ingest-backpressure`).
++    ///
++    /// A deployment's number rather than a constant, because it is the memory this process is
++    /// allowed to spend between the socket and the log: a frame may carry up to
++    /// [`crate::protocol::frame::MAX_PAYLOAD`] bytes, so the same capacity is a few hundred
++    /// kibibytes of ordinary telemetry or a gigabyte of the largest frames the protocol allows.
++    pub queue_capacity: usize,
++    /// What the queue does when a frame arrives and the bound is reached.
++    pub queue_policy: super::backpressure::Policy,
+     // kiln:scaffold:end
+ }
+ 
+@@ -81,6 +91,10 @@ impl Default for Config {
+             // Where the defaults of the settings declared in the block above live, for the same
+             // reason: a later step's keys arrive as insertions inside this region.
+             // kiln:scaffold:begin
++            queue_capacity: super::backpressure::DEFAULT_CAPACITY,
++            // Block, because a default must not lose data: a deployment that would rather drop
++            // frames than make its producers wait says so in `queue.policy`.
++            queue_policy: super::backpressure::DEFAULT_POLICY,
+             // kiln:scaffold:end
+         }
+     }
+diff --git a/src/service/mod.rs b/src/service/mod.rs
+index cf380dc..510ed41 100644
+--- a/src/service/mod.rs
++++ b/src/service/mod.rs
+@@ -11,4 +11,5 @@ pub mod logging;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod backpressure;
+ // kiln:scaffold:end
+diff --git a/tests/sim_backpressure.rs b/tests/sim_backpressure.rs
+new file mode 100644
+index 0000000..2136909
+--- /dev/null
++++ b/tests/sim_backpressure.rs
+@@ -0,0 +1,710 @@
++//! The overload schedules `lakelet/4.6-ingest-backpressure` is judged by: four policies, three
++//! producers, and one bound they all have to respect.
++//!
++//! Course content — the step's scaffold ships it, `slow:sim@N` runs it once per seed with
++//! `KILN_SIM_SEED` set, and the gate compares the `lakelet-sim` lines below in the order they were
++//! printed. Two things are therefore strict:
++//!
++//! * **the transcript is the schedule.** Every line is an event this scenario observed, and the seed
++//!   decides the order they happen in (`turmoil::Builder::rng_seed`, plus `enable_random_order` so
++//!   the nodes are stepped in a random order too). Which frame a policy drops is exactly the answer
++//!   that depends on that order — one producer's turn reaching the queue before another's is the
++//!   difference between "the oldest queued frame was evicted" and "the arriving one was refused" —
++//!   and that is why `slow:sim@3` is the gate this step is judged by. Nothing here prints a wall
++//!   clock, a path, an address or the iteration order of a map;
++//! * **the invariant is asserted here, not by the gate.** The gate can only see whether a run
++//!   passed. The claim this step makes — `offered == accepted + dropped`, and
++//!   `accepted == written + queued` at every checkpoint, with `Block` losing nothing — is checked
++//!   inside the scenario, per policy, and a schedule that breaks it fails the run with the sentence
++//!   that says which statement broke.
++//!
++//! # What the four phases are, and why the writer is held for three of them
++//!
++//! A phase is one policy, and every phase runs the same storm: three producers, six frames each, in
++//! turns of two, against a bound of three. `Block` needs its writer from the start — it waits for
++//! room instead of dropping, and room is what only the writer makes — so its transcript is the
++//! interleaving of offers and writes, and its checkpoint is taken once the queue is quiet. The other
++//! three are judged with the writer *held* until the controller says `drain`: that is what makes the
++//! bound reached at a moment the scenario chose, instead of a moment the machine's speed chose, and
++//! the depth at that checkpoint is the whole point of the phase.
++//!
++//! The store is real (the queue hands its frames to the write path the daemon uses,
++//! `lakelet/4.5-batch-writes`) and its policy is `Never`: when the device answers is `4.3`'s decision
++//! and not this scenario's, and a store that waited per batch would put a device's timing into a
++//! transcript that is supposed to be the schedule's.
++//!
++//! # The lines the gate reads
++//!
++//! * `phase` — a policy took over, with the bound it runs under and whether its writer is running;
++//! * `offered`, `refused`, `evicted` — one line per frame, in the order the queue decided about it.
++//!   `refused` carries the arriving frame because that is the frame the policy dropped; `evicted`
++//!   carries the frame that came back *and* the one that took its place;
++//! * `written` — one line per frame the write path wrote, with the size of the batch it travelled
++//!   in: the batch is the queue's decision (`4.5`'s boundary) and not this harness's;
++//! * `checkpoint` — the numbers at the moment the scenario looked, with the depth the queue held;
++//! * `tally` — what each producer was told about its own frames: the column that a shared queue
++//!   cannot fill in for it;
++//! * `verdict` — the invariant's answer, then `done` with the run's totals.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::sync::Mutex;
++use turmoil::Builder;
++use turmoil::net::{TcpListener, TcpStream};
++
++use lakelet::engine::Spool;
++use lakelet::engine::flush::Batcher;
++use lakelet::engine::wal::Policy as WalPolicy;
++use lakelet::protocol::batch::{self, Record};
++use lakelet::service::backpressure::{Decision, Payload, Policy, Queue, Tally};
++
++/// The seed this run uses when the judge does not name one.
++const DEFAULT_SEED: u64 = 1;
++/// The variable `slow:sim@N` sets: which schedule this run takes.
++const SEED: &str = "KILN_SIM_SEED";
++/// The daemon's name and port in the simulated network.
++const HOST: &str = "ingest";
++const PORT: u16 = 7000;
++/// The bound every phase runs under: small on purpose, so a storm of frames is an overload.
++const CAPACITY: usize = 3;
++/// Producers racing each other into the queue.
++const PRODUCERS: usize = 3;
++/// Frames each producer sends per phase, in turns of [`TURN`].
++const FRAMES: usize = 8;
++/// Frames per offer: one turn of the accept loop, which is `lakelet/4.5-batch-writes`' unit.
++///
++/// Deliberately *more* than [`CAPACITY`]: a turn that fits needs no decision at all, and a turn that
++/// cannot fit is what makes `Block` wait for the writer — the wait is the policy, and a scenario
++/// whose turns all fitted would never have shown it.
++const TURN: usize = 4;
++/// The policies the phases walk, in the order the transcript shows them.
++const POLICIES: [Policy; 4] = [
++    Policy::Block,
++    Policy::DropNewest,
++    Policy::DropOldest,
++    Policy::Sample,
++];
++/// How long a client waits between two polls of the host's status, in simulated milliseconds.
++const POLL: Duration = Duration::from_millis(10);
++
++/// A failure inside the scenario: the one sentence the run reports.
++type Failure = Box<dyn std::error::Error>;
++
++/// The seed this process was asked for.
++fn seed() -> u64 {
++    match std::env::var(SEED) {
++        Ok(text) => text
++            .parse()
++            .unwrap_or_else(|error| panic!("{SEED}=`{text}` is not a number: {error}")),
++        Err(_) => DEFAULT_SEED,
++    }
++}
++
++/// The bytes one frame carries, decided by the two numbers that name it, so the judge can rebuild
++/// every frame without reading the queue it is judging.
++fn payload(producer: usize, index: usize) -> Payload {
++    batch::encode(&[Record {
++        series: format!("sim,p={producer},i={index}"),
++        ts_millis: 1_700_000_000_000 + index as i64,
++        value: index as f64,
++    }])
++}
++
++/// The name the frame's own bytes carry: what an operator dropping it would see.
++fn name(payload: &Payload) -> String {
++    match batch::decode(payload) {
++        Ok(records) => records.first().map_or_else(
++            || format!("{} byte(s)", payload.len()),
++            |record| record.series.clone(),
++        ),
++        Err(error) => format!("{} byte(s) that are not a batch ({error})", payload.len()),
++    }
++}
++
++/// The value of `key=` in a reply, as a number.
++fn field(reply: &str, key: &str) -> u64 {
++    let (_, rest) = reply
++        .split_once(&format!("{key}="))
++        .unwrap_or_else(|| panic!("the reply `{reply}` carries no `{key}=`"));
++    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
++    digits
++        .parse()
++        .unwrap_or_else(|error| panic!("`{key}=` in `{reply}` is not a number: {error}"))
++}
++
++/// One whitespace-separated command word, as a number.
++fn number(word: Option<&str>, what: &str) -> Result<usize, Failure> {
++    let Some(word) = word else {
++        return Err(format!("this command needs a {what}").into());
++    };
++    word.parse()
++        .map_err(|error| format!("`{word}` is not a {what}: {error}").into())
++}
++
++/// The daemon the scenario drives: the write path, the queue of the phase that is open, and what the
++/// harness remembers about the producers that are offering to it.
++struct Host {
++    /// The write path, real files and all. The queue's frames reach it as one batch per take.
++    store: Arc<Mutex<Spool>>,
++    /// The queue of the open phase.
++    queue: Option<Arc<Queue>>,
++    /// The writer of the open phase, once one is running.
++    writer: Option<tokio::task::JoinHandle<()>>,
++    /// What each producer is told about its own frames, one tally each for this phase.
++    tallies: Vec<Arc<Tally>>,
++    /// How many frames each producer has offered in this phase, counted here rather than read back
++    /// from the tally: the tally's rule is what the verdict checks, so it cannot be the ruler too.
++    offered: Vec<u64>,
++    /// How many producers have finished the open phase.
++    done: u64,
++    /// How many phases have been opened; the running one is this minus one.
++    opened: usize,
++    /// How many clients have connected, the controller included.
++    clients: u64,
++    /// A failure inside the writer, which every later command reports.
++    failed: Option<String>,
++}
++
++impl Host {
++    /// A host with a store and no phase open yet.
++    fn new(store: Spool) -> Self {
++        Self {
++            store: Arc::new(Mutex::new(store)),
++            queue: None,
++            writer: None,
++            tallies: Vec::new(),
++            offered: vec![0; PRODUCERS],
++            done: 0,
++            opened: 0,
++            clients: 0,
++            failed: None,
++        }
++    }
++}
++
++/// One connection to the host, one command per line.
++struct Client {
++    stream: BufReader<TcpStream>,
++}
++
++impl Client {
++    /// Connect, waiting for the host to be listening.
++    async fn connect() -> Result<Self, Failure> {
++        for _ in 0..200 {
++            match TcpStream::connect((HOST, PORT)).await {
++                Ok(socket) => {
++                    return Ok(Self {
++                        stream: BufReader::new(socket),
++                    });
++                }
++                Err(_) => tokio::time::sleep(POLL).await,
++            }
++        }
++        Err(format!("{HOST}:{PORT} never accepted a connection").into())
++    }
++
++    /// Send one command and answer the reply. A command the host refused fails the run.
++    async fn ask(&mut self, command: &str) -> Result<String, Failure> {
++        self.stream.write_all(command.as_bytes()).await?;
++        self.stream.write_all(b"\n").await?;
++        self.stream.flush().await?;
++        let mut text = String::new();
++        if self.stream.read_line(&mut text).await? == 0 {
++            return Err(format!("the host closed the connection at `{command}`").into());
++        }
++        let reply = text.trim_end().to_owned();
++        match reply.strip_prefix("failed ") {
++            Some(reason) => Err(format!("`{command}` was refused: {reason}").into()),
++            None => Ok(reply),
++        }
++    }
++}
++
++/// Poll the host's status until the reply carries `needle`, or fail after `tries` looks.
++///
++/// Polling a condition instead of sleeping for a guessed duration is the rule every fixture in this
++/// course follows, and the bound is the other half of it: a scenario that waits for ever reports
++/// nothing, and the gate would call it a timeout instead of a run that never got there.
++async fn wait_for(client: &mut Client, needle: &str, tries: usize) -> Result<String, Failure> {
++    for _ in 0..tries {
++        let reply = client.ask("status").await?;
++        if reply.contains(needle) {
++            return Ok(reply);
++        }
++        tokio::time::sleep(POLL).await;
++    }
++    Err(format!("the host never said `{needle}`").into())
++}
++
++/// Read one command and answer the host's reply.
++async fn serve(socket: TcpStream, host: Arc<Mutex<Host>>) -> Result<(), Failure> {
++    {
++        host.lock().await.clients += 1;
++    }
++    let mut stream = BufReader::new(socket);
++    loop {
++        let mut text = String::new();
++        if stream.read_line(&mut text).await? == 0 {
++            return Ok(());
++        }
++        let reply = match command(text.trim(), &host).await {
++            Ok(reply) => reply,
++            Err(error) => format!("failed {error}"),
++        };
++        stream.write_all(reply.as_bytes()).await?;
++        stream.write_all(b"\n").await?;
++        stream.flush().await?;
++    }
++}
++
++/// One command, the one line it answers, and the work behind it.
++async fn command(text: &str, host: &Arc<Mutex<Host>>) -> Result<String, Failure> {
++    let mut words = text.split_whitespace();
++    let verb = words.next().unwrap_or_default();
++    if let Some(reason) = host.lock().await.failed.clone() {
++        return Err(reason.into());
++    }
++    match verb {
++        "status" => {
++            let host = host.lock().await;
++            Ok(status(&host))
++        }
++        "phase" => open_phase(words.next(), host).await,
++        "turn" => one_turn(&mut words, host).await,
++        "done" => {
++            let producer = number(words.next(), "producer")?;
++            let mut host = host.lock().await;
++            if producer >= PRODUCERS {
++                return Err(format!("producer {producer} is not one of this scenario's").into());
++            }
++            host.done += 1;
++            Ok(format!("done producers={}", host.done))
++        }
++        "checkpoint" => checkpoint(host).await,
++        "drain" => {
++            let (queue, running) = {
++                let mut host = host.lock().await;
++                if host.writer.is_none() {
++                    match host.queue.clone() {
++                        Some(queue) => {
++                            // The writer the phase was holding back starts here: the storm is over,
++                            // and what the queue holds is now the writer's to write.
++                            host.writer =
++                                Some(tokio::spawn(write(queue.clone(), Arc::clone(&host.store))));
++                        }
++                        None => return Err("no phase is running".into()),
++                    }
++                }
++                (host.queue.clone(), true)
++            };
++            let Some(queue) = queue else {
++                return Err("no phase is running".into());
++            };
++            let _ = running;
++            queue.settled().await;
++            Ok(format!("drained depth={}", queue.depth()))
++        }
++        "verdict" => verdict(host).await,
++        other => Err(format!("`{other}` is not a command this host speaks").into()),
++    }
++}
++
++/// The host's own view, which is what the clients poll to stay in step.
++fn status(host: &Host) -> String {
++    let Some(queue) = &host.queue else {
++        return format!(
++            "status phase=none clients={} done={}",
++            host.clients, host.done
++        );
++    };
++    let stats = queue.stats();
++    format!(
++        "status phase={} policy={} clients={} done={} offered={} accepted={} dropped={} depth={} \
++         written={}",
++        host.opened - 1,
++        queue.policy().as_str(),
++        host.clients,
++        host.done,
++        stats.offered(),
++        stats.accepted(),
++        stats.dropped(),
++        queue.depth(),
++        stats.written()
++    )
++}
++
++/// Open a phase: a fresh queue, fresh tallies, and a writer already running if the policy needs one.
++async fn open_phase(policy: Option<&str>, host: &Arc<Mutex<Host>>) -> Result<String, Failure> {
++    let Some(policy) = policy else {
++        return Err("a phase needs a policy".into());
++    };
++    let policy = Policy::parse(policy)?;
++    let mut host = host.lock().await;
++    if host.queue.is_some() {
++        return Err("a phase is already open".into());
++    }
++    let queue = Queue::new(CAPACITY, policy);
++    host.queue = Some(Arc::clone(&queue));
++    host.tallies = (0..PRODUCERS).map(|_| Arc::new(Tally::new())).collect();
++    host.offered = vec![0; PRODUCERS];
++    host.done = 0;
++    host.opened += 1;
++    let running = policy == Policy::Block;
++    if running {
++        // `Block` waits for room instead of dropping a frame, and room is what only the writer makes:
++        // a phase of `Block` with a held writer is a phase that never finishes.
++        host.writer = Some(tokio::spawn(write(
++            Arc::clone(&queue),
++            Arc::clone(&host.store),
++        )));
++    }
++    let index = host.opened - 1;
++    println!(
++        "lakelet-sim phase index={index} policy={} capacity={CAPACITY} writer={}",
++        policy.as_str(),
++        if running { "running" } else { "held" }
++    );
++    Ok(format!("phase={index} policy={}", policy.as_str()))
++}
++
++/// Offer one turn of frames, and report what the queue decided about each one.
++async fn one_turn(
++    words: &mut std::str::SplitWhitespace<'_>,
++    host: &Arc<Mutex<Host>>,
++) -> Result<String, Failure> {
++    let producer = number(words.next(), "producer")?;
++    let from = number(words.next(), "from")?;
++    let count = number(words.next(), "count")?;
++    let (queue, tally) = {
++        let mut host = host.lock().await;
++        let Some(queue) = host.queue.clone() else {
++            return Err("a turn arrived before any phase was open".into());
++        };
++        let Some(tally) = host.tallies.get(producer).cloned() else {
++            return Err(format!("producer {producer} is not one of this scenario's").into());
++        };
++        host.offered[producer] += count as u64;
++        // The turn is announced before it is offered, with the depth it found: that is the live
++        // observation of the bound, and in a phase whose writer is held every turn after the first
++        // finds `depth=capacity` and can go no further.
++        println!(
++            "lakelet-sim turn policy={} producer={producer} from={from} count={count} depth={} \
++             capacity={CAPACITY}",
++            queue.policy().as_str(),
++            queue.depth()
++        );
++        (queue, tally)
++    };
++    let frames: Vec<Payload> = (0..count)
++        .map(|offset| payload(producer, from + offset))
++        .collect();
++    // The lock is *not* held across this: under `Block` the offer waits for the writer, and the writer
++    // is what needs the store this host's bookkeeping is kept beside.
++    let decisions = queue.offer(frames.clone(), tally).await;
++    let policy = queue.policy();
++    for (frame, decision) in frames.iter().zip(&decisions) {
++        match decision {
++            Decision::Accepted => println!(
++                "lakelet-sim offered policy={} producer={producer} frame={}",
++                policy.as_str(),
++                name(frame)
++            ),
++            Decision::Refused(payload) => println!(
++                "lakelet-sim refused policy={} producer={producer} frame={}",
++                policy.as_str(),
++                name(payload)
++            ),
++            Decision::Evicted(victim) => println!(
++                "lakelet-sim evicted policy={} producer={producer} frame={} victim={}",
++                policy.as_str(),
++                name(frame),
++                name(victim)
++            ),
++        }
++    }
++    Ok(format!("turned frames={}", decisions.len()))
++}
++
++/// Look at the queue, print what the scenario saw, and check the law where it must hold.
++async fn checkpoint(host: &Arc<Mutex<Host>>) -> Result<String, Failure> {
++    let (queue, running) = {
++        let host = host.lock().await;
++        (host.queue.clone(), host.writer.is_some())
++    };
++    let Some(queue) = queue else {
++        return Err("no phase is running".into());
++    };
++    if running {
++        // A checkpoint is a moment at rest: a frame the writer has taken but not reported is in
++        // neither column yet, and the scenario waits for that window to close before it looks.
++        queue.settled().await;
++    }
++    let stats = queue.stats();
++    let depth = queue.depth() as u64;
++    println!(
++        "lakelet-sim checkpoint policy={} running={running} offered={} accepted={} dropped={} \
++         depth={depth} written={}",
++        queue.policy().as_str(),
++        stats.offered(),
++        stats.accepted(),
++        stats.dropped(),
++        stats.written()
++    );
++    if stats.offered() != stats.accepted() + stats.dropped() {
++        return Err(format!(
++            "`offered == accepted + dropped` broke under {}: offered={}, accepted={}, dropped={} — \
++             a frame the queue did not take was not counted as dropped, or one it dropped was still \
++             counted as accepted",
++            queue.policy().as_str(),
++            stats.offered(),
++            stats.accepted(),
++            stats.dropped()
++        )
++        .into());
++    }
++    if depth > CAPACITY as u64 {
++        return Err(format!(
++            "the queue held {depth} frame(s) and its bound is {CAPACITY}: a bound that a producer can \
++             push past is not a bound"
++        )
++        .into());
++    }
++    if stats.accepted() != stats.written() + depth {
++        return Err(format!(
++            "`accepted == written + queued` broke under {}: accepted={}, written={}, queued={depth} — \
++             a frame the queue answered for is neither on the file nor waiting to be written",
++            queue.policy().as_str(),
++            stats.accepted(),
++            stats.written()
++        )
++        .into());
++    }
++    Ok(format!(
++        "checkpoint offered={} accepted={} dropped={} depth={depth} written={}",
++        stats.offered(),
++        stats.accepted(),
++        stats.dropped(),
++        stats.written()
++    ))
++}
++
++/// The invariant's answer, and the end of the phase.
++async fn verdict(host: &Arc<Mutex<Host>>) -> Result<String, Failure> {
++    let (queue, tallies, offered) = {
++        let host = host.lock().await;
++        (
++            host.queue.clone(),
++            host.tallies.clone(),
++            host.offered.clone(),
++        )
++    };
++    let Some(queue) = queue else {
++        return Err("no phase is running".into());
++    };
++    queue.settled().await;
++    let stats = queue.stats();
++    let depth = queue.depth() as u64;
++    let policy = queue.policy().as_str();
++
++    // The caller's half: a queue can say how many frames it wrote, and only the tallies can say whose
++    // they were. A frame the queue dropped has to be a frame its caller was told about, which is what
++    // "an acknowledgement never moves ahead of the write" means one level up.
++    let mut written = 0;
++    let mut dropped = 0;
++    for (producer, tally) in tallies.iter().enumerate() {
++        println!(
++            "lakelet-sim tally policy={policy} producer={producer} offered={} written={} dropped={}",
++            offered[producer],
++            tally.written(),
++            tally.dropped()
++        );
++        if tally.written() + tally.dropped() != offered[producer] {
++            return Err(format!(
++                "producer {producer} offered {} frame(s) under `{policy}` and was told about {}: every \
++                 frame is written or dropped, and the two add up",
++                offered[producer],
++                tally.written() + tally.dropped()
++            )
++            .into());
++        }
++        written += tally.written();
++        dropped += tally.dropped();
++    }
++    if written != stats.written() || dropped != stats.dropped() {
++        return Err(format!(
++            "the tallies say {written} written and {dropped} dropped, the queue says {} and {}: the \
++             queue's books and its callers' have to be the same books",
++            stats.written(),
++            stats.dropped()
++        )
++        .into());
++    }
++    if stats.offered() != stats.accepted() + stats.dropped()
++        || stats.accepted() != stats.written() + depth
++    {
++        return Err(format!(
++            "the conservation law does not hold for `{policy}`: offered={}, accepted={}, dropped={}, \
++             written={}, queued={depth}",
++            stats.offered(),
++            stats.accepted(),
++            stats.dropped(),
++            stats.written()
++        )
++        .into());
++    }
++    println!(
++        "lakelet-sim verdict policy={policy} holds offered={} accepted={} dropped={} depth={depth} \
++         written={}",
++        stats.offered(),
++        stats.accepted(),
++        stats.dropped(),
++        stats.written()
++    );
++
++    // The phase is over: closing the queue is what ends the writer's loop, and the wait is what makes
++    // the next phase start from a host nobody is still writing to.
++    queue.close();
++    let writer = host.lock().await.writer.take();
++    if let Some(writer) = writer {
++        let _ = writer.await;
++    }
++    let mut host = host.lock().await;
++    host.queue = None;
++    Ok(format!("verdict policy={policy} holds"))
++}
++
++/// The writer's side of a phase: everything the queue holds, written as one batch, reported when it
++/// is on the file — the daemon's writer task, in a scenario that gets to watch it.
++async fn write(queue: Arc<Queue>, store: Arc<Mutex<Spool>>) {
++    while let Some(batch) = queue.take().await {
++        let size = batch.len();
++        {
++            let mut spool = store.lock().await;
++            let mut batcher = Batcher::new();
++            for payload in &batch {
++                batcher.push(payload.as_slice());
++            }
++            if let Err(error) = batcher.flush(&mut spool) {
++                eprintln!("lakelet-sim the write path refused a batch: {error}");
++                return;
++            }
++        }
++        queue.wrote(size);
++        for payload in &batch {
++            println!(
++                "lakelet-sim written policy={} batch={size} frame={} depth={} written={}",
++                queue.policy().as_str(),
++                name(payload),
++                queue.depth(),
++                queue.stats().written()
++            );
++        }
++    }
++}
++
++/// One producer: wait for each phase to open, offer its frames in turns, and say it is done.
++async fn produce(producer: usize) -> Result<(), Failure> {
++    let mut client = Client::connect().await?;
++    for (index, _) in POLICIES.iter().enumerate() {
++        wait_for(&mut client, &format!("phase={index}"), 2_000).await?;
++        for turn in 0..(FRAMES / TURN) {
++            let from = turn * TURN;
++            client
++                .ask(&format!("turn {producer} {from} {TURN}"))
++                .await?;
++        }
++        client.ask(&format!("done {producer}")).await?;
++    }
++    Ok(())
++}
++
++/// The controller: open each phase, wait for the storm to be over, look at the queue twice, and ask
++/// for the verdict.
++async fn control() -> Result<(), Failure> {
++    let mut client = Client::connect().await?;
++    // Every client before the first phase: a phase judged against a storm that had not started yet
++    // would say something about the schedule that is not true of the schedule.
++    wait_for(&mut client, &format!("clients={}", PRODUCERS + 1), 2_000).await?;
++
++    let mut totals = (0u64, 0u64, 0u64);
++    for (index, policy) in POLICIES.iter().enumerate() {
++        client.ask(&format!("phase {}", policy.as_str())).await?;
++        wait_for(&mut client, &format!("done={PRODUCERS}"), 4_000).await?;
++        let asked = client.ask("checkpoint").await?;
++        client.ask("drain").await?;
++        let settled = client.ask("checkpoint").await?;
++        client.ask("verdict").await?;
++        // The totals come from what the checkpoints printed, so the last line of the transcript is a
++        // sum of lines above it rather than a number the harness kept to itself.
++        totals.0 += field(&asked, "offered");
++        totals.1 += field(&settled, "dropped");
++        totals.2 += field(&settled, "written");
++        if index + 1 == POLICIES.len() {
++            println!(
++                "lakelet-sim done phases={} frames={} dropped={} written={}",
++                POLICIES.len(),
++                totals.0,
++                totals.1,
++                totals.2
++            );
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn an_overload_is_a_schedule_and_every_policy_keeps_its_books() {
++    let seed = seed();
++    let directory = std::env::temp_dir().join(format!(
++        "lakelet-sim-backpressure-{}-{seed}",
++        std::process::id()
++    ));
++    let _ = std::fs::remove_dir_all(&directory);
++    let store = Spool::with_policy(&directory, WalPolicy::Never)
++        .expect("a directory this process owns is a store");
++    let host = Arc::new(Mutex::new(Host::new(store)));
++
++    let mut builder = Builder::new();
++    builder.rng_seed(seed).enable_random_order();
++    let mut sim = builder.build();
++
++    let hosted = Arc::clone(&host);
++    sim.host(HOST, move || {
++        let host = Arc::clone(&hosted);
++        async move {
++            let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
++            loop {
++                let (socket, _) = listener.accept().await?;
++                let host = Arc::clone(&host);
++                tokio::spawn(async move {
++                    if let Err(error) = serve(socket, host).await {
++                        eprintln!("lakelet-sim a connection ended: {error}");
++                    }
++                });
++            }
++            #[allow(unreachable_code)]
++            Ok(())
++        }
++    });
++
++    // The seed is deliberately *not* in the transcript: the gate compares transcripts, and a
++    // transcript whose first line spells the seed would make two seeds look different without any
++    // event having differed. What tells the seeds apart here is the order of the lines below.
++    println!(
++        "lakelet-sim started capacity={CAPACITY} producers={PRODUCERS} frames={} policies={}",
++        FRAMES * PRODUCERS,
++        POLICIES.len()
++    );
++    for producer in 0..PRODUCERS {
++        sim.client(format!("producer{producer}"), async move {
++            produce(producer).await
++        });
++    }
++    sim.client("controller", async move { control().await });
++
++    sim.run()
++        .unwrap_or_else(|error| panic!("the simulation did not finish: {error}"));
++    let _ = std::fs::remove_dir_all(&directory);
++}

@@ -1,0 +1,914 @@
+diff --git a/src/bin/lakeletd.rs b/src/bin/lakeletd.rs
+index 0a2eda9..6891e70 100644
+--- a/src/bin/lakeletd.rs
++++ b/src/bin/lakeletd.rs
+@@ -18,6 +18,7 @@ use std::process::ExitCode;
+ use std::sync::Arc;
+ 
+ use lakelet::engine::Spool;
++use lakelet::service::backpressure::Queue;
+ use lakelet::service::config::{self, Flags};
+ use lakelet::service::{ingest, logging};
+ use tokio::net::TcpListener;
+@@ -26,7 +27,8 @@ use tokio::sync::Mutex;
+ /// Everything this program can tell a user about itself without starting.
+ const USAGE: &str = "\
+ usage: lakeletd [--config <path>] [--listen-addr <addr>] [--store-dir <path>] [--log-level <filter>] \
+-[--log-format text|json] [--check-config] [--help] [--version]";
++[--log-format text|json] [--queue-capacity <frames>] [--queue-policy <policy>] [--check-config] \
++[--help] [--version]";
+ 
+ #[tokio::main]
+ async fn main() -> ExitCode {
+@@ -74,6 +76,11 @@ async fn run() -> Result<(), lakelet::Error> {
+             "store recovered"
+         );
+     }
++    // The bound and the decision, as the four layers left them (`service::config`). Built here
++    // rather than inside the accept loop because the stop path prints what it did with the frames it
++    // was given, and that is the same queue this line makes.
++    let queue = Queue::new(config.queue_capacity, config.queue_policy);
++
+     let listener = TcpListener::bind(&config.listen_addr)
+         .await
+         .map_err(|error| lakelet::Error::Store {
+@@ -104,7 +111,25 @@ async fn run() -> Result<(), lakelet::Error> {
+         }
+     };
+ 
+-    let served = ingest::serve(listener, Arc::clone(&store), shutdown).await;
++    let served = ingest::serve(listener, Arc::clone(&store), Arc::clone(&queue), shutdown).await;
++    // `lakelet/4.6-ingest-backpressure`: what the queue did with everything it was offered, after
++    // the writer drained it. One line per stop, in the shape of the lines around it, and the three
++    // numbers that make the conservation law checkable from the outside: `offered` is what the
++    // connections handed over, `dropped` what a policy shed, and `written == accepted` says nothing
++    // was left behind. A deployment that never drops anything still reads this line — `dropped=0`
++    // beside `block` is the cheapest proof that its policy is doing what it chose.
++    {
++        let stats = queue.stats();
++        tracing::info!(
++            policy = queue.policy().as_str(),
++            capacity = queue.capacity(),
++            offered = stats.offered(),
++            accepted = stats.accepted(),
++            dropped = stats.dropped(),
++            written = stats.written(),
++            "queue drained"
++        );
++    }
+     // The stop path's own promise, and `lakelet/4.4-wal-recovery` is where it becomes true: whatever
+     // the policy is, a clean stop waits for the device once, so the window the write path left open
+     // is closed before the process goes (`docs/crash-points.md`, point 6). It costs one flush — on
+diff --git a/src/service/backpressure.rs b/src/service/backpressure.rs
+index a31928a..6b6599c 100644
+--- a/src/service/backpressure.rs
++++ b/src/service/backpressure.rs
+@@ -41,8 +41,11 @@
+ //! reaches the write path through one call, and this file only decides when that call happens and
+ //! what the daemon does when it cannot keep up.
+ 
+-use std::sync::Arc;
++use std::collections::VecDeque;
+ use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
++
++use tokio::sync::Notify;
+ 
+ use crate::error::Error;
+ 
+@@ -225,6 +228,17 @@ impl Tally {
+     pub fn bytes(&self) -> u64 {
+         self.bytes.load(Ordering::Relaxed)
+     }
++
++    /// Charge one written frame: the length of the payload the write path put on the file.
++    fn charge_write(&self, bytes: u64) {
++        self.written.fetch_add(1, Ordering::Relaxed);
++        self.bytes.fetch_add(bytes, Ordering::Relaxed);
++    }
++
++    /// Charge one dropped frame.
++    fn charge_drop(&self) {
++        self.dropped.fetch_add(1, Ordering::Relaxed);
++    }
+ }
+ 
+ /// What the queue did with one offered frame.
+@@ -245,17 +259,80 @@ pub enum Decision {
+ /// The bounded queue between accepting a frame and writing it.
+ ///
+ /// One of these is the daemon's whole memory budget between the socket and the log: at most
+-/// [`Queue::capacity`] frames are waiting at once, plus the one batch the writer has taken and not yet
+-/// written, which is bounded by the same number.
++/// [`Queue::capacity`] frames are waiting at once, plus the one batch the writer has taken and not
++/// yet written, which is bounded by the same number.
+ ///
+-/// **The state is yours.** This file declares no fields, because where the bound lives is the first
+-/// decision of the step: the bound *is* the number of frames the queue is holding, and a second
+-/// number that tracks the same thing — a counter beside the deque, a permit pool that is not the
+-/// slots — is a second number that can disagree with it. A lock this queue takes is a lock it must
+-/// not hold across an `await`: a producer parked on the bound must not be holding what the writer
+-/// needs to free a slot.
++/// The queue's state is a deque behind a lock, and the lock is never held across an `await`: a
++/// producer parked on the bound must not be holding what the writer needs to free a slot. The bound
++/// is the length of that deque, so no second number can disagree with it.
++#[derive(Debug)]
+ pub struct Queue {
+-    // The state this step designs: the bound, the frames waiting, and whatever `Block` parks on.
++    /// How many frames may be waiting at once: the bound, and a deployment's number.
++    capacity: usize,
++    /// What this queue does when a frame arrives and nothing has room.
++    policy: Policy,
++    /// The frames waiting and the counters, under one lock.
++    state: Mutex<Queued>,
++    /// "There is something to write, or nothing more will come": what [`Queue::take`] waits on, and
++    /// why a producer that has to park for room still tells the writer about the frames it already
++    /// handed over — without that, the writer sleeps while the producer waits for room only the
++    /// writer can make.
++    arrived: Notify,
++    /// "The queue's books moved": what a `Block` producer waiting for room, and [`Queue::settled`],
++    /// wait on. Deliberately **not** the same object as [`Queue::arrived`]: a producer that announced
++    /// its own wait on the thing it is about to await would complete its own future — `Notify`
++    /// promises that, for the create-before-check idiom — and spin in a loop that makes no progress.
++    progress: Notify,
++}
++
++/// What the queue holds, under its lock.
++#[derive(Debug, Default)]
++struct Queued {
++    /// The frames waiting to be written, oldest first.
++    waiting: VecDeque<Waiting>,
++    /// The frames the writer has taken and has not reported written, in the order it took them: the
++    /// tally each one is charged to when [`Queue::wrote`] arrives.
++    writing: VecDeque<Writing>,
++    /// Counters, as [`Stats`] reports them.
++    offered: u64,
++    accepted: u64,
++    dropped: u64,
++    written: u64,
++    /// `true` once [`Queue::close`] was called: no arrival is taken in after that.
++    closed: bool,
++}
++
++/// One frame waiting for the writer.
++#[derive(Debug)]
++struct Waiting {
++    /// The bytes the write path will write as one record.
++    payload: Payload,
++    /// Who is told when this frame is written or dropped.
++    tally: Arc<Tally>,
++}
++
++/// One frame the writer has taken and not reported.
++#[derive(Debug)]
++struct Writing {
++    /// Who is charged when the write is reported.
++    tally: Arc<Tally>,
++    /// Payload length, which is what that caller's `bytes` grows by.
++    bytes: u64,
++}
++
++/// One look at the queue from [`Queue::offer`]'s point of view.
++#[derive(Debug)]
++enum Attempt {
++    /// The frame's fate is settled.
++    Decided(Decision),
++    /// Nothing has room and this policy waits rather than dropping: the frame comes back, with the
++    /// arrival number it keeps, and is offered again once something has changed.
++    Wait {
++        /// Which arrival this is, counting from one.
++        arrival: u64,
++        /// The frame.
++        payload: Payload,
++    },
+ }
+ 
+ impl Queue {
+@@ -265,37 +342,54 @@ impl Queue {
+     /// step's page says which key each one comes from); this call is where they become a bound and a
+     /// decision.
+     ///
+-    /// A capacity of zero is not a queue that refuses everything: the configuration layer turns it
+-    /// into a refusal with a sentence naming the key, and this call is only reached with a capacity
+-    /// of at least one.
++    /// # Panics
++    ///
++    /// If `capacity` is zero. A queue of zero frames can never take a frame in, and the configuration
++    /// layer is what turns a deployment that asks for one into a refusal with a sentence; a zero that
++    /// reaches this call is a bug in the daemon, not a deployment's mistake.
+     #[must_use]
+     pub fn new(capacity: usize, policy: Policy) -> Arc<Self> {
+-        let _ = (capacity, policy);
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        assert!(
++            capacity > 0,
++            "a queue of zero frames cannot take a frame in: `queue.capacity` is at least one"
++        );
++        Arc::new(Self {
++            capacity,
++            policy,
++            state: Mutex::new(Queued::default()),
++            arrived: Notify::new(),
++            progress: Notify::new(),
++        })
+     }
+ 
+     /// How many frames may be waiting at once.
+     #[must_use]
+     pub fn capacity(&self) -> usize {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        self.capacity
+     }
+ 
+     /// What this queue does when a frame arrives and nothing has room.
+     #[must_use]
+     pub fn policy(&self) -> Policy {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        self.policy
+     }
+ 
+     /// How many frames are waiting for the writer right now.
+     #[must_use]
+     pub fn depth(&self) -> usize {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        self.lock().waiting.len()
+     }
+ 
+     /// The tally: what this queue has seen and what it did with it.
+     #[must_use]
+     pub fn stats(&self) -> Stats {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        let state = self.lock();
++        Stats {
++            offered: state.offered,
++            accepted: state.accepted,
++            dropped: state.dropped,
++            written: state.written,
++        }
+     }
+ 
+     /// Offer the frames one turn delivered, in order: the decision this step is about.
+@@ -325,8 +419,114 @@ impl Queue {
+     /// write later, or a drop now — so `offered == written + dropped` holds for the caller and not
+     /// only for the queue.
+     pub async fn offer(&self, frames: Vec<Payload>, tally: Arc<Tally>) -> Vec<Decision> {
+-        let _ = (frames, tally);
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        // Every frame of the turn is counted, and numbered, before any policy decides anything: an
++        // arrival is an arrival whether it is taken in, refused, or made to wait for room, and which
++        // arrival it is matters to `Sample`.
++        let first = {
++            let mut state = self.lock();
++            let first = state.offered + 1;
++            state.offered += frames.len() as u64;
++            first
++        };
++        let mut undecided: VecDeque<(u64, Payload)> = frames
++            .into_iter()
++            .enumerate()
++            .map(|(offset, payload)| (first + offset as u64, payload))
++            .collect();
++        let mut decisions = Vec::with_capacity(undecided.len());
++        loop {
++            // Registered before the state is read, so a change between the two is not a wakeup this
++            // producer can miss.
++            let changed = self.progress.notified();
++            let mut waiting = None;
++            {
++                // The decision, in a scope of its own: the lock is never held across an `await`,
++                // because a producer parked on the bound must not be holding what the writer needs to
++                // free a slot.
++                let mut state = self.lock();
++                while let Some((arrival, payload)) = undecided.pop_front() {
++                    match self.decide(&mut state, arrival, payload, &tally) {
++                        Attempt::Decided(decision) => decisions.push(decision),
++                        Attempt::Wait { arrival, payload } => {
++                            waiting = Some((arrival, payload));
++                            break;
++                        }
++                    }
++                }
++            }
++            // The frames this turn put in the queue are the writer's business, and so is a frame the
++            // producer still has to hand over: the writer is what makes room for it. `arrived` is the
++            // writer's signal and not this producer's, which is the whole reason there are two.
++            self.arrived.notify_waiters();
++            match waiting {
++                Some(frame) => {
++                    // Still to be handed over, and room is what it waits for — which only the writer
++                    // can make. Nothing is signalled on `progress` here: this producer is about to
++                    // await it, and completing its own future is how a loop like this spins.
++                    undecided.push_front(frame);
++                    changed.await;
++                }
++                None => {
++                    self.progress.notify_waiters();
++                    return decisions;
++                }
++            }
++        }
++    }
++
++    /// One look at the queue, under the lock: what happens to this frame right now.
++    ///
++    /// The lock belongs to the caller, because a turn is decided in one go wherever it can be, and
++    /// the caller is the only thing that knows where a frame's arrival number came from.
++    fn decide(
++        &self,
++        state: &mut Queued,
++        arrival: u64,
++        payload: Payload,
++        tally: &Arc<Tally>,
++    ) -> Attempt {
++        let room = state.waiting.len() < self.capacity;
++        let takes = match self.policy {
++            Policy::Block | Policy::DropNewest => room,
++            Policy::DropOldest => true,
++            Policy::Sample => arrival.is_multiple_of(SAMPLE_KEEP),
++        };
++        if state.closed || !takes {
++            if state.closed || self.policy != Policy::Block {
++                state.dropped += 1;
++                tally.charge_drop();
++                return Attempt::Decided(Decision::Refused(payload));
++            }
++            // `Block` does not refuse an arrival because nothing has room: it waits for room, and
++            // every change to the queue sends it back to look again.
++            return Attempt::Wait { arrival, payload };
++        }
++        if room {
++            state.take_in(payload, Arc::clone(tally));
++            return Attempt::Decided(Decision::Accepted);
++        }
++        // The bound is reached and this policy pays for the arrival with the frame that has been
++        // waiting longest. A full queue always holds one — the frames it holds are what fills it —
++        // and the arm that answers nothing is here so that a queue of zero frames, which
++        // [`Queue::new`] refuses, could not quietly break the bound.
++        match state.waiting.pop_front() {
++            Some(evicted) => {
++                // Taking a frame back is what the conservation law means by "dropped": it leaves
++                // `accepted` with the queue and lands in `dropped`, so `offered == accepted +
++                // dropped` stays true and `accepted == written + queued` keeps describing what the
++                // queue still owes a write for.
++                state.accepted -= 1;
++                state.dropped += 1;
++                evicted.tally.charge_drop();
++                state.take_in(payload, Arc::clone(tally));
++                Attempt::Decided(Decision::Evicted(evicted.payload))
++            }
++            None => {
++                state.dropped += 1;
++                tally.charge_drop();
++                Attempt::Decided(Decision::Refused(payload))
++            }
++        }
+     }
+ 
+     /// The writer's side: the frames to write next, oldest first.
+@@ -338,7 +538,30 @@ impl Queue {
+     ///
+     /// Answers `None` once the queue is closed *and* empty, which is what ends a writer's loop.
+     pub async fn take(&self) -> Option<Vec<Payload>> {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        loop {
++            let changed = self.arrived.notified();
++            {
++                let mut state = self.lock();
++                if state.waiting.is_empty() {
++                    if state.closed {
++                        return None;
++                    }
++                } else {
++                    let mut frames = Vec::with_capacity(state.waiting.len());
++                    while let Some(waiting) = state.waiting.pop_front() {
++                        state.writing.push_back(Writing {
++                            tally: waiting.tally,
++                            bytes: waiting.payload.len() as u64,
++                        });
++                        frames.push(waiting.payload);
++                    }
++                    // Frames left the queue, so there is room for a producer that is waiting for it.
++                    self.progress.notify_waiters();
++                    return Some(frames);
++                }
++            }
++            changed.await;
++        }
+     }
+ 
+     /// The writer's side, after the write: `count` frames taken by [`Queue::take`] are on the file.
+@@ -348,8 +571,17 @@ impl Queue {
+     /// intention as an outcome. It is also where the callers' [`Tally`] counters move, which is what
+     /// lets a caller say what it stored without reading the file.
+     pub fn wrote(&self, count: usize) {
+-        let _ = count;
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        {
++            let mut state = self.lock();
++            for _ in 0..count {
++                let Some(done) = state.writing.pop_front() else {
++                    break;
++                };
++                done.tally.charge_write(done.bytes);
++                state.written += 1;
++            }
++        }
++        self.progress.notify_waiters();
+     }
+ 
+     /// Wait until every frame offered so far has been written or dropped.
+@@ -365,7 +597,16 @@ impl Queue {
+     /// themselves — every frame offered has been resolved, so nothing is waiting and nothing is being
+     /// written.
+     pub async fn settled(&self) {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        loop {
++            let changed = self.progress.notified();
++            {
++                let state = self.lock();
++                if state.written + state.dropped == state.offered {
++                    return;
++                }
++            }
++            changed.await;
++        }
+     }
+ 
+     /// Stop taking frames in. What is already queued is still written.
+@@ -374,6 +615,28 @@ impl Queue {
+     /// [`Queue::offer`] is refused (and counted as an arrival the queue did not take), and
+     /// [`Queue::take`] answers `None` once nothing is left.
+     pub fn close(&self) {
+-        todo!("step lakelet/4.6-ingest-backpressure")
++        {
++            let mut state = self.lock();
++            state.closed = true;
++        }
++        self.arrived.notify_waiters();
++        self.progress.notify_waiters();
++    }
++
++    /// The queue's state, even if a producer panicked while holding it.
++    ///
++    /// The data behind it is a deque and five counters, and answering a lock error here would turn
++    /// one caller's panic into every later caller's failure — for a value that does not become wrong
++    /// just because somebody unwound.
++    fn lock(&self) -> MutexGuard<'_, Queued> {
++        self.state.lock().unwrap_or_else(PoisonError::into_inner)
++    }
++}
++
++impl Queued {
++    /// Take one frame in: it waits, and the queue now owes a write for it.
++    fn take_in(&mut self, payload: Payload, tally: Arc<Tally>) {
++        self.accepted += 1;
++        self.waiting.push_back(Waiting { payload, tally });
+     }
+ }
+diff --git a/src/service/config.rs b/src/service/config.rs
+index 3ce7b97..3097acd 100644
+--- a/src/service/config.rs
++++ b/src/service/config.rs
+@@ -107,11 +107,14 @@ impl Config {
+     #[must_use]
+     pub fn report(&self) -> String {
+         format!(
+-            "listen.addr = {}\nstore.dir = {}\nlog.level = {}\nlog.format = {}",
++            "listen.addr = {}\nstore.dir = {}\nlog.level = {}\nlog.format = {}\nqueue.capacity = \
++             {}\nqueue.policy = {}",
+             self.listen_addr,
+             self.store_dir.display(),
+             self.log_level,
+-            self.log_format.as_str()
++            self.log_format.as_str(),
++            self.queue_capacity,
++            self.queue_policy.as_str()
+         )
+     }
+ }
+@@ -129,6 +132,10 @@ pub struct Flags {
+     pub log_level: Option<String>,
+     /// `--log-format <text|json>`.
+     pub log_format: Option<String>,
++    /// `--queue-capacity <frames>`.
++    pub queue_capacity: Option<usize>,
++    /// `--queue-policy <block|drop-newest|drop-oldest|sample>`.
++    pub queue_policy: Option<String>,
+     /// `--check-config`: print the report and exit without starting.
+     pub check_config: bool,
+     /// `--help` / `-h`.
+@@ -157,6 +164,11 @@ impl Flags {
+                 }
+                 "--log-level" => flags.log_level = Some(value(&mut args, "--log-level")?),
+                 "--log-format" => flags.log_format = Some(value(&mut args, "--log-format")?),
++                "--queue-capacity" => {
++                    let written = value(&mut args, "--queue-capacity")?;
++                    flags.queue_capacity = Some(frames(&written, "--queue-capacity")?);
++                }
++                "--queue-policy" => flags.queue_policy = Some(value(&mut args, "--queue-policy")?),
+                 "--check-config" => flags.check_config = true,
+                 "--help" | "-h" => flags.help = true,
+                 "--version" => flags.version = true,
+@@ -178,6 +190,30 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String,
+     })
+ }
+ 
++/// A capacity as one of the layers writes it: a number of frames, at least one.
++///
++/// The rule is here rather than at each layer, because the bound is one rule. A deployment that asks
++/// for a queue of zero frames gets a refusal naming the key it wrote, instead of a daemon that
++/// starts and then refuses every frame it is ever sent.
++fn frames(text: &str, key: &str) -> Result<usize, Error> {
++    let parsed = text.parse::<usize>().map_err(|_| Error::Invalid {
++        detail: format!("`{key}` needs a number of frames, not `{text}`"),
++    })?;
++    bound(parsed, key)
++}
++
++/// The same rule for the layer that already holds a number: the configuration file.
++fn bound(frames: usize, key: &str) -> Result<usize, Error> {
++    if frames == 0 {
++        return Err(Error::Invalid {
++            detail: format!(
++                "`{key}` must be at least one frame: a queue of zero can never take a frame in"
++            ),
++        });
++    }
++    Ok(frames)
++}
++
+ /// One table of the configuration file. Every key is optional: a file that has to repeat the
+ /// defaults is a file that goes stale.
+ #[derive(Debug, Default, serde::Deserialize)]
+@@ -192,6 +228,9 @@ struct FileConfig {
+     /// `[log]`.
+     #[serde(default)]
+     log: FileLog,
++    /// `[queue]`.
++    #[serde(default)]
++    queue: FileQueue,
+ }
+ 
+ #[derive(Debug, Default, serde::Deserialize)]
+@@ -213,6 +252,13 @@ struct FileLog {
+     format: Option<String>,
+ }
+ 
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct FileQueue {
++    capacity: Option<usize>,
++    policy: Option<String>,
++}
++
+ /// Build the configuration from the four layers, in order.
+ ///
+ /// # Errors
+@@ -246,6 +292,12 @@ pub fn resolve(
+         if let Some(format) = file.log.format {
+             config.log_format = LogFormat::parse(&format)?;
+         }
++        if let Some(capacity) = file.queue.capacity {
++            config.queue_capacity = bound(capacity, "queue.capacity")?;
++        }
++        if let Some(policy) = file.queue.policy {
++            config.queue_policy = super::backpressure::Policy::parse(&policy)?;
++        }
+     }
+ 
+     if let Some(addr) = environment("LAKELET_LISTEN_ADDR") {
+@@ -260,6 +312,12 @@ pub fn resolve(
+     if let Some(format) = environment("LAKELET_LOG_FORMAT") {
+         config.log_format = LogFormat::parse(&format)?;
+     }
++    if let Some(capacity) = environment("LAKELET_QUEUE_CAPACITY") {
++        config.queue_capacity = frames(&capacity, "LAKELET_QUEUE_CAPACITY")?;
++    }
++    if let Some(policy) = environment("LAKELET_QUEUE_POLICY") {
++        config.queue_policy = super::backpressure::Policy::parse(&policy)?;
++    }
+ 
+     if let Some(addr) = &flags.listen_addr {
+         config.listen_addr = addr.clone();
+@@ -273,6 +331,12 @@ pub fn resolve(
+     if let Some(format) = &flags.log_format {
+         config.log_format = LogFormat::parse(format)?;
+     }
++    if let Some(capacity) = flags.queue_capacity {
++        config.queue_capacity = bound(capacity, "--queue-capacity")?;
++    }
++    if let Some(policy) = &flags.queue_policy {
++        config.queue_policy = super::backpressure::Policy::parse(policy)?;
++    }
+ 
+     Ok(config)
+ }
+diff --git a/src/service/ingest.rs b/src/service/ingest.rs
+index 90d97b7..8284d2d 100644
+--- a/src/service/ingest.rs
++++ b/src/service/ingest.rs
+@@ -10,31 +10,42 @@
+ //! * a peer can send a length that would allocate a gigabyte, which must be refused *before* the
+ //!   allocation and not after;
+ //! * every accepted payload goes to the store exactly once, and an accepted payload is one the
+-//!   client is allowed to believe is safe: [`Spool::append`] answers only when the record can be read
+-//!   back. `lakelet/4.5-batch-writes` moves the *grouping* and not the promise: the frames one turn
+-//!   of this loop decoded are written as one batch, and the batch is written before any of those
+-//!   frames is counted as accepted — a loop that answered first and wrote afterwards would be the
+-//!   defect that step exists to prevent.
++//!   client is allowed to believe is safe: the write path answers only when the record can be read
++//!   back.
+ //!
+-//! The connection's counters are logged (`accepted`, `rejected`, `bytes`) because that is how an
+-//! operator sees a client that is sending garbage, and the spec reads those lines. A connection that
+-//! carried nothing — a port probe, a health check — is logged at `debug` instead: an operator's log
+-//! should not grow a line per readiness check.
++//! `lakelet/4.5-batch-writes` moved the *grouping* of that promise: the frames one turn of this loop
++//! decoded are written as one batch, and the batch is written before any of those frames is counted
++//! as accepted — a loop that answered first and wrote afterwards would be the defect that step
++//! exists to prevent. `lakelet/4.6-ingest-backpressure` moves the *rest* of it out of this loop
++//! entirely: a frame is offered to a bounded queue ([`crate::service::backpressure`]), one writer
++//! task writes what the queue holds, and a connection reports nothing until the queue has settled —
++//! so the answer still comes after the write, and the queue is what decides what happens when the
++//! write cannot keep up.
+ //!
+-//! One task per connection, because a client that sends half a frame and then simply stays connected
+-//! must not hold up the next client. What *bounds* how many of those run at once is
+-//! `lakelet/4.6-ingest-backpressure`'s subject, not this step's.
++//! Two layers of counters, and they answer different questions:
++//!
++//! * a connection's [`Tally`] is what *its* frames came to — written, or dropped by the queue — and
++//!   the line it prints at the end carries those three numbers;
++//! * the daemon's [`Counters`] is the same thing for the process, which is what the stop path
++//!   reports.
++//!
++//! A connection that carried nothing — a port probe, a health check — is logged at `debug` instead:
++//! an operator's log should not grow a line per readiness check. One task per connection, because a
++//! client that sends half a frame and then simply stays connected must not hold up the next client.
++//! What bounds how many of those run at once is still an open question this track has not answered;
++//! what bounds what they may hand to the store is the queue.
+ 
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ use tokio::io::AsyncReadExt;
+ use tokio::net::TcpListener;
+ use tokio::sync::Mutex;
+ 
+ use crate::engine::Spool;
+-use crate::engine::flush::Batcher;
+ use crate::error::Error;
+ use crate::protocol::frame;
++use crate::service::backpressure::{Decision, Payload, Queue, Tally};
+ 
+ /// How many bytes are read from a connection at a time.
+ ///
+@@ -56,56 +67,45 @@ const MAX_PENDING: usize = 2 * frame::MAX_PAYLOAD + frame::OVERHEAD;
+ #[derive(Debug, Default)]
+ pub struct Counters {
+     /// Frames accepted and stored.
+-    accepted: std::sync::atomic::AtomicU64,
++    accepted: AtomicU64,
+     /// Frames refused, with the reason in the log.
+-    rejected: std::sync::atomic::AtomicU64,
++    rejected: AtomicU64,
+     /// Payload bytes stored.
+-    bytes: std::sync::atomic::AtomicU64,
++    bytes: AtomicU64,
+ }
+ 
+ impl Counters {
+     /// Frames accepted so far.
+     #[must_use]
+     pub fn accepted(&self) -> u64 {
+-        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
++        self.accepted.load(Ordering::Relaxed)
+     }
+ 
+     /// Frames refused so far.
+     #[must_use]
+     pub fn rejected(&self) -> u64 {
+-        self.rejected.load(std::sync::atomic::Ordering::Relaxed)
++        self.rejected.load(Ordering::Relaxed)
+     }
+ 
+     /// Payload bytes stored so far.
+     #[must_use]
+     pub fn bytes(&self) -> u64 {
+-        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
++        self.bytes.load(Ordering::Relaxed)
+     }
+ 
+     /// Add one connection's tally to the daemon's.
+-    fn add(&self, tally: Tally) {
+-        self.accepted
+-            .fetch_add(tally.accepted, std::sync::atomic::Ordering::Relaxed);
+-        self.rejected
+-            .fetch_add(tally.rejected, std::sync::atomic::Ordering::Relaxed);
+-        self.bytes
+-            .fetch_add(tally.bytes, std::sync::atomic::Ordering::Relaxed);
++    fn add(&self, accepted: u64, rejected: u64, bytes: u64) {
++        self.accepted.fetch_add(accepted, Ordering::Relaxed);
++        self.rejected.fetch_add(rejected, Ordering::Relaxed);
++        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+     }
+ }
+ 
+-/// What one connection did.
+-#[derive(Debug, Default, Clone, Copy)]
+-struct Tally {
+-    /// Frames accepted and stored.
+-    accepted: u64,
+-    /// Frames refused.
+-    rejected: u64,
+-    /// Payload bytes stored.
+-    bytes: u64,
+-}
+-
+ /// Serve connections until `shutdown` resolves.
+ ///
++/// The queue is the caller's, because the daemon prints its numbers when it stops; this function is
++/// what gives it a writer and hands it the frames.
++///
+ /// # Errors
+ ///
+ /// [`Error::Store`] when the store cannot be written to (which is fatal: a store that cannot store
+@@ -115,11 +115,16 @@ struct Tally {
+ pub async fn serve(
+     listener: TcpListener,
+     store: Arc<Mutex<Spool>>,
++    queue: Arc<Queue>,
+     shutdown: impl std::future::Future<Output = ()>,
+ ) -> Result<(), Error> {
+     let mut shutdown = std::pin::pin!(shutdown);
+     let counters = Arc::new(Counters::default());
+ 
++    // One writer for the whole daemon. It is the only place the log is written, which is what makes
++    // "the frames the queue holds go out in one batch" a single answer instead of one per connection.
++    let writer = tokio::spawn(write(Arc::clone(&queue), Arc::clone(&store)));
++
+     loop {
+         tokio::select! {
+             () = &mut shutdown => {
+@@ -129,23 +134,57 @@ pub async fn serve(
+                     bytes = counters.bytes(),
+                     "stopped accepting"
+                 );
+-                return Ok(());
++                // Closed, not abandoned: what the queue already holds is still written, and the wait
++                // below is what makes that true before this function answers.
++                queue.close();
++                break;
+             }
+             accepted = listener.accept() => {
+                 let (socket, peer) = accepted.map_err(|error| Error::Store {
+                     source: Box::new(error),
+                 })?;
+                 tracing::debug!(%peer, "connection accepted");
+-                let store = Arc::clone(&store);
++                let queue = Arc::clone(&queue);
+                 let counters = Arc::clone(&counters);
+                 tokio::spawn(async move {
+-                    if let Err(error) = connection(socket, store, &counters).await {
++                    if let Err(error) = connection(socket, queue, &counters).await {
+                         tracing::warn!(%error, "connection ended badly");
+                     }
+                 });
+             }
+         }
+     }
++
++    // A frame this daemon counted as accepted is one whose record is on the file, and the writer is
++    // what makes that true: `serve` does not return until the queue is empty and the last batch is
++    // written. A stop that returned here would leave accepted frames in memory and call it a stop.
++    match writer.await {
++        Ok(Ok(())) => Ok(()),
++        Ok(Err(error)) => Err(error),
++        Err(error) => Err(Error::Store {
++            source: Box::new(error),
++        }),
++    }
++}
++
++/// The one task that writes: it takes what the queue holds and writes it as one batch.
++///
++/// The size of that batch is the queue's decision and not this loop's — whatever is waiting when this
++/// task runs is what one call costs (`lakelet/4.5-batch-writes`) — and the queue's bound is what
++/// makes that number a deployment's instead of whatever arrived in one turn.
++async fn write(queue: Arc<Queue>, store: Arc<Mutex<Spool>>) -> Result<(), Error> {
++    while let Some(batch) = queue.take().await {
++        let payloads: Vec<&[u8]> = batch.iter().map(Vec::as_slice).collect();
++        {
++            let mut spool = store.lock().await;
++            spool.append_batch(&payloads)?;
++        }
++        // The queue is told here, where the write happened, and not when it handed the frames over:
++        // this is the moment the callers' tallies move from "offered" to "written", and a queue that
++        // reported the earlier moment would be acknowledging a write that had not happened.
++        queue.wrote(batch.len());
++    }
++    Ok(())
+ }
+ 
+ /// Read one connection until its client goes away.
+@@ -157,12 +196,16 @@ pub async fn serve(
+ /// without taking the process with it.
+ async fn connection(
+     mut socket: tokio::net::TcpStream,
+-    store: Arc<Mutex<Spool>>,
++    queue: Arc<Queue>,
+     counters: &Counters,
+ ) -> Result<(), Error> {
+     let mut pending: Vec<u8> = Vec::new();
+     let mut chunk = vec![0u8; READ_CHUNK];
+-    let mut tally = Tally::default();
++    // What this connection is told about the frames it offered, and the reason it does not count
++    // them itself: a frame the queue takes in can still be dropped afterwards, and only the queue
++    // knows when. `refused` is the half that never reaches the queue — bytes that are not a frame.
++    let tally = Arc::new(Tally::new());
++    let mut refused = 0u64;
+ 
+     let outcome = 'connection: loop {
+         let read = match socket.read(&mut chunk).await {
+@@ -183,26 +226,39 @@ async fn connection(
+         // stream being re-parsed from the start on every chunk.
+         match frame::read_all(&pending) {
+             Ok((frames, consumed)) => {
+-                // `lakelet/4.5-batch-writes`: everything this turn delivered is one batch, so the
+-                // store is opened and written once for it instead of once per frame. The `?` is
+-                // deliberate — a store that cannot write is not a store that may keep accepting —
+-                // and the tally moves *after* the flush, because a frame this loop counts as
+-                // accepted is one whose record the store can already read back.
+-                let mut batch = Batcher::new();
+-                let mut payload_bytes = 0;
+-                for frame in frames {
+-                    payload_bytes += frame.payload.len() as u64;
+-                    batch.push(frame.payload);
++                // A turn's frames are one offer, in the order the stream delivered them: the queue
++                // decides about all of them before the writer is told anything, which is what keeps
++                // one turn a batch (or as many batches as the bound forces) instead of a race between
++                // this loop and the writer. The `await` is deliberate — under `block` this is where
++                // the producer waits for room, and the other policies answer at once.
++                let payloads: Vec<Payload> =
++                    frames.into_iter().map(|frame| frame.payload).collect();
++                for decided in queue.offer(payloads, Arc::clone(&tally)).await {
++                    match decided {
++                        Decision::Accepted => {}
++                        Decision::Refused(payload) => {
++                            // Reported, not fatal: this is the line an operator reads when a
++                            // deployment's policy is dropping data, and the tally beside it says how
++                            // much. The daemon keeps serving.
++                            tracing::warn!(
++                                policy = %queue.policy().as_str(),
++                                bytes = payload.len(),
++                                "frame dropped by the queue"
++                            );
++                        }
++                        Decision::Evicted(payload) => {
++                            tracing::warn!(
++                                policy = %queue.policy().as_str(),
++                                bytes = payload.len(),
++                                "queued frame evicted by the queue"
++                            );
++                        }
++                    }
+                 }
+-                let accepted = batch.len() as u64;
+-                let mut spool = store.lock().await;
+-                batch.flush(&mut spool)?;
+-                tally.accepted += accepted;
+-                tally.bytes += payload_bytes;
+                 pending.drain(..consumed);
+             }
+             Err(error) => {
+-                tally.rejected += 1;
++                refused += 1;
+                 tracing::warn!(reason = %error, "frame rejected");
+                 // Nothing after a refusal can be trusted to start at a frame boundary, and a buffer
+                 // that only grows is how one client ends the process.
+@@ -215,14 +271,17 @@ async fn connection(
+         }
+     };
+ 
+-    counters.add(tally);
+-    if tally.accepted + tally.rejected > 0 {
+-        tracing::info!(
+-            accepted = tally.accepted,
+-            rejected = tally.rejected,
+-            bytes = tally.bytes,
+-            "connection closed"
+-        );
++    // The half of the line that is this step's, and the reason it is here rather than at the offer
++    // above: nothing is reported as accepted until the queue has settled, so `accepted` is frames
++    // that are on the file and `rejected` counts the ones it dropped — including frames that were
++    // queued for a while and evicted later, which an answer at offer time could not have known.
++    queue.settled().await;
++    let accepted = tally.written();
++    let rejected = refused + tally.dropped();
++    let bytes = tally.bytes();
++    counters.add(accepted, rejected, bytes);
++    if accepted + rejected > 0 {
++        tracing::info!(accepted, rejected, bytes, "connection closed");
+     } else {
+         tracing::debug!("connection closed without traffic");
+     }

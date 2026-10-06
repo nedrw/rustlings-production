@@ -62,6 +62,13 @@ pub struct Config {
     pub log_level: String,
     /// Log format.
     pub log_format: LogFormat,
+    // The settings a later step adds are declared inside this block: a scaffold may only write inside
+    // a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+    // (docs/authoring.md §5). A key declared here belongs in `report` below as well — a deployment
+    // diffs that text between two machines, so a key appears in it when it is added and never
+    // leaves it.
+    // kiln:scaffold:begin
+    // kiln:scaffold:end
 }
 
 impl Default for Config {
@@ -71,6 +78,10 @@ impl Default for Config {
             store_dir: PathBuf::from("data"),
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            // Where the defaults of the settings declared in the block above live, for the same
+            // reason: a later step's keys arrive as insertions inside this region.
+            // kiln:scaffold:begin
+            // kiln:scaffold:end
         }
     }
 }
