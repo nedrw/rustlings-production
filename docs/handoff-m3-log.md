@@ -298,3 +298,33 @@ log `draining`”，但代码里没有任何地方 flush——`Never`/`interval`
 
 **下一步**：`lakelet/4.4-wal-recovery`（`store/wal-recovery@apply`：校验和 + 部分写 + 重放，
 `slow:sim@3` 的第一次真跑，契约见本文件段 6 的探针结论），然后给开发者 B1 检查点报告。
+
+## 段 8：验收演练的进度（边做边记）
+
+plan §9 要六条腿，每条要“原始输出 + 回滚对比”。做不到的都记在这里，做到的记原始行——收尾时直接搬进
+[handoff-m3.md](handoff-m3.md) §4，不用回头翻提交。
+
+| 腿 | 判据 | 状态 |
+| --- | --- | --- |
+| 1 无网快路径 | 预拉镜像 + 私有 `XDG_CACHE_HOME` + `CARGO_NET_OFFLINE=true` → `kiln verify lakelet`（不带 `--slow`）绿 | **部分已做**：整个 T4 依赖集能无网构建（下面那行）；`kiln verify lakelet` 要等 24 步齐 |
+| 2 注入泄漏 | `slow:soak` 红并点名计数 → 回滚绿 | 等 4.17（`slow:soak@N` 第一次上场） |
+| 3 换掉合并顺序 | 用 `HashMap` 迭代顺序替换一处合并 → `slow:sim` 红 → 回滚绿 | 等 4.6/4.8（`sim@3` 的下一批用户；4.4 会先跑通 `sim` 门） |
+| 4 未分类的截断帧 | 注入 → fuzz/spec 红 → 回滚绿 | **已做**（段 5）：bug 种回去 → `kiln run` `FAILED. 5 passed; 2 failed`、`✗ slow:fuzz@3 3 of 3 seed(s) did not pass … panicked at src/protocol/sniff.rs:89:32`；回滚 → `7 passed` / `10/10 must gate(s) passed` |
+| 5 拿掉 4.14 的剪枝 | `bench-budget` 红 → 回滚绿 | 等 4.14 |
+| 6 改一个协议向量 / 弄坏 Dockerfile | `spec-integrity` 红 / `container-repro` 红 | 前半每步的 selftest 都在跑；后半等 4.22 的 Dockerfile |
+
+腿 1 的无网那一半，4.3 上实测（冷目标目录 + 全新 `XDG_CACHE_HOME`，只复用已缓存的 registry 源码）：
+
+```
+$ CARGO_NET_OFFLINE=true XDG_CACHE_HOME=/private/tmp/xdg-offline43 kiln selftest lakelet/4.3-write-path-adr --track lakelet
+    scaffold ✓ the spec fails as it must · solution ✓ the spec passes · gates ✓ 9/9 must green
+1/1 step(s) hold the contract … · real 17.95s
+```
+
+4.4 起 `turmoil` 进项目（dev-dependency），它的 48 个包在这台机器上也能离线构建（段 6 的探针就是
+`--offline` 跑的），所以这条腿在 4.4 之后要重取一次。
+
+**收尾时要补齐的两条命令**（plan §9 的最后两行）：`kiln verify lakelet --slow --json` 要给出
+`{passed: 24, failed: 0, blocked: 0, not_authored: 0, clean: true}`，`cargo xtask ci` 要 exit 0 且末行是
+`24/24 step(s) hold the contract`。两条都必须从**scratch 副本**里跑（`kiln` 会把项目命令的
+`CARGO_TARGET_DIR` 清掉，工作树里不许出现 `target/`，见 handoff-m3 §1 第 1 条）。
