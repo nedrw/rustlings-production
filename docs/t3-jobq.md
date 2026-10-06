@@ -73,7 +73,7 @@ T3 是一个用步一层层长出来的**任务队列引擎**：一个库（引�
 | 逐步 `selftest` | 3.1–3.27 全绿（13–15 个 must 门；3.5/3.6/3.7/3.9/3.11/3.12/3.16/3.23/3.26 含 `slow:conformance@2`）|
 | 慢门 | `mutants` 6/6 或 5/6（3.24 是 83%）；`bench-budget` 三/四个计数在 ±10%；`unsafe-budget@0` 零 `unsafe`；`?coverage`（插桩构建在项目副本里、子进程数据也算、模块 = 本步带进来的文件）3.21/3.22/3.23 **100%**、3.24 95%、3.25 87%、3.26 **94%**、3.27 85% —— 全过 |
 | 课程自有检查 | `lint-caps` `no issues.`（97/136/119/73）；`links` **87 page(s) · 464 link(s) · 283 external target(s)**，全部解析；`i18n` 0 error；`probe --check` 41/41 |
-| `cargo xtask ci` | **exit 0 · 39 m 22.9 s · `27/27 step(s) hold the contract`**（2026-10-06，子进程 profile 那笔之后）。方案 ③（`7c6bcb4`）之后的一次 CI 运行**被中断，没有取到数**：本地证据是 `verify jobq --slow`（27/27 `clean`、八条 mutants 走法不变、七条 coverage 全过）与 `cargo test -p kiln`（280 + 21 + 1）|
+| `cargo xtask ci` | **exit 0 · 30 m 58.8 s · `27/27 step(s) hold the contract`**（2026-10-06，方案 ③ 与 review 批次 A/B/C/E 全部落地之后；kiln 单测 `285 + 21 + 1`。此前几次：32 m 12 s / 35 m 32 s / 39 m 22.9 s，逐次记在 handoff §4.2）|
 | M2 验收演练 | 五条腿都有原始行（semver / mutants / bench-budget / conformance / unsafe-budget），见 handoff §4.3 |
 
 ## 6. T3 范围内剩下的缺口

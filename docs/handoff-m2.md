@@ -490,7 +490,7 @@ CARGO_TARGET_DIR=/private/tmp/demo-target XDG_CACHE_HOME=/private/tmp/xdg-demo \
 | postgres 后端子集 | 真正建 `PostgresStore` 的那 **10** 个规格（`authz cli dedup dlq isolation leases port_conformance state_machine timers tracing`）跑在 `KILN_BACKEND=postgres` → **71 passed · 0 failed**。`spec_fairness` 只建内存存储，不该算进来（§4.2 早先写的“11 个规格 → 75”把名单当成了后端口径，已改正）|
 | 无特性装配 | `cargo test -p jobq --no-default-features --test spec_port_conformance` → **8 passed**（修复前是 `E0432`，见 §5.2）|
 | 课程自己的检查 | `lint-caps` → `no issues.`（**97 capabilities · 136 slots · 119 ledger positions · 73 authored steps**，`checked 70 of 73 step bodies`）；`probe --check` → `41/41`；`links` → **87 page(s) · 464 link(s) · 283 external target(s)**，`✓ every target resolves`（2026-10-06 复核时的数字）；`i18n status` → `structure: 0 error(s)`，`drift: 0 warning(s)` |
-| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）；子进程 profile 那笔之后又跑一次：**exit 0 · 39 m 22.9 s**，输出同上（kiln 单测 `278 + 21 + 1`）|
+| CI | **`cargo xtask ci` → exit 0 · 32 m 12 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq 三条 track）。2026-10-06 在 coverage 改动后复跑：**exit 0 · 35 m 32 s · 同样是 `all checks passed` + `27/27 step(s) hold the contract`**（`cargo test --workspace` 里 kiln 是 `277 + 21 + 1`）；子进程 profile 那笔之后又跑一次：**exit 0 · 39 m 22.9 s**，输出同上（kiln 单测 `278 + 21 + 1`）；**方案 ③ 与 review 批次（A/B/C/E）之后的最新一次：exit 0 · 30 m 58.8 s · `27/27 step(s) hold the contract`（kiln 单测 `285 + 21 + 1`）** |
 
 ### 4.3 验收演练（已做两腿，原始输出）
 
@@ -774,7 +774,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
   #4/#7（`35ec238`）、#9（`d49b4c1`：`check --slow` 跑与 `verify --slow`/`selftest` 同一集合；
   顺手修了汇总行把“没跑的门”当成“未实现”的两个计数，现在分列 `slow gate(s) skipped` 与 `catalogue gate(s) not implemented yet`）、
   `c9146b2`（探题里还留着一条 `at or above` 的断言文案）。
-  **待定**：#5/#6 一批（见下一条）；**#8 随本轮收尾的 CI 补**。
+  **待定**：#5/#6 一批（见下一条）；**#8 已补**：`cargo xtask ci` → **exit 0 · 30 m 58.8 s · `xtask ci: all checks passed` · `27/27 step(s) hold the contract`**（逐条走 mailer/relay/jobq，含本轮 A/B/C/E 与 ②③ 那几笔）。
   **复核数字**（我独立重取）：`cargo test -p kiln` → **285 + 21 + 1**；`kiln probe --check` → **41/41**；
   尾巴树 `verify jobq --slow --json` → exit 0 · **7 m 21.7 s** · `{passed: 27, failed: 0, blocked: 0, not_authored: 0, clean: true}`、
   七条 coverage 与八条 mutants 走法的数字逐条不变（204/204、64/64、237/237、205/215、293/334、307/325、121/141）；
