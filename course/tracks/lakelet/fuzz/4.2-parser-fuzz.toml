@@ -8,10 +8,10 @@
 # `iterations_min` is a floor on what one seed's walk *reported*, not a target: the reference
 # solution walks 60_000 inputs per seed, and this floor is what a search still has to clear to
 # count as one. `corpus_cases` is how many regression inputs have to be replayed: the reference
-# solution pins one (the input the walk found), and a pinned input that stopped being replayed is a
-# panic that can come back without anybody noticing. Production fuzzing is `cargo-fuzz`; the gate
-# cannot use it (`kiln doctor` reports it as not installed here, and it needs nightly), so the
-# search it judges is the deterministic one this project owns.
+# solution keeps one (the minimised input the walk found, in `tests/corpus/parser/`), and a corpus
+# entry that stopped being replayed is a panic that can come back without anybody noticing. Production
+# fuzzing is `cargo-fuzz`; the gate cannot use it (`kiln doctor` reports it as not installed here,
+# and it needs nightly), so the search it judges is the deterministic one this project owns.
 command = "cargo test -p lakelet --test fuzz_protocol -- --nocapture"
 seeds = [1, 7, 20260101]
 iterations_min = 20000

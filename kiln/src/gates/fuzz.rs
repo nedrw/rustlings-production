@@ -1,13 +1,21 @@
-//! `fuzz@N` — the step's parser survives a bounded, seeded search, and every pinned input still
-//! replays.
+//! `fuzz@N` — the step's parser survives a bounded, seeded search, and the corpus it keeps is still
+//! replayed.
 //!
 //! Fuzzing in the course is two things, and only one of them needs a fuzzer. The *search* is a seeded,
 //! deterministic walk over mutated inputs — the step's harness prints how many mutations it made and
-//! how many pinned inputs it replayed, so the workload is a number a report can be held to instead of a
-//! promise that somebody ran it once. The *corpus* is the interesting half: every input that ever found
-//! a panic is pinned in the step's spec (read-only, hash-pinned by `spec-integrity`), and the gate
-//! checks that the harness still replays all of them. A regression input that stopped being replayed is
-//! a bug that can come back without anybody noticing.
+//! how many corpus inputs it replayed, so the workload is a number a report can be held to instead of a
+//! promise that somebody ran it once. The *corpus* is the interesting half: the inputs that ever found
+//! a panic are kept and replayed through the parser on every build, and the gate checks that a run
+//! still replayed as many of them as the course's file requires. A regression input that stopped being
+//! replayed is a bug that can come back without anybody noticing.
+//!
+//! *Where* the corpus lives is the step's business rather than this gate's. The step that uses the
+//! gate first (`lakelet/4.2-parser-fuzz`) keeps its entries in the project (`tests/corpus/**`, one hex
+//! input per line, read by a module the step's scaffold ships), because the input a search found is the
+//! learner's finding and not the course's bytes — pinning it in the spec would hand over the answer
+//! that step exists to make somebody find. What a gate can judge without knowing where the entries are
+//! is the count the harness reports against the count the course's file declares, so that is all this
+//! one does.
 //!
 //! Production fuzzing is `cargo-fuzz` (libFuzzer, coverage-guided, needs nightly). It is not part of
 //! the toolchain baseline, so it cannot be a `must` gate (plan §10); `kiln doctor` reports it and the
@@ -28,7 +36,7 @@ use crate::process;
 /// The variable the harness reads to pick the walk's seed.
 pub const SEED: &str = "KILN_FUZZ_SEED";
 
-/// What the harness reports: mutations performed, pinned inputs replayed.
+/// What the harness reports: mutations performed, corpus inputs replayed.
 const ITERATIONS: &str = "iterations";
 const CORPUS_CASES: &str = "corpus_cases";
 
@@ -42,7 +50,7 @@ struct Parameters {
     seeds: Vec<u64>,
     /// Mutations the walk has to perform per seed.
     iterations_min: u64,
-    /// How many regression inputs the step's spec pins. The harness says how many it replayed.
+    /// Regression inputs a run has to have replayed. The harness says how many it replayed.
     corpus_cases: u64,
 }
 
@@ -55,7 +63,7 @@ enum Attempt {
         seed: u64,
         /// Mutations it performed.
         iterations: f64,
-        /// Pinned inputs it replayed.
+        /// Corpus inputs it replayed.
         corpus_cases: f64,
     },
     /// The run did not pass — a panic, a compile error, a deadline.
@@ -144,7 +152,7 @@ fn attempt(ran: &process::Ran, seed: u64, prefix: &str) -> Attempt {
     }
 }
 
-/// Judge the runs: enough search, and every pinned input replayed.
+/// Judge the runs: enough search, and the corpus replayed.
 fn grade(
     attempts: &[Attempt],
     parameters: &Parameters,
@@ -218,9 +226,9 @@ fn grade(
     );
     if replayed < parameters.corpus_cases as f64 {
         return GateOutcome::failed(format!(
-            "the harness replayed {} of the {} regression input(s) this step pins — a pinned input \
-             that is no longer replayed is a panic that can come back ({} states the count, and `kiln \
-             spec restore` puts the spec back)",
+            "the harness replayed {} of the {} regression input(s) this step is judged by — a corpus \
+             entry that stopped being replayed is a panic that can come back (the count is the \
+             course's, in {}; the entries are the project's)",
             number(replayed),
             parameters.corpus_cases,
             path.display()
@@ -228,7 +236,7 @@ fn grade(
     }
 
     GateOutcome::passed(format!(
-        "{} seed(s) ran, {} mutation(s) each, {} of {} pinned input(s) replayed (the walk took {})",
+        "{} seed(s) ran, {} mutation(s) each, {} of {} regression input(s) replayed (the walk took {})",
         attempts.len(),
         ran.iter()
             .map(|(_, iterations, _)| number(*iterations))
@@ -310,7 +318,7 @@ mod tests {
             passed.detail
         );
         assert!(
-            passed.detail.contains("6 of 6 pinned input(s)"),
+            passed.detail.contains("6 of 6 regression input(s)"),
             "{}",
             passed.detail
         );
