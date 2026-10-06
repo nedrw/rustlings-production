@@ -112,19 +112,33 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
+    Ok(GateOutcome::passed(passed_line(
+        found.len(),
+        files.len(),
+        allowed,
+        &project.join("Cargo.toml"),
+    )))
+}
+
+/// The pass line: the counts, the note clause only when there is an occurrence for it to describe, and
+/// the policy this step is under.
+///
+/// A step at `@0` printed "0 `unsafe` occurrence(s) … , each with a `// SAFETY:` note" before this:
+/// nothing in it is false, and it still reads as if a note were expected from a step that has no
+/// `unsafe` at all (measured on `lakelet/4.7-columnar-segments`, whose line is read by every step from
+/// there on).
+fn passed_line(occurrences: usize, files: usize, allowed: usize, manifest: &Path) -> String {
+    let notes = if occurrences == 0 {
+        String::new()
+    } else {
+        format!(", each with a `// {SAFETY}` note")
+    };
     let policy = if allowed == 0 {
-        format!(
-            ", and `unsafe_code` is denied in {}",
-            project.join("Cargo.toml").display()
-        )
+        format!(", and `unsafe_code` is denied in {}", manifest.display())
     } else {
         format!(" (this step allows {allowed})")
     };
-    Ok(GateOutcome::passed(format!(
-        "{} `unsafe` occurrence(s) in {} production file(s), each with a `// {SAFETY}` note{policy}",
-        found.len(),
-        files.len()
-    )))
+    format!("{occurrences} `unsafe` occurrence(s) in {files} production file(s){notes}{policy}")
 }
 
 /// The `unsafe` occurrences of one file's production code.
@@ -602,6 +616,26 @@ mod tests {
             "a manifest nobody can read denies nothing"
         );
         assert!(!denies_unsafe_code(&scratch.path().join("elsewhere")));
+    }
+
+    #[test]
+    fn a_step_with_no_unsafe_does_not_claim_it_documented_any() {
+        let manifest = Path::new("/tmp/project/Cargo.toml");
+        let clean = passed_line(0, 31, 0, manifest);
+        assert!(
+            clean.contains("0 `unsafe` occurrence(s) in 31 production file(s)"),
+            "{clean}"
+        );
+        assert!(!clean.contains("each with a"), "{clean}");
+        assert!(clean.contains("unsafe_code` is denied"), "{clean}");
+
+        // With occurrences, the note clause is the point, and a step that allows some says so.
+        let documented = passed_line(2, 5, 2, manifest);
+        assert!(
+            documented.contains("each with a `// SAFETY:` note"),
+            "{documented}"
+        );
+        assert!(documented.contains("(this step allows 2)"), "{documented}");
     }
 
     #[test]
