@@ -1,0 +1,1826 @@
+diff --git a/docs/query.md b/docs/query.md
+index 16163e7..5ddea5e 100644
+--- a/docs/query.md
++++ b/docs/query.md
+@@ -1,51 +1,190 @@
+ # The query language
+ 
+-<!-- TODO: one paragraph, in this project's voice, on what a question about this store is — a
+-metric, a span of time and a window to count in — and why a refusal is a feature rather than a
+-gap. Link the code the way the other pages in this directory do, and delete this comment. -->
++A question about this store names three things: a **metric**, a span of **time**, and a **window**
++to count in. Everything else is optional, and everything the grammar cannot answer it **refuses**
++rather than approximates — a query that quietly answers something else is worse than one that
++says no, because the wrong answer is the one nobody goes looking for.
+ 
+-[TODO](TODO)
++The code is this page's contract, and there are five pieces of it: [the series name][series],
++[the scanner][lex], [the grammar][parse], [the plan][plan] and [the pass that reads][exec]. If
++this page and those files disagree, the files are right and this page is a bug.
++
++[series]: ../src/engine/query/series.rs
++[lex]: ../src/engine/query/lex.rs
++[parse]: ../src/engine/query/parse.rs
++[plan]: ../src/engine/query/plan.rs
++[exec]: ../src/engine/query/exec.rs
+ 
+ ## Two ways to ask
+ 
+-<!-- TODO: `lakeletq query` takes the same question as flags and as one `--sql` text. Say why the
+-two are mutually exclusive and why `--store` is a flag in both forms, then show one call in each
+-form with the answer it prints. Link the command line. -->
++`lakeletq query` takes the same question two ways, and they are mutually exclusive:
++
++```sh
++% lakeletq query --store ./lakelet-data --from 1700000000000 --to 1700003600000 \
++      --window 5m --agg mean
++1700000000000 41 12.5
++1700000300000 37 12.7
++
++% lakeletq query --store ./lakelet-data --sql \
++      "SELECT mean(value) FROM cpu WHERE host = 'h0'
++         AND ts BETWEEN 1700000000000 AND 1700003600000
++         GROUP BY time(5m), series LIMIT 3"
++cpu,host=h0 1700000000000 41 12.5
++cpu,host=h0 1700000300000 37 12.7
++```
++
++The flags are the shape `lakelet/4.10-downsampling` shipped; the text is this step's, and a call
++that gives both is refused as a caller error, because the text *is* the whole question. `--store`
++is a flag in both forms: a query text names a metric, not a directory.
+ 
+ ## The grammar
+ 
+-<!-- TODO: print the grammar the parser implements — every clause, the five aggregates, the five
+-window units — and then the rules that are decisions rather than syntax: the mandatory, half-open
+-`ts BETWEEN`; `FROM` naming the metric rather than the series; `AND` only; the mandatory
+-`GROUP BY time(<window>)` on the absolute grid and what it does to a range that is not a whole
+-number of windows long; `GROUP BY …, series` and what it changes about the answer; `LIMIT`
+-bounding series rather than buckets. Link the parser. -->
++```text
++SELECT <agg>(value) FROM <metric> WHERE <pred> [AND <pred>]*
++       GROUP BY time(<window>)[, series] [LIMIT <n>]
++<pred>   ::= <key> = '<value>' | ts BETWEEN <millis> AND <millis>
++<agg>    ::= count | sum | mean | min | max        (case-insensitive, like every keyword)
++<window> ::= <n><unit>, <unit> in ms | s | m | h | d
++```
+ 
+-## Refusals
++Six rules are decisions rather than syntax, and each of them is a sentence somebody had to write
++down:
+ 
+-<!-- TODO: the table a reader of the exit codes opens: one row per way a query is turned down, the
+-class it carries (2, 3 or 4) and what it means. Name the refusal variants — the class is a
+-property of the refusal and not of the code path that produced it — and say what the sentence a
+-caller reads contains: the byte, the word, the floor, the name. -->
++- **the time range is mandatory, and half-open.** `ts BETWEEN a AND b` means `[a, b)`: a record at
++  `a` is in the answer and a record at `b` is the first record of the *next* question. Every range
++  in this store is half-open — [`Range`](../src/engine/query/downsample.rs), the retention cutoff,
++  a segment's stated span — because an inclusive end makes two answers that meet both claim the
++  record they meet on. The range is also **required**: a telemetry query that reads all of time is
++  not a question, it is an accident with a fleet behind it.
++- **`FROM` names the metric, not the series.** A record's series is `metric,tag=value,…`, so
++  `FROM cpu` is every series whose metric is `cpu` and every `WHERE <key> = '<value>'` keeps only
++  the records whose series carries that pair, exactly. A series that carries the metric and *more*
++  tags than the predicates named is selected — the predicates are conditions, not a complete tag
++  set. `ts` is not a tag; it is the time axis, and a predicate on it is refused in a sentence that
++  says so.
++- **`AND` only.** Every predicate has to hold. `OR` is refused rather than answered because it is
++  the one clause whose presence changes what a plan may prune: a record that satisfies either half
++  cannot be ruled out by a predicate that matches one half. `lakelet/4.14-index-pruning` is where
++  that argument is made in full.
++- **`GROUP BY time(<window>)` is mandatory.** A query that does not say how wide one bucket is has
++  not said what it wants, and every bucket this store answers is a bucket of the **absolute time
++  grid**: `[n * width, (n + 1) * width)` counted from the Unix epoch, the same alignment a
++  retention cutoff snaps to. A range that is not a whole number of windows long therefore touches
++  one window more than a reader may have counted, and the first and last buckets are partial — they
++  hold what is in the *range*, and nothing that is not.
++- **`GROUP BY …, series` is what makes an answer per series.** Without it, one answer mixes every
++  series the predicates select, which is right for "how busy is the fleet" and wrong for "how busy
++  is this host". With it, the answer is one bucket list per series, ordered by series name, and
++  each line carries the series it is about.
++- **`LIMIT` bounds the number of *series* answered**, so it is written with `GROUP BY …, series`
++  and nowhere else: a limit on one mixed answer names nothing to bound. `LIMIT 0` is refused for
++  the same reason an empty range is — a query that asks for no answer is a mistake, not a small
++  request.
++
++An empty window is **absent**, not zero: a window with no records in the range is not a line, and
++not a `0`, because a store that reported nothing and a store that reported zero are different
++facts. `lakelet/4.10-downsampling` argues that rule where the buckets are computed.
++
++## Asking, and being refused
++
++The answer is one line per bucket on stdout, `start count value`, oldest window first, with the
++series name in front when the query groups by series; `--json` is the same answer as one document.
++The exit code is the part a script branches on, and there is one per class:
++
++| what happened | exit | stdout |
++| --- | --- | --- |
++| the question was answered | `0` | the answer |
++| the call was wrong | `2` | nothing |
++| the thing asked about is not there | `3` | nothing |
++| the store refused | `4` | nothing |
++| this deployment is broken | `1` | nothing |
++
++Every caller mistake is answered **before a store is opened**, so a `2` is the script's problem
++wherever the deployment happens to be. The refusal itself is a typed value, and the class is a
++property of the refusal rather than of the code path that produced it:
+ 
+ | refusal | class | what it means |
+ | --- | --- | --- |
+-| TODO | TODO | TODO |
++| `Syntax` | `2` | the text is not a query: a missing, repeated or out-of-order clause, a value that is not quoted, a `'` that never closes (at the byte it opened) |
++| `Aggregate` | `2` | the name after `SELECT` is not one of the five |
++| `Disjunction` | `2` | an `OR`, which this grammar does not have |
++| `Limit` | `2` | `LIMIT` without `series`, or a limit of zero |
++| `Forgot` | `2` | the range reaches below the store's floor; the sentence names the floor and what the store still answers |
++| `Unknown` | `3` | the metric is one this store has never held — a typo must not look like a quiet fleet |
++| `Store` | `4` | a segment or a manifest this build cannot read |
++
++The text form's document carries the counts beside the buckets, which is where a script reads what
++a query cost; the flag form's `--json` is the array it has always been.
+ 
+ ## `EXPLAIN`
+ 
+-<!-- TODO: what `EXPLAIN` is (a statement and not a flag), that it opens no segment, and a key
+-table with every key the plan prints: `metric`, `series`, `aggregate`, `from`, `to`, `window`,
+-`windows`, `columns`, `segments_opened`, `segments_pruned`, `records`, `limit`. Say which of those
+-are the plan's numbers and which are the executed outcome's. Link the plan. -->
++`EXPLAIN` is a statement, not a flag: `EXPLAIN SELECT …` answers with the plan and **opens no
++segment at all**. Every key is a fact the manifest already states:
++
++```text
++metric = cpu
++series = cpu,host=h0
++aggregate = mean
++from = 1700000000000
++to = 1700003600000
++window = 300000
++windows = 12
++columns = series,ts_millis,value
++segments_opened = 2
++segments_pruned = 6
++records = 88
++limit = none
++```
++
++| key | what it is |
++| --- | --- |
++| `metric` | the metric `FROM` named |
++| `series` | the series name the grammar can spell out of the predicates: a *prefix* of every series the answer can cover, not a list of them |
++| `aggregate` | which of the five summarises a window |
++| `from`, `to` | the half-open range, in milliseconds since the epoch |
++| `window` | how wide one bucket is, in milliseconds |
++| `windows` | how many windows the range touches (`MAX_WINDOWS` bounds this, before a store is opened) |
++| `columns` | which columns of a segment the answer is computed from: `series,ts_millis,value` |
++| `segments_opened` | how many segments the plan keeps |
++| `segments_pruned` | how many its stated spans rule out, so nothing is read from them |
++| `records` | how many records the opened segments hold, from the index |
++| `limit` | `none`, or how many series the answer may cover |
++
++`segments_pruned` is a claim about what the query will *not* do, and the executed counts are the
++[outcome's](../src/engine/query/exec.rs): `rows_scanned` is what was actually read (at most what
++`records` states) and `rows_answered` is what landed in a bucket (at most `rows_scanned`). A plan
++that reported a number it did not compute would be worse than no plan.
+ 
+ ## The pipeline
+ 
+-<!-- TODO: the four steps — prune, read, select, answer — and the counts each one produces. Say
+-that the buckets come from `lakelet/4.10-downsampling`'s pass unchanged, and link the executor and
+-the binary on top of the library. -->
++```text
++  query text ──▶ lex ──▶ parse ──▶ Query ──▶ plan ──▶ segments to open, and the ones to skip
++                                                  │
++                     the manifest's spans ────────┘
++                                                  ▼
++                                    read ──▶ select ──▶ downsample ──▶ the answer
++                                    the kept   metric +           the window pass of
++                                    segments   predicates         lakelet/4.10
++```
++
++Four steps, in that order, and the interesting one is the first: **pruning**. A segment whose
++stated span does not meet the range holds nothing the query asked about, so it is not opened, and
++the records a query walked is a number the plan chose rather than a number the store imposed.
++Everything after it is deliberately not reimplemented: the buckets come from
++`lakelet/4.10-downsampling`'s pass, unchanged, so there is one place in this project where a `mean`
++is defined. `cli` is the other end of the same pipeline — [the command line](../src/cli/mod.rs)
++decides about this process (two streams, one exit code, `--json` as a format), and
++[the binary](../src/bin/lakeletq.rs) writes what the library answered and nothing else.
+ 
+ ## What is not here yet
+ 
+-<!-- TODO: `OR` and `blocks_pruned` (`lakelet/4.14-index-pruning`), a series index
+-(`lakelet/4.18-cardinality-cost`), and summation (`lakelet/4.12-aggregation-correctness`). -->
++- **`OR`, and what it costs to prune one.** `lakelet/4.14-index-pruning` is where a disjunction is
++  argued rather than declined, and where the plan grows a second pruning decision
++  (`blocks_pruned`) on the same surface this page describes.
++- **a series index.** Whether a store has *ever* held a metric is decided today from the segments a
++  range touches, because the manifest names records and spans and not series — so a range with no
++  segment in it is answered empty whatever `FROM` names. A store that knows its own names cheaply is
++  `lakelet/4.18-cardinality-cost`.
++- **summation, and the numbers a query is wrong about.** Every value on this page is computed by
++  `lakelet/4.10-downsampling`'s pass, and what a running sum costs is
++  `lakelet/4.12-aggregation-correctness`.
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 4601612..4fd232f 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -60,6 +60,20 @@
+ //! order, and `[]` when the range held nothing — a script that has to special-case "no output" is
+ //! a script that gets it wrong once and then stops trusting the tool.
+ //!
++//! # Two ways to ask one question
++//!
++//! `query` takes its question either as **flags** or as one **`--sql` text**, and the two are
++//! mutually exclusive: the text *is* the whole question — its range, its window, its aggregate and
++//! the series it selects — so a call that gives both has said the same thing twice and is refused
++//! as a caller error. The flag form is `lakelet/4.10-downsampling`'s and is unchanged, byte for
++//! byte: the two forms answer the same question the same way, and the one thing a second input
++//! form may not do is make the first one drift.
++//!
++//! What the text form adds is *refusals a grammar can state*: a clause that is missing, an
++//! aggregate that does not exist, a range that reaches under the store's floor, a metric the store
++//! has never held. Each of them arrives as a typed refusal that carries its own class
++//! (`Refusal::class`), so this file does not decide what a wrong query exits with — it asks.
++//!
+ //! # What the course gives you, and what is yours
+ //!
+ //! [`USAGE`] is the grammar — it is the interface a script reads and the contract this module
+@@ -72,6 +86,10 @@ use std::path::Path;
+ 
+ use crate::engine::compaction::Segments;
+ use crate::engine::query::downsample::{self, Aggregate, Bucket, Range, Window};
++use crate::engine::query::exec;
++use crate::engine::query::lex::Refusal;
++use crate::engine::query::parse::{self, Statement, unit_millis};
++use crate::engine::query::plan::{self, COLUMNS, Plan};
+ use crate::error::Error;
+ 
+ /// The command answered.
+@@ -100,6 +118,7 @@ OPTIONS:
+ 
+ QUERY OPTIONS:
+     query --store <DIR> --from <MS> --to <MS> --window <DURATION> --agg <NAME> [--series <SERIES>]
++    query --store <DIR> --sql '<QUERY>'
+           --store <DIR>     the store directory to read
+           --from <MS>       first millisecond of the range, since the Unix epoch (inclusive)
+           --to <MS>         first millisecond after it (exclusive)
+@@ -107,10 +126,18 @@ QUERY OPTIONS:
+           --agg <NAME>      count, sum, mean, min or max
+           --series <SERIES> only this series (the default is every series, which is rarely what a
+                             mean wants)
+-
+-The answer is one line per bucket on stdout, `start count value`, oldest window first; a window
+-that held no records is not a line. With --json it is one array of {\"start\":…,\"count\":…,\"value\":…},
+-and [] when the range held nothing.
++          --sql <QUERY>     the whole question as one text, and not beside the flags above:
++                            SELECT mean(value) FROM cpu WHERE host = 'a'
++                              AND ts BETWEEN 1700000000000 AND 1700003600000
++                              GROUP BY time(1m), series LIMIT 3
++                            Put EXPLAIN in front of it to print the plan instead of the answer.
++
++The answer is one line per bucket on stdout, `start count value`, oldest window first, and a window
++that held no records is not a line; a query that names `series` in its GROUP BY puts the series
++name in front of those three fields, one line per series per bucket. The flag form's --json answer
++is one array of {\"start\":…,\"count\":…,\"value\":…} and [] when the range held nothing. A --sql
++answer is one object — the counts the query cost, beside its buckets — and EXPLAIN is one object of
++the plan's own keys.
+ 
+ Exit codes: 0 the command answered, 2 the call was wrong, 3 the thing asked about is not there,
+ 4 the store refused, 1 this deployment is broken.
+@@ -293,6 +320,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+     let mut window: Option<&str> = None;
+     let mut aggregate: Option<&str> = None;
+     let mut series: Option<&str> = None;
++    let mut sql: Option<&str> = None;
+ 
+     let mut index = 0;
+     while let Some(flag) = flags.get(index).copied() {
+@@ -306,6 +334,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+             "--window" => &mut window,
+             "--agg" => &mut aggregate,
+             "--series" => &mut series,
++            "--sql" => &mut sql,
+             other => return unknown(other, "`lakeletq --help` lists the flags `query` takes"),
+         };
+         // A flag given twice is refused rather than resolved: a script that appends its own
+@@ -322,6 +351,31 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+     let Some(store) = store else {
+         return missing("--store");
+     };
++
++    // The two forms are two ways to ask one question, so giving both is a caller saying the same
++    // thing twice — and the flag that was given beside `--sql` is named, because "you cannot mix
++    // these" sends a reader back to their script to guess which flag did it.
++    if let Some(text) = sql {
++        for (flag, given) in [
++            ("--from", from),
++            ("--to", to),
++            ("--window", window),
++            ("--agg", aggregate),
++            ("--series", series),
++        ] {
++            if let Some(value) = given {
++                return Outcome::refused(
++                    WRONG,
++                    format!(
++                        "`--sql` is the whole query, so `{flag} {value}` cannot be given beside \
++                         it: the text says which range, window, aggregate and series it is about"
++                    ),
++                );
++            }
++        }
++        return sql_query(store, text, json);
++    }
++
+     let Some(from) = from else {
+         return missing("--from");
+     };
+@@ -377,24 +431,18 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+ 
+     // How many buckets the question asks for is arithmetic, and it is done before a store is
+     // opened: `--window 1ms` over a year of range is a typo, not a question, and a tool that
+-    // started allocating for it would be a tool that hangs on a typo.
+-    let first = from_millis / width_millis;
+-    let last = (to_millis - 1) / width_millis;
+-    let windows = last - first + 1;
++    // started allocating for it would be a tool that hangs on a typo. The count itself is
++    // `lakelet/4.11-query-engine`'s `windows_of`, which is what makes the flag form and the text
++    // form refuse the same typo with the same number.
++    let range = Range::new(from_millis, to_millis);
++    let windows = plan::windows_of(range, Window::new(width_millis));
+     if windows > MAX_WINDOWS {
+-        return Outcome::refused(
+-            WRONG,
+-            format!(
+-                "that range and window ask for {windows} buckets, and this tool answers at most \
+-                 {MAX_WINDOWS}: `--window` is {window} and the range is {} millisecond(s) wide",
+-                to_millis - from_millis
+-            ),
+-        );
++        return too_many(windows, range, &format!("`--window` is {window}"));
+     }
+ 
+     let query = Query {
+         store: Path::new(store),
+-        range: Range::new(from_millis, to_millis),
++        range,
+         width_millis,
+         aggregate,
+         series,
+@@ -427,18 +475,14 @@ fn duration_millis(text: &str) -> Result<u64, String> {
+             unit.push(character);
+         }
+     }
+-    let factor = match unit.as_str() {
+-        "ms" => 1u64,
+-        "s" => 1_000,
+-        "m" => 60_000,
+-        "h" => 3_600_000,
+-        "d" => 86_400_000,
+-        other => {
+-            return Err(format!(
+-                "`--window {text}` has no unit this tool knows: `ms`, `s`, `m`, `h` and `d` are \
+-                 the ones it takes, and `{other}` is not one of them"
+-            ));
+-        }
++    // The five units are the *grammar's* (`lakelet/4.11-query-engine`'s `time(5m)`), so this asks
++    // the parser rather than carrying a second table: two copies of "what is `5m`" are two answers,
++    // and the one a caller reads would be whichever copy their input form happened to reach.
++    let Some(factor) = unit_millis(&unit) else {
++        return Err(format!(
++            "`--window {text}` has no unit this tool knows: `ms`, `s`, `m`, `h` and `d` are the \
++             ones it takes, and `{unit}` is not one of them"
++        ));
+     };
+     let Ok(count) = digits.parse::<u64>() else {
+         return Err(format!(
+@@ -473,39 +517,43 @@ fn answer(query: &Query<'_>) -> Outcome {
+     }
+ }
+ 
++/// The store directory a call names, or the two ways a path can be wrong.
++///
++/// A read does not create a store. `Segments::open` would, which is right for a daemon and wrong
++/// here: a typo in `--store` would leave an empty store behind and answer `0` with no lines, so
++/// the two ways a path can be wrong are told apart first — nothing there is the caller's (`3`),
++/// something that is not a directory is the deployment's (`1`).
++///
++/// Both input forms ask this, and both ask it *before* a store is opened, which is what makes the
++/// two codes mean the same thing however the question was written.
++fn directory(store: &Path) -> Result<(), Outcome> {
++    match std::fs::metadata(store) {
++        Err(_) => Err(Outcome::refused(
++            ABSENT,
++            format!(
++                "there is no store directory at `{}`: `--store` names the directory a store was \
++                 written to, and this tool does not create one",
++                store.display()
++            ),
++        )),
++        Ok(metadata) if !metadata.is_dir() => Err(Outcome::refused(
++            BROKEN,
++            format!(
++                "`{}` is not a directory, so this deployment cannot be a store: nothing about the \
++                 call is wrong, and nothing can be read either",
++                store.display()
++            ),
++        )),
++        Ok(_) => Ok(()),
++    }
++}
++
+ /// Ask the store, or say why it could not be asked.
+ ///
+ /// This is the whole of the query: open, snapshot, read, downsample. There is no second way to
+ /// open a store and no place that remembers what the second one would have been.
+ fn ask(query: &Query<'_>) -> Result<Vec<Bucket>, Outcome> {
+-    // A read does not create a store. `Segments::open` would, which is right for a daemon and
+-    // wrong here: a typo in `--store` would leave an empty store behind and answer `0` with no
+-    // lines, so the two ways a path can be wrong are told apart first — nothing there is the
+-    // caller's, something that is not a directory is the deployment's.
+-    match std::fs::metadata(query.store) {
+-        Err(_) => {
+-            return Err(Outcome::refused(
+-                ABSENT,
+-                format!(
+-                    "there is no store directory at `{}`: `--store` names the directory a store \
+-                     was written to, and this tool does not create one",
+-                    query.store.display()
+-                ),
+-            ));
+-        }
+-        Ok(metadata) if !metadata.is_dir() => {
+-            return Err(Outcome::refused(
+-                BROKEN,
+-                format!(
+-                    "`{}` is not a directory, so this deployment cannot be a store: nothing about \
+-                     the call is wrong, and nothing can be read either",
+-                    query.store.display()
+-                ),
+-            ));
+-        }
+-        Ok(_) => {}
+-    }
+-
++    directory(query.store)?;
+     let store = match Segments::open(query.store) {
+         Ok(store) => store,
+         Err(error) => return Err(class(&error, "the store could not be opened")),
+@@ -562,3 +610,250 @@ fn render(buckets: &[Bucket], json: bool) -> Result<String, Outcome> {
+     }
+     Ok(stdout)
+ }
++
++/// Answer one `--sql` question.
++///
++/// The order is the whole of this function, and it is not arbitrary: read the text, refuse a
++/// question that is too big for this tool *before* a store is opened, then the two path checks,
++/// then the store, then the plan or the execution. Every caller mistake is answered before
++/// anything is opened, so a `2` is the script's problem wherever the deployment happens to be —
++/// `jobq/3.15-cli-contract`'s rule, applied to a second input form rather than restated.
++fn sql_query(store: &str, text: &str, json: bool) -> Outcome {
++    let statement = match parse::parse(text) {
++        Ok(statement) => statement,
++        Err(refusal) => return refused_by(&refusal),
++    };
++    let asked = match &statement {
++        Statement::Query(query) => query,
++        Statement::Explain(query) => query,
++    };
++    let windows = plan::windows_of(asked.range(), asked.window());
++    if windows > MAX_WINDOWS {
++        return too_many(
++            windows,
++            asked.range(),
++            &format!(
++                "`time({})` is the window",
++                duration_text(asked.window().width_millis())
++            ),
++        );
++    }
++
++    let path = Path::new(store);
++    if let Err(outcome) = directory(path) {
++        return outcome;
++    }
++    let store = match Segments::open(path) {
++        Ok(store) => store,
++        Err(error) => return class(&error, "the store could not be opened"),
++    };
++    // One snapshot for the whole call, which is what makes `EXPLAIN` and the answer it explains
++    // two statements about one store: taking a snapshot reads the manifest and opens no segment,
++    // so a plan answers about a store whose segment files are unreadable.
++    let snapshot = store.snapshot();
++    match statement {
++        Statement::Explain(query) => match Plan::of(&snapshot, &query) {
++            Ok(plan) => render_plan(&plan, json),
++            Err(refusal) => refused_by(&refusal),
++        },
++        Statement::Query(query) => match exec::execute(&snapshot, &query) {
++            Ok(outcome) => render_answer(&outcome, json),
++            Err(refusal) => refused_by(&refusal),
++        },
++    }
++}
++
++/// The refusal a query answered with: the sentence, and the class the refusal carries.
++///
++/// The class is the refusal's own (`Refusal::class`), so this file does not keep a second table of
++/// what a wrong query exits with — the engine that can tell the refusals apart is the place that
++/// knows which exit code each one is.
++fn refused_by(refusal: &Refusal) -> Outcome {
++    Outcome::refused(refusal.class(), format!("`--sql` was refused: {refusal}"))
++}
++
++/// The refusal for a range and a window that ask for more buckets than this tool answers.
++///
++/// One number and one sentence, two spellings: the flag form names the flag it read, the text form
++/// names the clause it read, and both say how many buckets were asked for and what this tool
++/// answers. `lakelet/4.10-downsampling` set the ceiling, and this is where both input forms find
++/// it.
++fn too_many(windows: u64, range: Range, and_the_window: &str) -> Outcome {
++    Outcome::refused(
++        WRONG,
++        format!(
++            "that range and window ask for {windows} buckets, and this tool answers at most \
++             {MAX_WINDOWS}: {and_the_window} and the range is {} millisecond(s) wide",
++            range.to().saturating_sub(range.from())
++        ),
++    )
++}
++
++/// The width `width_millis` written back the way a caller writes a window: the largest unit that
++/// divides it, and milliseconds when none does.
++///
++/// It exists for one refusal — the range and the window that ask for too many buckets — where the
++/// reader has to see the two numbers *they* typed to find the typo, and "the window is 300000" is
++/// not one of them. The units are the grammar's (`unit_millis`), largest first, so `time(1m)` and
++/// `--window 60s` both come back as `1m`: the width is the fact, and how it was spelled is not.
++fn duration_text(width_millis: u64) -> String {
++    for unit in ["d", "h", "m", "s"] {
++        if let Some(factor) = unit_millis(unit)
++            && width_millis.is_multiple_of(factor)
++        {
++            return format!("{}{unit}", width_millis / factor);
++        }
++    }
++    format!("{width_millis}ms")
++}
++
++/// The answer in the shape that was asked for: one line per bucket, or one document.
++///
++/// The lines are `lakelet/4.10-downsampling`'s shape, with the series name in front when the query
++/// asked for one answer per series — a name first, because an answer that covers several series
++/// has to say which is which, and a field a reader can cut with `cut -d' ' -f1`.
++fn render_answer(outcome: &exec::Outcome, json: bool) -> Outcome {
++    if json {
++        let buckets: Vec<Bucketed> = outcome
++            .answers()
++            .iter()
++            .flat_map(|answer| {
++                answer.buckets().iter().map(move |bucket| Bucketed {
++                    series: answer.series().map(str::to_owned),
++                    start: bucket.start(),
++                    count: bucket.count(),
++                    value: bucket.value(),
++                })
++            })
++            .collect();
++        let document = Document {
++            segments_opened: outcome.segments_opened(),
++            segments_pruned: outcome.segments_pruned(),
++            rows_scanned: outcome.rows_scanned(),
++            rows_answered: outcome.rows_answered(),
++            series_matched: outcome.series_matched(),
++            series_answered: outcome.series_answered(),
++            buckets,
++        };
++        return match serde_json::to_string(&document) {
++            Ok(document) => Outcome::answered(format!("{document}\n")),
++            Err(error) => Outcome::refused(
++                BROKEN,
++                format!("the answer could not be written as JSON: {error}"),
++            ),
++        };
++    }
++    let mut stdout = String::new();
++    for answer in outcome.answers() {
++        for bucket in answer.buckets() {
++            let start = bucket.start();
++            let count = bucket.count();
++            let value = bucket.value();
++            match answer.series() {
++                Some(series) => stdout.push_str(&format!("{series} {start} {count} {value}\n")),
++                None => stdout.push_str(&format!("{start} {count} {value}\n")),
++            }
++        }
++    }
++    Outcome::answered(stdout)
++}
++
++/// The plan as `EXPLAIN` writes it: `key = value` lines, or one object of those keys.
++fn render_plan(plan: &Plan, json: bool) -> Outcome {
++    if !json {
++        return Outcome::answered(plan.explain());
++    }
++    let shown = Planned {
++        metric: plan.metric().to_owned(),
++        series: plan.series().to_owned(),
++        aggregate: plan.aggregate().name(),
++        from: plan.range().from(),
++        to: plan.range().to(),
++        window: plan.window().width_millis(),
++        windows: plan.windows(),
++        columns: COLUMNS,
++        segments_opened: plan.opened().len() as u64,
++        segments_pruned: plan.pruned().len() as u64,
++        records: plan.records(),
++        limit: plan.limit(),
++    };
++    match serde_json::to_string(&shown) {
++        Ok(document) => Outcome::answered(format!("{document}\n")),
++        Err(error) => Outcome::refused(
++            BROKEN,
++            format!("the plan could not be written as JSON: {error}"),
++        ),
++    }
++}
++
++/// One bucket as `--sql` writes it: the three fields of the flag form's answer, and the series it
++/// belongs to when the query asked for one answer per series.
++///
++/// The series field is *absent* rather than empty for a mixed answer, so a script can tell "this
++/// answer is the fleet's" from "this answer is a series whose name happens to be empty".
++#[derive(Debug, serde::Serialize)]
++struct Bucketed {
++    /// The series this bucket is about, when the answer is per series.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    series: Option<String>,
++    /// The window's start: milliseconds since the Unix epoch, on the absolute grid.
++    start: u64,
++    /// How many records of the range went into the window.
++    count: u64,
++    /// The aggregate over them.
++    value: f64,
++}
++
++/// The `--sql` answer as one JSON document: what the query cost, beside what it answered.
++///
++/// The counts are the executed ones (`lakelet/4.11-query-engine`'s `Outcome`) and not the plan's,
++/// because a script that reads them is asking what this call *did*. The plan's own numbers are
++/// what `EXPLAIN` answers, and the two are different questions.
++#[derive(Debug, serde::Serialize)]
++struct Document {
++    /// How many segments this query opened.
++    segments_opened: u64,
++    /// How many the plan's time range ruled out.
++    segments_pruned: u64,
++    /// How many records were read from the segments that were opened.
++    rows_scanned: u64,
++    /// How many of them landed in a bucket.
++    rows_answered: u64,
++    /// How many distinct series the records carried and the query selected.
++    series_matched: u64,
++    /// How many of those the answer is about.
++    series_answered: u64,
++    /// The buckets, oldest window first and, for a grouped answer, one series after another in
++    /// name order.
++    buckets: Vec<Bucketed>,
++}
++
++/// `EXPLAIN`'s answer as one JSON object: the keys `Plan::explain` prints, in the order it prints
++/// them, with the plan's own numbers in them.
++#[derive(Debug, serde::Serialize)]
++struct Planned {
++    /// The metric `FROM` named.
++    metric: String,
++    /// The series name the grammar can spell.
++    series: String,
++    /// How a window's records become one number.
++    aggregate: &'static str,
++    /// The first millisecond of the range.
++    from: u64,
++    /// The millisecond it stops before.
++    to: u64,
++    /// How wide one bucket is, in milliseconds.
++    window: u64,
++    /// How many windows the range touches.
++    windows: u64,
++    /// The columns a reader decodes.
++    columns: &'static str,
++    /// How many segments the query would open.
++    segments_opened: u64,
++    /// How many the manifest's spans rule out.
++    segments_pruned: u64,
++    /// How many records those segments hold, from the index.
++    records: u64,
++    /// How many series the answer may cover, or `null`.
++    limit: Option<u64>,
++}
+diff --git a/src/engine/compaction/snapshot.rs b/src/engine/compaction/snapshot.rs
+index 7ce8519..af8a91b 100644
+--- a/src/engine/compaction/snapshot.rs
++++ b/src/engine/compaction/snapshot.rs
+@@ -212,27 +212,55 @@ impl Snapshot {
+     /// [`Error::Store`] when a segment's file cannot be read, and everything
+     /// [`segment::read`](crate::engine::segment::read) refuses — a segment that is not this build's
+     /// format, was cut, or was changed after it was written.
++    ///
++    /// One segment at a time is [`Snapshot::records_of`], and this is that reader for every
++    /// segment the snapshot names, in the manifest's order — the same count check and the same
++    /// floor rule, so "read one" and "read all" cannot come to mean two different things.
+     pub fn records(&self) -> Result<Vec<Record>, Error> {
+-        let floor = self.floor();
+         let mut records = Vec::new();
+         for info in self.segments() {
+-            let path = file_of(&self.held.directory, info.index);
+-            let read = segment::read(&path)?;
+-            if read.len() as u64 != info.records {
+-                return Err(Error::Protocol {
+-                    detail: format!(
+-                        "the manifest says segment {} holds {} record(s) and {} holds {} — the \
++            records.extend(self.records_of(info)?);
++        }
++        Ok(records)
++    }
++
++    /// The records of one segment this snapshot names, in the order they were written.
++    ///
++    /// `lakelet/4.11-query-engine` is why this exists beside [`Snapshot::records`]. A query plans
++    /// from the manifest — each segment states the span its records cover — so it can read the
++    /// segments its range can meet and leave the rest closed, and the count of records it walked
++    /// is then a number the plan chose rather than a number the store imposed. Such a query needs
++    /// to read *one* entry, and the alternative to this method is a plan whose pruning is reported
++    /// but not performed.
++    ///
++    /// What a segment is and what it must contain is [`Snapshot::records`]'s contract, kept for
++    /// one file: the bytes are read through `lakelet/4.7-columnar-segments`' reader, the count the
++    /// manifest states is checked against what the file actually holds, and records older than the
++    /// floor of the epoch this snapshot names are not answers.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the segment's file cannot be read, and everything
++    /// [`segment::read`](crate::engine::segment::read) refuses — a segment that is not this
++    /// build's format, was cut, or was changed after it was written — plus [`Error::Protocol`]
++    /// when the file and the manifest disagree about how many records it holds.
++    pub fn records_of(&self, info: &SegmentInfo) -> Result<Vec<Record>, Error> {
++        let floor = self.floor();
++        let path = file_of(&self.held.directory, info.index);
++        let mut records = segment::read(&path)?;
++        if records.len() as u64 != info.records {
++            return Err(Error::Protocol {
++                detail: format!(
++                    "the manifest says segment {} holds {} record(s) and {} holds {} — the \
+                          manifest is the store's index, and an index that disagrees with its files \
+                          is a store that cannot be queried without guessing which of the two is \
+                          right",
+-                        info.index,
+-                        info.records,
+-                        path.display(),
+-                        read.len()
+-                    ),
+-                });
+-            }
+-            records.extend(read);
++                    info.index,
++                    info.records,
++                    path.display(),
++                    records.len()
++                ),
++            });
+         }
+         // One rule, applied at the end: what the store has forgotten up to is not an answer, and a
+         // snapshot answers with the floor of the epoch it named rather than with the store's floor
+diff --git a/src/engine/query/exec.rs b/src/engine/query/exec.rs
+index 964c08d..a2a889b 100644
+--- a/src/engine/query/exec.rs
++++ b/src/engine/query/exec.rs
+@@ -62,15 +62,13 @@ impl SeriesAnswer {
+     /// The series this answer covers, or `None` when it mixes every selected series.
+     #[must_use]
+     pub fn series(&self) -> Option<&str> {
+-        todo!(
+-            "lakelet/4.11-query-engine: the series this answer covers, or nothing when it mixes every selected series"
+-        )
++        self.series.as_deref()
+     }
+ 
+     /// The windows that held records, oldest first.
+     #[must_use]
+     pub fn buckets(&self) -> &[Bucket] {
+-        todo!("lakelet/4.11-query-engine: the windows that held records, oldest first")
++        &self.buckets
+     }
+ }
+ 
+@@ -104,43 +102,43 @@ impl Outcome {
+     /// The answers, in the order they cover the store.
+     #[must_use]
+     pub fn answers(&self) -> &[SeriesAnswer] {
+-        todo!("lakelet/4.11-query-engine: the answers, in the order they cover the store")
++        &self.answers
+     }
+ 
+     /// How many segments this query opened.
+     #[must_use]
+     pub const fn segments_opened(&self) -> u64 {
+-        todo!()
++        self.segments_opened
+     }
+ 
+     /// How many segments the plan's time range ruled out.
+     #[must_use]
+     pub const fn segments_pruned(&self) -> u64 {
+-        todo!()
++        self.segments_pruned
+     }
+ 
+     /// How many records were read from the segments that were opened.
+     #[must_use]
+     pub const fn rows_scanned(&self) -> u64 {
+-        todo!()
++        self.rows_scanned
+     }
+ 
+     /// How many records landed in a bucket of one of the answers.
+     #[must_use]
+     pub const fn rows_answered(&self) -> u64 {
+-        todo!()
++        self.rows_answered
+     }
+ 
+     /// How many distinct series the records carried and the query selected.
+     #[must_use]
+     pub const fn series_matched(&self) -> u64 {
+-        todo!()
++        self.series_matched
+     }
+ 
+     /// How many of those the answer is about.
+     #[must_use]
+     pub const fn series_answered(&self) -> u64 {
+-        todo!()
++        self.series_answered
+     }
+ }
+ 
+@@ -164,7 +162,99 @@ impl Outcome {
+ /// `lakelet/4.18-cardinality-cost` is where a store starts knowing its own names cheaply enough to
+ /// answer that question instead.
+ pub fn execute(snapshot: &Snapshot, query: &Query) -> Result<Outcome, Refusal> {
+-    todo!(
+-        "lakelet/4.11-query-engine: prune, read the segments the plan kept, collect the series that match, and answer each with `lakelet/4.10-downsampling`'s `downsample`"
+-    )
++    let plan = Plan::of(snapshot, query)?;
++
++    let mut records: Vec<Record> = Vec::new();
++    for info in plan.opened() {
++        let read = snapshot.records_of(info).map_err(|error| Refusal::Store {
++            detail: error.to_string(),
++        })?;
++        records.extend(read);
++    }
++    let rows_scanned = records.len() as u64;
++
++    // Which series the records carry, and which of them the query asked about. A `BTreeSet` is the
++    // order a grouped answer is written in — by series name — and it is also what makes
++    // `series_matched` a count of *series* rather than of records.
++    let mut matched: BTreeSet<&str> = BTreeSet::new();
++    let mut carries_metric = false;
++    for record in &records {
++        let series = Series::of(&record.series);
++        if series.metric() == query.metric() {
++            carries_metric = true;
++        }
++        if query.selects(&series) {
++            matched.insert(record.series.as_str());
++        }
++    }
++    if !carries_metric && !plan.opened().is_empty() {
++        return Err(Refusal::Unknown {
++            metric: query.metric().to_owned(),
++        });
++    }
++    let names: Vec<&str> = matched.into_iter().collect();
++
++    let mut answers: Vec<SeriesAnswer> = Vec::new();
++    if query.groups_by_series() {
++        let cap = query.limit().map_or(usize::MAX, |limit| {
++            usize::try_from(limit).unwrap_or(usize::MAX)
++        });
++        for name in names.iter().take(cap) {
++            let answered = downsample::downsample(
++                &records,
++                Some(name),
++                query.range(),
++                query.window(),
++                query.aggregate(),
++            );
++            answers.push(SeriesAnswer {
++                series: Some((*name).to_owned()),
++                buckets: answered.buckets().to_vec(),
++            });
++        }
++    } else {
++        // One answer that mixes every series the predicates select. `downsample`'s `None` filter
++        // means *every* record it is handed, so the records it is handed have to be the selected
++        // ones — a copy, and the only one this pass makes.
++        let selected: Vec<Record> = records
++            .iter()
++            .filter(|record| query.selects(&Series::of(&record.series)))
++            .cloned()
++            .collect();
++        let answered = downsample::downsample(
++            &selected,
++            None,
++            query.range(),
++            query.window(),
++            query.aggregate(),
++        );
++        answers.push(SeriesAnswer {
++            series: None,
++            buckets: answered.buckets().to_vec(),
++        });
++    }
++
++    // What was answered: the records that landed in a bucket. A bucket carries its own count
++    // (`lakelet/4.10-downsampling`'s `Bucket::count`), so this is the answer stating how much of
++    // the store went into it — and summing over the answers is summing over disjoint series, since
++    // a record's series is one string, so nothing is counted twice.
++    let rows_answered = answers
++        .iter()
++        .flat_map(|answer| answer.buckets())
++        .fold(0u64, |total, bucket| total.saturating_add(bucket.count()));
++    let series_answered = if query.groups_by_series() {
++        answers.len() as u64
++    } else {
++        names.len() as u64
++    };
++
++    Ok(Outcome {
++        answers,
++        segments_opened: plan.opened().len() as u64,
++        segments_pruned: plan.pruned().len() as u64,
++        rows_scanned,
++        rows_answered,
++        series_matched: names.len() as u64,
++        series_answered,
++    })
+ }
+diff --git a/src/engine/query/lex.rs b/src/engine/query/lex.rs
+index b918160..adfc55f 100644
+--- a/src/engine/query/lex.rs
++++ b/src/engine/query/lex.rs
+@@ -71,13 +71,13 @@ impl Token {
+     /// The byte this token starts at, counted from the start of the query.
+     #[must_use]
+     pub const fn at(&self) -> usize {
+-        todo!()
++        self.at
+     }
+ 
+     /// What was read.
+     #[must_use]
+     pub const fn kind(&self) -> &Kind {
+-        todo!()
++        &self.kind
+     }
+ 
+     /// `true` when this token is the word `keyword`, whatever case it was written in.
+@@ -86,9 +86,10 @@ impl Token {
+     /// place in the grammar that accepts one word and asks this question to find out.
+     #[must_use]
+     pub fn spells(&self, keyword: &str) -> bool {
+-        todo!(
+-            "lakelet/4.11-query-engine: a keyword is compared without case, and only where the grammar expects one"
+-        )
++        match &self.kind {
++            Kind::Word(word) => word.eq_ignore_ascii_case(keyword),
++            _ => false,
++        }
+     }
+ }
+ 
+@@ -204,7 +205,15 @@ impl Refusal {
+     /// which the command line answers before a query is read at all.
+     #[must_use]
+     pub const fn class(&self) -> u8 {
+-        todo!()
++        match self {
++            Refusal::Syntax { .. }
++            | Refusal::Aggregate { .. }
++            | Refusal::Disjunction { .. }
++            | Refusal::Limit { .. }
++            | Refusal::Forgot { .. } => 2,
++            Refusal::Unknown { .. } => 3,
++            Refusal::Store { .. } => 4,
++        }
+     }
+ }
+ 
+@@ -226,21 +235,54 @@ impl Refusal {
+ /// the scanner knows what a token is, the parser knows what a query is, and neither guesses at the
+ /// other's question.
+ pub fn lex(text: &str) -> Result<Vec<Token>, Refusal> {
+-    todo!(
+-        "lakelet/4.11-query-engine: whitespace separates; a `'` opens a value that runs to the next `'`; a digit opens a number; one of `(` `)` `,` `=` is a symbol; anything else opens a word"
+-    )
++    let mut tokens = Vec::new();
++    let mut characters = text.char_indices().peekable();
++    while let Some(&(at, character)) = characters.peek() {
++        let _ = characters.next();
++        if character.is_whitespace() {
++            continue;
++        }
++        if character == '\'' {
++            tokens.push(value(at, &mut characters)?);
++        } else if let Some(symbol) = symbol(character) {
++            tokens.push(Token {
++                at,
++                kind: Kind::Symbol(symbol),
++            });
++        } else if character.is_ascii_digit() {
++            tokens.push(digits(at, character, &mut characters)?);
++        } else {
++            tokens.push(word(at, character, &mut characters));
++        }
++    }
++    Ok(tokens)
+ }
+ 
+ /// The four symbols the grammar has, or `None` for a character that is part of a word.
+ fn symbol(character: char) -> Option<char> {
+-    todo!("lakelet/4.11-query-engine: the four symbols the grammar has, and nothing else")
++    match character {
++        '(' | ')' | ',' | '=' => Some(character),
++        _ => None,
++    }
+ }
+ 
+ /// A `'…'` value that opened at `at`, with the quotes taken off.
+ fn value(at: usize, characters: &mut Peekable<CharIndices<'_>>) -> Result<Token, Refusal> {
+-    todo!(
+-        "lakelet/4.11-query-engine: from the quote that opened it to the next one, and a value that never closes is refused at the byte it opened"
+-    )
++    let mut text = String::new();
++    for (_, character) in characters.by_ref() {
++        if character == '\'' {
++            return Ok(Token {
++                at,
++                kind: Kind::Text(text),
++            });
++        }
++        text.push(character);
++    }
++    Err(Refusal::Syntax {
++        at,
++        detail: "a value opens with `'` and the next `'` ends it, and this one is never closed"
++            .to_owned(),
++    })
+ }
+ 
+ /// The run of digits that starts with `first` at `at`.
+@@ -249,12 +291,43 @@ fn digits(
+     first: char,
+     characters: &mut Peekable<CharIndices<'_>>,
+ ) -> Result<Token, Refusal> {
+-    todo!(
+-        "lakelet/4.11-query-engine: the run of digits as the number it names, refused when it is larger than this store's milliseconds can be"
+-    )
++    let mut run = String::new();
++    run.push(first);
++    while let Some(&(_, character)) = characters.peek() {
++        if !character.is_ascii_digit() {
++            break;
++        }
++        run.push(character);
++        let _ = characters.next();
++    }
++    match run.parse::<u64>() {
++        Ok(number) => Ok(Token {
++            at,
++            kind: Kind::Number(number),
++        }),
++        Err(_) => Err(Refusal::Syntax {
++            at,
++            detail: format!(
++                "`{run}` is larger than the millisecond count this store states, and a range that \
++                 wrapped is an answer about another time"
++            ),
++        }),
++    }
+ }
+ 
+ /// The word that starts with `first` at `at`: everything up to the next separator.
+ fn word(at: usize, first: char, characters: &mut Peekable<CharIndices<'_>>) -> Token {
+-    todo!("lakelet/4.11-query-engine: a run of characters up to the next separator")
++    let mut text = String::new();
++    text.push(first);
++    while let Some(&(_, character)) = characters.peek() {
++        if character.is_whitespace() || character == '\'' || symbol(character).is_some() {
++            break;
++        }
++        text.push(character);
++        let _ = characters.next();
++    }
++    Token {
++        at,
++        kind: Kind::Word(text),
++    }
+ }
+diff --git a/src/engine/query/parse.rs b/src/engine/query/parse.rs
+index d0a264a..17caa39 100644
+--- a/src/engine/query/parse.rs
++++ b/src/engine/query/parse.rs
+@@ -111,43 +111,43 @@ impl Query {
+     /// The metric `FROM` named, exactly as it was written.
+     #[must_use]
+     pub fn metric(&self) -> &str {
+-        todo!("lakelet/4.11-query-engine: the metric `FROM` named, exactly as it was written")
++        &self.metric
+     }
+ 
+     /// The tag predicates, in the order they were written.
+     #[must_use]
+     pub fn predicates(&self) -> &[(String, String)] {
+-        todo!("lakelet/4.11-query-engine: the tag predicates, in the order they were written")
++        &self.predicates
+     }
+ 
+     /// The half-open range the query is about.
+     #[must_use]
+     pub const fn range(&self) -> Range {
+-        todo!()
++        self.range
+     }
+ 
+     /// How wide one bucket is.
+     #[must_use]
+     pub const fn window(&self) -> Window {
+-        todo!()
++        self.window
+     }
+ 
+     /// How a window's records become one number.
+     #[must_use]
+     pub const fn aggregate(&self) -> Aggregate {
+-        todo!()
++        self.aggregate
+     }
+ 
+     /// `true` when the answer is one bucket list per series rather than one mixed list.
+     #[must_use]
+     pub const fn groups_by_series(&self) -> bool {
+-        todo!()
++        self.per_series
+     }
+ 
+     /// How many series an answer may cover, or `None` when the grammar asked for no bound.
+     #[must_use]
+     pub const fn limit(&self) -> Option<u64> {
+-        todo!()
++        self.limit
+     }
+ 
+     /// The series name this query can spell: the metric, then the predicates it named, in the
+@@ -160,9 +160,14 @@ impl Query {
+     /// a segment is opened.
+     #[must_use]
+     pub fn series_name(&self) -> String {
+-        todo!(
+-            "lakelet/4.11-query-engine: the metric and the predicates it named, in the order they were written"
+-        )
++        let mut name = self.metric.clone();
++        for (key, value) in &self.predicates {
++            name.push(',');
++            name.push_str(key);
++            name.push('=');
++            name.push_str(value);
++        }
++        name
+     }
+ 
+     /// `true` when `series` is one this query asks about: the metric exactly, and every predicate
+@@ -177,7 +182,11 @@ impl Query {
+     /// fault is the case of a tag value is not.
+     #[must_use]
+     pub fn selects(&self, series: &Series<'_>) -> bool {
+-        todo!("lakelet/4.11-query-engine: the metric exactly, and every predicate held")
++        series.metric() == self.metric
++            && self
++                .predicates
++                .iter()
++                .all(|(key, value)| series.matches(key, value))
+     }
+ }
+ 
+@@ -189,9 +198,14 @@ impl Query {
+ /// asks this rather than matching on the string itself.
+ #[must_use]
+ pub fn unit_millis(unit: &str) -> Option<u64> {
+-    todo!(
+-        "lakelet/4.11-query-engine: the five units `lakelet/4.10-downsampling` put on `--window` — this is the one copy of the table"
+-    )
++    match unit {
++        "ms" => Some(1),
++        "s" => Some(1_000),
++        "m" => Some(60_000),
++        "h" => Some(3_600_000),
++        "d" => Some(86_400_000),
++        _ => None,
++    }
+ }
+ 
+ /// Read `text` as a query, or say what is wrong with it.
+@@ -209,9 +223,173 @@ pub fn unit_millis(unit: &str) -> Option<u64> {
+ /// floor, a metric the store has never held — are not here: this function reads a string and knows
+ /// nothing about any store.
+ pub fn parse(text: &str) -> Result<Statement, Refusal> {
+-    todo!(
+-        "lakelet/4.11-query-engine: the grammar in this module's header, one clause after another, and the refusals the module documents"
+-    )
++    let tokens = lex(text)?;
++    let mut reader = Reader {
++        tokens: &tokens,
++        read: 0,
++        end: text.len(),
++    };
++
++    let explain = reader.take_spelling("explain");
++    reader.keyword("select", "the word `SELECT`")?;
++
++    let at = reader.at();
++    let name = reader.word("an aggregate name")?;
++    let aggregate =
++        Aggregate::parse(&name.to_ascii_lowercase()).ok_or(Refusal::Aggregate { name, at })?;
++    reader.symbol('(', "an opening `(`")?;
++    reader.keyword("value", "the word `value`")?;
++    reader.symbol(')', "a closing `)`")?;
++    reader.keyword("from", "the word `FROM`")?;
++    let metric = reader.word("a metric name")?;
++
++    let mut predicates: Vec<(String, String)> = Vec::new();
++    let mut range: Option<Range> = None;
++    if reader.take_spelling("where") {
++        loop {
++            let at = reader.at();
++            if reader.take_spelling("ts") {
++                if range.is_some() {
++                    return Err(Refusal::Syntax {
++                        at,
++                        detail: "the time range was given twice: a query is about one span of \
++                                 time, written once as `ts BETWEEN a AND b`"
++                            .to_owned(),
++                    });
++                }
++                if !reader.take_spelling("between") {
++                    return Err(Refusal::Syntax {
++                        at,
++                        detail: "`ts` is the time axis and not a tag: the range is written \
++                                 `ts BETWEEN a AND b`, and a tag predicate is `<key> = '<value>'`"
++                            .to_owned(),
++                    });
++                }
++                let from = reader.number("the first millisecond of the range")?;
++                reader.keyword("and", "the word `AND`")?;
++                let to = reader.number("the millisecond the range stops before")?;
++                if to <= from {
++                    return Err(Refusal::Syntax {
++                        at,
++                        detail: format!(
++                            "`ts BETWEEN {from} AND {to}` is the empty range [{from}, {to}): the \
++                             range is half-open, so its first number has to be smaller than its \
++                             second"
++                        ),
++                    });
++                }
++                range = Some(Range::new(from, to));
++            } else {
++                if reader.spells("or") {
++                    return Err(Refusal::Disjunction { at });
++                }
++                let key = reader.word("a tag key")?;
++                reader.symbol('=', "an `=`")?;
++                let value = reader.text("a value in single quotes, as in `host = 'h0'`")?;
++                predicates.push((key, value));
++            }
++            if reader.take_spelling("and") {
++                continue;
++            }
++            // `OR` stands where `AND` would — between two predicates — which is the place a reader
++            // writes it and therefore the place it is refused.
++            if reader.spells("or") {
++                return Err(Refusal::Disjunction { at: reader.at() });
++            }
++            break;
++        }
++    }
++
++    let mut window: Option<Window> = None;
++    let mut per_series = false;
++    if reader.take_spelling("group") {
++        reader.keyword("by", "the word `BY`")?;
++        reader.keyword("time", "the word `time`")?;
++        reader.symbol('(', "an opening `(`")?;
++        window = Some(reader.window()?);
++        reader.symbol(')', "a closing `)`")?;
++        if reader.take_symbol(',') {
++            reader.keyword("series", "the word `series`")?;
++            per_series = true;
++        }
++    }
++
++    let mut limit = None;
++    let mut limit_at = None;
++    if reader.take_spelling("limit") {
++        let at = reader.at();
++        let asked = reader.number("a number of series")?;
++        if asked == 0 {
++            return Err(Refusal::Limit {
++                at,
++                detail: "`LIMIT 0` bounds an answer to nothing at all: a limit is how many series \
++                         an answer may cover, and zero is a query that asks for no answer"
++                    .to_owned(),
++            });
++        }
++        limit = Some(asked);
++        limit_at = Some(at);
++    }
++
++    if let Some(token) = reader.peek() {
++        return Err(Refusal::Syntax {
++            at: token.at(),
++            detail: format!(
++                "{} does not fit here: a query is `SELECT <agg>(value) FROM <metric> WHERE \
++                 <pred> [AND <pred>] GROUP BY time(<window>)[, series] [LIMIT <n>]`, and each \
++                 clause is written once, in that order",
++                spelled(token)
++            ),
++        });
++    }
++
++    let Some(range) = range else {
++        return Err(Refusal::Syntax {
++            at: reader.end,
++            detail: "there is no `ts BETWEEN a AND b`: a query has to say which span of time it \
++                     is about, because a telemetry question that reads all of time is not a \
++                     question — it is an accident with a fleet behind it"
++                .to_owned(),
++        });
++    };
++
++    let Some(window) = window else {
++        return Err(Refusal::Syntax {
++            at: reader.end,
++            detail: "there is no `GROUP BY time(<window>)`: a query answers windows, so how wide \
++                     one bucket is is for the caller to say — `GROUP BY time(5m)` is five \
++                     minutes a bucket, and `GROUP BY time(5m), series` is that for every series \
++                     the predicates select"
++                .to_owned(),
++        });
++    };
++
++    if let (Some(_), Some(at)) = (limit, limit_at)
++        && !per_series
++    {
++        return Err(Refusal::Limit {
++            at,
++            detail: "`LIMIT` bounds how many series an answer covers, so it is written together \
++                     with `GROUP BY time(<window>), series` — a limit on one mixed answer names \
++                     nothing to bound"
++                .to_owned(),
++        });
++    }
++
++    let query = Query {
++        metric,
++        predicates,
++        range,
++        window,
++        aggregate,
++        per_series,
++        limit,
++    };
++    Ok(if explain {
++        Statement::Explain(query)
++    } else {
++        Statement::Query(query)
++    })
+ }
+ 
+ /// The tokens of one query, and how far the parser has read.
+@@ -227,88 +405,142 @@ struct Reader<'a> {
+ impl<'a> Reader<'a> {
+     /// The next token, without using it.
+     fn peek(&self) -> Option<&'a Token> {
+-        todo!("lakelet/4.11-query-engine: the next token, without using it")
++        self.tokens.get(self.read)
+     }
+ 
+     /// Use the next token.
+     fn take(&mut self) -> Option<&'a Token> {
+-        todo!("lakelet/4.11-query-engine: use the next token")
++        let token = self.tokens.get(self.read)?;
++        self.read += 1;
++        Some(token)
+     }
+ 
+     /// The byte the reader is looking at: the next token's, or the end of the text.
+     fn at(&self) -> usize {
+-        todo!(
+-            "lakelet/4.11-query-engine: the byte the reader is looking at, or the end of the text"
+-        )
++        self.peek().map_or(self.end, Token::at)
+     }
+ 
+     /// Whether the next token is the word `keyword`, whatever case it was written in.
+     fn spells(&self, keyword: &str) -> bool {
+-        todo!("lakelet/4.11-query-engine: whether the next token is this word, whatever case")
++        self.peek().is_some_and(|token| token.spells(keyword))
+     }
+ 
+     /// Whether the next token is `symbol`.
+     fn at_symbol(&self, symbol: char) -> bool {
+-        todo!("lakelet/4.11-query-engine: whether the next token is this symbol")
++        matches!(self.peek().map(Token::kind), Some(Kind::Symbol(found)) if *found == symbol)
+     }
+ 
+     /// Use the next token when it is the word `keyword`, and answer whether it was.
+     fn take_spelling(&mut self, keyword: &str) -> bool {
+-        todo!(
+-            "lakelet/4.11-query-engine: use the next token when it is this word, and answer whether it was"
+-        )
++        if !self.spells(keyword) {
++            return false;
++        }
++        let _ = self.take();
++        true
+     }
+ 
+     /// Use the next token when it is `symbol`, and answer whether it was.
+     fn take_symbol(&mut self, symbol: char) -> bool {
+-        todo!(
+-            "lakelet/4.11-query-engine: use the next token when it is this symbol, and answer whether it was"
+-        )
++        if !self.at_symbol(symbol) {
++            return false;
++        }
++        let _ = self.take();
++        true
+     }
+ 
+     /// The refusal for a token that is not the one the grammar wants next.
+     fn unexpected(&self, what: &str) -> Refusal {
+-        todo!(
+-            "lakelet/4.11-query-engine: the refusal for a token that is not the one the grammar wants next"
+-        )
++        let at = self.at();
++        let detail = match self.peek() {
++            Some(token) => format!(
++                "{what} is expected here, and {} is there instead",
++                spelled(token)
++            ),
++            None => format!("{what} is expected here, and the query ends"),
++        };
++        Refusal::Syntax { at, detail }
+     }
+ 
+     /// Read the word `keyword`, or refuse what is there.
+     fn keyword(&mut self, keyword: &str, what: &str) -> Result<(), Refusal> {
+-        todo!("lakelet/4.11-query-engine: read this word, or refuse what is there")
++        if !self.take_spelling(keyword) {
++            return Err(self.unexpected(what));
++        }
++        Ok(())
+     }
+ 
+     /// Read `symbol`, or refuse what is there.
+     fn symbol(&mut self, symbol: char, what: &str) -> Result<(), Refusal> {
+-        todo!("lakelet/4.11-query-engine: read this symbol, or refuse what is there")
++        if !self.take_symbol(symbol) {
++            return Err(self.unexpected(what));
++        }
++        Ok(())
+     }
+ 
+     /// Read a word: a metric, a tag key, an aggregate name.
+     fn word(&mut self, what: &str) -> Result<String, Refusal> {
+-        todo!("lakelet/4.11-query-engine: read a word: a metric, a tag key, an aggregate name")
++        match self.take().map(|token| (token.at(), token.kind())) {
++            Some((_, Kind::Word(word))) => Ok(word.clone()),
++            _ => Err(self.unexpected(what)),
++        }
+     }
+ 
+     /// Read a `'…'` value, with the quotes already taken off.
+     fn text(&mut self, what: &str) -> Result<String, Refusal> {
+-        todo!("lakelet/4.11-query-engine: read a `'…'` value, with the quotes already taken off")
++        match self.take().map(|token| (token.at(), token.kind())) {
++            Some((_, Kind::Text(text))) => Ok(text.clone()),
++            _ => Err(self.unexpected(what)),
++        }
+     }
+ 
+     /// Read a number.
+     fn number(&mut self, what: &str) -> Result<u64, Refusal> {
+-        todo!("lakelet/4.11-query-engine: read a number")
++        match self.take().map(|token| (token.at(), token.kind())) {
++            Some((_, Kind::Number(number))) => Ok(*number),
++            _ => Err(self.unexpected(what)),
++        }
+     }
+ 
+     /// Read the `<n><unit>` of a `time(…)`, and remember the width it names.
+     fn window(&mut self) -> Result<Window, Refusal> {
+-        todo!(
+-            "lakelet/4.11-query-engine: read the `<n><unit>` of a `time(…)` and turn it into milliseconds"
+-        )
++        let at = self.at();
++        let count = self.number("a number of milliseconds, seconds, minutes, hours or days")?;
++        let unit = self.word("the unit of that window: `ms`, `s`, `m`, `h` or `d`")?;
++        let Some(factor) = unit_millis(&unit) else {
++            return Err(Refusal::Syntax {
++                at,
++                detail: format!(
++                    "`{count}{unit}` is not a window: `{unit}` is not one of the units this \
++                     grammar has — `ms`, `s`, `m`, `h` and `d`, as in `time(5m)`"
++                ),
++            });
++        };
++        let Some(width) = count.checked_mul(factor) else {
++            return Err(Refusal::Syntax {
++                at,
++                detail: format!(
++                    "`{count}{unit}` is wider than the millisecond count this store can state"
++                ),
++            });
++        };
++        if width == 0 {
++            return Err(Refusal::Syntax {
++                at,
++                detail: "`time(0…)` is a window with no bucket in it: a window is a positive \
++                         number of milliseconds, and a range that counts in nothing has no answer"
++                    .to_owned(),
++            });
++        }
++        Ok(Window::new(width))
+     }
+ }
+ 
+ /// How a reader would spell a token back, for a sentence that says what was found.
+ fn spelled(token: &Token) -> String {
+-    todo!(
+-        "lakelet/4.11-query-engine: how a reader would spell a token back, for a sentence that says what was found"
+-    )
++    match token.kind() {
++        Kind::Word(word) => format!("`{word}`"),
++        Kind::Number(number) => format!("the number `{number}`"),
++        Kind::Text(text) => format!("the value `'{text}'`"),
++        Kind::Symbol(symbol) => format!("`{symbol}`"),
++    }
+ }
+diff --git a/src/engine/query/plan.rs b/src/engine/query/plan.rs
+index 35bf7a3..4a5ebbf 100644
+--- a/src/engine/query/plan.rs
++++ b/src/engine/query/plan.rs
+@@ -101,9 +101,37 @@ impl Plan {
+     ///
+     /// [`Refusal::Forgot`] when the range begins below the store's floor.
+     pub fn of(snapshot: &Snapshot, query: &Query) -> Result<Self, Refusal> {
+-        todo!(
+-            "lakelet/4.11-query-engine: what the manifest says about the range: which segments its spans keep, how many records they hold, and how many windows it touches"
+-        )
++        let range = query.range();
++        let floor = snapshot.floor();
++        if range.from() < floor {
++            return Err(Refusal::Forgot {
++                from: range.from(),
++                floor,
++            });
++        }
++        let mut opened = Vec::new();
++        let mut pruned = Vec::new();
++        let mut records = 0u64;
++        for info in snapshot.segments() {
++            if meets(info, range) {
++                opened.push(*info);
++                records = records.saturating_add(info.records);
++            } else {
++                pruned.push(*info);
++            }
++        }
++        Ok(Self {
++            metric: query.metric().to_owned(),
++            series: query.series_name(),
++            aggregate: query.aggregate(),
++            range,
++            window: query.window(),
++            windows: windows_of(range, query.window()),
++            opened,
++            pruned,
++            records,
++            limit: query.limit(),
++        })
+     }
+ 
+     /// The segments the query would open, in the manifest's order.
+@@ -113,15 +141,13 @@ impl Plan {
+     /// numbers and made its reader look them up again would be a plan with two sources of truth.
+     #[must_use]
+     pub fn opened(&self) -> &[SegmentInfo] {
+-        todo!(
+-            "lakelet/4.11-query-engine: the segments the query would open, in the manifest's order"
+-        )
++        &self.opened
+     }
+ 
+     /// The segments the manifest's stated spans rule out, in the manifest's order.
+     #[must_use]
+     pub fn pruned(&self) -> &[SegmentInfo] {
+-        todo!("lakelet/4.11-query-engine: the segments the manifest's stated spans rule out")
++        &self.pruned
+     }
+ 
+     /// How many records the opened segments hold, from the manifest alone.
+@@ -132,49 +158,49 @@ impl Plan {
+     /// `rows_scanned` — is the number of records that were really read.
+     #[must_use]
+     pub const fn records(&self) -> u64 {
+-        todo!()
++        self.records
+     }
+ 
+     /// How many windows the range touches on the grid the query asked for.
+     #[must_use]
+     pub const fn windows(&self) -> u64 {
+-        todo!()
++        self.windows
+     }
+ 
+     /// How many series the answer may cover, or `None` when the grammar asked for no bound.
+     #[must_use]
+     pub const fn limit(&self) -> Option<u64> {
+-        todo!()
++        self.limit
+     }
+ 
+     /// The metric `FROM` named.
+     #[must_use]
+     pub fn metric(&self) -> &str {
+-        todo!("lakelet/4.11-query-engine: the metric `FROM` named")
++        &self.metric
+     }
+ 
+     /// The series name the grammar can spell: the metric, then the predicates it named.
+     #[must_use]
+     pub fn series(&self) -> &str {
+-        todo!("lakelet/4.11-query-engine: the series name the grammar can spell")
++        &self.series
+     }
+ 
+     /// How a window's records become one number.
+     #[must_use]
+     pub const fn aggregate(&self) -> Aggregate {
+-        todo!()
++        self.aggregate
+     }
+ 
+     /// The half-open range the query is about.
+     #[must_use]
+     pub const fn range(&self) -> Range {
+-        todo!()
++        self.range
+     }
+ 
+     /// How wide one bucket is.
+     #[must_use]
+     pub const fn window(&self) -> Window {
+-        todo!()
++        self.window
+     }
+ 
+     /// The plan as `key = value` lines, one per fact, in the order a reader wants them.
+@@ -184,9 +210,27 @@ impl Plan {
+     /// missing line — and the numbers are the ones the manifest states.
+     #[must_use]
+     pub fn explain(&self) -> String {
+-        todo!(
+-            "lakelet/4.11-query-engine: the plan as `key = value` lines, one per fact, with every key always present"
+-        )
++        let limit = match self.limit {
++            Some(limit) => limit.to_string(),
++            None => "none".to_owned(),
++        };
++        [
++            ("metric", self.metric.clone()),
++            ("series", self.series.clone()),
++            ("aggregate", self.aggregate.name().to_owned()),
++            ("from", self.range.from().to_string()),
++            ("to", self.range.to().to_string()),
++            ("window", self.window.width_millis().to_string()),
++            ("windows", self.windows.to_string()),
++            ("columns", COLUMNS.to_owned()),
++            ("segments_opened", self.opened.len().to_string()),
++            ("segments_pruned", self.pruned.len().to_string()),
++            ("records", self.records.to_string()),
++            ("limit", limit),
++        ]
++        .into_iter()
++        .map(|(key, value)| format!("{key} = {value}\n"))
++        .collect()
+     }
+ }
+ 
+@@ -203,9 +247,15 @@ impl Plan {
+ /// rule about what a window means.
+ #[must_use]
+ pub fn windows_of(range: Range, window: Window) -> u64 {
+-    todo!(
+-        "lakelet/4.11-query-engine: `floor((to - 1) / width) - floor(from / width) + 1`, and nothing for an empty range"
+-    )
++    if range.is_empty() {
++        return 0;
++    }
++    let width = window.width_millis().max(1);
++    let first = range.from() / width;
++    // The last window the range touches is the one `to - 1` falls in: the millisecond at `to`
++    // belongs to the next question. `range` is not empty here, so `to` is at least one.
++    let last = (range.to() - 1) / width;
++    last.saturating_sub(first).saturating_add(1)
+ }
+ 
+ /// `true` when `info` states a span that meets the half-open `range`.
+@@ -213,7 +263,8 @@ pub fn windows_of(range: Range, window: Window) -> u64 {
+ /// A segment that states none is kept: nobody wrote down when its records happened, and the whole
+ /// rule above is a decision made *from* two numbers.
+ fn meets(info: &SegmentInfo, range: Range) -> bool {
+-    todo!(
+-        "lakelet/4.11-query-engine: `first < to && last >= from` — and a segment whose span nobody stated is kept"
+-    )
++    match (info.first_millis(), info.last_millis()) {
++        (Some(first), Some(last)) => first < range.to() && last >= range.from(),
++        _ => true,
++    }
+ }
+diff --git a/src/engine/query/series.rs b/src/engine/query/series.rs
+index affd044..3b766bc 100644
+--- a/src/engine/query/series.rs
++++ b/src/engine/query/series.rs
+@@ -65,15 +65,30 @@ impl<'a> Series<'a> {
+     /// path to document because there is no input this refuses.
+     #[must_use]
+     pub fn of(name: &'a str) -> Self {
+-        todo!(
+-            "lakelet/4.11-query-engine: a series name is `metric[,key=value]*`: the metric is everything before the first comma, and a pair with a key in front of its `=` is a tag"
+-        )
++        let (metric, rest) = match name.split_once(',') {
++            Some((metric, rest)) => (metric, rest),
++            None => (name, ""),
++        };
++        let mut tags = Vec::new();
++        if !rest.is_empty() {
++            for pair in rest.split(',') {
++                // A pair is a tag when it has an `=` with something in front of it. The value may
++                // be empty — `cpu,host=` is a tag whose value is the empty string — because the
++                // bytes are the client's and `WHERE host = ''` has to be able to name them.
++                if let Some((key, value)) = pair.split_once('=')
++                    && !key.is_empty()
++                {
++                    tags.push((key, value));
++                }
++            }
++        }
++        Self { metric, tags }
+     }
+ 
+     /// The metric this series names: everything before the first comma.
+     #[must_use]
+     pub const fn metric(&self) -> &'a str {
+-        todo!()
++        self.metric
+     }
+ 
+     /// The tag pairs this series carries, in the order they were written.
+@@ -82,7 +97,7 @@ impl<'a> Series<'a> {
+     /// rather than a pair with a guessed key.
+     #[must_use]
+     pub fn tags(&self) -> &[(&'a str, &'a str)] {
+-        todo!("lakelet/4.11-query-engine: the pairs that are tags, in the order they were written")
++        &self.tags
+     }
+ 
+     /// `true` when this series carries the tag `key=value`, exactly.
+@@ -92,8 +107,8 @@ impl<'a> Series<'a> {
+     /// "the series carries this tag" means.
+     #[must_use]
+     pub fn matches(&self, key: &str, value: &str) -> bool {
+-        todo!(
+-            "lakelet/4.11-query-engine: exact, case included: a series either carries the pair or it does not"
+-        )
++        self.tags
++            .iter()
++            .any(|(tag_key, tag_value)| *tag_key == key && *tag_value == value)
+     }
+ }
