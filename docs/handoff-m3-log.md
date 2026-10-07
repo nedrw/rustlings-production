@@ -887,3 +887,13 @@ $ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --c
    `execute` 返回 `Result<Outcome, Refusal>`（`Error` 表达不了类别 `3`，而 `src/error.rs` 没有标记块
    所以本步不能扩它）、类别 `3` 只在“区间碰到的段”里判定（为了不让 `rows_scanned` 变成谎言，
    4.18 才是“仓库知道自己有哪些名字”的地方）。
+
+**后记（同一段，块的位置改了两次）**：第一版把标记块放在 `src/cli/mod.rs` 的**末尾**——它让
+4.10/4.11 的补丁里“够到文件尾”的 hunk 在 `git apply` 下失配（`patch failed: src/cli/mod.rs:154`，
+重建 `through 4.11` 基线树时实测；`kiln` 自己的补丁解析器容忍它，所以课程管线没事，**坏掉的是作者配方**）。
+块改到 `MAX_WINDOWS` 与 `Outcome` 的文档注释之间（在两个后续补丁每个 hunk 的上下文之外）之后：
+四个补丁（4.10 scaffold+solution、4.11 scaffold+solution）都能 `git apply` 到重建的 `through 4.9` 树，
+产物与 `kiln` 阶梯产物逐字节一致；全新副本里 4.1…4.11 阶梯 + 两步 `check --slow` 仍然绿
+（4.10 `10/10 must`、变异 5/6；4.11 `10/10 must` + 1 should、变异 6/6、覆盖 620/635）。
+**教训**：scaffold 的插入点不能放在“任何一个后续补丁会够到的文件尾”，否则作者配方（`git apply`）与
+课程管线（`kiln`）会分叉。
