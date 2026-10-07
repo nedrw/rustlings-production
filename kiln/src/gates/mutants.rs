@@ -64,22 +64,37 @@ use crate::gates::{GateOutcome, GateSpec, sandbox, sources};
 use crate::process::{self, Ran};
 use crate::scratch;
 
-/// Most mutants one step is judged on: rebuilding and re-running the spec six times is the price the
-/// slow path pays for a spec that has been shown to be able to fail (handoff M2 §1).
+/// Most mutants one step is judged on: rebuilding and re-running the spec twelve times is the price
+/// the slow path pays for a spec that has been shown to be able to fail (handoff M2 §1).
+///
+/// **Twelve and not six, since the walk's sites became the lines a step's own patch writes**
+/// (handoff M3 §1 rule 17, `sources::production_lines`). A narrower sample means each survivor is
+/// worth more, and a step's own plumbing carries a few lines no test can see: a `true` in an
+/// `OpenOptions` flag where the flag has no observable effect, a `Weak` retain that only decides
+/// whether the instrument itself leaks, a comparison whose two branches agree on equality.
+/// Measured: `lakelet/4.17-soak` sampled three such lines out of six and read 50% — a verdict about
+/// its neighbours' eyes, not about its suite. At twelve the same three cost a quarter, and a step
+/// has to be genuinely uncovered to fall under the bar. The walk costs about twice what it did
+/// (each judged mutant is one spec run: 15-20 s per step became 30-40 s).
 ///
 /// `attempts`, not judgements: a mutation whose site does not compile scores nothing (see
-/// [`Verdict::Skipped`]), and six of those in a row would leave the gate with no evidence at all
+/// [`Verdict::Skipped`]), and twelve of those in a row would leave the gate with no evidence at all
 /// rather than with a pass. The walk stops as soon as [`MUTANT_CAP`] mutants have been *judged*, so
-/// the healthy case still costs six runs and only a project whose operators are hard to reach pays
-/// for more.
-pub const MUTANT_CAP: usize = 6;
+/// the healthy case still costs twelve runs and only a project whose operators are hard to reach
+/// pays for more.
+pub const MUTANT_CAP: usize = 12;
 
 /// Candidate sites one step may try to reach [`MUTANT_CAP`] judgements.
 ///
-/// Twice the cap, because a site that does not compile is common — a `>` that turns out to be part
-/// of a type the angle-bracket rule below could not tell from a comparison, a constant that is also
-/// an array length — and an attempt is cheaper than a step judged on four mutants.
-const ATTEMPT_CAP: usize = MUTANT_CAP * 2;
+/// Three times the cap, because a site that does not compile is common — a `>` that turns out to be
+/// part of a type the angle-bracket rule below could not tell from a comparison, a constant that is
+/// also an array length — and an attempt is cheaper than a step judged on fewer mutants than the cap
+/// allows. Twice was not enough once the sites became the lines a step's own patch writes
+/// (`sources::production_lines`): a step whose operators sit in awkward places ran out of attempts
+/// and reported eight judgements where twelve were asked for, and a ratio over a different number
+/// than the cap is a ratio a reader cannot compare with its neighbour's. The budget below still
+/// bounds the walk, so a project that needs thirty-six attempts is slow, not unbounded.
+const ATTEMPT_CAP: usize = MUTANT_CAP * 3;
 
 /// How long the whole walk may take, however many attempts are left.
 ///

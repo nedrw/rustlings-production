@@ -543,6 +543,11 @@ run = { cmd = "cargo test -p lakelet --test spec_soak" }
 spec = ["spec/4.17/soak.rs"]
 scaffold = "scaffold/4.17-soak.patch"
 solution = "solutions/4.17-soak.patch"
+# `slow:mutants@70` and not `@80`: the walk's sample is the lines this step's patch writes, and
+# two of the eight sites it can judge are invisible to any test — a `Weak` retain whose only
+# effect is the instrument's own memory, and `.write(true)` on a file opened to be synced,
+# where `sync_all` on a read-only descriptor is legal (measured: `fsync` and `F_FULLFSYNC`
+# both succeed on an `O_RDONLY` descriptor). The other six are the suite's business.
 gates = [
     "spec-integrity",
     "caps",
@@ -554,7 +559,7 @@ gates = [
     "exit-code",
     "links",
     "slow:soak@4000",
-    "slow:mutants@80",
+    "slow:mutants@70",
 ]
 hint = "The gate judges counters and not minutes: `tests/soak.rs` runs the ingest/flush/query cycle `cycles_min` times and prints what is still alive at the end (tasks, file handles, tracked series). The long form of the same command (`LAKELET_SOAK_MINUTES=30`) is what a real soak is, and `docs/soak.md` says which number moved the last time it ran."
 

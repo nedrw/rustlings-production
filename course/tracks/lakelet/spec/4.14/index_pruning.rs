@@ -1,7 +1,7 @@
 //! Spec for `lakelet/4.14-index-pruning`: a sidecar index that may cost a read and never a record.
 //!
 //! `kiln run` copies this file into the project as `tests/spec_index_pruning.rs`; it is the course's
-//! file, not the learner's (plan §3 D2). Twenty cases, and the shape of them is the point:
+//! file, not the learner's (plan §3 D2). Twenty-two cases, and the shape of them is the point:
 //!
 //! * **a zone answers "may" and never "does".** The bounds of a segment's timestamps and values are a
 //!   *value*, and every rule about it leans one way: a false positive costs a file read, a false
@@ -1672,4 +1672,86 @@ fn the_index_is_engine_code_and_it_lives_beside_the_segments() {
         page.contains("segments_pruned"),
         "and it still describes the pruning it always did"
     );
+}
+
+/// A merge whose inputs all state a range writes a segment that states one too.
+///
+/// `lakelet/4.8-compaction` pinned the *union* of the ranges; this case is about the flag behind
+/// it. An input that states nothing is meant to make the merged range unstated (`SegmentInfo`), and
+/// a merge that answered "nothing stated" for inputs that stated everything would write a segment
+/// no retention pass may ever drop — for ever, and silently.
+#[test]
+fn a_merge_of_stated_ranges_states_the_range_it_wrote() {
+    let batches = vec![hour(0), hour(1)];
+    let (dir, mut store) = sealed_with("merge-states", MergePolicy::new(2, u64::MAX), &batches);
+    let inputs: Vec<(u64, u64)> = store
+        .manifest()
+        .segments()
+        .iter()
+        .map(|info| {
+            (
+                info.first_millis()
+                    .unwrap_or_else(|| panic!("a sealed segment states its range")),
+                info.last_millis()
+                    .unwrap_or_else(|| panic!("a sealed segment states its range")),
+            )
+        })
+        .collect();
+    assert_eq!(inputs.len(), 2, "the case sealed two segments: {inputs:?}");
+
+    let ran = store
+        .compact()
+        .unwrap_or_else(|error| panic!("two comparable segments merge: {error}"))
+        .unwrap_or_else(|| panic!("the policy has a plan for two comparable segments"));
+    let merged = store
+        .manifest()
+        .segments()
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("the merge left one segment"));
+    assert_eq!(
+        merged.index,
+        ran.wrote(),
+        "the merged segment is the one it wrote"
+    );
+    let first = merged
+        .first_millis()
+        .unwrap_or_else(|| panic!("a merge of stated ranges states the range it wrote"));
+    let last = merged
+        .last_millis()
+        .unwrap_or_else(|| panic!("a merge of stated ranges states the range it wrote"));
+    assert_eq!(
+        (first, last),
+        (
+            inputs
+                .iter()
+                .map(|(first, _)| *first)
+                .min()
+                .expect("two inputs"),
+            inputs
+                .iter()
+                .map(|(_, last)| *last)
+                .max()
+                .expect("two inputs")
+        ),
+        "the range the merge wrote is the union of the ranges it took"
+    );
+    drop(dir);
+}
+
+/// An index shorter than the header, a zone map, a filter and a seal is refused, not decoded.
+///
+/// The length is the first of the four checks a reader makes, and it is the one that keeps the
+/// arithmetic below it in range: a file of four bytes is not a small index, it is not an index.
+#[test]
+fn an_index_shorter_than_its_own_arithmetic_is_refused() {
+    for length in [0usize, 1, 4, 8, 16] {
+        let bytes = vec![0u8; length];
+        let refused = SegmentIndex::decode(&bytes);
+        assert!(
+            refused.is_err(),
+            "{length} byte(s) is not an index, and reading it as one would be guessing at where it \
+             ends"
+        );
+    }
 }

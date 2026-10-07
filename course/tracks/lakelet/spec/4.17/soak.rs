@@ -1,6 +1,6 @@
 //! `lakelet/4.17-soak` — what is still alive after a long run, and what counts it.
 //!
-//! Seventeen cases, one claim each, and every one of them about a **stock** rather than a flow:
+//! Eighteen cases, one claim each, and every one of them about a **stock** rather than a flow:
 //!
 //! 1. [`a_report_carries_the_five_counters_and_no_clock`] — the shape of the one value a soak
 //!    reads, and the names it answers;
@@ -42,6 +42,7 @@ use lakelet::engine::index::{self, Lookup};
 use lakelet::engine::query::{exec, parse};
 use lakelet::engine::retention;
 use lakelet::engine::soak::{Live, Open};
+use lakelet::engine::spool;
 use lakelet::engine::wal::Policy as Durability;
 use lakelet::protocol::batch::{self, Record};
 use lakelet::service::backpressure::{Policy as Overflow, Queue};
@@ -917,4 +918,59 @@ fn listing(directory: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+/// A log cut inside a record opens, keeps what was whole, and forgets the tail.
+///
+/// The recovery this pins is `lakelet/4.4-wal-recovery`'s, and the line it pins is this step's: the
+/// truncation of a torn tail is a *write* to the log, and a store that opened the file without
+/// permission to write it would refuse to open at all — which is a soak that cannot start on the
+/// day a machine dies mid-append.
+#[test]
+fn a_log_cut_inside_a_record_opens_and_keeps_what_was_whole() {
+    let dir = fresh("torn-tail");
+    let records = batch(0);
+    let frame = batch::encode(&records);
+    {
+        let (mut spool, _store) = open(dir.path());
+        spool
+            .append(&frame)
+            .unwrap_or_else(|error| panic!("the case writes one batch: {error}"));
+        let held = spool
+            .records()
+            .unwrap_or_else(|error| panic!("the batch is readable before the crash: {error}"));
+        assert_eq!(
+            held,
+            vec![frame.clone()],
+            "and the batch is readable before the crash"
+        );
+    }
+
+    // The death: the *next* record's bytes reached the file and its checksum did not, so the log
+    // holds a whole record and then a torn one — which is what a machine that dies mid-append
+    // leaves, and the shape `lakelet/4.4-wal-recovery` calls `Torn`.
+    let later = batch(1);
+    let torn = batch::encode(&later);
+    let log = dir.path().join(spool::FILE);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap_or_else(|error| panic!("{} is writable: {error}", log.display()));
+        file.write_all(&torn[..torn.len() / 2])
+            .unwrap_or_else(|error| panic!("the tail is cut: {error}"));
+        file.sync_all()
+            .unwrap_or_else(|error| panic!("the cut reaches the device: {error}"));
+    }
+
+    let (spool, _store) = open(dir.path());
+    let held = spool
+        .records()
+        .unwrap_or_else(|error| panic!("a store whose tail was torn opens: {error}"));
+    assert_eq!(
+        held,
+        vec![frame],
+        "the payload the device kept is the one a restart recovers, and the torn one is gone"
+    );
 }
