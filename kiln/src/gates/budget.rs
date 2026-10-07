@@ -2,10 +2,12 @@
 //! baseline.
 //!
 //! The gate exists because "it got slower" is not a review comment anybody can act on. The step ships
-//! a harness (`tests/budget.rs`) that prints counts rather than times — statements per batch, cells
-//! scanned, the ratio between two sizes — and the course keeps the number each count must stay near,
-//! in `course/tracks/<track>/budget/<step-id>.toml` (handoff M2 §1). The gate runs the command that
-//! file names, reads the `<track>-budget <name>=<value>` lines it prints, and compares:
+//! a harness that prints counts rather than times — statements per batch, cells scanned, the ratio
+//! between two sizes — and the course keeps the number each count must stay near, in
+//! `course/tracks/<track>/budget/<step-id>.toml` (handoff M2 §1). Which file the harness is belongs
+//! to the baseline's own `command` (`tests/budget.rs` in T3, `tests/budget_downsample.rs` in T4),
+//! and the messages below read it from there ([`harness_path`]). The gate runs that command, reads
+//! the `<track>-budget <name>=<value>` lines it prints, and compares:
 //!
 //! * every metric has to stay within ±P% of its baseline, so a count that doubles is a failure while
 //!   a count that wobbles by a few percent is not;
@@ -67,8 +69,9 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     if measured.is_empty() {
         return Ok(GateOutcome::blocked(format!(
             "`{}` printed no `{prefix} <name>=<value>` line, so nothing could be compared — the \
-             harness the course scaffolds for this step (`tests/budget.rs`) is what prints them:\n    {}",
+             harness the course scaffolds for this step ({}) prints them:\n    {}",
             baseline.command,
+            harness_path(&baseline.command),
             output_detail(&ran)
         )));
     }
@@ -78,7 +81,27 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         &baseline.metric,
         &measured,
         &baseline_path,
+        &baseline.command,
     ))
+}
+
+/// The harness a baseline's command runs, named the way a reader can open it: the path of the
+/// command's `--test <target>`, or a phrase rather than a path when the command has no such target.
+///
+/// The message that names it used to be the literal `tests/budget.rs`, which is the file
+/// `jobq/3.22-bench-budget` ships and not the one any later lane does — `lakelet/4.10-downsampling`
+/// prints its counts from `tests/budget_downsample.rs` — so a blocked gate sent its reader looking
+/// for a file the project does not have.
+fn harness_path(command: &str) -> String {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let target = words
+        .iter()
+        .position(|word| *word == "--test")
+        .and_then(|at| words.get(at + 1));
+    match target {
+        Some(target) => format!("`tests/{target}.rs`"),
+        None => "the harness the course ships for this step".to_owned(),
+    }
 }
 
 /// Compare every baseline metric with what the harness measured.
@@ -87,6 +110,7 @@ fn compare(
     baseline: &Bounds,
     measured: &[Measured],
     baseline_path: &Path,
+    command: &str,
 ) -> GateOutcome {
     let missing: Vec<&str> = baseline
         .keys()
@@ -100,10 +124,11 @@ fn compare(
     if !missing.is_empty() {
         return GateOutcome::blocked(format!(
             "the harness did not report {}, which the course baseline ({}) has — without it this \
-             step cannot be judged: the harness is the course's `tests/budget.rs`, so restore it with \
+             step cannot be judged: the harness is the course's {}, so restore it with \
              `kiln reset` instead of editing it",
             missing.join(", "),
-            baseline_path.display()
+            baseline_path.display(),
+            harness_path(command)
         ));
     }
 
@@ -187,7 +212,31 @@ mod tests {
     fn result(stdout: &str) -> GateOutcome {
         let measured = harness::measurements(stdout, "jobq-budget").expect("the fixture parses");
         assert!(!measured.is_empty(), "the fixture has a metric");
-        compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"))
+        compare(
+            10.0,
+            &baseline(),
+            &measured,
+            Path::new("budget/3.22.toml"),
+            COMMAND,
+        )
+    }
+
+    /// The baseline's command, in the shape `jobq/3.22-bench-budget`'s own file writes it.
+    const COMMAND: &str = "cargo test -p jobq --test budget -- --nocapture";
+
+    #[test]
+    fn a_message_names_the_harness_the_command_actually_runs() {
+        // The gate used to say `tests/budget.rs` whatever lane it was judging, and that file is not
+        // in four of them: a blocked gate sent its reader after a path the project does not have.
+        assert_eq!(
+            harness_path("cargo test -p lakelet --test budget_downsample -- --nocapture"),
+            "`tests/budget_downsample.rs`"
+        );
+        assert_eq!(harness_path(COMMAND), "`tests/budget.rs`");
+        assert_eq!(
+            harness_path("cargo run -q --bin soak"),
+            "the harness the course ships for this step"
+        );
     }
 
     #[test]
@@ -256,7 +305,13 @@ mod tests {
     fn a_metric_the_harness_forgot_is_blocked_and_named() {
         let measured = harness::measurements("jobq-budget claim_statements=12\n", "jobq-budget")
             .expect("parses");
-        let outcome = compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"));
+        let outcome = compare(
+            10.0,
+            &baseline(),
+            &measured,
+            Path::new("budget/3.22.toml"),
+            COMMAND,
+        );
         assert_eq!(outcome.outcome, Outcome::Blocked);
         assert!(outcome.detail.contains("scan_cells"), "{}", outcome.detail);
         assert!(
@@ -274,7 +329,13 @@ mod tests {
             "jobq-budget",
         )
         .expect("parses");
-        let outcome = compare(10.0, &baseline(), &measured, Path::new("budget/3.22.toml"));
+        let outcome = compare(
+            10.0,
+            &baseline(),
+            &measured,
+            Path::new("budget/3.22.toml"),
+            COMMAND,
+        );
         assert_eq!(outcome.outcome, Outcome::Passed);
         assert!(!outcome.detail.contains("peak_rss"), "{}", outcome.detail);
     }
