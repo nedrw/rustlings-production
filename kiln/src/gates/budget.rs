@@ -215,9 +215,8 @@ mod tests {
         );
         assert_eq!(passed.outcome, Outcome::Passed);
         assert!(
-            passed.detail.contains("2 within ±10%") && passed
-                .detail
-                .contains("1 at or below an upper bound"),
+            passed.detail.contains("2 within ±10%")
+                && passed.detail.contains("1 at or below an upper bound"),
             "{}",
             passed.detail
         );
