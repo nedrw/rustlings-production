@@ -897,3 +897,62 @@ $ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --c
 （4.10 `10/10 must`、变异 5/6；4.11 `10/10 must` + 1 should、变异 6/6、覆盖 620/635）。
 **教训**：scaffold 的插入点不能放在“任何一个后续补丁会够到的文件尾”，否则作者配方（`git apply`）与
 课程管线（`kiln`）会分叉。
+
+## 段 17：B3d — 4.12 `num/aggregation-correctness@apply`（和不是 `+`，一天不是 24 小时）
+
+**做了什么**：`spec/4.12/aggregation.rs`（1277 行、17 用例）、`scaffold/4.12-aggregation-correctness.patch`
+（430 行、**0 删除**：新建 `src/engine/query/agg.rs`（412 行）+ 在 `query/mod.rs` 的标记块里插 3 行）、
+`solutions/4.12-aggregation-correctness.patch`（810 行：`agg.rs` 333、`cli/mod.rs` 61、`downsample.rs` 147、
+`exec.rs` 39）、`course/docs/steps/en/lakelet/4.12-aggregation-correctness.md`（198 行）。
+`track.toml` 未动（`9 must + 1 should`——`slow:?coverage@80` 是应该门）。
+
+**这一步钉下来的六条不变量**：① **和不是 `+`**：`Sum` 是 Kahan–Neumaier 补偿累加器，`BOUND` 与
+`error_bound(values)` 把承诺写成数字（相对“量级之和”），而 `naive` **故意留在模块里**——它是所有人
+都写得出来的实现，也是用例要证明其错的那一半；② **答案不依赖读取顺序**：同一批记录打乱后答案必须落在
+`error_bound` 之内（朴素求和过不了这条，这就是这个模块存在的理由）；③ **计数是整数**（`Bucket::count`
+仍是 `u64`）；④ **一天不是 24 小时**：`Zone` 只带**这个构建所带的**转换表（`UTC` + 一个春季前跳、
+秋季后跳的时区），表外回答 `None` 而不是猜；⑤ **`--zone` 规则刻意很窄**：只有 **1d** 窗口会变成
+**本地日**（所以前跳那天 23 小时、后跳那天 25 小时），更短的窗口一个字节都不变，`--zone UTC` 与不带
+`--zone` 逐字节相同；⑥ **`EXPLAIN` 不加键**（4.11 的规格数着十二行——rule 10）。
+
+**原始结论行**（我在自己的构建与**全新** scratch 副本上重取）：
+
+```
+$ kiln selftest --track lakelet                          # 12/12 step(s) hold the contract（4.1…4.12）
+$ kiln selftest lakelet/4.12-aggregation-correctness --track lakelet  # scaffold ✓（... FAILED）/ solution ✓ / gates ✓ 9/9 must green
+$ kiln check lakelet/4.12-aggregation-correctness --slow   # 9/9 must gate(s) passed · 1 should gate(s) run
+  ✓ slow:mutants@80    5/6 mutant(s) killed (83%, needs ≥80%)（12 次尝试里 1 次没能判：不编译或没跑完）
+  ✓ slow:?coverage@80  177 of 177 line(s) of this step's module are covered (100% ≥ 80%)
+$ kiln verify lakelet    → 12/12 judged step(s) pass · 0 failed · 0 not prepared · 12 without content
+$ kiln lint-caps → no issues · kiln links → 102 page(s) · 502 link(s) ✓ · kiln i18n → 85/97 · kiln probe --check → 41/41
+$ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --check 干净
+```
+
+两条补丁在**我自己重建并核对过**的 `through 4.11` 树上重放后与受测树逐字节一致（`diff -r` 只剩 `kiln`
+同步的 `tests/spec_*.rs`）；scaffold 0 删除。
+
+**演练（我重取了一遍）**：把 `Sum::value()` 里的补偿项去掉（等于只留朴素求和）——
+
+```
+1. RED    $ cargo test -q --test spec_aggregation → FAILED. 12 passed; 5 failed
+2. CAUGHT a_window_answer_is_the_accumulators_answer
+          panicked at tests/spec_aggregation.rs:597:5: the window's sum is the accumulator's sum:
+          a running total over the same records answers 1e16 / left: [1e16] / right: [1.0000000000001e16]
+          （另外四条：补偿和、打乱顺序、bound 是承诺、窗口答案…）
+3. GREEN  回滚 → ok. 17 passed; 0 failed
+```
+
+**这一段钉下来的三件事**：
+
+1. **§5 那条仪器缺陷又添了第三个实测点**：4.12 的 5/6 里活下来的位点是
+   `src/cli/mod.rs:678 if windows > MAX_WINDOWS {`（`>` → `>=`），而 **`MAX_WINDOWS` 在 4.12 自己的
+   参考解补丁里出现 0 次**（4.10 有 3 次、4.11 有 5 次）——它是更早两步的行，被 4.12 的规格“判”了。
+   （另一次没能判的尝试是 `agg.rs:531 - → +`，编译器报 “leading `+` is not supported”，门正确地把它
+   排除在比值之外。）结论不变：比值低于 100% 先看是“本步真缺口”还是“后来者/更早者的行被抽中”。
+2. **作者按规则 10 找出了三处不许动的地方**：`Refusal` **不能加变体**（4.11 的规格对它穷举匹配、没有
+   通配臂——加了就让 4.11 在最终树上红），所以时区拒绝复用 `Refusal::Syntax`（类别 2）并把位置算在
+   时区名里；`EXPLAIN` 不能加键；`downsample.rs` 没有标记块，所以本地日入口不能由 scaffold 声明，
+   由学员自己写（正文写明形状）。这三条都记在这一段里，后面的步骤照抄。
+3. **一次“先粗后细”的演练教训**：我第一次把 `Sum::add` 改成朴素加法时留下了悬空的 `total`，于是
+   `cargo test` 失败的是**编译**而不是规格；换成去掉 `value()` 里的补偿项才是行为变异。**演练必须确认
+   红的是规格**（编译错也红，但它什么都没证明）。

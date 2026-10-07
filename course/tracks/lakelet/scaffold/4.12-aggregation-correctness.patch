@@ -1,0 +1,430 @@
+diff --git a/src/engine/query/agg.rs b/src/engine/query/agg.rs
+new file mode 100644
+index 0000000..6ae20dd
+--- /dev/null
++++ b/src/engine/query/agg.rs
+@@ -0,0 +1,412 @@
++//! The two numbers a query is wrong about while every other test passes: how a sum rounds, and
++//! what a day is.
++//!
++//! Step `lakelet/4.12-aggregation-correctness`. `lakelet/4.10-downsampling` decided *what a
++//! window is* and `lakelet/4.11-query-engine` decided *which records an answer may read*. Both of
++//! them are about records and time, and both of them are wrong about two things neither of those
++//! steps can see: arithmetic that loses the small terms, and a calendar that is not the one the
++//! absolute grid assumes.
++//!
++//! # A sum is not `+`
++//!
++//! Adding a hundred thousand values in the order they arrived loses the small ones to the large
++//! ones: an `f64` carries about sixteen decimal digits, an accumulator over a store's worth of
++//! samples reaches magnitudes where a single sample falls below the last place, and every one of
++//! those additions rounds. [`naive`] is kept in this module **precisely because it is the
++//! implementation everybody writes** — it is what this step's cases prove wrong, and a module
++//! that shipped only the correct version would leave a reader wondering what the fuss is about.
++//!
++//! [`Sum`] is a compensated accumulator (Kahan's rule, in Neumaier's form): it keeps the part of
++//! each addition that the rounding threw away and adds it back at the end. [`BOUND`] is the error
++//! this project promises, stated relative to the **sum of the magnitudes** it added — a scale,
++//! not a fingerprint, because a sum's error is a property of the sizes that went into it rather
++//! than of the answer it produced. [`error_bound`] is that promise as a number a case can ask
++//! for, and [`agrees`] is the comparison for magnitudes that
++//! `lakelet/4.10-downsampling`'s tolerance makes for values.
++//!
++//! # An answer may not depend on the order the store reads it in
++//!
++//! Segments are read oldest first, a merge rewrites them, and a crash can change an epoch without
++//! reordering anything — so the same records arrive in a different order on a different day, and
++//! **the same question has to answer the same way**. Plain summation does not: the numbers added
++//! first are the ones that stop mattering. Compensation is what makes an answer a function of the
++//! records rather than of the read, and this step's spec shuffles one workload and demands one
++//! answer within [`error_bound`] — and then shows [`naive`] failing the same demand, which is the
++//! case that justifies this module existing at all.
++//!
++//! This is also the honest reading of *monotonic time*. A store's data is full of clocks that
++//! stepped backwards: a machine that corrected its time, a host that was rebooted, a counter that
++//! was replayed. Nothing here may assume that a later record carries a later timestamp, so a
++//! bucket is computed from the records whose timestamp falls in it and never from where a record
++//! sat in the read.
++//!
++//! # A count is an integer
++//!
++//! [`Sum::count`] counts the values that were added, exactly, in a `u64`. `Bucket::count` —
++//! `lakelet/4.10-downsampling`'s contract — is a `u64` for the same reason: a count carried in an
++//! `f64` is exact only up to two to the fifty-third, and a float count is the bug a store with a
++//! hundred million records finds. A mean is a sum divided by a count, and the division is the
++//! part that is allowed to round — not the count.
++//!
++//! # A day is not twenty-four hours
++//!
++//! Every bucket this store has computed so far sits on the absolute grid, counted from the Unix
++//! epoch, and that grid is the right one for a window of a second, a minute or an hour: an hour
++//! is an hour everywhere. A **day** is not, and the step that says "one point a day" is where a
++//! dashboard built on the absolute grid is a day out, twice a year, in every zone that has a
++//! summer.
++//!
++//! [`Zone`] is a name and the offset transitions **this build knows about**, and the word to
++//! notice is *this build*. A time-zone database is a file that goes stale, ships as a data update
++//! and is wrong the moment a government changes a rule; this project ships the transitions it was
++//! built with and says so. Three consequences a reader should be able to point at:
++//!
++//! * [`Zone::SHIPPED`] is the list of names this build has tables for, and [`Zone::parse`] answers
++//!   those names and a fixed `±HH:MM` offset — nothing else, because a name nobody shipped is a
++//!   name this build cannot be right about;
++//! * [`Zone::offset_at`] answers `None` **outside the table** rather than guessing. A table whose
++//!   rules begin in 2024 cannot say what 2019 was, and inventing `+01:00` for it would be a
++//!   confident answer to a question this build has no data for;
++//! * [`Zone::local_day`] is the half-open span of the *local* day an instant falls in — which is
++//!   twenty-three hours on the day a zone springs forward and twenty-five on the day it falls
++//!   back, and both of those are days a dashboard counting in fixed 86 400-second steps draws
++//!   wrong.
++//!
++//! **The tolerance is a number in the code, and so is the bound.** `lakelet/4.10-downsampling`
++//! states one tolerance for a downsampled answer against a raw one; this step states a second,
++//! different one for a sum against the exact result, and neither of them is a comment: every
++//! comparison of two computed numbers in this step's spec goes through [`agrees`], and the cases
++//! that matter are the ones that **fail** it.
++
++use std::borrow::Cow;
++
++use crate::engine::query::lex::Refusal;
++
++/// How many milliseconds a day is when a caller counts in days on the absolute grid.
++///
++/// The grid this step's zone arithmetic departs from, and the width that makes it depart: a window
++/// of exactly one day is the one window whose buckets a time zone may move (the command line's
++/// `--zone` rule), and every shorter window is already on the absolute grid
++/// `lakelet/4.10-downsampling` pinned.
++pub const DAY_MILLIS: u64 = 86_400_000;
++
++/// The error a compensated sum is allowed, relative to the sum of the magnitudes it added.
++///
++/// The promise is a **relative** one on purpose, and the base is `Σ|v|` rather than the sum
++/// itself: a sum that cancels — `1e16 - 1e16 + 1` — has a tiny answer and a large error budget,
++/// while the same values all positive have a large answer, and a bound stated against the answer
++/// would call the first one exact and the second one broken. What a compensated step cannot cancel
++/// is the rounding of the addition it just made and of the correction it stores; four units in the
++/// last place of the magnitudes is that promise with room to spare, and it is about twelve
++/// thousand times tighter than the `n · ε` a plain `+=` earns over a hundred thousand samples.
++pub const BOUND: f64 = 4.0 * f64::EPSILON;
++
++/// A compensated (Kahan–Neumaier) accumulator: the sum a query computes values with.
++///
++/// The two float fields are the whole of the trick. `sum` is the running total, and `compensation`
++/// accumulates what each addition rounded away — the part of the addend that did not fit in `sum`
++/// after the addition. `value` is their sum, so the rounding is undone at the end rather than at
++/// every step, and the error a caller sees is the error of *one* addition rather than of a hundred
++/// thousand.
++///
++/// The shape is deliberately not an `f64` with extra methods: `Sum` is a value a pass carries
++/// through a window (`lakelet/4.10-downsampling`'s `Tally` is one), it is `Copy` so a pass can
++/// hand one out, and the count travels beside the sum because a mean is the one aggregate that
++/// needs both.
++#[derive(Debug, Clone, Copy, Default, PartialEq)]
++pub struct Sum {
++    /// The running total: what `+=` would have left behind.
++    sum: f64,
++    /// What the additions rounded away, accumulated instead of lost.
++    compensation: f64,
++    /// How many values have been added. An integer, and an exact one.
++    count: u64,
++}
++
++impl Sum {
++    /// An accumulator with nothing in it: the sum of no values at all.
++    #[must_use]
++    pub const fn new() -> Self {
++        todo!()
++    }
++
++    /// Add one value.
++    ///
++    /// The correction is the difference between the addition that was made and the exact one, and
++    /// it is computed the Neumaier way — from whichever of the two addends is the larger, because
++    /// that is the one whose low bits the addition dropped. The correction is skipped when the
++    /// addition did not round for a reason an `f64` can *round*: an infinity, a `NaN`, or an
++    /// overflow. `inf - inf` is not a number, and a sum that is perfectly well defined (`1 + inf`)
++    /// must not be turned into one by an accumulator that meant well.
++    pub fn add(&mut self, value: f64) {
++        todo!("lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
++               and the count")
++    }
++
++    /// The sum, as well as this accumulator can state it: the total plus what the additions left
++    /// behind.
++    #[must_use]
++    pub const fn value(&self) -> f64 {
++        todo!()
++    }
++
++    /// How many values have been added, exactly.
++    #[must_use]
++    pub const fn count(&self) -> u64 {
++        todo!()
++    }
++
++    /// What the values average to, or `None` when there are none.
++    ///
++    /// An empty accumulator has no mean, and it is `None` rather than `NaN` because a mean of
++    /// nothing is not a number a caller can use: `NaN` propagates through every comparison that
++    /// follows it and shows up as a missing point on a dashboard an hour later.
++    #[must_use]
++    pub fn mean(&self) -> Option<f64> {
++        todo!("lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
++               over the count")
++    }
++}
++
++/// The sum everybody writes: add each value to a running total, in the order they arrive.
++///
++/// This is not a straw man and it is not dead code. It is the half of this step's subject that a
++/// reader already has — `let mut sum = 0.0; for value in values { sum += value; }` — and the cases
++/// in this step's spec call it to show what it costs, because a claim that compensation is
++/// necessary is a claim *about this function* and cannot be made without running it.
++#[must_use]
++pub fn naive(values: &[f64]) -> f64 {
++    todo!("lakelet/4.12-aggregation-correctness: the loop everybody writes is the whole function")
++}
++
++/// The same sum through [`Sum`]: what a query computes values with.
++#[must_use]
++pub fn running(values: &[f64]) -> f64 {
++    todo!("lakelet/4.12-aggregation-correctness: `Sum` is declared above; the loop is yours")
++}
++
++/// The error [`running`] is allowed on `values`: [`BOUND`] times the sum of their magnitudes.
++///
++/// The magnitudes are summed **through a `Sum` and not through `naive`**, which is the part a
++/// reader can get wrong: a bound computed by the arithmetic it is bounding would itself be wrong
++/// by orders of magnitude more than the bound it states, and the case it exists to judge would be
++/// judged against a number that means nothing. `NaN` and infinities make the bound not a number,
++/// and [`agrees`] then agrees with nothing — the honest answer for a workload no bound applies to.
++#[must_use]
++pub fn error_bound(values: &[f64]) -> f64 {
++    todo!("lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
++           state them, times BOUND")
++}
++
++/// `true` when `left` and `right` are the same number, inside the absolute `bound`.
++///
++/// `lakelet/4.10-downsampling`'s `agree` compares two answers whose scale is their own; this one
++/// compares a computed number against a stated promise, so the scale is the caller's `bound` and
++/// there is no floor of one hiding behind it. `NaN` agrees with nothing, itself included — and
++/// `NaN` is exactly what a broken aggregation produces, so the comparison that certifies an answer
++/// has to refuse to certify it.
++#[must_use]
++pub fn agrees(left: f64, right: f64, bound: f64) -> bool {
++    todo!("lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
++           answers false by itself")
++}
++
++/// One step of a zone's table: from `from_millis` on, the zone is `offset_millis` from UTC.
++///
++/// Both numbers are milliseconds rather than hours, because that is the unit a caller's timestamp
++/// is in and the unit a local day is computed in: a conversion per lookup would be a rounding per
++/// lookup.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct Change {
++    /// The first millisecond since the Unix epoch the offset applies at.
++    from_millis: u64,
++    /// The offset from UTC, in milliseconds. `3_600_000` is `+01:00`.
++    offset_millis: i64,
++}
++
++/// What a zone knows: a table of transitions, or one offset that never changes.
++///
++/// The two cases are genuinely different and the type says so. A named zone is a *history* — the
++/// transitions this build was built with, and nothing before the first one — while a fixed offset
++/// is arithmetic a caller wrote down, true for every instant there is.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Table {
++    /// One offset from UTC for every instant the zone covers: `+02:00`, or UTC itself.
++    Fixed(i64),
++    /// The transitions this build ships, ascending, each in force from its own instant on.
++    Shipped(&'static [Change]),
++}
++
++/// A time zone: a name and the offset transitions this deployment knows about.
++///
++/// The name is a `Cow` because a zone has exactly two provenances and both of them are names: one
++/// of [`Zone::SHIPPED`], which is a `&'static str` this build was compiled with, and a fixed
++/// offset a caller wrote, which is spelled `+HH:MM` and is stored as the caller wrote it. A
++/// `&'static str` cannot hold both, and leaking one string per distinct offset typed at a command
++/// line is not a trade this store makes.
++///
++/// `from_millis` and `to_millis` are the span this build's table **covers**, which is a different
++/// fact from where its transitions are: `Europe/Berlin` is known for 2024 and 2025 in this build,
++/// and outside that span [`Zone::offset_at`] says so rather than extrapolating a rule it does not
++/// have. They are counted from the Unix epoch like every other millisecond in this crate — the
++/// unit a `Range` is in, so the comparison a query needs is a comparison and not a conversion.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Zone {
++    /// What the zone is called: a shipped name, or the offset a caller wrote.
++    name: Cow<'static, str>,
++    /// The first millisecond since the Unix epoch this build's table covers.
++    from_millis: u64,
++    /// The first one after the last it covers.
++    to_millis: u64,
++    /// What it knows about those instants.
++    table: Table,
++}
++
++/// The milliseconds in an hour, for reading the table below.
++const HOUR_MILLIS: i64 = 3_600_000;
++
++/// The transitions `Europe/Berlin` had in the two years this build knows about.
++///
++/// Five entries, in the order they happened, and each one is a real instant a reader can check the
++/// way an operator checks a zone: the offset in force when the table opens, the two changes of
++/// 2024, and the two of 2025. The European rule is the last Sunday of March and the last Sunday of
++/// October at 01:00 UTC, which is why the instants look arbitrary and are not.
++const BERLIN_CHANGES: [Change; 5] = [
++    // 2024-01-01T00:00:00+01:00: the offset the table opens on, and the first instant it covers.
++    Change {
++        from_millis: 1_704_063_600_000,
++        offset_millis: HOUR_MILLIS,
++    },
++    // 2024-03-31T01:00:00Z: 02:00 local becomes 03:00, and that day is 23 hours long.
++    Change {
++        from_millis: 1_711_846_800_000,
++        offset_millis: 2 * HOUR_MILLIS,
++    },
++    // 2024-10-27T01:00:00Z: 03:00 local becomes 02:00, and that day is 25 hours long.
++    Change {
++        from_millis: 1_729_990_800_000,
++        offset_millis: HOUR_MILLIS,
++    },
++    // 2025-03-30T01:00:00Z: the same rule, the next year.
++    Change {
++        from_millis: 1_743_296_400_000,
++        offset_millis: 2 * HOUR_MILLIS,
++    },
++    // 2025-10-26T01:00:00Z.
++    Change {
++        from_millis: 1_761_440_400_000,
++        offset_millis: HOUR_MILLIS,
++    },
++];
++
++/// `Europe/Berlin` as this build was built with it: two years of transitions, and nothing outside
++/// them.
++const BERLIN: Zone = Zone {
++    name: Cow::Borrowed("Europe/Berlin"),
++    from_millis: 1_704_063_600_000,
++    to_millis: 1_767_222_000_000,
++    table: Table::Shipped(&BERLIN_CHANGES),
++};
++
++/// The widest a fixed offset may be from UTC, in hours.
++///
++/// Fourteen, and it is a real bound rather than a sanity check: no zone has ever been further from
++/// UTC than `+14:00` (Kiribati's Line Islands), so a value beyond it is a typo — and a typo that
++/// quietly answered would put a bucket fourteen hours from the one the caller meant.
++const MAX_OFFSET_HOURS: i64 = 14;
++
++impl Zone {
++    /// UTC: zero offset, for every instant an `i64` can name.
++    pub const UTC: Zone = Zone {
++        name: Cow::Borrowed("UTC"),
++        from_millis: 0,
++        to_millis: u64::MAX,
++        table: Table::Fixed(0),
++    };
++
++    /// The names this build has a table for: what a caller may write in place of an offset, and
++    /// the list a refusal naming an unknown zone reads from.
++    pub const SHIPPED: [&'static str; 2] = ["UTC", "Europe/Berlin"];
++
++    /// The zone a name names.
++    ///
++    /// Two provenances, and the order they are tried in is the point: a name [`Zone::SHIPPED`]
++    /// lists gets **this build's table** for that zone — its transitions, and the span they cover
++    /// — while anything else is read as a fixed offset `+HH:MM`/`-HH:MM`, which is arithmetic the
++    /// caller supplied and which this build therefore knows for every instant. A name that is
++    /// neither is refused rather than defaulted to UTC, because a `--zone Europe/Berlinn` that
++    /// quietly answered UTC is a dashboard a day out that nobody can explain.
++    ///
++    /// # Errors
++    ///
++    /// [`Refusal::Syntax`] — the caller's class, `2` — when the name is not one this build ships
++    /// and is not a `±HH:MM` offset with two digits in each field. The offset the refusal carries
++    /// is a byte offset into the *name* the caller wrote, since a zone is not part of a query
++    /// text: byte `0` is the name itself, which is where a name nobody shipped is wrong.
++    pub fn parse(name: &str) -> Result<Zone, Refusal> {
++        todo!("lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
++               name that is neither is refused with `Refusal::Syntax`")
++    }
++
++    /// What this zone is called: a shipped name, or the offset a caller wrote.
++    #[must_use]
++    pub fn name(&self) -> &str {
++        &self.name
++    }
++
++    /// The half-open span of instants this build's table covers, as `[from, to)`.
++    ///
++    /// This is the fact a refusal has to state to be useful: "this build does not know that
++    /// instant" is not actionable, and "this build knows 2024-01-01 through 2025-12-31" tells a
++    /// caller exactly which part of their range cannot be answered. `UTC` and a fixed offset cover
++    /// every instant, and a shipped table covers the span it ships.
++    #[must_use]
++    pub const fn covers(&self) -> (u64, u64) {
++        todo!()
++    }
++
++    /// How far `ts_millis` is from UTC in this zone, or `None` when the table does not cover that
++    /// instant.
++    ///
++    /// `None` is the whole of this build's honesty about time zones. A shipped table is a *file*:
++    /// it names the transitions it was built with and there is no rule in it for 2019 or for 2029,
++    /// and a query answered with a guessed offset would put a bucket an hour from the one the
++    /// caller asked about, twice a year, in a way nobody can see. So the offset is stated where
++    /// the table has it and refused where it does not, while a fixed offset is stated everywhere.
++    ///
++    /// A timestamp before the Unix epoch is read as the epoch, which is the same choice
++    /// [`Window::partition`](super::downsample::Window::partition) makes for the same clock: there
++    /// is no instant below zero for a clock that was wrong to land in, and a table whose span
++    /// starts in 2024 covers neither.
++    #[must_use]
++    pub fn offset_at(&self, ts_millis: i64) -> Option<i64> {
++        todo!("lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
++               at or before the instant")
++    }
++
++    /// The half-open span of the *local* day `ts_millis` falls in, as milliseconds since the Unix
++    /// epoch in UTC, or `None` when the table does not cover the day.
++    ///
++    /// The two numbers are the instants the local day begins and ends, which is what a bucket key
++    /// has to be: a dashboard asked for a point a day has to print one *instant* per day, and it
++    /// has to be the instant the day started — not midnight in the caller's own offset, and not
++    /// the start of the absolute-grid window the day happens to overlap.
++    ///
++    /// The span is the point of the whole module. On the day a zone springs forward the local day
++    /// is **23 hours** long and on the day it falls back it is **25**, and that is not an artefact
++    /// to be smoothed away: it is the answer. A dashboard that counted 86 400 000 milliseconds
++    /// from the previous midnight would label the samples of two different days with the same date
++    /// twice a year, and an hour of a 25-hour day's samples would be missing. The boundaries are
++    /// found by resolving local midnight against the offset in force *at that midnight*, which is
++    /// why a day whose offset changes part-way through still comes out as one span.
++    ///
++    /// A local day that would begin before the Unix epoch is the **first** day there is, which is
++    /// the same choice [`Window::partition`](super::downsample::Window::partition) makes for the
++    /// same clock: a day that begins in 1969 is not a pair of `u64`s, and a record that carries one
++    /// belongs to the first day this store can name rather than to no day at all.
++    #[must_use]
++    pub fn local_day(&self, ts_millis: i64) -> Option<(u64, u64)> {
++        todo!("lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
++               midnight, and the offset in force at that midnight")
++    }
++}
+diff --git a/src/engine/query/mod.rs b/src/engine/query/mod.rs
+index 9a33f81..f1ec004 100644
+--- a/src/engine/query/mod.rs
++++ b/src/engine/query/mod.rs
+@@ -31,4 +31,7 @@ pub mod lex;
+ pub mod parse;
+ pub mod plan;
+ pub mod series;
++// `lakelet/4.12-aggregation-correctness`: the two numbers a query is wrong about — how a sum
++// rounds, and what a day is in a zone the absolute grid does not have.
++pub mod agg;
+ // kiln:scaffold:end

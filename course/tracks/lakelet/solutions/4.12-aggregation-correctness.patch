@@ -1,0 +1,810 @@
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 1fe5e26..ccb913f 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -44,6 +44,24 @@
+ //!   `lakelet/4.11-query-engine` is where a query *refuses* a range the store cannot answer
+ //!   rather than answering what is left of it.
+ //!
++//! # The calendar, and why it is a flag in both forms
++//!
++//! `--zone` names the calendar a **one-day** window counts in — `UTC`, a name this build ships a
++//! table for, or a fixed `+HH:MM`/`-HH:MM` offset — and it is a flag beside `--store` rather than
++//! part of the question text, because `GROUP BY time(1d)` says how wide a bucket is and not which
++//! midnight it starts at. The rule is one window wide: with a window of exactly one day the
++//! buckets are **local days** of that zone, so the day a zone springs forward holds 23 hours of
++//! samples and the day it falls back holds 25, and with any other window the zone changes nothing
++//! at all, because an hour is an hour everywhere and a rule that moved a five-minute bucket would
++//! be a second grid (`lakelet/4.12-aggregation-correctness`). The default is `UTC`, whose local
++//! days *are* the absolute grid `lakelet/4.10-downsampling` pinned — so a caller who says nothing
++//! and a caller who says `UTC` get the same bytes.
++//!
++//! A range the named zone's table does not cover is refused rather than answered with a guessed
++//! offset, and the sentence names the span the table does cover: a time-zone table is a file that
++//! goes stale, and a build that answered about 2019 with 2024's rules would be a day out twice a
++//! year in a way nobody can see.
++//!
+ //! # The two shapes
+ //!
+ //! ```text
+@@ -85,6 +103,7 @@
+ use std::path::Path;
+ 
+ use crate::engine::compaction::Segments;
++use crate::engine::query::agg::Zone;
+ use crate::engine::query::downsample::{self, Aggregate, Bucket, Range, Window};
+ use crate::engine::query::exec;
+ use crate::engine::query::lex::Refusal;
+@@ -118,7 +137,8 @@ OPTIONS:
+ 
+ QUERY OPTIONS:
+     query --store <DIR> --from <MS> --to <MS> --window <DURATION> --agg <NAME> [--series <SERIES>]
+-    query --store <DIR> --sql '<QUERY>'
++          [--zone <ZONE>]
++    query --store <DIR> --sql '<QUERY>' [--zone <ZONE>]
+           --store <DIR>     the store directory to read
+           --from <MS>       first millisecond of the range, since the Unix epoch (inclusive)
+           --to <MS>         first millisecond after it (exclusive)
+@@ -126,6 +146,9 @@ QUERY OPTIONS:
+           --agg <NAME>      count, sum, mean, min or max
+           --series <SERIES> only this series (the default is every series, which is rarely what a
+                             mean wants)
++          --zone <ZONE>     the calendar a one-day window counts in: UTC, Europe/Berlin, or a
++                            fixed offset as +HH:MM or -HH:MM, as in +02:00 (the default is UTC,
++                            and a window narrower than a day ignores it)
+           --sql <QUERY>     the whole question as one text, and not beside the flags above:
+                             SELECT mean(value) FROM cpu WHERE host = 'a'
+                               AND ts BETWEEN 1700000000000 AND 1700003600000
+@@ -216,7 +239,7 @@ impl Outcome {
+ }
+ 
+ /// Everything one `query` call decided, once the text on the command line is numbers and values.
+-#[derive(Debug, Clone, Copy)]
++#[derive(Debug, Clone)]
+ struct Query<'a> {
+     /// The store directory the question is about.
+     store: &'a Path,
+@@ -228,6 +251,8 @@ struct Query<'a> {
+     aggregate: Aggregate,
+     /// The series to answer about, or every series.
+     series: Option<&'a str>,
++    /// The calendar a one-day window counts in.
++    zone: &'a Zone,
+     /// Whether the answer is one JSON document rather than one line per bucket.
+     json: bool,
+ }
+@@ -325,6 +350,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+     let mut window: Option<&str> = None;
+     let mut aggregate: Option<&str> = None;
+     let mut series: Option<&str> = None;
++    let mut zone: Option<&str> = None;
+     let mut sql: Option<&str> = None;
+ 
+     let mut index = 0;
+@@ -339,6 +365,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+             "--window" => &mut window,
+             "--agg" => &mut aggregate,
+             "--series" => &mut series,
++            "--zone" => &mut zone,
+             "--sql" => &mut sql,
+             other => return unknown(other, "`lakeletq --help` lists the flags `query` takes"),
+         };
+@@ -357,6 +384,18 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+         return missing("--store");
+     };
+ 
++    // The zone is a flag in **both** input forms, beside `--store`: a query text names a metric,
++    // a range and a window, and which calendar a day is counted in is not something it can say.
++    // A name this build cannot read is refused here, before a store is opened, like every other
++    // caller mistake — and the refusal's own class is what the script branches on.
++    let zone = match zone {
++        Some(name) => match Zone::parse(name) {
++            Ok(zone) => zone,
++            Err(refusal) => return Outcome::refused(refusal.class(), refusal.to_string()),
++        },
++        None => Zone::UTC,
++    };
++
+     // The two forms are two ways to ask one question, so giving both is a caller saying the same
+     // thing twice — and the flag that was given beside `--sql` is named, because "you cannot mix
+     // these" sends a reader back to their script to guess which flag did it.
+@@ -378,7 +417,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+                 );
+             }
+         }
+-        return sql_query(store, text, json);
++        return sql_query(store, text, json, &zone);
+     }
+ 
+     let Some(from) = from else {
+@@ -451,6 +490,7 @@ fn query(flags: &[&str], json: bool) -> Outcome {
+         width_millis,
+         aggregate,
+         series,
++        zone: &zone,
+         json,
+     };
+     answer(&query)
+@@ -570,13 +610,20 @@ fn ask(query: &Query<'_>) -> Result<Vec<Bucket>, Outcome> {
+         Ok(records) => records,
+         Err(error) => return Err(class(&error, "the store's segments could not be read")),
+     };
+-    let answered = downsample::downsample(
++    // The window pass is the only place a day means anything, and it is asked about the zone
++    // rather than told what to do with it: a second rule about local days here would be a second
++    // answer to a question `lakelet/4.12-aggregation-correctness` answers once.
++    let answered = match downsample::downsample_zoned(
+         &records,
+         query.series,
+         query.range,
+         Window::new(query.width_millis),
+         query.aggregate,
+-    );
++        Some(query.zone),
++    ) {
++        Ok(answered) => answered,
++        Err(refusal) => return Err(Outcome::refused(refusal.class(), refusal.to_string())),
++    };
+     Ok(answered.buckets().to_vec())
+ }
+ 
+@@ -623,7 +670,7 @@ fn render(buckets: &[Bucket], json: bool) -> Result<String, Outcome> {
+ /// then the store, then the plan or the execution. Every caller mistake is answered before
+ /// anything is opened, so a `2` is the script's problem wherever the deployment happens to be —
+ /// `jobq/3.15-cli-contract`'s rule, applied to a second input form rather than restated.
+-fn sql_query(store: &str, text: &str, json: bool) -> Outcome {
++fn sql_query(store: &str, text: &str, json: bool, zone: &Zone) -> Outcome {
+     let statement = match parse::parse(text) {
+         Ok(statement) => statement,
+         Err(refusal) => return refused_by(&refusal),
+@@ -661,7 +708,7 @@ fn sql_query(store: &str, text: &str, json: bool) -> Outcome {
+             Ok(plan) => render_plan(&plan, json),
+             Err(refusal) => refused_by(&refusal),
+         },
+-        Statement::Query(query) => match exec::execute(&snapshot, &query) {
++        Statement::Query(query) => match exec::execute_in(&snapshot, &query, Some(zone)) {
+             Ok(outcome) => render_answer(&outcome, json),
+             Err(refusal) => refused_by(&refusal),
+         },
+diff --git a/src/engine/query/agg.rs b/src/engine/query/agg.rs
+index 6ae20dd..38a863a 100644
+--- a/src/engine/query/agg.rs
++++ b/src/engine/query/agg.rs
+@@ -127,7 +127,11 @@ impl Sum {
+     /// An accumulator with nothing in it: the sum of no values at all.
+     #[must_use]
+     pub const fn new() -> Self {
+-        todo!()
++        Self {
++            sum: 0.0,
++            compensation: 0.0,
++            count: 0,
++        }
+     }
+ 
+     /// Add one value.
+@@ -139,21 +143,36 @@ impl Sum {
+     /// overflow. `inf - inf` is not a number, and a sum that is perfectly well defined (`1 + inf`)
+     /// must not be turned into one by an accumulator that meant well.
+     pub fn add(&mut self, value: f64) {
+-        todo!("lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
+-               and the count")
++        // The addition itself, which is the one thing that cannot be avoided: `total` is what
++        // `+=` would have left behind, and `lost` is what it threw away.
++        let total = self.sum + value;
++        // The correction is skipped when the addition did not round for a reason an `f64` can
++        // *round*: an infinity, a `NaN`, or an overflow to infinity. `inf - inf` is not a number,
++        // and `1.0 + inf` is a perfectly well defined sum that the compensation must not turn
++        // into one.
++        if total.is_finite() {
++            let lost = if self.sum.abs() >= value.abs() {
++                (self.sum - total) + value
++            } else {
++                (value - total) + self.sum
++            };
++            self.compensation += lost;
++        }
++        self.sum = total;
++        self.count += 1;
+     }
+ 
+     /// The sum, as well as this accumulator can state it: the total plus what the additions left
+     /// behind.
+     #[must_use]
+     pub const fn value(&self) -> f64 {
+-        todo!()
++        self.sum + self.compensation
+     }
+ 
+     /// How many values have been added, exactly.
+     #[must_use]
+     pub const fn count(&self) -> u64 {
+-        todo!()
++        self.count
+     }
+ 
+     /// What the values average to, or `None` when there are none.
+@@ -163,8 +182,10 @@ impl Sum {
+     /// follows it and shows up as a missing point on a dashboard an hour later.
+     #[must_use]
+     pub fn mean(&self) -> Option<f64> {
+-        todo!("lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
+-               over the count")
++        if self.count == 0 {
++            return None;
++        }
++        Some(self.value() / self.count as f64)
+     }
+ }
+ 
+@@ -176,13 +197,21 @@ impl Sum {
+ /// necessary is a claim *about this function* and cannot be made without running it.
+ #[must_use]
+ pub fn naive(values: &[f64]) -> f64 {
+-    todo!("lakelet/4.12-aggregation-correctness: the loop everybody writes is the whole function")
++    let mut total = 0.0;
++    for value in values {
++        total += value;
++    }
++    total
+ }
+ 
+ /// The same sum through [`Sum`]: what a query computes values with.
+ #[must_use]
+ pub fn running(values: &[f64]) -> f64 {
+-    todo!("lakelet/4.12-aggregation-correctness: `Sum` is declared above; the loop is yours")
++    let mut sum = Sum::new();
++    for value in values {
++        sum.add(*value);
++    }
++    sum.value()
+ }
+ 
+ /// The error [`running`] is allowed on `values`: [`BOUND`] times the sum of their magnitudes.
+@@ -194,8 +223,11 @@ pub fn running(values: &[f64]) -> f64 {
+ /// and [`agrees`] then agrees with nothing — the honest answer for a workload no bound applies to.
+ #[must_use]
+ pub fn error_bound(values: &[f64]) -> f64 {
+-    todo!("lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
+-           state them, times BOUND")
++    let mut magnitudes = Sum::new();
++    for value in values {
++        magnitudes.add(value.abs());
++    }
++    BOUND * magnitudes.value()
+ }
+ 
+ /// `true` when `left` and `right` are the same number, inside the absolute `bound`.
+@@ -207,8 +239,7 @@ pub fn error_bound(values: &[f64]) -> f64 {
+ /// has to refuse to certify it.
+ #[must_use]
+ pub fn agrees(left: f64, right: f64, bound: f64) -> bool {
+-    todo!("lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
+-           answers false by itself")
++    (left - right).abs() <= bound
+ }
+ 
+ /// One step of a zone's table: from `from_millis` on, the zone is `offset_millis` from UTC.
+@@ -265,6 +296,9 @@ pub struct Zone {
+ /// The milliseconds in an hour, for reading the table below.
+ const HOUR_MILLIS: i64 = 3_600_000;
+ 
++/// [`DAY_MILLIS`] in the signed unit the wall-clock arithmetic of a local day is done in.
++const DAY: i64 = DAY_MILLIS as i64;
++
+ /// The transitions `Europe/Berlin` had in the two years this build knows about.
+ ///
+ /// Five entries, in the order they happened, and each one is a real instant a reader can check the
+@@ -344,8 +378,18 @@ impl Zone {
+     /// is a byte offset into the *name* the caller wrote, since a zone is not part of a query
+     /// text: byte `0` is the name itself, which is where a name nobody shipped is wrong.
+     pub fn parse(name: &str) -> Result<Zone, Refusal> {
+-        todo!("lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
+-               name that is neither is refused with `Refusal::Syntax`")
++        if let Some(zone) = shipped(name) {
++            return Ok(zone);
++        }
++        match fixed_offset(name) {
++            Ok(offset_millis) => Ok(Zone {
++                name: Cow::Owned(name.to_owned()),
++                from_millis: 0,
++                to_millis: u64::MAX,
++                table: Table::Fixed(offset_millis),
++            }),
++            Err((at, detail)) => Err(Refusal::Syntax { at, detail }),
++        }
+     }
+ 
+     /// What this zone is called: a shipped name, or the offset a caller wrote.
+@@ -362,7 +406,7 @@ impl Zone {
+     /// every instant, and a shipped table covers the span it ships.
+     #[must_use]
+     pub const fn covers(&self) -> (u64, u64) {
+-        todo!()
++        (self.from_millis, self.to_millis)
+     }
+ 
+     /// How far `ts_millis` is from UTC in this zone, or `None` when the table does not cover that
+@@ -380,8 +424,21 @@ impl Zone {
+     /// starts in 2024 covers neither.
+     #[must_use]
+     pub fn offset_at(&self, ts_millis: i64) -> Option<i64> {
+-        todo!("lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
+-               at or before the instant")
++        let at = u64::try_from(ts_millis).unwrap_or(0);
++        if at < self.from_millis || at >= self.to_millis {
++            return None;
++        }
++        match self.table {
++            Table::Fixed(offset_millis) => Some(offset_millis),
++            // The changes ascend and the first one is at or before `from_millis`, so a covered
++            // instant always has one at or before it; `None` here would be a table this build
++            // shipped wrong, and saying so is better than answering with a guess.
++            Table::Shipped(changes) => changes
++                .iter()
++                .rev()
++                .find(|change| change.from_millis <= at)
++                .map(|change| change.offset_millis),
++        }
+     }
+ 
+     /// The half-open span of the *local* day `ts_millis` falls in, as milliseconds since the Unix
+@@ -406,7 +463,147 @@ impl Zone {
+     /// belongs to the first day this store can name rather than to no day at all.
+     #[must_use]
+     pub fn local_day(&self, ts_millis: i64) -> Option<(u64, u64)> {
+-        todo!("lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
+-               midnight, and the offset in force at that midnight")
++        let offset = self.offset_at(ts_millis)?;
++        // The day is a property of the local calendar, so it is found in local time first: the
++        // wall clock at this instant, rounded down to its own midnight.
++        let at = u64::try_from(ts_millis).unwrap_or(0);
++        let local = i64::try_from(at).ok()?.checked_add(offset)?;
++        let midnight = local.div_euclid(DAY).max(0).checked_mul(DAY)?;
++        let start = self.instant_of(midnight, offset)?;
++        // A day is as long as the clock says it is: the midnight after this one is found the same
++        // way, against the offset in force *there*, which is how a spring-forward day comes out
++        // 23 hours long without anybody subtracting an hour.
++        let next = midnight.checked_add(DAY)?;
++        let end = self.instant_of(next, offset)?;
++        Some((u64::try_from(start).ok()?, u64::try_from(end).ok()?))
++    }
++
++    /// The instant whose wall clock in this zone reads `wall_millis`, or `None` when resolving it
++    /// leaves the table.
++    ///
++    /// Resolving a wall-clock time needs the offset in force *at* that wall-clock time, and `seed`
++    /// is the offset in force at the caller's own instant — a different one on the day a zone
++    /// changes. The lookup is the correction, and one pass of it is enough for every table whose
++    /// transitions are not at local midnight: a table that had one would need a rule for a
++    /// wall-clock time that does not exist, which is a question this build does not have to
++    /// answer.
++    fn instant_of(&self, wall_millis: i64, seed: i64) -> Option<i64> {
++        let instant = wall_millis.checked_sub(seed)?;
++        let offset = self.offset_at(instant)?;
++        wall_millis.checked_sub(offset)
++    }
++}
++
++/// The milliseconds in a minute, for reading an offset.
++const MINUTE_MILLIS: i64 = 60_000;
++
++/// The zone a name [`Zone::SHIPPED`] lists, or `None` for a name this build has no table for.
++///
++/// The match and the list are two spellings of one fact, which is why this step's spec asserts them
++/// together: a name added to one and forgotten in the other is a name this build claims to know
++/// and answers UTC for.
++fn shipped(name: &str) -> Option<Zone> {
++    match name {
++        "UTC" => Some(Zone::UTC),
++        "Europe/Berlin" => Some(BERLIN),
++        _ => None,
++    }
++}
++
++/// The number of characters `±HH:MM` has after the sign.
++const SHAPE: usize = 5;
++
++/// Where the colon sits in the `HH:MM` half of an offset.
++const COLON: usize = 2;
++
++/// How many minutes an hour has, for reading the minutes of an offset.
++const MINUTES_PER_HOUR: i64 = 60;
++
++/// The fixed offset `name` spells, or the byte it stops being one at and the sentence to say so.
++///
++/// A fixed offset is `±HH:MM` and nothing else: a sign, two digits, a colon, two digits. One digit
++/// is not a shorter way to write a zone — `+2:00` and `+02:00` would be two spellings of one
++/// offset, and a name is the thing a caller, a log line and a refusal all have to agree on.
++fn fixed_offset(name: &str) -> Result<i64, (usize, String)> {
++    let (sign, digits) = if name.starts_with('+') {
++        (1i64, 1usize)
++    } else if name.starts_with('-') {
++        (-1i64, 1usize)
++    } else {
++        return Err((
++            0,
++            format!(
++                "`{name}` is not a zone this build knows: it ships {} as names, and reads an \
++                 offset as `+HH:MM` or `-HH:MM`",
++                list(&Zone::SHIPPED)
++            ),
++        ));
++    };
++
++    // The shape, character by character, so that a refusal points at the character that is wrong
++    // rather than at the value: `+02:0` and `+2:00` are different mistakes.
++    let bytes = name.as_bytes();
++    let mut fault = None;
++    for index in 0..SHAPE {
++        let byte = bytes.get(index + 1).copied();
++        let wanted = if index == COLON {
++            byte == Some(b':')
++        } else {
++            byte.is_some_and(|byte| byte.is_ascii_digit())
++        };
++        if !wanted {
++            fault = Some(index + 1);
++            break;
++        }
+     }
++    if fault.is_none() && bytes.len() > SHAPE + 1 {
++        fault = Some(SHAPE + 1);
++    }
++    if let Some(at) = fault {
++        return Err((
++            at,
++            format!(
++                "`{name}` is not a fixed offset: write one as `+HH:MM` or `-HH:MM`, two digits in \
++                 each field, as in `+02:00`"
++            ),
++        ));
++    }
++
++    // The shape holds, so every byte here is a digit and this cannot miss.
++    let mut hours = 0i64;
++    let mut minutes = 0i64;
++    for (index, byte) in bytes.iter().enumerate().skip(1) {
++        let digit = i64::from(byte.saturating_sub(b'0'));
++        match index {
++            1 => hours = digit * 10,
++            2 => hours += digit,
++            4 => minutes = digit * 10,
++            5 => minutes += digit,
++            _ => {}
++        }
++    }
++    if hours > MAX_OFFSET_HOURS || minutes >= MINUTES_PER_HOUR {
++        let at = if hours > MAX_OFFSET_HOURS {
++            digits + 1
++        } else {
++            digits + 4
++        };
++        return Err((
++            at,
++            format!(
++                "`{name}` is not an offset this build accepts: one is at most `±14:00` from UTC, \
++                 and the minutes go from `00` to `59`"
++            ),
++        ));
++    }
++    Ok(sign * (hours * HOUR_MILLIS + minutes * MINUTE_MILLIS))
++}
++
++/// The names of `names`, as a sentence a refusal can carry: `` `UTC`, `Europe/Berlin` ``.
++fn list(names: &[&str]) -> String {
++    names
++        .iter()
++        .map(|name| format!("`{name}`"))
++        .collect::<Vec<String>>()
++        .join(", ")
+ }
+diff --git a/src/engine/query/downsample.rs b/src/engine/query/downsample.rs
+index eb7754c..ab18604 100644
+--- a/src/engine/query/downsample.rs
++++ b/src/engine/query/downsample.rs
+@@ -67,10 +67,24 @@
+ //! with the same mean, and the difference otherwise is a property of how the range falls across
+ //! the windows, not of the arithmetic. So every comparison of two computed numbers in this step's
+ //! spec goes through [`agree`], and none of them writes `==` between two `f64`s.
++//!
++//! # A day is a bucket of a calendar, and a calendar is not a grid
++//!
++//! `lakelet/4.12-aggregation-correctness` adds exactly one window to this module without moving
++//! any of the others: a window of **one day**, when the caller named a time zone, counts in the
++//! **local days** of that zone ([`downsample_zoned`]) — so the day a zone springs forward is 23
++//! hours of samples and the day it falls back is 25, and a bucket's `start` is the instant the
++//! local day began. Every shorter window is untouched: an hour is an hour in every zone, and a
++//! rule that moved a five-minute bucket would be a second grid beside this one, which
++//! `lakelet/4.9-retention` counts in and `lakelet/4.14-index-pruning` prunes against. The offset
++//! arithmetic is [`agg`]'s and the choice of zone is the caller's: `None` and UTC's local days
++//! are the same answer, because UTC's days *are* the absolute grid.
+ 
+ use std::collections::BTreeMap;
+ use std::collections::btree_map::Entry;
+ 
++use crate::engine::query::agg::{self, Sum, Zone};
++use crate::engine::query::lex::Refusal;
+ use crate::engine::retention::partition::Partition;
+ use crate::protocol::batch::Record;
+ 
+@@ -401,6 +415,90 @@ pub fn downsample(
+     range: Range,
+     window: Window,
+     aggregate: Aggregate,
++) -> Answer {
++    summarize(
++        records,
++        series,
++        range,
++        |ts_millis| Some(window.partition(ts_millis).start()),
++        aggregate,
++    )
++}
++
++/// Answer one question on the grid a zone names, or refuse a range this build cannot state.
++///
++/// `zone` is `None` for the grid this module is made of — the absolute one — and `Some(zone)` for
++/// a caller who said which calendar they are counting in. The rule is one window wide and narrow
++/// on purpose:
++///
++/// * a window of **exactly one day** counts in the **local days** of `zone`, so a spring-forward
++///   day is 23 hours of samples and a fall-back day is 25, and a bucket's `start` is the instant
++///   the local day began;
++/// * **every other window is unchanged**, and so is a first and last bucket that fall inside the
++///   range's edges: the zone moves the boundaries of a day, not the rule that a bucket counts what
++///   is in the range.
++///
++/// `Zone::UTC` is not a special case in this function and does not need to be: UTC's local days
++/// are the absolute grid, so a caller who names it gets the answer they would have got by saying
++/// nothing — which is what makes `--zone UTC` the default rather than a mode.
++///
++/// # Errors
++///
++/// [`Refusal::Syntax`] when the range reaches outside the span `zone`'s table covers. The class is
++/// the caller's (`2`), and this is a `Refusal` rather than a fourth error type because the class
++/// *is* the answer to "what does a script do with this", and the sentence names the span, because
++/// "this build does not know that instant" is not something a caller can act on.
++pub fn downsample_zoned(
++    records: &[Record],
++    series: Option<&str>,
++    range: Range,
++    window: Window,
++    aggregate: Aggregate,
++    zone: Option<&Zone>,
++) -> Result<Answer, Refusal> {
++    let absolute = |ts_millis: i64| Some(window.partition(ts_millis).start());
++    let Some(zone) = zone else {
++        return Ok(summarize(records, series, range, absolute, aggregate));
++    };
++    if window.width_millis() != agg::DAY_MILLIS {
++        return Ok(summarize(records, series, range, absolute, aggregate));
++    }
++    let (from, to) = zone.covers();
++    if range.from() < from || range.to() > to {
++        return Err(Refusal::Syntax {
++            at: 0,
++            detail: format!(
++                "the range [{}, {}) is not one this build can answer in {}: the table it was \
++                 built with covers [{from}, {to})",
++                range.from(),
++                range.to(),
++                zone.name()
++            ),
++        });
++    }
++    Ok(summarize(
++        records,
++        series,
++        range,
++        |ts_millis| zone.local_day(ts_millis).map(|(start, _)| start),
++        aggregate,
++    ))
++}
++
++/// The pass both grids run: one walk over the records, one key per record, one bucket per key.
++///
++/// `key` is the whole of what a grid is — it answers which bucket a timestamp falls in — and it is
++/// a function rather than a `Window` because a local day is not a width: the day a zone springs
++/// forward is not the length of the day after it. `None` means the grid has no bucket for that
++/// instant at all, which the absolute grid never says (a clock before 1970 falls in the first
++/// window rather than in none) and a zone's table says outside the span it ships, where
++/// `downsample_zoned` has already refused the range rather than dropping records quietly.
++fn summarize(
++    records: &[Record],
++    series: Option<&str>,
++    range: Range,
++    key: impl Fn(i64) -> Option<u64>,
++    aggregate: Aggregate,
+ ) -> Answer {
+     let mut scanned = 0u64;
+     let mut series_matched = 0u64;
+@@ -417,8 +515,13 @@ pub fn downsample(
+         if !range.contains(at) {
+             continue;
+         }
++        // The bucket comes from the timestamp and never from where the record sat in the read:
++        // records arrive oldest first, a merge rewrites them and a clock that stepped backwards
++        // is in the data, so the position of a record says nothing about the time it is about.
++        let Some(start) = key(record.ts_millis) else {
++            continue;
++        };
+         in_range += 1;
+-        let start = window.partition(record.ts_millis).start();
+         match windows.entry(start) {
+             Entry::Occupied(mut window) => window.get_mut().add(record.value),
+             Entry::Vacant(window) => {
+@@ -427,8 +530,8 @@ pub fn downsample(
+         }
+     }
+ 
+-    // A map keyed by the window's start is the answer's order for free, and the windows it never
+-    // saw are the ones it does not have: a window with no records in the range is *absent* rather
++    // A map keyed by the bucket's start is the answer's order for free, and the buckets it never
++    // saw are the ones it does not have: a bucket with no records in the range is *absent* rather
+     // than present with a zero in it.
+     let buckets = windows
+         .into_iter()
+@@ -444,16 +547,15 @@ pub fn downsample(
+ 
+ /// One window's records while the pass is inside it: what a summary needs, and nothing else.
+ ///
+-/// The four numbers are kept rather than the records, because a window of a day's samples is not
+-/// something to hold in memory in order to answer a mean — and because the four are exactly what
+-/// the five aggregates need, which is why `min` and `max` are accumulated as the pass goes rather
+-/// than computed at the end.
++/// The records are not kept, because a window of a day's samples is not something to hold in
++/// memory in order to answer a mean — and three numbers are exactly what the five aggregates need,
++/// which is why `min` and `max` are accumulated as the pass goes rather than computed at the end.
++/// The sum and the count travel together in one [`Sum`] because they are one fact about the
++/// window: what went in, and how much of it there was.
+ #[derive(Debug, Clone, Copy)]
+ struct Tally {
+-    /// How many records have gone in.
+-    count: u64,
+-    /// What they add up to.
+-    sum: f64,
++    /// What the records add up to, and how many of them there were.
++    sum: Sum,
+     /// The smallest value seen.
+     min: f64,
+     /// The largest value seen.
+@@ -463,9 +565,10 @@ struct Tally {
+ impl Tally {
+     /// The tally of one record.
+     fn of(value: f64) -> Self {
++        let mut sum = Sum::new();
++        sum.add(value);
+         Self {
+-            count: 1,
+-            sum: value,
++            sum,
+             min: value,
+             max: value,
+         }
+@@ -473,8 +576,7 @@ impl Tally {
+ 
+     /// Add one more record's value.
+     fn add(&mut self, value: f64) {
+-        self.count += 1;
+-        self.sum += value;
++        self.sum.add(value);
+         // `f64::min`/`f64::max` rather than a comparison: a value that is not a number is not an
+         // extreme, and a comparison would let one of them poison the whole window's answer.
+         self.min = self.min.min(value);
+@@ -483,16 +585,23 @@ impl Tally {
+ 
+     /// This window as the answer reports it.
+     fn bucket(&self, start: u64, aggregate: Aggregate) -> Bucket {
++        // The count is the accumulator's own `u64` and not a float: a count is exact, and the
++        // division in a mean is the only rounding an aggregate of this step is allowed.
++        let count = self.sum.count();
++        let total = self.sum.value();
+         let value = match aggregate {
+-            Aggregate::Count => self.count as f64,
+-            Aggregate::Sum => self.sum,
+-            Aggregate::Mean => self.sum / self.count as f64,
++            Aggregate::Count => count as f64,
++            Aggregate::Sum => total,
++            // A tally exists only for a window that held a record, so the `None` a mean of
++            // nothing would be cannot happen here. A value that is not a number is the honest
++            // answer if it ever does; a panic inside a query is not.
++            Aggregate::Mean => self.sum.mean().unwrap_or(f64::NAN),
+             Aggregate::Min => self.min,
+             Aggregate::Max => self.max,
+         };
+         Bucket {
+             start_millis: start,
+-            count: self.count,
++            count,
+             value,
+         }
+     }
+diff --git a/src/engine/query/exec.rs b/src/engine/query/exec.rs
+index a2a889b..95a3858 100644
+--- a/src/engine/query/exec.rs
++++ b/src/engine/query/exec.rs
+@@ -40,6 +40,7 @@
+ use std::collections::BTreeSet;
+ 
+ use crate::engine::compaction::Snapshot;
++use crate::engine::query::agg::Zone;
+ use crate::engine::query::downsample::{self, Bucket};
+ use crate::engine::query::lex::Refusal;
+ use crate::engine::query::parse::Query;
+@@ -142,7 +143,27 @@ impl Outcome {
+     }
+ }
+ 
+-/// Answer `query` against `snapshot`.
++/// Answer `query` against `snapshot` with no zone named.
++///
++/// The grid `lakelet/4.10-downsampling` pinned and `lakelet/4.11-query-engine` shipped, which is
++/// what a caller who says nothing means: see [`execute_in`] for the same question asked in a
++/// calendar.
++///
++/// # Errors
++///
++/// As [`execute_in`].
++pub fn execute(snapshot: &Snapshot, query: &Query) -> Result<Outcome, Refusal> {
++    execute_in(snapshot, query, None)
++}
++
++/// Answer `query` against `snapshot`, on the grid `zone` names.
++///
++/// `zone` is the caller's calendar, and it is `None` for the grid this store has always counted
++/// in. It reaches exactly one decision, and that decision is `downsample_zoned`'s rather than this
++/// module's: a window of exactly one day counts in local days, and every other window is
++/// untouched. The executor is where the flag arrives and not where it means anything, which is
++/// why this module passes it straight through — a second place that knew what a day was would be a
++/// second answer to a question the window pass already answers.
+ ///
+ /// # Errors
+ ///
+@@ -161,7 +182,11 @@ impl Outcome {
+ /// the store has nothing in — where "no data" is the answer for every name at once.
+ /// `lakelet/4.18-cardinality-cost` is where a store starts knowing its own names cheaply enough to
+ /// answer that question instead.
+-pub fn execute(snapshot: &Snapshot, query: &Query) -> Result<Outcome, Refusal> {
++pub fn execute_in(
++    snapshot: &Snapshot,
++    query: &Query,
++    zone: Option<&Zone>,
++) -> Result<Outcome, Refusal> {
+     let plan = Plan::of(snapshot, query)?;
+ 
+     let mut records: Vec<Record> = Vec::new();
+@@ -200,13 +225,14 @@ pub fn execute(snapshot: &Snapshot, query: &Query) -> Result<Outcome, Refusal> {
+             usize::try_from(limit).unwrap_or(usize::MAX)
+         });
+         for name in names.iter().take(cap) {
+-            let answered = downsample::downsample(
++            let answered = downsample::downsample_zoned(
+                 &records,
+                 Some(name),
+                 query.range(),
+                 query.window(),
+                 query.aggregate(),
+-            );
++                zone,
++            )?;
+             answers.push(SeriesAnswer {
+                 series: Some((*name).to_owned()),
+                 buckets: answered.buckets().to_vec(),
+@@ -221,13 +247,14 @@ pub fn execute(snapshot: &Snapshot, query: &Query) -> Result<Outcome, Refusal> {
+             .filter(|record| query.selects(&Series::of(&record.series)))
+             .cloned()
+             .collect();
+-        let answered = downsample::downsample(
++        let answered = downsample::downsample_zoned(
+             &selected,
+             None,
+             query.range(),
+             query.window(),
+             query.aggregate(),
+-        );
++            zone,
++        )?;
+         answers.push(SeriesAnswer {
+             series: None,
+             buckets: answered.buckets().to_vec(),

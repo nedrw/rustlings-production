@@ -23,8 +23,9 @@
 | B3a | `course(lakelet/4.9-retention): old data leaves in whole buckets, and a reader never sees it go` | 4.9 正文（teach，15 用例）+ `retention/{mod,partition}.rs`（scaffold 新建的契约文件）+ manifest v2（每段时间范围 + 持久 floor + `u64::MAX` 哨兵）+ `SegmentInfo::spanning` 与三参 `new` 并存（§1 第 10 条）+ `Snapshot::records` 按本 epoch 的 floor 过滤 + `tests/budget_retention.rs` 与 `budget/4.9-retention.toml`（19 计数，含 `bytes_freed_on_disk` 与 `bytes_rewritten_max 0`）；`slow:mutants@80` 5/6（83%，噪声见 §5） |
 | B3b | `course(lakelet/4.10-downsampling): a window is a bucket of the absolute grid, and an answer answers only the range it was asked` | 4.10 正文（teach，17 用例）+ `query/{mod,downsample}.rs`（窗口/范围/五种聚合/`Bucket`/`Answer`/`TOLERANCE`/`agree`，窗口复用 4.9 的 `Partition`）+ `src/cli/mod.rs` 与 `src/bin/lakeletq.rs`（`lakeletq query` 落地，jobq/3.15 的 CLI 契约 + `MAX_WINDOWS`）+ 装置 `tests/budget_downsample.rs` 与 `budget/4.10-downsampling.toml`（14 计数，含 `gaps`、`invented_windows_max 0`、`mean_gap_max`）；框架修复：`bench-budget` 的 blocked 消息不再硬编码 `tests/budget.rs` |
 | B3c | `course(lakelet/4.11-query-engine): the grammar is a subset, the refusals are typed, and the plan is printed` | 4.11 正文（teach，18 用例）+ `query/{series,lex,parse,plan,exec}.rs`（全函数系列解析、按位置拒绝的扫描器、四类拒绝带类别、`ts BETWEEN` 必填且半开、`OR` 拒绝、计划只从 manifest 裁剪）+ `Snapshot::records_of` + `--sql` 一半的 `cli/mod.rs` + 写成的 `docs/query.md`（`links`）；**顺带修好 4.10 scaffold 缺标记块**（`cli/mod.rs` 末尾补块，4.19/4.23 的前置条件） |
+| B3d | `course(lakelet/4.12-aggregation-correctness): a sum is not +, and a day is not 24 hours` | 4.12 正文（teach，17 用例）+ `query/agg.rs`（Kahan–Neumaier 的 `Sum` + 写成数字的 `BOUND`/`error_bound`、刻意保留的 `naive`、顺序无关性、`Zone` 自带转换表且表外回答 `None`）+ `downsample.rs` 的 `downsample_zoned` + `--zone`（只对 1d 窗口生效，本地日 23/25 小时）+ `exec.rs` 的 `execute_in`；`slow:mutants@80` 5/6（噪声，见 §5）、`?coverage` 177/177（100%） |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.11）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.12）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -117,6 +118,8 @@
   代价是全部变异比值要重测；在那之前，比值低于 100% 要先看它是“本步的真缺口”还是“后来者的代码被抽中”。
   对照：4.7 的 `decode.rs:422 if shift > 63` 确实是 4.7 自己写的行，那是**真缺口**（一个需要第十个字节的
   varint 没被覆盖），与仪器无关。
+  第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
+  在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
 - **`mutants@80` 的样本只有 6 个、比值阈值 80%**：5/6 = 83% 只高出阈值 3 个百分点，
   抽样换一位就会翻盘。这是计划 §6 D-1 定下的形状（“12 步、每步最多 6 个”），没改；
   但如果以后再出现“某个步骤因仪器原因卡在 83%”，值得重新讨论样本数（每再多判一个位点约 +1–2 s）。
