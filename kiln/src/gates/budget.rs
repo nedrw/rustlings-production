@@ -134,6 +134,12 @@ fn compare(
 
     let mut failures: Vec<String> = Vec::new();
     let mut judged: Vec<String> = Vec::new();
+    // A metric the harness prints and the baseline does not name is *not judged* — the baseline is
+    // the list of things this lane compares — and the silence that used to follow it was the
+    // mistake: an author who grew a harness (or replaced it) saw a green line and believed the new
+    // number was being watched. The names travel with the verdict instead of failing it, because the
+    // baseline is course content and a learner can do nothing about the mismatch.
+    let mut unbaselined: Vec<String> = Vec::new();
     // Two rules are in play whenever the table carries an upper bound, and the pass line has to say so:
     // a `_max` metric is judged `≤ bound`, not `±P%`, and a report that calls both of them "within
     // ±P%" tells the learner the wrong thing about the metric that was measured (4.5's `--slow` run
@@ -141,9 +147,9 @@ fn compare(
     let mut bounded = 0usize;
     for measurement in measured {
         let Some(limit) = baseline.get(&measurement.name) else {
-            // A metric the course never measured has nothing to be compared against. Saying so here
-            // would be noise on every step; the baseline is course content, so the fix is not the
-            // learner's either way.
+            // A metric the course never measured has nothing to be compared against, but saying
+            // *which* ones is what keeps a grown harness from looking judged when it is not.
+            unbaselined.push(measurement.name.clone());
             continue;
         };
         judged.push(format!(
@@ -178,21 +184,36 @@ fn compare(
 
     if !failures.is_empty() {
         return GateOutcome::failed(format!(
-            "{} of {} metric(s) moved out of budget: {}",
+            "{} of {} metric(s) moved out of budget{}: {}",
             failures.len(),
             judged.len(),
+            unbaselined_clause(&unbaselined),
             failures.join("; ")
         ));
     }
     GateOutcome::passed(format!(
         "{} metric(s) judged against the course baseline ({} within ±{}%, {} at or below an upper \
-         bound): {}",
+         bound{}): {}",
         judged.len(),
         judged.len() - bounded,
         number(percent),
         bounded,
+        unbaselined_clause(&unbaselined),
         judged.join(", ")
     ))
+}
+
+/// The clause a verdict carries when the harness printed metrics the baseline does not name:
+/// `, 2 the baseline does not name: a, b`, or nothing at all when every metric was judged.
+fn unbaselined_clause(unbaselined: &[String]) -> String {
+    if unbaselined.is_empty() {
+        return String::new();
+    }
+    format!(
+        ", {} the baseline does not name so they were not judged: {}",
+        unbaselined.len(),
+        unbaselined.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -223,6 +244,42 @@ mod tests {
 
     /// The baseline's command, in the shape `jobq/3.22-bench-budget`'s own file writes it.
     const COMMAND: &str = "cargo test -p jobq --test budget -- --nocapture";
+
+    #[test]
+    fn a_metric_the_baseline_does_not_name_is_reported_rather_than_ignored() {
+        // Measured on `lakelet/4.15-budget-regression` (handoff M3 §4): the harness grew a metric
+        // and the gate printed a green line without it, so the new number looked judged when
+        // nothing compared it. It still does not fail — the baseline is course content — but the
+        // verdict says which metrics nobody watched.
+        let outcome = result(
+            "jobq-budget claim_statements=12\njobq-budget scan_cells=340\njobq-budget scale_ratio_max=2.2\n\
+             jobq-budget a_metric_the_baseline_lacks=7\n",
+        );
+        assert_eq!(outcome.outcome, Outcome::Passed);
+        assert!(
+            outcome.detail.contains("3 metric(s) judged"),
+            "only the baselined metrics are judged: {}",
+            outcome.detail
+        );
+        assert!(
+            outcome.detail.contains(
+                "1 the baseline does not name so they were not judged: a_metric_the_baseline_lacks"
+            ),
+            "the verdict names what nobody watched: {}",
+            outcome.detail
+        );
+        // A run that judged what the baseline names says nothing extra: the clause is for a
+        // mismatch, not for every line.
+        let clean = result(
+            "jobq-budget claim_statements=12\njobq-budget scan_cells=340\njobq-budget scale_ratio_max=2.2\n",
+        );
+        assert_eq!(clean.outcome, Outcome::Passed);
+        assert!(
+            !clean.detail.contains("does not name"),
+            "nothing to say when every metric was judged: {}",
+            clean.detail
+        );
+    }
 
     #[test]
     fn a_message_names_the_harness_the_command_actually_runs() {
@@ -337,7 +394,13 @@ mod tests {
             COMMAND,
         );
         assert_eq!(outcome.outcome, Outcome::Passed);
-        assert!(!outcome.detail.contains("peak_rss"), "{}", outcome.detail);
+        // Not judged, but no longer silent: the verdict names it as a metric the baseline does not
+        // name (handoff M3 §4 — a grown harness looked judged when nothing compared it).
+        assert!(
+            outcome.detail.contains("not judged: peak_rss"),
+            "{}",
+            outcome.detail
+        );
     }
 
     #[test]
