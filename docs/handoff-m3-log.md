@@ -759,3 +759,67 @@ $ cargo test -q -p kiln → 319 + 21 + 1 passed · cargo clippy --workspace --al
 **下一步**：4.10 `query/downsampling@apply`（下采样 + `lakeletq` CLI，窗口复用 4.9 的 `Partition`，
 CLI 沿用 jobq/3.15 的退出码与两条流契约），随后 4.11–4.14。plan §9 的演练台账不变：腿 2（4.17 泄漏）、
 腿 5（4.14 去掉裁剪）、腿 6 后半（4.22 弄坏 Dockerfile）还没做。
+
+## 段 15：B3b — 4.10 `query/downsampling@apply`（窗口在绝对网格上，答案只答它被问到的范围）
+
+**做了什么**：`spec/4.10/downsampling.rs`（1524 行、17 用例）、`scaffold/4.10-downsampling.patch`
+（993 行、**0 删除**：新建 `src/engine/query/{mod,downsample}.rs`、`src/cli/mod.rs`、
+`src/bin/lakeletq.rs`、`tests/budget_downsample.rs`，并在 `src/engine/mod.rs` 与 `src/lib.rs`
+的标记块里各插一行）、`solutions/4.10-downsampling.patch`（770 行）、
+`budget/4.10-downsampling.toml`（83 行、14 计数）、`course/docs/steps/en/lakelet/4.10-downsampling.md`
+（277 行、12 条 TRAP）。`track.toml` 未动（门数 10，与作业书一致）。
+
+**这一步钉下来的五条不变量**：① **窗口是绝对时间轴的桶**（`floor(ts / width) * width`，半开，
+复用 4.9 的 `Partition`；锚在第一条记录上的窗口会让同一小时的两个查询给出两条阶梯，也让保留期的
+桶与查询的桶没法比）；② **桶只数范围内的记录**（首尾桶是部分的，`Bucket::count` 是那个诚实的数字，
+绝不用范围外的记录去填）；③ **空窗口缺席而不是零**（“没有上报”与“上报了零”是两个事实）；
+④ **`series` 是精确名字，`None` 才是全部**；⑤ **容差是代码里的数字**（`TOLERANCE`/`agree`，本步
+所有两数比较都走它，没有一条用例用 `==` 比 `f64`）。CLI 是 jobq/3.15 的契约换一组子命令：
+`stdout` 是答案、失败时 `stdout` 为空、0/2/3/4/1 一类一码、`--json` 只是一种格式、不读 stdin；
+另加 `MAX_WINDOWS`（范围与窗口之比是调用者的笔误，在开库之前按 2 拒掉）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+$ kiln selftest --track lakelet                              # 10/10 step(s) hold the contract（4.1…4.10）
+$ kiln selftest lakelet/4.10-downsampling --track lakelet     # scaffold ✓（1 passed; 16 failed）/ solution ✓ / gates ✓ 10/10 must green
+$ kiln check lakelet/4.10-downsampling --slow                 # 10/10 must gate(s) passed
+  ✓ slow:bench-budget@10 14 metric(s) judged（9 within ±10%，5 at or below an upper bound）:
+    segments_sealed 4, records 400, series 4, windows 28, buckets_emitted 23, gaps 5,
+    invented_windows_max 0, records_scanned 400, series_matched 100, records_in_range 88,
+    records_per_bucket_max 4, records_unaccounted_max 0, mean_gap_max 0.030632411067195164, refused_max 0
+  ✓ slow:mutants@80 6/6 mutant(s) killed (100%, needs ≥80%)（walk 10s）
+$ kiln verify lakelet          → 10/10 judged step(s) pass · 0 failed · 0 not prepared · 14 without content（rc=3 = 还有 14 步没内容）
+$ kiln lint-caps → no issues · kiln links → 100 page(s) · 496 link(s) ✓ · kiln i18n status → 83/97 · kiln probe --check → 41/41
+$ cargo test -q -p kiln → 320 + 21 + 1 passed · clippy 干净 · cargo fmt --all --check 干净
+```
+
+**两条补丁在我的**（从仓库重建的）**`through 4.9` 树上重放后与受测树逐字节一致**，`budget/4.10-downsampling.toml`
+的 14 个基线与门打印的 14 个数一一相等。
+
+**演练（我按作者的配方重取了一遍）**：把范围过滤去掉（桶于是数整个窗口，也就是“部分的桶去借邻居”）
+
+```
+1. RED    $ cargo test -q --test spec_downsampling → FAILED. 12 passed; 5 failed
+          同一棵树上的预算车道也红：buckets_emitted 25（应 23）、invented_windows_max 2
+2. CAUGHT a_range_that_starts_and_ends_mid_window_leaves_partial_buckets
+          panicked at tests/spec_downsampling.rs:514:5: the first bucket starts on the grid and not at
+          the range's edge: a window is a bucket of the time axis
+3. GREEN  回滚 → ok. 17 passed; 0 failed
+```
+
+**这一段钉下来的三件事**：
+
+1. **基线树必须在派活前重建并核对**：作业书里写的 `/private/tmp/l4b3/base` 其实是 `through 4.8`
+   （我在 4.9 落地前建的），子 agent 自己找到了 `through 4.9` 的那一份并使用。我随后**从仓库重建**
+   （skeleton + 逐步 scaffold/solution）并 `diff` 核对，确认它的树只多出 `kiln` 生成的
+   `Cargo.lock` 与 `tests/spec_*.rs`。以后每步：**先重建基线树、`diff` 核对，再把路径写进作业书**。
+2. **一条门消息里的硬编码路径**（框架修复）：`bench-budget` 的 blocked 消息把 harness 写成常量
+   ``tests/budget.rs``——那是 jobq/3.22 的文件，T4 的四个车道各有自己的名字（本步是
+   `tests/budget_downsample.rs`），于是“被阻塞”的门把读者指向一个项目里不存在的路径。现在路径从
+   基线的 `command` 里取 `--test <target>`（`kiln/src/gates/budget.rs`，+81/−10，带单测）。
+3. **一个 worker 死了、另一个 pick up 了它的草稿**：上一段的环境故障留下了 `/private/tmp/l4b3/{gen,check2}`
+   里的半成品；新的 worker 明确声明了这一点，逐行核对草稿、修掉四处不一致（规格头写“Sixteen cases”、
+   装置注释点名一个不存在的计数、正文说“17 条全红”（实际 16 条红，那条结构用例读源码所以过）、一处
+   换行）、重生成补丁并重跑全部验收。**继承的散文必须自己再验一遍**：这一步的页内数字我逐条对了预算
+   车道的实测值，用例名与规格逐条对齐（17/17）。
