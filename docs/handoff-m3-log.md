@@ -678,3 +678,84 @@ sim  → ✗ slow:sim@3 3 of 3 seed(s) did not pass：三个种子都在
 0 not prepared · 16 without content`，JSON 的 totals 是 `{"blocked":0,"clean":false,"failed":0,"not_authored":16,
 "passed":8,"steps":24}`——收尾那条验收（`passed: 24, not_authored: 0, clean: true`）的形状已经验过，剩下的只是把
 `not_authored` 推到 0。
+
+## 段 14：B3a — 4.9 `store/retention@apply`（旧数据按桶离开，读者看不到它离开）
+
+**做了什么**：`course/tracks/lakelet/spec/4.9/retention.rs`（1391 行、15 用例）、
+`scaffold/4.9-retention.patch`（879 行，`+850/−0`：新建 `src/engine/retention/{mod,partition}.rs` 与
+`tests/budget_retention.rs`，只在 `src/engine/mod.rs` 的标记块里插 `pub mod retention;`）、
+`solutions/4.9-retention.patch`（918 行，`+507/−52`）、`budget/4.9-retention.toml`（87 行、19 计数）、
+`course/docs/steps/en/lakelet/4.9-retention.md`（233 行，teach 模板）。`track.toml` 没动（门数 10，与作业书一致）。
+
+**这一步钉下来的五条不变量**：① **段的年龄来自索引**——manifest 进入 version 2：头部多一个 `floor`、
+每条目五个 `u64`（`index, bytes, records, first_millis, last_millis`），版本字节把旧索引变成**拒绝**
+而不是误读；② **cutoff 是桶边界不是时刻**（`Policy::cutoff` 用 `Partition` 向下取整，`keep = 0` 表示
+全留）；③ **整段过期**（`last < cutoff` 才过期，半开：`last == cutoff` 留），**跨界段保留且绝不重写**，
+它低于 cutoff 的记录改为“不再是被答案”，计数 `records_counted 1260` 与 `records_answered 1200` 的差
+就是它；④ **floor 持久且单向**（`max(policy.cutoff(now), floor)`，落进 manifest，重开仍在；一次不删
+任何东西的 pass **什么都不写**：epoch、字节全同）；⑤ **退休给最后一个读者**（复用 4.8 的 `Set`），
+所以“哪些段删不掉”是测试说的，不是报告说的。
+
+**一处契约形状是复审逼出来的**：最初把 `SegmentInfo::new` 从三参扩到五参，那会让 `kiln run
+lakelet/4.8-compaction` 同步出的规格在 4.8 自己的树上编译失败（顺序学习的学员 + `xtask ci` 的逐步守约）。
+改成 `new` 保留三参（“手工造的、只谈大小的值，没人写下它的年龄”，`range: None`）、新增
+`spanning(...)`（`seal`/`merge`/`decode` 都走它），范围是 `Option`，未写下的年龄在 manifest 里写成
+`u64::MAX` 两次（一个记录不可能有的毫秒），规则对它**保留且不算跨界**。4.8 的规格与哈希回到原值
+（`4a644e44…`），4.9 的哈希重钉（`1e474441…`）。规则已写进 `handoff-m3.md` §1 第 10 条。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+$ kiln selftest --track lakelet                                    # 9/9 step(s) hold the contract（4.1…4.9）
+$ kiln selftest lakelet/4.9-retention --track lakelet              # scaffold ✓ E0599 `spanning` / solution ✓ / gates ✓ 10/10 must green
+$ kiln check lakelet/4.9-retention --slow                          # real 21.8s
+  ✓ slow:bench-budget@10 19 metric(s) judged（13 within ±10%，6 at or below an upper bound）:
+    segments_before 24, records_before 2160, bytes_before 9384, segments_expired 10, records_expired 900,
+    bytes_reclaimed 3904, straddling 1, segments_after 14, bytes_after 5480, bytes_freed_on_disk 3904,
+    bytes_rewritten_max 0, records_counted 1260, records_answered 1200, records_below_cutoff_max 0,
+    floor_hours 11, idle_expired_max 0, segments_unaccounted_max 0, bytes_unaccounted_max 0, refused_max 0
+  ✓ slow:mutants@80 5/6 mutant(s) killed (83%, needs ≥80%)（walk 12s）
+  10/10 must gate(s) passed
+$ kiln verify lakelet                                              # real 10.4s → 9/9 judged step(s) pass · 0 failed · 0 not prepared · 15 without content
+$ kiln lint-caps → no issues · kiln links → 99 page(s) · 491 link(s) ✓ · kiln i18n status → 0 error(s) · kiln probe --check → 41/41
+$ cargo test -q -p kiln → 319 + 21 + 1 passed · cargo clippy --workspace --all-targets → 干净 · cargo fmt --all --check → 干净
+```
+
+两条补丁在**纯净的** `through 4.8` 树上重放后与受测树逐字节一致（`diff -r` 只剩 `kiln` 同步出来的
+`tests/spec_*.rs`），`budget/4.9-retention.toml` 的 19 个基线与门打印的 19 个数一一相等。
+
+**演练（我按作者的配方重取了一遍）**：把读路径的过滤从 `>= floor` 改成 `>= 0`（即“不按 floor 限制
+答案”）——
+
+```
+1. RED   $ cargo test -q --test spec_retention   → test result: FAILED. 9 passed; 6 failed
+2. CAUGHT $ cargo test -q --test spec_retention what_the_index_stopped_naming
+   panicked at tests/spec_retention.rs:748:5: the records a read returns are the records at or after the
+   cutoff, once each, in the store's order — and nothing older, whoever can still find it on the disk
+3. GREEN 回滚 → test result: ok. 15 passed; 0 failed
+```
+
+红的是六条：`what_the_index_stopped_naming…`、`a_straddling_segment_is_kept_and_not_rewritten`、
+`a_reader_that_took_its_snapshot_before_the_pass_keeps_its_view`、`the_floor_survives_the_open`、
+`the_floor_never_moves_backwards`、`a_reopened_store_adds_segments_without_reusing_an_ordinal`。
+
+**这一段钉下来的四件事**：
+
+1. **早期规格只能通过“早期树上已经存在的东西”接纳后来的契约**（已写进 `handoff-m3.md` §1 第 10 条）。
+   判据是每一步的规格必须在自己那棵树上通过：改早期规格的文本，等于同时把红线挪过去。
+2. **`slow:mutants@80` 会抽到改不出行为的位点，这是仪器的噪声，不为此改门**（§1 第 11 条、§5）：
+   4.9 的 6 个判定位点里有一个是 `Vec::with_capacity(HEADER + len * ENTRY + …)` 的 `+` → `-`，
+   手工打进去后 15/15 用例与 19/19 计数全绿。曾实现“容量参数不是位点”的规则并**回滚**：它会重排
+   每一步的抽样（jobq 3.20–3.27 + lakelet 十二步），而且前提不严格（容量更大可能溢出 panic）。
+   顺手修掉一条**早已在 main 上**的 fmt 脏点（`kiln/src/gates/budget.rs:215`，B2b 带来的）。
+3. **抽样换个位点就会露出真缺口**：回滚前的抽样把 4.7 从 6/6 变成 5/6，新位点是
+   `src/engine/segment/decode.rs:422` 的 `if shift > 63` → `>=`——这是 4.7 规格**没覆盖的边界**
+   （一个需要第十个字节的 varint），不是仪器的噪声。记进 §5，收尾时可补一条用例。
+4. **Delta 会跳过未跟踪目录里的文件**：`course/tracks/lakelet/spec/4.9/` 是新目录，第一次合并时
+   `spec.9` 文件没到我的工作树（`spec/manifest.toml` 却到了），Delta 当时报的是
+   `<skipped-untracked-directory path="course/tracks/lakelet/spec/4.9"/>`。形状与第 9 条同一族：
+   **新建目录里的文件要么进 git 的索引、要么由本步的提交带走**，别把它当“文件已经写好了”。
+
+**下一步**：4.10 `query/downsampling@apply`（下采样 + `lakeletq` CLI，窗口复用 4.9 的 `Partition`，
+CLI 沿用 jobq/3.15 的退出码与两条流契约），随后 4.11–4.14。plan §9 的演练台账不变：腿 2（4.17 泄漏）、
+腿 5（4.14 去掉裁剪）、腿 6 后半（4.22 弄坏 Dockerfile）还没做。

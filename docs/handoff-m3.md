@@ -20,8 +20,9 @@
 | B2b | `course(lakelet/4.6-ingest-backpressure): overload is a decision, and every one of them is counted`（`3aa7272`） | 4.6 正文（deepen）+ 13 用例规格 + `service/backpressure.rs`（有界队列 + 四策略 + `Stats`/`Tally`）+ 骨架 `config.rs` 两个标记块与 `queue.{capacity,policy}` 四层配置 + `tests/sim_backpressure.rs` + `sim/4.6-ingest-backpressure.toml`；`slow:sim@3` 第二次真跑，plan §9 演练第 3 条在此完成（`HashMap` 顺序注入 → 重放半部红） |
 | B2c | `course(lakelet/4.7-columnar-segments): a segment is columns, and the page writes the layout down`（`0813393`） | 4.7 正文（teach）+ 14 用例规格（含 123 字节金向量 + 全部截断/翻转扫描）+ `segment/{mod,encode,decode,compress}.rs` + `docs/format.md` + `budget/4.7-columnar-segments.toml`（10 计数）+ 装置 `tests/budget_segments.rs`；`unsafe-budget@0` 首次真跑（scaffold 落 `unsafe_code = "deny"`），`mutants@80` 6/6 |
 | B2d | `course(lakelet/4.8-compaction): a merge is a value, and a reader never sees half of one`（`4a946e0`） | 4.8 正文（teach）+ 14 用例规格 + `compaction/{mod,plan,snapshot}.rs`（合并策略作为值、五种 stage、退休给最后一个读者）+ 装置 `tests/{sim,budget}_compaction.rs` + `budget/4.8-compaction.toml`（13 计数）+ `sim/4.8-compaction.toml`；`kiln verify lakelet` 首次真跑（`8/8 judged · 0 failed · 16 without content`） |
+| B3a | `course(lakelet/4.9-retention): old data leaves in whole buckets, and a reader never sees it go` | 4.9 正文（teach，15 用例）+ `retention/{mod,partition}.rs`（scaffold 新建的契约文件）+ manifest v2（每段时间范围 + 持久 floor + `u64::MAX` 哨兵）+ `SegmentInfo::spanning` 与三参 `new` 并存（§1 第 10 条）+ `Snapshot::records` 按本 epoch 的 floor 过滤 + `tests/budget_retention.rs` 与 `budget/4.9-retention.toml`（19 计数，含 `bytes_freed_on_disk` 与 `bytes_rewritten_max 0`）；`slow:mutants@80` 5/6（83%，噪声见 §5） |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.8）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.9）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -33,7 +34,9 @@
    `rsync -a --exclude .git --exclude .delta --exclude app --exclude target --exclude .kiln ./ /private/tmp/<name>/`，
    然后在副本里 `kiln run <前置步>` → `kiln solution <前置步>` → `kiln run <本步>` → `kiln solution <本步>` →
    `kiln check <本步> --slow`（都带私有 `XDG_CACHE_HOME`）。**`kiln selftest` 是例外**：它在
-   `/var/folders/...` 建砂箱，在工作树里跑安全（但它只跑 must 门，不带 `--slow`）。
+   `/var/folders/...` 建砂箱，在工作树里跑安全。**但别以为它只跑快门**：`cmd/selftest.rs` 调用的是
+   `session.gates(step, true)`，也就是 `slow:mutants@80`、`slow:bench-budget@10` 都会跑
+   （4.9 实测它打印的就是 `gates ✓ 10/10 must green`，含两条慢门）。
 2. **每批收尾都跑 `cargo test -p kiln`，即使那一批没碰 `kiln/**`。** 里面有几条断言读的是**课程树**
    （`caps::lint::tests::the_repository_course_is_clean` 的 `authored_steps`、
    `info::tests::the_repository_course_loads` 的 `tracks().len()`），一次 track 元数据落地就要同步它们——
@@ -63,4 +66,37 @@
    两次都是凭邻近步骤的清单估的。
 9. **作者工作一律在 `/private/tmp`，不在仓库里留未跟踪的暂存目录**。4.8 实测：在工作树里建一个未跟踪的作者
    目录之后，工作树的终端停止物化（“the checkout kept changing”），只能把它删掉、把作者工作挪到 `/private/tmp`。
-   （与规则 1 同一族：工作树只放会被提交的东西。）
+   （与规则 1 同一族：工作树只放会被提交的东西。）一个**空**目录同样算——`git status` 看不见它，VFS 看得见。
+
+10. **早期规格只能通过“早期树上已经存在的东西”接纳后来的契约。** 4.9 要给 `SegmentInfo` 加时间范围时，
+    最自然的写法是把 `SegmentInfo::new` 从三个参数扩成五个——那是**课程级回归**：
+    `kiln run lakelet/4.8-compaction` 会把**当前**规格同步进学员树，于是顺序学习的学员在 4.8 拿到的规格
+    编译不过，`xtask ci` 的“每一步都守约”也永远红。判据是**每一步的规格必须在自己那棵树上通过**
+    （`kiln selftest <该步>`），所以后来的契约要么是加一个**新**构造函数/新方法（4.9 的做法：
+    `SegmentInfo::new` 保留三参、新增 `spanning`），要么是早期树本来就有的形状。改早期规格文本等于同时
+    承认那条红线——能避免就别改。
+
+11. **`slow:mutants@80` 会抽到不可能被杀的位点，这是仪器的噪声，别为它改门。** 4.9 实测：六个判定位点里
+    有一个是 `src/engine/compaction/mod.rs` 里 `Vec::with_capacity(HEADER + len * ENTRY + …)` 的 `+` →
+    `-`；把它手工打进去，15 条规格用例与 19 个预算计数全绿——这不是规格的缺口，是那个算术改不出行为。
+    曾实现过一条“容量参数不是位点”的规则并**回滚**了，理由写进 §5：它会重排**每一步**的抽样
+    （jobq 3.20–3.27 与 lakelet 的十二步都在内），而它自己的前提也不严格成立（容量参数更大可能在溢出时 panic）。
+    结论：83% ≥ 80% 是过门，噪声接受。
+
+## 5. 施工中记录、收尾时并入 §5 的缺口
+
+- **变异门会抽到改不出行为的位点（D1，实测，决定不改门）**：`src/engine/compaction/mod.rs:261`
+  `Vec::with_capacity(HEADER + self.segments.len() * ENTRY + checksum::LEN)` 的 `+` → `-` 被抽中过；
+  手工应用后发现 15/15 规格用例与 19/19 预算计数全绿，于是一个判定位点无人能杀，4.9 的比值为 5/6 = 83%。
+  候选修法是“`with_capacity`/`reserve`/`reserve_exact` 的参数不是位点”，已实现并**回滚**：
+  ①它会重排每一步的抽样（jobq 3.20–3.27 与 lakelet 十二步的已记录数字全部作废，需重新测量）；
+  ②前提不严格——容量参数变大仍可能在溢出时 panic，所以位点不是“绝不可见”的。
+  留着的东西：`kiln/src/gates/budget.rs:215` 在 main 上一直是 fmt 脏的（B2b 的预算报告修复带来），
+  已用 `cargo fmt --all` 修好（只重排了一条断言）。
+- **4.7 的规格有一处未被覆盖的边界（抽样时发现，未修）**：`src/engine/segment/decode.rs:422` 的
+  `if shift > 63` 改成 `>=` 后，读取器会在 `bits > 1` 检查之前拒绝 `shift == 63` 的那个字节，也就是
+  拒绝一个需要第十个字节的 varint——所以一条“往返一个差值大到需要第十个字节的时间戳”的用例能钉住它。
+  4.7 记录的 `mutants 6/6` 是那次抽样的运气，不等于这条边界被覆盖；收尾时可考虑补一条用例。
+- **`mutants@80` 的样本只有 6 个、比值阈值 80%**：5/6 = 83% 只高出阈值 3 个百分点，
+  抽样换一位就会翻盘。这是计划 §6 D-1 定下的形状（“12 步、每步最多 6 个”），没改；
+  但如果以后再出现“某个步骤因仪器原因卡在 83%”，值得重新讨论样本数（每再多判一个位点约 +1–2 s）。
