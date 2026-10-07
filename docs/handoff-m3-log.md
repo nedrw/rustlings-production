@@ -1262,3 +1262,45 @@ GREEN  回滚（`cmp` 对齐原文）→ ✓ slow:soak@4000 4000 cycle(s) in 142
    规则 11 的仪器噪声。最终 5/6 = 83%（也正是这两条新用例把规格从 12–16 带到 17 条）。
 3. **门对装置输出形状是硬的**：一行一个 `name=value`（第 16 条）。另外记下 `kiln check --slow` 在
    4.17 上要跑 ~3 分钟（soak 146 s + mutants 21 s + 快门），这是 T4 目前最慢的一步。
+
+## 段 23：B4d — 4.18 `obs/cardinality-cost@apply` + 变异门的三次修正与全量重测
+
+**4.18 做了什么**：`spec/4.18/cardinality.rs`（1220 行、16 用例）、`scaffold/4.18-cardinality.patch`
+（552 行、**0 删除**：`engine/cardinality/{cap,mod}.rs` 的契约桩 + `docs/cardinality.md` 的桩 + 一行标记块插入）、
+`solutions/4.18-cardinality.patch`（1340 行、碰 11 个文件）、`soak/4.18-cardinality-cost.toml`（40 行，
+带 4.17 的 command 与本树的界）、正文 153 行。`track.toml` 未动（10 must）。
+五条不变量：**cap 是数据**（`Cap { limit }`，`Admission::{Admitted, Rejected}`）；**账本是派生状态**
+（从写路径历史重建、用侧车索引修剪，重启后能“跟踪”本进程从未见过的系列）；**守恒式**
+`offered = admitted + rejected`；**拒绝在 4.6 已经数拒绝的地方可见**（连接的 `Tally`——单向协议无法回话，
+正文写明）；**`lakeletq inspect series` 给留下的系列定价**（页面里的算术都是本店实测）。
+`slow:soak@4000` 复跑：五个活计数器与上一步逐位相同（`store_bytes` 差 2 字节，在 4.17 的允许内），
+所以**没有动任何界**；作者还实测并报告了一件与作业书预期相反的事：账本泄漏**不会**推动那五个计数器
+（它们数文件/任务/记录，不数账本），抓到它的是边界与守恒用例。
+
+**变异门的三次修正**（框架，`2d1c585` + `0c0300d` + 本次）：
+1. **范围**：位点从“补丁碰过的文件的所有行”改成“补丁**写下的行**”（`sources::production_lines`）。
+   修前四次实测：4.10 的 `MAX_WINDOWS` 被 4.12 判、4.11 的 `render_plan` 被 4.10 判、4.14 被迫碰
+   `cli/mod.rs` 后抽到 4.10 的行、**4.12 在尾巴树上掉到 66%**（那是 M3 验收 `verify --slow` 无法通过的原因）。
+2. **锚定**：行号不跟着树走——`verify --slow` 第一次跑出新红：4.9 与 4.17 在 `compaction/mod.rs` 上
+   变异了**后来步骤移动过的行**。改成按**文本**匹配（`Written { line, text }`）。
+3. **样本**：`MUTANT_CAP` 6 → 12、`ATTEMPT_CAP` 2× → 3×（收窄后每票更重；4.17 抽到 8 个里 3 个
+   不可见位点读到 50%）。**4.14 与 4.17 因此补了三条真缺口的用例**（合并必须声明合并后的范围、
+   短于自身算术的索引必须在算术溢出前被拒、被撕开的日志必须能打开并忘掉尾巴）——都是各自页面早就
+   声称、只有规格沉默的事。
+
+**原始结论行**（我在自己的构建与**全新**副本 `l4b3-check8` 上重取）：
+
+```
+$ kiln verify lakelet --slow        # real 12m01s
+  18/18 judged step(s) pass · 0 failed · 0 not prepared · 6 without content   （exit 3 = 还有 6 步没内容）
+  其中慢门各自跑过：4.2 fuzz@3、4.4/4.6/4.8/4.13 sim@3、4.9/4.10/4.14/4.15/4.17/4.18 的 bench/soak、
+  12 个 mutants 步、4.11/4.12 的 ?coverage
+$ kiln selftest --track lakelet     # real 16m46s → 18/18 step(s) hold the contract
+$ jobq 3.20…3.27 八个变异步各自 selftest → 1/1 hold the contract（八条 exit=0）
+$ cargo test -q -p kiln → 322 + 21 + 1 · clippy 干净 · fmt 干净
+```
+
+**这一步钉下来的三件事**：① **4.18 落地**（B4 四步完成：4.15–4.18；还差 4.19、4.20）；② **变异门修完并全量重测**
+（t lakelet 18/18 + jobq 八步；`verify --slow` 第一次在尾巴树上全绿，M3 验收的形状达成）；③ **一个新的
+经验**：门的“位点”必须按内容锚定，按行号锚定等于把后来者的代码算在前面的步骤头上——这条与 §5 的
+“抽样范围”是同一个教训的两半。

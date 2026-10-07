@@ -28,8 +28,24 @@ use crate::project::{self, Scaffold};
 pub struct FileLines {
     /// Path relative to the project.
     pub path: String,
-    /// New-file line numbers, ascending: the lines the patch writes.
-    pub lines: Vec<usize>,
+    /// What this step wrote into the file: every line the patch adds, with the new-file line number
+    /// it had *when the patch was written*.
+    ///
+    /// The number is for a reader — the walk finds the sites by their **text**, because a line
+    /// number does not travel: a later step edits the same file, every line below the edit moves,
+    /// and the number a patch recorded then points at somebody else's code. Measured on the tail
+    /// tree: `lakelet/4.9-retention`'s walk mutated two lines of `compaction/mod.rs` that
+    /// `lakelet/4.14`–`4.18` had moved, and failed its own suite for code it did not write.
+    pub lines: Vec<Written>,
+}
+
+/// One line a step's patch wrote: where it was, and what it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    /// New-file line number when the patch was written (1-based).
+    pub line: usize,
+    /// The line itself, without its trailing newline.
+    pub text: String,
 }
 
 /// The lines a step's own work occupies: for every `src/**/*.rs` file its reference-solution patch
@@ -59,7 +75,7 @@ fn written_lines(patch: &Patch) -> Vec<FileLines> {
         if !is_production_source(&file.path) {
             continue;
         }
-        let mut lines: Vec<usize> = Vec::new();
+        let mut lines: Vec<Written> = Vec::new();
         // Where this hunk starts on the new side: its own old start, moved by what the hunks before
         // it added or removed. A created file has no old side at all and starts at line 1.
         let mut offset: isize = 0;
@@ -75,7 +91,10 @@ fn written_lines(patch: &Patch) -> Vec<FileLines> {
                 match line.kind {
                     Kind::Add => {
                         if at > 0 {
-                            lines.push(at as usize);
+                            lines.push(Written {
+                                line: at as usize,
+                                text: line.text.clone(),
+                            });
                         }
                         at += 1;
                         added += 1;
@@ -95,14 +114,14 @@ fn written_lines(patch: &Patch) -> Vec<FileLines> {
         };
         // A patch may list one file twice (a scaffold section and a solution section); the lines
         // are one set, in the order they were written.
-        for line in lines {
-            if !known.lines.contains(&line) {
-                known.lines.push(line);
+        for site in lines {
+            if !known.lines.contains(&site) {
+                known.lines.push(site);
             }
         }
     }
     for file in &mut files {
-        file.lines.sort_unstable();
+        file.lines.sort_unstable_by_key(|site| site.line);
     }
     files
 }

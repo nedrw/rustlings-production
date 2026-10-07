@@ -482,10 +482,15 @@ fn candidates(project: &Path, module: &[sources::FileLines]) -> Result<Vec<Mutan
         let mut start = 0usize;
         for (index, chunk) in text.split_inclusive('\n').enumerate() {
             let line = chunk.strip_suffix('\n').unwrap_or(chunk);
-            // Only the lines this step's patch writes are its work: a line an earlier or a later
-            // step wrote is not something this step's suite can be asked to notice
-            // ([`sources::production_lines`]).
-            if file.lines.binary_search(&(index + 1)).is_err() {
+            // Only the lines this step's patch writes are its work, and they are found by their
+            // text rather than by their number: the number a patch recorded is a number in the
+            // tree the patch was written against, and a later step's edits move every line below
+            // them ([`sources::production_lines`]).
+            if !file
+                .lines
+                .iter()
+                .any(|site| site.text.trim_end() == line.trim_end())
+            {
                 start += chunk.len();
                 continue;
             }
@@ -885,7 +890,14 @@ mod tests {
         scratch.write("src/lib.rs", text);
         let module = [sources::FileLines {
             path: "src/lib.rs".to_owned(),
-            lines: (1..=200).collect(),
+            lines: text
+                .lines()
+                .enumerate()
+                .map(|(at, text)| sources::Written {
+                    line: at + 1,
+                    text: text.to_owned(),
+                })
+                .collect(),
         }];
         let found = candidates(scratch.path(), &module).expect("the fixture is readable");
 
@@ -910,18 +922,36 @@ mod tests {
             "src/lib.rs",
             "pub fn f(a: u32) -> u32 {\n    let b = a + 1;\n    if b > 2 { b } else { 0 }\n}\n",
         );
-        let all = |lines: Vec<usize>| {
+        let written = |lines: &[&str]| {
             [sources::FileLines {
                 path: "src/lib.rs".to_owned(),
-                lines,
+                lines: lines
+                    .iter()
+                    .enumerate()
+                    .map(|(at, text)| sources::Written {
+                        line: at + 1,
+                        text: (*text).to_owned(),
+                    })
+                    .collect(),
             }]
         };
-        let every_line = candidates(scratch.path(), &all((1..=4).collect())).expect("readable");
+        let every_line = candidates(
+            scratch.path(),
+            &written(&[
+                "pub fn f(a: u32) -> u32 {",
+                "    let b = a + 1;",
+                "    if b > 2 { b } else { 0 }",
+                "}",
+            ]),
+        )
+        .expect("readable");
         assert!(
             every_line.iter().any(|mutant| mutant.line == 2),
             "the line the fixture holds is a site when the patch wrote it: {every_line:?}"
         );
-        let only_the_third = candidates(scratch.path(), &all(vec![3])).expect("readable");
+        let only_the_third =
+            candidates(scratch.path(), &written(&["    if b > 2 { b } else { 0 }"]))
+                .expect("readable");
         assert!(
             only_the_third
                 .iter()
@@ -935,7 +965,10 @@ mod tests {
         let scratch = crate::test_support::TempDir::new("mutants-missing");
         let module = [sources::FileLines {
             path: "src/gone.rs".to_owned(),
-            lines: vec![1, 2, 3],
+            lines: vec![sources::Written {
+                line: 1,
+                text: "pub fn gone() {}".to_owned(),
+            }],
         }];
         let found = candidates(scratch.path(), &module).expect("a missing file is not an error");
         assert!(found.is_empty(), "{found:?}");
@@ -1118,9 +1151,9 @@ mod tests {
 
     #[test]
     fn an_attempt_that_does_not_build_costs_an_attempt_and_not_a_slot() {
-        // The gate samples twice its cap, and stops once it has judged enough mutants: a site that
-        // does not compile must not be able to leave a step measured on two mutants, and the
-        // healthy project must still pay six runs rather than twelve.
+        // The gate samples three times its cap, and stops once it has judged enough mutants: a
+        // site that does not compile must not be able to leave a step measured on two mutants, and
+        // the healthy project still pays one run per judged mutant rather than one per attempt.
         let candidates: Vec<Mutant> = (0..40)
             .map(|index| Mutant {
                 path: "src/lib.rs".to_owned(),
@@ -1133,7 +1166,7 @@ mod tests {
             })
             .collect();
         let attempts = sample(&candidates, ATTEMPT_CAP);
-        assert_eq!(attempts.len(), MUTANT_CAP * 2);
+        assert_eq!(attempts.len(), MUTANT_CAP * 3);
         assert!(
             attempts.len() <= candidates.len(),
             "a sample never invents sites"
