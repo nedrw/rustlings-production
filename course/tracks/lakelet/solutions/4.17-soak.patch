@@ -1,0 +1,906 @@
+diff --git a/docs/soak.md b/docs/soak.md
+index 5259952..fbb4905 100644
+--- a/docs/soak.md
++++ b/docs/soak.md
+@@ -1,35 +1,146 @@
+ # A soak is a count of cycles and a bound on what is alive
+ 
+-<!-- TODO: one paragraph, in this project's voice, on what a soak is *here* and why it is not
+-minutes: the same cycle thousands of times against one store, and the question `what is still
+-there?`. Say why a wall-clock criterion would fail a correct step on a loaded machine and pass a
+-leaking one on a quiet night, and point at the counters this project already keeps for work —
+-[the phase profile](perf.md) — as the thing a soak does not replace. -->
++Every performance number in this project before this page is a **flow**: bytes written per payload
++byte, work per phase, blocks a plan did not read. Each one answers "how much did that cost", and
++none of them can answer the question a process that has been up for nine days raises — *what is
++still there?* A store can be fast and honest about every count it keeps and still hand a client one
++file descriptor per connection, and the first symptom of that is a machine that stops at the
++descriptor limit on day nine rather than a number anybody watches.
+ 
+-[TODO](TODO)
++So a soak asks the other question, the same way `bench-budget` asks its own (see
++[the write-amplification record](write-amplification.md) for the shape and
++[the phase profile](perf.md) for the counters a regression is found in): run the *same cycle*
++thousands of times against **one store**, and read what is alive at the end of it. The harness is
++`tests/soak.rs`, the course's file; the counters it prints come from
++[`src/engine/soak.rs`](../src/engine/soak.rs) and, for the tasks, from
++[`src/service/soak.rs`](../src/service/soak.rs).
+ 
+-## The cycle, and the five counters
++## The cycle, and the counters
+ 
+-<!-- TODO: what one cycle is — ingest a batch through the protocol path, let the flush close it,
+-let retention forget what is older than the window, ask one question about the span it just wrote —
+-and why retention has to be part of it. Then a row per counter: what it counts, and what its growth
+-would mean. `tests/soak.rs` prints them and `src/engine/soak.rs` answers them. -->
++One cycle is what a deployment does over and over: ingest a batch through the protocol path, let the
++flush close it into a segment, let retention forget what is older than the window, and ask one
++question about the span the cycle just wrote. Retention is not decoration — a store that keeps
++everything grows for ever, and the counters would say so, which is a different claim than a leak.
++
++Five counters are read after every cycle, and each one is a count of *state*. What its growth would
++mean is the whole of what the number is for:
++
++| counter | what it counts | what its growth would mean |
++| --- | --- | --- |
++| `open_tasks` | tasks the service has spawned and not reaped | a handle nobody let go of — one per connection, or one per maintenance tick, for the life of the process |
++| `open_handles` | files the store holds open right now | a descriptor held past the call that opened it: the machine stops at the limit long before the disk is full |
++| `store_files` | files the store itself names: the manifest, and the segment and the index of every ordinal the manifest lists | a store that never compacts and never expires, or a merge that leaves its inputs' names behind |
++| `store_bytes` | what those files cost together | the same claim in bytes: segments that are never merged stop being cheap to keep |
++| `records` | what the store holds, from the manifest alone | nothing at all — this is the counter that has to move, because a store that is doing no work has a steady state for the wrong reason |
++
++`records` is the control. The other four have to stay flat *while* it does real work, and a soak in
++which nothing moves at all is not evidence of anything.
++
++Two of the five are not the store's. `open_tasks` belongs to the service that spawned the connection
++and writer tasks — the ingest loop spawns them, and the maintenance ticks the harness runs are
++spawned through the same ledger — and it is *handed in* to the report as a number, because the
++engine runs in a test, in a repair tool and in a load generator and none of those has a task
++scheduler. `open_handles` is asked of the store's directory rather than of each half of it: the log
++and the segments of one store are one store, so they are one count, and two stores never share one.
++
++Two things are deliberately **not** counters here. The write path's log at the store's root is not:
++it is the buffer of records no flush has closed, this build never truncates it, and a run that
++counted it would be measuring the run's own length rather than the store's shape. And the files an
++*expired* ordinal's index leaves on the disk are not: nothing names that ordinal any more, so
++nothing can consult it, and [the layout](format.md) and `lakelet/4.14-index-pruning` say why it
++stays. A count of the disk would report that garbage as a leak once per expiry and teach a reader to
++ignore the counter.
+ 
+ ## The steady state, and why the clock is not the judgement
+ 
+-<!-- TODO: the rule the harness asserts — the same counters at the halfway mark and at the end —
+-and the one counter that is allowed an allowance, with the reason. Then the cycles/hours
+-distinction: the counted run CI does, and the long form (`LAKELET_SOAK_MINUTES=30`), which is the
+-same question with a bigger sample. -->
++Every cycle writes a segment and retention forgets one, so a store that is working has the **same**
++counters at the halfway mark and at the end. That is the rule the harness asserts, and it fails with
++the sentence that names the counter which moved:
++
++```text
++the soak does not reach a steady state: `store_files` was 13 at the halfway mark and is 2013 at the
++end, which is 2000 more than the 0 this step allows it. A counter that moves between the halfway
++mark and the end is something the run opened and did not close
++```
++
++`store_bytes` is the one counter allowed an allowance, and it is a measured one: two segments hold
++the same records at two different times of day and the varints carrying those timestamps are not
++always the same width, so a segment may come out a few bytes longer than its predecessor. The
++harness allows a kilobyte — twenty times what a counted run has been seen to move and a fifth of one
++segment — and a leak moves this counter by a *segment*, not by a byte.
++
++Which is why the workload is the same records every cycle, moved on to the next window: identical
++work is what makes `store_bytes` a stock a run can compare with itself instead of a number with a
++guess attached.
++
++**And a soak is not minutes.** The command in CI runs a floor of 4000 cycles and bounds what is
++alive at the end; a machine that is twice as slow takes twice as long to print the same numbers. A
++wall-clock criterion would fail a correct step on a loaded machine and pass a leaking one that ran
++during a quiet night, which is why every `must` gate in this course is judged by counts. The clock
++is still *printed* — a reader wants to know what 4000 cycles cost — on a line the gate does not read.
+ 
+ ## Running it
+ 
+-<!-- TODO: the two commands, and the shape of the transcript: the five counters every tenth cycle,
+-then the same five with `cycles=` and `refused=`. Say what each environment variable decides. -->
++The counted run is the project's own harness, and it is what the course's `soak` file drives:
++
++```sh
++cargo test -p lakelet --test soak -- --nocapture
++```
++
++Every tenth cycle prints the five counters — **one metric per line**, which is the shape every
++counter harness in this track prints (`tests/budget.rs`, `tests/attribution.rs`) — and the run's own
++totals come last, in the same shape:
++
++```text
++lakelet-soak open_tasks=2
++lakelet-soak open_handles=0
++lakelet-soak store_files=13
++lakelet-soak store_bytes=2741
++lakelet-soak records=384
++…
++lakelet-soak cycles=4000
++lakelet-soak refused=0
++```
++
++`LAKELET_SOAK_CYCLES` decides how many cycles the counted run takes; `refused` counts the cycles the
++store would not take, and a run that has to refuse is a run whose numbers mean something else.
++
++A real soak is the **same command with a longer workload**, and it prints the same shape:
++
++```sh
++LAKELET_SOAK_MINUTES=30 cargo test -p lakelet --test soak -- --nocapture
++```
++
++Thirty minutes of the same cycle is a bigger sample of one question and not a different question:
++the counters are read the same way, the steady-state rule is the same rule, and how many cycles a
++timed run gets is the machine's business. The harness says so out loud — its halfway mark is then
++half of the *clock*, because a run stopped by time has no cycle halfway mark to compare.
+ 
+ ## The last time this ran
+ 
+-<!-- TODO: the numbers from a run you did — the counters at the halfway mark and at the end, the
+-wall clock, and which number moved and by how much. If nothing moved, say that and give the
+-numbers; if something did, say what you did about it. A page quoting an intention rather than a run
+-is the thing this step exists to prevent. -->
++Four thousand cycles, on the machine this page was written on, and nothing moved:
++
++```text
++lakelet-soak open_tasks=2      lakelet-soak open_tasks=2
++lakelet-soak open_handles=0    lakelet-soak open_handles=0
++lakelet-soak store_files=13    lakelet-soak store_files=13
++lakelet-soak store_bytes=2739  lakelet-soak store_bytes=2743
++lakelet-soak records=384       lakelet-soak records=384
++   cycle 2000                    cycle 4000
++
++soak: 4000 cycle(s) in 148s, 0 refused, 4000 frame(s) in the log
++```
++
++Thirteen files, 384 records, nothing open, two tasks — and the store did real work the whole time:
++4000 batches through the protocol path, 4000 segments closed and 4000 expired, 4000 questions
++answered. The one number that moved is `store_bytes`: 2739 to 2743, four bytes out of 2739, over a
++run whose whole steady range was 2734 to 2747. That is the timestamp varints and not the store, and
++it is what the allowance is sized against.
++
++The *first* run of this page did move a number, and it is worth saying which one and what was done
++about it: `store_files` grew by one per expired segment and the harness said so by name. The store
++was fine. The **counter** was wrong — it counted every `.lks` and `.lki` lying under the store
++directory rather than the files the manifest names, so the garbage an expiry leaves on purpose
++looked exactly like a leak. Naming what the store *names* is what makes the number flat, and it is
++the whole reason this page separates the store from the disk a paragraph above: a counter that
++counts the wrong thing turns a soak into an argument with the wrong file.
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+index 2ec66ff..b279bc5 100644
+--- a/src/engine/compaction/mod.rs
++++ b/src/engine/compaction/mod.rs
+@@ -130,6 +130,7 @@ use std::sync::Arc;
+ use crate::engine::index::{self, Lookup, SegmentIndex};
+ use crate::engine::retention::{self, ExpireReport};
+ use crate::engine::segment;
++use crate::engine::soak::Open;
+ use crate::engine::wal::checksum;
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+@@ -915,7 +916,9 @@ impl Segments {
+     /// half-written index.
+     fn write_manifest(&self, manifest: Manifest) -> Result<(), Error> {
+         let pending = self.directory.join(PENDING);
+-        std::fs::write(&pending, manifest.encode()?).map_err(store)?;
++        Open::at(&self.directory)
++            .write(&pending, &manifest.encode()?)
++            .map_err(store)?;
+         flush(&pending)?;
+         std::fs::rename(&pending, self.directory.join(MANIFEST)).map_err(store)?;
+         flush(&self.directory)
+@@ -1125,7 +1128,10 @@ fn refused(detail: String) -> Error {
+ /// Wait for the device on `path`: `sync_all`, not `fsync`, for the reason
+ /// `docs/adr/0001-write-path.md` measured.
+ fn flush(path: &Path) -> Result<(), Error> {
+-    std::fs::File::open(path)
++    // Charged like every other file this store opens (`lakelet/4.17-soak`): waiting for the device
++    // is a handle held for the length of the wait, and a store that held it for longer would say so.
++    Open::of_file(path)
++        .read_handle(path)
+         .map_err(store)?
+         .sync_all()
+         .map_err(store)
+@@ -1170,7 +1176,7 @@ fn length_of(path: &Path) -> Result<u64, Error> {
+ /// answer: this returns an error, because guessing would be a store with a hole in it.
+ fn read_manifest(directory: &Path) -> Result<Manifest, Error> {
+     let path = directory.join(MANIFEST);
+-    match std::fs::read(&path) {
++    match Open::at(directory).read(&path) {
+         Ok(bytes) => Manifest::decode(&bytes, &path),
+         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::empty()),
+         Err(error) => Err(store(error)),
+diff --git a/src/engine/index/mod.rs b/src/engine/index/mod.rs
+index efad0fa..cf12579 100644
+--- a/src/engine/index/mod.rs
++++ b/src/engine/index/mod.rs
+@@ -83,6 +83,7 @@ pub mod zone;
+ use std::path::{Path, PathBuf};
+ 
+ use crate::engine::query::series::Series;
++use crate::engine::soak::Open;
+ use crate::engine::wal::checksum;
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+@@ -348,7 +349,9 @@ pub fn load(directory: &Path, ordinal: u64) -> Lookup {
+     // Absent and unreadable are one answer to a reader: nothing was consulted. A permission this
+     // process does not have and a file that is not there are both "this store has no index for that
+     // segment", and both cost the same read.
+-    let Ok(bytes) = std::fs::read(file_of(directory, ordinal)) else {
++    // `lakelet/4.17-soak`: derived state read whole, and charged like everything else this store
++    // opens while it is open.
++    let Ok(bytes) = Open::at(directory).read(&file_of(directory, ordinal)) else {
+         return Lookup::Missing;
+     };
+     match SegmentIndex::decode(&bytes) {
+@@ -376,7 +379,9 @@ pub fn write(directory: &Path, ordinal: u64, index: &SegmentIndex) -> Result<(),
+     // then on.
+     flush(&sidecar)?;
+     let path = file_of(directory, ordinal);
+-    std::fs::write(&path, index.encode()).map_err(store)?;
++    Open::at(directory)
++        .write(&path, &index.encode())
++        .map_err(store)?;
+     flush(&path)
+ }
+ 
+@@ -455,7 +460,10 @@ fn store(source: std::io::Error) -> Error {
+ 
+ /// Wait for the device to have what was written to `path`.
+ fn flush(path: &Path) -> Result<(), Error> {
+-    std::fs::File::open(path)
++    // Charged (`lakelet/4.17-soak`), like the wait for the device in `compaction`: the handle is
++    // the store's for as long as the sync takes.
++    Open::of_file(path)
++        .read_handle(path)
+         .map_err(store)?
+         .sync_all()
+         .map_err(store)
+diff --git a/src/engine/segment/mod.rs b/src/engine/segment/mod.rs
+index 48007d3..9941467 100644
+--- a/src/engine/segment/mod.rs
++++ b/src/engine/segment/mod.rs
+@@ -52,6 +52,7 @@ pub mod encode;
+ 
+ use std::path::Path;
+ 
++use crate::engine::soak::Open;
+ use crate::engine::wal::checksum;
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+@@ -209,9 +210,14 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Record>, Error> {
+ /// [`Error::Store`] when the file cannot be written, and everything [`encode`] refuses.
+ pub fn write(path: &Path, records: &[Record]) -> Result<(), Error> {
+     let bytes = encode(records)?;
+-    std::fs::write(path, bytes).map_err(|source| Error::Store {
+-        source: Box::new(source),
+-    })
++    // `lakelet/4.17-soak`: bytes this store writes are bytes it had a file open for, and the
++    // counter is what says whether it let go of it. A caller that names a path somebody else owns
++    // charges a counter nobody reads, which costs nothing and lies about nothing.
++    Open::of_file(path)
++        .write(path, &bytes)
++        .map_err(|source| Error::Store {
++            source: Box::new(source),
++        })
+ }
+ 
+ /// Read the records out of the segment at `path`.
+@@ -222,9 +228,11 @@ pub fn write(path: &Path, records: &[Record]) -> Result<(), Error> {
+ /// named as a segment is a segment somebody expected to be there — and everything [`decode`]
+ /// refuses.
+ pub fn read(path: &Path) -> Result<Vec<Record>, Error> {
+-    let bytes = std::fs::read(path).map_err(|source| Error::Store {
+-        source: Box::new(source),
+-    })?;
++    let bytes = Open::of_file(path)
++        .read(path)
++        .map_err(|source| Error::Store {
++            source: Box::new(source),
++        })?;
+     decode(&bytes)
+ }
+ 
+diff --git a/src/engine/soak.rs b/src/engine/soak.rs
+index 3d6dd58..23cff89 100644
+--- a/src/engine/soak.rs
++++ b/src/engine/soak.rs
+@@ -6,43 +6,42 @@
+ //! a flow and the thing that goes wrong over ten thousand cycles is a stock: a file handle nobody
+ //! dropped, a task nobody reaped, a store that grew a file per cycle and never gave one back.
+ //!
+-//! So this module is where the store's stocks are counted, and the shape is deliberately small:
++//! So this module is where the store's three stocks are counted, and the shape is deliberately
++//! small:
+ //!
+ //! * [`Open`] counts the files **one store** holds open right now. A store is its directory — the
+ //!   log at its root and the segments beside it are the same store — so the count is asked of the
+-//!   directory and not of each half, and two stores never share one;
++//!   directory and not of each half, and two stores never share one.
+ //! * [`Live`] is the report a soak prints: `open_tasks`, `open_handles`, `store_files`,
+ //!   `store_bytes` and `records`. The first belongs to the service — the tasks it has spawned and
+ //!   not reaped — and the other four are this store's, answered from the directory and the
+ //!   manifest. Which is why that one is *handed in* rather than asked for: the engine runs in a
+ //!   test, in a repair tool and in a load generator, and none of those has a task scheduler.
+ //!
+-//! Nothing in this file may read a clock, and that is the step's whole argument: a soak is judged
+-//! by what is alive at the end, so a machine that is twice as slow takes twice as long to say the
+-//! same thing. A spec case reads this file for exactly that. `docs/soak.md` is the page that says
+-//! what each counter's growth would mean.
+-//!
+-//! # What is yours
+-//!
+-//! The two types and their signatures are the contract this step's harness and spec are written
+-//! against; the bodies are this step's work. The interesting one is [`Open::at`]: a count has to be
+-//! a *store's* count and not the process's, or two deployments in one process would read each
+-//! other's numbers — and it has to be reachable from the five places a file is opened in this
+-//! store, which is why the store asks its **directory** for its counter rather than passing one
+-//! down through every call site. The second half of the work is not in this file at all: every
+-//! open in `src/engine` goes through [`Open`], so that a handle that is held past the call that
+-//! opened it is a number this store reports.
+-
+-use std::fs::File;
+-use std::io;
+-use std::path::Path;
+-use std::sync::Arc;
++//! Nothing in this file reads a clock, and that is the step's whole argument: a soak is judged by
++//! what is alive at the end, so a machine that is twice as slow takes twice as long to say the same
++//! thing, and a machine somebody else is compiling on says the same thing as an idle one
++//! (handoff M2 §1.1). `docs/soak.md` is the page that says what each counter's growth would mean.
++
++use std::collections::HashMap;
++use std::fs::{File, OpenOptions};
++use std::io::{self, Read, Write};
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, OnceLock, Weak};
+ 
+-use crate::engine::compaction::{Manifest, Segments};
++use crate::engine::compaction::{self, Manifest, Segments};
++use crate::engine::index;
+ use crate::engine::spool::Spool;
+ 
+ /// The files one store currently holds open, shared by everything that opens one of them.
++///
++/// The count is a property of the *store* rather than of a module, and a store is identified by the
++/// directory it is rooted at: [`Open::at`] answers one counter per directory for as long as anybody
++/// holds it, so the write path's log handle and the segment set's manifest handle are one number
++/// and two stores are two. That is also what makes the count honest — a file opened by the log and
++/// a file opened by the segments are both "this store has a handle" — and it is why nothing has to
++/// pass a counter down through five call sites to reach the one that opens a file.
+ #[derive(Debug, Default)]
+ pub struct Open {
+     /// How many of its files the store has open right now.
+@@ -52,18 +51,22 @@ pub struct Open {
+ impl Open {
+     /// The counter of the store rooted at `directory`.
+     ///
+-    /// One counter per store directory, for as long as anybody holds it: the log and the segments
+-    /// of one store are one store, and two stores are two. What that costs a process that opens
+-    /// and closes a hundred stores is the implementer's decision, and the obvious one is that a
+-    /// store that has been dropped leaves nothing behind — a counter that leaked entries itself
+-    /// would be a poor instrument for finding a leak.
+-    ///
+-    /// # Panics
+-    ///
+-    /// Your implementation must not panic for any `directory` a caller can name.
++    /// Weak, and pruned as it is looked at: a store that has been dropped leaves no entry behind, so
++    /// a process that opens and closes a hundred stores does not accumulate a hundred counters —
++    /// which is the leak this step is about, and a counter that leaked entries itself would be a
++    /// poor instrument for finding one.
+     #[must_use]
+-    pub fn at(_directory: &Path) -> Arc<Self> {
+-        todo!("the counter of one store directory")
++    pub fn at(directory: &Path) -> Arc<Self> {
++        let mut counters = registry()
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner());
++        counters.retain(|_, counter| counter.strong_count() > 0);
++        if let Some(open) = counters.get(directory).and_then(Weak::upgrade) {
++            return open;
++        }
++        let open = Arc::new(Self::default());
++        counters.insert(directory.to_path_buf(), Arc::downgrade(&open));
++        open
+     }
+ 
+     /// The counter of the store that owns `file`.
+@@ -71,10 +74,22 @@ impl Open {
+     /// The store's own files live either at its root — the log and the manifest — or one directory
+     /// below it (`segments/`, `index/`), so a call that has a *file* and not a store still charges
+     /// the store it belongs to. That is the rule the counter is built on, one sentence long:
+-    /// **every file this store opens is charged to the store that opened it.**
++    /// **every file this store opens is charged to the store that opened it.** A path that is not
++    /// a store's file — a codec handed a temporary by a budget harness — answers a counter nothing
++    /// else uses, which is the honest answer for bytes no store holds.
+     #[must_use]
+-    pub fn of_file(_file: &Path) -> Arc<Self> {
+-        todo!("the counter of the store a file belongs to")
++    pub fn of_file(file: &Path) -> Arc<Self> {
++        let parent = file.parent().unwrap_or(file);
++        let below = matches!(
++            parent.file_name().and_then(|name| name.to_str()),
++            Some(compaction::DIRECTORY | index::DIRECTORY)
++        );
++        let directory = if below {
++            parent.parent().unwrap_or(parent)
++        } else {
++            parent
++        };
++        Self::at(directory)
+     }
+ 
+     /// How many of the store's files are open right now.
+@@ -84,6 +99,9 @@ impl Open {
+     }
+ 
+     /// Take a charged handle for `file`, for a caller that opened it its own way.
++    ///
++    /// The write path opens its log with options of its own (`append`, `write`), and what the
++    /// counter cares about is not how the file was opened but that this store now holds it.
+     #[must_use]
+     pub fn hold(self: &Arc<Self>, file: File) -> Held {
+         Held::new(file, Arc::clone(self))
+@@ -95,8 +113,8 @@ impl Open {
+     ///
+     /// [`io::Error`] when the file cannot be opened — the caller decides what a missing file means,
+     /// and this is the one place that decision is not made for it.
+-    pub fn read_handle(self: &Arc<Self>, _path: &Path) -> io::Result<Held> {
+-        todo!("a counted handle on a file opened for reading")
++    pub fn read_handle(self: &Arc<Self>, path: &Path) -> io::Result<Held> {
++        Ok(Held::new(File::open(path)?, Arc::clone(self)))
+     }
+ 
+     /// Open `path` for appending, creating it, counting the handle until it is dropped.
+@@ -104,17 +122,26 @@ impl Open {
+     /// # Errors
+     ///
+     /// [`io::Error`] when the file cannot be opened.
+-    pub fn append(self: &Arc<Self>, _path: &Path) -> io::Result<Held> {
+-        todo!("a counted handle on a file opened for appending")
++    pub fn append(self: &Arc<Self>, path: &Path) -> io::Result<Held> {
++        Ok(Held::new(
++            OpenOptions::new().create(true).append(true).open(path)?,
++            Arc::clone(self),
++        ))
+     }
+ 
+     /// Read a whole file, counting the handle while it is open.
+     ///
++    /// The store's readers are whole-file reads: the handle is open for the length of the call and
++    /// no longer, which is what a balanced read looks like and what the counter says.
++    ///
+     /// # Errors
+     ///
+     /// [`io::Error`] when the file cannot be opened or read.
+-    pub fn read(self: &Arc<Self>, _path: &Path) -> io::Result<Vec<u8>> {
+-        todo!("a whole-file read that is counted while it is open")
++    pub fn read(self: &Arc<Self>, path: &Path) -> io::Result<Vec<u8>> {
++        let mut held = self.read_handle(path)?;
++        let mut bytes = Vec::new();
++        held.read_to_end(&mut bytes)?;
++        Ok(bytes)
+     }
+ 
+     /// Write a whole file, counting the handle while it is open.
+@@ -122,8 +149,9 @@ impl Open {
+     /// # Errors
+     ///
+     /// [`io::Error`] when the file cannot be created or written.
+-    pub fn write(self: &Arc<Self>, _path: &Path, _bytes: &[u8]) -> io::Result<()> {
+-        todo!("a whole-file write that is counted while it is open")
++    pub fn write(self: &Arc<Self>, path: &Path, bytes: &[u8]) -> io::Result<()> {
++        let mut held = Held::new(File::create(path)?, Arc::clone(self));
++        held.write_all(bytes)
+     }
+ 
+     /// Charge one more open handle to this store.
+@@ -188,7 +216,8 @@ impl Drop for Held {
+ ///
+ /// Counts of *state*: every one of them is something that exists at the moment it is asked, and
+ /// none of them is a duration, a rate or a total (the run's own totals — `cycles` and the refusals —
+-/// belong to the harness that did the cycles, not to the store).
++/// belong to the harness that did the cycles, not to the store). A report is copied, compared and
++/// printed, which is why it is five numbers and not a reader over a live store.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Live {
+     /// Tasks the service has spawned and not reaped.
+@@ -219,22 +248,23 @@ impl Live {
+     /// What is still alive in the store rooted at `directory`, and in the process that owns `tasks`.
+     ///
+     /// This is the one place a caller asks. The store half is answered from the directory and the
+-    /// manifest — how many files the store names, how long they are together, and how many records
+-    /// the manifest names — and the task half is handed in, because the tasks belong to the layer
+-    /// above this one and this module may not reach into it.
+-    ///
+-    /// Who counts as *the store's* files is the decision worth making carefully: `store_files` is
+-    /// the counter the steady state is read from, and it is the number a long run has to see stop
+-    /// moving. The manifest is what a store *names* — read `lakelet/4.14-index-pruning` for what
+-    /// stays on the disk after a segment expires — and the log at the directory's root is the write
+-    /// path's, not this report's.
+-    ///
+-    /// # Panics
+-    ///
+-    /// Your implementation must not panic for a directory it can read.
++    /// manifest — how many files the store put there, how long they are together, and how many
++    /// records the manifest names — and the task half is handed in, because the tasks belong to the
++    /// layer above this one and this module may not reach into it.
+     #[must_use]
+-    pub fn of(_directory: &Path, _manifest: &Manifest, _open_tasks: u64) -> Self {
+-        todo!("the five counters of one store")
++    pub fn of(directory: &Path, manifest: &Manifest, open_tasks: u64) -> Self {
++        let files = files_of(directory, manifest);
++        let store_bytes = files
++            .iter()
++            .filter_map(|path| length_of(path))
++            .fold(0u64, u64::saturating_add);
++        Self {
++            open_tasks,
++            open_handles: Open::at(directory).get(),
++            store_files: files.len() as u64,
++            store_bytes,
++            records: manifest.records(),
++        }
+     }
+ 
+     /// Tasks the service has spawned and not reaped.
+@@ -287,6 +317,10 @@ impl Live {
+ 
+ impl Spool {
+     /// How many of this store's files the write path holds open right now.
++    ///
++    /// The log's own handle, and the files the store opened while a batch was being written: the
++    /// count is the store's (`Open`), so this and [`Segments::open_handles`] answer the same number
++    /// for one store and never share one with another.
+     #[must_use]
+     pub fn open_handles(&self) -> u64 {
+         Open::at(self.directory()).get()
+@@ -300,3 +334,50 @@ impl Segments {
+         Open::at(self.directory()).get()
+     }
+ }
++
++/// The counters of every store this process has a counter for.
++fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Open>>> {
++    static COUNTERS: OnceLock<Mutex<HashMap<PathBuf, Weak<Open>>>> = OnceLock::new();
++    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++/// The files a store's *names*: the manifest, and the segment and the index of every ordinal it
++/// lists, when they are there.
++///
++/// The rule is the manifest and not a directory listing, and the difference is the whole point of
++/// the counter. A store's files are the ones it can still be asked about — `index::load` is only
++/// ever consulted for the ordinals a manifest lists, and `lakelet/4.14-index-pruning` is explicit
++/// that the index of an expired ordinal *stays behind*, as the garbage a capacity number is later
++/// made of — so a count of everything lying in the directory would report that garbage as a leak
++/// and a `.DS_Store` as this store's file. What a soak has to see is the store's *shape*: a store
++/// that never compacts and never expires grows this number without bound, and one that does both
++/// holds it still.
++///
++/// A named file that is not there is not one of them: the count is of files the store has, so the
++/// missing half of a pair is reported by a read that fails rather than by a number that counts a
++/// path. The log at the directory's root is deliberately **not** among them: it is the write path's
++/// buffer of records no flush has closed, this build never truncates it, and a run that counted it
++/// would be measuring the run's own length rather than the store's shape (`docs/soak.md`).
++fn files_of(directory: &Path, manifest: &Manifest) -> Vec<PathBuf> {
++    let mut files: Vec<PathBuf> = Vec::new();
++    let named = directory.join(compaction::MANIFEST);
++    if named.is_file() {
++        files.push(named);
++    }
++    for info in manifest.segments() {
++        for path in [
++            compaction::file_of(directory, info.index),
++            index::file_of(directory, info.index),
++        ] {
++            if path.is_file() {
++                files.push(path);
++            }
++        }
++    }
++    files
++}
++
++/// How long a file is, or nothing when it is not there.
++fn length_of(path: &Path) -> Option<u64> {
++    std::fs::metadata(path).ok().map(|metadata| metadata.len())
++}
+diff --git a/src/engine/spool.rs b/src/engine/spool.rs
+index bb6cc46..23b0424 100644
+--- a/src/engine/spool.rs
++++ b/src/engine/spool.rs
+@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
+ use std::time::Instant;
+ 
+ use crate::engine::flush::Stats;
++use crate::engine::soak::Open;
+ use crate::engine::wal::Policy;
+ use crate::engine::wal::replay::Recovered;
+ use crate::engine::wal::segment::{self, Stop};
+@@ -121,7 +122,10 @@ impl Spool {
+     /// been opened reads back whole, and one that was cut *while open* says so instead of answering
+     /// a prefix nobody asked for. `replay::recover` is the reader that answers the prefix.
+     pub fn records(&self) -> Result<Vec<Vec<u8>>, Error> {
+-        let bytes = match std::fs::read(self.path()) {
++        // `lakelet/4.17-soak`: the read that walks the whole log is a file this store has open
++        // for the length of the call, and it is charged like every other one — so a store whose
++        // readers held on to the handle would say so here rather than on day nine.
++        let bytes = match Open::of_file(&self.path()).read(&self.path()) {
+             Ok(bytes) => bytes,
+             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+             Err(error) => return Err(store(error)),
+diff --git a/src/engine/spool/batch.rs b/src/engine/spool/batch.rs
+index d3fa0f1..74bf266 100644
+--- a/src/engine/spool/batch.rs
++++ b/src/engine/spool/batch.rs
+@@ -27,6 +27,7 @@ use std::io::Write;
+ use std::time::Duration;
+ 
+ use crate::engine::flush::Stats;
++use crate::engine::soak::Open;
+ use crate::engine::wal::Policy;
+ use crate::engine::wal::segment;
+ use crate::error::Error;
+@@ -78,10 +79,12 @@ impl Spool {
+         // for a write path that opened the file once per record, which is the defect this step
+         // exists to catch.
+         let mut calls = 0;
+-        let mut file = std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(self.path())
++        // One open, charged to the store it belongs to (`lakelet/4.17-soak`), and the count is
++        // what `calls` below reports as well: a write path that held the handle instead of opening
++        // it once per batch would be a different step's decision, and the counter is what would
++        // say whether it let go.
++        let mut file = Open::of_file(&self.path())
++            .append(&self.path())
+             .map_err(store)?;
+         calls += 1;
+         file.write_all(&bytes).map_err(store)?;
+diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
+index 0b56c1c..29b2bdc 100644
+--- a/src/engine/spool/durable.rs
++++ b/src/engine/spool/durable.rs
+@@ -17,6 +17,7 @@ use std::path::PathBuf;
+ use std::time::Instant;
+ 
+ use crate::engine::flush::Stats;
++use crate::engine::soak::Open;
+ use crate::engine::wal::Policy;
+ use crate::engine::wal::replay;
+ use crate::error::Error;
+@@ -37,15 +38,14 @@ impl Spool {
+         std::fs::create_dir_all(&directory).map_err(store)?;
+         // Touch the file, so a store that has accepted nothing yet answers an empty list instead of
+         // "no such file": those are different situations, and the reader should not have to guess.
+-        std::fs::OpenOptions::new()
+-            .create(true)
+-            .append(true)
+-            .open(directory.join(FILE))
++        Open::at(&directory)
++            .append(&directory.join(FILE))
+             .map_err(store)?;
+         // A file's data and the directory entry that names it are two different writes, and only the
+         // second one makes the store *exist* after a crash. It costs one flush per store, here, at
+         // open — which is why the write path never has to pay it again.
+-        std::fs::File::open(&directory)
++        Open::at(&directory)
++            .read_handle(&directory)
+             .map_err(store)?
+             .sync_all()
+             .map_err(store)?;
+@@ -124,10 +124,12 @@ impl Spool {
+     /// failed does not move [`Spool::durable_offset`]: the boundary has to name the last flush that
+     /// *succeeded*, or the recovery built on it invents records that were never on the device.
+     pub fn sync(&mut self) -> Result<(), Error> {
+-        let file = std::fs::OpenOptions::new()
+-            .write(true)
+-            .open(self.path())
+-            .map_err(store)?;
++        let file = Open::of_file(&self.path()).hold(
++            std::fs::OpenOptions::new()
++                .write(true)
++                .open(self.path())
++                .map_err(store)?,
++        );
+         // `sync_all` and not `fsync`: the decision record measured both on this machine, and only the
+         // first one waits for the device.
+         file.sync_all().map_err(store)?;
+diff --git a/src/engine/wal/replay.rs b/src/engine/wal/replay.rs
+index 15ff4f3..50950a9 100644
+--- a/src/engine/wal/replay.rs
++++ b/src/engine/wal/replay.rs
+@@ -35,6 +35,7 @@
+ 
+ use std::path::Path;
+ 
++use crate::engine::soak::Open;
+ use crate::engine::spool::FILE;
+ use crate::error::Error;
+ 
+@@ -98,7 +99,9 @@ impl Recovered {
+ /// [`Error::Store`] when the file cannot be read, and [`Error::Protocol`] when what is in it is not
+ /// this log.
+ pub fn recover(directory: &Path) -> Result<Recovered, Error> {
+-    let bytes = match std::fs::read(directory.join(FILE)) {
++    // `lakelet/4.17-soak`: opening a store reads its whole log, and the handle that read holds is
++    // the store's like every other one.
++    let bytes = match Open::of_file(&directory.join(FILE)).read(&directory.join(FILE)) {
+         Ok(bytes) => bytes,
+         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+         Err(error) => {
+@@ -124,10 +127,16 @@ pub fn recover(directory: &Path) -> Result<Recovered, Error> {
+ /// removed cannot be appended to either, because writing behind bytes nobody can read would hide them
+ /// in the middle of the log for good.
+ pub fn truncate(directory: &Path, bytes: u64) -> Result<(), Error> {
+-    std::fs::OpenOptions::new()
+-        .write(true)
+-        .open(directory.join(FILE))
+-        .and_then(|file| file.set_len(bytes))
++    Open::of_file(&directory.join(FILE))
++        .hold(
++            std::fs::OpenOptions::new()
++                .write(true)
++                .open(directory.join(FILE))
++                .map_err(|error| Error::Store {
++                    source: Box::new(error),
++                })?,
++        )
++        .set_len(bytes)
+         .map_err(|error| Error::Store {
+             source: Box::new(error),
+         })
+diff --git a/src/service/backpressure.rs b/src/service/backpressure.rs
+index 6b6599c..ffd75a8 100644
+--- a/src/service/backpressure.rs
++++ b/src/service/backpressure.rs
+@@ -283,6 +283,11 @@ pub struct Queue {
+     /// its own wait on the thing it is about to await would complete its own future — `Notify`
+     /// promises that, for the create-before-check idiom — and spin in a loop that makes no progress.
+     progress: Notify,
++    /// What this ingest path has spawned and reaped: the connections that fill the queue and the
++    /// writer that drains it (`lakelet/4.17-soak`, `crate::service::soak`). Beside the bound
++    /// because the tasks are the queue's work, and reachable through [`Queue::tasks`] because the
++    /// ledger is what a soak reads at the end of a run.
++    pub(crate) tasks: Arc<crate::service::soak::Tasks>,
+ }
+ 
+ /// What the queue holds, under its lock.
+@@ -359,6 +364,7 @@ impl Queue {
+             state: Mutex::new(Queued::default()),
+             arrived: Notify::new(),
+             progress: Notify::new(),
++            tasks: crate::service::soak::Tasks::new(),
+         })
+     }
+ 
+diff --git a/src/service/ingest.rs b/src/service/ingest.rs
+index 8284d2d..5743e7f 100644
+--- a/src/service/ingest.rs
++++ b/src/service/ingest.rs
+@@ -123,7 +123,11 @@ pub async fn serve(
+ 
+     // One writer for the whole daemon. It is the only place the log is written, which is what makes
+     // "the frames the queue holds go out in one batch" a single answer instead of one per connection.
+-    let writer = tokio::spawn(write(Arc::clone(&queue), Arc::clone(&store)));
++    // It is spawned *through* the ledger and its handle is held until this function returns, which
++    // is what `lakelet/4.17-soak` reads at the end of a run: a writer nobody reaped is a task that
++    // is still alive, and the stop path below is where it stops being one.
++    let tasks = queue.tasks();
++    let writer = tasks.spawn(write(Arc::clone(&queue), Arc::clone(&store)));
+ 
+     loop {
+         tokio::select! {
+@@ -146,11 +150,16 @@ pub async fn serve(
+                 tracing::debug!(%peer, "connection accepted");
+                 let queue = Arc::clone(&queue);
+                 let counters = Arc::clone(&counters);
+-                tokio::spawn(async move {
++                // Spawned through the ledger and let go at once: a connection's task is its own, and
++                // what the ledger counts is the service's hold on it. A loop that kept the handle
++                // would grow by one per client for the life of the process — which is the leak
++                // `lakelet/4.17-soak` exists to find, and the reason the spawn is not written here
++                // as a bare `tokio::spawn`.
++                drop(tasks.spawn(async move {
+                     if let Err(error) = connection(socket, queue, &counters).await {
+                         tracing::warn!(%error, "connection ended badly");
+                     }
+-                });
++                }));
+             }
+         }
+     }
+@@ -158,7 +167,7 @@ pub async fn serve(
+     // A frame this daemon counted as accepted is one whose record is on the file, and the writer is
+     // what makes that true: `serve` does not return until the queue is empty and the last batch is
+     // written. A stop that returned here would leave accepted frames in memory and call it a stop.
+-    match writer.await {
++    match writer.join().await {
+         Ok(Ok(())) => Ok(()),
+         Ok(Err(error)) => Err(error),
+         Err(error) => Err(Error::Store {
+diff --git a/src/service/soak.rs b/src/service/soak.rs
+index 3373b5f..a4814fe 100644
+--- a/src/service/soak.rs
++++ b/src/service/soak.rs
+@@ -11,21 +11,12 @@
+ //! drains it are the tasks this deployment's service spawns, and a ledger of its own would be a
+ //! second thing every caller has to thread through the daemon to reach them.
+ //!
+-//! What a task is counted as is decided here, and it is the decision this step is about: **a task
+-//! is open from the moment this ledger spawns it until the handle that owns it is awaited or
+-//! dropped.** Not "until it finishes" — that would make the count a race between a task's last
+-//! instruction and the reader asking, and a soak whose counters depended on that would report two
+-//! numbers for one run. The handle is the service's hold on the task, and a service that keeps a
+-//! handle per cycle is a service that grows by one per cycle, which is exactly the leak a long run
+-//! is for.
+-//!
+-//! # What is yours
+-//!
+-//! [`Tasks::spawn`] is the one place a service task becomes one, and the three pieces that make the
+-//! count hold (`Tasks::release`, `Counted`'s drop, and a `Queue::new` that gives a queue a ledger
+-//! of its own) are this step's work. The second half is in `src/service/ingest.rs`: the daemon's
+-//! loop spawns through this ledger instead of calling `tokio::spawn` itself, so that the tasks the
+-//! service owns are the tasks the service reports.
++//! What a task is counted as is decided here, in one sentence: **a task is open from the moment
++//! this ledger spawns it until the handle that owns it is awaited or dropped.** Not "until it
++//! finishes" — that would make the count a race between a task's last instruction and the reader
++//! asking, and a soak whose counters depended on that would report two numbers for one run. The
++//! handle is the service's hold on the task, and a service that keeps a handle per cycle is a
++//! service that grows by one per cycle, which is exactly the leak a long run is for.
+ 
+ use std::future::Future;
+ use std::sync::Arc;
+@@ -69,13 +60,16 @@ impl Tasks {
+         F: Future + Send + 'static,
+         F::Output: Send + 'static,
+     {
+-        let _ = (work, Arc::clone(self));
+-        todo!("a spawned task and the count it occupies")
++        self.open.fetch_add(1, Ordering::Relaxed);
++        Task {
++            handle: tokio::spawn(work),
++            counted: Counted(Arc::clone(self)),
++        }
+     }
+ 
+     /// Let one go: called by the count that owns a spawned task, once.
+     fn release(&self) {
+-        todo!("one task fewer to answer for")
++        self.open.fetch_sub(1, Ordering::Relaxed);
+     }
+ }
+ 
+@@ -104,7 +98,8 @@ impl<T> Task<T> {
+     /// apart has [`JoinError::is_panic`].
+     pub async fn join(self) -> Result<T, JoinError> {
+         // The count is held until the await returns, and that is the whole meaning of the two
+-        // values: the service owns the task for as long as it is waiting for it.
++        // values: the service owns the task for as long as it is waiting for it, so a reader that
++        // asked in the middle of a join would see the task as one this service is still holding.
+         let counted = self.counted;
+         let joined = self.handle.await;
+         drop(counted);
+@@ -127,8 +122,6 @@ struct Counted(Arc<Tasks>);
+ 
+ impl Drop for Counted {
+     fn drop(&mut self) {
+-        // Dropping the owning handle is a reap, so this is where the count goes (`Tasks::release`
+-        // is the half of it you write).
+         self.0.release();
+     }
+ }
+@@ -141,6 +134,6 @@ impl Queue {
+     /// stores do not (`crate::engine::soak`).
+     #[must_use]
+     pub fn tasks(&self) -> Arc<Tasks> {
+-        todo!("the ledger this queue's tasks are counted in")
++        Arc::clone(&self.tasks)
+     }
+ }

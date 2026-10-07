@@ -1,0 +1,51 @@
+# The long run `lakelet/4.17-soak` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `soak`
+# gate reads *this* copy. The command is the project's own harness (`tests/soak.rs`, which this
+# step's scaffold ships); the gate runs it once and reads the lines it prints.
+#
+# What the harness does: it keeps **one** store — a soak that opened a fresh store per cycle could
+# not see a leak — and runs the same cycle four thousand times against it: one batch of sixty-four
+# records goes through the protocol path to a real daemon in the same process, a tick closes it into
+# a segment, retention forgets what is older than six one-minute windows, and the cycle asks one
+# question about the span it just wrote. Every tenth cycle prints the five live counters, and the
+# last line adds the run's totals.
+#
+# `cycles_min` is a **floor on the workload** and not a target: a soak that stopped after a tenth of
+# the cycles has not seen the growth it exists to find, so the count is part of the judgement.
+#
+# Every metric below is an **upper bound** — "no worse than this" and not "about this" — because
+# they are all *stocks*: how many tasks the service is holding, how many files the store has open,
+# how many files it keeps and what they cost. "About right" is not a meaningful verdict for a
+# number that goes wrong by growing, and "not above this" is. The baselines were measured on the
+# reference solution over four thousand cycles; each bound carries the room a different machine and
+# a different `zstd` release need, and no more.
+#
+# The **wall clock is not judged**, and that is the decision this file exists to make visible
+# (handoff M2 §1.1): a minute is not a property of the code, so a wall-clock criterion would fail a
+# correct step on a machine somebody else is compiling on and pass a leaking one during a quiet
+# night. The gate prints what the run cost as evidence; the verdict is the counters.
+command = "cargo test -p lakelet --test soak -- --nocapture"
+cycles_min = 4000
+
+[metric]
+# Tasks the service has spawned and not reaped. Two are alive for the whole run — the daemon's
+# serve loop and the writer it spawns — and the tick each cycle runs is joined before the cycle
+# ends, so a run that reads three is a run whose maintenance ticks are piling up.
+open_tasks_max = 3
+# Files the store holds open between two cycles. Measured at zero: an append, a read, a segment
+# write and a manifest write are each open and closed inside the call that made them. One is
+# allowed, for a build that caches its log handle on purpose; one *per cycle* is the defect.
+open_handles_max = 1
+# Files the store itself names: the manifest, and the segment and the index of every ordinal the
+# manifest lists. Measured at thirteen, which is six windows of history plus the manifest. A store
+# that never compacts or never expires grows this without bound, so the bound is this tight.
+store_files_max = 14
+# What those files cost together. Measured between 2734 and 2747 bytes over a four-thousand-cycle
+# run — the spread is the width of the varints carrying the timestamps — and bounded at well over
+# twice that, because a `zstd` release may answer different bytes for the same records. A leak of
+# one file per cycle moves this by a *segment*, not by a byte.
+store_bytes_max = 6000
+# Cycles the store refused. A store that answered a question with a refusal has a run whose other
+# numbers mean something else, so a refusal is a red gate as well as a moved counter.
+refused_max = 0

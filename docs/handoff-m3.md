@@ -28,8 +28,9 @@
 | B3f | `course(lakelet/4.14-index-pruning): the index is beside the store, and pruning is a number` | 4.14 正文（teach，20 用例）+ `index/{mod,zone,bloom}.rs`（`<store>/index/<ordinal>.lki` 的侧车索引：zone map + 词级布隆；缺失/损坏/过期只损失剪枝）+ 装置 `tests/budget_pruning.rs` 与 `budget/4.14-index-pruning.toml`（18 计数，含 `pruning_rate`）；计划的第二级剪枝（`blocks_pruned`）与 `Outcome` 的新计数器；`spec/4.11` 的键数断言放宽成 `>=`（rule 10 的正解）并重钉。**plan §9 腿 5 完成**：去掉索引查询 → `pruning_rate 95 → 50`、`blocks_pruned 11 → 0`、`7/10 must`；回滚 `10/10 must` |
 | B4a | `course(lakelet/4.15-budget-regression): the engine counts work per phase, and the profile names the phase that moved` | 4.15 正文（deepen，15 用例）+ `trace/{mod,counters}.rs`（七相位计数与恒等式：计数工作不计数时间）+ `query/exec.rs` 按相位计费 + `Outcome` 带 `trace`（`EXPLAIN` 的键不动——rule 10）+ 装置 `tests/attribution.rs` 与 `budget/4.15-budget-regression.toml`（36 计数）+ 项目页 `docs/perf.md`（`links`）；框架修复：`bench-budget` 不再静默忽略基线里没有的计数 |
 | B4b | `course(lakelet/4.16-profiling): a profile is evidence, and the page carries the run that produced every number` | 4.16 正文（teach，13 用例、8 条 TRAP）+ `lakelet-load --profile`（`--cycles` 可重复、`--seconds` 按钟停）+ 项目页 `docs/profile.md`（顶部两符号 = 每次 `seal` 的四次 `sync_all`，**七个相位没有一个计到 flush**——正文据此建议段路径也走 4.3 的 `wal::Policy`）+ 规格**逐行重跑并比对页面上的那段输出**；骨架改了 17 加/2 删（补两个标记块、改单线程 runtime，实测八条 parked worker 线程会淹掉 profile）；框架无改动 |
+| B4c | `course(lakelet/4.17-soak): the gate judges counters, and the harness fails on the counter that moved` | 4.17 正文（teach，17 用例）+ 五个活计数器（`open_tasks`/`open_handles`/`store_files`/`store_bytes`/`records`）+ 装置 `tests/soak.rs`（稳态断言、`LAKELET_SOAK_MINUTES` 长形态）与 `soak/4.17-soak.toml`（`cycles_min = 4000` 下界 + 全上界）+ 项目页 `docs/soak.md`（`links`）。**plan §9 腿 2 完成**：在 `ingest::serve` 注入“句柄不放”的泄漏 → `✗ slow:soak@4000 … panicked at tests/soak.rs:356 (after 149s)`（装置点名 `open_tasks 2003 → 4002`）、`7/11 must`；回滚 → `open_tasks 2`、`11/11 must`。计时：soak 门 ~146 s |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.16，B4 进行中）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.17，B4 进行中）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -147,3 +148,7 @@
     的 `spec-integrity`（“manifest says sha256:65e71040…, the file is sha256:934d4cb5…”）与 `fmt` 把它抓出来的，
     从作者自己的副本拷回后才 16/16。做法：每一步合并后**先比 `spec/manifest.toml` 里钉的哈希**（或至少比行数），
     worker 的 scratch 树在核对通过前不要清理。
+
+16. **给计数门写的装置，一行只放一个 `name=value`**。`kiln` 的 `harness::measurements` 是严格的：一行里写
+    两个（`open_tasks=2 open_handles=0 …`）会被判成“不是数字”并让门 **blocked**（4.17 的作者第一次
+    `selftest` 就撞上）。五个计数就写五行；最后的 `cycles=`/`refused=` 同理各占一行。

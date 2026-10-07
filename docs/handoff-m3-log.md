@@ -307,7 +307,7 @@ plan §9 要六条腿，每条要“原始输出 + 回滚对比”。做不到�
 | 腿 | 判据 | 状态 |
 | --- | --- | --- |
 | 1 无网快路径 | 预拉镜像 + 私有 `XDG_CACHE_HOME` + `CARGO_NET_OFFLINE=true` → `kiln verify lakelet`（不带 `--slow`）绿 | **部分已做**：整个 T4 依赖集能无网构建（下面那行）；`kiln verify lakelet` 要等 24 步齐 |
-| 2 注入泄漏 | `slow:soak` 红并点名计数 → 回滚绿 | 等 4.17（`slow:soak@N` 第一次上场） |
+| 2 注入泄漏 | `slow:soak` 红并点名计数 → 回滚绿 | **已做**（段 22，4.17）：在 `ingest::serve` 注入“句柄不放”的泄漏 → `✗ slow:soak@4000 the soak did not finish: exit code 101: thread 'the_counters_hold_their_place_over_a_long_run' … panicked at tests/soak.rs:356:9: (after 149s)`、`7/11 must gate(s) passed`；回滚 → `✓ slow:soak@4000 4000 cycle(s) in 142s, 5 live counter(s) inside their bounds: open_handles 0, open_tasks 2, refused 0, store_bytes 2743, store_files 13`、`11/11 must`（作者与我各自跑了一遍） |
 | 3 换掉合并顺序 | 用 `HashMap` 迭代顺序替换一处合并 → `slow:sim` 红 → 回滚绿 | **已做**（段 11，4.6）：写者拿到帧的顺序换成 `HashMap` 迭代 → `✗ slow:sim@3 the same seed produced two different transcripts: seed 1 came out as 5da24ff3 and 45197a26`；回滚 → `✓ … transcripts 4b891aaf/59a2e06b/59d4f669 — seed 1 replayed identically` |
 | 4 未分类的截断帧 | 注入 → fuzz/spec 红 → 回滚绿 | **已做**（段 5）：bug 种回去 → `kiln run` `FAILED. 5 passed; 2 failed`、`✗ slow:fuzz@3 3 of 3 seed(s) did not pass … panicked at src/protocol/sniff.rs:89:32`；回滚 → `7 passed` / `10/10 must gate(s) passed` |
 | 5 拿掉 4.14 的剪枝 | `bench-budget` 红 → 回滚绿 | **已做**（段 19，4.14）：把计划的索引查询去掉 → `✗ slow:bench-budget@10 6 of 18 metric(s) moved out of budget … pruning_rate is 50, -45 of the baseline 95`、`7/10 must gate(s) passed`；回滚 → `pruning_rate 95`、`10/10 must gate(s) passed`（作者与我各自跑了一遍，数字逐字一致） |
@@ -1198,3 +1198,67 @@ GREEN  回滚 → ok. 13 passed; 0 failed
 2. **骨架也可以在后来的步骤里改，只要验证到位**：改骨架等于改**每一步**的树——判据是“前 N 步的补丁
    是否仍能 `git apply`”+“全量 `selftest` 是否还 16/16”，两条都做了才敢留。理由与证据进正文（八条 parked
    线程会淹掉单线程程序的 profile）。
+
+## 段 22：B4c — 4.17 `perf/soak@apply`（十个一千次循环之后，还活着的是什么）
+
+**做了什么**：`spec/4.17/soak.rs`（920 行、17 用例）、`scaffold/4.17-soak.patch`（1059 行、**0 删除**：
+新建 `src/engine/soak.rs`（302 行桩）、`src/service/soak.rs`（146 行桩）、课程装置 `tests/soak.rs`（525 行，
+完整）、`docs/soak.md` 的桩（35 行），并在 `engine/mod.rs` 与 `service/mod.rs` 的标记块里各插一行）、
+`solutions/4.17-soak.patch`（906 行，碰 **12 个文件**）、`soak/4.17-soak.toml`（51 行）、
+`course/docs/steps/en/lakelet/4.17-soak.md`（158 行）。`track.toml` 未动（11 must）。
+
+**这一步钉下来的四条不变量**：① **五个活计数器**：`open_tasks`（spawn 了还没被 reap 的任务——
+实现为“句柄还没被 await 或 drop”，刻意不做成“直到任务跑完”，那会变成与最后一条指令的竞态）、
+`open_handles`、`store_files`、`store_bytes`、`records`，每一个的**增长**都对应一个具体的事故；
+② **稳态是一条断言而不是一句希望**：中点与终点的计数必须在声明的界内一致，不一致时由装置自己报出点名
+计数的那句话；③ **判据是计数不是分钟**：`cycles_min = 4000` 是**下界**，`[metric]` 全是**上界**，
+`LAKELET_SOAK_MINUTES=30` 是给人跑的长形态、门从不设置它；④ **一行一个计数**（`name=value`）——
+门的解析器遇到 `a=b c=d` 会 **报错**而不是跳过（作者第一次 selftest 就撞上，`slow:soak@4000` 直接
+`blocked`）。这条写进 §1 第 16 条。
+
+**两处作者比作业书更准的判断**：`store_files` 数的是**manifest 认的那些文件**，不是磁盘上的一切——
+4.14 **故意**留下过期 ordinal 的索引文件（它的规格钉着这件事），数磁盘会把那个“垃圾”读成每次过期漏一个
+文件；被发现的是计数器不够准，而不是那个文件该删。`store_bytes` **不含日志**——这份构建从不截断日志，
+把它算进去会让稳态恒不成立，那是另一件事，不是泄漏。
+
+**原始结论行**（我在自己的构建与**全新**副本 `l4b3-check7` 上重取；阶梯 4.1…4.17 全部 run 红 / solution 绿）：
+
+```
+$ kiln check lakelet/4.17-soak --slow            # 11/11 must gate(s) passed
+  ✓ spec-integrity 18 spec file(s) match · … · ✓ links
+  ✓ slow:soak@4000 4000 cycle(s) in 146s, 5 live counter(s) inside their bounds:
+    open_handles 0, open_tasks 2, refused 0, store_bytes 2743, store_files 13
+  ✓ slow:mutants@80 5/6 mutant(s) killed (83%, needs ≥80%)（walk 21s）
+$ kiln verify lakelet → 17/17 judged step(s) pass · 0 failed · 0 not prepared · 7 without content
+$ kiln selftest --track lakelet → 17/17 step(s) hold the contract · real 10m30.6s
+$ cargo test -q -p kiln → 321 + 21 + 1 · clippy 干净 · fmt 干净 · lint-caps no issues · links 107 page(s) · i18n 0 error · probe 41/41
+```
+
+计时：`check --slow` 里的 soak 门约 **146–157 s**（每循环三次设备等待：段、索引目录、索引文件——那是 4.8 的
+持久性决定，不是本步能省的）；中点（第 2000 循环）`open_tasks=2 open_handles=0 store_files=13 records=384`，
+终点（第 4000 循环）`open_tasks=2 open_handles=0 store_files=13 store_bytes=2743 records=384 cycles=4000`。
+
+**演练（plan §9 腿 2，我重取了一遍）**：在**生产代码**里注入泄漏——`ingest::serve` 把每条连接的句柄收进
+一个活到进程结束的 `Vec`，不再 `drop`：
+
+```
+RED    ✗ slow:soak@4000 the soak did not finish: exit code 101: thread
+       'the_counters_hold_their_place_over_a_long_run' (…) panicked at tests/soak.rs:356:9: (after 149s)
+       （装置自己的那句话点名了计数与两个数：`the soak does not reach a steady state: open_tasks was 2003
+        at the halfway mark and is 4002 at the end, which is 1999 more than the 0 this step allows it`；
+        门只剪贴 panic 的首行，所以这句话在测试输出里、不在门的行里）
+       ⚠ slow:mutants@80 the spec does not pass on the project as it is… · 7/11 must gate(s) passed（2m42s）
+GREEN  回滚（`cmp` 对齐原文）→ ✓ slow:soak@4000 4000 cycle(s) in 142s … · 11/11 must gate(s) passed（3m01s）
+```
+
+**这一段钉下来的三件事**：
+
+1. **腿 2 完成**（计划 §9）：泄漏被 soak 抓住、点名计数、回滚变绿 ✓。台账（段 8）里腿 1 的完整一半、
+   腿 6 后半仍待收尾（4.22 的 Dockerfile）。
+2. **§5 的抽样缺陷又添一个方向（第五个实测点）**：本步的参考解碰了 **12 个文件**，其中大部分是 4.8/4.14
+   的共享文件，于是“本步的规格”第一次跑出 **0/6**——作者把六个抽样位点逐个手工打进去量，四条死于“重开
+   仓库并对盘上的东西（manifest、epoch、段长度、索引）逐项比对”的用例、一条死于合并后的 epoch，活下来的
+   那条是 4.8 `discard` 的 `NotFound` 分支（不可达：`with_policy` 先建 `segments/` 再 `read_dir`）——
+   规则 11 的仪器噪声。最终 5/6 = 83%（也正是这两条新用例把规格从 12–16 带到 17 条）。
+3. **门对装置输出形状是硬的**：一行一个 `name=value`（第 16 条）。另外记下 `kiln check --slow` 在
+   4.17 上要跑 ~3 分钟（soak 146 s + mutants 21 s + 快门），这是 T4 目前最慢的一步。
