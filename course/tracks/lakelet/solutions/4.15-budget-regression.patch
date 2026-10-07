@@ -1,0 +1,566 @@
+diff --git a/docs/perf.md b/docs/perf.md
+index 86b1626..7a42f96 100644
+--- a/docs/perf.md
++++ b/docs/perf.md
+@@ -1,41 +1,191 @@
+ # The phase profile: which part of a query moved
+ 
+-<!-- TODO: one paragraph, in this project's voice, on why a budget that only says "this got slower"
+-is a number nobody can act on, and what a count per phase adds to it. Say that nothing on this page
+-is a measurement of the machine — every number here is work the engine did — and link the counter the
+-profile is read from (`../src/engine/trace/counters.rs`). -->
++A budget that says "this query got slower" is a number nobody can act on. `lakelet/4.14-index-pruning`
++made one cost of this store a number — `pruning_rate`, the share of the segments a query did not have
++to open — and that answers *how much was saved*. What it does not answer is the question a red budget
++actually asks: **which part of the run is now doing the extra work?** A query whose prune decision
++stopped pruning, a segment format that got more expensive to inflate, a predicate that keeps ten times
++as many records as it used to and a `GROUP BY …, series` that walks them once per series all show up
++as the same thing in a wall-clock number, and as four different things in the profile this page is
++about.
+ 
+-[TODO](TODO)
++So every run of a query counts what it did, phase by phase, and answers with those counts beside its
++answer. The rules live in [the trace module](../src/engine/trace/counters.rs); the counting happens
++where the work does, in [the executor](../src/engine/query/exec.rs); and the lane that prints a
++profile of a real store is [the course's harness](../tests/attribution.rs). If this page and those
++files disagree, the files are right and this page is a bug.
++
++Nothing on this page is a measurement of the machine. Every number is a count of something the engine
++did — a segment examined, a record decoded, a value folded into a window — so two runs of the same
++question over the same store answer with the same profile in any process, on any machine, under any
++load. That is the property `jobq/3.22-bench-budget` argues for and the reason this project budgets
++counts at all.
+ 
+ ## The phases
+ 
+-<!-- TODO: what each of the seven phases counts, and — the part a reader needs — the rule that
+-decides when it is charged. A table with one row per phase is what the harness prints: `headers`,
+-`blocks`, `decompress`, `decode`, `filter`, `aggregate`, `render`. Say which phase a query pays for
+-whether or not it reads a segment, and which one is the predicate rather than the range. -->
++Seven, in the order a query walks them. The name in the first column is what a metric line and a
++JSON key spell it with.
++
++| phase | charged once per | what a bigger number means |
++| --- | --- | --- |
++| `headers` | segment the plan examined | the query was planned against a longer store, or the plan stopped pruning |
++| `blocks` | segment file whose block was read | the plan kept more segments: less was pruned, by the range or by the index |
++| `decompress` | block inflated | the same read: every block that was read is inflated, and one whose seal refuses it is read and never inflated |
++| `decode` | record read out of a block | more records were read — more segments, or bigger ones |
++| `filter` | record the predicates kept | the predicates are matching more of what is read |
++| `aggregate` | value folded into a window | more values reached the windows: the range or the predicate widened |
++| `render` | bucket written into an answer | the answer covers more windows or more series |
++
++Three of the rules behind that table are decisions rather than descriptions:
+ 
+-| phase | charged once per |
+-| --- | --- |
+-| TODO | TODO |
++- **`headers` is the only phase a query pays for whether or not it reads anything.** A plan is made
++  from the manifest alone (`lakelet/4.11-query-engine`), and making it means examining every segment's
++  stated span and, for the ones the range meets, its sidecar index
++  (`lakelet/4.14-index-pruning`). A query whose range meets no segment costs exactly that many
++  headers and nothing else; a query whose range meets everything costs the same headers as one that
++  prunes it all away, because deciding is what the phase counts.
++- **`filter` is the predicate and not the range.** "The records `WHERE` kept" is this pass's
++  question; whether a kept record is inside the range is the window pass's, and a range that is not a
++  whole number of windows long has a first and a last window that reach past what the query asked for.
++  A record the predicate kept and the range did not is a **filtered** record that was never
++  aggregated, which is the difference between "the predicate got wider" and "the range got wider".
++- **`aggregate` is what the window pass folded in, not what it was handed.** A `GROUP BY …, series`
++  query hands the pass the records it read once per series — a scan per series, which is the design
++  `lakelet/4.11-query-engine` chose over a second implementation of the grid — so counting what was
++  offered would count the same record several times and stop meaning anything. The pass's own count of
++  what became part of a window is the honest one, and it is what the phase is charged with.
++
++A count of zero is a metric, not a missing line: "this run decoded nothing" is a fact about the run,
++and a profile that left the number out would leave a reader unable to tell a phase that did no work
++from a phase that was never asked.
+ 
+ ## The identities
+ 
+-<!-- TODO: the inequalities that make the profile a measurement rather than seven tallies, and the
+-conservation identity that ties `headers` to the pruning counters `lakelet/4.14-index-pruning`
+-added. Say what each one would catch if it were broken. -->
++A counter no case can falsify is worse than no counter: it is a number a reader trusts and a defect
++does not move. The phases are therefore not seven independent tallies — each is a subset or a
++superset of another, and the relations are what make the profile checkable:
++
++```text
++headers >= blocks >= decompress                  every read block was decided about, and read before it was inflated
++decode  >= filter >= aggregate >= render         every decoded record is offered to the predicates,
++                                                 every kept one to the window pass, and a bucket holds at least one value
++headers == segments_opened + segments_pruned + blocks_pruned
++                                                 every segment the plan examined is opened or pruned —
++                                                 by the range or by the index — and never two of those
++decode  == rows_scanned                          the outcome's own count of what it read
++aggregate == rows_answered                       every value that was folded in landed in a bucket
++```
++
++The conservation line is the one that ties this page to the pruning counters: `blocks_pruned` is
++`lakelet/4.14-index-pruning`'s share of the store, `segments_pruned` is `lakelet/4.11-query-engine`'s,
++and those two beside `segments_opened` are every segment the manifest names. A plan that reported a
++segment it never examined, or examined one it never reported, fails it — which is the failure a
++profile of seven plausible numbers would otherwise hide.
++
++What each identity catches, in the direction that matters:
++
++- `decode >= filter`: a filter charged for records that were pruned away is a predicate credited with
++  work the read never paid for;
++- `filter >= aggregate`: a window pass charged for values the predicate dropped is the "the range got
++  wider" story told about a predicate that did not change;
++- `aggregate >= render`: more buckets than values means a bucket was invented — the one defect in this
++  area that changes an answer rather than a number;
++- `headers >= blocks`: work read that the plan never decided about is pruning reported but not
++  performed.
+ 
+ ## Running the lane
+ 
+-<!-- TODO: the exact command, what it prints, and how to read one line of the course's baseline. Name
+-the two queries the lane asks and what the difference between their profiles is worth. -->
++```sh
++% cargo test -p lakelet --test attribution -- --nocapture
++lakelet-budget selective_headers=24
++lakelet-budget selective_blocks=1
++lakelet-budget selective_decompress=1
++lakelet-budget selective_decode=60
++lakelet-budget selective_filter=30
++lakelet-budget selective_aggregate=30
++lakelet-budget selective_render=1
++lakelet-budget selective_share_decode=41
++…
++lakelet-budget wide_decode=720
++…
++lakelet-budget decode_saved=660
++lakelet-budget segments_saved=11
++lakelet-budget bytes_saved=2708
++lakelet-budget merged_total=1647
++lakelet-budget merged_runs=2
++lakelet-budget refused_max=0
++```
++
++The store is twenty-four sealed segments, one hour each and sixty records each: thirty samples of
++`cpu,host=h{i}`, a series exactly one segment carries, and thirty of `cpu,host=fleet`, a series every
++segment carries. The lane asks two questions of the last twelve hours, one window an hour:
++
++- **`selective`** asks for `h20`. The manifest rules twelve segments out by their stated spans and the
++  index rules eleven more out, so one segment is opened: 60 records decoded, 30 kept by the predicate,
++  30 folded into one bucket.
++- **`wide`** asks for `fleet`. Its range meets the same twelve segments and the index can rule none of
++  them out — a filter that answered "no" about a pair a segment really holds would be a lost record —
++  so twelve segments are opened: 720 records decoded, 360 kept, 360 folded into twelve buckets.
++
++The five `*_saved` lines are the difference between the two, and they are the lane's whole story: the
++index was worth eleven segment reads, 660 decoded records and 2708 bytes on this store, and it was
++worth exactly nothing in `render` — the wide query's answer has more buckets, and a profile that
++called that a saving would be reporting the wrong direction. `merged_total` and `merged_runs` are the
++two runs as one report (`Trace::merge`): the pair cost 1647 units of work over two runs, which is the
++selective profile plus the wide one and nothing else.
++
++The course keeps a baseline of every one of these lines and `kiln check
++lakelet/4.15-budget-regression --slow` compares the two: each metric within ±10%, and any name ending
++in `_max` judged as an upper bound instead. The baseline is content — the numbers the reference
++solution printed — and editing the harness or the baseline changes the instrument rather than the
++machine it measures.
+ 
+ ## A red budget, read into a phase
+ 
+-<!-- TODO: the walk a reader does when `slow:bench-budget@10` names a metric that moved: which
+-profile to open first, which phase a bigger number belongs to, and what a phase that *stopped* being
+-charged says about a run. Use numbers from this store. -->
++When the gate goes red it names the metrics that moved, and the profile is where they are read. The
++walk is short because the phases are ordered by how far into the run they happen:
++
++1. **`headers` moved and nothing else.** The plan is doing more deciding — the store grew, or a range
++   that used to be pruned now is not. No file was read, so the answer is about the manifest.
++2. **`blocks` or `decompress` moved with `decode`.** More segments were opened, and everything
++   downstream of the read moved with them. Look at the pruning: `segments_pruned` and `blocks_pruned`
++   in the same answer say whether the range or the index stopped doing its work.
++3. **`decode` moved and `blocks` did not.** The same number of files, more records in them. That is a
++   segment layout or a flush policy question, not a query one.
++4. **`filter` moved with `decode` and `aggregate` did not.** The predicates are keeping more of what
++   is read but the windows are unchanged: the query got wider, the range did not.
++5. **`filter` moved alone.** The same records were read and more of them passed the predicate. Look at
++   what `WHERE` selects — a tag that used to be rare, a series that has spread.
++6. **`aggregate` or `render` moved alone.** The answer's shape changed: more windows in the range, more
++   series in the group, or a bucket per series where there used to be a mixed answer.
++
++The drill that makes this concrete is one line long: take the index directory out of a store and ask
++the same two questions again. On the store above, measured with the harness:
++
++```text
++                 with the index        without it
++selective_decode            60              720
++selective_filter            30               30
++selective_aggregate         30               30
++selective_render             1                1
++wide_decode                 720             720
++wide_filter                 360             360
++```
++
++Twelve segments read where one was enough, and the same thirty records kept — the index saved *reads*
++and not records, which is exactly what the phase view says and what the answer alone could never say.
++The wide query is the same either way, and that is not a detail: with the index gone the wide profile
++does not move, so a reader who only looked at that run would conclude the index was worth nothing.
+ 
+ ## Where the ideas come from
+ 
+-<!-- TODO: name the two standing ideas this page stands on — a phase profile from a profiler, and a
+-counter compared across two runs — and say what this project takes from each. -->
++Two ideas stand under this page, and both are older than this project:
++
++- **a phase profile.** `perf stat` reports a run as counts rather than a duration — instructions,
++  branches, cache misses — because a count is a property of the program and a duration is a property
++  of the machine. The seven phases here are the same idea at the scale of one query, with the phases
++  chosen by the parts of *this* store that a regression can hide in.
++- **a counter compared across two runs.** Prometheus's `process_cpu_seconds_total` and the counters
++  beside it are monotonically increasing totals that mean the same thing on every machine, so a
++  dashboard can subtract two samples and trust the difference. `decode_saved` is the same arithmetic
++  done once, in a gate, on purpose — against a baseline measured on a machine nobody had to name.
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index 01f6ca0..bb93e77 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -109,6 +109,7 @@ use crate::engine::query::exec;
+ use crate::engine::query::lex::Refusal;
+ use crate::engine::query::parse::{self, Statement, unit_millis};
+ use crate::engine::query::plan::{self, COLUMNS, Plan};
++use crate::engine::trace::{Phase, Trace};
+ use crate::error::Error;
+ 
+ /// The command answered.
+@@ -790,6 +791,7 @@ fn render_answer(outcome: &exec::Outcome, json: bool) -> Outcome {
+             rows_answered: outcome.rows_answered(),
+             series_matched: outcome.series_matched(),
+             series_answered: outcome.series_answered(),
++            trace: Phases(outcome.trace()),
+             buckets,
+         };
+         return match serde_json::to_string(&document) {
+@@ -873,7 +875,7 @@ struct Bucketed {
+ /// `lakelet/4.14-index-pruning`'s `index_missing` is the one number that says a store is answering
+ /// by brute force rather than by an index.
+ #[derive(Debug, serde::Serialize)]
+-struct Document {
++struct Document<'a> {
+     /// How many segments this query opened.
+     segments_opened: u64,
+     /// How many the plan's time range ruled out.
+@@ -898,11 +900,38 @@ struct Document {
+     series_matched: u64,
+     /// How many of those the answer is about.
+     series_answered: u64,
++    /// What the run cost, counted phase by phase (`lakelet/4.15-budget-regression`): one number per
++    /// phase, in the order the phases ran.
++    trace: Phases<'a>,
+     /// The buckets, oldest window first and, for a grouped answer, one series after another in
+     /// name order.
+     buckets: Vec<Bucketed>,
+ }
+ 
++/// The phase profile of a run, as `--json` writes it: one number per phase, in the order the phases
++/// ran.
++///
++/// An object built from `Phase::ALL` rather than seven named fields, because the phases are one list
++/// and a struct would spell them a second time: a profile whose keys were written out by hand here
++/// is a profile that drifts from the one the harness prints
++/// (`lakelet/4.15-budget-regression`). The order is the phases' own — a `BTreeMap` would answer with
++/// them alphabetically, which is an order no phase ran in — and a JSON object's key order is a
++/// reader's convenience rather than a promise, so the contract is the names and the numbers.
++#[derive(Debug)]
++struct Phases<'a>(&'a Trace);
++
++impl serde::Serialize for Phases<'_> {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        use serde::ser::SerializeMap;
++
++        let mut map = serializer.serialize_map(Some(Phase::ALL.len()))?;
++        for phase in Phase::ALL {
++            map.serialize_entry(phase.name(), &self.0.count(phase))?;
++        }
++        map.end()
++    }
++}
++
+ /// `EXPLAIN`'s answer as one JSON object: the keys `Plan::explain` prints, in the order it prints
+ /// them, with the plan's own numbers in them.
+ #[derive(Debug, serde::Serialize)]
+diff --git a/src/engine/query/exec.rs b/src/engine/query/exec.rs
+index 63ac7bc..4513e89 100644
+--- a/src/engine/query/exec.rs
++++ b/src/engine/query/exec.rs
+@@ -37,6 +37,11 @@
+ //! most what the plan said, and what was answered is at most what was read — are what make them
+ //! worth printing.
+ //!
++//! Beside them, and added by `lakelet/4.15-budget-regression`, an outcome carries a [`Trace`]: the
++//! same run counted per phase, charged where each phase did its work. A budget that says a query got
++//! slower can name the part of it that moved only if the parts were counted, and this pass is the
++//! one place that sees all of them.
++//!
+ //! Five of them are `lakelet/4.14-index-pruning`'s, and they are the plan's decision rather than the
+ //! pass's work: `blocks_pruned` is what the index saved, `bytes_read` and `bytes_avoided` are that
+ //! decision in the units a store is measured in, and `index_missing` and `index_unusable` are the
+@@ -53,6 +58,7 @@ use crate::engine::query::lex::Refusal;
+ use crate::engine::query::parse::Query;
+ use crate::engine::query::plan::Plan;
+ use crate::engine::query::series::Series;
++use crate::engine::trace::{Phase, Trace};
+ use crate::protocol::batch::Record;
+ 
+ /// One answer in an outcome: the series it is about, and the buckets it holds.
+@@ -85,7 +91,9 @@ impl SeriesAnswer {
+ /// The six counts are the pass's own account of itself, and they are deliberately about three
+ /// different things: the *plan* (`segments_opened`, `segments_pruned`), the *work* (`rows_scanned`,
+ /// `rows_answered`) and the *shape* (`series_matched`, `series_answered`). A caller reads the
+-/// answer and then reads these to find out what it was worth asking.
++/// answer and then reads these to find out what it was worth asking. The [`Trace`] beside them is
++/// the same run again, split by the phase that paid for it: these counts say *how much* was read,
++/// and that one says which part of the pass was doing it (`lakelet/4.15-budget-regression`).
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct Outcome {
+     /// The answers, in the order they cover the store: by series name for a grouped query, and one
+@@ -114,6 +122,12 @@ pub struct Outcome {
+     index_missing: u64,
+     /// How many of them had one that could not be read.
+     index_unusable: u64,
++    /// What this run cost, counted phase by phase (`lakelet/4.15-budget-regression`).
++    ///
++    /// The plan's decision, the read, the decode, the predicate, the window pass and the answer, as
++    /// counts of what each of them did — the numbers a profile is printed from, and the ones a
++    /// budget that went red is read with.
++    trace: Trace,
+ }
+ 
+ impl Outcome {
+@@ -200,6 +214,16 @@ impl Outcome {
+     pub const fn index_unusable(&self) -> u64 {
+         self.index_unusable
+     }
++
++    /// What this run cost, counted phase by phase (`lakelet/4.15-budget-regression`).
++    ///
++    /// The counts beside the answer rather than above it: they are about the run that produced it,
++    /// and the same question asked of the same store answers with the same profile — nothing here is
++    /// a measurement of the machine (`jobq/3.22-bench-budget`).
++    #[must_use]
++    pub const fn trace(&self) -> &Trace {
++        &self.trace
++    }
+ }
+ 
+ /// Answer `query` against `snapshot` with no zone named.
+@@ -247,12 +271,32 @@ pub fn execute_in(
+     zone: Option<&Zone>,
+ ) -> Result<Outcome, Refusal> {
+     let plan = Plan::of(snapshot, query)?;
++    // The trace, charged as the walk happens: every count below is something this pass did, counted
++    // where it did it (`lakelet/4.15-budget-regression`). Nothing here is derived from the answer
++    // afterwards, because a number derived afterwards cannot say which phase it came from.
++    let mut trace = Trace::new();
++
++    // The plan examined every entry of the manifest it was made from, and the three lists it decided
++    // those entries into — opened, pruned by the range, pruned by the index — are the whole store:
++    // that conservation is `lakelet/4.14-index-pruning`'s identity, and it is what makes this the one
++    // phase a query pays for whether or not it reads a segment.
++    trace.charge(
++        Phase::Headers,
++        plan.opened().len() as u64 + plan.pruned().len() as u64 + plan.blocks_pruned(),
++    );
+ 
+     let mut records: Vec<Record> = Vec::new();
+     for info in plan.opened() {
++        // A segment file holds one block (`lakelet/4.7-columnar-segments`), so reading and inflating
++        // are two halves of one file read. They are counted apart because the seal over the block is
++        // compared *before* it is inflated: a block whose bytes changed is a block that was read and
++        // never inflated, which is why the pair's identity is `>=` and not `=`.
++        trace.charge(Phase::Blocks, 1);
+         let read = snapshot.records_of(info).map_err(|error| Refusal::Store {
+             detail: error.to_string(),
+         })?;
++        trace.charge(Phase::Decompress, 1);
++        trace.charge(Phase::Decode, read.len() as u64);
+         records.extend(read);
+     }
+     let rows_scanned = records.len() as u64;
+@@ -268,6 +312,11 @@ pub fn execute_in(
+             carries_metric = true;
+         }
+         if query.selects(&series) {
++            // The predicate is this pass's question and the range is the window pass's: a record the
++            // predicates kept can still be outside the range, which is what the first and last window
++            // of a range that is not a whole number of windows long are made of
++            // (`lakelet/4.10-downsampling`).
++            trace.charge(Phase::Filter, 1);
+             matched.insert(record.series.as_str());
+         }
+     }
+@@ -292,6 +341,12 @@ pub fn execute_in(
+                 query.aggregate(),
+                 zone,
+             )?;
++            // What the window pass took in and what it wrote down: its own account of itself
++            // (`Answer::in_range` is the records that became part of a window, and a window that
++            // held none is not a bucket). The values it was *offered* would count a record once per
++            // series of a grouped query, which is the scan per series below and not the aggregate.
++            trace.charge(Phase::Aggregate, answered.in_range());
++            trace.charge(Phase::Render, answered.buckets().len() as u64);
+             answers.push(SeriesAnswer {
+                 series: Some((*name).to_owned()),
+                 buckets: answered.buckets().to_vec(),
+@@ -314,6 +369,8 @@ pub fn execute_in(
+             query.aggregate(),
+             zone,
+         )?;
++        trace.charge(Phase::Aggregate, answered.in_range());
++        trace.charge(Phase::Render, answered.buckets().len() as u64);
+         answers.push(SeriesAnswer {
+             series: None,
+             buckets: answered.buckets().to_vec(),
+@@ -350,5 +407,6 @@ pub fn execute_in(
+         bytes_avoided: plan.bytes_avoided(),
+         index_missing: plan.index_missing(),
+         index_unusable: plan.index_unusable(),
++        trace,
+     })
+ }
+diff --git a/src/engine/trace/counters.rs b/src/engine/trace/counters.rs
+index 2dc78b8..99c198f 100644
+--- a/src/engine/trace/counters.rs
++++ b/src/engine/trace/counters.rs
+@@ -129,7 +129,15 @@ impl Phase {
+     /// in, which is why they are asserted rather than described.
+     #[must_use]
+     pub const fn name(self) -> &'static str {
+-        todo!()
++        match self {
++            Self::Headers => "headers",
++            Self::Blocks => "blocks",
++            Self::Decompress => "decompress",
++            Self::Decode => "decode",
++            Self::Filter => "filter",
++            Self::Aggregate => "aggregate",
++            Self::Render => "render",
++        }
+     }
+ 
+     /// The phase `name` names, or nothing when no phase is called that.
+@@ -138,7 +146,15 @@ impl Phase {
+     /// `lakelet-budget decode=60` line has a name and needs the phase it belongs to.
+     #[must_use]
+     pub fn parse(name: &str) -> Option<Self> {
+-        todo!("lakelet/4.15-budget-regression: the phase `{name}` names, or nothing")
++        Self::ALL.into_iter().find(|phase| phase.name() == name)
++    }
++
++    /// Where this phase's counter sits in a [`Trace`]: its place in [`Phase::ALL`].
++    ///
++    /// The enumeration below is written in [`Phase::ALL`]'s order, and the spec pins the pair: a
++    /// phase that is charged one is the phase that reports one, whatever else moves.
++    const fn slot(self) -> usize {
++        self as usize
+     }
+ }
+ 
+@@ -160,7 +176,10 @@ impl Trace {
+     /// A trace that has counted nothing: one run, no work.
+     #[must_use]
+     pub const fn new() -> Self {
+-        todo!()
++        Self {
++            counts: [0; PHASES],
++            runs: 1,
++        }
+     }
+ 
+     /// Charge `count` of `phase`'s work to this run.
+@@ -169,16 +188,15 @@ impl Trace {
+     /// records it read, a window pass counts the values it folded in. A count of zero is nothing to
+     /// charge and does not make a phase have run.
+     pub fn charge(&mut self, phase: Phase, count: u64) {
+-        todo!(
+-            "lakelet/4.15-budget-regression: {count} of the {phase:?} phase's work, added to this \
+-             run"
+-        )
++        if let Some(counter) = self.counts.get_mut(phase.slot()) {
++            *counter = counter.saturating_add(count);
++        }
+     }
+ 
+     /// What this run was charged for `phase`.
+     #[must_use]
+     pub fn count(&self, phase: Phase) -> u64 {
+-        todo!("lakelet/4.15-budget-regression: the {phase:?} phase's counter")
++        self.counts.get(phase.slot()).copied().unwrap_or(0)
+     }
+ 
+     /// Every phase's count, added up: the whole of what the run did.
+@@ -186,7 +204,9 @@ impl Trace {
+     /// The denominator of [`Trace::shares`], and the one number that says a profile is empty.
+     #[must_use]
+     pub fn total(&self) -> u64 {
+-        todo!("lakelet/4.15-budget-regression: every phase's counter, added up")
++        self.counts
++            .iter()
++            .fold(0u64, |total, count| total.saturating_add(*count))
+     }
+ 
+     /// The phases that ran, as whole percent of the total, largest first.
+@@ -197,9 +217,36 @@ impl Trace {
+     /// profile that adds up to 99 is a profile somebody has to explain.
+     #[must_use]
+     pub fn shares(&self) -> Vec<(Phase, u64)> {
+-        todo!(
+-            "lakelet/4.15-budget-regression: the phases that ran, as whole percent, largest first"
+-        )
++        let total = self.total();
++        if total == 0 {
++            return Vec::new();
++        }
++        let whole = u128::from(total);
++        // Floored whole percent, with the remainder each floor left behind: a share is a fraction of
++        // a whole run, and whole percent of one does not add up on its own.
++        let mut shares: Vec<(Phase, u64, u128)> = Phase::ALL
++            .iter()
++            .copied()
++            .filter(|phase| self.count(*phase) > 0)
++            .map(|phase| {
++                let scaled = u128::from(self.count(phase)) * 100;
++                (phase, (scaled / whole) as u64, scaled % whole)
++            })
++            .collect();
++        let given: u64 = shares.iter().map(|(_, percent, _)| *percent).sum();
++        // The leftover whole percents go to the phases with the largest remainders, which is what
++        // makes the rounding a reader can check: the floors can leave up to one point per phase, and
++        // never more than there are phases that ran.
++        shares.sort_by_key(|(_, _, remainder)| std::cmp::Reverse(*remainder));
++        let left = 100u64.saturating_sub(given);
++        for (_, percent, _) in shares.iter_mut().take(left as usize) {
++            *percent = percent.saturating_add(1);
++        }
++        shares.sort_by_key(|(_, percent, _)| std::cmp::Reverse(*percent));
++        shares
++            .into_iter()
++            .map(|(phase, percent, _)| (phase, percent))
++            .collect()
+     }
+ 
+     /// Add another run's counts to this one: two runs, one report.
+@@ -208,13 +255,16 @@ impl Trace {
+     /// answered two questions and wants one account of the pair starts from the first run's trace
+     /// and merges the second into it.
+     pub fn merge(&mut self, other: &Trace) {
+-        todo!("lakelet/4.15-budget-regression: {other:?}, added to this run: two runs, one report")
++        for (counter, added) in self.counts.iter_mut().zip(other.counts.iter()) {
++            *counter = counter.saturating_add(*added);
++        }
++        self.runs = self.runs.saturating_add(other.runs);
+     }
+ 
+     /// How many runs this trace is the sum of.
+     #[must_use]
+     pub const fn runs(&self) -> u64 {
+-        todo!()
++        self.runs
+     }
+ }
+ 

@@ -1086,3 +1086,61 @@ GREEN 回滚 → ✓ slow:bench-budget@10 … pruning_rate 95 … · ✓ slow:mu
    `<skipped-untracked-directory>` 并让整个工作树的终端停摆（“the checkout kept changing”）；恢复办法是
    先把那棵树恢复到 Delta 认识的样子（撤掉 shell 写的那次编辑、删掉未跟踪目录），然后用**文件工具**建文件、
    再 `cp` 内容过去。**工作树里的文件只用文件工具创建**（第 9 条的姊妹条，见 §1 第 14 条）。
+
+## 段 20：B4a — 4.15 `perf/bench-budget@operate`（从预算到归因：把工作分到相位上数）
+
+**做了什么**：`spec/4.15/budget_regression.rs`（1026 行、15 用例）、
+`scaffold/4.15-budget-regression.patch`（652 行、**0 删除**：新建 `src/engine/trace/{mod,counters}.rs`
+的契约桩、课程装置 `tests/attribution.rs`（316 行）与 `docs/perf.md` 的桩，`engine/mod.rs` +3）、
+`solutions/4.15-budget-regression.patch`（566 行：`counters.rs` 的函数体、`query/exec.rs` 按相位计费、
+`cli/mod.rs` 在 `--json` 里带出 `trace`、写成的 `docs/perf.md`）、
+`budget/4.15-budget-regression.toml`（105 行、**36 计数**）、
+`course/docs/steps/en/lakelet/4.15-budget-regression.md`（205 行，deepen：RECALL/DELTA/TASK/DONE WHEN/TRAP，
+**没有 WHY**）。`track.toml` 未动（10 must：`links` 与 `slow:bench-budget@10` 在内，**没有 mutants**）。
+
+**这一步钉下来的四条不变量**：① **相位**：`Headers / Blocks / Decompress / Decode / Filter / Aggregate /
+Render`，每一笔都是引擎真的做过的计数——**计数工作，绝不计数时间**；② **恒等式**：`Blocks >= Decompress`、
+`Decode >= Filter >= Aggregate`、`Headers` 等于计划看过的段数，且 `Decode == rows_scanned`（一条计数没有
+用例能反驳，比没有计数更糟）；③ **profile 只能从一次运行读，不能从 `EXPLAIN` 读**（rule 10：4.11 数着它的
+行数、4.14 按名字与顺序钉着十三个键——所以 `trace` 落在 `Outcome` 与答案文档里；正文把这件事讲成
+“`EXPLAIN` 预测，profile 测量”）；④ **一次运行的形状**（`Trace::new()` 的 `runs == 1`，两次运行合并报 2）。
+
+**两处作者比作业书更对的判断**：`Filter` 只是**谓词**（若把它定义成“谓词且范围”，在引擎能产生的每一次运行
+上它都等于 `Aggregate`，`Filter >= Aggregate` 就成了不可反驳的恒等式——正是正文反对的东西），范围那一半
+由窗口通负责；`Aggregate` 记的是**窗口通真正折进去的**（`Answer::in_range()`），不是“交给它的”，否则
+`GROUP BY …, series` 会把同一条记录按系列数重复计数。
+
+**原始结论行**（我在自己的构建与副本 `l4b3-check5` 上重取）：
+
+```
+$ kiln selftest --track lakelet                     # 15/15 step(s) hold the contract
+$ kiln check lakelet/4.15-budget-regression --slow   # 10/10 must gate(s) passed
+  ✓ slow:bench-budget@10 36 metric(s) judged（35 within ±10%，1 at or below an upper bound）:
+    selective_headers 24, selective_blocks 1, selective_decompress 1, selective_decode 60,
+    selective_filter 30, selective_aggregate 30, selective_render 1, selective_share_decode 41, …
+    wide_decode 720, wide_filter 360, wide_aggregate 360, decode_saved 660, filter_saved 330,
+    aggregate_saved 330, segments_saved 11, bytes_saved 2708, merged_total 1647, merged_runs 2, refused_max 0
+$ kiln verify lakelet → 15/15 judged step(s) pass · 0 failed · 0 not prepared · 9 without content
+$ cargo test -q -p kiln → 321 + 21 + 1 · clippy 干净 · fmt 干净 · lint-caps no issues · links 105 page(s) · i18n 0 error · probe 41/41
+```
+
+**演练（我重取了一遍）**：把 `Filter` 命中的记录再按 `Decode` 记一次（相位说谎）——
+
+```
+RED    $ cargo test -q --test spec_budget_regression → FAILED. 12 passed; 3 failed
+CAUGHT a_record_the_range_kept_out_is_filtered_and_not_aggregated
+       panicked at tests/spec_budget_regression.rs:707:5: the segment holds sixty records and both
+       series were decoded / left: 90 / right: 60（另两条：恒等式用例、索引拿掉后相位移动的用例）
+GREEN  回滚 → ok. 15 passed; 0 failed
+```
+
+**这一段钉下来的两件事**：
+
+1. **框架修复：`bench-budget` 不再“静默忽略”基线里没有的计数**。作者的实测：装置多打印一个数、基线里没有
+   它，门照样绿，于是那个数字看起来被看着、其实没有任何比较。现在通过/失败的判词里会带一句
+   `N the baseline does not name so they were not judged: …`（`kiln/src/gates/budget.rs`，带单测；
+   正确内容上它一个字都不多说——4.10 与 4.15 两条车道的实测行都没变）。另一面已经是对的：**基线里有而
+   装置没打印**的计数会让门 `blocked` 并点名。
+2. **一条给我的提醒**：作业书里我把 4.15 的慢门写成“可能有 `mutants@80`”，实际 `track.toml` 里没有——
+   作者按规则 8 对着文件数并指出（并改用两次伪造演练顶替）。门数只从 `track.toml` 数，这句话我还是要
+   自己再犯一次，记在这里。

@@ -26,8 +26,9 @@
 | B3d | `course(lakelet/4.12-aggregation-correctness): a sum is not +, and a day is not 24 hours` | 4.12 正文（teach，17 用例）+ `query/agg.rs`（Kahan–Neumaier 的 `Sum` + 写成数字的 `BOUND`/`error_bound`、刻意保留的 `naive`、顺序无关性、`Zone` 自带转换表且表外回答 `None`）+ `downsample.rs` 的 `downsample_zoned` + `--zone`（只对 1d 窗口生效，本地日 23/25 小时）+ `exec.rs` 的 `execute_in`；`slow:mutants@80` 5/6（噪声，见 §5）、`?coverage` 177/177（100%） |
 | B3e | `course(lakelet/4.13-model-based-tests): a model that knows nothing about segments, and a walk that has to agree with it` | 4.13 正文（teach，18 用例）+ `engine/rng.rs`（xorshift64\*，金向量 + 差异性）+ `tests/support/model.rs`（只有“记录 + floor”的参考模型）+ `tests/support/walk.rs`（夹具：操作字母表、时钟、transcript、收缩）+ `tests/sim_model.rs`（读 `KILN_SIM_SEED` 的装置）+ `sim/4.13-model-based-tests.toml`；`slow:sim@3` transcripts `85c499a1/903bdf8e/a8efae13`（种子 1 逐字节重放）、`slow:mutants@80` 6/6 |
 | B3f | `course(lakelet/4.14-index-pruning): the index is beside the store, and pruning is a number` | 4.14 正文（teach，20 用例）+ `index/{mod,zone,bloom}.rs`（`<store>/index/<ordinal>.lki` 的侧车索引：zone map + 词级布隆；缺失/损坏/过期只损失剪枝）+ 装置 `tests/budget_pruning.rs` 与 `budget/4.14-index-pruning.toml`（18 计数，含 `pruning_rate`）；计划的第二级剪枝（`blocks_pruned`）与 `Outcome` 的新计数器；`spec/4.11` 的键数断言放宽成 `>=`（rule 10 的正解）并重钉。**plan §9 腿 5 完成**：去掉索引查询 → `pruning_rate 95 → 50`、`blocks_pruned 11 → 0`、`7/10 must`；回滚 `10/10 must` |
+| B4a | `course(lakelet/4.15-budget-regression): the engine counts work per phase, and the profile names the phase that moved` | 4.15 正文（deepen，15 用例）+ `trace/{mod,counters}.rs`（七相位计数与恒等式：计数工作不计数时间）+ `query/exec.rs` 按相位计费 + `Outcome` 带 `trace`（`EXPLAIN` 的键不动——rule 10）+ 装置 `tests/attribution.rs` 与 `budget/4.15-budget-regression.toml`（36 计数）+ 项目页 `docs/perf.md`（`links`）；框架修复：`bench-budget` 不再静默忽略基线里没有的计数 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.14，B3 收口）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.15，B4 进行中）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 

@@ -1,0 +1,105 @@
+# The phase profile of `lakelet/4.15-budget-regression`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/attribution.rs`, which this step's scaffold ships); the metrics are the lines it prints,
+# and every one of them is a count or a ratio of two counts rather than a time — a count is the same
+# number on a loaded machine as on an idle one, which is why this lane judges counts at all
+# (handoff M2 §1.1).
+#
+# What the harness does: it seals twenty-four segments, one hour each and sixty records each — thirty
+# samples of `cpu,host=h{i}`, a series that appears in exactly one segment, and thirty of
+# `cpu,host=fleet`, a series every segment carries — and asks **two** queries of the last twelve
+# hours, one window an hour. Nothing in it reads a clock or measures a duration: the epoch, the
+# timestamps, the series and the windows are all constants, so two runs of this file on two machines
+# print the same counts.
+#
+# # The two profiles are the lane
+#
+# `lakelet/4.14-index-pruning` counts what a query did *not* read. This lane counts what it did, split
+# by the part of the engine that paid, because "this query got slower" is a sentence a review can act
+# on only when it names the phase that moved. The two queries are shaped to make that nameable:
+#
+# * the **selective** query asks for `h20`. The manifest rules twelve segments out by their stated
+#   spans and the index rules eleven more out, so one segment is opened: 60 records decoded, 30 kept
+#   by the predicate, 30 folded into one bucket. Its `decode` is 60 and its `blocks` is 1;
+# * the **wide** query asks for `fleet`, which every segment carries, so the index can rule none of
+#   the twelve segments the range meets out: 720 records decoded, 360 kept, 360 folded into twelve
+#   buckets. Its `decode` is twelve times the selective run's — the same store, the same range and a
+#   predicate the index cannot help with;
+# * the `*_saved` lines are the difference between the two, and they are the lane's story as five
+#   numbers: the index was worth eleven segment reads, 660 decoded records and 2708 bytes on this
+#   store. The drill the plan's sixth acceptance leg runs is one line — take the index directory out
+#   and ask again — and it moves `selective_decode` from 60 to 720 while `selective_filter`,
+#   `selective_aggregate` and `selective_render` do not move at all: the index saved *reads* and not
+#   records, which is what a profile says and an answer cannot.
+#
+# Every phase of every run is printed, and a phase that did no work prints a zero rather than a
+# missing line: "this run decoded nothing" is a fact about the run, and a gate that could not tell it
+# from a harness that stopped reporting would judge an absence as a pass. `*_share_*` are the same
+# profiles as whole percent of the run, for the phases that ran, and they add up to exactly 100 — the
+# largest phase carries the rounding (`src/engine/trace/counters.rs`).
+#
+# `merged_total` and `merged_runs` are the two runs merged into one report (`Trace::merge`): the pair
+# cost 1647 units of work over two runs, which is the selective profile added to the wide one. It is
+# here so that a merge that lost a phase's work is a red gate rather than a reader's arithmetic.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: "no worse than this", not "about this". `bytes_saved` carries the compressor's own slack —
+# a `zstd` release may answer different bytes for the same input, and the course never pins a
+# compressor's output — which is why `budget/4.8-compaction.toml` and `budget/4.9-retention.toml`
+# bound their byte counts the same way.
+command = "cargo test -p lakelet --test attribution -- --nocapture"
+
+[metric]
+# The selective query's profile: one counter per phase, in the order a query walks them. `headers` is
+# the plan's decision — it examined all twenty-four segments and each one is opened, pruned by the
+# range or pruned by the index — and it is the one phase a query pays for whether or not it reads.
+selective_headers = 24
+selective_blocks = 1
+selective_decompress = 1
+selective_decode = 60
+selective_filter = 30
+selective_aggregate = 30
+selective_render = 1
+# The same run as whole percent: where a run's work went, which is the number a reader of a profile
+# looks at first. A phase that ran and rounded to nothing is still a row.
+selective_share_decode = 41
+selective_share_filter = 20
+selective_share_aggregate = 20
+selective_share_headers = 16
+selective_share_blocks = 1
+selective_share_decompress = 1
+selective_share_render = 1
+# The wide query's profile: the same store, the same range, and a predicate no index can prune. Its
+# `decode` is twelve times the selective run's, which is the difference the diff lines below name.
+wide_headers = 24
+wide_blocks = 12
+wide_decompress = 12
+wide_decode = 720
+wide_filter = 360
+wide_aggregate = 360
+wide_render = 12
+wide_share_decode = 48
+wide_share_filter = 24
+wide_share_aggregate = 24
+wide_share_blocks = 1
+wide_share_decompress = 1
+wide_share_render = 1
+wide_share_headers = 1
+# The two runs against each other, in the phase the difference lives in. This is the lane's story and
+# the reason a profile is worth a gate: a change that made the selective query read like the wide one
+# moves these five and says which phase paid. `render` is deliberately not among them — the wide
+# query's answer has *more* buckets, and a saving that was negative would be reporting the wrong
+# direction.
+decode_saved = 660
+filter_saved = 330
+aggregate_saved = 330
+segments_saved = 11
+bytes_saved = 2708
+# The two runs as one report: the counts add, and the runs behind them add with them.
+merged_total = 1647
+merged_runs = 2
+# A store that refused something is a store this lane cannot judge by counts alone. An upper bound of
+# zero, so the failure a refusal causes is named as a refusal as well as by the counts it moved.
+refused_max = 0
