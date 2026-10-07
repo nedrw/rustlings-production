@@ -143,6 +143,11 @@ index 0000000..ded95ff
 +/// error (`2`) naming both numbers — and the number is high enough that it is never a page size: a
 +/// million one-hour buckets is a hundred and fourteen years.
 +pub const MAX_WINDOWS: u64 = 1_000_000;
++// The modules a later step adds are declared inside this block: a scaffold may only write
++// inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits
++// safe (docs/authoring.md §5).
++// kiln:scaffold:begin
++// kiln:scaffold:end
 +
 +/// What the process would have written, and the code it would have ended with.
 +///
@@ -195,11 +200,6 @@ index 0000000..ded95ff
 +         this module's header — the grammar, the two renderers and the exit codes are yours"
 +    )
 +}
-+// The modules a later step adds are declared inside this block: a scaffold may only write
-+// inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits
-+// safe (docs/authoring.md §5).
-+// kiln:scaffold:begin
-+// kiln:scaffold:end
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
 index fd2d4db..c068e24 100644
 --- a/src/engine/mod.rs
