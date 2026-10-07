@@ -1,0 +1,552 @@
+diff --git a/docs/cardinality.md b/docs/cardinality.md
+new file mode 100644
+index 0000000..700bbbd
+--- /dev/null
++++ b/docs/cardinality.md
+@@ -0,0 +1,53 @@
++# Cardinality is the bill
++
++<!-- TODO: two or three paragraphs, in this project's voice, on why cardinality is the cost this
++track has not priced yet: everything measured so far is a flow (bytes, work, blocks not read) and
++this one is a *stock* the application chooses. Say what a label with an unbounded value set does to
++a segment's dictionary, to the index's vocabulary and to the identity of an answer, and say why the
++write path cannot notice. Link the pages that carry the neighbouring facts —
++[the segment format](format.md) for the series column, the query language for what a name is asked
++of — and keep it under 200 words. -->
++
++[TODO](TODO)
++
++## The cap, and the number this build ships
++
++<!-- TODO: the number (`Cap::DEFAULT`, and `series.limit` in the configuration with its four
++layers), and the honest part: the number is *chosen*, so say what it is chosen *for* and point at the
++arithmetic below. Then the rule in two sentences — a series the store already tracks is always
++admitted, a series it has never seen is admitted while there is room — and one paragraph on why a
++frame is judged whole. -->
++
++## The ledger is derived state
++
++<!-- TODO: where the ledger comes from (the log's records, pruned by the sidecar indexes of the
++segments the store still holds), why it is not a file of its own (the rule `4.14` established for
++derived state), what a missing or damaged index costs instead, and why opening a store is what
++rebuilds it — the restart is the case that decides whether the cap is a policy or a decoration. -->
++
++## The three counters, and the identity
++
++<!-- TODO: a row per counter, and the identity `offered == admitted + rejected` with a sentence on
++what crossing it means. Say that the counters count *offers* while `tracked_count` is the live set,
++and show one line of a real transcript. -->
++
++## What a refused client sees
++
++<!-- TODO: what a client's operator can read — the connection's counters, the one `warn` line per
++refused frame, the `series ledger` line the stop path prints, and `lakeletq inspect series` — and
++what is deliberately *not* visible: the refused records are not sampled, not stored and not
++queryable. The protocol is one-way, so say how a client finds out at all. -->
++
++## What a series costs, measured
++
++<!-- TODO: the workload you measured, the commands that produced the numbers, and the table. The
++ledger's numbers come from `lakeletq inspect series` on a store a daemon wrote; the segment and index
++numbers come from sealing the same records and reading the two files. Then the arithmetic at the cap:
++what 1024 series cost a day on this workload, and which of the numbers is the one a flush interval
++moves. A page quoting an intention rather than a run is the thing this step exists to prevent. -->
++
++## What the cap costs you
++
++<!-- TODO: one paragraph on the price of the policy, which is not a number: the series that were
++refused are the ones nobody can query later, backfill or restore, and what that means on the day of
++an incident. -->
+diff --git a/src/engine/cardinality/cap.rs b/src/engine/cardinality/cap.rs
+new file mode 100644
+index 0000000..1c17b2b
+--- /dev/null
++++ b/src/engine/cardinality/cap.rs
+@@ -0,0 +1,119 @@
++//! The cap as a value: how many series a store tracks, and what it says about one that does not fit.
++//!
++//! Step `lakelet/4.18-cardinality-cost`, and the half of it that counts nothing. A cap is a
++//! *policy* — a number somebody chose, and a rule for the two answers it can give — so it lives
++//! here as data rather than inside the registry that applies it: a deployment's number can be
++//! argued about, tested and changed without reading the code that keeps the ledger, and a test can
++//! ask what the rule says without a store anywhere near it.
++//!
++//! # What the limit counts
++//!
++//! **Series the store tracks**, and not frames, not records and not bytes. The distinction is the
++//! whole of this step: a client that sends a million samples of `cpu,host=h0` is a client this
++//! store is happy to serve — that is one series, a million records — and a client that sends one
++//! sample each of a million `host=` values is the one that costs money, because every one of those
++//! names is a dictionary entry, an index vocabulary term and a part of an answer's identity. A cap
++//! on *requests* would refuse the first client; a cap on *series* refuses the second, which is the
++//! client whose data the store cannot afford (`docs/cardinality.md` measures what a series costs).
++//!
++//! # The rule, in two sentences
++//!
++//! **A series the store already tracks is always admitted**: a cap must not break a series that is
++//! being reported, or a deployment that reached its limit would start losing the data it already
++//! holds, one sample at a time, with no error anywhere. **A series it has never seen is admitted
++//! while the ledger has room for it and refused once it does not** — the refusal is
++//! [`Admission::Rejected`], it carries both numbers so that a log line or a client can say exactly
++//! what happened, and it is *counted* by the caller (`Registry::series_rejected`), because a policy
++//! nobody can see is a policy nobody can operate.
++
++use std::fmt;
++
++/// How many series a store tracks before it starts refusing ones it has never seen.
++///
++/// The number is a deployment's, not a law of the format, and it is the one number in this step
++/// that has to be defended rather than derived: see [`Cap::DEFAULT`] for the one this build ships
++/// and `docs/cardinality.md` for the arithmetic that makes it a budget rather than a guess.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Cap {
++    /// How many series fit.
++    limit: usize,
++}
++
++impl Cap {
++    /// The cap this build ships: **1024 series**.
++    ///
++    /// Chosen, not measured, and the page says so: it is the number of series a store of this
++    /// course's size can hold at the price `docs/cardinality.md` measures per series, rounded to
++    /// something a person can hold in their head and argue about in a review. It is deliberately
++    /// not a limit anybody hits by accident — every workload this course's own harnesses run stays
++    /// far inside it — so that the first refusal a deployment sees is one somebody set on purpose,
++    /// in `series.limit`, with the arithmetic in front of them.
++    pub const DEFAULT: Cap = Cap::new(1024);
++
++    /// A cap of `limit` series.
++    ///
++    /// Zero is a legal cap and means what it says: a store that tracks nothing may still hold what
++    /// it already has (a tracked series is always admitted), and may take no new series at all.
++    #[must_use]
++    pub const fn new(limit: usize) -> Self {
++        Self { limit }
++    }
++
++    /// How many series this cap allows.
++    #[must_use]
++    pub const fn limit(&self) -> usize {
++        self.limit
++    }
++}
++
++impl fmt::Display for Cap {
++    /// The policy as a deployment reads it back, for the line that prints it.
++    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("the cap as a phrase, for the line that prints a deployment's policy")
++    }
++}
++
++/// What a cap says about one offered series.
++///
++/// Two answers and not three, because the third question a client might ask — *why not?* — is the
++/// one [`Admission::Rejected`] already answers by carrying the two numbers the decision was made
++/// from: how many series the store tracks, and what its cap allows. A reader of a log line or a
++/// client's error has both, and neither of them is a string somebody has to parse.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Admission {
++    /// The store takes it: either it is already tracked, or there was room for one more.
++    Admitted,
++    /// The store refuses it: `tracked` series are in the ledger and the cap allows `limit`.
++    ///
++    /// The refusal is about a series **the store has never seen**. A series it already tracks is
++    /// admitted however full the ledger is, which is why this variant cannot mean "the store is
++    /// full" in the abstract: it means "there is no room for a name nobody has reported yet".
++    Rejected {
++        /// How many series the store was tracking when it decided.
++        tracked: usize,
++        /// How many its cap allows.
++        limit: usize,
++    },
++}
++
++impl Admission {
++    /// `true` when the store took the series.
++    ///
++    /// The accessor exists because both answers are values a caller branches on: a log line, a
++    /// counter and the ingest path's decision are all written against this and not against a
++    /// sentence somebody has to read.
++    #[must_use]
++    pub const fn is_admitted(&self) -> bool {
++        matches!(self, Self::Admitted)
++    }
++}
++
++impl fmt::Display for Admission {
++    /// The decision as a reader gets it, naming the two numbers it was made from.
++    ///
++    /// Both answers are printable: a refused frame's log line is where an operator meets this, and
++    /// a taken one is a line a caller writes too.
++    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!("the decision as a log line or a client could read it")
++    }
++}
+diff --git a/src/engine/cardinality/mod.rs b/src/engine/cardinality/mod.rs
+new file mode 100644
+index 0000000..ea80ba9
+--- /dev/null
++++ b/src/engine/cardinality/mod.rs
+@@ -0,0 +1,347 @@
++//! The store's ledger of series: which ones it has admitted, what each one costs, and the cap that
++//! decides whether a name nobody has reported yet fits.
++//!
++//! Step `lakelet/4.18-cardinality-cost`. A series is a metric and a tag set — `cpu,host=h0,dc=east`
++//! — and everything in this store is keyed by one: a segment lays its columns out by series name, a
++//! query names one in `FROM … WHERE …`, and the sidecar index's vocabulary is built from their
++//! names (`lakelet/4.14-index-pruning`). What nothing before this step bounded is **how many of
++//! them there are**, and that number is the one an operator cannot see until it is expensive: a
++//! label whose value set the *application* chooses — `host=<pod name>`, `user=<id>`,
++//! `request_id=<uuid>` — turns one metric into a million series, and a store that holds a million
++//! series holds a million dictionaries, a million index vocabularies and a million names in every
++//! answer's identity. [`Cap`] is the policy that bounds it, and this module is the ledger that
++//! makes the cap a decision about a *store* rather than about one connection.
++//!
++//! # What the ledger counts
++//!
++//! The series this store has **admitted**, with what each one cost so far. Two numbers are enough
++//! to decide about a new name, and each has a trap in it:
++//!
++//! * [`Registry::tracked_count`] is the **live set** — how many names the ledger holds right now —
++//!   and it is what the cap's limit is measured against. Counting *records* instead would cap the
++//!   traffic rather than the cardinality, and a store with one series and a billion samples would
++//!   be refused while a store with a million one-sample series was not, which is backwards;
++//! * [`Registry::cost_of`] is what one series has cost: records, bytes, and the first and last
++//!   timestamp it was seen at. It is the number `docs/cardinality.md` does its arithmetic with,
++//!   and the number `lakeletq inspect series` prints.
++//!
++//! # Where the ledger comes from: the store, not a file of its own
++//!
++//! The ledger is **derived state**, and that is the rule it shares with the sidecar index
++//! (`lakelet/4.14-index-pruning`): a store cannot be wrong about its own cardinality because a file
++//! this module writes is missing or stale. [`Registry::of_store`] rebuilds it from what the store
++//! itself has — the records its log carries, which is every record the write path ever accepted
++//! (`docs/soak.md`: this build never truncates the log), pruned by the sidecar indexes of the
++//! segments it still holds. Opening a store is what does that, so a deployment that restarts does
++//! not start counting from zero and admit a fresh `limit` of new names on every restart — which
++//! would be a cap that leaks exactly as fast as the process manager restarts it.
++//!
++//! The prune is where the index earns its place here, and its direction is 4.14's:
++//!
++//! * a series **some** live index may hold is one the store still holds, and stays;
++//! * a series **no** live index may hold is one the store has forgotten — retention expired the
++//!   segments that carried it, a merge dropped them — and it leaves the ledger, which is what
++//!   makes room for a new name. A cap that counted names for ever would be a lifetime quota on a
++//!   store whose retention window deliberately forgets;
++//! * an index that is **missing or damaged** is [`SegmentIndex::unstated`], which may hold
++//!   everything. It therefore proves nothing and drops nothing: the ledger keeps a name it cannot
++//!   rule out, which costs tracking *precision* — the store counts a series it may no longer hold —
++//!   and never an answer, because an index is a hint and the store's records are the store.
++//!
++//! # The conservation identity
++//!
++//! Every offer is counted, exactly once, on one side of the cap:
++//!
++//! ```text
++//! offered() == series_admitted() + series_rejected()
++//! ```
++//!
++//! and a series the cap refused is **not** in the ledger. That is the line a case can falsify, and
++//! it is the line a leak crosses: a refused name that is inserted anyway leaves `tracked_count`
++//! above the limit and the two counters short of `offered`. Nothing else in this module can be
++//! wrong about the cap without crossing it.
++//!
++//! A frame is judged as the batch it is, and the identity is over *series*: a frame whose records
++//! name three series is three offers, and a frame the cap refuses is a whole frame the store does
++//! not write — the write path stores a payload whole or not at all
++//! (`lakelet/4.5-batch-writes`), so a refusal that let half of a frame through would be an
++//! unstated partial write. Each series of a refused frame counts as rejected, including one the
++//! store already tracks, because what the counter answers is "did this store take this data".
++//!
++//! # What is yours
++//!
++//! The types and the signatures are the contract this step's spec, its ingest path and the tool are
++//! written against; the bodies are this step's work. The accessors and the conservation identity
++//! are given, because they are arithmetic. The three decisions that are not:
++//!
++//! * **where the ledger comes from.** It is *derived state*, and `lakelet/4.14-index-pruning` is the
++//!   step that argued why: a store that is wrong about its own cardinality because a sidecar went
++//!   stale is the failure that rule exists to prevent. [`Registry::of_store`] rebuilds it from what
++//!   the store itself has, and the case that decides whether the cap is a policy or a decoration is
++//!   the **restart** — a ledger that counted only what this process admitted lets a fresh limit of
++//!   names in every time the process manager restarts the daemon;
++//! * **what a rebuild may prune**, and which direction of it is the safe one;
++//! * **what one payload costs each series it names.** Whatever rule you pick, the numbers have to
++//!   add up to the bytes the store was handed, or the arithmetic on the page is a claim.
++//!
++//! # What this module deliberately does not do
++//!
++//! * **it does not read a clock.** `now` is handed in by the caller, so a case can charge a series
++//!   at any timestamp it likes and two runs of one workload agree;
++//! * **it does not decide what a client sees.** A refusal is a value ([`Admission`]) and the count
++//!   of it; the service's ingest path is what turns it into a log line and a frame that is not
++//!   stored, and `docs/cardinality.md` says what the client can observe;
++//! * **it does not evict.** A cap that dropped the oldest series to make room would answer a query
++//!   with a hole, and no count of anything would say so. The line this store draws is: the series
++//!   it already holds are kept, and the ones it cannot afford are the ones it never takes.
++
++pub mod cap;
++
++pub use cap::{Admission, Cap};
++
++use std::collections::BTreeMap;
++use std::path::Path;
++
++use crate::engine::index::SegmentIndex;
++use crate::engine::query::series::Series;
++use crate::error::Error;
++
++/// What one series has cost this store so far.
++///
++/// Four numbers, and each of them is a question somebody asks about cardinality: how many records
++/// the series is (`records`), how many bytes they took (`bytes`), and when it was first and last
++/// seen (`first_millis`, `last_millis`, both inclusive, milliseconds since the Unix epoch). The
++/// pair of timestamps is what makes "a series that was reported once, six months ago" visible: it
++/// is a series the cap is holding room for and nothing is reporting any more, and deciding what to
++/// do about those is what the page argues and what a future step's eviction policy would need.
++///
++/// `bytes` is what the write path was handed for this series, shared out over the series a payload
++/// named by how many records each carried (see [`Registry::charge`]): the numbers add up to exactly
++/// the bytes this store accepted, which is what makes the total on the page arithmetic rather than
++/// a claim.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Cost {
++    /// Records charged to this series.
++    records: u64,
++    /// Bytes charged to this series.
++    bytes: u64,
++    /// The earliest timestamp it was charged at.
++    first_millis: u64,
++    /// The latest timestamp it was charged at.
++    last_millis: u64,
++}
++
++impl Cost {
++    /// How many records this series has cost.
++    #[must_use]
++    pub const fn records(&self) -> u64 {
++        self.records
++    }
++
++    /// How many bytes this series has cost.
++    #[must_use]
++    pub const fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// The earliest timestamp this series was seen at, inclusive.
++    #[must_use]
++    pub const fn first_millis(&self) -> u64 {
++        self.first_millis
++    }
++
++    /// The latest timestamp it was seen at, inclusive.
++    #[must_use]
++    pub const fn last_millis(&self) -> u64 {
++        self.last_millis
++    }
++}
++
++/// The series a store has admitted, what each one cost, and the counters a run is judged on.
++///
++/// A store holds one of these. It is not a cache and not an index: it is the answer to "how much
++/// cardinality does this store carry", which is the question the cap is a policy about, and it is
++/// built from the store's own records rather than kept beside them (`Registry::of_store`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Registry {
++    /// The policy: how many series fit.
++    cap: Cap,
++    /// The live set, by name, in name order — which is the order [`Registry::tracked`] answers and
++    /// therefore the order the tool prints one line per series in. Sorted rather than in arrival
++    /// order because a table that reorders itself between two runs is a table nobody can diff.
++    tracked: BTreeMap<String, Cost>,
++    /// Series offers this registry admitted.
++    admitted: u64,
++    /// Series offers it refused.
++    rejected: u64,
++}
++
++impl Registry {
++    /// An empty ledger under this cap.
++    ///
++    /// Empty is the honest start for a caller that has no store: a registry that invented series
++    /// would be a cap counting something nobody reported.
++    #[must_use]
++    pub const fn new(cap: Cap) -> Self {
++        Self {
++            cap,
++            tracked: BTreeMap::new(),
++            admitted: 0,
++            rejected: 0,
++        }
++    }
++
++    /// The ledger of what these payloads carry: every record they hold, charged to the series it
++    /// names.
++    ///
++    /// This is how a store's ledger is rebuilt from the records it kept, and it is **not** an
++    /// offer: nothing is judged by the cap and no counter moves, because these records are already
++    /// in the store. What the cap decides is what a client may *add* to it, and a store that
++    /// refused its own records would be a store whose cap depended on which way round it was
++    /// opened.
++    ///
++    /// A payload that is not a batch this build can read contributes nothing: the write path
++    /// accepted bytes, and bytes that name no series are not the ledger's business.
++    #[must_use]
++    pub fn of_payloads(cap: Cap, payloads: &[Vec<u8>]) -> Self {
++        let _ = (cap, payloads);
++        todo!("the ledger of the records these payloads hold")
++    }
++
++    /// The ledger of the store rooted at `directory`, rebuilt from what the store itself holds.
++    ///
++    /// Two sources, in this order, and neither of them is a file this module owns:
++    ///
++    /// 1. **the log**, replayed read-only ([`replay::recover`]): every payload the write path
++    ///    accepted, which is the store's whole history of *names* even where retention has since
++    ///    expired the segments that carried them;
++    /// 2. **the sidecar indexes of the segments the store still holds**
++    ///    ([`compaction::live_indexes`]): the prune, which is what drops the names the store has
++    ///    forgotten and refolds every survivor's window to the extremes the indexes state.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Store`] when the log, the manifest or an index cannot be read, and
++    /// [`Error::Protocol`] when the log or the manifest is not this build's.
++    pub fn of_store(directory: &Path, cap: Cap) -> Result<Self, Error> {
++        let _ = (directory, cap);
++        todo!("the ledger of a store, rebuilt from the store")
++    }
++
++    /// The policy this ledger is judged by.
++    #[must_use]
++    pub const fn cap(&self) -> Cap {
++        self.cap
++    }
++
++    /// The live set, in name order: each tracked series and what it cost.
++    pub fn tracked(&self) -> impl Iterator<Item = (&str, &Cost)> {
++        // The scaffold answers nothing here: this is the one signature a `todo!()` cannot stand in
++        // for, because an opaque return type has to be a real value. Every case and the tool ask
++        // this for the whole live set, so an empty answer fails loudly rather than quietly.
++        std::iter::empty()
++    }
++
++    /// How many series the ledger holds right now: the number the cap's limit is measured against.
++    #[must_use]
++    pub fn tracked_count(&self) -> u64 {
++        self.tracked.len() as u64
++    }
++
++    /// What this series has cost, or `None` when the store does not track it.
++    ///
++    /// `None` is the informative answer: it says the store has no records naming this series that
++    /// it still holds, which is a different fact from a series that cost nothing.
++    #[must_use]
++    pub fn cost_of(&self, series: &str) -> Option<&Cost> {
++        let _ = series;
++        todo!("what one series has cost, or `None`")
++    }
++
++    /// How many series offers this ledger admitted.
++    #[must_use]
++    pub const fn series_admitted(&self) -> u64 {
++        self.admitted
++    }
++
++    /// How many series offers it refused.
++    #[must_use]
++    pub const fn series_rejected(&self) -> u64 {
++        self.rejected
++    }
++
++    /// How many series offers it was given: [`Registry::series_admitted`] plus
++    /// [`Registry::series_rejected`], added up here so that the identity is one call rather than
++    /// arithmetic a caller can get wrong.
++    #[must_use]
++    pub const fn offered(&self) -> u64 {
++        self.admitted.saturating_add(self.rejected)
++    }
++
++    /// Offer one series, and charge it what it carried when the store takes it.
++    ///
++    /// The rule is [`Cap`]'s: a series already in the ledger is always admitted, and a series the
++    /// store has never seen is admitted while the ledger has room for it. `records` and `bytes` are
++    /// what this offer carried, and `now` is when it happened — a timestamp in the record's own
++    /// units, handed in rather than read from a clock, so that a case can charge any moment it
++    /// likes and two runs of one workload report the same numbers.
++    ///
++    /// A refusal charges nothing: the series is not in the ledger, its cost is not moved, and the
++    /// only trace of it is [`Registry::series_rejected`].
++    pub fn admit(&mut self, series: &Series<'_>, records: u64, bytes: u64, now: u64) -> Admission {
++        let _ = (series, records, bytes, now);
++        todo!("one series offered, and what the cap answered")
++    }
++
++    /// Offer one frame's payload: every series its records name, judged as one batch.
++    ///
++    /// `None` when these bytes are not a batch this build can read. That is not a refusal and not an
++    /// error: the cap judges *records*, and payload bytes that decode to no records — the frames
++    /// `lakelet/4.1-ingest-protocol` accepts whatever a client sends, and a store's own budget
++    /// harnesses hand the write path payloads directly — name no series and are the write path's
++    /// business.
++    ///
++    /// The frame is judged whole, because the write path stores a payload whole or not at all: if
++    /// every series it names either is tracked already or fits beside the ones that are, the frame
++    /// is `Admitted` and each series is charged its share of the payload's bytes — shared out by
++    /// record count, so a store's per-series bytes add up to exactly the bytes it was handed.
++    /// Otherwise the frame is `Rejected`, every series it named is counted as rejected, and nothing
++    /// is charged, because nothing is written.
++    pub fn charge(&mut self, payload: &[u8]) -> Option<Admission> {
++        let _ = payload;
++        todo!("one frame's payload, and what the cap answered about it")
++    }
++
++    /// Rebuild the ledger against the sidecar indexes of the segments a store still holds.
++    ///
++    /// One rule per index, and both directions are the safe one:
++    ///
++    /// * a series **some** index may hold stays, with its window refolded to the extremes those
++    ///   indexes state (`SegmentIndex::zone`) — the store's own answer about when the series
++    ///   happened, rather than the one the log's records gave;
++    /// * a series **no** index may hold is dropped: the store has forgotten it, and a cap that
++    ///   counted forgotten names would refuse new ones for a store with room to spare;
++    /// * an index that is missing or damaged is [`SegmentIndex::unstated`], which may hold
++    ///   everything and therefore drops nothing. The ledger keeps a name it cannot rule out, which
++    ///   costs precision and never an answer.
++    ///
++    /// An empty slice is a store with no segments to check against — a directory whose write path
++    /// has never closed one — and it drops nothing for the same reason: a caller that has no
++    /// evidence has made no claim.
++    pub fn rebuild(&mut self, indexes: &[SegmentIndex]) {
++        let _ = indexes;
++        todo!("the live set, checked against the segments the store still holds")
++    }
++}
++
++/// The series one payload's records name, in name order: the names a caller has to log, count or
++/// display.
++///
++/// The reading is the same one [`Registry::charge`] judges a frame by, so a caller that names a
++/// refused frame's series and the cap that refused it cannot disagree about what the frame carried.
++/// `None` when these bytes are not a batch this build can read, or name no series at all.
++#[must_use]
++pub fn series_of(payload: &[u8]) -> Option<Vec<String>> {
++    let _ = payload;
++    todo!("the series a payload's records name")
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 4f95286..786cea1 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -51,6 +51,10 @@ pub mod trace;
+ // `lakelet/4.17-soak`: what is still alive after a long run — the files a store holds open, the
+ // files it keeps, and the one report a soak reads them out of.
+ pub mod soak;
++// `lakelet/4.18-cardinality-cost`: how many series a store carries, what each one costs, and the
++// cap that refuses a name nobody has reported yet. The store's own ledger, rebuilt from its log and
++// its segments' sidecars.
++pub mod cardinality;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.

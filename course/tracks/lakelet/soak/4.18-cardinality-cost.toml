@@ -1,0 +1,40 @@
+# The long run `lakelet/4.18-cardinality-cost` is judged by: the same harness, the same workload and
+# the same bounds `lakelet/4.17-soak` measured — because the gate is step-scoped and this step's
+# subject is what the cap must *not* move.
+#
+# Why a cap soaks at all: a cap on the series a store tracks is a policy about *state*, and the two
+# failures it exists to prevent are failures a long run finds and a short one does not. A ledger that
+# counts a refused name anyway makes the cap meaningless slowly, and a refusal that turned away the
+# store's own traffic shows up as `refused` moving rather than as an error anywhere.
+#
+# The harness is `tests/soak.rs`, unchanged by this step. Its workload writes eight series, and the
+# cap this build ships is 1024, so a correct step leaves every number where 4.17 left it. Measured on
+# this step's reference solution over four thousand cycles, against the same run without the cap:
+#
+#   after:  open_tasks=2  open_handles=0  store_files=13  store_bytes=2743  records=384
+#   before: open_tasks=2  open_handles=0  store_files=13  store_bytes=2743  records=384
+#
+# Counter for counter identical, and `store_bytes` walked the same 2734..2747 range over both runs —
+# so the bounds below are 4.17's and are not this step's to move. A change here that moves one of
+# them is wrong and the bound is right: the numbers above are the evidence.
+#
+# Every metric is an upper bound — all five are *stocks*, and "not above this" is the only verdict
+# that means anything about a number whose failure mode is growth. The wall clock is printed beside
+# them as evidence and never judged (handoff M2 §1.1).
+command = "cargo test -p lakelet --test soak -- --nocapture"
+cycles_min = 4000
+
+[metric]
+# Tasks the service has spawned and not reaped. Two are alive for the whole run.
+open_tasks_max = 3
+# Files the store holds open between two cycles; one per cycle is the defect.
+open_handles_max = 1
+# Files the store itself names: the manifest, and the segment and the index of every ordinal it lists.
+store_files_max = 14
+# What those files cost together: the same records at two times of day differ by a few timestamp
+# varints, which is why this bound sits far above the 2743 the reference solution reports.
+store_bytes_max = 6000
+# Cycles the store refused. The cap's expected contribution to this number is zero: the soak's eight
+# series fit inside the default cap, and a refusal here would mean the cap turned away the store's own
+# traffic.
+refused_max = 0
