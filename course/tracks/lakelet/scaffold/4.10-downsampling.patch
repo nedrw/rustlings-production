@@ -33,7 +33,7 @@ new file mode 100644
 index 0000000..ded95ff
 --- /dev/null
 +++ b/src/cli/mod.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,166 @@
 +//! The read side of the store, as an interface another program consumes.
 +//!
 +//! `lakeletd` is a process a supervisor starts; `lakeletq` is a tool a *script* runs, and a script
@@ -195,6 +195,11 @@ index 0000000..ded95ff
 +         this module's header — the grammar, the two renderers and the exit codes are yours"
 +    )
 +}
++// The modules a later step adds are declared inside this block: a scaffold may only write
++// inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits
++// safe (docs/authoring.md §5).
++// kiln:scaffold:begin
++// kiln:scaffold:end
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
 index fd2d4db..c068e24 100644
 --- a/src/engine/mod.rs
