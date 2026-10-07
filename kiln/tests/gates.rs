@@ -73,14 +73,20 @@ fn course_with(scratch: &Scratch, gates: &[&str], lib_rs: &str) -> Course {
 
 /// The reference solution the fixture's step declares.
 ///
-/// Nothing here applies it: `mutants` and `coverage` read it for *which* files the step is about, and
-/// an insertion with no context line is a patch that parses against any `lib.rs`, so the fixture does
-/// not have to keep its text in step with the crate below.
+/// Nothing here applies it: `mutants` and `coverage` read it for *which* files — and, for
+/// `mutants`, *which lines* — the step is about, and an insertion with no context line is a patch
+/// that parses against any `lib.rs`, so the fixture does not have to keep its text in step with the
+/// crate below. The lines it writes are the fixture crate's [`BUMP`], because that is where the
+/// mutable operators the gate samples live: a patch that wrote a doc comment somewhere else would
+/// leave the walk with nothing of the step's own to mutate.
 const SOLUTION: &str = concat!(
     "--- a/src/lib.rs\n",
     "+++ b/src/lib.rs\n",
-    "@@ -1,0 +2,1 @@\n",
-    "+/// The reference solution adds this line.\n",
+    "@@ -1,0 +2,4 @@\n",
+    "+/// Doubles a positive value; zero is a case of its own.\n",
+    "+pub fn bump(value: u32) -> u32 {\n",
+    "+    if value > 0 { value + value } else { 100 }\n",
+    "+}\n",
 );
 
 /// Write a fixture file, with `{crate}` standing for the fixture crate's (unique) name.

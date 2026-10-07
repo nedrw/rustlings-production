@@ -8,8 +8,12 @@
 //! Four rules keep it deterministic and free of external tools (handoff M2 §1):
 //!
 //! * **what** is mutated comes from the course's own metadata: the `.rs` files under `src/` that this
-//!   step's reference-solution patch touches ([`sources::production_sources`]). A new step cannot
-//!   forget to register its module, because the patch *is* the module;
+//!   step's reference-solution patch touches, cut down to **the lines that patch writes**
+//!   ([`sources::production_lines`]). A new step cannot forget to register its module, because the
+//!   patch *is* the module — and a step is not judged on the lines a neighbour wrote in a file it
+//!   happens to edit (`docs/handoff-m3.md` §5 records four measurements of exactly that, the last
+//!   one a step whose own ratio fell to 66% because two later steps had edited files its patch
+//!   touched);
 //! * **where** is decided by source order: the mutants are taken evenly spaced over the candidate
 //!   positions, starting at the first one, at most [`MUTANT_CAP`] of them are judged and at most
 //!   [`ATTEMPT_CAP`] sites are tried;
@@ -187,7 +191,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     };
 
     let track_dir = ctx.track.dir(ctx.course.root());
-    let module = sources::production_sources(&track_dir, ctx.step)?;
+    let module = sources::production_lines(&track_dir, ctx.step)?;
     if module.is_empty() {
         return Ok(GateOutcome::blocked(format!(
             "{}'s reference solution touches no production source under `src/`, so the module this \
@@ -198,9 +202,14 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 
     let candidates = candidates(project, &module)?;
     if candidates.is_empty() {
+        let listed = module
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<String>>()
+            .join(", ");
         return Ok(GateOutcome::blocked(format!(
-            "no mutable operator in the step's module ({}), so there is nothing to mutate",
-            module.join(", ")
+            "no mutable operator in the lines this step's patch writes ({listed}), so there is nothing \
+             to mutate"
         )));
     }
     let attempts = sample(&candidates, ATTEMPT_CAP);
@@ -445,9 +454,10 @@ fn judge(tally: Tally<'_>) -> GateOutcome {
 
 /// Every position that could be mutated, in source order: the files in the order the patch lists
 /// them, then line by line, then left to right within a line.
-fn candidates(project: &Path, module: &[String]) -> Result<Vec<Mutant>> {
+fn candidates(project: &Path, module: &[sources::FileLines]) -> Result<Vec<Mutant>> {
     let mut all = Vec::new();
-    for path in module {
+    for file in module {
+        let path = &file.path;
         // A file the patch touches but the project does not have is not a mutant site: the spec run
         // will say what is missing, and mutating a file nobody wrote is not this gate's question.
         let Ok(text) = std::fs::read_to_string(project.join(path)) else {
@@ -457,6 +467,13 @@ fn candidates(project: &Path, module: &[String]) -> Result<Vec<Mutant>> {
         let mut start = 0usize;
         for (index, chunk) in text.split_inclusive('\n').enumerate() {
             let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+            // Only the lines this step's patch writes are its work: a line an earlier or a later
+            // step wrote is not something this step's suite can be asked to notice
+            // ([`sources::production_lines`]).
+            if file.lines.binary_search(&(index + 1)).is_err() {
+                start += chunk.len();
+                continue;
+            }
             let on_this_line = classes.get(start..start + line.len()).unwrap_or_default();
             for edit in edits(line, on_this_line) {
                 let Some(after) = apply(line, &edit) else {
@@ -851,7 +868,10 @@ mod tests {
         let scratch = crate::test_support::TempDir::new("mutants-splice");
         let text = "fn a() { 1 }\nfn b() { 1 + 1 }\nfn c() { 1 }\n";
         scratch.write("src/lib.rs", text);
-        let module = ["src/lib.rs".to_owned()];
+        let module = [sources::FileLines {
+            path: "src/lib.rs".to_owned(),
+            lines: (1..=200).collect(),
+        }];
         let found = candidates(scratch.path(), &module).expect("the fixture is readable");
 
         // Five sites: the `1` of `a`, then `1`, `+` and `1` of `b`, then the `1` of `c`.
@@ -866,9 +886,42 @@ mod tests {
     }
 
     #[test]
+    fn a_line_the_patch_does_not_write_is_not_a_site() {
+        // The rule the walk's sampling scope rests on (handoff M3 §5): a file a step *edits*
+        // carries lines an earlier or a later step wrote, and a site among them is one this step's
+        // suite cannot be asked to notice.
+        let scratch = crate::test_support::TempDir::new("mutants-lines");
+        scratch.write(
+            "src/lib.rs",
+            "pub fn f(a: u32) -> u32 {\n    let b = a + 1;\n    if b > 2 { b } else { 0 }\n}\n",
+        );
+        let all = |lines: Vec<usize>| {
+            [sources::FileLines {
+                path: "src/lib.rs".to_owned(),
+                lines,
+            }]
+        };
+        let every_line = candidates(scratch.path(), &all((1..=4).collect())).expect("readable");
+        assert!(
+            every_line.iter().any(|mutant| mutant.line == 2),
+            "the line the fixture holds is a site when the patch wrote it: {every_line:?}"
+        );
+        let only_the_third = candidates(scratch.path(), &all(vec![3])).expect("readable");
+        assert!(
+            only_the_third
+                .iter()
+                .all(|mutant| mutant.line == 3 && !mutant.before.contains('+')),
+            "only the written line is sampled, and only its own operators: {only_the_third:?}"
+        );
+    }
+
+    #[test]
     fn a_file_the_solution_touches_but_the_project_lacks_is_not_a_site() {
         let scratch = crate::test_support::TempDir::new("mutants-missing");
-        let module = ["src/gone.rs".to_owned()];
+        let module = [sources::FileLines {
+            path: "src/gone.rs".to_owned(),
+            lines: vec![1, 2, 3],
+        }];
         let found = candidates(scratch.path(), &module).expect("a missing file is not an error");
         assert!(found.is_empty(), "{found:?}");
     }

@@ -7,8 +7,8 @@
 //!   course already says where a step's work is — its patches. The two gates ask different questions
 //!   of that, and deliberately read different sets: `coverage` measures what the step *introduces*
 //!   ([`introduced_sources`]: the files its scaffold and its reference solution create), and
-//!   `mutants` samples every file the reference solution touches ([`production_sources`]). The
-//!   reasons are written out on each function.
+//!   `mutants` samples the **lines** the reference solution writes (`[production_lines]`) — the
+//!   files it touches, cut down to its own work. The reasons are written out on each function.
 //! * **where does the course keep what the gate judges against?** Course-owned files next to `spec/`,
 //!   at the same trust level: readable, useless to edit, because the gate reads the course's copy.
 //!   A bench baseline is per judged step (`budget/<step-id>.toml`); a public-API witness is *not* —
@@ -19,8 +19,93 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{KilnError, Result};
 use crate::info::Step;
-use crate::patch::{Patch, Section};
+use crate::patch::{Kind, Patch, Section};
 use crate::project::{self, Scaffold};
+
+/// One file of a step's own work, as `mutants` samples it: the path, and the new-file line numbers
+/// that step's reference-solution patch adds or changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLines {
+    /// Path relative to the project.
+    pub path: String,
+    /// New-file line numbers, ascending: the lines the patch writes.
+    pub lines: Vec<usize>,
+}
+
+/// The lines a step's own work occupies: for every `src/**/*.rs` file its reference-solution patch
+/// touches, the **new-file line numbers the patch adds or changes**.
+///
+/// This is what `mutants` samples, and it is a *narrower* question than [`production_sources`] on
+/// purpose. That list is files, and a file a step edits also carries every line an earlier or a
+/// later step wrote — a site on one of those lines is not this step's code, and its spec cannot be
+/// asked to kill it. The difference was measured, not assumed (handoff-m3 §5): the walk sampled
+/// `4.10`'s `MAX_WINDOWS` line against `4.12`'s suite, `4.11`'s `render_plan` against `4.10`'s,
+/// `4.10`'s window bound against `4.14`'s, and finally `4.12`'s own suite dropped to 66% on the
+/// tail tree because `4.13`–`4.18` had edited two of the files its patch touches.
+///
+/// A line the patch *removes* is not here: it does not exist in the tree the suite runs against.
+/// A file the patch only deletes has no lines at all, and the caller says what that means.
+pub fn production_lines(track_dir: &Path, step: &Step) -> Result<Vec<FileLines>> {
+    let Some(solution) = project::load_solution(track_dir, step)? else {
+        return Ok(Vec::new());
+    };
+    Ok(written_lines(&solution))
+}
+
+/// The lines `patch` writes into every production source it touches, in patch order.
+fn written_lines(patch: &Patch) -> Vec<FileLines> {
+    let mut files: Vec<FileLines> = Vec::new();
+    for file in patch.sections() {
+        if !is_production_source(&file.path) {
+            continue;
+        }
+        let mut lines: Vec<usize> = Vec::new();
+        // Where this hunk starts on the new side: its own old start, moved by what the hunks before
+        // it added or removed. A created file has no old side at all and starts at line 1.
+        let mut offset: isize = 0;
+        for hunk in &file.hunks {
+            let mut at = if file.section == Section::Create {
+                1
+            } else {
+                hunk.old_start as isize + offset
+            };
+            let mut added: isize = 0;
+            let mut removed: isize = 0;
+            for line in &hunk.lines {
+                match line.kind {
+                    Kind::Add => {
+                        if at > 0 {
+                            lines.push(at as usize);
+                        }
+                        at += 1;
+                        added += 1;
+                    }
+                    Kind::Context => at += 1,
+                    Kind::Remove => removed += 1,
+                }
+            }
+            offset += added - removed;
+        }
+        let Some(known) = files.iter_mut().find(|known| known.path == file.path) else {
+            files.push(FileLines {
+                path: file.path.clone(),
+                lines,
+            });
+            continue;
+        };
+        // A patch may list one file twice (a scaffold section and a solution section); the lines
+        // are one set, in the order they were written.
+        for line in lines {
+            if !known.lines.contains(&line) {
+                known.lines.push(line);
+            }
+        }
+    }
+    for file in &mut files {
+        file.lines.sort_unstable();
+    }
+    files
+}
 
 /// The production sources a step's reference solution touches, relative to the project.
 ///
