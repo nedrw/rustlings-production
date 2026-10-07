@@ -1,0 +1,918 @@
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+index 4543ed8..45407ab 100644
+--- a/src/engine/compaction/mod.rs
++++ b/src/engine/compaction/mod.rs
+@@ -14,7 +14,7 @@
+ //! ```text
+ //!  <store>/ingest.log                 the log (`lakelet/4.1-ingest-protocol` … `4.4-wal-recovery`)
+ //!  <store>/segments/<n>.lks           one closed segment per file, named by its ordinal
+-//!  <store>/segments.manifest          what the store is: an epoch and the segments it is made of
++//!  <store>/segments.manifest          what the store is: an epoch, a floor and the segments
+ //!  <store>/segments.manifest.pending  a manifest being written (see the swap, below)
+ //! ```
+ //!
+@@ -27,6 +27,56 @@
+ //! manifest states is refused rather than read, because an index that disagrees with its files is a
+ //! store nobody can answer from: answering without that segment would answer a *hole*.
+ //!
++//! # The index, byte for byte
++//!
++//! ```text
++//!  0..4      `MAGIC`: the four bytes that say this file is this store's index
++//!  4         `VERSION`: the layout's version, one byte — this build writes 2
++//!  5..13     u64, little endian: the epoch
++//!  13..21    u64, little endian: the floor (`lakelet/4.9-retention`)
++//!  21..25    u32, little endian: how many entries follow
++//!  25..      one 40-byte entry per segment, in the manifest's order:
++//!              0..8    u64: the segment's ordinal
++//!              8..16   u64: how many bytes its file holds
++//!              16..24  u64: how many records it holds
++//!              24..32  u64: the earliest timestamp it holds, in milliseconds
++//!              32..40  u64: the latest timestamp it holds, in the same units
++//!  then      u32, little endian: the seal over everything above (`wal::checksum`)
++//! ```
++//!
++//! The last pair is a range this build wrote down, or `u64::MAX` twice — a millisecond no record
++//! can have, because a record's `ts_millis` is an `i64` this store converts and the largest one it
++//! can state is `i64::MAX as u64`. The pair is therefore the *absence* of a range rather than a
++//! range: an entry nobody could state an age for still costs the same forty bytes, decoding it
++//! needs no error branch, and nothing claims an age that is not there. A segment can be described
++//! without one (`SegmentInfo::new`, a value built for a decision about size), and
++//! `lakelet/4.9-retention` is where that matters: a policy never deletes a segment whose age the
++//! index does not state.
++//!
++//! Version 2 is `lakelet/4.9-retention`'s: the floor in the header and a time range per segment.
++//! The version byte is what makes an older index a *refusal* rather than a misreading — a version 1
++//! manifest read as this one would state segments with no timestamps and a floor of whatever bytes
++//! happened to sit there, and a retention pass would then delete data on numbers nobody wrote.
++//!
++//! # Retention: a floor, and segments that carry a time range
++//!
++//! The floor is the millisecond the store has already **forgotten up to**: everything below it is
++//! not an answer any more. It is written down rather than recomputed from the policy, and that is
++//! the whole point of it — a promise that data is gone cannot be taken back, so a store whose
++//! answers changed when a configuration file was edited would be a store whose deletion was a
++//! suggestion. [`Segments::expire`] never moves it backwards: the cutoff a pass acts on is
++//! `policy.cutoff(now)` or the floor, whichever is later.
++//!
++//! A pass deletes **whole segments**, and only those whose last record is below the cutoff
++//! (`lakelet/4.9-retention`'s [`retention::Policy::plan`]). A segment whose entry states no range —
++//! a value somebody built for a decision about size, never a segment this store wrote — is never
++//! one of them: nobody wrote down when its records happened, and a store does not delete data on a
++//! number nobody wrote. A segment that stays but reaches below
++//! the cutoff is a **straddler**: it is not deleted (that would take newer records with it) and it
++//! is not rewritten (that is a merge's business, and a pass that rewrote would pay the write
++//! amplification `lakelet/4.8-compaction` exists to bound). Its old records stay on the disk and
++//! stop being answers through the read path (`Snapshot::records`), which is what the floor is for.
++//!
+ //! # The five stages of a merge, and what a crash at each one leaves
+ //!
+ //! | stage | what is on the device | what the store is after a restart |
+@@ -53,11 +103,12 @@
+ //! # What this module does not do
+ //!
+ //! A merge keeps every record it takes, in the order it found them: this store has no key that a
+-//! later record could shadow, and nothing here deletes a record — `lakelet/4.9-retention` is where
+-//! "remove" gets a second meaning, and it will have to say what happens to a record a merge is in
+-//! the middle of copying. Nor does this module decide *when* a merge runs: [`Segments::compact`] is
+-//! the whole job in one call for a background task, and `lakelet/4.11-query-engine` is what reads
+-//! the segments a snapshot names when a query arrives.
++//! later record could shadow, and a merge deletes nothing at all. The one operation here that
++//! removes data is [`Segments::expire`], and it removes whole segments — never a record inside one,
++//! because removing a record means rewriting the file around it. Nor does this module decide *when*
++//! either of them runs: [`Segments::compact`] is a merge in one call and [`Segments::expire`] is a
++//! retention pass in one call, for a background task that decides the schedule, and
++//! `lakelet/4.11-query-engine` is what reads the segments a snapshot names when a query arrives.
+ 
+ pub mod plan;
+ pub mod snapshot;
+@@ -68,6 +119,7 @@ pub use snapshot::Snapshot;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
++use crate::engine::retention::{self, ExpireReport};
+ use crate::engine::segment;
+ use crate::engine::wal::checksum;
+ use crate::error::Error;
+@@ -98,13 +150,20 @@ const DIGITS: usize = 10;
+ const MAGIC: [u8; 4] = *b"LKLM";
+ 
+ /// The manifest layout's version.
+-const VERSION: u8 = 1;
++///
++/// 2 added the floor to the header and the two timestamps to every entry (see the layout in the
++/// module docs). A version 1 index is refused by [`Manifest::decode`] rather than read as a version
++/// 2 one, which is the only honest answer: its entries are 24 bytes and say nothing about time, so
++/// reading it would mean acting on numbers nobody wrote.
++const VERSION: u8 = 2;
+ 
+-/// The bytes one entry of a manifest takes: an index, a length and a record count.
+-const ENTRY: usize = 24;
++/// The bytes one entry of a manifest takes: an index, a length, a record count and the two
++/// timestamps that bound the segment.
++const ENTRY: usize = 40;
+ 
+-/// The bytes before a manifest's first entry: [`MAGIC`], [`VERSION`], the epoch and the count.
+-const HEADER: usize = MAGIC.len() + 1 + 8 + 4;
++/// The bytes before a manifest's first entry: [`MAGIC`], [`VERSION`], the epoch, the floor and the
++/// count.
++const HEADER: usize = MAGIC.len() + 1 + 8 + 8 + 4;
+ 
+ /// The file one segment's bytes live in: `<directory>/segments/<index>.lks`.
+ ///
+@@ -116,24 +175,33 @@ pub fn file_of(directory: &Path, index: u64) -> PathBuf {
+     directory.join(DIRECTORY).join(file_name(index))
+ }
+ 
+-/// What the store is: an epoch, and the segments it is made of, oldest first.
++/// What the store is: an epoch, a floor, and the segments it is made of, oldest first.
+ ///
+ /// The epoch changes every time the store changes shape — a segment is closed, a merge is
+-/// installed — and it is the number a [`Snapshot`] carries, so "these two readers saw the same
+-/// store" is a comparison rather than an argument.
++/// installed, a retention pass expires something — and it is the number a [`Snapshot`] carries, so
++/// "these two readers saw the same store" is a comparison rather than an argument.
++///
++/// The floor (`lakelet/4.9-retention`) is the millisecond the store has forgotten up to: the cutoff
++/// of the last pass that changed anything, and `0` while nothing has been expired. It travels with
++/// the epoch because the two answer the same kind of question — the epoch says *when* a reader's
++/// view was taken, the floor says *what that view may still answer* — and only the floor of the
++/// manifest a snapshot named decides what that snapshot answers.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Manifest {
+     /// How many times the store has changed shape.
+     epoch: u64,
++    /// The millisecond this store has forgotten up to, or `0` when nothing has been expired.
++    floor: u64,
+     /// The segments, in the order their records were accepted.
+     segments: Vec<SegmentInfo>,
+ }
+ 
+ impl Manifest {
+-    /// An empty store: no segments, and an epoch nothing has happened at yet.
++    /// An empty store: no segments, a floor of nothing, and an epoch nothing has happened at yet.
+     fn empty() -> Self {
+         Self {
+             epoch: 0,
++            floor: 0,
+             segments: Vec::new(),
+         }
+     }
+@@ -144,6 +212,12 @@ impl Manifest {
+         self.epoch
+     }
+ 
++    /// The millisecond this store has forgotten up to: everything below it is not an answer.
++    #[must_use]
++    pub fn floor(&self) -> u64 {
++        self.floor
++    }
++
+     /// The segments that are the store, oldest first.
+     #[must_use]
+     pub fn segments(&self) -> &[SegmentInfo] {
+@@ -200,11 +274,17 @@ impl Manifest {
+         body.extend_from_slice(&MAGIC);
+         body.push(VERSION);
+         body.extend_from_slice(&self.epoch.to_le_bytes());
++        body.extend_from_slice(&self.floor.to_le_bytes());
+         body.extend_from_slice(&count.to_le_bytes());
+         for info in &self.segments {
+             body.extend_from_slice(&info.index.to_le_bytes());
+             body.extend_from_slice(&info.bytes.to_le_bytes());
+             body.extend_from_slice(&info.records.to_le_bytes());
++            // A segment whose age nobody stated is written as the pair no record can have, so that
++            // the entry stays one width and the reader below can tell the two apart (`NO_RANGE`).
++            let (first_millis, last_millis) = info.stated();
++            body.extend_from_slice(&first_millis.to_le_bytes());
++            body.extend_from_slice(&last_millis.to_le_bytes());
+         }
+         // One seal over the whole body, in the shape the log and a segment use: a length and the
+         // bytes it covers. A manifest a device changed is a manifest whose segments cannot be
+@@ -255,14 +335,20 @@ impl Manifest {
+         if *version != VERSION {
+             return Err(refused(format!(
+                 "{} says it is manifest layout version {version} and this build writes version \
+-                 {VERSION}",
++                 {VERSION}: version {VERSION} states each segment's time range and the store's \
++                 floor, and an index that does not is refused rather than read as one that does, \
++                 because a retention pass acting on a range nobody wrote would delete data that is \
++                 still an answer",
+                 path.display()
+             )));
+         }
+         let Some(epoch) = u64_at(bytes, MAGIC.len() + 1) else {
+             return Err(refused(format!("{} has no epoch", path.display())));
+         };
+-        let Some(count) = u32_at(bytes, MAGIC.len() + 1 + 8) else {
++        let Some(floor) = u64_at(bytes, MAGIC.len() + 1 + 8) else {
++            return Err(refused(format!("{} has no floor", path.display())));
++        };
++        let Some(count) = u32_at(bytes, MAGIC.len() + 1 + 8 + 8) else {
+             return Err(refused(format!("{} has no entry count", path.display())));
+         };
+         let stated = (count as usize)
+@@ -309,10 +395,12 @@ impl Manifest {
+         let mut segments = Vec::with_capacity(count as usize);
+         for number in 0..count as usize {
+             let at = HEADER + number * ENTRY;
+-            let (Some(index), Some(length), Some(records)) = (
++            let (Some(index), Some(length), Some(records), Some(first), Some(last)) = (
+                 u64_at(bytes, at),
+                 u64_at(bytes, at + 8),
+                 u64_at(bytes, at + 16),
++                u64_at(bytes, at + 24),
++                u64_at(bytes, at + 32),
+             ) else {
+                 return Err(refused(format!(
+                     "{}'s entry {number} is cut: an index with a half-written entry is an index \
+@@ -320,9 +408,13 @@ impl Manifest {
+                     path.display()
+                 )));
+             };
+-            segments.push(SegmentInfo::new(index, length, records));
++            segments.push(SegmentInfo::from_entry(index, length, records, first, last));
+         }
+-        Ok(Self { epoch, segments })
++        Ok(Self {
++            epoch,
++            floor,
++            segments,
++        })
+     }
+ }
+ 
+@@ -410,12 +502,21 @@ impl Segments {
+         self.policy
+     }
+ 
+-    /// What the store is: the epoch, and the segments it is made of.
++    /// What the store is: the epoch, the floor, and the segments it is made of.
+     #[must_use]
+     pub fn manifest(&self) -> &Manifest {
+         self.current.manifest()
+     }
+ 
++    /// The millisecond this store has forgotten up to (`lakelet/4.9-retention`).
++    ///
++    /// Everything below it is not an answer any more, whatever segment happens to still hold it,
++    /// and it never moves backwards: `0` while nothing has been expired.
++    #[must_use]
++    pub fn floor(&self) -> u64 {
++        self.current.manifest().floor()
++    }
++
+     /// What a reader holds: the segments that are the store right now, and the promise that they
+     /// are still there — and still this set — however many merges happen while the reader reads.
+     #[must_use]
+@@ -449,11 +550,19 @@ impl Segments {
+         let path = file_of(&self.directory, index);
+         segment::write(&path, records)?;
+         flush(&path)?;
+-        let info = SegmentInfo::new(index, length_of(&path)?, records.len() as u64);
++        let (first_millis, last_millis) = range_of(records);
++        let info = SegmentInfo::spanning(
++            index,
++            length_of(&path)?,
++            records.len() as u64,
++            first_millis,
++            last_millis,
++        );
+         let mut segments = self.current.manifest().segments().to_vec();
+         segments.push(info);
+         let manifest = Manifest {
+             epoch: self.current.manifest().epoch() + 1,
++            floor: self.current.manifest().floor(),
+             segments,
+         };
+         self.write_manifest(manifest.clone())?;
+@@ -545,6 +654,17 @@ impl Segments {
+         let mut records: Vec<Record> = Vec::with_capacity(plan.records() as usize);
+         let mut taken: Vec<u64> = Vec::with_capacity(positions.len());
+         let mut bytes_in = 0u64;
++        // The range of the segment this merge writes is the union of its inputs' ranges, and the
++        // index already holds every one of them: nothing here reads a record to find out when the
++        // records happened, because the store wrote that down when it closed each segment — the same
++        // reason the sizes and counts above come from the manifest rather than from the files.
++        //
++        // An input whose range nobody stated makes the union unstated as well: the merged file holds
++        // records whose age is not written down anywhere, and saying nothing about it is the only
++        // honest answer (`SegmentInfo`).
++        let mut first_millis: Option<u64> = None;
++        let mut last_millis: Option<u64> = None;
++        let mut stated = true;
+         for position in &positions {
+             let Some(info) = segments.get(*position) else {
+                 continue;
+@@ -552,7 +672,19 @@ impl Segments {
+             records.extend(segment::read(&file_of(&self.directory, info.index))?);
+             taken.push(info.index);
+             bytes_in += info.bytes;
++            match (info.first_millis(), info.last_millis()) {
++                (Some(first), Some(last)) => {
++                    first_millis = Some(first_millis.map_or(first, |current| current.min(first)));
++                    last_millis = Some(last_millis.map_or(last, |current| current.max(last)));
++                }
++                _ => stated = false,
++            }
+         }
++        let range = if stated {
++            first_millis.zip(last_millis)
++        } else {
++            None
++        };
+ 
+         let index = self.next;
+         let file = file_of(&self.directory, index);
+@@ -566,6 +698,7 @@ impl Segments {
+             bytes: length_of(&file_of(&self.directory, index))?,
+             bytes_in,
+             records: records.len() as u64,
++            range,
+             segments_before: segments.len(),
+         };
+         self.pending = Some(index);
+@@ -601,9 +734,11 @@ impl Segments {
+         for info in &before {
+             if ran.taken.contains(&info.index) {
+                 // The new segment sits where its inputs did, which is what keeps the store's order
+-                // the order the records were accepted in.
++                // the order the records were accepted in — and it states the union of their time
++                // ranges, so the index goes on answering "when did the records in this segment
++                // happen" without a file being read.
+                 if !placed {
+-                    segments.push(SegmentInfo::new(ran.index, ran.bytes, ran.records));
++                    segments.push(ran.entry());
+                     placed = true;
+                 }
+                 continue;
+@@ -622,6 +757,9 @@ impl Segments {
+         let after = segments.len();
+         let manifest = Manifest {
+             epoch: ran.epoch,
++            // A merge moves no floor: every record it took is still in the store, so what the store
++            // has promised to have forgotten is exactly what it was.
++            floor: self.current.manifest().floor(),
+             segments,
+         };
+         self.write_manifest(manifest.clone())?;
+@@ -645,6 +783,72 @@ impl Segments {
+         })
+     }
+ 
++    /// Expire every segment older than `policy`'s cutoff, and report what the store stopped
++    /// holding.
++    ///
++    /// This is the one call in this module that removes data, and the rule is
++    /// `lakelet/4.9-retention`'s: **a segment expires exactly when its last timestamp is below the
++    /// cutoff**, so a pass removes whole files and never rewrites one. A segment that stays but
++    /// reaches below the cutoff is a straddler — it holds records on both sides, so deleting it
++    /// would delete records newer than the cutoff, and rewriting it is a merge's business. Its old
++    /// records stop being answers through the read path instead ([`Snapshot::records`]), which is
++    /// what the floor is.
++    ///
++    /// The cutoff is `policy.cutoff(now_millis)` or the store's own floor, whichever is later: a
++    /// store that has said "everything below this is gone" cannot be talked out of it by a policy
++    /// whose window grew, or by a clock that moved backwards. `now_millis` is passed in rather than
++    /// read here, so a pass is a value a caller decides the time of — the same reason
++    /// `lakelet/4.3-write-path-adr` made the fsync policy a value.
++    ///
++    /// Nothing at all is written when the plan is empty: the epoch, the index's bytes and every
++    /// file stay exactly as they were. A task that runs a pass every minute would otherwise rewrite
++    /// the index every minute to say what it already said.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when a merge is written and not installed — a pass replaces the index the
++    /// merge is about to install, so the two are serialized rather than interleaved — and
++    /// [`Error::Store`] when the manifest cannot be written or put in place.
++    pub fn expire(
++        &mut self,
++        policy: &retention::Policy,
++        now_millis: u64,
++    ) -> Result<ExpireReport, Error> {
++        if let Some(index) = self.pending {
++            return Err(Error::Invalid {
++                detail: format!(
++                    "segment {index} has been written by a merge and not installed yet: a retention \
++                     pass replaces the index that merge is about to install, so `install` it (or \
++                     drop the `Merge`, and open the store again) before expiring anything"
++                ),
++            });
++        }
++        let before = self.current.manifest().segments().len();
++        let epoch = self.current.manifest().epoch();
++        let cutoff = policy.cutoff(now_millis).max(self.floor());
++        let plan = policy.plan(self.current.manifest().segments(), cutoff);
++        if plan.is_empty() {
++            return Ok(ExpireReport::of(&plan, epoch, before));
++        }
++        let manifest = Manifest {
++            epoch: epoch + 1,
++            floor: cutoff,
++            segments: plan.retained().to_vec(),
++        };
++        self.write_manifest(manifest.clone())?;
++        // One step, like a merge's swap: the index names the retained segments, and the ones that
++        // expired are retired to the last reader that named the old set. A reader that took its
++        // snapshot before this call goes on reading the files it named — with the floor *of that
++        // set*, so it answers what it would have answered — and the files leave the disk when the
++        // last such reader lets go.
++        let installed = Arc::new(Set::new(self.directory.clone(), manifest));
++        let replaced = std::mem::replace(&mut self.current, installed);
++        let expired: Vec<u64> = plan.expired().iter().map(|info| info.index).collect();
++        replaced.retire(&expired);
++        drop(replaced);
++        Ok(ExpireReport::of(&plan, epoch + 1, before))
++    }
++
+     /// The whole job in one call — plan, merge, install — for the caller that has nothing to decide:
+     /// a background task, a test, a repair tool.
+     ///
+@@ -683,7 +887,9 @@ impl Segments {
+ /// A merge that has been written and made durable, and is not the store yet.
+ ///
+ /// The value [`Segments::merge`] answers with and [`Segments::install`] takes: the stage between
+-/// "the new segment is on the device" and "the store is the new set". Holding it is holding a file
++/// "the new segment is on the device" and "the store is the new set". It carries everything the
++/// entry it will become states — the range of timestamps of its records included, or the fact that
++/// its inputs stated none — so that installing it is writing the index and nothing else. Holding it is holding a file
+ /// nobody names, which is why it is `#[must_use]`: installing it makes the store the new set, and
+ /// dropping it leaves an orphan for the next open to delete.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -703,11 +909,32 @@ pub struct Merge {
+     bytes_in: u64,
+     /// How many records it holds.
+     records: u64,
++    /// The range of timestamps its records hold: the union of its inputs' ranges, or nothing when
++    /// one of them stated nothing.
++    range: Option<(u64, u64)>,
+     /// How many segments the store was made of when this merge was planned.
+     segments_before: usize,
+ }
+ 
+ impl Merge {
++    /// The entry this merge installs: the segment it wrote, with the range its inputs stated.
++    ///
++    /// `None` where any input stated none, because the merged file holds those records with no
++    /// age written down anywhere: an index that guessed one would be an index a retention pass
++    /// could act on (`lakelet/4.9-retention`).
++    fn entry(&self) -> SegmentInfo {
++        match self.range {
++            Some((first_millis, last_millis)) => SegmentInfo::spanning(
++                self.index,
++                self.bytes,
++                self.records,
++                first_millis,
++                last_millis,
++            ),
++            None => SegmentInfo::new(self.index, self.bytes, self.records),
++        }
++    }
++
+     /// The epoch the store would have if this merge were installed.
+     #[must_use]
+     pub fn epoch(&self) -> u64 {
+@@ -866,6 +1093,30 @@ fn flush(path: &Path) -> Result<(), Error> {
+         .map_err(store)
+ }
+ 
++/// The range of timestamps `records` holds: the earliest and the latest, both inclusive.
++///
++/// The units are the manifest's — milliseconds since the Unix epoch, unsigned — and a timestamp
++/// before it is counted as `0`: the index states an unsigned millisecond, and there is no bucket
++/// below the epoch for a retention policy to name. `records` is never empty here
++/// ([`Segments::seal`] refuses an empty one), so both numbers are the timestamps of records the
++/// file actually holds.
++fn range_of(records: &[Record]) -> (u64, u64) {
++    let mut first = u64::MAX;
++    let mut last = 0u64;
++    for record in records {
++        let at = millis_of(record.ts_millis);
++        first = first.min(at);
++        last = last.max(at);
++    }
++    (first, last)
++}
++
++/// One record's timestamp in the units the manifest states: milliseconds since the Unix epoch,
++/// with anything before it counted as `0`.
++fn millis_of(ts_millis: i64) -> u64 {
++    u64::try_from(ts_millis).unwrap_or(0)
++}
++
+ /// How many bytes the file at `path` holds.
+ fn length_of(path: &Path) -> Result<u64, Error> {
+     std::fs::metadata(path)
+diff --git a/src/engine/compaction/plan.rs b/src/engine/compaction/plan.rs
+index 0cc5c6d..62d7679 100644
+--- a/src/engine/compaction/plan.rs
++++ b/src/engine/compaction/plan.rs
+@@ -37,13 +37,42 @@
+ //! of the tier would depend on how long the store had been running, and a store that pays an
+ //! unbounded cost because it has been up for a month is a store that stalls. A merge of one
+ //! segment is not a plan either — it rewrites bytes and removes none.
++//!
++//! # What a segment states about time
++//!
++//! `lakelet/4.9-retention` gives the manifest's entry for a segment the range of timestamps its
++//! records hold, and this module's view of a segment with it ([`SegmentInfo::first_millis`],
++//! [`SegmentInfo::last_millis`]). Two constructors, because a segment can exist without one:
++//! [`SegmentInfo::spanning`] is what the store uses when a segment is closed, installed or decoded
++//! — an entry this build wrote always states the range of the records in the file it names — and
++//! [`SegmentInfo::new`] is the value a caller builds by hand for a decision about **size**, which
++//! is what a merge plan is made from in `lakelet/4.8-compaction`, and which states no range at all.
++//! That second one is not an error: `None` is a statement about the *index*, not about the records
++//! — nobody wrote down when they happened — and `lakelet/4.9-retention` is where that has a
++//! consequence (a segment whose age nobody states is never deleted).
++//!
++//! A merge *rule* reads none of this — a plan is still made from sizes — but the same index now
++//! answers two questions, and a merge is the operation that has to keep the second one true: the
++//! segment a merge writes states the union of the ranges its inputs state, and states nothing when
++//! one of them states nothing, which the index already knows ([`SegmentInfo`]) — no file is read to
++//! learn it.
+ 
+-/// One segment as a plan sees it: what it is called, how many bytes it costs, what it holds.
++/// One segment as a plan sees it: what it is called, how many bytes it costs, what it holds, and —
++/// when somebody wrote it down — when the records in it happened.
+ ///
+ /// This is the manifest's view of a segment (`lakelet/4.8-compaction`), which is why a plan can be
+ /// made without opening a single file: the size and the record count are what the store wrote down
+ /// when it closed the segment, and a decision that had to read every file it is deciding about
+-/// would pay the cost it is trying to avoid.
++/// would pay the cost it is trying to avoid. The two timestamps are the same kind of fact — written
++/// down once, when the segment is closed — and they are what `lakelet/4.9-retention` decides from:
++/// a segment is old when its *last* record is old, whatever is inside it.
++///
++/// They are an `Option` because a segment can be *described* without them
++/// ([`SegmentInfo::new`], the constructor for a decision about size). `None` says nothing about the
++/// records and everything about the index: nobody stated when they happened. The one rule that has
++/// to be conservative about that is retention's (`lakelet/4.9-retention`): a segment whose age
++/// nobody states is never deleted, because the alternative is deleting data on a number nobody
++/// wrote down.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct SegmentInfo {
+     /// The segment's ordinal. Its file is this number inside the store's segment directory, and the
+@@ -53,16 +82,109 @@ pub struct SegmentInfo {
+     pub bytes: u64,
+     /// How many records it holds.
+     pub records: u64,
++    /// The earliest and the latest timestamp its records hold, both inclusive — or nothing, when
++    /// nobody stated them.
++    range: Option<(u64, u64)>,
+ }
+ 
++/// The two numbers a manifest writes for a segment whose time range nobody stated.
++///
++/// `u64::MAX` is a millisecond no record can have — a record's `ts_millis` is an `i64` this store
++/// converts, so the largest one it can state is `i64::MAX as u64` — which makes the pair the
++/// *absence* of a range rather than a range. The entry therefore stays forty bytes wide, decoding
++/// the pair never needs an error branch, and nothing in a manifest claims a range that is not
++/// there.
++pub(crate) const NO_RANGE: (u64, u64) = (u64::MAX, u64::MAX);
++
+ impl SegmentInfo {
+-    /// One segment, as the store writes it into the manifest.
++    /// One segment as a plan sees it, whose records' time range nobody stated.
++    ///
++    /// This is the constructor for a value built by hand: a decision about *size*
++    /// (`lakelet/4.8-compaction` plans merges from bytes and counts), a test that wants a segment
++    /// of a given length — anything whose question is not about time. Nothing here is guessed:
++    /// [`SegmentInfo::first_millis`] and [`SegmentInfo::last_millis`] answer `None`, and a
++    /// retention policy keeps such a segment instead of deleting data on a number nobody wrote
++    /// (`lakelet/4.9-retention`).
+     #[must_use]
+     pub const fn new(index: u64, bytes: u64, records: u64) -> Self {
+         Self {
+             index,
+             bytes,
+             records,
++            range: None,
++        }
++    }
++
++    /// One segment whose records' time range the store states: both bounds inclusive.
++    ///
++    /// This is what the store uses everywhere a segment becomes an entry of the manifest — closing
++    /// one ([`Segments::seal`](crate::engine::compaction::Segments::seal)), writing the result of a
++    /// merge ([`Segments::install`](crate::engine::compaction::Segments::install)) and reading the
++    /// index back (`Manifest::decode`) — so an entry this build wrote always states the range of
++    /// the records in the file it names. A segment holds at least one record (`Segments::seal`
++    /// refuses an empty one), so the two numbers are timestamps of records that are really there.
++    #[must_use]
++    pub const fn spanning(
++        index: u64,
++        bytes: u64,
++        records: u64,
++        first_millis: u64,
++        last_millis: u64,
++    ) -> Self {
++        Self {
++            index,
++            bytes,
++            records,
++            range: Some((first_millis, last_millis)),
++        }
++    }
++
++    /// The earliest timestamp this segment's records hold, or `None` when nobody stated a range.
++    #[must_use]
++    pub const fn first_millis(&self) -> Option<u64> {
++        match self.range {
++            Some((first, _)) => Some(first),
++            None => None,
++        }
++    }
++
++    /// The latest timestamp this segment's records hold, or `None` when nobody stated a range.
++    #[must_use]
++    pub const fn last_millis(&self) -> Option<u64> {
++        match self.range {
++            Some((_, last)) => Some(last),
++            None => None,
++        }
++    }
++
++    /// The two numbers a manifest writes for this segment: its range, or [`NO_RANGE`] when it
++    /// states none.
++    #[must_use]
++    pub(crate) const fn stated(&self) -> (u64, u64) {
++        match self.range {
++            Some((first, last)) => (first, last),
++            None => NO_RANGE,
++        }
++    }
++
++    /// The segment five numbers out of a manifest's entry state.
++    ///
++    /// [`NO_RANGE`] is read back as the absence of a range, and anything else as a range somebody
++    /// wrote down. There is no third answer: an index with a range no record can have is not this
++    /// build's index, and inventing an error for it would be a check a decoder cannot make without
++    /// a second number to compare against.
++    #[must_use]
++    pub(crate) const fn from_entry(
++        index: u64,
++        bytes: u64,
++        records: u64,
++        first_millis: u64,
++        last_millis: u64,
++    ) -> Self {
++        if first_millis == NO_RANGE.0 && last_millis == NO_RANGE.1 {
++            Self::new(index, bytes, records)
++        } else {
++            Self::spanning(index, bytes, records, first_millis, last_millis)
+         }
+     }
+ }
+diff --git a/src/engine/compaction/snapshot.rs b/src/engine/compaction/snapshot.rs
+index 35309d8..7ce8519 100644
+--- a/src/engine/compaction/snapshot.rs
++++ b/src/engine/compaction/snapshot.rs
+@@ -26,8 +26,27 @@
+ //!
+ //! The order a snapshot reads in is the manifest's order: oldest segment first, in the order the
+ //! records were accepted, which is the order a merge preserves and the order the store answers in.
+-//! Nothing here sorts, groups or filters — `lakelet/4.9-retention` is where a record can stop being
+-//! an answer, and `lakelet/4.11-query-engine` is where one is asked for.
++//! Nothing here sorts or groups — `lakelet/4.11-query-engine` is where one is asked for.
++//!
++//! # What a snapshot answers once a store has a floor
++//!
++//! `lakelet/4.9-retention` gives the manifest a **floor**: the millisecond the store has forgotten
++//! up to. A snapshot answers the records at or after the floor *of the epoch it names*, and the
++//! two halves of that sentence are two different promises:
++//!
++//! * **of the epoch it names** — a retention pass that runs beside a reader does not change what
++//!   that reader answers. This is the promise a merge already had ([`Snapshot::records`] reads the
++//!   set the snapshot holds, not the store), now for data leaving rather than moving;
++//! * **at or after the floor** — every read that begins *after* a pass is confined to what the
++//!   store still keeps. A straddling segment's old records are still in the file — nothing rewrote
++//!   it, and nothing deleted it — and they are not answers. That is the trade the whole step is
++//!   about, written down here as one `retain`.
++//!
++//! [`Snapshot::len`] counts what the *segments* hold rather than what an answer returns, and that
++//! is deliberate: it is the number a caller sizes memory with before reading, and a query that
++//! plans on a count it then filters below is a query whose plan is a lie. A store with a floor can
++//! therefore answer fewer records than it counts, and `lakelet/4.11-query-engine` is where that
++//! difference becomes a number a plan is written from.
+ 
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+@@ -37,7 +56,7 @@ use crate::error::Error;
+ use crate::protocol::batch::Record;
+ 
+ use super::plan::SegmentInfo;
+-use super::{Manifest, file_of};
++use super::{Manifest, file_of, millis_of};
+ 
+ /// The segments one read is allowed to see, and the files that may not leave while it does.
+ ///
+@@ -133,12 +152,29 @@ impl Snapshot {
+         self.held.manifest().segments()
+     }
+ 
+-    /// How many records this snapshot will hand back, from the manifest alone.
++    /// The millisecond the store this snapshot named had forgotten up to when it was taken.
++    ///
++    /// The floor *of this snapshot's epoch*, not of the store as it is now: a retention pass that
++    /// runs beside this reader raises the store's floor and leaves this one where it was, which is
++    /// what makes a read that began before the pass answer what it would have answered.
++    #[must_use]
++    pub fn floor(&self) -> u64 {
++        self.held.manifest().floor()
++    }
++
++    /// How many records this snapshot's segments hold, from the manifest alone.
+     ///
+     /// The number a caller needs *before* it reads — how much memory an answer will take, whether a
+     /// query can be answered from one file — and the reason the manifest keeps each segment's
+     /// record count: counting them by reading every segment would be the cost this store is trying
+     /// to avoid.
++    ///
++    /// It is what the **segments** hold and not what an answer returns: once a store has a floor
++    /// (`lakelet/4.9-retention`), a segment that straddles the cutoff keeps its old records on the
++    /// disk, [`Snapshot::records`] leaves them out, and this count includes them. The two numbers
++    /// are both honest — the count is a bound on the work, the answer is the answer — and redefining
++    /// this one to mean "what a read would hand back" would need the floor of a set the caller has
++    /// not read yet.
+     #[must_use]
+     pub fn len(&self) -> u64 {
+         self.held.manifest().records()
+@@ -166,12 +202,18 @@ impl Snapshot {
+     /// what each file actually holds for the same reason: an index that disagrees with its files is
+     /// a store nobody can query.
+     ///
++    /// Records older than the floor of the epoch this snapshot names are **not** part of the
++    /// answer (`lakelet/4.9-retention`): a retention pass deletes whole segments, so a segment that
++    /// straddles the cutoff still holds records from before it, and they stop being answers here
++    /// rather than by rewriting the file around them.
++    ///
+     /// # Errors
+     ///
+     /// [`Error::Store`] when a segment's file cannot be read, and everything
+     /// [`segment::read`](crate::engine::segment::read) refuses — a segment that is not this build's
+     /// format, was cut, or was changed after it was written.
+     pub fn records(&self) -> Result<Vec<Record>, Error> {
++        let floor = self.floor();
+         let mut records = Vec::new();
+         for info in self.segments() {
+             let path = file_of(&self.held.directory, info.index);
+@@ -192,6 +234,10 @@ impl Snapshot {
+             }
+             records.extend(read);
+         }
++        // One rule, applied at the end: what the store has forgotten up to is not an answer, and a
++        // snapshot answers with the floor of the epoch it named rather than with the store's floor
++        // as it is now — a pass that runs beside this reader changes the next read and not this one.
++        records.retain(|record| millis_of(record.ts_millis) >= floor);
+         Ok(records)
+     }
+ }
+diff --git a/src/engine/retention/mod.rs b/src/engine/retention/mod.rs
+index be3c70c..0a6668f 100644
+--- a/src/engine/retention/mod.rs
++++ b/src/engine/retention/mod.rs
+@@ -142,8 +142,11 @@ impl Policy {
+     /// expire.
+     #[must_use]
+     pub fn cutoff(&self, now_millis: u64) -> u64 {
+-        let _ = (self, now_millis);
+-        todo!("step lakelet/4.9-retention")
++        if self.keeps_everything() {
++            return 0;
++        }
++        let at = now_millis.saturating_sub(self.keep_millis);
++        partition::Partition::of(at, self.width_millis).start()
+     }
+ 
+     /// Which of `segments` expires at `cutoff_millis`, which of them stays, and which of the ones
+@@ -164,8 +167,35 @@ impl Policy {
+     /// straddling, because nothing compared it with the cutoff.
+     #[must_use]
+     pub fn plan(&self, segments: &[SegmentInfo], cutoff_millis: u64) -> Plan {
+-        let _ = (self, segments, cutoff_millis);
+-        todo!("step lakelet/4.9-retention")
++        let mut expired: Vec<SegmentInfo> = Vec::new();
++        let mut retained: Vec<SegmentInfo> = Vec::new();
++        let mut straddling: Vec<u64> = Vec::new();
++        for info in segments {
++            // A segment whose age nobody stated is retained and is not straddling: there is nothing
++            // to compare with the cutoff, and the conservative answer is the one that cannot delete
++            // data (`SegmentInfo`).
++            let Some(last) = info.last_millis() else {
++                retained.push(*info);
++                continue;
++            };
++            if last < cutoff_millis {
++                expired.push(*info);
++            } else {
++                if info
++                    .first_millis()
++                    .is_some_and(|first| first < cutoff_millis)
++                {
++                    straddling.push(info.index);
++                }
++                retained.push(*info);
++            }
++        }
++        Plan {
++            cutoff: cutoff_millis,
++            expired,
++            retained,
++            straddling,
++        }
+     }
+ }
+ 
+@@ -292,8 +322,17 @@ impl ExpireReport {
+     /// this" — costs nothing to write.
+     #[must_use]
+     pub fn of(plan: &Plan, epoch: u64, segments_before: usize) -> Self {
+-        let _ = (plan, epoch, segments_before);
+-        todo!("step lakelet/4.9-retention")
++        Self {
++            epoch,
++            cutoff: plan.cutoff(),
++            segments_before,
++            segments_after: plan.retained().len(),
++            expired: plan.expired().to_vec(),
++            retained: plan.retained().to_vec(),
++            straddling: plan.straddling().to_vec(),
++            bytes_reclaimed: plan.expired_bytes(),
++            records_expired: plan.expired_records(),
++        }
+     }
+ 
+     /// The epoch the store ended at — a new one when something expired, the same one when nothing
+diff --git a/src/engine/retention/partition.rs b/src/engine/retention/partition.rs
+index 3cc1ff6..ebe4d8e 100644
+--- a/src/engine/retention/partition.rs
++++ b/src/engine/retention/partition.rs
+@@ -44,15 +44,17 @@ impl Partition {
+     /// so the narrowest bucket that exists is the one a zero asks for.
+     #[must_use]
+     pub fn of(ts_millis: u64, width_millis: u64) -> Self {
+-        let _ = (ts_millis, width_millis);
+-        todo!("step lakelet/4.9-retention")
++        let width_millis = width_millis.max(1);
++        Self {
++            start_millis: ts_millis - ts_millis % width_millis,
++            width_millis,
++        }
+     }
+ 
+     /// The millisecond this bucket starts at.
+     #[must_use]
+     pub fn start(&self) -> u64 {
+-        let _ = self;
+-        todo!("step lakelet/4.9-retention")
++        self.start_millis
+     }
+ 
+     /// The millisecond after this bucket's last one: buckets are half-open, `[start, end)`.
+@@ -62,15 +64,13 @@ impl Partition {
+     /// problems than an arithmetic overflow.
+     #[must_use]
+     pub fn end(&self) -> u64 {
+-        let _ = self;
+-        todo!("step lakelet/4.9-retention")
++        self.start_millis.saturating_add(self.width_millis)
+     }
+ 
+     /// How many milliseconds this bucket covers.
+     #[must_use]
+     pub fn width(&self) -> u64 {
+-        let _ = self;
+-        todo!("step lakelet/4.9-retention")
++        self.width_millis
+     }
+ 
+     /// Which bucket of this width this is, counted from the epoch: `start / width`.
+@@ -79,8 +79,7 @@ impl Partition {
+     /// *which* bucket a cutoff landed on rather than the millisecond it starts at.
+     #[must_use]
+     pub fn index(&self) -> u64 {
+-        let _ = self;
+-        todo!("step lakelet/4.9-retention")
++        self.start_millis / self.width_millis
+     }
+ 
+     /// `true` when `ts_millis` is this bucket's: at or after its start and before its end.
+@@ -89,15 +88,13 @@ impl Partition {
+     /// bucket that begins on it, and a bucket and its neighbour never both hold one.
+     #[must_use]
+     pub fn contains(&self, ts_millis: u64) -> bool {
+-        let _ = (self, ts_millis);
+-        todo!("step lakelet/4.9-retention")
++        self.start_millis <= ts_millis && ts_millis < self.end()
+     }
+ }
+ 
+ impl fmt::Display for Partition {
+     /// The bucket the way a cutoff is written in a report and a log line: `[start, end)`.
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let _ = (self, formatter);
+-        todo!("step lakelet/4.9-retention")
++        write!(formatter, "[{}, {})", self.start(), self.end())
+     }
+ }

@@ -1,0 +1,879 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 60c3756..fd2d4db 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -31,6 +31,9 @@ pub mod segment;
+ // — a merge a reader never sees half-done. The policy is a value (`plan`), the store is the
+ // manifest (`mod`), and what a reader holds while a merge happens is a snapshot.
+ pub mod compaction;
++// `lakelet/4.9-retention`: what leaves the store, decided from time alone — the rule as a value
++// (`retention`), and a pass that deletes whole segments and writes down how far it has forgotten.
++pub mod retention;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/retention/mod.rs b/src/engine/retention/mod.rs
+new file mode 100644
+index 0000000..be3c70c
+--- /dev/null
++++ b/src/engine/retention/mod.rs
+@@ -0,0 +1,359 @@
++//! Retention: what leaves the store, decided from time alone — the rule as a value, and the report
++//! of carrying it out.
++//!
++//! Step `lakelet/4.9-retention`. `lakelet/4.8-compaction` gave the store closed segments, a
++//! manifest that names them, and one operation that changes what the store is: a merge, which
++//! rewrites segments and loses no record. What nothing in this store has done yet is *remove* data.
++//! A telemetry store that only ever appends fills the disk it was given, and the decision of what
++//! leaves is a policy about time: every record carries a timestamp, so "older than the retention
++//! window" is a rule somebody can write down, review, and measure.
++//!
++//! # The claim, and its two halves
++//!
++//! "Old data is gone" is two statements, and the second is the one that costs:
++//!
++//! * **everything older than the cutoff is unreachable.** No read answers a record whose timestamp
++//!   is below the cutoff — whether the file holding it was deleted or not;
++//! * **nothing newer than the cutoff was touched.** The segments that stay are the segments that
++//!   were: same order, same byte lengths, same record counts, same timestamps. That is an
++//!   *equality* claim about the index, not a count, and it is the half a pass is judged on,
++//!   because a pass that gets its arithmetic wrong throws away data that was still an answer.
++//!
++//! # The rules this build's policy is made of
++//!
++//! * **whole segments, never part of one.** A segment expires exactly when its *last* timestamp is
++//!   below the cutoff (`SegmentInfo::last_millis`). Removing a record from inside a file means
++//!   rewriting that file, and a retention pass that rewrote would pay exactly the write
++//!   amplification `lakelet/4.5-batch-writes` and `lakelet/4.8-compaction` spent two steps
++//!   measuring — to remove bytes it is trying to stop paying for;
++//! * **a segment whose age nobody wrote down is never deleted.** `SegmentInfo::last_millis` answers
++//!   `None` for a value somebody built for a decision about *size* rather than about time
++//!   (`SegmentInfo::new`, what `lakelet/4.8-compaction` plans merges from). `None` says nobody
++//!   stated when its records happened — not that they are old — so a plan keeps such a segment, and
++//!   it is not straddling either: nobody compared it with the cutoff, and calling it straddling
++//!   would claim it reaches below a boundary it was never read against. Deleting data on a number
++//!   nobody wrote down is the one decision a retention policy may not take;
++//! * **a retained segment that reaches below the cutoff straddles, and is left alone.** It holds
++//!   records on both sides, so dropping it would delete records newer than the cutoff; rewriting
++//!   it is the merge's business, if anything's. It stays where it is and its old records stop
++//!   being answers through the *read* path instead (`Snapshot::records`), while the store's floor
++//!   — the millisecond it has promised to have forgotten — moves past them;
++//! * **the cutoff is a bucket boundary, not an instant.** [`Policy::cutoff`] snaps `now - keep`
++//!   down with `Partition`, so a pass expires in whole buckets: a boundary is the same number on
++//!   every machine (no clock, no rounding, no timezone), and a pass never leaves a partial bucket
++//!   behind. The price is coarse: data is kept for somewhere between `keep` and `keep + width`;
++//! * **zero keeps everything, and the comparison is half-open.** A policy that keeps everything
++//!   answers a cutoff of `0`, which is below every timestamp this store can hold, so a plan made
++//!   at it is empty and the store does not move. A record whose timestamp is exactly the cutoff is
++//!   *kept*: `last_millis < cutoff`, not `<=`.
++//!
++//! [`Policy::plan`] is the whole rule, and it is a value: it reads no clock, opens no file and
++//! touches nothing, so what a pass *would* do can be judged — by a test, by a page, by an operator
++//! with a store they are afraid to touch — without doing it. The store's half of the rule lives in
++//! `crate::engine::compaction`: the manifest carries the floor and `Segments::expire` carries a
++//! plan out.
++//!
++//! # What a plan does not say
++//!
++//! A plan names segments by index, and a plan is a value taken at a moment: it says nothing about
++//! what the store looks like when it is carried out. `Segments::expire` is where a plan meets the
++//! manifest it was made from.
++
++// The modules a later step adds are declared inside this block: a scaffold may only write inside a
++// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
++// (docs/authoring.md §5).
++// kiln:scaffold:begin
++// `lakelet/4.9-retention`: the bucket arithmetic a cutoff is snapped to, shared with the windows
++// `lakelet/4.10-downsampling` aligns on.
++pub mod partition;
++// kiln:scaffold:end
++
++use crate::engine::compaction::SegmentInfo;
++
++/// The rule this store retains by: keep `keep_millis` of time, and count it in buckets of
++/// `width_millis`.
++///
++/// A policy is data on purpose, and both numbers are decisions somebody has to defend. This build
++/// ships [`Policy::DEFAULT`]: **keep everything**, in one-hour buckets. A store that deletes what
++/// it has not been asked to delete is the worst default a storage engine can ship — the value has
++/// to be set by somebody who meant it — while the bucket width is the part a caller can leave
++/// alone until then.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Policy {
++    /// How many milliseconds of history to keep. Zero keeps everything.
++    keep_millis: u64,
++    /// How wide one bucket of time is. Zero is treated as one millisecond.
++    width_millis: u64,
++}
++
++impl Policy {
++    /// The policy this build ships: keep everything, in one-hour buckets.
++    ///
++    /// Zero means "keep everything" rather than "keep nothing", and that is the whole shape of the
++    /// default: an unconfigured store must not delete data, and the first number a caller types is
++    /// the window they meant. One hour is the width because it is the bucket telemetry is read in —
++    /// `lakelet/4.10-downsampling` aligns its windows on it — and because a cutoff snapped to an
++    /// hour is a boundary an operator can say out loud.
++    pub const DEFAULT: Policy = Policy {
++        keep_millis: 0,
++        width_millis: 3_600_000,
++    };
++
++    /// A policy that keeps `keep_millis` of time in buckets `width_millis` wide.
++    #[must_use]
++    pub const fn new(keep_millis: u64, width_millis: u64) -> Self {
++        Self {
++            keep_millis,
++            width_millis,
++        }
++    }
++
++    /// How many milliseconds of history this policy keeps.
++    #[must_use]
++    pub const fn keep_millis(&self) -> u64 {
++        self.keep_millis
++    }
++
++    /// How wide one bucket of this policy's time is.
++    #[must_use]
++    pub const fn width_millis(&self) -> u64 {
++        self.width_millis
++    }
++
++    /// `true` when this policy keeps everything: no cutoff, no plan, nothing the store may delete.
++    #[must_use]
++    pub const fn keeps_everything(&self) -> bool {
++        self.keep_millis == 0
++    }
++
++    /// The cutoff this policy has at `now_millis`: everything strictly below it is older than the
++    /// window, and the number is a bucket boundary.
++    ///
++    /// `now - keep`, *snapped down* through [`partition::Partition::of`], which is the difference
++    /// between a
++    /// retention pass and an alarm: a raw `now - keep` moves with the clock, so the boundary a pass
++    /// deletes up to would depend on when it ran — the same store, the same policy and two
++    /// different cutoffs, minutes apart. A bucket boundary is a number two machines agree on, and a
++    /// pass always removes whole buckets, so a run at 00:59 and a run at 01:01 delete the same
++    /// thing.
++    ///
++    /// A policy that keeps everything answers `0` whatever `now_millis` is — and so does one whose
++    /// window reaches back past the epoch (`saturating_sub`): there is no millisecond below zero to
++    /// expire.
++    #[must_use]
++    pub fn cutoff(&self, now_millis: u64) -> u64 {
++        let _ = (self, now_millis);
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// Which of `segments` expires at `cutoff_millis`, which of them stays, and which of the ones
++    /// that stay reach below it.
++    ///
++    /// The cutoff is taken as given rather than computed from a clock here: a caller that has a
++    /// store *also* has a floor (`Segments::floor`), and a cutoff below the floor is not a cutoff
++    /// this store may act on — the store that called this is where that `max` belongs, once.
++    ///
++    /// The rule, in one sentence: *a segment expires exactly when its last timestamp is below the
++    /// cutoff; a segment that stays and whose first timestamp is below it is straddling.* Order is
++    /// the manifest's order, in both lists and in the indices of `straddling`, because the plan's
++    /// second half is the claim that the retained list *is* the manifest minus the expired ones.
++    ///
++    /// A segment whose range the index does not state is kept, and is not straddling: the rule is
++    /// total, and `None` means "nobody wrote down when these records happened" rather than "old".
++    /// A plan therefore never deletes a segment whose age nobody stated — and never calls one
++    /// straddling, because nothing compared it with the cutoff.
++    #[must_use]
++    pub fn plan(&self, segments: &[SegmentInfo], cutoff_millis: u64) -> Plan {
++        let _ = (self, segments, cutoff_millis);
++        todo!("step lakelet/4.9-retention")
++    }
++}
++
++/// What a pass would do: which segments expire, which stay, and which of those straddle the cutoff.
++///
++/// A plan is a value a caller can hold, log or refuse, and it is where the rule can be *read*
++/// without a store: nothing here touches a file, and the same list of segments gives the same plan
++/// every time. What it cannot say is whether the store still looks like this — that is
++/// `Segments::expire`'s question, and a plan whose segments are gone is not repaired, it is
++/// refused.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Plan {
++    /// The cutoff this plan was made at: a bucket boundary, and the number the answer is about.
++    cutoff: u64,
++    /// The segments that expire, in the manifest's order.
++    expired: Vec<SegmentInfo>,
++    /// The segments that stay, in the manifest's order and with the manifest's values.
++    retained: Vec<SegmentInfo>,
++    /// The indices of the retained segments that reach below the cutoff, ascending.
++    straddling: Vec<u64>,
++}
++
++impl Plan {
++    /// The cutoff this plan was made at.
++    #[must_use]
++    pub fn cutoff(&self) -> u64 {
++        self.cutoff
++    }
++
++    /// `true` when nothing expires: no segment reaches below the cutoff.
++    ///
++    /// The one test a caller needs before doing anything: an empty plan means the store does not
++    /// move — no manifest written, no file removed, no epoch — because a pass that wrote a manifest
++    /// saying what the store already said would be a disk write per call for nothing.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.expired.is_empty()
++    }
++
++    /// The segments that expire, in the manifest's order.
++    #[must_use]
++    pub fn expired(&self) -> &[SegmentInfo] {
++        &self.expired
++    }
++
++    /// The segments that stay, in the manifest's order, with the manifest's own values.
++    #[must_use]
++    pub fn retained(&self) -> &[SegmentInfo] {
++        &self.retained
++    }
++
++    /// The indices of the retained segments that reach below the cutoff.
++    ///
++    /// A straddler is the price of deleting whole files: it stays because part of it is newer than
++    /// the cutoff, and it is *not* rewritten, so its old records remain on the disk until a merge
++    /// takes it — they simply stop being answers (`Snapshot::records`).
++    #[must_use]
++    pub fn straddling(&self) -> &[u64] {
++        &self.straddling
++    }
++
++    /// How many bytes the expired segments cost together.
++    #[must_use]
++    pub fn expired_bytes(&self) -> u64 {
++        self.expired
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.bytes))
++    }
++
++    /// How many records the expired segments hold together.
++    #[must_use]
++    pub fn expired_records(&self) -> u64 {
++        self.expired
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.records))
++    }
++
++    /// How many bytes the retained segments cost together.
++    #[must_use]
++    pub fn retained_bytes(&self) -> u64 {
++        self.retained
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.bytes))
++    }
++}
++
++/// What one retention pass cost and what it changed, in counts.
++///
++/// The report a store's own bookkeeping is written in, and the number a page like
++/// `tests/budget_retention.rs` measures: how many segments left, what they held, and what the store
++/// holds now. Its two ends are the *conservation* the step is judged on —
++/// `segments_before - expired == segments_after` and `retained_bytes == before - reclaimed` — and
++/// the straddling count is what says out loud that some of what stayed is not an answer any more.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ExpireReport {
++    /// The epoch the store moved to, or the one it kept when nothing expired.
++    epoch: u64,
++    /// The cutoff the pass acted at, after the floor was taken into account.
++    cutoff: u64,
++    /// How many segments the store was made of before the pass.
++    segments_before: usize,
++    /// How many it is made of after it.
++    segments_after: usize,
++    /// The segments that expired, in the manifest's order.
++    expired: Vec<SegmentInfo>,
++    /// The segments that stayed, in the manifest's order.
++    retained: Vec<SegmentInfo>,
++    /// The indices of the retained segments that reach below the cutoff.
++    straddling: Vec<u64>,
++    /// How many bytes the expired segments cost: what the store stopped holding.
++    bytes_reclaimed: u64,
++    /// How many records left with them.
++    records_expired: u64,
++}
++
++impl ExpireReport {
++    /// The report of carrying `plan` out, in the epoch the store ended at.
++    ///
++    /// Every number here is derived from the plan and the two counts, rather than passed in
++    /// separately: a report whose `bytes_reclaimed` disagreed with the segments it says expired
++    /// would be a report nobody could act on, and it is exactly the kind of disagreement a
++    /// conservation check is looking for. The store's call site is the one that matters
++    /// (`Segments::expire`); it is public so that a preview — "this plan, carried out, would say
++    /// this" — costs nothing to write.
++    #[must_use]
++    pub fn of(plan: &Plan, epoch: u64, segments_before: usize) -> Self {
++        let _ = (plan, epoch, segments_before);
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// The epoch the store ended at — a new one when something expired, the same one when nothing
++    /// did.
++    #[must_use]
++    pub fn epoch(&self) -> u64 {
++        self.epoch
++    }
++
++    /// The cutoff this pass acted at.
++    #[must_use]
++    pub fn cutoff(&self) -> u64 {
++        self.cutoff
++    }
++
++    /// How many segments the store was made of before the pass.
++    #[must_use]
++    pub fn segments_before(&self) -> usize {
++        self.segments_before
++    }
++
++    /// How many it is made of after it.
++    #[must_use]
++    pub fn segments_after(&self) -> usize {
++        self.segments_after
++    }
++
++    /// The segments that expired, in the manifest's order.
++    #[must_use]
++    pub fn expired(&self) -> &[SegmentInfo] {
++        &self.expired
++    }
++
++    /// The segments that stayed, in the manifest's order.
++    #[must_use]
++    pub fn retained(&self) -> &[SegmentInfo] {
++        &self.retained
++    }
++
++    /// The indices of the retained segments that reach below the cutoff.
++    #[must_use]
++    pub fn straddling(&self) -> &[u64] {
++        &self.straddling
++    }
++
++    /// How many bytes the store stopped holding: the expired segments' bytes.
++    #[must_use]
++    pub fn bytes_reclaimed(&self) -> u64 {
++        self.bytes_reclaimed
++    }
++
++    /// How many records left with them.
++    #[must_use]
++    pub fn records_expired(&self) -> u64 {
++        self.records_expired
++    }
++
++    /// `true` when nothing expired and the store did not move.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.expired.is_empty()
++    }
++}
+diff --git a/src/engine/retention/partition.rs b/src/engine/retention/partition.rs
+new file mode 100644
+index 0000000..3cc1ff6
+--- /dev/null
++++ b/src/engine/retention/partition.rs
+@@ -0,0 +1,103 @@
++//! Which bucket of time a timestamp falls in: the arithmetic retention decides with, and nothing
++//! else.
++//!
++//! Step `lakelet/4.9-retention`. `lakelet/4.8-compaction` gave the store closed segments and a
++//! manifest naming them, and said what it deliberately does not decide: *which* of them may leave.
++//! A record's age is the one thing that answers it, and every record carries a timestamp — so the
++//! decision is a comparison between two numbers, but only after both have been put in the same
++//! bucket of time. This module is that arithmetic: no store, no clock, no side effect, which is
++//! what lets a cutoff be *snapped* to a boundary at one place and a test say what the boundary is
++//! instead of hoping for it.
++//!
++//! A partition is **half-open**: `[start, end)`. A timestamp that sits exactly on a boundary
++//! belongs to the bucket that starts there and not to the one before it — the same `>=`/`<` split
++//! that decides whether a segment is older than a cutoff (`super::Policy::plan`). One rule, written
++//! once: an off-by-one here deletes a millisecond of data a policy promised to keep, or keeps a
++//! bucket it promised to delete, and neither would show up as anything but a number in a report.
++//!
++//! The two numbers a partition is made of are both `u64` milliseconds, and both are supposed to be
++//! *configurations* rather than measurements: this module therefore has no clock of its own and
++//! nothing in it is a duration anybody waited for.
++
++use std::fmt;
++
++/// One bucket of `width_millis` milliseconds, and the millisecond it starts at.
++///
++/// A partition is a value: it is made from a timestamp and a width, it answers questions about
++/// them, and it holds nothing that changes. The reason it is a type rather than two numbers passed
++/// around is that a cutoff, a bucket and a width have to agree about their boundaries, and the
++/// place they agree is here.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Partition {
++    /// The first millisecond of the bucket: every timestamp in it is at or after this one.
++    start_millis: u64,
++    /// How many milliseconds the bucket covers — never zero, whatever a caller asked for.
++    width_millis: u64,
++}
++
++impl Partition {
++    /// The bucket `ts_millis` falls in, when a bucket is `width_millis` milliseconds wide.
++    ///
++    /// A width of zero is treated as one, because the alternative is a partition nothing can be in:
++    /// `Partition::contains` would answer `false` for every timestamp, including the one the
++    /// partition was made from. A misconfiguration is not a reason for a store to answer a hole,
++    /// so the narrowest bucket that exists is the one a zero asks for.
++    #[must_use]
++    pub fn of(ts_millis: u64, width_millis: u64) -> Self {
++        let _ = (ts_millis, width_millis);
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// The millisecond this bucket starts at.
++    #[must_use]
++    pub fn start(&self) -> u64 {
++        let _ = self;
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// The millisecond after this bucket's last one: buckets are half-open, `[start, end)`.
++    ///
++    /// Saturated rather than wrapped: a bucket whose width reaches past the top of what a `u64`
++    /// counts ends at the top of it, and a store configured with a width that large has bigger
++    /// problems than an arithmetic overflow.
++    #[must_use]
++    pub fn end(&self) -> u64 {
++        let _ = self;
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// How many milliseconds this bucket covers.
++    #[must_use]
++    pub fn width(&self) -> u64 {
++        let _ = self;
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// Which bucket of this width this is, counted from the epoch: `start / width`.
++    ///
++    /// The number two partitions are compared by, and the one a plan reports when it wants to say
++    /// *which* bucket a cutoff landed on rather than the millisecond it starts at.
++    #[must_use]
++    pub fn index(&self) -> u64 {
++        let _ = self;
++        todo!("step lakelet/4.9-retention")
++    }
++
++    /// `true` when `ts_millis` is this bucket's: at or after its start and before its end.
++    ///
++    /// Half-open, which is the whole of the `[start, end)` claim: the boundary timestamp is in the
++    /// bucket that begins on it, and a bucket and its neighbour never both hold one.
++    #[must_use]
++    pub fn contains(&self, ts_millis: u64) -> bool {
++        let _ = (self, ts_millis);
++        todo!("step lakelet/4.9-retention")
++    }
++}
++
++impl fmt::Display for Partition {
++    /// The bucket the way a cutoff is written in a report and a log line: `[start, end)`.
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let _ = (self, formatter);
++        todo!("step lakelet/4.9-retention")
++    }
++}
+diff --git a/tests/budget_retention.rs b/tests/budget_retention.rs
+new file mode 100644
+index 0000000..c5d5540
+--- /dev/null
++++ b/tests/budget_retention.rs
+@@ -0,0 +1,385 @@
++//! The retention budget's harness for `lakelet/4.9-retention`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.9-retention
++//! --slow` runs, and the counts it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.9-retention.toml`.
++//!
++//! What it measures is **segments, records and bytes, never the clock**: a store of twenty-four
++//! segments is built from a fixed series and a fixed set of timestamps, one retention pass is
++//! carried out at a `now` the harness passes in, and what that cost is a set of counts — how many
++//! segments left, what they held, what the disk gave back, and what a reader answers afterwards. A
++//! count is the same number on a loaded machine as on an idle one, which is why `kiln`'s budget
++//! gate compares counts (`handoff M2 §1.1`) and why no run of this file can flake because
++//! something else was compiling. `cargo test -p lakelet --test budget_retention -- --nocapture`
++//! prints the lines by hand; the `lakelet-budget` prefix is what the gate reads.
++//!
++//! Three numbers are the ones this lane exists for, and each names a way a retention pass is
++//! wrong:
++//!
++//! * `bytes_freed_on_disk` is measured by **comparing file lengths** — the sum over the store's
++//!   segment directory before the pass, less the sum after it — rather than by trusting
++//!   `ExpireReport::bytes_reclaimed`. The two have to agree (`bytes_unaccounted_max`), and a pass
++//!   that reported bytes it did not free, or freed bytes it did not report, fails here;
++//! * `bytes_rewritten_max` is **zero**, and it is measured the same way: every file in the segment
++//!   directory that was created or changed by the pass, by content. A retention pass deletes whole
++//!   files and writes an index; the moment it rewrites a straddling segment to make its own
++//!   numbers look better, it pays exactly the write amplification `lakelet/4.8-compaction` spent a
++//!   step measuring, and this count says so;
++//! * `records_answered` against `records_counted` is the straddler's price, as two numbers: the
++//!   store's index still *counts* every record in the segments it kept — including the ones in a
++//!   segment that reaches back below the cutoff — while the read path answers only the records at
++//!   or after the floor. The difference is not a bug in either; it is the difference between what
++//!   the store holds and what it still answers, and `records_below_cutoff_max` is the half that
++//!   must be zero.
++//!
++//! The workload is deliberately **shaped so that a segment straddles the cutoff**: every segment
++//! holds ninety minutes of one series, one hour of buckets, and the policy keeps twelve and a half
++//! hours, so the cutoff is snapped down to an hour boundary that falls *inside* a segment. A
++//! workload whose segments all sat inside their own bucket would measure the easy half of the rule
++//! and never touch the segment that may neither be deleted nor rewritten.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness a learner can break by editing their own fixture would judge the
++//! fixture instead of the store.
++
++use std::collections::BTreeMap;
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::compaction::{DIRECTORY, Segments};
++use lakelet::engine::retention::Policy;
++use lakelet::protocol::batch::Record;
++
++/// Segments the store is built from before the pass.
++const SEGMENTS: usize = 24;
++
++/// Records one sealed segment holds: ninety minutes of one series, a sample a minute.
++const PER_SEGMENT: usize = 90;
++
++/// Milliseconds between two samples of one series.
++const STEP: i64 = 60_000;
++
++/// One hour — the bucket width the policy counts in, and the width of the minutes below.
++const HOUR: i64 = 3_600_000;
++
++/// The first timestamp of every segment, on an hour boundary so the arithmetic is readable.
++///
++/// `1_699_999_200_000` is `472_222 * HOUR` exactly: every segment therefore starts on a bucket
++/// boundary and runs ninety minutes into the next one, which is what puts a straddler at the
++/// cutoff this workload is built to have.
++const EPOCH: i64 = 472_222 * HOUR;
++
++/// The `now` the pass is given: exactly [`SEGMENTS`] hours after [`EPOCH`], and passed in — this
++/// harness never reads a clock, so its counts are the same on every machine and every day.
++const NOW: u64 = (472_222 + SEGMENTS as i64) as u64 * HOUR as u64;
++
++/// What the policy keeps: twelve and a half hours, in one-hour buckets.
++///
++/// Deliberately *not* a whole number of buckets: the cutoff is `now - keep` snapped down to a
++/// boundary, so a pass at twelve and a half hours removes ten segments and leaves the eleventh
++/// straddling the boundary in the middle of it. A window of exactly twelve hours would put the
++/// cutoff on a segment's start and the straddler would not exist.
++const KEEP: u64 = 12 * HOUR as u64 + 30 * 60_000;
++
++/// The series every segment's records belong to — one name, so the bytes a segment costs are its
++/// framing and its encoding rather than a dictionary that never repeats.
++const SERIES: &str = "cpu,host=h0";
++
++/// The records one sealed segment holds: one series' window, starting at [`EPOCH`] plus one hour
++/// per segment.
++fn segment_records(index: usize) -> Vec<Record> {
++    let start = EPOCH + index as i64 * HOUR;
++    (0..PER_SEGMENT)
++        .map(|offset| Record {
++            series: SERIES.to_owned(),
++            ts_millis: start + offset as i64 * STEP,
++            value: value_of(index * PER_SEGMENT + offset),
++        })
++        .collect()
++}
++
++/// The value of sample `position`: distinct bit patterns, and no structure a column can exploit.
++///
++/// A store of temperature readings compresses; a store of latency quantiles does not, and the
++/// second one is what this lane measures. On data with structure, deleting a segment saves less
++/// than the encoding already did, and the bytes this file is about would be an argument about
++/// `zstd` instead of about what a pass removed.
++fn value_of(position: usize) -> f64 {
++    let mixed = (position as u64).wrapping_mul(2_654_435_761) % 100_003;
++    mixed as f64 / 8.0
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("lakelet-retention-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    fn path(&self) -> &Path {
++        &self.path
++    }
++
++    /// Every file in the store's segment directory, by name, as the bytes it holds.
++    ///
++    /// The disk's own answer rather than the index's: what a pass freed and what it rewrote are
++    /// questions about files, and the store's own report is one of the things being judged.
++    fn segment_files(&self) -> BTreeMap<String, Vec<u8>> {
++        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
++        let entries = std::fs::read_dir(self.path.join(DIRECTORY))
++            .unwrap_or_else(|error| panic!("{} cannot be listed: {error}", self.path.display()));
++        for entry in entries.flatten() {
++            let name = entry.file_name().to_string_lossy().into_owned();
++            let bytes = std::fs::read(entry.path()).unwrap_or_else(|error| {
++                panic!("every file in the segment directory is readable: {error}")
++            });
++            files.insert(name, bytes);
++        }
++        files
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// How many bytes a set of files costs together.
++fn bytes_of(files: &BTreeMap<String, Vec<u8>>) -> u64 {
++    files.values().fold(0u64, |total, bytes| {
++        total.saturating_add(bytes.len() as u64)
++    })
++}
++
++/// How many bytes a pass wrote into the segment directory: every file that was created or changed,
++/// by content, measured against what was there before it ran.
++fn rewritten(before: &BTreeMap<String, Vec<u8>>, after: &BTreeMap<String, Vec<u8>>) -> u64 {
++    after
++        .iter()
++        .filter(|(name, bytes)| before.get(*name) != Some(*bytes))
++        .fold(0u64, |total, (_, bytes)| {
++            total.saturating_add(bytes.len() as u64)
++        })
++}
++
++/// What one pass over the store cost, counted.
++struct Counted {
++    /// Segments the store was built from.
++    sealed: u64,
++    /// Records they held.
++    records: u64,
++    /// Bytes the store's segment files cost, from their lengths, before the pass.
++    bytes_before: u64,
++    /// Segments the plan expired.
++    expired: u64,
++    /// Records that left with them, as the report counts them.
++    records_expired: u64,
++    /// Bytes the report says the store stopped holding.
++    reclaimed: u64,
++    /// Retained segments that reach below the cutoff.
++    straddling: u64,
++    /// Segments the store is made of after the pass.
++    after: u64,
++    /// Bytes its segment files cost after it, from their lengths.
++    bytes_after: u64,
++    /// Bytes of files the pass created or changed, by content.
++    rewritten: u64,
++    /// Records the index still counts in the segments the store kept.
++    counted: u64,
++    /// Records a read of the store answers after the pass.
++    answered: u64,
++    /// Records that came back older than the cutoff, which is the half that may not happen.
++    below_cutoff: u64,
++    /// The store's floor after the pass, as whole hours past [`EPOCH`].
++    floor_hours: u64,
++    /// Segments a second pass at the same `now` expired: none, or the pass wrote for nothing.
++    idle_expired: u64,
++    /// Something the store refused, counted rather than raised: a store that cannot do this is what
++    /// the gate's counts are for.
++    refused: u64,
++}
++
++/// Build the store, carry one pass out at [`NOW`], and count what it did.
++///
++/// The failures are counted rather than raised for the reason `tests/budget_compaction.rs` counts
++/// its own: this file's numbers are what a gate compares, and a harness that panicked would report
++/// nothing at all instead of the count that moved.
++fn pass() -> Counted {
++    let directory = Dir::new("budget");
++    let mut counted = Counted {
++        sealed: 0,
++        records: 0,
++        bytes_before: 0,
++        expired: 0,
++        records_expired: 0,
++        reclaimed: 0,
++        straddling: 0,
++        after: 0,
++        bytes_after: 0,
++        rewritten: 0,
++        counted: 0,
++        answered: 0,
++        below_cutoff: 0,
++        floor_hours: 0,
++        idle_expired: 0,
++        refused: 0,
++    };
++    let mut store = match Segments::open(directory.path()) {
++        Ok(store) => store,
++        Err(error) => {
++            eprintln!("the store could not be opened: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    for index in 0..SEGMENTS {
++        let records = segment_records(index);
++        if let Err(error) = store.seal(&records) {
++            eprintln!("segment {index} could not be sealed: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        counted.sealed += 1;
++        counted.records += records.len() as u64;
++    }
++    let before = directory.segment_files();
++    counted.bytes_before = bytes_of(&before);
++
++    let policy = Policy::new(KEEP, HOUR as u64);
++    let cutoff = policy.cutoff(NOW);
++    let report = match store.expire(&policy, NOW) {
++        Ok(report) => report,
++        Err(error) => {
++            eprintln!("the retention pass was refused: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    counted.records_expired = report.records_expired();
++    counted.expired = report.expired().len() as u64;
++    counted.reclaimed = report.bytes_reclaimed();
++    counted.straddling = report.straddling().len() as u64;
++    counted.after = store.manifest().segments().len() as u64;
++    counted.floor_hours = store.floor().saturating_sub(EPOCH as u64) / HOUR as u64;
++
++    // The disk's own answer, and the answer to "did this pass rewrite anything": the files that
++    // are there now, against the files that were there before it ran.
++    let after = directory.segment_files();
++    counted.bytes_after = bytes_of(&after);
++    counted.rewritten = rewritten(&before, &after);
++
++    // What a read that begins after the pass answers — and what the index says it could answer.
++    let snapshot = store.snapshot();
++    counted.counted = snapshot.len();
++    match snapshot.records() {
++        Ok(read) => {
++            counted.answered = read.len() as u64;
++            counted.below_cutoff = read
++                .iter()
++                .filter(|record| record.ts_millis < cutoff as i64)
++                .count() as u64;
++        }
++        Err(error) => {
++            eprintln!("the store could not be read back: {error}");
++            counted.refused += 1;
++        }
++    }
++
++    // A second pass at the same `now`: the cutoff is the floor's, so nothing is left to expire and
++    // the store does not move. A pass that expired something here would be one whose first pass
++    // forgot what it had done.
++    match store.expire(&policy, NOW) {
++        Ok(report) => counted.idle_expired = report.expired().len() as u64,
++        Err(error) => {
++            eprintln!("a second pass at the same `now` was refused: {error}");
++            counted.refused += 1;
++        }
++    }
++    counted
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++#[test]
++fn the_retention_budget() {
++    let counted = pass();
++
++    // The shape of the store the pass was given: a store with nothing in it cannot pass a byte
++    // bound, and a `seal` that wrote the wrong number of records is caught before anything expires.
++    metric("segments_before", counted.sealed);
++    metric("records_before", counted.records);
++    metric("bytes_before", counted.bytes_before);
++
++    // What the policy expired: whole segments, the records that left with them, and the bytes the
++    // store says it stopped holding — with the straddler named, because a workload whose cutoff
++    // fell on a segment boundary would measure the easy half of this rule and nothing else.
++    metric("segments_expired", counted.expired);
++    metric("records_expired", counted.records_expired);
++    metric("bytes_reclaimed", counted.reclaimed);
++    metric("straddling", counted.straddling);
++
++    // What the disk gave back, measured by comparing file lengths rather than by trusting the
++    // report: the two agree, or one of them is wrong.
++    metric("segments_after", counted.after);
++    metric("bytes_after", counted.bytes_after);
++    metric(
++        "bytes_freed_on_disk",
++        counted.bytes_before.saturating_sub(counted.bytes_after),
++    );
++    // An upper bound of zero: a pass that rewrote a segment — a straddler folded into a new file,
++    // an old one re-encoded "to make the numbers better" — writes bytes it was supposed to stop
++    // paying for, and every one of them is counted here.
++    metric("bytes_rewritten_max", counted.rewritten);
++
++    // What the store answers, against what it still holds. `records_counted` is the index's own
++    // count of the segments that stayed, which includes the straddler's old records; the read path
++    // is what keeps them out of an answer, and this is the number that says it did.
++    metric("records_counted", counted.counted);
++    metric("records_answered", counted.answered);
++    metric("records_below_cutoff_max", counted.below_cutoff);
++
++    // Where the floor landed, counted in whole hours past the epoch: the cutoff this pass acted at,
++    // which the plan snapped down to a bucket boundary. A pass that never moved the floor, or
++    // moved it to `now`, answers a number that is not this one.
++    metric("floor_hours", counted.floor_hours);
++    // And a second pass at the same `now` expires nothing, because the floor is where the first one
++    // left it. An upper bound of zero.
++    metric("idle_expired_max", counted.idle_expired);
++
++    // The two conservation identities, as counts that must be zero: what the report says left is
++    // what the index stopped naming, and the bytes it says it freed are the bytes the disk gave
++    // back. A pass that loses or invents a segment fails one of them whatever its other numbers
++    // say.
++    metric(
++        "segments_unaccounted_max",
++        counted
++            .sealed
++            .saturating_sub(counted.expired)
++            .abs_diff(counted.after),
++    );
++    metric(
++        "bytes_unaccounted_max",
++        counted
++            .bytes_before
++            .saturating_sub(counted.reclaimed)
++            .abs_diff(counted.bytes_after),
++    );
++
++    // A store that refused something is a store this lane cannot judge by counts alone: a refusal
++    // shows up as the numbers moving, and this says why in one line.
++    metric("refused_max", counted.refused);
++}

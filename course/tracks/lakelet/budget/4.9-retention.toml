@@ -1,0 +1,87 @@
+# The retention budget of `lakelet/4.9-retention`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_retention.rs`, which this step's scaffold ships); the metrics are the lines it
+# prints, and every one of them is a count, a byte total or a ratio of two counts rather than a
+# time — a count is the same number on a loaded machine as on an idle one, which is why this lane
+# judges counts at all (handoff M2 §1.1).
+#
+# What the harness does: it seals twenty-four segments of one series — ninety minutes each, a
+# sample a minute, on fixed timestamps — and carries one retention pass out at a `now` it passes
+# in itself, with a policy that keeps twelve and a half hours in one-hour buckets. Nothing in it
+# reads a clock or measures a duration: `now`, the timestamps and the series are all constants, so
+# two runs of this file on two machines print the same counts.
+#
+# The workload is deliberately shaped so that a segment **straddles the cutoff**: a segment covers
+# ninety minutes and a bucket is an hour, so a cutoff snapped to a boundary falls *inside* a
+# segment, in every run. The two easy halves of retention — "delete whole segments" and "keep
+# everything newer" — can be implemented without ever meeting the third case, and the third case is
+# the one where a store either throws away data it promised to keep or pays write amplification it
+# exists to avoid.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: "no worse than this", not "about this", so a pass that wrote less, or a pass that leaked
+# fewer records below the cutoff, passes and only a bigger number fails. The byte totals carry the
+# compressor's own slack — a `zstd` release may answer different bytes for the same input, and the
+# course never pins a compressor's output — which is why `budget/4.8-compaction.toml` bounds its
+# byte counts the same way.
+command = "cargo test -p lakelet --test budget_retention -- --nocapture"
+
+[metric]
+# The shape of the store the pass was given: segments sealed, the records in them, and the bytes
+# their files cost — the last one measured by adding up file lengths rather than by asking the
+# store. A store with nothing in it cannot pass any of the counts below, and a `seal` that wrote the
+# wrong records is caught before anything is expired.
+segments_before = 24
+records_before = 2160
+bytes_before = 9384
+# What the pass expired: ten whole segments, the nine hundred records that left with them, the
+# bytes the store says it stopped holding, and the one segment that straddles the cutoff and is
+# therefore neither deleted nor rewritten. The straddler is judged as a count for the same reason
+# the workload is shaped for it: a cutoff that fell on a segment boundary would answer zero here,
+# and a store with no straddling segment is a store this lane never tests the hard half of.
+segments_expired = 10
+records_expired = 900
+bytes_reclaimed = 3904
+straddling = 1
+# What the disk gave back. `bytes_after` and `bytes_freed_on_disk` are computed from the lengths of
+# the files in the segment directory — the disk's own answer, not the report's — and the second is
+# the first thing a reviewer of a retention feature asks for: the store says it reclaimed 3 904
+# bytes, and the files on the disk are 3 904 bytes shorter. `bytes_unaccounted_max` is the two
+# claims subtracted from each other, and it has to be zero.
+segments_after = 14
+bytes_after = 5480
+bytes_freed_on_disk = 3904
+# An upper bound of zero: the number of bytes the pass wrote into files that already existed, or
+# that did not exist before it ran. A retention pass deletes whole files and writes an index; the
+# moment it rewrites a straddling segment to fold its old records away, it pays exactly the write
+# amplification `lakelet/4.8-compaction` spent a step measuring, and every byte of it is counted
+# here.
+bytes_rewritten_max = 0
+# What the store holds against what it answers. `records_counted` is the index's own count of the
+# records in the segments it kept — the straddler's sixty records below the cutoff included — and
+# `records_answered` is what a read that begins after the pass hands back. The difference is the
+# straddler's price, and it is not a bug in either number: one is the work a caller plans for, the
+# other is the answer. `records_below_cutoff_max` is the half that must be zero, and it is the whole
+# of "everything older than the cutoff is unreachable".
+records_counted = 1260
+records_answered = 1200
+records_below_cutoff_max = 0
+# Where the floor landed, counted in whole hours past the epoch: eleven, which is the hour the
+# policy's cutoff was snapped down to. A pass that never moved the floor answers zero here, and one
+# that moved it to `now` — instead of to a bucket boundary below it — answers twenty-four.
+floor_hours = 11
+# And a second pass at the same `now`: an upper bound of zero, because the floor the first pass
+# wrote is what it acts at, so there is nothing left to expire and the store must not move. A pass
+# that expired something here has forgotten what it already did.
+idle_expired_max = 0
+# The two conservation identities, as counts that must be zero: the segments the report says left
+# are the segments the index stopped naming, and the bytes it says it freed are the bytes the disk
+# gave back. A pass that lost a segment, or invented one, fails one of them whatever its other
+# numbers say.
+segments_unaccounted_max = 0
+bytes_unaccounted_max = 0
+# A store that refused something is a store this lane cannot judge by counts alone. An upper bound
+# of zero, so the failure a refusal causes is named as a refusal as well as by the counts it moved.
+refused_max = 0
