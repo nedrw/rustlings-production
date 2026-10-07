@@ -1144,3 +1144,57 @@ GREEN  回滚 → ok. 15 passed; 0 failed
 2. **一条给我的提醒**：作业书里我把 4.15 的慢门写成“可能有 `mutants@80`”，实际 `track.toml` 里没有——
    作者按规则 8 对着文件数并指出（并改用两次伪造演练顶替）。门数只从 `track.toml` 数，这句话我还是要
    自己再犯一次，记在这里。
+
+## 段 21：B4b — 4.16 `perf/profiling@operate`（profile 是证据：采样、读它、说出结论）
+
+**做了什么**：`spec/4.16/profiling.rs`（730 行、13 用例）、
+`scaffold/4.16-profiling.patch`（631 行、**0 删除**：新建 `lakelet-load` 的 `--profile` 模式文件、
+装置与 `docs/profile.md` 的桩，并按规则 4 给 `src/bin/lakelet-load.rs` 补了两个标记块）、
+`solutions/4.16-profiling.patch`（382 行：模式的语义 + 写成的 `docs/profile.md`）、
+`course/docs/steps/en/lakelet/4.16-profiling.md`（151 行、8 条 TRAP）；**骨架改了 17 加 / 2 删**
+（见下）。`track.toml` 未动（9 must，无慢门）。
+
+**两条不变量**：① **`--cycles N` 是可重复的、`--seconds N` 不是**：前者打印相位计数（4.15 教的那些）
+与工作形状，后者按钟停——规格只依赖前者；② **页面上的数字是命令的输出**：`docs/profile.md` 里那一段
+`lakelet-load --profile --cycles 8` 的输出，由规格**重新跑一遍逐行比对**（“从一次运行里改页面，不要凭
+意图改”）。
+
+**这一步的发现（作者没有顺着我的作业书圆谎，值得记下）**：profile 顶部两个符号是 `__fcntl` 与 `__open`
+——就是每次 `seal` 的**四次 `sync_all`**（段文件、侧车索引、pending manifest、目录）——而**七个相位里
+没有一个计到 flush**。正文因此诚实地说“这个进程把时间花在没有任何相位计费的地方”，并据此建议把段路径
+也交给 4.3 给记录路径的那套 `wal::Policy`，而不是假装某个计数看到了它。
+
+**骨架改动（实测而不是风格）**：`lakelet-load` 原本没有标记块（规则 4），且用默认多线程 runtime——
+八条 `tokio-rt-worker` 线程停在 `__psynch_cvwait`，第一次采样的顶部就是它（22463 个样本），把单线程程序的
+profile 淹了。改成 `#[tokio::main(flavor = "current_thread")]` 并补两个标记块之后：**前 15 步的补丁在
+新骨架上依旧全部 `git apply` 通过**，`kiln selftest --track lakelet` **16/16**。
+
+**原始结论行**（我在自己的构建与**全新**副本 `l4b3-check6` 上重取）：
+
+```
+$ kiln selftest --track lakelet                    # 16/16 step(s) hold the contract · real 6m57.8s
+$ kiln check lakelet/4.16-profiling --slow         # ✓ spec-integrity 17 spec file(s) match · … · 9/9 must gate(s) passed
+$ kiln verify lakelet                              # 16/16 judged step(s) pass · 0 failed · 0 not prepared · 8 without content
+$ cargo test -q -p kiln → 321 + 21 + 1 · clippy 干净 · fmt 干净 · lint-caps no issues · links 106 page(s) · i18n 0 error · probe 41/41
+```
+
+**演练（我重取了一遍）**：把页面上那段的 `records=8000` 改成 `8001`——
+
+```
+RED    $ cargo test -q --test spec_profiling → FAILED. 12 passed; 1 failed
+CAUGHT the_page_carries_the_profile_the_command_prints（tests/spec_profiling.rs:600:5）
+       `docs/profile.md`'s block is not what `lakelet-load --profile --cycles 8` prints: … Edit the page
+       from a run, never from an intention.（两侧列表并排打印，唯一差别是 records=8000 / 8001）
+GREEN  回滚 → ok. 13 passed; 0 failed
+```
+
+**这一段钉下来的两件事**：
+
+1. **一个 worker 交付的文件可能“到了但是残的”**：因为 shell 往**新目录**里写的文件会被 Delta 跳过
+   （规则 14），作者只能用文件工具分块转录 730 行的规格；到我这边的副本是 `934d4cb5…`（**少了约 530 行、
+   且 rustfmt 脏**），而 manifest 钉的是 `65e71040…`。**是 scratch 副本车道里的 `spec-integrity` 与 `fmt`
+   把它抓出来的**（`0/16 judged … 16 failed`），我从作者自己的副本拷回正确文件（哈希对齐）后 16/16。
+   → 新增 §1 第 15 条：**交付的文件要对哈希（或行数），并且先别删 worker 的副本**。
+2. **骨架也可以在后来的步骤里改，只要验证到位**：改骨架等于改**每一步**的树——判据是“前 N 步的补丁
+   是否仍能 `git apply`”+“全量 `selftest` 是否还 16/16”，两条都做了才敢留。理由与证据进正文（八条 parked
+   线程会淹掉单线程程序的 profile）。

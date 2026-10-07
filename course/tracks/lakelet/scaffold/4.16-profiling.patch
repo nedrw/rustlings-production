@@ -1,0 +1,631 @@
+diff --git a/docs/profile.md b/docs/profile.md
+new file mode 100644
+index 0000000..e1852cd
+--- /dev/null
++++ b/docs/profile.md
+@@ -0,0 +1,43 @@
++# A profile is evidence: what the sampler saw, and what it means
++
++<!-- TODO: one paragraph, in this project's voice, on the difference between a counter and a
++sampler: a counter reports the work somebody wrote down, and a sampler reports where the process
++actually was. Say which of the two the block at the end of this page is, and why the two are read
++together rather than one instead of the other. -->
++
++[TODO](TODO)
++
++## What was sampled, and with what
++
++<!-- TODO: run `kiln doctor` and copy its profilers section — which sampler works on this machine
++is that section's business and not a matter of taste. Then the build and the run: start
++`lakelet-load --profile --seconds 30`, note the pid, and sample that pid with `sample <pid>
++<seconds> -file out.txt`. Say which build you profiled, and why that one. -->
++
++## What the two symbols at the top are doing
++
++<!-- TODO: copy the last section of `sample`'s report in, and name the two symbols at its top. For
++each: what it is doing in this store, and the call graph above that section is what says where it
++comes from. Then say how much of the report this store's own code got. -->
++
++## The change the numbers justify
++
++<!-- TODO: one sentence naming what to change next, tied to the phase counters — if the top symbol
++is the decoder, say which phase's count it corresponds to. Then say what would have to move in the
++counters for the change to be visible; if nothing would, say so and say why that is the finding
++rather than a gap in the page. -->
++
++## Running it yourself
++
++<!-- TODO: `lakelet-load --profile --cycles <n>` for an `<n>` you state below. The block is that
++command's whole output, line for line: one line per phase in the order a query walks them, then
++`cycles=`, `records=` and `bytes=`. Walk the identities a reader can check by hand. -->
++
++```text
++lakelet-load headers=TODO
++```
++
++## Where the ideas come from
++
++<!-- TODO: the two or three standing ideas this page stands on — sampling versus counting, and the
++durability policy the write-path record argues for — and what this project takes from each. -->
+diff --git a/src/bin/lakelet-load.rs b/src/bin/lakelet-load.rs
+index 85d9ba7..8a366ae 100644
+--- a/src/bin/lakelet-load.rs
++++ b/src/bin/lakelet-load.rs
+@@ -19,6 +19,11 @@ use tokio::net::TcpStream;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.16-profiling`: the mode that puts this process in the state a sampler can look at, and
++// the codes both modes of this program leave behind. Its file sits beside the program it is a mode
++// of rather than in `src/bin/`, where `cargo` would take it for a second binary.
++#[path = "lakelet-load/profile.rs"]
++mod profile;
+ // kiln:scaffold:end
+ 
+ /// Everything this program can tell a user about itself.
+@@ -36,6 +41,12 @@ async fn main() -> ExitCode {
+     // the two modes of this program share no flags and neither may see the other's
+     // (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    // `--profile` is a mode of this program and not a flag of one run of it: it is taken out of the
++    // line where it was put, and what follows it is its own grammar. A line that is not a profile
++    // line answers `None`, and the ingest mode below never learns that this mode exists.
++    if let Some(code) = profile::main(std::env::args().skip(1)) {
++        return ExitCode::from(code);
++    }
+     // kiln:scaffold:end
+     match run().await {
+         Ok(()) => ExitCode::SUCCESS,
+diff --git a/src/bin/lakelet-load/profile.rs b/src/bin/lakelet-load/profile.rs
+new file mode 100644
+index 0000000..e015c28
+--- /dev/null
++++ b/src/bin/lakelet-load/profile.rs
+@@ -0,0 +1,547 @@
++//! `lakelet-load --profile` — the mode that puts this process in the state you want to look at.
++//!
++//! Step `lakelet/4.16-profiling`. A sampler reports where a *process* spent its time, and that is
++//! evidence about a store only if the process was doing the store's work: so this mode drops the
++//! socket the ingest mode writes to and drives a store of its own, in this process, in a loop long
++//! enough to look at.
++//!
++//! One cycle is four steps, in the order a load run does them:
++//!
++//! 1. **the workload** — [`super::simulate`]'s records for one batch, with their timestamps moved
++//!    past every cycle before this one, so no two segments a run writes state the same span;
++//! 2. **the protocol path** — those records as the frames a client would send, read back out of
++//!    their own bytes, so the store holds what the wire carried rather than what the generator
++//!    meant;
++//! 3. **the flush** — one segment, sealed into the store;
++//! 4. **the question** — one query about the span this cycle just wrote, answered by the executor
++//!    `lakelet/4.11-query-engine` shipped and counted by the phases
++//!    `lakelet/4.15-budget-regression` established.
++//!
++//! The fourth step is what makes the loop evidence rather than load: the records a cycle ingests are
++//! the records its query reads and answers, so a run's phase counts are numbers a reader can check
++//! by hand. `decode == filter == aggregate == records` (no predicate was asked, and one window holds
++//! the whole of one cycle's question), `blocks == decompress == cycles` (one segment was read per
++//! cycle), and `headers` is one entry per segment per cycle — `cycles * (cycles + 1) / 2`.
++//!
++//! # Why there are two ways to stop
++//!
++//! `--cycles` stops after a number of cycles and `--seconds` stops after a wall-clock bound, and the
++//! difference between them is the whole reason both exist. `--cycles` is the *reproducible* one: no
++//! clock, no thread count and no wall time reaches the counters, so two runs with the same `n` print
++//! the same bytes in any process on any machine — which is what lets a page carry a table and a gate
++//! compare it, `lakelet/4.15-budget-regression`'s argument one level up. `--seconds` is the *honest*
++//! one: it is the run a human samples, how many cycles it got is the machine's business, and so
++//! nothing about it is reproducible and nothing may depend on it.
++//!
++//! # What this mode is not
++//!
++//! It is not a second query tool. It says nothing about `lakeletq`'s contract, it reads the store
++//! through the engine rather than over the protocol, and it opens no socket at all: its job is to
++//! *put this process in the state you want to look at*, and a profile of it is the evidence.
++
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
++
++use lakelet::Error;
++use lakelet::engine::compaction::Segments;
++use lakelet::engine::trace::Trace;
++
++/// The prefix every line of a profile carries: this program's name, the way a metric line carries
++/// the name of the thing that produced it.
++pub const PREFIX: &str = "lakelet-load";
++
++/// The code a deployment that cannot work leaves behind, whatever was asked.
++pub const BROKEN: u8 = 1;
++
++/// The code a call this program cannot answer leaves behind.
++pub const WRONG: u8 = 2;
++
++/// The code a store that refused leaves behind.
++pub const REFUSED: u8 = 4;
++
++/// Milliseconds between two samples of the workload: [`super::simulate`]'s own step, and the width
++/// one window of a cycle's question is a whole number of.
++const SAMPLE_MILLIS: i64 = 1_000;
++
++/// Everything this mode can tell a user about itself.
++pub const USAGE: &str = "\
++usage: lakelet-load --profile (--cycles <n> | --seconds <n>) [--store <dir>] [WORKLOAD OPTIONS]
++
++The profile mode runs this loader's own workload against a store of its own, in this process, so
++that a sampler has something to look at. One cycle ingests a batch through the protocol path, seals
++it into the store, and asks the store one question about the span it just wrote. What it prints is
++the phase counters `lakelet/4.15-budget-regression` established, then the workload's own shape:
++
++    lakelet-load headers=36        one line per phase, in the order a query walks them
++    lakelet-load blocks=8
++    lakelet-load decompress=8
++    lakelet-load decode=8000
++    lakelet-load filter=8000
++    lakelet-load aggregate=8000
++    lakelet-load render=8
++    lakelet-load cycles=8          the cycles the run got
++    lakelet-load records=8000      the records they ingested
++    lakelet-load bytes=232832      the frame bytes they sent
++    lakelet-load seconds=30        the bound a --seconds run was given, and nothing else
++
++OPTIONS:
++    --profile               run this mode: the other mode of this program is the default
++    --cycles <n>            stop after n cycles, at least 1. No clock is read, so two runs with
++                            the same n print the same bytes — this is the run a page may quote
++    --seconds <n>           stop after n seconds of wall clock, and run at least one cycle. This is
++                            the run a human samples: how many cycles it got is the machine's
++                            business, and the run is evidence only through what it printed
++    --store <dir>           the store to write. It is created if it is not there; with no --store
++                            a run writes to one of this process's own, which is removed afterwards
++    --samples <n>           records a cycle ingests (default 1000)
++    --batch <n>             records in one protocol frame (default 128)
++    --seed <n>              the workload's seed (default 1)
++    --series <n>            distinct series the workload spreads over (default 8)
++    --help, -h              print this help and exit
++    --version               print the version and exit
++
++Exit codes: 0 the run finished, 2 the call was wrong, 3 a question the store would not answer,
++4 the store refused, 1 this deployment is broken.
++";
++
++/// A refusal: the class it belongs to, and the sentence a reader acts on.
++///
++/// One value for both halves — a flag that cannot be read and a store that will not open — because
++/// the code and the sentence are one decision, and a caller that printed half of one and then failed
++/// is worse than a caller that printed nothing. `lakelet/4.10-downsampling`'s `Outcome` makes the
++/// same point about a command line, and this is that rule in the mode that added a second grammar to
++/// this program.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Refusal {
++    /// What the process would exit with.
++    code: u8,
++    /// The sentence standard error would have received.
++    detail: String,
++}
++
++impl Refusal {
++    /// The code this refusal belongs to.
++    #[must_use]
++    pub const fn code(&self) -> u8 {
++        self.code
++    }
++
++    /// The sentence a reader acts on.
++    #[must_use]
++    pub fn detail(&self) -> &str {
++        &self.detail
++    }
++
++    /// A line this program cannot answer.
++    fn caller(detail: impl Into<String>) -> Self {
++        Self {
++            code: WRONG,
++            detail: detail.into(),
++        }
++    }
++
++    /// Something this deployment cannot do, whatever the line asked for.
++    fn broken(detail: impl Into<String>) -> Self {
++        Self {
++            code: BROKEN,
++            detail: detail.into(),
++        }
++    }
++
++    /// A failure the library reported, in the class its variant is.
++    fn failed(error: Error) -> Self {
++        Self {
++            code: exit_code(&error),
++            detail: error.to_string(),
++        }
++    }
++}
++
++/// When a profile run stops.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Stop {
++    /// After this many cycles, at least one.
++    Cycles(u64),
++    /// After this many seconds of wall clock, and at least one cycle.
++    Seconds(u64),
++}
++
++impl Stop {
++    /// The number the line gave, whichever kind of stop it was.
++    #[must_use]
++    const fn count(self) -> u64 {
++        match self {
++            Self::Cycles(count) | Self::Seconds(count) => count,
++        }
++    }
++
++    /// The `seconds=` a run of this stop prints: the bound a timed run was given, and nothing for a
++    /// counted one. The bound rather than the time it took, because the time it took is a
++    /// measurement of the machine and this line is there to say *which* run a reader is looking at.
++    #[must_use]
++    const fn bound(self) -> Option<u64> {
++        match self {
++            Self::Cycles(_) => None,
++            Self::Seconds(seconds) => Some(seconds),
++        }
++    }
++}
++
++/// What one `--profile` line asked for, once the text on it is numbers and paths.
++#[derive(Debug)]
++enum Asked {
++    /// Run the workload: where to write it, with what, and when to stop.
++    Run {
++        /// The store the line named, if it named one.
++        store: Option<PathBuf>,
++        /// The workload, in the grammar the ingest mode already reads.
++        load: super::Options,
++        /// When to stop.
++        stop: Stop,
++    },
++    /// The help page.
++    Help,
++    /// The version line.
++    Version,
++}
++
++impl Asked {
++    /// Read one profile line, or answer `None` for a line that is not one.
++    ///
++    /// `None` matters: this mode is asked about *every* line this program is given, and the ingest
++    /// mode's grammar is not this one. A line without `--profile` is the other mode's, and this
++    /// function has then said nothing about it.
++    fn parse(args: impl Iterator<Item = String>) -> Result<Option<Self>, Refusal> {
++        let args: Vec<String> = args.into_iter().collect();
++        if !args.iter().any(|argument| argument == "--profile") {
++            return Ok(None);
++        }
++        // Asking for the help page is not a run that can fail, and it is answered wherever it
++        // appears — `lakelet/4.10-downsampling`'s rule for the other tool in this project.
++        if args
++            .iter()
++            .any(|argument| argument == "--help" || argument == "-h")
++        {
++            return Ok(Some(Self::Help));
++        }
++        if args.iter().any(|argument| argument == "--version") {
++            return Ok(Some(Self::Version));
++        }
++
++        let mut rest: Vec<String> = Vec::new();
++        let mut cycles: Option<u64> = None;
++        let mut seconds: Option<u64> = None;
++        let mut store: Option<PathBuf> = None;
++        let mut args = args.into_iter();
++        while let Some(argument) = args.next() {
++            match argument.as_str() {
++                "--profile" => {}
++                "--cycles" => cycles = Some(count(&mut args, "--cycles")?),
++                "--seconds" => seconds = Some(count(&mut args, "--seconds")?),
++                "--store" => store = Some(PathBuf::from(value(&mut args, "--store")?)),
++                other => rest.push(other.to_owned()),
++            }
++        }
++
++        let stop = match (cycles, seconds) {
++            (Some(cycles), None) => Stop::Cycles(cycles),
++            (None, Some(seconds)) => Stop::Seconds(seconds),
++            (None, None) => {
++                return Err(Refusal::caller(
++                    "`--profile` was not told when to stop: it takes `--cycles <n>` or \
++                     `--seconds <n>`, and a run that was never told is not a profile",
++                ));
++            }
++            (Some(_), Some(_)) => {
++                return Err(Refusal::caller(
++                    "`--profile` takes `--cycles` or `--seconds` and not both: they are two \
++                     answers to when this run stops",
++                ));
++            }
++        };
++
++        // What is left of the line is this program's own ingest grammar, read by the one parser that
++        // owns it: a profile run takes the workload options the ingest mode takes, with the same
++        // defaults, because it is the same workload. `--target` names the daemon the *other* mode
++        // writes to, so a profile run reads it and has nothing to do with it.
++        let load = super::Options::from_args(rest.into_iter()).map_err(Refusal::failed)?;
++        Ok(Some(Self::Run { store, load, stop }))
++    }
++}
++
++/// What one profile run did: the count of every phase, and the workload those counts were charged
++/// with.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Run {
++    /// Every cycle's query as one report ([`Trace::merge`]): the counts add, and so do the runs
++    /// behind them.
++    trace: Trace,
++    /// How many cycles the run got.
++    cycles: u64,
++    /// How many records those cycles ingested.
++    records: u64,
++    /// How many bytes of frames they sent.
++    bytes: u64,
++    /// The wall-clock bound the run was given, for a `--seconds` run.
++    seconds: Option<u64>,
++}
++
++impl Run {
++    /// A run that has done nothing yet, stopped by `stop`.
++    fn new(stop: Stop) -> Self {
++        Self {
++            trace: Trace::new(),
++            cycles: 0,
++            records: 0,
++            bytes: 0,
++            seconds: stop.bound(),
++        }
++    }
++
++    /// The lines one profile run prints, in the order a reader checks them: the seven phases in the
++    /// order a query walks them, then the workload's own shape.
++    ///
++    /// A phase that charged nothing is a zero on its own line rather than a missing one — "this run
++    /// decoded nothing" is a fact about the run, and a profile that left it out would make a phase
++    /// that did no work indistinguishable from a phase that was never asked
++    /// (`lakelet/4.15-budget-regression`).
++    #[must_use]
++    pub fn lines(&self) -> Vec<String> {
++        todo!(
++            "lakelet/4.16-profiling: one line per phase in the order `Phase::ALL` walks them, then \
++             the workload's own shape — the format `USAGE` prints"
++        )
++    }
++}
++
++/// Run the workload against the store at `store`, until `stop` says to stop.
++///
++/// # Errors
++///
++/// A [`Refusal`] when the workload cannot be put through the protocol, when the store will not take
++/// it, and when the store will not answer the question: a failure the library reports is carried in
++/// the class [`exit_code`] gives its variant, and a refusal to answer in the class its own variant
++/// names.
++pub fn run(store: &Path, load: &super::Options, stop: Stop) -> Result<Run, Refusal> {
++    let mut segments = Segments::open(store).map_err(Refusal::failed)?;
++    let mut run = Run::new(stop);
++    // Where this run's own timestamps begin, which is the store's business rather than a counter's:
++    // see [`resume`].
++    let from = resume(&segments, step_millis(load.samples));
++
++    match stop {
++        Stop::Cycles(_) => {
++            while run.cycles < stop.count() {
++                cycle(&mut segments, load, from, &mut run)?;
++            }
++        }
++        // A timed run is stopped by the clock and never before it has done something: the check is
++        // after the cycle, so `--seconds 1` on a machine that answers in a millisecond still
++        // measures one cycle rather than none.
++        Stop::Seconds(_) => {
++            let started = Instant::now();
++            let bound = Duration::from_secs(stop.count());
++            loop {
++                cycle(&mut segments, load, from, &mut run)?;
++                if started.elapsed() >= bound {
++                    break;
++                }
++            }
++        }
++    }
++    Ok(run)
++}
++
++/// The span of one batch of `samples`: how wide a window of a cycle's question is, and how far apart
++/// two cycles' timestamps are.
++///
++/// The width is a batch rather than a unit a reader would choose, and it is chosen for the same
++/// reason the phase counts are checkable: with a window per cycle, `render` is one per cycle
++/// whatever the grid did, so the shape of the answer is a number the workload wrote down rather than
++/// one the grid decided.
++fn step_millis(samples: usize) -> i64 {
++    let batch = i64::try_from(samples).unwrap_or(i64::MAX);
++    batch.max(1).saturating_mul(SAMPLE_MILLIS)
++}
++
++/// The first timestamp of this run that no segment of the store already states, or nothing when the
++/// store is empty.
++///
++/// A run that was given a store with segments in it **appends** to it: it starts on the first whole
++/// window past the latest timestamp the manifest states, so the spans it writes cannot overlap the
++/// ones that are there. That is what makes a cycle's question meet one segment on any store rather
++/// than only on a store the run made — the conservation `decode == records` is about the store, not
++/// about the loop's counter of its own cycles.
++fn resume(segments: &Segments, step: i64) -> Option<i64> {
++    let latest = segments
++        .manifest()
++        .segments()
++        .iter()
++        .filter_map(|info| info.last_millis())
++        .max()?;
++    let slot = i64::try_from(latest).unwrap_or(i64::MAX) / step.max(1) + 1;
++    Some(slot.saturating_mul(step.max(1)))
++}
++
++/// One cycle: the workload, the protocol path, the flush, and the question about what was flushed.
++///
++/// The trace is charged here rather than derived afterwards: `outcome.trace()` is the executor's own
++/// account of the run it just did, and the first cycle's is *the* report while every later one is
++/// merged into it (`Trace::merge`), so `runs` says how many cycles the profile covers.
++fn cycle(
++    segments: &mut Segments,
++    load: &super::Options,
++    from: Option<i64>,
++    run: &mut Run,
++) -> Result<(), Refusal> {
++    let _ = (segments, load, from, run);
++    todo!(
++        "lakelet/4.16-profiling: the workload with its timestamps moved on to `from`, the frames a \
++         client would send read back out of their own bytes, `Segments::seal`, and then one \
++         question about the span this cycle wrote — answered by `exec::execute` and added to the \
++         run's `Trace`"
++    )
++}
++
++/// The code this program leaves behind for `error`: the class the variant is, decided in one place.
++///
++/// Both modes of this binary answer with this rule, because one program answers a failure one way
++/// whatever it was asked to do: `2` is the caller's, `4` is the store's, and everything else — a
++/// configuration this build cannot read — is a deployment that is broken rather than a line that is
++/// wrong.
++#[must_use]
++pub fn exit_code(error: &Error) -> u8 {
++    match error {
++        Error::Invalid { .. } => WRONG,
++        Error::Protocol { .. } | Error::Store { .. } => REFUSED,
++        Error::Config { .. } => BROKEN,
++        _ => BROKEN,
++    }
++}
++
++/// Run the profile mode, if this line asked for it.
++///
++/// `None` when the line is not a profile line: the ingest mode is this program's then, and nothing
++/// here has said anything about it. `Some(code)` when it was: everything this mode prints has been
++/// printed, and the code is what the process leaves behind.
++#[must_use]
++pub fn main(args: impl Iterator<Item = String>) -> Option<u8> {
++    let asked = match Asked::parse(args) {
++        Ok(None) => return None,
++        Ok(Some(asked)) => asked,
++        Err(refusal) => return Some(complained(&refusal)),
++    };
++    let (store, load, stop) = match asked {
++        Asked::Help => {
++            println!("{USAGE}");
++            return Some(0);
++        }
++        Asked::Version => {
++            println!("{PREFIX} {}", env!("CARGO_PKG_VERSION"));
++            return Some(0);
++        }
++        Asked::Run { store, load, stop } => (store, load, stop),
++    };
++
++    // The two ways a path can be wrong are told apart *before* a store is opened, which is what makes
++    // the codes mean the same thing however the line was written (`lakelet/4.10-downsampling`'s rule
++    // for the read side of this project). A directory that is not there is not one of them: this mode
++    // writes, so it creates it.
++    let owned = match Store::of(store.as_deref()) {
++        Ok(owned) => owned,
++        Err(refusal) => return Some(complained(&refusal)),
++    };
++    match run(owned.path(), &load, stop) {
++        Ok(run) => {
++            for line in run.lines() {
++                println!("{line}");
++            }
++            Some(0)
++        }
++        Err(refusal) => Some(complained(&refusal)),
++    }
++}
++
++/// Report a refusal on standard error and answer the code it belongs to.
++///
++/// Nothing of a refused run reaches standard output: a script that pipes a profile into a parser must
++/// never be handed half a profile beside a complaint.
++fn complained(refusal: &Refusal) -> u8 {
++    eprintln!("{PREFIX}: {}", refusal.detail());
++    refusal.code()
++}
++
++/// The store a profile run writes to.
++struct Store {
++    /// Where it is.
++    path: PathBuf,
++    /// Whether this process made it, and so owes the filesystem a `remove_dir_all`.
++    temporary: bool,
++}
++
++impl Store {
++    /// The directory `named` names, or one of this process's own.
++    fn of(named: Option<&Path>) -> Result<Self, Refusal> {
++        let Some(named) = named else {
++            let path =
++                std::env::temp_dir().join(format!("{PREFIX}-profile-{}", std::process::id()));
++            // A run's counts are counts of the store it wrote, so a store left behind by a run with
++            // this process's id would be counted too. It is emptied rather than reused, which is what
++            // makes the numbers a reader sees the numbers of a fresh store — the whole reason a
++            // `--cycles` table can be quoted on a page.
++            let _ = std::fs::remove_dir_all(&path);
++            return Ok(Self {
++                path,
++                temporary: true,
++            });
++        };
++        match std::fs::metadata(named) {
++            Ok(metadata) if !metadata.is_dir() => Err(Refusal::broken(format!(
++                "`{}` is not a directory, so this deployment cannot be a store: nothing about the \
++                 call is wrong, and nothing can be written either",
++                named.display()
++            ))),
++            _ => Ok(Self {
++                path: named.to_path_buf(),
++                temporary: false,
++            }),
++        }
++    }
++
++    /// Where the store is.
++    fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for Store {
++    fn drop(&mut self) {
++        if self.temporary {
++            let _ = std::fs::remove_dir_all(&self.path);
++        }
++    }
++}
++
++/// The value of a flag that needs one.
++fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Refusal> {
++    args.next().ok_or_else(|| {
++        Refusal::caller(format!(
++            "`{flag}` needs a value: a profile run is stopped by `{flag} <n>`"
++        ))
++    })
++}
++
++/// The count a stop needs: at least one, because a run that would do nothing is not a measurement.
++fn count(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, Refusal> {
++    let text = value(args, flag)?;
++    let parsed: u64 = text.parse().map_err(|_| {
++        Refusal::caller(format!("`{flag}` takes a number, and `{text}` is not one"))
++    })?;
++    if parsed == 0 {
++        return Err(Refusal::caller(format!(
++            "`{flag} 0` would be a run that did nothing at all, so its profile would be seven \
++             zeroes: give it at least one"
++        )));
++    }
++    Ok(parsed)
++}

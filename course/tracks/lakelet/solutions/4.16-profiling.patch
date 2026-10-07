@@ -1,0 +1,382 @@
+diff --git a/docs/profile.md b/docs/profile.md
+index e1852cd..851e4fc 100644
+--- a/docs/profile.md
++++ b/docs/profile.md
+@@ -1,43 +1,163 @@
+ # A profile is evidence: what the sampler saw, and what it means
+ 
+-<!-- TODO: one paragraph, in this project's voice, on the difference between a counter and a
+-sampler: a counter reports the work somebody wrote down, and a sampler reports where the process
+-actually was. Say which of the two the block at the end of this page is, and why the two are read
+-together rather than one instead of the other. -->
++A counter and a sampler answer two different questions, and this page reads both.
+ 
+-[TODO](TODO)
++A counter says *what work the run counted*. [The phase profile](perf.md) made that a value with
++seven phases, and `lakelet-load --profile` prints it for a load loop of its own: no clock reaches
++those numbers, so two runs of the same workload print the same bytes, and the block further down
++this page is one of them quoted so that it can be re-run rather than believed.
++
++A sampler says *where the process actually was*. It is the only instrument in this project that can
++disagree with the counters, and when the two disagree the disagreement is the finding rather than a
++gap in either one. This page is one reading of both, and the finding below is exactly that kind.
+ 
+ ## What was sampled, and with what
+ 
+-<!-- TODO: run `kiln doctor` and copy its profilers section — which sampler works on this machine
+-is that section's business and not a matter of taste. Then the build and the run: start
+-`lakelet-load --profile --seconds 30`, note the pid, and sample that pid with `sample <pid>
+-<seconds> -file out.txt`. Say which build you profiled, and why that one. -->
++`lakelet-load --profile` is the mode that puts this process in the state you want to look at: one
++cycle ingests a batch through the protocol path, seals it into a store of its own, and asks the
++store one question about the span it just wrote ([the mode](../src/bin/lakelet-load/profile.rs)).
++`--seconds 30` runs that loop for thirty seconds; what it prints is not the point of that run — the
++*process* is.
++
++Which sampler to use is not a matter of taste, and it is not the same answer on two machines.
++`kiln doctor` answers it by running the tools rather than by looking for them, and here it says:
++
++```text
++profilers
++  ✓ sample (/usr/bin/sample) — `sample <pid> <seconds> -file out.txt` works on your own processes without root
++  ✗ samply — no such command (cargo install samply --locked)
++      needed for a flame graph you can open and share; the platform sampler above is what works here
++  ! cargo flamegraph (…) is installed and cannot run here: it drives `dtrace`, and a `dtrace` this
++    user can start refuses with "DTrace requires additional privileges"
++```
++
++Three lines, three answers, and they are worth the space: `sample` is here and needs no root for a
++process you own; `cargo-flamegraph` is the trap — installed, plausible, and refused, because the
++`dtrace` it drives wants privileges this user does not have; and `samply`, the portable answer, is
++not installed at all. A reader whose `kiln doctor` says something else should believe their own
++doctor; the shape of the reading below does not change.
++
++The build matters too. This is a release build, because the samples of a debug build are largely
++samples of unoptimized code — a fact about `cargo build` rather than about this store:
++
++```sh
++cargo build --release -p lakelet --bin lakelet-load
++./target/release/lakelet-load --profile --seconds 30 &
++sample $! 5 -file /private/tmp/lakelet-load.sample.txt
++```
++
++The loader prints nothing until it stops, so the pid a shell reports for the background job is the
++one to sample — `$!` in the line above, and `pgrep -n lakelet-load` if it is already running.
++
++`sample`'s report is long. Its last section — every leaf frame the sampler landed in, heaviest
++first — is the answer, and this is what it printed here:
++
++```text
++Sort by top of stack, same collapsed (when >= 5):
++        __fcntl  (in libsystem_kernel.dylib)        2180
++        __open  (in libsystem_kernel.dylib)        393
++        __rename  (in libsystem_kernel.dylib)        160
++        write  (in libsystem_kernel.dylib)        119
++        _RNvMCseAmp1tIiz26_9crc32fastNtB2_6Hasher6update  (in lakelet-load)        53
++        _RNvMNtNtNtCs1eoBWF22PJM_7lakelet6engine5index5bloomNtB2_5Bloom6insert  (in lakelet-load)        45
++        _xzm_free  (in libsystem_malloc.dylib)        38
++        _xzm_xzone_malloc  (in libsystem_malloc.dylib)        28
++        close  (in libsystem_kernel.dylib)        23
++        <deduplicated_symbol>  (in libsystem_malloc.dylib)        21
++        ZSTD_decompressSequences  (in lakelet-load)        20
++```
+ 
+ ## What the two symbols at the top are doing
+ 
+-<!-- TODO: copy the last section of `sample`'s report in, and name the two symbols at its top. For
+-each: what it is doing in this store, and the call graph above that section is what says where it
+-comes from. Then say how much of the report this store's own code got. -->
++**`__fcntl`, 2180 samples — waiting for the device.** The name is the `fcntl(2)` syscall, and the
++call graph above that section says which call it is: `Segments::seal` reaches it four times inside
++one cycle — the segment file, its sidecar index, the pending manifest, and the directory the
++manifest is renamed into — and every one of those is `File::sync_all → fcntl → __fcntl`. `sync_all`
++is the syscall [the write-path record](adr/0001-write-path.md) measured at 4.173 ms, and that
++record shows it *is* `fcntl(fd, F_FULLFSYNC)` on this platform, from the toolchain's source rather
++than from two numbers agreeing. Four of those in one cycle is most of a cycle, and the sampler is
++what says so.
++
++**`__open`, 393 samples — the writes the flush then waits for.** `std::fs::write` opens the file it
++writes and closes it, and a flush opens that file again to sync it, so each of the four writes in a
++cycle contributes an `open(2)` under `write_manifest` and `index::write`. That makes the second
++symbol the second half of the first story rather than a second story: this store is not slow at
++*computing*, it is slow at *committing*.
++
++Then the list gets small: `crc32fast::Hasher::update` is 53 samples and `index::bloom::Bloom::insert`
++45 — the checksum the frame codec computes and the sidecar index a `seal` builds — and the heaviest
++frame from the *read* half of the loop, `ZSTD_decompressSequences`, is 20. What the seven phases
++charge is that read half, and the report says it is the small part. That is the whole of the
++finding: this process spends its time where no phase is charged.
+ 
+ ## The change the numbers justify
+ 
+-<!-- TODO: one sentence naming what to change next, tied to the phase counters — if the top symbol
+-is the decoder, say which phase's count it corresponds to. Then say what would have to move in the
+-counters for the change to be visible; if nothing would, say so and say why that is the finding
+-rather than a gap in the page. -->
++**The durability of a sealed segment should be a policy, the way the durability of an appended
++record already is.** `lakelet/4.3-write-path-adr` measured one durable write at 4.173 ms and turned
++"how often does the store wait for the device" into a value — `wal::Policy`, `interval(50ms)` — for
++the write path it owned. The segment path that `lakelet/4.7-columnar-segments` and
++`lakelet/4.8-compaction` added never got one: `Segments::seal`, `index::write` and `write_manifest`
++wait for the device unconditionally, four times per sealed segment, and a load loop that seals one
++segment per cycle spends its life inside `fcntl`. The change the numbers justify is to give that
++path the same decision the record path got.
++
++What would have to move in the counters for that change to be visible: **none of the seven.** The
++phases count the *query*; a flush is the write path, and no phase charges it, so the sampler is the
++only instrument here that can see this at all. That is worth stating plainly instead of working
++around: a counter and a profile are not two spellings of one number, they are two instruments, and
++this step has a page because one of them was blind.
++
++The counters are not blind to everything, and this page's block is what they do see. `decode` is
++`records` exactly — a cycle asks about the span it just wrote, so the loop reads precisely what it
++ingested — and the rest follows from that: ten times the batch moves `decode`, `filter` and
++`aggregate` with `records`, while `blocks` and `decompress` stay one per cycle and `headers` stays
++`cycles * (cycles + 1) / 2`. A change to the *workload* is visible in the counters and a change to
++the *flush* is not, and knowing which of the two a number belongs to is what this page is for.
+ 
+ ## Running it yourself
+ 
+-<!-- TODO: `lakelet-load --profile --cycles <n>` for an `<n>` you state below. The block is that
+-command's whole output, line for line: one line per phase in the order a query walks them, then
+-`cycles=`, `records=` and `bytes=`. Walk the identities a reader can check by hand. -->
++This is the whole output of `lakelet-load --profile --cycles 8`, on a store the run makes for
++itself, and it is the one block here that a reader can compare byte for byte:
+ 
+ ```text
+-lakelet-load headers=TODO
++lakelet-load headers=36
++lakelet-load blocks=8
++lakelet-load decompress=8
++lakelet-load decode=8000
++lakelet-load filter=8000
++lakelet-load aggregate=8000
++lakelet-load render=8
++lakelet-load cycles=8
++lakelet-load records=8000
++lakelet-load bytes=232832
+ ```
+ 
++One line per phase, in the order a query walks them and under the names
++[the counter](../src/engine/trace/counters.rs) spells them with, and then the shape of the
++workload. The lines are checkable by hand: `headers` is `36 = 8 * 9 / 2`, one manifest entry for
++every segment that existed in every one of the eight cycles; `blocks` and `decompress` are `8`, one
++segment read per cycle; `decode`, `filter` and `aggregate` are `8000`, the records those cycles
++ingested and every one of them folded into a window; `render` is `8`, one window per cycle; and
++`bytes` is the 232,832 bytes of frames the loader's own workload generator
++([`simulate`](../src/bin/lakelet-load.rs)) produced for them. The mode's own documentation states
++the same identities as invariants of the loop, so a change that broke one of them would show up in
++these lines first.
++
++Run the same command with `--seconds` instead and the same lines come out, with `seconds=` beside
++them and a cycle count the machine decided. That is the difference between proving an instrument
++and reading a machine, and neither run is more honest than the other: one is the evidence a page
++may quote, and the other is the evidence only a sampler can read.
++
+ ## Where the ideas come from
+ 
+-<!-- TODO: the two or three standing ideas this page stands on — sampling versus counting, and the
+-durability policy the write-path record argues for — and what this project takes from each. -->
++- **sampling versus counting.** A counter is instrumentation somebody wrote, so it reports the work
++  somebody thought to count. A sampler is an interruption nobody wrote: it reports the process as
++  it was, including the parts no counter covers. `perf stat` and `perf record` are those two halves
++  in the usual tooling, and the reason both exist is this page's finding.
++- **the durability policy.** The write-path record's argument — that waiting for the device is a
++  cost with a decided bound rather than a habit — is the change this profile justifies. Its
++  measured 4.173 ms is what makes the sampler's top line readable as a number rather than as a
++  symbol.
++- [`sample(1)`](https://ss64.com/mac/sample.html) — the platform sampler, its call graph and its
++  leaf-frame table. `man sample` on a Mac is the same page, and it is the tool the block above came
++  out of.
+diff --git a/src/bin/lakelet-load.rs b/src/bin/lakelet-load.rs
+index 8a366ae..c5f183e 100644
+--- a/src/bin/lakelet-load.rs
++++ b/src/bin/lakelet-load.rs
+@@ -52,7 +52,7 @@ async fn main() -> ExitCode {
+         Ok(()) => ExitCode::SUCCESS,
+         Err(error) => {
+             eprintln!("lakelet-load: {error}");
+-            ExitCode::FAILURE
++            ExitCode::from(profile::exit_code(&error))
+         }
+     }
+ }
+diff --git a/src/bin/lakelet-load/profile.rs b/src/bin/lakelet-load/profile.rs
+index e015c28..9e7a2e6 100644
+--- a/src/bin/lakelet-load/profile.rs
++++ b/src/bin/lakelet-load/profile.rs
+@@ -44,7 +44,12 @@ use std::time::{Duration, Instant};
+ 
+ use lakelet::Error;
+ use lakelet::engine::compaction::Segments;
+-use lakelet::engine::trace::Trace;
++use lakelet::engine::query::exec;
++use lakelet::engine::query::lex;
++use lakelet::engine::query::parse::{self, Statement};
++use lakelet::engine::trace::{Phase, Trace};
++use lakelet::protocol::batch::{self, Record};
++use lakelet::protocol::frame::{self, Decoded, Frame};
+ 
+ /// The prefix every line of a profile carries: this program's name, the way a metric line carries
+ /// the name of the thing that produced it.
+@@ -63,6 +68,10 @@ pub const REFUSED: u8 = 4;
+ /// one window of a cycle's question is a whole number of.
+ const SAMPLE_MILLIS: i64 = 1_000;
+ 
++/// The metric every record of the workload belongs to: [`super::simulate`] writes one series name,
++/// and this is the part of it a query names in `FROM`.
++const METRIC: &str = "cpu";
++
+ /// Everything this mode can tell a user about itself.
+ pub const USAGE: &str = "\
+ usage: lakelet-load --profile (--cycles <n> | --seconds <n>) [--store <dir>] [WORKLOAD OPTIONS]
+@@ -155,6 +164,14 @@ impl Refusal {
+             detail: error.to_string(),
+         }
+     }
++
++    /// A question the store would not answer, in the class the refusal itself names.
++    fn refused(by: &lex::Refusal) -> Self {
++        Self {
++            code: by.class(),
++            detail: by.to_string(),
++        }
++    }
+ }
+ 
+ /// When a profile run stops.
+@@ -307,10 +324,21 @@ impl Run {
+     /// (`lakelet/4.15-budget-regression`).
+     #[must_use]
+     pub fn lines(&self) -> Vec<String> {
+-        todo!(
+-            "lakelet/4.16-profiling: one line per phase in the order `Phase::ALL` walks them, then \
+-             the workload's own shape — the format `USAGE` prints"
+-        )
++        let mut lines: Vec<String> = Vec::with_capacity(Phase::ALL.len() + 4);
++        for phase in Phase::ALL {
++            lines.push(format!(
++                "{PREFIX} {}={}",
++                phase.name(),
++                self.trace.count(phase)
++            ));
++        }
++        lines.push(format!("{PREFIX} cycles={}", self.cycles));
++        lines.push(format!("{PREFIX} records={}", self.records));
++        lines.push(format!("{PREFIX} bytes={}", self.bytes));
++        if let Some(seconds) = self.seconds {
++            lines.push(format!("{PREFIX} seconds={seconds}"));
++        }
++        lines
+     }
+ }
+ 
+@@ -394,13 +422,101 @@ fn cycle(
+     from: Option<i64>,
+     run: &mut Run,
+ ) -> Result<(), Refusal> {
+-    let _ = (segments, load, from, run);
+-    todo!(
+-        "lakelet/4.16-profiling: the workload with its timestamps moved on to `from`, the frames a \
+-         client would send read back out of their own bytes, `Segments::seal`, and then one \
+-         question about the span this cycle wrote — answered by `exec::execute` and added to the \
+-         run's `Trace`"
+-    )
++    let records = workload(load, run.cycles, from);
++    let (carried, bytes) = ingest(&records, load.batch)?;
++    segments.seal(&carried).map_err(Refusal::failed)?;
++    run.bytes = run.bytes.saturating_add(bytes);
++    run.records = run.records.saturating_add(carried.len() as u64);
++
++    let outcome = ask(segments, &carried)?;
++    if run.cycles == 0 {
++        run.trace = outcome.trace().clone();
++    } else {
++        run.trace.merge(outcome.trace());
++    }
++    run.cycles = run.cycles.saturating_add(1);
++    Ok(())
++}
++
++/// The batch one cycle ingests: the ingest mode's workload, moved on so that its first record is at
++/// `from` — or where the workload starts, when there is nothing to resume — and every later cycle
++/// is one window past the one before it.
++///
++/// The offset is what keeps the loop's numbers checkable. Every cycle's records advance by one
++/// batch's worth of time, so the question a cycle asks meets the segment that cycle just sealed and
++/// no other — which is why `decode` is exactly `records` on every run.
++fn workload(load: &super::Options, cycle: u64, from: Option<i64>) -> Vec<Record> {
++    let mut records = super::simulate(load);
++    let base = records.first().map_or(0, |record| record.ts_millis);
++    let start = from.unwrap_or(base);
++    let advance = i64::try_from(cycle)
++        .unwrap_or(i64::MAX)
++        .saturating_mul(step_millis(records.len()));
++    let offset = start.saturating_sub(base).saturating_add(advance);
++    for record in &mut records {
++        record.ts_millis = record.ts_millis.saturating_add(offset);
++    }
++    records
++}
++
++/// The workload as the frames a client would send, read back out of their own bytes.
++///
++/// Answers what the wire carried and how many bytes it took, so what the store holds is what the
++/// protocol carried rather than what the generator meant, and `bytes=` is this program's own account
++/// of the workload it sent.
++fn ingest(records: &[Record], batch: usize) -> Result<(Vec<Record>, u64), Refusal> {
++    let mut carried: Vec<Record> = Vec::with_capacity(records.len());
++    let mut bytes = 0u64;
++    for chunk in records.chunks(batch.max(1)) {
++        let wire = Frame::new(batch::encode(chunk)).encode();
++        bytes = bytes.saturating_add(wire.len() as u64);
++        let payload = match frame::decode(&wire) {
++            Decoded::Frame(frame, _) => frame.payload,
++            // Neither of these can happen to bytes this process has just written, and both are
++            // reported rather than unwrapped: a frame codec that answered `Incomplete` about its own
++            // output is a deployment to go and look at, not a reason to stop explaining.
++            Decoded::Incomplete { needed } => {
++                return Err(Refusal::broken(format!(
++                    "the frame this cycle wrote needs {needed} more byte(s) to be read back, which \
++                     is not a frame it wrote"
++                )));
++            }
++            Decoded::Invalid { reason } => {
++                return Err(Refusal::broken(format!(
++                    "the frame this cycle wrote cannot be read back: {reason}"
++                )));
++            }
++        };
++        carried.extend(batch::decode(&payload).map_err(Refusal::failed)?);
++    }
++    Ok((carried, bytes))
++}
++
++/// One question about the span `records` just wrote, and what it cost.
++fn ask(segments: &Segments, records: &[Record]) -> Result<exec::Outcome, Refusal> {
++    let (from, to) = span(records);
++    let window = step_millis(records.len());
++    let text = format!(
++        "SELECT count(value) FROM {METRIC} WHERE ts BETWEEN {from} AND {to} \
++         GROUP BY time({window}ms)"
++    );
++    let query = match parse::parse(&text) {
++        Ok(Statement::Query(query) | Statement::Explain(query)) => query,
++        Err(refusal) => return Err(Refusal::refused(&refusal)),
++    };
++    exec::execute(&segments.snapshot(), &query).map_err(|by| Refusal::refused(&by))
++}
++
++/// The half-open span one cycle's question covers: from the first timestamp it wrote to one sample
++/// past the last, which is all of what it just sealed and none of what came before.
++fn span(records: &[Record]) -> (i64, i64) {
++    let mut first = i64::MAX;
++    let mut last = i64::MIN;
++    for record in records {
++        first = first.min(record.ts_millis);
++        last = last.max(record.ts_millis);
++    }
++    (first, last.saturating_add(SAMPLE_MILLIS))
+ }
+ 
+ /// The code this program leaves behind for `error`: the class the variant is, decided in one place.

@@ -27,8 +27,9 @@
 | B3e | `course(lakelet/4.13-model-based-tests): a model that knows nothing about segments, and a walk that has to agree with it` | 4.13 正文（teach，18 用例）+ `engine/rng.rs`（xorshift64\*，金向量 + 差异性）+ `tests/support/model.rs`（只有“记录 + floor”的参考模型）+ `tests/support/walk.rs`（夹具：操作字母表、时钟、transcript、收缩）+ `tests/sim_model.rs`（读 `KILN_SIM_SEED` 的装置）+ `sim/4.13-model-based-tests.toml`；`slow:sim@3` transcripts `85c499a1/903bdf8e/a8efae13`（种子 1 逐字节重放）、`slow:mutants@80` 6/6 |
 | B3f | `course(lakelet/4.14-index-pruning): the index is beside the store, and pruning is a number` | 4.14 正文（teach，20 用例）+ `index/{mod,zone,bloom}.rs`（`<store>/index/<ordinal>.lki` 的侧车索引：zone map + 词级布隆；缺失/损坏/过期只损失剪枝）+ 装置 `tests/budget_pruning.rs` 与 `budget/4.14-index-pruning.toml`（18 计数，含 `pruning_rate`）；计划的第二级剪枝（`blocks_pruned`）与 `Outcome` 的新计数器；`spec/4.11` 的键数断言放宽成 `>=`（rule 10 的正解）并重钉。**plan §9 腿 5 完成**：去掉索引查询 → `pruning_rate 95 → 50`、`blocks_pruned 11 → 0`、`7/10 must`；回滚 `10/10 must` |
 | B4a | `course(lakelet/4.15-budget-regression): the engine counts work per phase, and the profile names the phase that moved` | 4.15 正文（deepen，15 用例）+ `trace/{mod,counters}.rs`（七相位计数与恒等式：计数工作不计数时间）+ `query/exec.rs` 按相位计费 + `Outcome` 带 `trace`（`EXPLAIN` 的键不动——rule 10）+ 装置 `tests/attribution.rs` 与 `budget/4.15-budget-regression.toml`（36 计数）+ 项目页 `docs/perf.md`（`links`）；框架修复：`bench-budget` 不再静默忽略基线里没有的计数 |
+| B4b | `course(lakelet/4.16-profiling): a profile is evidence, and the page carries the run that produced every number` | 4.16 正文（teach，13 用例、8 条 TRAP）+ `lakelet-load --profile`（`--cycles` 可重复、`--seconds` 按钟停）+ 项目页 `docs/profile.md`（顶部两符号 = 每次 `seal` 的四次 `sync_all`，**七个相位没有一个计到 flush**——正文据此建议段路径也走 4.3 的 `wal::Policy`）+ 规格**逐行重跑并比对页面上的那段输出**；骨架改了 17 加/2 删（补两个标记块、改单线程 runtime，实测八条 parked worker 线程会淹掉 profile）；框架无改动 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.15，B4 进行中）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.16，B4 进行中）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -140,3 +141,9 @@
     里写文件，Delta 报 `<skipped-untracked-directory>` 并让整棵树的终端停摆（“the checkout kept changing”）；
     恢复要把那棵树还原到 Delta 认识的样子（撤掉 shell 那次编辑、删掉未跟踪目录），然后**用文件工具建文件、
     再用 `cp` 把内容拷进去**。第 9 条的姊妹条：第 9 条说作者工作放 `/private/tmp`，这条说工作树里建文件的方式。
+
+15. **交付的文件要对哈希或行数核对，并且先别删 worker 的副本**。4.16 实测：作者用文件工具分块转录的 730 行
+    规格（因为 shell 写新目录会被跳过，见第 14 条）到我这边只剩约 200 行且 rustfmt 脏——是 scratch 副本车道里
+    的 `spec-integrity`（“manifest says sha256:65e71040…, the file is sha256:934d4cb5…”）与 `fmt` 把它抓出来的，
+    从作者自己的副本拷回后才 16/16。做法：每一步合并后**先比 `spec/manifest.toml` 里钉的哈希**（或至少比行数），
+    worker 的 scratch 树在核对通过前不要清理。

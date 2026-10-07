@@ -2,7 +2,7 @@
 //!
 //! A store is only judged by what a *client* can make it do, and this is that client: it speaks the
 //! same protocol the daemon reads, from a separate process, which is the shape every later step
-//! needs — `4.15` profiles a run of it, `4.17` soaks through it, and the acceptance drill of the
+//! needs — `4.16` profiles a run of it, `4.17` soaks through it, and the acceptance drill of the
 //! track drives it from a shell.
 //!
 //! It is deterministic: `--seed` decides the series names, the timestamps and the values, so two runs
@@ -15,13 +15,28 @@ use lakelet::protocol::frame::Frame;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+// The modes a later step adds are declared inside this block: a scaffold may only write inside a
+// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+// (docs/authoring.md §5).
+// kiln:scaffold:begin
+// kiln:scaffold:end
+
 /// Everything this program can tell a user about itself.
 const USAGE: &str = "\
 usage: lakelet-load [--target <addr>] [--samples <n>] [--batch <n>] [--seed <n>] [--series <n>] \
 [--help] [--version]";
 
-#[tokio::main]
+// One thread is the shape of both modes of this program: the ingest mode writes one connection in
+// order, and the profile mode waits on nothing at all. A worker pool nobody uses would be eight
+// parked threads in every profile of this program, which is time a reader has to explain away
+// (`lakelet/4.16-profiling`).
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // A new mode is decided inside this block, before the ingest grammar reads a word of the line:
+    // the two modes of this program share no flags and neither may see the other's
+    // (docs/authoring.md §5).
+    // kiln:scaffold:begin
+    // kiln:scaffold:end
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
