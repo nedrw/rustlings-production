@@ -10,6 +10,7 @@ format_version = 1
 "spec/4.10/downsampling.rs" = "sha256:b55d1eaa8b9d71474c9c7dd3dee42f1afc16c62f742c9b1d09f48430cd2e499e"
 "spec/4.11/query_engine.rs" = "sha256:c992f866d13ca064a46b1c86ee2c8edbf00a4fa91d805622a3d4fcb5f35ed47d"
 "spec/4.12/aggregation.rs" = "sha256:ba76f9f0839c04c79fafa55e674b489d89cd6914c4c6ac706702c0ca627a1f7f"
+"spec/4.13/model_based.rs" = "sha256:2a8ab274c24bf630d9effd8c1efa18d147b84bc1eda68e61b3846b642af06e99"
 "spec/4.2/parser_fuzz.rs" = "sha256:cb5b26fe86f923cb4f6d997dc1c2dc01a12fb6b74a128dbdfe88967fbe3c0c9c"
 "spec/4.3/write_path.rs" = "sha256:370a7a0e3b7d75aeebd7dd6bfe3953e8567388eaeb0a3f03df1bf67afd57c635"
 "spec/4.4/wal_recovery.rs" = "sha256:381075965c01289a0dece3f816f3a5f0d5c13fa98620fbfd277f05d4fae14850"

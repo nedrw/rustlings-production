@@ -956,3 +956,66 @@ $ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --c
 3. **一次“先粗后细”的演练教训**：我第一次把 `Sum::add` 改成朴素加法时留下了悬空的 `total`，于是
    `cargo test` 失败的是**编译**而不是规格；换成去掉 `value()` 里的补偿项才是行为变异。**演练必须确认
    红的是规格**（编译错也红，但它什么都没证明）。
+
+## 段 18：B3e — 4.13 `test/model-based@apply`（模型是契约的最简形式，随机走一遍必须与它一致）
+
+**做了什么**：`spec/4.13/model_based.rs`（1005 行、18 用例）、`scaffold/4.13-model-based-tests.patch`
+（1321 行、**0 删除**：新建 `src/engine/rng.rs`、`tests/support/{model,walk}.rs`、`tests/sim_model.rs`，
+并在 `engine/mod.rs` 与 `tests/support/mod.rs` 的标记块里插三行）、
+`solutions/4.13-model-based-tests.patch`（166 行：只有 `rng.rs` 与 `model.rs` 的函数体）、
+`sim/4.13-model-based-tests.toml`（41 行，`seeds = [1, 7, 20260101]`、`replay = 1`）、
+`course/docs/steps/en/lakelet/4.13-model-based-tests.md`（222 行）。`track.toml` 未动（10 must，无 should 门）。
+
+**这一步钉下来的五条不变量**：① **自研种子 RNG 的确定性与差异性都算契约**（xorshift64\*：同种子同序列
+——用金向量钉住；不同种子必须给出不同序列，`slow:sim@3` 的“至少两份不同 transcript”靠的就是它）；
+② **模型不知道段、合并、manifest、文件的存在**——它只有“追加进来的记录 + floor”，因为读者看到的就是
+“接受过的前缀减去已经忘记的”，**合并对读者必须不可见**；③ **每一步之后都比**（同一份 transcript 里
+`model=` 与 `store=` 的摘要成对出现，不一致就走收缩）；④ **transcript 只有计数、摘要和名字**（没有墙钟、
+路径、地址，也没有未掩码的浮点），因此 `replay` 种子必须逐字节可重放；⑤ **不一致时收缩**（贪心地删操作，
+直到删任何一步都仍然不一致，然后打印最小序列——`op=1 append / op=2 flush / op=3 expire` 就是“最早咬人的
+那次过期”的形状）。
+
+**原始结论行**（我在自己的构建与 canonical 副本 `l4b3-check4` 上重取）：
+
+```
+$ kiln selftest --track lakelet                     # 13/13 step(s) hold the contract（4.1…4.13）
+$ kiln selftest lakelet/4.13-model-based-tests --track lakelet  # scaffold ✓（2 passed; 16 failed）/ solution ✓ / gates ✓ 10/10 must green
+$ kiln check lakelet/4.13-model-based-tests --slow   # 10/10 must gate(s) passed
+  ✓ slow:sim@3     3 seed(s) ran, transcripts 85c499a1/903bdf8e/a8efae13 — seed 1 replayed identically（walk 2s）
+  ✓ slow:mutants@80 6/6 mutant(s) killed (100%, needs ≥80%)（walk 12s）
+$ kiln verify lakelet    → 13/13 judged step(s) pass · 0 failed · 0 not prepared · 11 without content
+$ kiln lint-caps → no issues · kiln links → 103 page(s) · 502 link(s) ✓ · kiln i18n → 86/97 · kiln probe --check → 41/41
+$ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --check 干净
+```
+
+三个种子的 transcript 摘要与作者报告的一致（`85c499a1/903bdf8e/a8efae13`）；两条补丁在我重建并核对过的
+`through 4.12` 树上重放后与作者的两棵工作树都逐字节一致；scaffold 0 删除。
+
+**演练（我重取了一遍）**：把 `Model::expire` 改成空实现（floor 不再前进）——
+
+```
+SPEC   $ cargo test -q --test spec_model_based → FAILED. 15 passed; 3 failed
+       （the_floor_moves_forwards_and_what_it_forgot_stops_being_an_answer、
+         an_expiry_moves_the_floor_and_the_answers_shrink_with_it、a_walk_replays_what_it_was_seeded_with）
+SIM    $ KILN_SIM_SEED=1 cargo test -q --test sim_model -- --nocapture
+       lakelet-sim result=disagreed ops=14 seed=1 shrunk_to=3
+       lakelet-sim shrink op=1 kind=append n=2 series=cpu,host=h3 · op=2 kind=flush · op=3 kind=expire
+       panicked at tests/sim_model.rs:115
+GREEN  回滚 → spec 18 passed · 单种子 harness ok
+```
+
+**这一段钉下来的四件事**：
+
+1. **作业书里那几处“作者改得更好”的偏差，全都记录在案**：走步做成**夹具**（`tests/support/walk.rs`，
+   因为规格需要一个“故意错的序列”来演示收缩，而测试目标之间不能互相 import）；**一致时的 transcript
+   不打印种子**（打印了三个种子就会因为一个与走步无关的原因而不同，`slow:sim@3` 的反空洞判据就白设了
+   ——作者的理由比我的作业书好）；**模型在 flush 把它封成段时才听到一批**（读者的答案就是 manifest 认的
+   那些段）；**走步把合并比例放宽到 3**（实测：比例 2 时三个种子里有一个从不合并，本步的主张就没被验到）。
+2. **一次“反过来教我一件事”的抽样**：`slow:mutants@80` 第一次抽到 `rng.rs` 的 `if span <= 0`（`<=` → `<`）
+   ——**值**不变，但退化区间会**多消耗一次抽样**，于是可观察的是生成器的流位置。作者把它写成规则
+   （“a span that names nothing draws nothing”）并用一条用例钉住，于是 6/6。这不是仪器噪声，是**真缺口**。
+3. **每个树一个 `CARGO_TARGET_DIR`，没有例外**：作者在作者侧踩了运河对岸的同一个坑——两棵副本共用一个
+   target 目录，cargo 把**旧的** `lakelet` 产物给了新树，于是一条规格为一个树里并不存在的理由而红。
+   这条写进 handoff-m3 §1 第 13 条。
+4. **规格与装置的分工**：规格读的是**固定种子**（环境变量 `KILN_SIM_SEED` 是给门跑的 harness 的，规格读环境
+   就等于让规格判机器），而 harness 读 `KILN_SIM_SEED`/`KILN_SIM_OPS` 并打印 transcript。

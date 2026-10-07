@@ -1,0 +1,41 @@
+# The walks `lakelet/4.13-model-based-tests` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_model.rs`, which this
+# step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set, and every
+# run has to be green — a walk that only agrees under the seed somebody happened to try is exactly
+# the failure this gate is about.
+#
+# What the seed decides here is the **whole walk**: which of the six operations comes next, which
+# series a batch is of, how many records it carries, which way the clock steps, and which question
+# is asked about which span. The sequence comes out of the store's own generator
+# (`src/engine/rng.rs`, the file this step's learner writes), and every operation is played against
+# a real store of the walk's own directory: real segment files, a real manifest, real merges, real
+# retention, and a log that is reopened and replayed.
+#
+# What "agreed" means is the judgement, and it is made after **every** operation rather than at the
+# end: the records a reader of the store can see have to be the records the model says are
+# answerable, record for record and bit for bit, and the store's floor has to be the floor the model
+# moved. A question is answered twice — by the store's executor over the segments its plan kept, and
+# by `lakelet/4.10-downsampling` over the model's records — and the two bucket lists have to be the
+# same. Merges, flushes and reopens are invisible on the reader's side, which is the property that
+# makes a model without a segment in it worth comparing against.
+#
+# `seeds` is three walks and the count is the judgement: `slow:sim@3` asks for at least three, and
+# the gate also demands that at least two of them produce *different* transcripts, so a harness that
+# ignored the seed would fail rather than pass three times. What the three differ in is the shape of
+# what they walk, and it is measured rather than argued: twenty-two, twenty-six and twenty-four
+# appends; eight, nine and twelve flushes that closed something; one, two and three merges; eight,
+# two and one expiries that moved the floor; three, two and three reopens; and nine, five and six
+# questions answered with buckets. Every one of the six operations happens in every one of them,
+# because the seed steers the draw and not the store.
+#
+# `replay = 1` is the seed that is run *twice*: the two transcripts have to be byte-identical, which
+# is the property the harness is written for — every line is a count, a name, a digest or a refusal,
+# never a path, an address, a wall clock or an unmasked float. The seed itself is deliberately in no
+# line of an agreeing walk: `result=agreed` next to a seed would make three transcripts differ for a
+# reason that says nothing about the walk, and the anti-vacuity rule above would stop meaning
+# anything. The failing path is the exception, and there the seed is what a reader needs first.
+command = "cargo test -p lakelet --test sim_model -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1

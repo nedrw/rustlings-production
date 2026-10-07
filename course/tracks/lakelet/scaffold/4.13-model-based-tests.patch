@@ -1,0 +1,1321 @@
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index c068e24..7844b76 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -37,6 +37,9 @@ pub mod retention;
+ // `lakelet/4.10-downsampling`: what a question about the store is — the windows of the
+ // absolute time axis, the five aggregates, and the pass that answers from records.
+ pub mod query;
++// `lakelet/4.13-model-based-tests`: the one number a walk's decisions come out of — a seeded
++// generator whose sequence is fixed by arithmetic, so the same seed replays a run on any machine.
++pub mod rng;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/rng.rs b/src/engine/rng.rs
+new file mode 100644
+index 0000000..c6b4dc4
+--- /dev/null
++++ b/src/engine/rng.rs
+@@ -0,0 +1,147 @@
++//! The store's own seeded generator: one number in, one reproducible sequence out.
++//!
++//! Step `lakelet/4.13-model-based-tests`. A walk is only evidence if somebody else can run it
++//! again, and the only thing that makes that true is that everything the walk decides comes out of
++//! one number. So the generator lives in the engine rather than in a test: a walk, a soak, a fuzz
++//! corpus and `lakelet-load` all want "the same seed is the same run", and a test-side copy would
++//! be a fourth sequence nobody can reproduce.
++//!
++//! # Why not `rand`
++//!
++//! `rand` is a good crate and a bad fit for this lesson. It is a *tree* of crates with a version
++//! history of its own, its default generator is explicitly allowed to change between releases, and
++//! the one thing a walk needs from it — the same numbers on every machine, for ever — is the one
++//! thing its own documentation declines to promise (`StdRng` is documented as *not* reproducible
++//! across releases). This course has been here before (`jobq/3.19-property-invariants`): a walk
++//! needs arithmetic somebody can read in one screen, and forty lines of integer arithmetic that
++//! cannot change under a dependency bump is worth more than a dependency that can.
++//!
++//! # What it is
++//!
++//! A xorshift64\*: the state is one `u64`, [`Rng::next_u64`] mixes it with itself in three shifts
++//! and multiplies it, and that product is the number. It is not a cryptographic generator and does
++//! not pretend to be: the whole of what this build asks of it is an index into a list of six
++//! operations and a number a clock moves by, and it is chosen because its stream is a *published*
++//! one — a walk's finding is worth exactly as much as the fact that the same seed reproduces it.
++//!
++//! Two contracts, and every walk in this course depends on both:
++//!
++//! * **the same seed is the same sequence.** Not "similar": identical, on every machine, in every
++//!   process, in every build, because nothing here reads a clock, a thread id, an address or a hash
++//!   seed. `lakelet/4.13-model-based-tests`' spec pins a golden vector of the first outputs for one
++//!   seed, so that a refactor which quietly changed the stream fails a case rather than moving every
++//!   walk in the project;
++//! * **a different seed is a different sequence.** `slow:sim@N` runs a step's own scenarios once per
++//!   seed and refuses transcripts that are all identical — a harness that ignored the seed would
++//!   otherwise pass three times on one schedule. That judgement is only about the *generator* if
++//!   the generator is what the seed reaches, which is why the seed goes nowhere else.
++
++/// The multiplier of xorshift64\*: Vigna's constant.
++///
++/// It is what makes this a generator rather than a linear map over GF(2). The three shifts alone
++/// are linear, so the low bits of the state move in step with each other and a generator whose
++/// answer *is* the state is one whose low bits repeat long before its high ones do. Multiplying the
++/// mixed state by an odd constant is what fixes that: odd, so the map is invertible and no bit of
++/// the state falls out of the answer, and wide, so every bit of the answer depends on all 64 bits
++/// of it.
++const MULTIPLIER: u64 = 0x2545_f491_4f6c_dd1d;
++
++/// What a zero seed becomes.
++///
++/// Zero is a **legal** seed — a harness that refused it would be a harness that cannot walk the
++/// first thing somebody types — and it is the one state xorshift cannot leave: all three shifts of
++/// zero are zero, and the stream would be a constant. So the state is nudged off zero here, once,
++/// at construction, where the correction is visible; nothing else in this file special-cases it.
++/// The number is the fractional part of the golden ratio in hex, which is the usual choice for
++/// "spread one value over a 64-bit state".
++const AWAY_FROM_ZERO: u64 = 0x9e37_79b9_7f4a_7c15;
++
++/// A generator: one seed in, one reproducible sequence of numbers out.
++///
++/// The whole of its state is one `u64`, which is what makes two generators built from one seed the
++/// same generator: there is no buffer, no index into a table and no entropy the constructor could
++/// have taken from the machine.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Rng {
++    /// The state, always non-zero ([`AWAY_FROM_ZERO`] is what a zero seed becomes).
++    state: u64,
++}
++
++impl Rng {
++    /// A generator that starts from `seed`.
++    ///
++    /// A zero seed is a seed like any other and does not produce a constant stream; see
++    /// [`AWAY_FROM_ZERO`].
++    #[must_use]
++    pub const fn new(seed: u64) -> Self {
++        todo!()
++    }
++
++    /// The next 64 bits: the state moves on, and the answer is the state mixed with itself.
++    ///
++    /// The three shifts are the whole generator. They are written as `^=` in place because that is
++    /// what they are — each one folds a differently-scaled copy of the state into it — and the
++    /// multiply at the end is the star.
++    pub fn next_u64(&mut self) -> u64 {
++        todo!("lakelet/4.13-model-based-tests: `MULTIPLIER` is the star, and the three shifts are \
++               the whole of the state update")
++    }
++
++    /// A number in `0..bound`, and `0` when there is nothing to draw from.
++    ///
++    /// `0` rather than a panic, because "draw from an empty alphabet" has one sane answer and a
++    /// generator that panicked on it would fail inside somebody else's process: a walk that asks
++    /// for `below(0)` has asked for an index into a list of nothing, and the answer a caller can
++    /// act on is the first one. Nothing is drawn for it: an alphabet with no letters in it has no
++    /// letter to hand out, and the stream does not move.
++    ///
++    /// A remainder is not perfectly uniform when `bound` does not divide 2^64 — for an alphabet of
++    /// six operations the bias is about one part in 3e18 — and that is the trade this generator
++    /// makes on purpose: a walk is a search for a counter-example, not a sample for a statistic.
++    /// `jobq/3.19-property-invariants` made the same trade for the same reason.
++    pub fn below(&mut self, bound: u64) -> u64 {
++        todo!("lakelet/4.13-model-based-tests: in range, total, and the same answer for one seed")
++    }
++
++    /// A number in `low..=high`: **both ends are included**.
++    ///
++    /// A clock, a duration and a record's timestamp are all "somewhere in this span, and either end
++    /// of it is a legal instant", so a half-open range would make the last millisecond of every
++    /// span unreachable — and "the boundary is never drawn" is exactly the kind of blind spot a
++    /// walk is written to find in *other* code. `between(a, a)` is `a`.
++    ///
++    /// A `high` at or below `low` answers `low`: a span that names nothing has one number a caller
++    /// can use, and answering with an instant outside the interval the caller named would be a
++    /// worse answer than the boundary they typed. **Nothing is drawn for it** — a span with no
++    /// range in it has no element to hand out, and the stream does not move — which is
++    /// [`Rng::below`]'s rule about an empty alphabet one level up.
++    pub fn between(&mut self, low: i64, high: i64) -> i64 {
++        todo!("lakelet/4.13-model-based-tests: both ends included, and a span that names nothing \
++               answers `low`")
++    }
++
++    /// One of `items`, drawn uniformly.
++    ///
++    /// # Panics
++    ///
++    /// Panics when `items` is empty. Unlike [`Rng::below`], there is no value to answer with: the
++    /// caller asked for *an element*, and the only alternatives to a panic are an invented element
++    /// or `Option` at every call site. Every walk in this project draws from an alphabet it wrote
++    /// down, so a panic here is a bug in the harness rather than a state a run can reach.
++    #[must_use]
++    pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
++        todo!("lakelet/4.13-model-based-tests: one of the alphabet the caller handed you")
++    }
++
++    /// `true` about `percent` times in a hundred.
++    ///
++    /// `0` is never and `100` is always, and **above `100` is always** rather than a refusal: this
++    /// is a probability written as a whole number, not a validated setting, and a walk that asked
++    /// for `chance(150)` has said "very much yes" — the answer a caller can act on is the one that
++    /// does not need them to read a manual.
++    #[must_use]
++    pub fn chance(&mut self, percent: u64) -> bool {
++        todo!("lakelet/4.13-model-based-tests: `percent` times in a hundred, and 0 and 100 mean \
++               what they say")
++    }
++}
+diff --git a/tests/sim_model.rs b/tests/sim_model.rs
+new file mode 100644
+index 0000000..a247eae
+--- /dev/null
++++ b/tests/sim_model.rs
+@@ -0,0 +1,123 @@
++//! The walk `lakelet/4.13-model-based-tests` is judged by: a seeded sequence of operations against
++//! a real store, compared with the learner's model after every one of them.
++//!
++//! Course content — the step's scaffold ships it, `slow:sim@N` runs it once per seed with
++//! `KILN_SIM_SEED` set, and the gate compares the `lakelet-sim` lines below in the order they were
++//! printed. Three things are therefore strict:
++//!
++//! * **the seed decides the walk.** Which operation comes next, which series it is of, how many
++//!   records it carries, which way the clock steps and which question is asked all come out of
++//!   [`KILN_SIM_SEED`](SEED) through the store's own generator (`src/engine/rng.rs`), so the same
++//!   seed walks the same path on every machine and a `replay` of it is byte-identical. What the
++//!   seed does *not* decide is whether the walk agrees with the model — that is the store's
++//!   answer, and a run where it is "no" is the finding this harness exists to produce;
++//! * **the model is compared after every operation, not at the end.** A walk that compared the
++//!   final state would report "64 operations and the answers differ"; comparing after each one
++//!   names the operation that changed the answer, which is the difference between a failing run
++//!   and something somebody can act on;
++//! * **a failure is shrunk before it is reported.** The sequence in the log is the shortest one
++//!   that still disagrees — see `tests/support/walk.rs` — because "op 57 disagreed" without it is
++//!   a finding nobody can debug, and the seed that produced it is printed beside it.
++//!
++//! # Why the seed is not in a transcript that agreed
++//!
++//! `slow:sim@N` demands that at least two seeds produce *different* transcripts — three identical
++//! ones would mean the harness never read the seed, so one run would have been reported three
++//! times. A transcript that printed its own seed would satisfy that demand without walking
++//! anything, which is why no line of an agreeing walk carries it. The failing path is the
++//! exception: [`shrink`](walk::shrink)'s report names the seed, because a reader of a red log
++//! needs the run it came from.
++//!
++//! # What the transcript holds
++//!
++//! One line per operation — `op=<n> kind=… appended n=… log=…`, and the store's own account of a
++//! flush, a merge, an expiry or a reopen — and, after every one of them, the pair the whole step
++//! is about: `op=<n> model=<digest> store=<digest>`. A digest covers the floor and every record,
++//! compared by bits, so a lost record, a reordered series and a floor that moved the wrong way are
++//! all visible. Nothing here prints a path, an address, a wall clock or an unmasked float.
++
++mod support;
++
++use support::walk::{self, Dir, Op};
++
++/// The seed this run uses when the judge does not name one.
++///
++/// Seed `1` is also what `sim/4.13-model-based-tests.toml` marks as `replay`, so a learner running
++/// this file by hand sees the walk the gate replays.
++const DEFAULT_SEED: u64 = 1;
++
++/// The variable `slow:sim@N` sets: which walk this run takes.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The variable an author uses to walk a longer or shorter sequence than [`walk::OPS`].
++///
++/// Not read by any gate: it is here so that a person looking for a failing walk can widen it
++/// without editing a course file, and the walk it produces is the same kind of walk.
++const OPS: &str = "KILN_SIM_OPS";
++
++/// The seed this process was asked for.
++fn seed() -> u64 {
++    match std::env::var(SEED) {
++        Ok(text) => text
++            .parse()
++            .unwrap_or_else(|error| panic!("{SEED}=`{text}` is not a number: {error}")),
++        Err(_) => DEFAULT_SEED,
++    }
++}
++
++/// How many operations this run walks.
++fn length() -> usize {
++    match std::env::var(OPS) {
++        Ok(text) => text
++            .parse()
++            .unwrap_or_else(|error| panic!("{OPS}=`{text}` is not a number: {error}")),
++        Err(_) => walk::OPS,
++    }
++}
++
++/// Walk once, print the transcript, and fail with the shrunk sequence when the answers differ.
++///
++/// A panic rather than an exit code, because this is the step's `run.cmd`: `cargo test` is what the
++/// judge runs, and the panicking sentence is what it quotes. The transcript is printed line by line
++/// as it is built, so a run that dies halfway still leaves what it observed.
++#[test]
++fn a_walk_agrees_with_the_model_after_every_operation() {
++    let seed = seed();
++    let ops = walk::plan(seed, length());
++    let dir = Dir::new("model-walk");
++    let report = walk::run(&ops, dir.path());
++    for line in &report.lines {
++        println!("{line}");
++    }
++    let Some(mismatch) = report.mismatch else {
++        println!("{} result=agreed ops={}", walk::PREFIX, report.played);
++        return;
++    };
++
++    // The finding: the sequence without the operations the failure does not need. The same seed,
++    // the same starting state, and every candidate replayed on the disk the walk itself uses.
++    let minimal: Vec<Op> =
++        walk::shrink(&ops, |candidate| !walk::run(candidate, dir.path()).agreed());
++    println!(
++        "{} result=disagreed ops={} seed={seed} shrunk_to={}",
++        walk::PREFIX,
++        report.played,
++        minimal.len()
++    );
++    for (index, op) in minimal.iter().enumerate() {
++        println!(
++            "{} shrink op={} {}",
++            walk::PREFIX,
++            index + 1,
++            walk::describe(op)
++        );
++    }
++    panic!(
++        "the store and the model disagreed after {} of {} operation(s), and the smallest sequence \
++         that still disagrees has {} of them — a store must answer what it was told, minus what \
++         its floor forgot, however it kept it: {mismatch}",
++        report.played,
++        ops.len(),
++        minimal.len()
++    );
++}
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index 4b49203..b5f4f3d 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -14,6 +14,11 @@ pub mod service;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.13-model-based-tests`: the reference model a walk compares the store against, and
++// the walk device itself — the operations, the seeded plan, the comparison after every operation
++// and the shrinking of a sequence that disagreed.
++pub mod model;
++pub mod walk;
+ // kiln:scaffold:end
+ 
+ use std::path::{Path, PathBuf};
+diff --git a/tests/support/model.rs b/tests/support/model.rs
+new file mode 100644
+index 0000000..8a63745
+--- /dev/null
++++ b/tests/support/model.rs
+@@ -0,0 +1,122 @@
++//! The learner's reference model: what the store was *told*, and nothing about how it is kept.
++//!
++//! Step `lakelet/4.13-model-based-tests`. `tests/sim_model.rs` runs a walk of random operations
++//! against a real store — real segments, real merges, real retention, real reopens — and compares
++//! the store's answers with this model after every one of them. The model is the other half of that
++//! comparison, and it is deliberately the *stupid* half:
++//!
++//! * **a read returns what was appended, in the order it was appended** — a `Vec<Record>`, and no
++//!   index, no segment, no manifest, no merge, no spool and no clock;
++//! * **expiry moves a floor** — one number — and what is below it stops being an answer while it
++//!   stays in the model, because it stays in the store too (a segment that straddles the cutoff
++//!   keeps its old records on the disk; `lakelet/4.9-retention`);
++//! * **everything else is invisible.** A flush writes a segment, a merge rewrites four of them into
++//!   one, a crash and a reopen replay a log and delete orphans, and this file has no opinion about
++//!   any of it, because a reader of the store cannot see any of it either. That is the property the
++//!   walk is *for*: what a reader sees is a prefix of what the store accepted, minus what the floor
++//!   forgot, and every operation in between has to leave this file's answers alone.
++//!
++//! It lives here — `tests/support/`, beside the fixtures — rather than in `src/`, because it is a
++//! *test's* idea of the store and not the store's: a model is a second implementation of a contract
++//! written for a test to disagree with, and shipping it in the engine would put a second answer to
++//! "what does a read return" inside the thing being judged.
++
++use lakelet::protocol::batch::Record;
++
++/// What a store was told, and what it has forgotten: every record, in order, above a floor.
++///
++/// The two fields are the whole model, and the shape is the argument: records are kept in the order
++/// the store accepted them — one list, not a map, because a read of the whole store hands them back
++/// in that order whatever they are of — and the floor is one number.
++#[derive(Debug, Clone, Default, PartialEq)]
++pub struct Model {
++    /// Every record the store accepted, in the order it accepted them. Nothing here is ever
++    /// removed: `lakelet/4.9-retention` forgets records without the store losing them, so a model
++    /// that deleted them could not tell "the store forgot it" from "the store lost it".
++    accepted: Vec<Record>,
++    /// The millisecond everything below stops being an answer. Zero until an expiry happens, and
++    /// it never moves backwards — a floor is a promise the store cannot take back.
++    floor: u64,
++}
++
++impl Model {
++    /// A model of a store that has been told nothing.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("lakelet/4.13-model-based-tests: a model of a store that has been told nothing")
++    }
++
++    /// Record the batch the store just accepted, in the order within the batch.
++    pub fn append(&mut self, records: &[Record]) {
++        todo!("lakelet/4.13-model-based-tests: in the order within the batch, and never removed")
++    }
++
++    /// Move the floor to `cutoff_millis`: what a retention pass at that cutoff leaves behind.
++    ///
++    /// The walk calls this when the store's floor moves and not when a policy computed a cutoff:
++    /// a pass that expires nothing writes no manifest and moves nothing
++    /// (`lakelet/4.9-retention`), so there is nothing to model and the store's floor is the truth
++    /// this follows.
++    ///
++    /// A cutoff below the floor moves nothing. The store's floor is one-way for a reason worth
++    /// keeping here as well: a pass whose policy window grew, or a clock that stepped backwards,
++    /// cannot make a store that has already said "everything below this is gone" answer again.
++    pub fn expire(&mut self, cutoff_millis: u64) {
++        todo!("lakelet/4.13-model-based-tests: one number, and it only ever moves forwards")
++    }
++
++    /// The millisecond this model has forgotten up to.
++    #[must_use]
++    pub fn floor(&self) -> u64 {
++        todo!("lakelet/4.13-model-based-tests: the millisecond this model has forgotten up to")
++    }
++
++    /// What a read of the whole store must return: everything at or after the floor, in order.
++    ///
++    /// The half-open rule is the store's, not a filter of convenience: a record whose timestamp is
++    /// exactly the floor is still an answer (`lakelet/4.9-retention` keeps whole buckets, and the
++    /// cutoff is the first millisecond it keeps).
++    #[must_use]
++    pub fn answerable(&self) -> Vec<Record> {
++        todo!("lakelet/4.13-model-based-tests: everything at or after the floor, in order")
++    }
++
++    /// What a read of one series must return: the same rule, narrowed to that series.
++    ///
++    /// The name is compared exactly, as the store compares it: a series is a metric name and its
++    /// label set as one string, and `cpu,host=h1` is not `cpu`.
++    #[must_use]
++    pub fn answerable_of(&self, series: &str) -> Vec<Record> {
++        todo!("lakelet/4.13-model-based-tests: the same rule, for one series, compared exactly")
++    }
++
++    /// How many records this model heard — **including the ones the floor forgot**.
++    ///
++    /// A different number from `answerable().len()` on purpose, and the difference is a promise
++    /// `lakelet/4.9-retention` makes: a bucket that straddles the cutoff keeps its old records on
++    /// the disk, so what the store *holds* and what it *answers* are two questions, and this is
++    /// the one the first half answers.
++    #[must_use]
++    pub fn len(&self) -> u64 {
++        todo!("lakelet/4.13-model-based-tests: everything it heard, the floor included")
++    }
++
++    /// `true` when the store has never been told anything.
++    ///
++    /// Present because [`Model::len`] exists: a type with a `len` and no `is_empty` is the lint
++    /// `clippy::len_without_is_empty`, and answering it here is cheaper than a `#[allow]`.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("lakelet/4.13-model-based-tests: whether it was ever told anything")
++    }
++}
++
++/// A record's timestamp as a count of milliseconds, which is how a floor is compared.
++///
++/// A record carries an `i64` — a clock that was wrong can land before the epoch — and a floor and a
++/// bucket are `u64`, because there is no bucket below zero (`lakelet/4.10-downsampling`: "a timestamp
++/// before the Unix epoch belongs to the first bucket"). A record before the epoch is therefore
++/// millisecond zero, and the model says exactly what the store says about it.
++fn millis_of(record: &Record) -> u64 {
++    u64::try_from(record.ts_millis).unwrap_or(0)
++}
+diff --git a/tests/support/walk.rs b/tests/support/walk.rs
+new file mode 100644
+index 0000000..c179297
+--- /dev/null
++++ b/tests/support/walk.rs
+@@ -0,0 +1,875 @@
++//! The walk `lakelet/4.13-model-based-tests` is judged by: random operations, a real store, and
++//! the learner's model after every one of them.
++//!
++//! Course content — `tests/sim_model.rs` ships it, drives it once per seed under `KILN_SIM_SEED`,
++//! and this file is where the walk itself lives. It is here rather than inside `sim_model.rs`
++//! because a walk is a device two things need: the harness prints one, and the step's spec runs a
++//! short one and shrinks a broken one. A test target cannot be imported by another test target, and
++//! a second copy of this file for the spec would be a second answer to "what does a walk do".
++//!
++//! # What a walk is
++//!
++//! * **a sequence of operations, drawn from a seed** ([`plan`]) — six kinds, a series, a batch size
++//!   and a clock that sometimes steps backwards, because a store's data is full of clocks that did.
++//!   The clock moves once per batch — five to twenty minutes between one turn of a load and the
++//!   next, with the records inside a batch seconds apart — which is what keeps a flushed segment a
++//!   *narrow* span of time rather than a smear of whatever the seed drew: a store whose every
++//!   segment reached across its whole history is a store no retention pass could ever remove a
++//!   segment from, and the expiry path would go untested;
++//! * **a real store** — real segments, a real manifest, real merges, real retention, a real log
++//!   that is reopened ([`run`]) — in a directory of the walk's own, so two runs of one sequence are
++//!   comparable;
++//! * **the model after every operation** — not at the end. A walk that only compared the final
++//!   state would report "64 operations and something went wrong"; the comparison after each one
++//!   names the operation that changed the answer, which is the whole difference between a failing
++//!   run and a case somebody can reproduce;
++//! * **the shrinking of a sequence that failed** ([`shrink`]) — a minimal sequence of operations is
++//!   the one thing a red CI log has to contain, and greedily deleting operations until no deletion
++//!   keeps the failure is how it is produced.
++//!
++//! # What is deliberately *not* judged here
++//!
++//! The window arithmetic. A query is answered twice — once by the store's own executor and once by
++//! `lakelet/4.10-downsampling`'s pass over the model's records — and both sides use the same pass
++//! on purpose: the grid, the partial buckets and the five aggregates are that step's spec's subject,
++//! and a walk that re-derived them would be a second implementation of them. What this walk judges
++//! is the store's **bookkeeping**: the segments a merge replaces, the floor a retention pass writes
++//! down, and what survives a reopen.
++//!
++//! # The transcript
++//!
++//! Every line starts with [`PREFIX`] and carries counts, names and digests — never a path, an
++//! address, a wall clock or an unmasked float — so the same seed prints the same bytes on any
++//! machine. `slow:sim@N` compares those bytes between two runs of the seed that replays, and it
++//! refuses three runs whose transcripts are all identical, which is why **the seed is not in any
++//! line of a walk that agreed**: a seed printed next to a transcript would make three runs differ
++//! for a reason that says nothing about the walk. A *failing* run is the exception, and there the
++//! seed is the first thing a reader needs: [`shrink`]'s report names it.
++
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::Spool;
++use lakelet::engine::compaction::{Policy, Segments};
++use lakelet::engine::query::downsample::{self, Aggregate, Range, Window};
++use lakelet::engine::query::exec;
++use lakelet::engine::query::lex::Refusal;
++use lakelet::engine::query::parse::{Statement, parse};
++use lakelet::engine::retention;
++use lakelet::engine::rng::Rng;
++use lakelet::engine::wal;
++use lakelet::protocol::batch::{self, Record};
++
++use crate::support::model::Model;
++
++/// The prefix `slow:sim@N` reads: `<track>-sim`, and the gate ignores every line that is not one.
++pub const PREFIX: &str = "lakelet-sim";
++
++/// The instant the walk's clock starts at: 2023-11-14T22:13:20Z, a round number rather than a
++/// meaningful date, because nothing in this walk is about what day it was.
++pub const BASE: u64 = 1_700_000_000_000;
++
++/// How far the clock may run: the walk's whole history fits in these four hours.
++pub const HORIZON: u64 = 4 * HOUR;
++
++/// One minute, in milliseconds.
++const MINUTE: u64 = 60_000;
++
++/// How far apart the records of one batch are, in milliseconds.
++///
++/// A batch is one turn of a load: its records arrive together, and the next turn is minutes later.
++const STEP: u64 = 10_000;
++
++/// One hour, in milliseconds.
++const HOUR: u64 = 60 * MINUTE;
++
++/// The metric of every record a walk appends.
++///
++/// One metric with four hosts behind it, because the query side of the walk asks by metric and
++/// compares against the model's whole-store answer: every series has to be one the query selects,
++/// and the label set is what makes the four names different series rather than the four names.
++pub const METRIC: &str = "cpu";
++
++/// The series a walk's batches are of.
++pub const SERIES: [&str; 4] = ["cpu,host=h0", "cpu,host=h1", "cpu,host=h2", "cpu,host=h3"];
++
++/// What the walk's retention policy keeps: an hour.
++const KEEP: u64 = HOUR;
++
++/// The bucket width the walk's retention policy counts in: five minutes.
++///
++/// Deliberately not a divisor of [`KEEP`]'s relationship with the clock: a cutoff is snapped *down*
++/// to a boundary, so a pass always lands on a number the walk did not type.
++const PART: u64 = 5 * MINUTE;
++
++/// How many operations a walk plays when the judge does not say: enough that the three walks
++/// `slow:sim@3` runs each flush a dozen times, merge at least once, expire several times, reopen a
++/// few times and ask a handful of questions — every one of the six in every one of them, measured
++/// on the reference solution.
++pub const OPS: usize = 64;
++
++/// One operation of a walk: what is played against the store, and against the model.
++///
++/// The operations are data, and the timestamps are in them rather than read from a clock while
++/// they are played: a sequence is a *value*, so a shrunk one can be replayed on its own — on a
++/// machine that generates nothing — and so the same sequence means the same thing in a bug report.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Op {
++    /// A batch of records arrived: the write path accepts them. The model is told about them by
++    /// the [`Op::Flush`] that closes them into a segment, not here — see `Store::append`.
++    Append {
++        /// The records, stamped and valued by the plan.
++        records: Vec<Record>,
++    },
++    /// The records the log holds since the last flush are closed into one segment.
++    Flush,
++    /// One compaction pass, if the policy has a plan.
++    Merge,
++    /// A retention pass at `now`: everything older than the policy's window is forgotten.
++    Expire {
++        /// The instant the pass runs at.
++        now: u64,
++    },
++    /// The store is dropped and opened again: the log is replayed and the manifest is read.
++    Reopen,
++    /// A question, answered by the store's executor and by the model's records.
++    Query {
++        /// The first millisecond the question is about.
++        from: u64,
++        /// The first millisecond it is not.
++        to: u64,
++        /// How wide one bucket is.
++        window_millis: u64,
++        /// How a window's records become one number.
++        aggregate: Aggregate,
++    },
++}
++
++/// A directory a walk owns, removed when the run is over.
++///
++/// The name is this process's, and it never reaches the transcript: a path in a transcript is a
++/// transcript that only replays on one machine.
++#[derive(Debug)]
++pub struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    #[must_use]
++    pub fn new(label: &str) -> Self {
++        let path = std::env::temp_dir().join(format!("lakelet-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    #[must_use]
++    pub fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// The walk's clock: the instant each batch is stamped with.
++///
++/// It steps backwards about a quarter of the time, because a fleet's clocks do — a store whose
++/// records only ever arrive in ascending order is a store that never meets the case
++/// `lakelet/4.7-columnar-segments` wrote a delta encoder for. It never leaves
++/// `[BASE, BASE + HORIZON]`, so the whole history of a walk is one span of simulated time and a
++/// query's range can name the ends of it.
++#[derive(Debug, Clone, Copy)]
++struct Clock {
++    /// The instant the next batch starts at.
++    now: u64,
++}
++
++impl Clock {
++    /// A clock at [`BASE`].
++    fn new() -> Self {
++        Self { now: BASE }
++    }
++
++    /// How far this clock has come from [`BASE`]: the span a pass or a question can name.
++    ///
++    /// Both are drawn from *inside* the walk's history and not from the horizon, because the clock
++    /// travels as far as the appends take it: a cutoff drawn from the whole horizon would be below
++    /// the first record for most of a walk, and a retention pass that removes nothing is a pass
++    /// this walk would never have tested.
++    fn travelled(&self) -> u64 {
++        self.now.saturating_sub(BASE).max(1)
++    }
++
++    /// Move by one step and answer the instant the next batch starts at.
++    ///
++    /// Five to twenty minutes, forwards or backwards, clamped to the walk's span: the clamp is what
++    /// keeps "the last instant of the walk" a number the plan can write down, and a clock that
++    /// stepped below [`BASE`] would make a query's range start after some of its own records.
++    fn tick(&mut self, rng: &mut Rng) -> u64 {
++        let step = rng.between(5, 20) as u64 * MINUTE;
++        self.now = if rng.chance(25) {
++            self.now.saturating_sub(step)
++        } else {
++            self.now + step
++        };
++        self.now = self.now.clamp(BASE, BASE + HORIZON);
++        self.now
++    }
++}
++
++/// A walk of `ops` operations, drawn from `seed`.
++///
++/// This is the whole of what the seed decides: which operation comes next, which series it is of,
++/// how many records it carries, how far the clock moves and which way, and — through the expiries
++/// — how far the floor travels. Nothing else in a run reads a clock, a path or an address, so the
++/// same seed is the same walk on every machine.
++#[must_use]
++pub fn plan(seed: u64, ops: usize) -> Vec<Op> {
++    let mut rng = Rng::new(seed);
++    let mut clock = Clock::new();
++    (0..ops).map(|_| one(&mut rng, &mut clock)).collect()
++}
++
++/// The merge policy a walk's store runs with: the shipped one, with the ratio widened to three.
++///
++/// The width is `lakelet/4.8-compaction`'s four, and the *ratio* is the one number this walk
++/// changes, for a reason about walks rather than about stores. A store whose flushes arrive on a
++/// steady tick produces segments of one size, which is what the shipped factor of two is for; a
++/// walk's flushes close whatever the seed happened to leave pending, and the segments the three
++/// walks this step is judged by closed ranged from 33 to 228 bytes — a spread of seven, in which a
++/// run of four segments all within a factor of two of each other is a matter of luck. A walk that
++/// never merges is a walk that never tests this step's claim, which is that a merge is invisible to
++/// a reader, so the ratio is widened to what puts the merge path in every one of those walks. At
++/// three, the merged segment still leaves its tier.
++fn policy() -> Policy {
++    Policy::new(Policy::DEFAULT.width(), 3)
++}
++
++/// Half of `span`, and never zero: the lower end of "the older part of what this walk has kept".
++fn half(span: u64) -> u64 {
++    (span / 2).max(1)
++}
++
++/// The next operation of a walk.
++///
++/// The weights are the shape of the walk and not a tuning knob: thirty-six appends to twenty
++/// flushes (so a segment holds what a couple of turns of a load brought, and a flush usually has
++/// something to close), a merge every seventh operation, an expiry in ten, a question in seven, and
++/// a reopen in twenty. What a given seed *visits* is then a fact about that seed — a merge can
++/// collapse four segments into one and leave the expiry after it nothing to remove — and the
++/// weights are set so that each of the six operations is one a [`OPS`]-operation walk usually takes
++/// rather than one a seed happens to hit.
++fn one(rng: &mut Rng, clock: &mut Clock) -> Op {
++    match rng.below(100) {
++        0..=35 => Op::Append {
++            records: batch(rng, clock),
++        },
++        36..=55 => Op::Flush,
++        56..=70 => Op::Merge,
++        71..=80 => Op::Expire {
++            // A pass whose cutoff lands between a quarter and three quarters of the way back
++            // through what the walk has collected. A retention pass removes whole segments only
++            // (`lakelet/4.9-retention`), so the cutoff has to fall *behind* some segment's last
++            // record for the floor to move at all: a cutoff at the clock itself would leave every
++            // segment reaching past it, and the pass would delete nothing.
++            now: clock
++                .now
++                .saturating_sub(half(clock.travelled()) / 2 + rng.below(half(clock.travelled())))
++                + KEEP,
++        },
++        81..=85 => Op::Reopen,
++        _ => query(rng, clock),
++    }
++}
++
++/// A batch for one of the walk's series, stamped by the clock.
++///
++/// One turn of the load: the clock moves once for the whole batch and the records inside it are
++/// [`STEP`] apart, which is what makes a flushed segment a *narrow* span of time rather than a
++/// smear of whatever the seed drew. A store whose every segment held records from its whole history
++/// would be a store no retention pass could ever remove a segment from, and the expiry path — the
++/// one that moves the floor and shrinks what a reader answers with — would go untested.
++fn batch(rng: &mut Rng, clock: &mut Clock) -> Vec<Record> {
++    let series = (*rng.pick(&SERIES)).to_owned();
++    let count = 1 + rng.below(4);
++    let at = clock.tick(rng);
++    (0..count)
++        .map(|index| Record {
++            series: series.clone(),
++            ts_millis: (at + index * STEP) as i64,
++            value: rng.below(1_024) as f64 / 8.0,
++        })
++        .collect()
++}
++
++/// A question about a span of the walk's own history.
++///
++/// The range starts somewhere the walk has already been and ends a few buckets later, so it may
++/// reach below the floor — the refusal a caller earns by asking about records the store has
++/// forgotten, which is worked out on both sides — and a narrow window may fall between two
++/// records and be answered with no buckets at all. Both are answers the model has an opinion about.
++fn query(rng: &mut Rng, clock: &mut Clock) -> Op {
++    let window_millis = *rng.pick(&[MINUTE, 5 * MINUTE, 15 * MINUTE, HOUR]);
++    let from = clock.now.saturating_sub(rng.below(clock.travelled()));
++    Op::Query {
++        from,
++        to: from + window_millis * (1 + rng.below(8)),
++        window_millis,
++        aggregate: *rng.pick(&Aggregate::ALL),
++    }
++}
++
++/// One operation, as a transcript names it.
++///
++/// Short, deterministic, and about *what was played*: the counts and names a reader needs to follow
++/// a walk without a debugger. Never a timestamp — a record's own time is inside the digest, and a
++/// line that printed it would be a line about the data rather than about the operation.
++#[must_use]
++pub fn describe(op: &Op) -> String {
++    match op {
++        Op::Append { records } => {
++            let series = records
++                .first()
++                .map_or("none", |record| record.series.as_str());
++            format!("kind=append n={} series={series}", records.len())
++        }
++        Op::Flush => "kind=flush".to_owned(),
++        Op::Merge => "kind=merge".to_owned(),
++        Op::Expire { .. } => "kind=expire".to_owned(),
++        Op::Reopen => "kind=reopen".to_owned(),
++        Op::Query {
++            window_millis,
++            aggregate,
++            ..
++        } => format!("kind=query window={window_millis} agg={}", aggregate.name()),
++    }
++}
++
++/// A mistake a walk can be asked to make, so that the machinery which *finds* a failure is shown
++/// one.
++///
++/// The harness walks with [`Defect::None`]; the step's spec walks with the other variant to watch
++/// [`shrink`] do its work. The mistake is the one this whole step exists to catch, made on purpose:
++/// a model that is never told what one flush closed, while the store keeps it — so the two halves
++/// of the comparison disagree about *content* rather than about the floor, which is the kind of
++/// disagreement a person needs reduced to something readable.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Defect {
++    /// Everything the store keeps, the model is told about: the walk the gate judges.
++    None,
++    /// The model is never told about the records of the **first flush that closed any**, and a
++    /// model with a hole that size is a model whose answers are missing a batch.
++    ForgetFirstFlush,
++}
++
++/// What one walk of a written-down sequence found.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Report {
++    /// The transcript, in the order the walk observed things.
++    pub lines: Vec<String>,
++    /// How many operations were played.
++    pub played: usize,
++    /// Where the store and the model disagreed, or `None` when they agreed after every operation.
++    pub mismatch: Option<String>,
++}
++
++impl Report {
++    /// `true` when this walk is evidence that nothing is wrong: every operation agreed.
++    #[must_use]
++    pub fn agreed(&self) -> bool {
++        self.mismatch.is_none()
++    }
++}
++
++/// Play `ops` against a store of `directory`, comparing with the model after every operation.
++///
++/// The directory is wiped first: a walk starts from a store that has never been told anything, and
++/// a run that began in a store somebody else left behind would be a run about that store. The
++/// transcript stops where the walk stopped — at the first disagreement — because the operations
++/// after it were never played and a line for one of them would be a line about a run that did not
++/// happen.
++#[must_use]
++pub fn run(ops: &[Op], directory: &Path) -> Report {
++    run_with(ops, directory, Defect::None)
++}
++
++/// The same walk, with one deliberate mistake in the model: see [`Defect`].
++///
++/// Nothing else differs, which is the point: the same operations, the same store and the same
++/// comparison, with one thing known to be wrong.
++#[must_use]
++pub fn run_with(ops: &[Op], directory: &Path, defect: Defect) -> Report {
++    let _ = std::fs::remove_dir_all(directory);
++    let mut report = Report {
++        lines: Vec::new(),
++        played: 0,
++        mismatch: None,
++    };
++    let mut walk = match Store::open(directory, defect) {
++        Ok(walk) => walk,
++        Err(detail) => {
++            report.mismatch = Some(detail);
++            return report;
++        }
++    };
++    for (index, op) in ops.iter().enumerate() {
++        let number = index + 1;
++        report.played = number;
++        let observed = match walk.play(op) {
++            Ok(observed) => observed,
++            Err(detail) => {
++                report.mismatch = Some(format!("op {number} ({}) — {detail}", describe(op)));
++                return report;
++            }
++        };
++        report
++            .lines
++            .push(format!("{PREFIX} op={number} {} {observed}", describe(op)));
++        let pair = match walk.check() {
++            Ok(pair) => pair,
++            Err(detail) => {
++                report.mismatch = Some(format!("op {number} ({}) — {detail}", describe(op)));
++                return report;
++            }
++        };
++        report.lines.push(format!(
++            "{PREFIX} op={number} model={} store={}",
++            pair.0, pair.1
++        ));
++    }
++    report
++}
++
++/// The longest prefix of `ops` that still fails, with every operation it does not need taken out.
++///
++/// The contract is three sentences, and each of them is what `lakelet/4.13-model-based-tests`'
++/// spec checks: the answer still fails; its operations are the ones it was given, in the same
++/// order, with some left out; and **no single operation can be taken out of the answer and still
++/// leave a failure**. Deliberately "nothing obvious left to remove" rather than "the smallest":
++/// the smallest is a search over every subset, and the sequence a person reads in a bug report is
++/// the one where every remaining operation is load-bearing.
++///
++/// `fails` is asked about candidate sequences and answers whether that sequence still disagrees.
++/// It is a closure rather than a named runner because a walk is not the only thing that can fail:
++/// the step's own spec hands this function a store with a planted defect, which is how a shrinker
++/// is tested without breaking the store it ships with.
++#[must_use]
++pub fn shrink<F>(ops: &[Op], mut fails: F) -> Vec<Op>
++where
++    F: FnMut(&[Op]) -> bool,
++{
++    let mut kept: Vec<Op> = ops.to_vec();
++    let mut removed = true;
++    while removed {
++        removed = false;
++        let mut index = 0;
++        while index < kept.len() {
++            let mut candidate = kept.clone();
++            candidate.remove(index);
++            if fails(&candidate) {
++                kept = candidate;
++                removed = true;
++            } else {
++                index += 1;
++            }
++        }
++    }
++    kept
++}
++
++/// A store of a walk's own: the write path, the segments, and the model beside them.
++struct Store {
++    /// Where both halves live.
++    directory: PathBuf,
++    /// The log: what has been accepted and not yet closed into a segment.
++    spool: Spool,
++    /// The segments and the manifest: what a reader is handed.
++    segments: Segments,
++    /// What the store was told.
++    model: Model,
++    /// How many batches the write path has accepted: the log's own length, kept here rather than
++    /// asked of the file (`Spool::records` reads and replays the whole log, and a walk that asked
++    /// on every operation would replay it sixty-four times).
++    accepted: usize,
++    /// The mistake this walk was asked to make.
++    defect: Defect,
++    /// Whether the mistake has already been made: the first flush that closed anything, and only
++    /// that one.
++    forgotten: bool,
++    /// How many of the log's payloads a flush has already closed into a segment.
++    ///
++    /// This build's log is never truncated — nothing in `src/engine/spool` removes bytes — so "the
++    /// records since the last flush" is the harness's own boundary, kept here where a reader of the
++    /// walk can see it. A flush that sealed the whole log again would put every record in the
++    /// store twice, and the walk would blame the store for the harness's arithmetic.
++    flushed: usize,
++}
++
++impl Store {
++    /// Open the two halves of an empty store in `directory`.
++    fn open(directory: &Path, defect: Defect) -> Result<Self, String> {
++        std::fs::create_dir_all(directory).map_err(|error| {
++            format!(
++                "{} cannot be created for this walk's store: {error}",
++                directory.display()
++            )
++        })?;
++        // `Never`: this walk never dies in the middle of a write — that is
++        // `lakelet/4.4-wal-recovery`'s scenario, and it is a different step's spec — and the
++        // interval policy would read a wall clock inside a run whose whole point is that the same
++        // seed produces the same bytes. `docs/crash-points.md` is what `Never` costs a store that
++        // *does* lose power.
++        let spool = Spool::with_policy(directory, wal::Policy::Never).map_err(failed)?;
++        let segments = Segments::with_policy(directory, policy()).map_err(failed)?;
++        Ok(Self {
++            directory: directory.to_path_buf(),
++            spool,
++            segments,
++            model: Model::new(),
++            defect,
++            forgotten: false,
++            accepted: 0,
++            flushed: 0,
++        })
++    }
++
++    /// Play one operation, answering the line the transcript prints for it.
++    fn play(&mut self, op: &Op) -> Result<String, String> {
++        match op {
++            Op::Append { records } => self.append(records),
++            Op::Flush => self.flush(),
++            Op::Merge => self.merge(),
++            Op::Expire { now } => self.expire(*now),
++            Op::Reopen => self.reopen(),
++            Op::Query {
++                from,
++                to,
++                window_millis,
++                aggregate,
++            } => self.ask(*from, *to, *window_millis, *aggregate),
++        }
++    }
++
++    /// The write path accepts a batch.
++    ///
++    /// The model is **not** told here, and that is the walk's sharpest edge: a record the log holds
++    /// and no segment holds is not an answer — a read is the segments a manifest names, with what
++    /// the floor forgot left out, which is what a query in `lakelet/4.11-query-engine` reads — so
++    /// `Append` is an operation a reader cannot see, and the comparison after it is the claim that
++    /// accepting a record changes nothing anybody can read. What the model is told is what a flush
++    /// *closes*.
++    fn append(&mut self, records: &[Record]) -> Result<String, String> {
++        let payload = batch::encode(records);
++        self.spool.append(&payload).map_err(failed)?;
++        self.accepted += 1;
++        Ok(format!(
++            "accepted bytes={} log={}",
++            payload.len(),
++            self.accepted
++        ))
++    }
++
++    /// Close what the log holds since the last flush into one segment.
++    fn flush(&mut self) -> Result<String, String> {
++        let payloads = self.spool.records().map_err(failed)?;
++        let start = self.flushed.min(payloads.len());
++        let mut records: Vec<Record> = Vec::new();
++        for payload in &payloads[start..] {
++            records.extend(batch::decode(payload).map_err(failed)?);
++        }
++        let segments = self.segments.manifest().segments().len();
++        if records.is_empty() {
++            return Ok(format!("closed=0 segments={segments}"));
++        }
++        self.segments.seal(&records).map_err(failed)?;
++        // Now the records are the store's: the segment holds them, the manifest names it, and a
++        // reader sees them. This is where the model hears about them, and the comparison right
++        // after this operation is what says a flush is a bookkeeping change and not a change in
++        // what was stored — unless this walk was asked to make the one deliberate mistake, in
++        // which case the model is never told and the two halves disagree about content.
++        if self.defect == Defect::ForgetFirstFlush && !self.forgotten {
++            self.forgotten = true;
++        } else {
++            self.model.append(&records);
++        }
++        self.flushed = payloads.len();
++        Ok(format!(
++            "closed={} bytes={} segments={}",
++            records.len(),
++            self.segments
++                .manifest()
++                .segments()
++                .last()
++                .map_or(0, |info| info.bytes),
++            self.segments.manifest().segments().len()
++        ))
++    }
++
++    /// One compaction pass, if the policy has a plan.
++    fn merge(&mut self) -> Result<String, String> {
++        let segments = self.segments.manifest().segments().len();
++        match self.segments.compact().map_err(failed)? {
++            None => Ok(format!("none segments={segments}")),
++            Some(report) => Ok(format!(
++                "took={} records={} segments={}->{}",
++                report.merged().len(),
++                report.records(),
++                report.segments_before(),
++                report.segments_after()
++            )),
++        }
++    }
++
++    /// A retention pass at `now`, with the floor the model works out for itself.
++    ///
++    /// The model is *not* told what the pass did: it is told the cutoff a policy with this window
++    /// and this clock has, and the two are compared afterwards. Handing the model the store's own
++    /// answer would make the floor the one thing this walk could not catch.
++    fn expire(&mut self, now: u64) -> Result<String, String> {
++        let policy = retention::Policy::new(KEEP, PART);
++        // The number the store *will* write down if anything expires: the policy's cutoff at
++        // `now`, and never below the floor it already has (`Segments::expire` takes the same max,
++        // because a floor is a promise a growing window may not take back).
++        let cutoff = policy.cutoff(now).max(self.segments.floor());
++        let before = self.segments.manifest().segments().len();
++        let report = self.segments.expire(&policy, now).map_err(failed)?;
++        // A pass that expires nothing **does not move the store** (`lakelet/4.9-retention`: an
++        // empty plan writes no manifest at all, so the epoch, the index and the floor stay where
++        // they were), and the model follows the store rather than the policy here: what it has
++        // forgotten is what the store wrote down, and a cutoff nobody acted on is not a floor.
++        if !report.is_empty() {
++            self.model.expire(cutoff);
++        }
++        Ok(format!(
++            "floor={} segments={before}->{}",
++            self.segments.floor(),
++            report.segments_after()
++        ))
++    }
++
++    /// Drop both halves and open them again: the log is replayed, the manifest is read, and the
++    /// orphans a crash leaves behind are deleted.
++    ///
++    /// Nothing here is an event in what the store was *told*, so the model does not hear about it;
++    /// what a reopen has to preserve is exactly what it is not told about.
++    fn reopen(&mut self) -> Result<String, String> {
++        let spool = Spool::with_policy(&self.directory, wal::Policy::Never).map_err(failed)?;
++        let segments = Segments::with_policy(self.directory.clone(), policy()).map_err(failed)?;
++        self.spool = spool;
++        self.segments = segments;
++        // `lakelet/4.4-wal-recovery`'s promise, asked of the store rather than assumed: opening a
++        // store replays the log, so every payload this walk appended is still in it. The model is
++        // no help here — it is told about a batch when a flush closes it, and the records this
++        // catches are the ones no flush has reached yet.
++        let replayed = self.spool.records().map_err(failed)?.len();
++        if replayed != self.accepted {
++            return Err(format!(
++                "the log of the reopened store holds {replayed} payload(s) and this walk appended \
++                 {} — opening a store is what replays its log, and a record that was acknowledged \
++                 is the one thing a store may not lose; check what the open cut off the end",
++                self.accepted
++            ));
++        }
++        Ok(format!(
++            "floor={} segments={} log={replayed}",
++            self.segments.floor(),
++            self.segments.manifest().segments().len()
++        ))
++    }
++
++    /// Ask a question of the store's executor and of the model's records.
++    ///
++    /// The store's side is the real thing — a plan drawn from the manifest, the segments it keeps,
++    /// one read each — and the model's side is the same question over what the model was told,
++    /// answered by the pass `lakelet/4.10-downsampling` ships. The two must produce the same
++    /// buckets, and the one refusal that can come out of a *range* is worked out twice as well: a
++    /// range that reaches below the floor is refused by the plan before a segment is opened, and
++    /// the model says the same thing about a floor of its own.
++    fn ask(
++        &self,
++        from: u64,
++        to: u64,
++        window_millis: u64,
++        aggregate: Aggregate,
++    ) -> Result<String, String> {
++        let text = format!(
++            "SELECT {}(value) FROM {METRIC} WHERE ts BETWEEN {from} AND {to} \
++             GROUP BY time({window_millis}ms)",
++            aggregate.name()
++        );
++        let statement = parse(&text).map_err(|refusal| {
++            format!("`{text}` is a query this grammar wrote and it refused it: {refusal}")
++        })?;
++        let Statement::Query(query) = statement else {
++            return Err(format!("`{text}` is not `EXPLAIN` and parsed as one"));
++        };
++        let snapshot = self.segments.snapshot();
++        let store = match exec::execute(&snapshot, &query) {
++            Ok(outcome) => answer(outcome.answers().len(), &buckets_of_outcome(&outcome)),
++            Err(refusal) => format!("refused={}", refusal_name(&refusal)),
++        };
++        let model = if from < self.model.floor() {
++            "refused=forgot(2)".to_owned()
++        } else {
++            let answered = downsample::downsample(
++                &self.model.answerable(),
++                None,
++                Range::new(from, to),
++                Window::new(window_millis),
++                aggregate,
++            );
++            answer(1, &buckets_of(answered.buckets()))
++        };
++        if store != model {
++            return Err(format!(
++                "the question `{text}` answered {store} from the store and {model} from the model — \
++                 a query reads the segments a snapshot names, and what it answers is what the store \
++                 was told, minus what its floor forgot; check the plan's pruning (a segment the \
++                 manifest states a range for) and the floor the last expiry wrote down"
++            ));
++        }
++        Ok(store)
++    }
++
++    /// Compare the store with the model: the floor, then every record, in order, by bits.
++    ///
++    /// Both halves of the answer are compared, and the floor first because it is one number with
++    /// one sentence: the store's floor is what it says it has forgotten, and a model whose floor
++    /// disagrees is a model whose answers will disagree with everything that follows.
++    fn check(&self) -> Result<(String, String), String> {
++        let snapshot = self.segments.snapshot();
++        let store_floor = self.segments.floor();
++        let store = snapshot.records().map_err(|error| {
++            format!(
++                "the store could not answer from its own segments: {error} — a manifest that \
++                 disagrees with its files is a store nothing can be read out of"
++            )
++        })?;
++        let model_floor = self.model.floor();
++        if store_floor != model_floor {
++            return Err(format!(
++                "the store has forgotten up to {store_floor} and the model up to {model_floor} — \
++                 a retention pass moves the floor and writes it into the manifest, and the model \
++                 works the same number out from the same policy; check what the last `Expire` \
++                 moved and that the floor never moves backwards"
++            ));
++        }
++        let model = self.model.answerable();
++        if store.len() != model.len() {
++            return Err(format!(
++                "the store answers {} record(s) and the model {} — a flush, a merge and a reopen \
++                 are all invisible to a reader, so after every one of them the store must answer \
++                 exactly what it was told, minus what its floor forgot; check the operation this \
++                 walk just played",
++                store.len(),
++                model.len()
++            ));
++        }
++        for (index, (left, right)) in store.iter().zip(&model).enumerate() {
++            if !same(left, right) {
++                return Err(format!(
++                    "record {index} of {} is `{}` at {} from the store and `{}` at {} from the \
++                     model — a merge writes one segment where its inputs were, and a reopen \
++                     replays the log, so neither may reorder or lose a record",
++                    store.len(),
++                    left.series,
++                    left.ts_millis,
++                    right.series,
++                    right.ts_millis
++                ));
++            }
++        }
++        Ok((digest(model_floor, &model), digest(store_floor, &store)))
++    }
++}
++
++/// The one answer a query that groups by nothing has, as a token.
++///
++/// A query without `GROUP BY …, series` has exactly one answer (`lakelet/4.11-query-engine`), and
++/// this walk never asks for more: the model has one list of records, so the question it can be
++/// compared about is the one that mixes every series.
++fn buckets_of_outcome(outcome: &exec::Outcome) -> String {
++    match outcome.answers().first() {
++        Some(mixed) => buckets_of(mixed.buckets()),
++        None => buckets_of(&[]),
++    }
++}
++
++/// An answer as a transcript token: how many answers, how many buckets, and a digest of them.
++///
++/// A token rather than the buckets, because a transcript is compared between runs and a bucket's
++/// value is a float: `buckets=3 digest=91f2…` is the same information in a form that cannot differ
++/// by a last place between two machines.
++fn answer(answers: usize, buckets: &str) -> String {
++    format!("answered={answers} {buckets}")
++}
++
++/// One bucket list as a transcript token.
++fn buckets_of(buckets: &[downsample::Bucket]) -> String {
++    let mut hash = 0xcbf2_9ce4_8422_2325u64;
++    for bucket in buckets {
++        hash = mix(hash, &bucket.start().to_le_bytes());
++        hash = mix(hash, &bucket.count().to_le_bytes());
++        hash = mix(hash, &bucket.value().to_bits().to_le_bytes());
++    }
++    format!("buckets={} digest={hash:016x}", buckets.len())
++}
++
++/// How a refusal is named in a transcript: what it refused, and the class a script reads.
++///
++/// The class is `jobq/3.15-cli-contract`'s exit-code table, and the name is what a reader of a
++/// failing transcript needs; the sentence itself is not printed, because it quotes the range and
++/// the floor and a token that long is a token nobody diffs.
++fn refusal_name(refusal: &Refusal) -> &'static str {
++    match refusal {
++        Refusal::Forgot { .. } => "forgot(2)",
++        Refusal::Unknown { .. } => "unknown(3)",
++        Refusal::Store { .. } => "store(4)",
++        _ => "syntax(2)",
++    }
++}
++
++/// The floor and every record of a side, as one number: the pair a transcript prints.
++fn digest(floor: u64, records: &[Record]) -> String {
++    let mut hash = mix(0xcbf2_9ce4_8422_2325u64, &floor.to_le_bytes());
++    hash = mix(hash, &(records.len() as u64).to_le_bytes());
++    for record in records {
++        hash = mix(hash, record.series.as_bytes());
++        hash = mix(hash, &[0]);
++        hash = mix(hash, &record.ts_millis.to_le_bytes());
++        hash = mix(hash, &record.value.to_bits().to_le_bytes());
++    }
++    format!("{hash:016x}")
++}
++
++/// One FNV-1a step: `bytes` folded into `hash`.
++///
++/// Written out rather than taken from a crate, for the reason this whole walk exists: what a
++/// transcript is compared through has to be the same arithmetic on every machine.
++fn mix(hash: u64, bytes: &[u8]) -> u64 {
++    let mut hash = hash;
++    for byte in bytes {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    hash
++}
++
++/// `true` when two records are the same record: every field, the value compared by bits.
++fn same(left: &Record, right: &Record) -> bool {
++    left.series == right.series
++        && left.ts_millis == right.ts_millis
++        && left.value.to_bits() == right.value.to_bits()
++}
++
++/// A store failure, as the sentence a failing run reports.
++fn failed(error: impl std::fmt::Display) -> String {
++    format!("the store refused an operation this walk's own store cannot refuse: {error}")
++}

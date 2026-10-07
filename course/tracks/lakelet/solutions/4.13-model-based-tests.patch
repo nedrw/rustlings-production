@@ -1,0 +1,166 @@
+diff --git a/src/engine/rng.rs b/src/engine/rng.rs
+index c6b4dc4..2734000 100644
+--- a/src/engine/rng.rs
++++ b/src/engine/rng.rs
+@@ -74,7 +74,8 @@ impl Rng {
+     /// [`AWAY_FROM_ZERO`].
+     #[must_use]
+     pub const fn new(seed: u64) -> Self {
+-        todo!()
++        let state = if seed == 0 { AWAY_FROM_ZERO } else { seed };
++        Self { state }
+     }
+ 
+     /// The next 64 bits: the state moves on, and the answer is the state mixed with itself.
+@@ -83,8 +84,12 @@ impl Rng {
+     /// what they are — each one folds a differently-scaled copy of the state into it — and the
+     /// multiply at the end is the star.
+     pub fn next_u64(&mut self) -> u64 {
+-        todo!("lakelet/4.13-model-based-tests: `MULTIPLIER` is the star, and the three shifts are \
+-               the whole of the state update")
++        let mut state = self.state;
++        state ^= state >> 12;
++        state ^= state << 25;
++        state ^= state >> 27;
++        self.state = state;
++        state.wrapping_mul(MULTIPLIER)
+     }
+ 
+     /// A number in `0..bound`, and `0` when there is nothing to draw from.
+@@ -100,7 +105,10 @@ impl Rng {
+     /// makes on purpose: a walk is a search for a counter-example, not a sample for a statistic.
+     /// `jobq/3.19-property-invariants` made the same trade for the same reason.
+     pub fn below(&mut self, bound: u64) -> u64 {
+-        todo!("lakelet/4.13-model-based-tests: in range, total, and the same answer for one seed")
++        if bound == 0 {
++            return 0;
++        }
++        self.next_u64() % bound
+     }
+ 
+     /// A number in `low..=high`: **both ends are included**.
+@@ -116,8 +124,13 @@ impl Rng {
+     /// range in it has no element to hand out, and the stream does not move — which is
+     /// [`Rng::below`]'s rule about an empty alphabet one level up.
+     pub fn between(&mut self, low: i64, high: i64) -> i64 {
+-        todo!("lakelet/4.13-model-based-tests: both ends included, and a span that names nothing \
+-               answers `low`")
++        let span = high.saturating_sub(low);
++        if span <= 0 {
++            return low;
++        }
++        // `span + 1` values, and the +1 cannot overflow an `i64`'s span in a `u64`.
++        let offset = self.below(span as u64 + 1) as i64;
++        low + offset
+     }
+ 
+     /// One of `items`, drawn uniformly.
+@@ -130,7 +143,20 @@ impl Rng {
+     /// down, so a panic here is a bug in the harness rather than a state a run can reach.
+     #[must_use]
+     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+-        todo!("lakelet/4.13-model-based-tests: one of the alphabet the caller handed you")
++        assert!(
++            !items.is_empty(),
++            "`pick` draws one element of an alphabet, and this one holds none: there is no element \
++             to answer with, and inventing one would be a walk playing an operation nobody wrote"
++        );
++        // `get` rather than `items[index]`: the lint ladder this project sets denies indexing in
++        // library code, because a store that panics stops answering (`docs/authoring.md` §7.4).
++        // The `unreachable!` is `below`'s promise — the draw is in `0..len` — written down where it
++        // is spent.
++        let index = self.below(items.len() as u64) as usize;
++        match items.get(index) {
++            Some(item) => item,
++            None => unreachable!("`below(len)` is in `0..len`, so one element of the list matches"),
++        }
+     }
+ 
+     /// `true` about `percent` times in a hundred.
+@@ -141,7 +167,6 @@ impl Rng {
+     /// does not need them to read a manual.
+     #[must_use]
+     pub fn chance(&mut self, percent: u64) -> bool {
+-        todo!("lakelet/4.13-model-based-tests: `percent` times in a hundred, and 0 and 100 mean \
+-               what they say")
++        percent >= 100 || self.below(100) < percent
+     }
+ }
+diff --git a/tests/support/model.rs b/tests/support/model.rs
+index 8a63745..ac50e24 100644
+--- a/tests/support/model.rs
++++ b/tests/support/model.rs
+@@ -43,12 +43,12 @@ impl Model {
+     /// A model of a store that has been told nothing.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("lakelet/4.13-model-based-tests: a model of a store that has been told nothing")
++        Self::default()
+     }
+ 
+     /// Record the batch the store just accepted, in the order within the batch.
+     pub fn append(&mut self, records: &[Record]) {
+-        todo!("lakelet/4.13-model-based-tests: in the order within the batch, and never removed")
++        self.accepted.extend_from_slice(records);
+     }
+ 
+     /// Move the floor to `cutoff_millis`: what a retention pass at that cutoff leaves behind.
+@@ -62,13 +62,13 @@ impl Model {
+     /// keeping here as well: a pass whose policy window grew, or a clock that stepped backwards,
+     /// cannot make a store that has already said "everything below this is gone" answer again.
+     pub fn expire(&mut self, cutoff_millis: u64) {
+-        todo!("lakelet/4.13-model-based-tests: one number, and it only ever moves forwards")
++        self.floor = self.floor.max(cutoff_millis);
+     }
+ 
+     /// The millisecond this model has forgotten up to.
+     #[must_use]
+     pub fn floor(&self) -> u64 {
+-        todo!("lakelet/4.13-model-based-tests: the millisecond this model has forgotten up to")
++        self.floor
+     }
+ 
+     /// What a read of the whole store must return: everything at or after the floor, in order.
+@@ -78,7 +78,11 @@ impl Model {
+     /// cutoff is the first millisecond it keeps).
+     #[must_use]
+     pub fn answerable(&self) -> Vec<Record> {
+-        todo!("lakelet/4.13-model-based-tests: everything at or after the floor, in order")
++        self.accepted
++            .iter()
++            .filter(|record| millis_of(record) >= self.floor)
++            .cloned()
++            .collect()
+     }
+ 
+     /// What a read of one series must return: the same rule, narrowed to that series.
+@@ -87,7 +91,10 @@ impl Model {
+     /// label set as one string, and `cpu,host=h1` is not `cpu`.
+     #[must_use]
+     pub fn answerable_of(&self, series: &str) -> Vec<Record> {
+-        todo!("lakelet/4.13-model-based-tests: the same rule, for one series, compared exactly")
++        self.answerable()
++            .into_iter()
++            .filter(|record| record.series == series)
++            .collect()
+     }
+ 
+     /// How many records this model heard — **including the ones the floor forgot**.
+@@ -98,7 +105,7 @@ impl Model {
+     /// the one the first half answers.
+     #[must_use]
+     pub fn len(&self) -> u64 {
+-        todo!("lakelet/4.13-model-based-tests: everything it heard, the floor included")
++        self.accepted.len() as u64
+     }
+ 
+     /// `true` when the store has never been told anything.
+@@ -107,7 +114,7 @@ impl Model {
+     /// `clippy::len_without_is_empty`, and answering it here is cheaper than a `#[allow]`.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("lakelet/4.13-model-based-tests: whether it was ever told anything")
++        self.accepted.is_empty()
+     }
+ }
+ 
