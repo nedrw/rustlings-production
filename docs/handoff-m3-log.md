@@ -823,3 +823,67 @@ $ cargo test -q -p kiln → 320 + 21 + 1 passed · clippy 干净 · cargo fmt --
    装置注释点名一个不存在的计数、正文说“17 条全红”（实际 16 条红，那条结构用例读源码所以过）、一处
    换行）、重生成补丁并重跑全部验收。**继承的散文必须自己再验一遍**：这一步的页内数字我逐条对了预算
    车道的实测值，用例名与规格逐条对齐（17/17）。
+
+## 段 16：B3c — 4.11 `query/engine@design`（受限语法、按类别拒绝、把计划摆出来）
+
+**做了什么**：`spec/4.11/query_engine.rs`（2016 行、18 用例）、
+`scaffold/4.11-query-engine.patch`（1166 行、**0 删除**：新建 `query/{series,lex,parse,plan,exec}.rs`
+与 `docs/query.md` 的桩、在 `query/mod.rs` 的标记块里插五行）、
+`solutions/4.11-query-engine.patch`（1826 行，+1138/−205：五个模块的语义、`cli/mod.rs` 的 `--sql` 一半、
+`Snapshot::records_of`、写成的 `docs/query.md`）、`course/docs/steps/en/lakelet/4.11-query-engine.md`
+（218 行、12 条 TRAP）。`track.toml` 未动（**10 must + 1 should**：`slow:?coverage@80` 是应该门）。
+
+**这一步钉下来的六条不变量**：① **系列名是读出来的、不是校验出来的**——`Series::of` 是全函数
+（指标名＝第一个逗号之前，`k=v` 才是标签，畸形项永不匹配），因为摄取协议接受任意字节；
+② **扫描器按位置拒绝**（未闭合的引号指向开引号那一格）；③ **每个拒绝都是一个变体并带着类别**：
+文本错 `2`、店里从来没有过的指标 `3`（“安静的机队”不等于“打错的指标”）、低于 floor 的区间 `2`
+并在句子里点名 floor、store 拒绝 `4`、部署坏 `1`；④ **`ts BETWEEN` 是必须的且半开**（范围在库里
+处处半开，包含上界会让相邻两个答案重叠一毫秒），`OR` 被拒（它是唯一会改变“计划能裁掉什么”的从句）；
+⑤ **`GROUP BY time(<window>)` 是必须的**（没有窗口就没有诚实的默认），`LIMIT` 只数**系列**且必须配
+`GROUP BY …, series`；⑥ **计划只从 manifest 做**（按 4.9 的每段时间范围裁剪，`EXPLAIN` 一个段都不开
+——用例把“被裁掉那段的文件删掉”来证明这件事，而执行复用的是 4.10 的 `downsample`，逐系列调用）。
+
+**原始结论行**（我在自己的构建与 scratch 副本上重取）：
+
+```
+$ kiln selftest --track lakelet                          # 11/11 step(s) hold the contract（4.1…4.11）
+$ kiln selftest lakelet/4.11-query-engine --track lakelet # scaffold ✓（0 passed; 18 failed）/ solution ✓ / gates ✓ 10/10 must green
+$ kiln check lakelet/4.11-query-engine --slow             # 10/10 must gate(s) passed · 1 should gate(s) run
+  ✓ links              41 link(s) in 7 page(s) resolve
+  ✓ slow:mutants@80    6/6 mutant(s) killed (100%, needs ≥80%)（walk 13s）
+  ✓ slow:?coverage@80  620 of 635 line(s) of this step's module are covered (97% ≥ 80%)
+$ kiln verify lakelet    → 11/11 judged step(s) pass · 0 failed · 0 not prepared · 13 without content
+$ kiln lint-caps → no issues · kiln links → 101 page(s) · 502 link(s) ✓ · kiln i18n → 84/97 · kiln probe --check → 41/41
+$ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · cargo fmt --all --check 干净
+```
+
+**演练（我重取了一遍）**：把计划的 `meets()` 从 `first < range.to()` 改成 `<=`
+
+```
+1. RED    $ cargo test -q --test spec_query_engine → FAILED. 17 passed; 1 failed
+2. CAUGHT the_plan_prunes_from_the_manifest_and_explain_opens_nothing
+          panicked at tests/spec_query_engine.rs:941:5: the one segment whose stated span meets an hour-long range
+3. GREEN  回滚 → ok. 18 passed; 0 failed
+```
+
+**这一段钉下来的三件事**：
+
+1. **修好了“创建者没留标记块”的墙（对 4.19/4.23 是前置条件）**：4.10 的 scaffold 建出了
+   `src/cli/mod.rs` 却**没有标记块**（违反 §1 第 4 条），于是任何后来的 scaffold 都插不进去——
+   4.11 只能让学员自己在文件里加 `--sql` 那一半（它照做了并写进正文），而 4.19 的
+   `src/cli/backup.rs`、4.23 的 `src/cli/rotate.rs` 会撞同一堵墙。修法是在 4.10 的 scaffold 补丁里
+   给那个新文件末尾补 5 行块（hunk 头 161→166），然后在**全新副本**里重跑 4.1…4.11 的阶梯并
+   `check --slow` 两步：块落到了学员的 `app/lakelet/src/cli/mod.rs:863`，4.10 与 4.11 各自
+   `10/10 must` 仍然绿。**代价要记下来**：文件行数一变，变异门的抽样就移位，4.10 的比值从
+   6/6（100%）变成 5/6（83%，仍过门）。
+2. **变异门的一个结构缺陷（实测，收尾时并入 §5）**：`slow:mutants@80` 的候选位点来自“本步参考解
+   补丁碰过的 `src/**.rs` 文件的**当前内容**”——后来者在同一个文件里加的代码会落进**更早一步**的
+   抽样里，而更早那一步的规格没有义务覆盖后来者的功能。实测：4.11 往 `src/cli/mod.rs` 加了
+   `render_plan`（那是 4.10 补丁碰过的文件），4.10 的抽样就抽到 `src/cli/mod.rs:763 if !json {`
+   （`!` 被去掉）并让它存活——而 4.11 自己的规格**能**杀掉它（用例 9 同时断言两种形状）。
+   候选修法（留给下一轮）：只抽“本步补丁新增/改动的行”，而不是整个文件；代价是全部变异比值重测。
+   与之相对，4.7 的 `decode.rs:422 if shift > 63` 确实是 4.7 自己写的行，那是一个**真缺口**。
+3. **4.11 自己定的三处与作业书不同，都记录在案**：`GROUP BY time(...)` 必填（书里写成 `[...]`）、
+   `execute` 返回 `Result<Outcome, Refusal>`（`Error` 表达不了类别 `3`，而 `src/error.rs` 没有标记块
+   所以本步不能扩它）、类别 `3` 只在“区间碰到的段”里判定（为了不让 `rows_scanned` 变成谎言，
+   4.18 才是“仓库知道自己有哪些名字”的地方）。
