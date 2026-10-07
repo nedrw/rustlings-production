@@ -1,0 +1,123 @@
+# The pruning budget of `lakelet/4.14-index-pruning`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_pruning.rs`, which this step's scaffold ships); the metrics are the lines it prints,
+# and every one of them is a count, a byte total or a ratio of two counts rather than a time — a count
+# is the same number on a loaded machine as on an idle one, which is why this lane judges counts at
+# all (handoff M2 §1.1).
+#
+# What the harness does: it seals twenty-four segments, one hour each and sixty records each — thirty
+# samples of `cpu,host=h{i}`, a series that appears in exactly one segment, and thirty of
+# `cpu,host=fleet`, a series every segment carries — and then asks **one** query: the store's own
+# `h20`, over the last twelve hours, one window an hour. Nothing in it reads a clock or measures a
+# duration: the epoch, the timestamps, the series and the windows are all constants, so two runs of
+# this file on two machines print the same counts.
+#
+# # The shape of the workload is the whole lane
+#
+# A store whose segments each held everything would answer that query correctly while opening all
+# twenty-four of them, and every functional case in the step's spec would pass: **pruning that prunes
+# nothing is correct and slow**, and only a count says so. So the workload is shaped to give each of
+# the two prunings something to do, and to keep them apart:
+#
+# * twelve segments lie **before** the query's range, and the *manifest* rules them out — that is the
+#   pruning a store had before this step existed (`lakelet/4.11-query-engine`), counted as
+#   `segments_pruned_by_time`;
+# * of the twelve the range meets, eleven hold no `h20` record at all, and the **index** rules them
+#   out: a segment's sidecar says what its records span and which series it may carry, and a query's
+#   tag predicate is what it is asked about. That is `blocks_pruned`, this step's share;
+# * the one segment that stays holds sixty records of which thirty are answers, which is why
+#   `rows_scanned` (sixty) and `rows_answered` (thirty) are both here: pruning is by segment and never
+#   by series, and a lane that only counted what it pruned would not say so.
+#
+# `pruning_rate` is the two prunings as one number — the share of the store's segments the query did
+# not open, in whole percent — and it is what the plan's fifth acceptance drill moves to zero by
+# taking the index out of the plan (`docs/m3-plan.md` §9). That red is loud on purpose, and it is
+# meant to be: with the index gone the query opens the twelve segments its range meets,
+# `blocks_pruned` and `bytes_avoided` fall to zero, `bytes_read`, `segments_opened` and `rows_scanned`
+# rise by what the index was saving, and the gate names every one of them against this file.
+#
+# # The three numbers that catch the other failure
+#
+# A lane that only compared *what was pruned* would be happy with an index that prunes too much, and
+# that is the one bug this step's whole design is shaped to make impossible: a record the index skipped
+# is gone from an answer, and no count of pruned segments would say so. So:
+#
+# * `answer_mismatch_max` is zero, and it is measured against the records this harness sealed rather
+#   than against the store: the answer has to be one series, in one window, holding thirty records. A
+#   pruned segment that held a record the query asked about moves this and nothing else;
+# * `index_missing_max` and `index_unusable_max` are zero, and they come from the query's *own*
+#   counters: a store that had lost its index answers the same thing having opened more segments, so
+#   the answer counts cannot tell a working index from a missing one and these two can. They are upper
+#   bounds, so a run that somehow consulted no index at all fails rather than passes;
+# * `segments_unaccounted_max` and `bytes_unaccounted_max` are zero, and they are the conservation
+#   identities: every segment is opened, pruned by the range or pruned by the index, and every byte of
+#   the store lies in the segments that were opened or in the ones a decision left closed. A count
+#   that was reported and not performed fails one of them whatever else it says.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: "no worse than this", not "about this", so a run that pruned more, read fewer bytes or
+# answered with fewer mismatches passes, and only a bigger number fails. The byte totals carry the
+# compressor's own slack — a `zstd` release may answer different bytes for the same input, and the
+# course never pins a compressor's output — which is why `budget/4.8-compaction.toml` and
+# `budget/4.9-retention.toml` bound their byte counts the same way.
+command = "cargo test -p lakelet --test budget_pruning -- --nocapture"
+
+[metric]
+# The shape of the store the query was asked of: segments, the bytes their files cost (measured from
+# the disk rather than from the manifest), and the bytes of the twelve segments the range does not
+# reach. A store with nothing in it cannot pass any count below, and a `seal` that wrote the wrong
+# records is caught here before anything is pruned. The last of the three is known by construction —
+# the workload is one hour to a segment from a fixed epoch — and it is what makes the byte identity
+# below checkable without a second implementation of the plan's own rule.
+segments_total = 24
+bytes_total = 5896
+bytes_outside_range = 2945
+# What the query did: it opened one segment of twenty-four, and the two prunings that left it standing
+# are counted apart because they are different facts about a store. Twelve segments were ruled out by
+# the manifest's stated spans — the pruning a store already had — and eleven by the index, which is
+# the pruning this step adds. A store that pruned by neither would answer the same query after opening
+# twenty-four segments, and these three lines are what says it did not.
+segments_opened = 1
+segments_pruned_by_time = 12
+blocks_pruned = 11
+# And what each decision was worth in bytes, from the manifest: the segment that was opened cost 243
+# bytes and the eleven the index closed cost 2708. These are the numbers a reader of "pruning is
+# measurable" is really asking for — a saved segment is a saved file — and they are the second and
+# third metrics a "prune nothing" implementation moves.
+bytes_read = 243
+bytes_avoided = 2708
+# The rate, in whole percent: twenty-three of twenty-four segments were not opened. This is the metric
+# the fifth drill is written about, because one number is easier to move than five: take the index out
+# of the plan and this falls to fifty (the twelve the manifest rules out, and no more), while
+# `blocks_pruned` and `bytes_avoided` fall to zero and `segments_opened`, `bytes_read` and
+# `rows_scanned` rise to what the index was saving. The gate names all six.
+pruning_rate = 95
+# The two conservation identities, as counts that must be zero: every segment is opened, pruned by the
+# range or pruned by the index, and every byte of the store is in the segments that were opened or in
+# the ones a decision left closed. A count that was reported and not performed fails one of them.
+segments_unaccounted_max = 0
+bytes_unaccounted_max = 0
+# What was read against what was answered: the segment that stayed holds sixty records and thirty of
+# them are answers, which is the difference between a reader that opens a file and a reader that keeps
+# what is in it. A query that pruned by *record* would move the first number and change the meaning of
+# the second, and the spec's cases are where that shape is refused.
+rows_scanned = 60
+rows_answered = 30
+# The answer itself, against the records this harness sealed: one series, one window, thirty records.
+# Zero, or the pruning was wrong — which is the failure a count of pruned segments cannot see, and the
+# reason this metric exists at all.
+answer_mismatch_max = 0
+# The index the store wrote, and the two ways a store can be unable to use one. The files are counted
+# on the disk — a store of twenty-four segments has twenty-four of them, one per sealed segment — and
+# the two upper bounds are the query's own counters: zero here means every segment the range met had
+# an index that could be read. A store that lost its index directory answers the same question with
+# `index_missing` at twelve and the same pruning rate at zero, which is exactly the trade this step
+# makes and the reason the counters exist.
+index_files = 24
+index_missing_max = 0
+index_unusable_max = 0
+# A store that refused something is a store this lane cannot judge by counts alone. An upper bound of
+# zero, so the failure a refusal causes is named as a refusal as well as by the counts it moved.
+refused_max = 0

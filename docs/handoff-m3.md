@@ -25,8 +25,9 @@
 | B3c | `course(lakelet/4.11-query-engine): the grammar is a subset, the refusals are typed, and the plan is printed` | 4.11 正文（teach，18 用例）+ `query/{series,lex,parse,plan,exec}.rs`（全函数系列解析、按位置拒绝的扫描器、四类拒绝带类别、`ts BETWEEN` 必填且半开、`OR` 拒绝、计划只从 manifest 裁剪）+ `Snapshot::records_of` + `--sql` 一半的 `cli/mod.rs` + 写成的 `docs/query.md`（`links`）；**顺带修好 4.10 scaffold 缺标记块**（`cli/mod.rs` 末尾补块，4.19/4.23 的前置条件） |
 | B3d | `course(lakelet/4.12-aggregation-correctness): a sum is not +, and a day is not 24 hours` | 4.12 正文（teach，17 用例）+ `query/agg.rs`（Kahan–Neumaier 的 `Sum` + 写成数字的 `BOUND`/`error_bound`、刻意保留的 `naive`、顺序无关性、`Zone` 自带转换表且表外回答 `None`）+ `downsample.rs` 的 `downsample_zoned` + `--zone`（只对 1d 窗口生效，本地日 23/25 小时）+ `exec.rs` 的 `execute_in`；`slow:mutants@80` 5/6（噪声，见 §5）、`?coverage` 177/177（100%） |
 | B3e | `course(lakelet/4.13-model-based-tests): a model that knows nothing about segments, and a walk that has to agree with it` | 4.13 正文（teach，18 用例）+ `engine/rng.rs`（xorshift64\*，金向量 + 差异性）+ `tests/support/model.rs`（只有“记录 + floor”的参考模型）+ `tests/support/walk.rs`（夹具：操作字母表、时钟、transcript、收缩）+ `tests/sim_model.rs`（读 `KILN_SIM_SEED` 的装置）+ `sim/4.13-model-based-tests.toml`；`slow:sim@3` transcripts `85c499a1/903bdf8e/a8efae13`（种子 1 逐字节重放）、`slow:mutants@80` 6/6 |
+| B3f | `course(lakelet/4.14-index-pruning): the index is beside the store, and pruning is a number` | 4.14 正文（teach，20 用例）+ `index/{mod,zone,bloom}.rs`（`<store>/index/<ordinal>.lki` 的侧车索引：zone map + 词级布隆；缺失/损坏/过期只损失剪枝）+ 装置 `tests/budget_pruning.rs` 与 `budget/4.14-index-pruning.toml`（18 计数，含 `pruning_rate`）；计划的第二级剪枝（`blocks_pruned`）与 `Outcome` 的新计数器；`spec/4.11` 的键数断言放宽成 `>=`（rule 10 的正解）并重钉。**plan §9 腿 5 完成**：去掉索引查询 → `pruning_rate 95 → 50`、`blocks_pruned 11 → 0`、`7/10 must`；回滚 `10/10 must` |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.13）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.14，B3 收口）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -121,6 +122,10 @@
   varint 没被覆盖），与仪器无关。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
+  第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
+  4.10 的 `if windows > MAX_WINDOWS`，作者一开始只有 66%，补了一条命令行边界的用例才回到 83%。
+  **一个步骤只要碰到共享文件，就会“继承”那个文件里没被覆盖的行**——把小步骤的比值当成“本步规格好坏”
+  的读数之前，先看那些行是不是本步写的。
 - **`mutants@80` 的样本只有 6 个、比值阈值 80%**：5/6 = 83% 只高出阈值 3 个百分点，
   抽样换一位就会翻盘。这是计划 §6 D-1 定下的形状（“12 步、每步最多 6 个”），没改；
   但如果以后再出现“某个步骤因仪器原因卡在 83%”，值得重新讨论样本数（每再多判一个位点约 +1–2 s）。
@@ -129,3 +134,8 @@
     副本共用一个 target 目录，cargo 把**旧的** `lakelet` 产物交给了新树（那棵树里 `rng.rs` 是被改坏的），
     于是一条规格为一个树里并不存在的理由而红，差点去追一个假的 bug。砂箱侧的版本写在 `handoff-m2` §5.2，
     作者侧同样成立：**每个 scratch 树、每个 dev 树、每次演练都用自己的 target 目录**（名字里带上用途）。
+
+14. **工作树里的文件只用文件工具创建，不要用终端写**。4.14 的作者实测：用 shell 往工作树的**新未跟踪目录**
+    里写文件，Delta 报 `<skipped-untracked-directory>` 并让整棵树的终端停摆（“the checkout kept changing”）；
+    恢复要把那棵树还原到 Delta 认识的样子（撤掉 shell 那次编辑、删掉未跟踪目录），然后**用文件工具建文件、
+    再用 `cp` 把内容拷进去**。第 9 条的姊妹条：第 9 条说作者工作放 `/private/tmp`，这条说工作树里建文件的方式。

@@ -1,0 +1,1128 @@
+diff --git a/src/engine/index/bloom.rs b/src/engine/index/bloom.rs
+new file mode 100644
+index 0000000..d6534e5
+--- /dev/null
++++ b/src/engine/index/bloom.rs
+@@ -0,0 +1,201 @@
++//! One segment's series vocabulary, in a thousand bits: may this segment hold a series you asked
++//! about?
++//!
++//! Step `lakelet/4.14-index-pruning`. A zone map (`crate::engine::index::zone`) answers a question
++//! about *time*; this answers the other one a query asks. A record's series is a metric and a tag set
++//! — `cpu,host=h0,dc=east` — and `WHERE host = 'h0'` asks every record of a segment a string
++//! question. A filter cannot answer that question, but it can answer the cheap one in front of it:
++//! **may any series here carry this pair at all?** A `no` is a segment the query does not open, and
++//! the whole cost of the answer is four hashes.
++//!
++//! # The direction, again
++//!
++//! A bloom filter has no false negatives, and that is why it is the right shape here rather than a
++//! map: a term that went in always answers `may_contain`, so a segment whose records really carry a
++//! pair is never skipped. A **false positive** — `yes` about a segment that holds nothing of the kind
++//! — costs one segment read. The same safety direction as the zone map, for the same reason: a saved
++//! read is invisible and a lost record is not.
++//!
++//! # The elements are terms
++//!
++//! What goes into a filter is a **term**: a series name, or one `key=value` pair a series carries.
++//! Both, because a query names both shapes — `FROM cpu` names a metric, and `WHERE host = 'h0'` names
++//! a pair — while what a *segment* has is whole names. Which terms a name contributes is the store's
++//! rule and not this module's (`crate::engine::index` derives them from `lakelet/4.11-query-engine`'s
++//! reading of a series); what this module owns is the filter.
++//!
++//! The **metric** is deliberately not one of the terms, and the reason is worth the paragraph: the
++//! plan asks the filter about the pairs a query named and never about its metric. A store could prune
++//! with the metric — a segment holding no record of metric `cpu` cannot answer `FROM cpu` — and doing
++//! so would quietly change an answer: `FROM mem` about a store that has never held `mem` is *refused*
++//! today (`Refusal::Unknown`, decided from the records a query read), and a metric probe would turn
++//! that refusal into an empty answer whenever every segment in the range was pruned. Whether a store
++//! has *ever* held a metric is a question about its whole history, and `lakelet/4.18-cardinality-cost`
++//! is the step that makes a store able to answer it.
++//!
++//! # The size is fixed, and the fixedness is the point
++//!
++//! Every filter this build writes is [`BITS`] bits with [`HASHES`] hashes, and a filter states its own
++//! size ([`Bloom::encode`]) so a decoder can refuse one of another shape. That is what makes
++//! [`Bloom::union`] possible at all: a merge writes the **union** of its inputs' vocabularies without
++//! reading a series name (`lakelet/4.14-index-pruning`), and two filters can only be ORed when their
++//! bits mean the same places. A size that followed how many names went into a filter would make that
++//! merge impossible, and the alternative — hashing every name again — is the read the index exists to
++//! avoid.
++//!
++//! A fixed size has a price, and it is stated rather than hidden. For `n` terms in `BITS` bits with
++//! `HASHES` hashes the rate is `(1 - e^(-kn/m))^k`, and a segment's vocabulary is about two terms per
++//! series (its name, and the pairs it carries):
++//!
++//! | series in a segment | terms | `may_contain` says yes about | reads wasted |
++//! | ------------------- | ----- | --------------------------- | ------------ |
++//! | 8                   | 16    | 1 in 74 000                 | none worth counting |
++//! | 32                  | 64    | 1 in 400                    | none worth counting |
++//! | 128                 | 256   | 1 in 6                      | one in six   |
++//! | 10 000 names        | 10 000+ | everything                | every one    |
++//!
++//! A full filter is not a bug: it answers `yes` to every question, which is exactly what "I cannot
++//! tell you" has to look like in a filter that may never answer `no` by mistake. What it does mean is
++//! that a *segment* whose series count grows past what a thousand bits can hold stops saving reads —
++//! and bounding a store's cardinality per segment is `lakelet/4.18-cardinality-cost`'s subject, not
++//! this step's.
++//!
++//! # The hash
++//!
++//! CRC-32, the function the project already has (`crc32fast` — the frame seal in
++//! `crate::protocol::frame` and the record seal in `crate::engine::wal::checksum`), with the hash's
++//! index appended so that the four positions of one term are four different numbers, and one
++//! **avalanche** step over the result before it is taken modulo the size.
++//!
++//! The avalanche is not decoration, and it is the one thing here that was measured rather than
++//! assumed. A CRC is built to *detect* errors, not to spread keys: two messages that differ in their
++//! last byte have CRCs that differ in their high bits far more than in their low ones, and the low
++//! bits are exactly what `% BITS` keeps. Without the mixing step this filter answered `yes` about one
++//! term in thirty that it had never seen (a rate of 326 in 10 000 on a vocabulary of eight names,
++//! where the table below promises one in a hundred thousand) — a filter that quietly keeps a
++//! fraction of its promises is worse than one that is small. One `fmix32` round turns the checksum
++//! into a hash, and the measured rate afterwards is the table's.
++//!
++//! One bit is a function of the term alone: no seed, no address, no clock, so the same store answers
++//! the same questions in two processes and two runs of the same test are the same run.
++//!
++//! ```text
++//!  0..2  u16, little endian: how many bits the filter holds — [`BITS`], and a decoder refuses
++//!                            anything else, because a filter of another shape cannot be merged
++//!  2..   the bits, in bytes, least significant bit of the first byte first
++//! ```
++
++use crate::error::Error;
++
++/// How many bits one filter holds.
++///
++/// A thousand and twenty-four, which is 128 bytes of an index file and enough for the vocabularies a
++/// segment of this store usually has (see the table in the module docs). It is a constant rather than
++/// a parameter because [`Bloom::union`] needs two filters to be the same shape.
++pub const BITS: usize = 1024;
++
++/// How many bits one term sets.
++///
++/// Four, which is the usual answer for a filter this size: past it the extra hashes cost more time
++/// than they save in false positives. The optimum for `n` terms in `m` bits is about `m/n · ln 2`,
++/// which is four for sixty-four terms — and a filter is written for the vocabulary a *segment* has.
++pub const HASHES: u8 = 4;
++
++/// The bits, in bytes, one filter holds — the width of the filter in an index file, which is
++/// why the encoder states it in bits and the decoder refuses a different count.
++pub const BYTES: usize = BITS / 8;
++
++/// What a segment's series vocabulary is written down as.
++///
++/// A value: built once from the names a segment holds, never changed afterwards, comparable and
++/// copyable, and answerable without a store. Two of them can be merged without a name being read,
++/// which is the property a merge's index is built on.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Bloom {
++    /// The bits themselves, least significant bit of the first byte first.
++    bits: Vec<u8>,
++}
++
++impl Bloom {
++    /// The filter for a vocabulary: every `term` in it.
++    ///
++    /// A term is a series name or a `key=value` pair (`crate::engine::index` builds the list from a
++    /// segment's records). An empty vocabulary is a legal input and answers a filter that may contain
++    /// nothing — the value for a segment whose series nobody stated, which the reader must then not
++    /// consult; `SegmentIndex::unstated` is where that is written down so nobody has to remember it.
++    #[must_use]
++    pub fn of<'a>(terms: impl IntoIterator<Item = &'a str>) -> Self {
++        todo!("lakelet/4.14-index-pruning: one bit per hash of every term")
++    }
++
++    /// The filter that may contain everything: what a vocabulary nobody could state is written down as.
++    ///
++    /// Every bit set, so every question is answered `yes`. It costs the reads the index was going to
++    /// save and it can never cost a record, which is the only trade an index that cannot read its
++    /// inputs is allowed to make (`lakelet/4.14-index-pruning`: a merge whose input has no readable
++    /// index still writes an index, and it writes this one).
++    #[must_use]
++    pub fn everything() -> Self {
++        todo!(
++            "lakelet/4.14-index-pruning: every bit set: what a vocabulary nobody could state is written as"
++        )
++    }
++
++    /// Set every bit of `term`, which is the whole of what a bloom filter does with one.
++    pub fn insert(&mut self, term: &str) {
++        todo!("lakelet/4.14-index-pruning: the four bits of one term")
++    }
++
++    /// `true` when `term` **may** be one this filter was built from.
++    ///
++    /// `false` is a proof: every term that went in answers `true`, so a `false` means no term this
++    /// filter holds is that one. `true` is only an admission that the filter cannot tell.
++    #[must_use]
++    pub fn may_contain(&self, term: &str) -> bool {
++        todo!(
++            "lakelet/4.14-index-pruning: whether every one of a term's bits is set, which is the whole answer"
++        )
++    }
++
++    /// How many bits this filter holds.
++    ///
++    /// The size, not the number of bits set: it is the geometry two filters have to agree on to be
++    /// merged, and the number the false-positive rate in the module docs is a function of.
++    #[must_use]
++    pub const fn bits(&self) -> usize {
++        todo!()
++    }
++
++    /// The filter that holds what either of the two holds: a term either one may contain is a term
++    /// this one may contain.
++    ///
++    /// No term is rehashed and no name is read, which is why a merge's index costs nothing beyond the
++    /// indexes it already has (`lakelet/4.14-index-pruning`). The two filters are the same shape
++    /// because every filter this build makes is ([`BITS`], [`HASHES`]) and [`Bloom::decode`] refuses
++    /// one that says otherwise.
++    #[must_use]
++    pub fn union(&self, other: &Self) -> Self {
++        todo!(
++            "lakelet/4.14-index-pruning: the bits either side set, which needs both to be the same shape"
++        )
++    }
++
++    /// This filter as the bytes the layout in the module docs states.
++    #[must_use]
++    pub fn encode(&self) -> Vec<u8> {
++        todo!("lakelet/4.14-index-pruning: the size in two bytes, then the bits")
++    }
++
++    /// Read the filter these bytes are, or refuse them.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the bytes are not one filter's encoding: fewer than its own size
++    /// states, more than it states, or a stated size that is not [`BITS`] — a filter of another
++    /// geometry cannot be merged with this build's, and a merge is how a merge's index is written.
++    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
++        todo!(
++            "lakelet/4.14-index-pruning: the filter these bytes are, or a refusal: another shape cannot be merged"
++        )
++    }
++}
+diff --git a/src/engine/index/mod.rs b/src/engine/index/mod.rs
+new file mode 100644
+index 0000000..cd14a31
+--- /dev/null
++++ b/src/engine/index/mod.rs
+@@ -0,0 +1,289 @@
++//! A sidecar index beside the segments: what a segment holds, written down so that a query can decide
++//! not to open it.
++//!
++//! Step `lakelet/4.14-index-pruning`. `lakelet/4.11-query-engine` prunes from the manifest — a
++//! segment's span of timestamps rules it out of a query's range — and everything a manifest states
++//! about a segment is a *count*: how many bytes, how many records, when the first and last of them
++//! happened. Nothing in it says what the records *are*, so a query with a selective predicate opens
++//! every segment its range meets and throws most of the records away. This module is the third thing
++//! a store knows about a closed segment, and it is a **value**: the zone map of its two ordered columns
++//! ([`zone::Zone`]) and its series vocabulary as a filter ([`bloom::Bloom`]).
++//!
++//! # It is derived state, and that is the central rule of this step
++//!
++//! Everything here can be built again from the segment it belongs to. That has a consequence that the
++//! whole design is shaped around: **a missing, damaged or stale index costs pruning and nothing else.**
++//!
++//! * **missing** — a store whose index directory was deleted still answers every query exactly what it
++//!   answered before, having opened more segments;
++//! * **damaged** — a file that is not an index this build can read is a *hint that is wrong* and not a
++//!   store that is wrong. It is refused ([`SegmentIndex::decode`], checked against a seal from
++//!   `crate::engine::wal::checksum`) and the segment is opened;
++//! * **stale** — an ordinal the manifest does not name. Ordinals are never reused
++//!   (`lakelet/4.8-compaction`), so a file left behind by a merge or a retention pass names a segment
++//!   that is gone, and [`load`] is only ever asked about the ordinals the manifest names.
++//!
++//! The counters say which of the three happened (`index_missing`, `index_unusable`, and
++//! `blocks_pruned` for what the index *did* save — `lakelet/4.14-index-pruning`'s `Outcome`) rather
++//! than an answer changing, because the two are different facts about a store: one says "this store
++//! lost its index", the other says "this store is guessing at it". Neither is a reason to answer with
++//! a hole.
++//!
++//! # Where it lives, and why it is not with the segments
++//!
++//! ```text
++//!  <store>/segments/<n>.lks          one closed segment per file, named by its ordinal
++//!  <store>/index/<n>.lki             the sidecar index of that segment
++//!  <store>/segments.manifest         what the store is: an epoch, a floor and the segments
++//! ```
++//!
++//! Its own directory, beside `segments/`, because the manifest is the store
++//! (`lakelet/4.8-compaction`): a segment counts exactly when the manifest names it, and everything
++//! else in `segments/` is an orphan a crash left behind and is deleted on the next open. An index file
++//! in there would be deleted by that rule the moment it mattered — and the count of files in
++//! `segments/` is a number `lakelet/4.8-compaction`'s and `lakelet/4.9-retention`'s cases assert.
++//! Nothing deletes an index file today: a merge's inputs and a retention pass's segments leave theirs
++//! behind as *garbage*, named by ordinals nothing names any more, which costs a few kilobytes and can
++//! never be consulted. Turning that garbage into a number somebody manages is
++//! `lakelet/4.20-capacity-model`'s subject.
++//!
++//! The index is written **after** the segment's file and **before** the manifest names the segment, so
++//! a crash between the two leaves an index nobody consults rather than a consultation of an index for
++//! a segment the store does not have. The manifest stays the store: what a store *is* never depends on
++//! an index file existing.
++//!
++//! # The layout, byte for byte
++//!
++//! ```text
++//!  0..4        `MAGIC`: the four bytes that say this file is this store's index
++//!  4           `VERSION`: the layout's version, one byte — this build writes 1
++//!  5..9        u32, little endian: how many bytes the zone map's encoding takes
++//!  9..9+z      the zone map (`zone::Zone::encode`)
++//!  9+z..       the series filter (`bloom::Bloom::encode`, which states its own size)
++//!  then        u32, little endian: the seal over everything above (`wal::checksum`)
++//! ```
++//!
++//! A magic and a version of its own, and not the segment's: a file that is not this build's index is
++//! refused rather than read as one, and the two formats have no reason to move together. What a version
++//! buys is the same thing it buys `lakelet/4.7-columnar-segments` and `lakelet/4.9-retention`: an
++//! older layout is a *refusal* rather than a misreading. The seal covers every byte above it, so a
++//! flipped bit in an index file is a damaged hint and not a plausible lie — which for derived state is
++//! the difference between a counting mistake and a wrong answer.
++//!
++//! # What the index is *not*
++//!
++//! It is not a second store and it does not hold a record. Deleting every file below
++//! `<store>/index/` costs a query reads and nothing else, which is why nothing here has an error
++//! path out of [`load`]: an index that cannot be read is a fact about the index, and the plan's
++//! counters are where it is told.
++
++pub mod bloom;
++pub mod zone;
++
++use std::path::{Path, PathBuf};
++
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++use bloom::Bloom;
++use zone::Zone;
++
++/// The directory inside the store directory that holds the sidecar indexes.
++pub const DIRECTORY: &str = "index";
++
++/// The extension an index file carries: lakelet index.
++pub const EXTENSION: &str = "lki";
++
++/// The four bytes in front of every index this build writes.
++const MAGIC: [u8; 4] = *b"LKLI";
++
++/// Version of the layout in the module docs. A file that says anything else is not this build's index.
++pub const VERSION: u8 = 1;
++
++/// How many digits an index file's name has, so a directory listing is in the ordinals' order — the
++/// same width `lakelet/4.8-compaction` gives a segment's file.
++const DIGITS: usize = 10;
++
++/// The length field in front of the zone map's bytes.
++const LENGTH: usize = 4;
++
++/// The bytes before an index's zone map: [`MAGIC`], [`VERSION`] and that length.
++const HEADER: usize = MAGIC.len() + 1 + LENGTH;
++
++/// The file one segment's index lives in: `<directory>/index/<ordinal>.lki`.
++///
++/// Public for the reason `lakelet/4.8-compaction`'s `file_of` is: the layout is part of what the store
++/// *is*, and an operator with `ls`, a repair tool and a case that has to damage one of these files all
++/// need to name it. The extension is what keeps a listing of the directory readable — `ls` shows where
++/// the segments are and where their indexes are without either being confused for the other.
++#[must_use]
++pub fn file_of(directory: &Path, ordinal: u64) -> PathBuf {
++    todo!("lakelet/4.14-index-pruning: the file one segment's sidecar lives in")
++}
++
++/// What consulting one segment's index found.
++///
++/// Three answers and not two, because `lakelet/4.14-index-pruning`'s counters distinguish them: a
++/// store that lost its index and a store whose index was damaged are different facts, and a reader
++/// that could not tell them apart could not say which one to go and fix.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Lookup {
++    /// The index this store wrote for that ordinal.
++    Found(SegmentIndex),
++    /// No index file for it, or one that cannot be read at all. Pruning is what is lost, and the count
++    /// is `index_missing`.
++    Missing,
++    /// A file is there and is not an index this build can read: damaged bytes, a layout this build does
++    /// not know, or a file cut short. Pruning is what is lost, and the count is `index_unusable`.
++    Damaged,
++}
++
++impl Lookup {
++    /// The index, when there was one this build could read.
++    ///
++    /// The two ways of having none — `Missing` and `Damaged` — are one answer to a caller that only
++    /// wanted to consult an index, and two different answers to a caller that wants to know what is
++    /// wrong with a store. That is why this is a method on the caller's side of the distinction
++    /// rather than a field of it.
++    #[must_use]
++    pub fn into_index(self) -> Option<SegmentIndex> {
++        todo!("lakelet/4.14-index-pruning: the index, when there was one to read")
++    }
++}
++
++/// One segment's index: what its records span, and which series they may carry.
++///
++/// The two halves answer the two questions a plan asks before opening a file — *may a record here be
++/// inside my range* ([`SegmentIndex::may_meet`]) and *may a series here carry the pair I asked about*
++/// ([`SegmentIndex::may_hold`]) — and both are written in the safe direction: `false` is a proof, and
++/// `true` is only an admission that this index cannot tell.
++#[derive(Debug, Clone, PartialEq)]
++pub struct SegmentIndex {
++    /// The bounds of the segment's timestamps and values.
++    zone: Zone,
++    /// The series names its records carry, and the tag pairs those names spell.
++    series: Bloom,
++}
++
++impl SegmentIndex {
++    /// The index of `records`.
++    ///
++    /// The vocabulary is the **names and the pairs**: a record's series contributes itself and each
++    /// `key=value` pair it carries, read exactly as `lakelet/4.11-query-engine` reads a series — what a
++    /// tag is, is that step's decision, and a store that decided again would prune on a term a query
++    /// never asks about.
++    #[must_use]
++    pub fn of(records: &[Record]) -> Self {
++        todo!(
++            "lakelet/4.14-index-pruning: the zone of the records and the vocabulary of their series"
++        )
++    }
++
++    /// The index of a segment nobody could state: a zone that meets every range and a filter that may
++    /// contain every term.
++    ///
++    /// This is what a merge writes for a segment whose input has no readable index
++    /// (`lakelet/4.14-index-pruning`), and it is the *safe* answer rather than the convenient one: the
++    /// merged file holds records whose vocabulary nobody wrote down, and an index that claimed to know
++    /// it — an empty filter, say — would prove that those records are not there. Pruning nothing costs
++    /// a read; pruning wrongly costs a record.
++    #[must_use]
++    pub fn unstated() -> Self {
++        todo!(
++            "lakelet/4.14-index-pruning: the index that prunes nothing, which is the safe answer for what nobody wrote down"
++        )
++    }
++
++    /// The bounds of the segment's timestamps and values.
++    #[must_use]
++    pub const fn zone(&self) -> &Zone {
++        todo!()
++    }
++
++    /// The filter over the segment's series vocabulary.
++    #[must_use]
++    pub const fn series(&self) -> &Bloom {
++        todo!()
++    }
++
++    /// `true` when a record here **may** have a timestamp inside the half-open `[from, to)`.
++    #[must_use]
++    pub fn may_meet(&self, from: u64, to: u64) -> bool {
++        todo!("lakelet/4.14-index-pruning: may a record here be inside the range")
++    }
++
++    /// `true` when a series here **may** carry the tag pair `pair`, spelled `key=value`.
++    ///
++    /// The spelling is the query's and not the record's: `WHERE host = 'h0'` names the pair
++    /// `host=h0`, and the term the writer put in the filter for a record whose series is
++    /// `cpu,host=h0,dc=east` is that same string. Anything the grammar can spell as one pair is a term
++    /// somebody inserted.
++    #[must_use]
++    pub fn may_hold(&self, pair: &str) -> bool {
++        todo!("lakelet/4.14-index-pruning: may a series here carry this tag pair")
++    }
++
++    /// The index that covers both segments: the zones' union and both vocabularies.
++    ///
++    /// This is what makes a merge's index free: the vocabulary of the segment a merge writes is the
++    /// union of its inputs' vocabularies, so a merge that already has the inputs' indexes never reads a
++    /// *series name* to write one — the same trick `lakelet/4.9-retention` used for the time range a
++    /// merge's entry states.
++    #[must_use]
++    pub fn union(&self, other: &Self) -> Self {
++        todo!("lakelet/4.14-index-pruning: the index that covers both segments")
++    }
++
++    /// This index as the bytes the layout in the module docs states: the header, the zone map, the
++    /// filter, and the seal over all of it.
++    #[must_use]
++    pub fn encode(&self) -> Vec<u8> {
++        todo!("lakelet/4.14-index-pruning: the header, the zone map, the filter and the seal")
++    }
++
++    /// Read the index these bytes are, or refuse them.
++    ///
++    /// Every byte is checked by one of four comparisons, and the order is cheapest first: the file is
++    /// long enough to be an index at all, it starts with this build's magic and version, its seal
++    /// verifies over everything above it, and the two halves decode within the room the header states.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the bytes are not this build's index: a magic that is not this store's,
++    /// a layout version this build does not write, a seal that does not verify, a zone or a filter that
++    /// does not decode, or bytes after the seal — an index with something appended is refused rather
++    /// than read as one that is whole (`lakelet/4.7-columnar-segments` refuses a segment the same way).
++    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
++        todo!(
++            "lakelet/4.14-index-pruning: the index these bytes are, or a refusal: magic, version, seal, then the two halves"
++        )
++    }
++}
++
++/// The index of segment `ordinal`, or why there is none to consult.
++///
++/// This is the only reader, and it has **no error path on purpose**: an index is derived state
++/// (`lakelet/4.14-index-pruning`), so a file that is absent, unreadable or damaged is a fact a plan
++/// counts and does without — never a failure it raises at somebody who asked a question about their
++/// own data.
++#[must_use]
++pub fn load(directory: &Path, ordinal: u64) -> Lookup {
++    todo!("lakelet/4.14-index-pruning: the index of one segment, or why there is none to consult")
++}
++
++/// Write `index` as the index of segment `ordinal`.
++///
++/// Called by the store's writer after the segment's file is on the device and before the manifest names
++/// it (`lakelet/4.8-compaction`'s order for everything a merge or a flush installs), so a crash between
++/// the two leaves a file nobody consults.
++///
++/// # Errors
++///
++/// [`Error::Store`] when the directory cannot be created, or the file cannot be written or flushed. A
++/// store that cannot write down what it knows is a store that answers from what it read, which is why
++/// this is an error and not a shrug: the alternative is a store that silently prunes less for ever.
++pub fn write(directory: &Path, ordinal: u64, index: &SegmentIndex) -> Result<(), Error> {
++    todo!(
++        "lakelet/4.14-index-pruning: write it, flush it, and let a failure be an error: derived state is still state"
++    )
++}
+diff --git a/src/engine/index/zone.rs b/src/engine/index/zone.rs
+new file mode 100644
+index 0000000..6d06d3d
+--- /dev/null
++++ b/src/engine/index/zone.rs
+@@ -0,0 +1,209 @@
++//! One segment's span, as two intervals: the timestamps its records carry, and the values they hold.
++//!
++//! Step `lakelet/4.14-index-pruning`. `lakelet/4.9-retention` gave the manifest a range of timestamps
++//! per segment and `lakelet/4.11-query-engine` prunes from it, which is one interval per segment. This
++//! module is that idea as a *value*: for every column of a record that has an order, the smallest and
++//! the largest thing in it — the timestamps, and the values.
++//!
++//! # The safe direction, and it is the whole design
++//!
++//! A zone answers **may**, never "does". Every rule below is written so that a wrong answer costs in
++//! the direction a store can recover from:
++//!
++//! * a **false positive** — "a record here may meet your range" about a segment that holds none —
++//!   costs one file read;
++//! * a **false negative** costs a *record*. A query that did not open a segment holding a record it
++//!   asked about answers with a hole in it, and no count would say so: the count it saved is
++//!   invisible and the record it lost is not.
++//!
++//! So a bound nobody stated answers `true` for everything, and a zone built from no records answers
++//! `true` as well: nothing is known, and "nothing is known" is not a reason to skip a file. That is
++//! `lakelet/4.9-retention`'s rule for a segment whose age nobody wrote down — a decision made from a
++//! number nobody wrote down is a decision nobody can defend — applied to an index instead of to a
++//! deletion.
++//!
++//! A **NaN** is the same kind of absence in the value column, and it is the one thing a value has
++//! that a timestamp does not: it is not above or below anything, so it has no place on an interval.
++//! A set that holds one therefore states **no** value bounds rather than bounds that quietly leave it
++//! out.
++//!
++//! # The units, and why they are the manifest's
++//!
++//! Timestamps are milliseconds since the Unix epoch, unsigned, and a record whose `ts_millis` is
++//! negative counts as `0` — the rule the manifest's own entry states, because the zone and the
++//! manifest are two statements about the same records, and a store where they disagreed would prune
++//! on one number and delete on another.
++//!
++//! # The encoding, byte for byte
++//!
++//! ```text
++//!  0      flags: bit 0 is "the timestamps are stated", bit 1 is "the values are"
++//!  1..9   u64, little endian: the earliest timestamp, or 0 when none is stated
++//!  9..17  u64, little endian: the latest timestamp, or 0
++//!  17..25 f64, little endian: the smallest value, or 0.0
++//!  25..33 f64, little endian: the largest value, or 0.0
++//! ```
++//!
++//! Thirty-three bytes, fixed: a zone is a value a reader compares and an index file places at an
++//! offset, and a layout that shifted would make `SegmentIndex::decode` a parser rather than an offset
++//! table. A flag bit this build does not write is a **refusal** and not a reading, the same reason
++//! `lakelet/4.7-columnar-segments` refuses a layout version it does not know: a damaged hint read as
++//! a different hint is a decision taken from bytes nobody wrote.
++
++use std::fmt;
++
++use crate::error::Error;
++use crate::protocol::batch::Record;
++
++/// How many bytes one encoded zone takes.
++pub const BYTES: usize = 33;
++
++/// The flag bit that says the timestamp bounds are stated.
++const TIMESTAMPS: u8 = 0b01;
++
++/// The flag bit that says the value bounds are stated.
++const VALUES: u8 = 0b10;
++
++/// The flags this build writes, and the whole of what a decoder accepts.
++const STATED: u8 = TIMESTAMPS | VALUES;
++
++/// What one segment's records span, per column: two intervals, either of which may be unstated.
++///
++/// One value, built from records and never changed afterwards, which is what makes a plan's decision
++/// reproducible: the same segment answers the same question at any time, and comparing two zones is
++/// comparing what their records were.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Zone {
++    /// The earliest and the latest timestamp, both inclusive — or nothing, when no record stated one.
++    ts: Option<(u64, u64)>,
++    /// The smallest and the largest value, both inclusive — or nothing, when a record holds a NaN.
++    value: Option<(f64, f64)>,
++}
++
++impl Zone {
++    /// The zone of `records`: the bounds of the two columns that have an order.
++    ///
++    /// No records at all is a legal input and answers an *unstated* zone, which may contain anything:
++    /// the caller that hands over an empty segment is not a caller this store's writer can produce
++    /// (`Segments::seal` refuses one, because a file holding nothing would be carried for ever), and a
++    /// reader that met one anyway would open it — which is the answer that costs a read instead of a
++    /// record.
++    #[must_use]
++    pub fn of(records: &[Record]) -> Self {
++        todo!("lakelet/4.14-index-pruning: the bounds of the two columns that have an order")
++    }
++
++    /// The earliest timestamp this zone states, or nothing when none was stated.
++    #[must_use]
++    pub const fn first_millis(&self) -> Option<u64> {
++        todo!()
++    }
++
++    /// The latest timestamp it states, or nothing.
++    #[must_use]
++    pub const fn last_millis(&self) -> Option<u64> {
++        todo!()
++    }
++
++    /// The smallest value it states, or nothing.
++    #[must_use]
++    pub const fn min_value(&self) -> Option<f64> {
++        todo!()
++    }
++
++    /// The largest value it states, or nothing.
++    #[must_use]
++    pub const fn max_value(&self) -> Option<f64> {
++        todo!()
++    }
++
++    /// `true` when a record here **may** have the timestamp `at`.
++    ///
++    /// Both bounds are inclusive because a millisecond is an instant and not a half-open interval: the
++    /// record that stands exactly on the end of a span is in it. An unstated zone answers `true` to
++    /// every instant, which is the module's rule for everything nobody wrote down.
++    #[must_use]
++    pub fn may_contain_ts(&self, at: u64) -> bool {
++        todo!(
++            "lakelet/4.14-index-pruning: may, and never does: an unstated bound answers yes to everything"
++        )
++    }
++
++    /// `true` when a record here **may** hold the value `value`.
++    ///
++    /// Inclusive, and unstated answers `true`, exactly as [`Zone::may_contain_ts`] does: the two
++    /// columns are asked the same shape of question. Nothing in this build's read path asks this one
++    /// yet — a query's grammar has no predicate on a value (`lakelet/4.11-query-engine`) — and it is
++    /// here because it is the same value's other column: the questions a column can be asked belong
++    /// to the value that holds it, and a predicate that does not exist yet is a reason to leave a
++    /// method unused rather than to leave a column unmapped.
++    #[must_use]
++    pub fn may_contain_value(&self, value: f64) -> bool {
++        todo!("lakelet/4.14-index-pruning: the same question for the other column")
++    }
++
++    /// `true` when a record here **may** have a timestamp inside the half-open `[from, to)`.
++    ///
++    /// This is the question a plan asks, and it is the rule `lakelet/4.11-query-engine` already prunes
++    /// the manifest by, written over a zone's own bounds: a segment is met when its earliest record is
++    /// before `to` and its latest is at or after `from`. Both comparisons are load-bearing in opposite
++    /// directions — the upper one strict because a record standing exactly at `to` belongs to the next
++    /// question, the lower one not because a record standing exactly at `from` is in this one — and a
++    /// **question** that meets nothing answers `true`: an unstated zone may contain anything, and a
++    /// direction that answers `false` there would be the one failure a plan may not have.
++    #[must_use]
++    pub fn may_meet(&self, from: u64, to: u64) -> bool {
++        todo!(
++            "lakelet/4.14-index-pruning: the half-open rule the manifest is pruned by, over this zone"
++        )
++    }
++
++    /// The zone that covers the records of both: the smallest first, the largest last, per column.
++    ///
++    /// A **union with an unstated zone is unstated**, and that is the rule rather than an accident of
++    /// the arithmetic: one side has records whose bounds nobody wrote down, so the pair has no bounds
++    /// anybody can defend. It is what a merge needs (`lakelet/4.14-index-pruning` writes the union of
++    /// its inputs' indexes), and it is the same rule the manifest states for a merged segment's range
++    /// (`lakelet/4.9-retention`).
++    #[must_use]
++    pub fn union(&self, other: &Self) -> Self {
++        todo!(
++            "lakelet/4.14-index-pruning: the interval that covers both, and nothing at all when either states nothing"
++        )
++    }
++
++    /// This zone as the [`BYTES`] bytes the layout above states.
++    #[must_use]
++    pub fn encode(&self) -> Vec<u8> {
++        todo!("lakelet/4.14-index-pruning: thirty-three bytes: a flags byte and four numbers")
++    }
++
++    /// Read the zone these bytes are, or refuse them.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the bytes are not one zone's encoding: not [`BYTES`] of them, or a
++    /// flags byte carrying a bit this build does not write. A zone that cannot be read is an index a
++    /// reader does without (`Index::load` answers `Lookup::Damaged`), and refusing here is what keeps
++    /// a damaged hint from being read as a different one.
++    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
++        todo!(
++            "lakelet/4.14-index-pruning: the zone these bytes are, or a refusal naming what is wrong"
++        )
++    }
++}
++
++impl fmt::Display for Zone {
++    /// The zone as one line: `ts=[first,last] value=[min,max]`, with `unstated` for a bound nobody
++    /// wrote down.
++    ///
++    /// Both bounds are printed for both columns, including the ones this build's read path never asks
++    /// about, because this is the line a log writes and a reader of a log is following *what a
++    /// decision was made from* — a zone that printed only the half it was asked about would be a
++    /// different value in the log than in the store.
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        todo!(
++            "lakelet/4.14-index-pruning: one line: `ts=[first,last] value=[min,max]`, or `unstated`"
++        )
++    }
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 7844b76..da53127 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -40,6 +40,9 @@ pub mod query;
+ // `lakelet/4.13-model-based-tests`: the one number a walk's decisions come out of — a seeded
+ // generator whose sequence is fixed by arithmetic, so the same seed replays a run on any machine.
+ pub mod rng;
++// `lakelet/4.14-index-pruning`: what a closed segment knows about itself, written down beside it —
++// the bounds of its columns and a filter over its series, so that a query can decide not to open it.
++pub mod index;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/tests/budget_pruning.rs b/tests/budget_pruning.rs
+new file mode 100644
+index 0000000..c592d6c
+--- /dev/null
++++ b/tests/budget_pruning.rs
+@@ -0,0 +1,391 @@
++//! The pruning budget's harness for `lakelet/4.14-index-pruning`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.14-index-pruning
++//! --slow` runs, and the counts it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.14-index-pruning.toml`.
++//!
++//! What it measures is **segments, records, bytes and one rate, never the clock**: a store of
++//! twenty-four sealed segments is built from fixed series and fixed timestamps, one selective query
++//! is asked of it, and what that cost is a set of counts. A count is the same number on a loaded
++//! machine as on an idle one, which is why `kiln`'s budget gate compares counts (`handoff M2 §1.1`)
++//! and why no run of this file can flake because something else was compiling.
++//! `cargo test -p lakelet --test budget_pruning -- --nocapture` prints the lines by hand; the
++//! `lakelet-budget` prefix is what the gate reads.
++//!
++//! # The workload is shaped so that a selective query has something to prune
++//!
++//! Twenty-four segments, one hour each, **sixty records each**: thirty samples of `cpu,host=h{i}`
++//! — the segment's own host, a series that appears in exactly one segment — and thirty of
++//! `cpu,host=fleet`, a series every segment carries. Two series in every segment, one of them unique
++//! to it, is the shape that tells the two prunings apart:
++//!
++//! * the query asks for `host = 'h20'` over the **last twelve hours**. The twelve segments before the
++//!   range are ruled out by the *manifest*, whose stated spans meet nothing the query asked for
++//!   (`segments_pruned_by_time`, `lakelet/4.11-query-engine`'s pruning);
++//! * of the twelve the range meets, eleven do not hold `h20` at all — that is what the *index* is
++//!   asked about, and the count is `blocks_pruned` (this step's);
++//! * and the one that stays holds sixty records of which thirty are answers: pruning is by segment
++//!   and not by series, which is why `rows_scanned` and `rows_answered` are both here.
++//!
++//! A store whose segments each held everything would prune nothing and pass every *functional* case
++//! in the spec, which is the failure this lane exists for: **pruning that prunes nothing is
++//! correct and slow**, and only a count says so. `pruning_rate` is that count as one number — the
++//! share of the store's segments the query did not open, in whole percent — and it is the metric the
++//! plan's fifth drill moves to zero by taking the index out of the plan. That red is loud on purpose:
++//! `blocks_pruned` falls with it, `bytes_avoided` falls with it, `bytes_read` and `segments_opened`
++//! rise, and the gate names all of them against the baseline below.
++//!
++//! Three numbers are here to catch the *other* failure — a wrong answer that is fast:
++//!
++//! * `answer_mismatch_max` is zero, and it is measured against the records this file sealed rather
++//!   than against the store: the answer has to be the one series the predicate named, in one window,
++//!   with thirty records in it. A pruned segment holding a record the query asked about shows up here
++//!   and not in any count of what was pruned;
++//! * `index_missing_max` and `index_unusable_max` are zero, measured from the query's own counters:
++//!   a store that had lost its index answers the same thing having opened more segments, so the
++//!   answer counts cannot tell a working index from a missing one and these two can;
++//! * `bytes_unaccounted_max` and `segments_unaccounted_max` are zero: every segment is opened, pruned
++//!   by the range or pruned by the index, and every byte of the store is in the segments the query
++//!   opened or in the ones a pruning decision left unopened. A count that was reported and not
++//!   performed fails one of them.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness a learner can break by editing their own fixture would judge the
++//! fixture instead of the store.
++
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::compaction::{Segments, file_of};
++use lakelet::engine::index;
++use lakelet::engine::query::exec::{self, Outcome};
++use lakelet::engine::query::parse::{Statement, parse};
++use lakelet::protocol::batch::Record;
++
++/// Segments the store is built from.
++const SEGMENTS: u64 = 24;
++
++/// Records one sealed segment holds: thirty of its own host and thirty of the fleet's.
++const PER_SERIES: usize = 30;
++
++/// Milliseconds between two samples of one series: two minutes, so one hour is thirty samples.
++const STEP: u64 = 120_000;
++
++/// One hour — the width of a segment, of a window, and of the arithmetic below.
++const HOUR: u64 = 3_600_000;
++
++/// The first timestamp of every segment, on an hour boundary.
++///
++/// `1_699_999_200_000` is `472_222 * HOUR` exactly, so a segment's span, the query's range and the
++/// grid its windows count on all start on numbers a reader can check by hand.
++const EPOCH: u64 = 472_222 * HOUR;
++
++/// The first hour the query asks about: half the store, so that the *manifest* prunes the other half.
++const FROM_HOUR: u64 = SEGMENTS / 2;
++
++/// The series every segment carries, so that a segment's vocabulary is never one term.
++const FLEET: &str = "fleet";
++
++/// The host the query asks for: the one series that appears in exactly one segment, and in the
++/// second half of the store.
++const SELECTIVE: u64 = 20;
++
++/// The records one sealed segment holds: its own host, then the fleet's, one series after the other.
++fn segment_records(segment: u64) -> Vec<Record> {
++    let start = EPOCH + segment * HOUR;
++    let mut records: Vec<Record> = (0..PER_SERIES)
++        .map(|offset| Record {
++            series: format!("cpu,host=h{segment}"),
++            ts_millis: (start + offset as u64 * STEP) as i64,
++            value: value_of(segment * PER_SERIES as u64 + offset as u64),
++        })
++        .collect();
++    records.extend((0..PER_SERIES).map(|offset| Record {
++        series: format!("cpu,host={FLEET}"),
++        ts_millis: (start + offset as u64 * STEP) as i64,
++        value: value_of(segment * PER_SERIES as u64 + offset as u64),
++    }));
++    records
++}
++
++/// The value of sample `position`: distinct bit patterns, and no structure a column can exploit.
++///
++/// The bytes a segment costs are part of what this lane compares, and a store of values a compressor
++/// likes would make those counts an argument about `zstd` rather than about pruning.
++fn value_of(position: u64) -> f64 {
++    let mixed = position.wrapping_mul(2_654_435_761) % 100_003;
++    mixed as f64 / 8.0
++}
++
++/// The query this lane asks: one selective host, over the second half of the store, one window an
++/// hour.
++fn text() -> String {
++    format!(
++        "SELECT count(value) FROM cpu WHERE host = 'h{SELECTIVE}' AND ts BETWEEN {} AND {} \
++         GROUP BY time(1h), series",
++        EPOCH + FROM_HOUR * HOUR,
++        EPOCH + SEGMENTS * HOUR
++    )
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path = std::env::temp_dir().join(format!(
++            "lakelet-budget-pruning-{label}-{}",
++            std::process::id()
++        ));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    fn path(&self) -> &Path {
++        &self.path
++    }
++
++    /// How many bytes one segment's file costs on the disk, or zero when it is not there.
++    ///
++    /// The disk's own answer and not the manifest's: what a segment *costs* is what a reader pays to
++    /// open it, and a store that wrote a file shorter than it says it did would be caught here
++    /// before any count of pruning was.
++    fn bytes_of(&self, segment: u64) -> u64 {
++        std::fs::metadata(file_of(&self.path, segment))
++            .map(|metadata| metadata.len())
++            .unwrap_or(0)
++    }
++
++    /// How many files the store's index directory holds.
++    fn index_files(&self) -> u64 {
++        std::fs::read_dir(self.path.join(index::DIRECTORY))
++            .map(|entries| entries.filter_map(std::result::Result::ok).count() as u64)
++            .unwrap_or(0)
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// What one selective query over the built store cost, counted.
++struct Counted {
++    /// Segments the store was built from.
++    total: u64,
++    /// Bytes their files cost together, from the disk.
++    bytes_total: u64,
++    /// Bytes the segments *before* the query's range cost, which is what the manifest rules out —
++    /// known here by construction and not by re-implementing the rule the plan applies.
++    bytes_by_time: u64,
++    /// Segments the query opened, from the outcome.
++    opened: u64,
++    /// Segments the manifest's stated spans ruled out.
++    pruned_by_time: u64,
++    /// Segments the index ruled out.
++    blocks_pruned: u64,
++    /// Bytes the segments that were opened cost, from the manifest.
++    bytes_read: u64,
++    /// Bytes the segments the index ruled out cost.
++    bytes_avoided: u64,
++    /// Records read from the segments that were opened.
++    rows_scanned: u64,
++    /// Records that landed in a bucket.
++    rows_answered: u64,
++    /// Answers that are not what this file sealed: series, window or count.
++    mismatch: u64,
++    /// Segments the range met that had no index at all.
++    index_missing: u64,
++    /// Segments whose index could not be read.
++    index_unusable: u64,
++    /// Files in the store's index directory.
++    index_files: u64,
++    /// Something the store refused, counted rather than raised.
++    refused: u64,
++}
++
++/// Build the store, ask the query, and count what it did.
++///
++/// Failures are counted rather than raised for the reason `tests/budget_retention.rs` counts its own:
++/// this file's numbers are what a gate compares, and a harness that panicked would report nothing at
++/// all instead of the count that moved.
++fn ask() -> Counted {
++    let directory = Dir::new("budget");
++    let mut counted = Counted {
++        total: 0,
++        bytes_total: 0,
++        bytes_by_time: 0,
++        opened: 0,
++        pruned_by_time: 0,
++        blocks_pruned: 0,
++        bytes_read: 0,
++        bytes_avoided: 0,
++        rows_scanned: 0,
++        rows_answered: 0,
++        mismatch: 0,
++        index_missing: 0,
++        index_unusable: 0,
++        index_files: 0,
++        refused: 0,
++    };
++    let mut store = match Segments::open(directory.path()) {
++        Ok(store) => store,
++        Err(error) => {
++            eprintln!("the store could not be opened: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    for segment in 0..SEGMENTS {
++        let records = segment_records(segment);
++        if let Err(error) = store.seal(&records) {
++            eprintln!("segment {segment} could not be sealed: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        counted.total += 1;
++        counted.bytes_total += directory.bytes_of(segment);
++        // The segments the query's range does not reach: the workload is built an hour to a segment
++        // from a known epoch, so which of them are outside the range is arithmetic on constants and
++        // not a second implementation of the plan's rule.
++        if segment < FROM_HOUR {
++            counted.bytes_by_time += directory.bytes_of(segment);
++        }
++    }
++    counted.index_files = directory.index_files();
++
++    let query = match parse(&text()) {
++        Ok(Statement::Query(query)) | Ok(Statement::Explain(query)) => query,
++        Err(refusal) => {
++            eprintln!("the query was refused by the grammar: {refusal}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    let snapshot = store.snapshot();
++    let outcome: Outcome = match exec::execute(&snapshot, &query) {
++        Ok(outcome) => outcome,
++        Err(refusal) => {
++            eprintln!("the query was refused by the store: {refusal}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++
++    counted.opened = outcome.segments_opened();
++    counted.pruned_by_time = outcome.segments_pruned();
++    counted.blocks_pruned = outcome.blocks_pruned();
++    counted.bytes_read = outcome.bytes_read();
++    counted.bytes_avoided = outcome.bytes_avoided();
++    counted.rows_scanned = outcome.rows_scanned();
++    counted.rows_answered = outcome.rows_answered();
++    counted.index_missing = outcome.index_missing();
++    counted.index_unusable = outcome.index_unusable();
++
++    // What the answer *is*, against what this file sealed: one answer, for the series the predicate
++    // named, in one window, holding thirty records. Every disagreement is one count, so a wrong
++    // answer that was fast is a number the gate names.
++    let expected = format!("cpu,host=h{SELECTIVE}");
++    if outcome.answers().len() != 1 {
++        counted.mismatch += 1;
++    }
++    for answer in outcome.answers() {
++        if answer.series() != Some(expected.as_str()) {
++            counted.mismatch += 1;
++        }
++        if answer.buckets().len() != 1 {
++            counted.mismatch += 1;
++        }
++        let held: u64 = answer
++            .buckets()
++            .iter()
++            .fold(0u64, |total, bucket| total.saturating_add(bucket.count()));
++        if held != PER_SERIES as u64 {
++            counted.mismatch += 1;
++        }
++        if answer
++            .buckets()
++            .first()
++            .is_some_and(|bucket| bucket.start() != EPOCH + SELECTIVE * HOUR)
++        {
++            counted.mismatch += 1;
++        }
++    }
++    counted
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++#[test]
++fn the_pruning_budget() {
++    let counted = ask();
++
++    // The shape of the store the query was asked of: segments, the bytes they cost, and the bytes of
++    // the ones the range does not reach. A store with nothing in it cannot pass any count below, and
++    // a `seal` that wrote the wrong records is caught before anything is pruned.
++    metric("segments_total", counted.total);
++    metric("bytes_total", counted.bytes_total);
++    metric("bytes_outside_range", counted.bytes_by_time);
++
++    // What the query did: the segments it opened, the two prunings counted apart, and the bytes each
++    // of them was worth. `segments_pruned_by_time` is the pruning a store had before this step;
++    // `blocks_pruned` is the index's share, and it is the number the drill moves to zero.
++    metric("segments_opened", counted.opened);
++    metric("segments_pruned_by_time", counted.pruned_by_time);
++    metric("blocks_pruned", counted.blocks_pruned);
++    metric("bytes_read", counted.bytes_read);
++    metric("bytes_avoided", counted.bytes_avoided);
++
++    // The rate, in whole percent: the share of the store's segments the query did not have to open.
++    // One number is easier to move than five, which is why the gate has one to name when the index
++    // is taken out of the plan — and it is the metric the fifth drill is written about.
++    let unopened = counted.pruned_by_time + counted.blocks_pruned;
++    metric(
++        "pruning_rate",
++        unopened.saturating_mul(100) / counted.total.max(1),
++    );
++
++    // Every segment is opened, pruned by the range or pruned by the index, and every byte of the
++    // store is in the segments that were opened or in the ones a decision left unopened. A count
++    // that was reported and not performed fails one of these whatever its other numbers say.
++    metric(
++        "segments_unaccounted_max",
++        counted
++            .total
++            .abs_diff(counted.opened + counted.pruned_by_time + counted.blocks_pruned),
++    );
++    metric(
++        "bytes_unaccounted_max",
++        counted
++            .bytes_total
++            .abs_diff(counted.bytes_read + counted.bytes_avoided + counted.bytes_by_time),
++    );
++
++    // What was read and what was answered: a segment is opened whole, so the sixty records of the
++    // one segment that stayed were read and the thirty of them that are answers landed in a bucket.
++    metric("rows_scanned", counted.rows_scanned);
++    metric("rows_answered", counted.rows_answered);
++    // And the answer itself, against the records this file sealed. Zero, or the pruning was wrong —
++    // which is the one failure a count of pruned segments cannot see.
++    metric("answer_mismatch_max", counted.mismatch);
++
++    // The index the store wrote, and the two ways a store can be unable to use one. The files are
++    // counted on the disk; the two upper bounds come from the query's own counters, and a store that
++    // had lost its index would print the same answer with these two moved.
++    metric("index_files", counted.index_files);
++    metric("index_missing_max", counted.index_missing);
++    metric("index_unusable_max", counted.index_unusable);
++
++    // A store that refused something is a store this lane cannot judge by counts alone.
++    metric("refused_max", counted.refused);
++}

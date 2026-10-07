@@ -1,0 +1,1391 @@
+diff --git a/docs/query.md b/docs/query.md
+index 5ddea5e..574293b 100644
+--- a/docs/query.md
++++ b/docs/query.md
+@@ -119,7 +119,9 @@ a query cost; the flag form's `--json` is the array it has always been.
+ ## `EXPLAIN`
+ 
+ `EXPLAIN` is a statement, not a flag: `EXPLAIN SELECT …` answers with the plan and **opens no
+-segment at all**. Every key is a fact the manifest already states:
++segment at all** — since `lakelet/4.14-index-pruning` it does read the small sidecar index beside
++each segment the range meets, and nothing inside a segment. Every key is a fact the plan already
++holds: the manifest's own numbers, and what those indexes said:
+ 
+ ```text
+ metric = cpu
+@@ -132,6 +134,7 @@ windows = 12
+ columns = series,ts_millis,value
+ segments_opened = 2
+ segments_pruned = 6
++blocks_pruned = 5
+ records = 88
+ limit = none
+ ```
+@@ -147,6 +150,7 @@ limit = none
+ | `columns` | which columns of a segment the answer is computed from: `series,ts_millis,value` |
+ | `segments_opened` | how many segments the plan keeps |
+ | `segments_pruned` | how many its stated spans rule out, so nothing is read from them |
++| `blocks_pruned` | how many the *index* rules out: a segment whose stated span meets the range and whose zone map or series filter says no (`lakelet/4.14-index-pruning`) |
+ | `records` | how many records the opened segments hold, from the index |
+ | `limit` | `none`, or how many series the answer may cover |
+ 
+@@ -155,6 +159,15 @@ limit = none
+ `records` states) and `rows_answered` is what landed in a bucket (at most `rows_scanned`). A plan
+ that reported a number it did not compute would be worse than no plan.
+ 
++The two prunings are printed apart because they are different decisions by different parts of the
++store, and the three counts together are the whole store: a segment is **opened**, ruled out by the
++**manifest's** stated span (`segments_pruned`) or ruled out by the **index** beside it
++(`blocks_pruned`) — never in two of them and never in none. The executed document `lakeletq query
++--json` prints carries the same three, plus `bytes_read` and `bytes_avoided` (what the decision was
++worth in bytes) and `index_missing` and `index_unusable`: an index is derived state, so a store that
++lost one answers exactly what it answered before, having opened more segments, and those two counters
++are how a script sees that it did.
++
+ ## The pipeline
+ 
+ ```text
+@@ -169,7 +182,10 @@ that reported a number it did not compute would be worse than no plan.
+ 
+ Four steps, in that order, and the interesting one is the first: **pruning**. A segment whose
+ stated span does not meet the range holds nothing the query asked about, so it is not opened, and
+-the records a query walked is a number the plan chose rather than a number the store imposed.
++the records a query walked is a number the plan chose rather than a number the store imposed. Since
++`lakelet/4.14-index-pruning` there are two such decisions rather than one — the manifest's stated
++span, and the index beside each segment that says what its records span and which series it may
++carry — and a tag predicate in `WHERE` is what the second one acts on.
+ Everything after it is deliberately not reimplemented: the buckets come from
+ `lakelet/4.10-downsampling`'s pass, unchanged, so there is one place in this project where a `mean`
+ is defined. `cli` is the other end of the same pipeline — [the command line](../src/cli/mod.rs)
+@@ -178,9 +194,11 @@ decides about this process (two streams, one exit code, `--json` as a format), a
+ 
+ ## What is not here yet
+ 
+-- **`OR`, and what it costs to prune one.** `lakelet/4.14-index-pruning` is where a disjunction is
+-  argued rather than declined, and where the plan grows a second pruning decision
+-  (`blocks_pruned`) on the same surface this page describes.
++- **`OR`, and what it costs to prune one.** The grammar still declines a disjunction, and
++  `lakelet/4.14-index-pruning` is where the question is argued in full: the index prunes a
++  *conjunction* — a segment is skipped when any pair the query named cannot be in it — and a
++  disjunction is the dual of that rule, so a step that adds `OR` inherits a pruning rule rather than
++  needing an index of its own.
+ - **a series index.** Whether a store has *ever* held a metric is decided today from the segments a
+   range touches, because the manifest names records and spans and not series — so a range with no
+   segment in it is answered empty whatever `FROM` names. A store that knows its own names cheaply is
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index ccb913f..01f6ca0 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -781,6 +781,11 @@ fn render_answer(outcome: &exec::Outcome, json: bool) -> Outcome {
+         let document = Document {
+             segments_opened: outcome.segments_opened(),
+             segments_pruned: outcome.segments_pruned(),
++            blocks_pruned: outcome.blocks_pruned(),
++            bytes_read: outcome.bytes_read(),
++            bytes_avoided: outcome.bytes_avoided(),
++            index_missing: outcome.index_missing(),
++            index_unusable: outcome.index_unusable(),
+             rows_scanned: outcome.rows_scanned(),
+             rows_answered: outcome.rows_answered(),
+             series_matched: outcome.series_matched(),
+@@ -826,6 +831,7 @@ fn render_plan(plan: &Plan, json: bool) -> Outcome {
+         columns: COLUMNS,
+         segments_opened: plan.opened().len() as u64,
+         segments_pruned: plan.pruned().len() as u64,
++        blocks_pruned: plan.blocks_pruned(),
+         records: plan.records(),
+         limit: plan.limit(),
+     };
+@@ -861,12 +867,29 @@ struct Bucketed {
+ /// The counts are the executed ones (`lakelet/4.11-query-engine`'s `Outcome`) and not the plan's,
+ /// because a script that reads them is asking what this call *did*. The plan's own numbers are
+ /// what `EXPLAIN` answers, and the two are different questions.
++///
++/// The index's share is here for the same reason the segments' is: a caller who wants to know
++/// whether the pruning happened reads it from the run that happened, and
++/// `lakelet/4.14-index-pruning`'s `index_missing` is the one number that says a store is answering
++/// by brute force rather than by an index.
+ #[derive(Debug, serde::Serialize)]
+ struct Document {
+     /// How many segments this query opened.
+     segments_opened: u64,
+     /// How many the plan's time range ruled out.
+     segments_pruned: u64,
++    /// How many the index ruled out: a segment whose range is met and whose sidecar says no
++    /// (`lakelet/4.14-index-pruning`).
++    blocks_pruned: u64,
++    /// How many bytes the segments that were opened cost, from the manifest.
++    bytes_read: u64,
++    /// How many bytes the segments the index ruled out cost.
++    bytes_avoided: u64,
++    /// How many of the segments the range met had no index to consult, so more was read than the
++    /// index could have saved: a store to repair, and not a wrong answer.
++    index_missing: u64,
++    /// How many of them had an index that could not be read: the other store to repair.
++    index_unusable: u64,
+     /// How many records were read from the segments that were opened.
+     rows_scanned: u64,
+     /// How many of them landed in a bucket.
+@@ -904,6 +927,9 @@ struct Planned {
+     segments_opened: u64,
+     /// How many the manifest's spans rule out.
+     segments_pruned: u64,
++    /// How many the sidecar index rules out — the key `lakelet/4.14-index-pruning` adds, beside the
++    /// twelve this object already carried.
++    blocks_pruned: u64,
+     /// How many records those segments hold, from the index.
+     records: u64,
+     /// How many series the answer may cover, or `null`.
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+index 45407ab..2ec66ff 100644
+--- a/src/engine/compaction/mod.rs
++++ b/src/engine/compaction/mod.rs
+@@ -14,10 +14,18 @@
+ //! ```text
+ //!  <store>/ingest.log                 the log (`lakelet/4.1-ingest-protocol` … `4.4-wal-recovery`)
+ //!  <store>/segments/<n>.lks           one closed segment per file, named by its ordinal
++//!  <store>/index/<n>.lki              that segment's sidecar index (`lakelet/4.14-index-pruning`)
+ //!  <store>/segments.manifest          what the store is: an epoch, a floor and the segments
+ //!  <store>/segments.manifest.pending  a manifest being written (see the swap, below)
+ //! ```
+ //!
++//! The sidecar is not the store and never becomes it: a segment counts exactly when the manifest names
++//! it, whatever `index/` holds, and every file in there is state that can be built again from the
++//! segment it describes (`lakelet/4.14-index-pruning`). This module writes one after it writes the
++//! segment and before the manifest names it — for a flush ([`Segments::seal`]) and for a merge
++//! ([`Segments::merge`], from the union of its inputs' indexes) — and reads none of them back: a
++//! plan is what consults an index.
++//!
+ //! **The manifest is the store.** Not the directory listing, not the newest file: a segment counts
+ //! exactly when the manifest names it, in the order it is listed, and everything else in
+ //! `segments/` is an orphan a crash left behind. That is what makes a merge something a reader
+@@ -119,6 +127,7 @@ pub use snapshot::Snapshot;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ 
++use crate::engine::index::{self, Lookup, SegmentIndex};
+ use crate::engine::retention::{self, ExpireReport};
+ use crate::engine::segment;
+ use crate::engine::wal::checksum;
+@@ -550,6 +559,12 @@ impl Segments {
+         let path = file_of(&self.directory, index);
+         segment::write(&path, records)?;
+         flush(&path)?;
++        // The segment's sidecar index, written *after* the file and *before* the manifest names the
++        // segment: the order is the one this module is built on, so a crash between the two leaves an
++        // index for a segment the store does not have — a file nobody consults, because `load` is only
++        // ever asked about the ordinals the manifest names. A reader that finds none pays a segment
++        // read and counts it (`lakelet/4.14-index-pruning`'s `index_missing`).
++        index::write(&self.directory, index, &SegmentIndex::of(records))?;
+         let (first_millis, last_millis) = range_of(records);
+         let info = SegmentInfo::spanning(
+             index,
+@@ -665,11 +680,26 @@ impl Segments {
+         let mut first_millis: Option<u64> = None;
+         let mut last_millis: Option<u64> = None;
+         let mut stated = true;
++        // The vocabulary of the segment this merge writes is the **union** of its inputs'
++        // vocabularies, taken from their sidecar indexes rather than computed from the records: no
++        // *series name* is read to write it, exactly as no record is read to state the merged
++        // segment's time range. An input whose index nobody can read states nothing
++        // (`SegmentIndex::unstated`), which prunes nothing rather than guessing — an index that
++        // claimed a vocabulary the merged file does not have would hide records that are in it.
++        let mut vocabulary: Option<SegmentIndex> = None;
+         for position in &positions {
+             let Some(info) = segments.get(*position) else {
+                 continue;
+             };
+             records.extend(segment::read(&file_of(&self.directory, info.index))?);
++            let theirs = match index::load(&self.directory, info.index) {
++                Lookup::Found(found) => found,
++                Lookup::Missing | Lookup::Damaged => SegmentIndex::unstated(),
++            };
++            vocabulary = Some(match vocabulary {
++                Some(so_far) => so_far.union(&theirs),
++                None => theirs,
++            });
+             taken.push(info.index);
+             bytes_in += info.bytes;
+             match (info.first_millis(), info.last_millis()) {
+@@ -690,6 +720,14 @@ impl Segments {
+         let file = file_of(&self.directory, index);
+         segment::write(&file, &records)?;
+         flush(&file)?;
++        // The index of the segment this merge wrote, in the same order `seal` uses: after the file,
++        // before `install` makes the manifest name it. Written from the union above, so a merge that
++        // has its inputs' indexes reads no series name and hashes nothing.
++        index::write(
++            &self.directory,
++            index,
++            &vocabulary.unwrap_or_else(SegmentIndex::unstated),
++        )?;
+         let ran = Merge {
+             epoch: self.current.manifest().epoch() + 1,
+             index,
+diff --git a/src/engine/compaction/snapshot.rs b/src/engine/compaction/snapshot.rs
+index af8a91b..4d9a719 100644
+--- a/src/engine/compaction/snapshot.rs
++++ b/src/engine/compaction/snapshot.rs
+@@ -51,6 +51,7 @@
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ 
++use crate::engine::index::{self, Lookup};
+ use crate::engine::segment;
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+@@ -268,4 +269,22 @@ impl Snapshot {
+         records.retain(|record| millis_of(record.ts_millis) >= floor);
+         Ok(records)
+     }
++
++    /// The sidecar index of one segment this snapshot names, or why there is none to consult.
++    ///
++    /// The sibling of [`Snapshot::records_of`] and it exists for the same reason: a plan decides from
++    /// what a segment *states*, and one of the two things it states is written beside the segment
++    /// rather than in it (`lakelet/4.14-index-pruning`). A snapshot is what knows where this store's
++    /// files are, so this is the one place that turns a segment's ordinal into the file a reader of it
++    /// consults — and it answers with a [`Lookup`] rather than an error, because an index is derived
++    /// state: missing, damaged and stale all cost pruning and none of them costs a record.
++    ///
++    /// It does not read the segment it belongs to, and it does not need to: the file names the ordinal
++    /// it was written for, and only the ordinals this snapshot's manifest names are ever asked about,
++    /// which is what makes a stale index (a merge's leftover, an expired segment's) unreachable
++    /// rather than merely unused.
++    #[must_use]
++    pub fn index_of(&self, info: &SegmentInfo) -> Lookup {
++        index::load(&self.held.directory, info.index)
++    }
+ }
+diff --git a/src/engine/index/bloom.rs b/src/engine/index/bloom.rs
+index d6534e5..53a35ff 100644
+--- a/src/engine/index/bloom.rs
++++ b/src/engine/index/bloom.rs
+@@ -125,7 +125,11 @@ impl Bloom {
+     /// consult; `SegmentIndex::unstated` is where that is written down so nobody has to remember it.
+     #[must_use]
+     pub fn of<'a>(terms: impl IntoIterator<Item = &'a str>) -> Self {
+-        todo!("lakelet/4.14-index-pruning: one bit per hash of every term")
++        let mut bloom = Self::empty();
++        for term in terms {
++            bloom.insert(term);
++        }
++        bloom
+     }
+ 
+     /// The filter that may contain everything: what a vocabulary nobody could state is written down as.
+@@ -136,14 +140,26 @@ impl Bloom {
+     /// index still writes an index, and it writes this one).
+     #[must_use]
+     pub fn everything() -> Self {
+-        todo!(
+-            "lakelet/4.14-index-pruning: every bit set: what a vocabulary nobody could state is written as"
+-        )
++        Self {
++            bits: vec![0xff; BYTES],
++        }
++    }
++
++    /// An empty filter: the one a vocabulary is built up in.
++    fn empty() -> Self {
++        Self {
++            bits: vec![0; BYTES],
++        }
+     }
+ 
+     /// Set every bit of `term`, which is the whole of what a bloom filter does with one.
+     pub fn insert(&mut self, term: &str) {
+-        todo!("lakelet/4.14-index-pruning: the four bits of one term")
++        for index in 0..HASHES {
++            let at = bit_of(term, index);
++            if let Some(byte) = self.bits.get_mut(at / 8) {
++                *byte |= 1 << (at % 8);
++            }
++        }
+     }
+ 
+     /// `true` when `term` **may** be one this filter was built from.
+@@ -152,9 +168,7 @@ impl Bloom {
+     /// filter holds is that one. `true` is only an admission that the filter cannot tell.
+     #[must_use]
+     pub fn may_contain(&self, term: &str) -> bool {
+-        todo!(
+-            "lakelet/4.14-index-pruning: whether every one of a term's bits is set, which is the whole answer"
+-        )
++        (0..HASHES).all(|index| self.bit(bit_of(term, index)))
+     }
+ 
+     /// How many bits this filter holds.
+@@ -163,7 +177,7 @@ impl Bloom {
+     /// merged, and the number the false-positive rate in the module docs is a function of.
+     #[must_use]
+     pub const fn bits(&self) -> usize {
+-        todo!()
++        BITS
+     }
+ 
+     /// The filter that holds what either of the two holds: a term either one may contain is a term
+@@ -175,15 +189,23 @@ impl Bloom {
+     /// one that says otherwise.
+     #[must_use]
+     pub fn union(&self, other: &Self) -> Self {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the bits either side set, which needs both to be the same shape"
+-        )
++        Self {
++            bits: self
++                .bits
++                .iter()
++                .zip(&other.bits)
++                .map(|(mine, theirs)| mine | theirs)
++                .collect(),
++        }
+     }
+ 
+     /// This filter as the bytes the layout in the module docs states.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        todo!("lakelet/4.14-index-pruning: the size in two bytes, then the bits")
++        let mut bytes = Vec::with_capacity(2 + self.bits.len());
++        bytes.extend_from_slice(&(BITS as u16).to_le_bytes());
++        bytes.extend_from_slice(&self.bits);
++        bytes
+     }
+ 
+     /// Read the filter these bytes are, or refuse them.
+@@ -194,8 +216,79 @@ impl Bloom {
+     /// states, more than it states, or a stated size that is not [`BITS`] — a filter of another
+     /// geometry cannot be merged with this build's, and a merge is how a merge's index is written.
+     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the filter these bytes are, or a refusal: another shape cannot be merged"
+-        )
++        let Some(slice) = bytes.get(..2) else {
++            return Err(refused(
++                "a filter starts with the two bytes that state how many bits it holds, and these \
++                 bytes do not reach them",
++            ));
++        };
++        let Ok(size) = <[u8; 2]>::try_from(slice) else {
++            return Err(refused("a filter's size is two bytes"));
++        };
++        let stated = usize::from(u16::from_le_bytes(size));
++        if stated != BITS {
++            return Err(refused(format!(
++                "the filter says it holds {stated} bit(s) and this build writes {BITS} — a filter of \
++                 another shape cannot be merged with this one, and merging is how a merge's index is \
++                 written"
++            )));
++        }
++        let Some(bits) = bytes.get(2..) else {
++            return Err(refused("a filter is its size and its bits"));
++        };
++        if bits.len() != BYTES {
++            return Err(refused(format!(
++                "the filter says it holds {BITS} bit(s) and these {} byte(s) of bits follow — a \
++                 filter that is cut short cannot be read as one that is whole",
++                bits.len()
++            )));
++        }
++        Ok(Self {
++            bits: bits.to_vec(),
++        })
++    }
++
++    /// Whether one bit is set, answering `false` for a position past the end.
++    ///
++    /// The position cannot be past the end — every caller takes it modulo [`BITS`] — and a filter is
++    /// not a place to panic over an arithmetic mistake: the safe answer to "is this bit set" about a
++    /// bit that is not there is `no`, which opens a segment.
++    fn bit(&self, at: usize) -> bool {
++        self.bits
++            .get(at / 8)
++            .is_some_and(|byte| byte & (1 << (at % 8)) != 0)
++    }
++}
++
++/// The bit one term's `index`-th hash lands on.
++///
++/// CRC-32 over the term with the hash's index appended, avalanched and taken modulo the size: four
++/// positions from the one checksum function the project already depends on, and a number that
++/// depends on nothing but the term — no seed, no address, no clock.
++///
++/// The avalanche is `fmix32`, the last step of murmur3's 32-bit finalizer, and it is what makes the
++/// positions of one term unrelated to each other *and* to the positions of a term that differs from
++/// it by one byte. A CRC is a checksum: see the module docs for the rate this filter had before the
++/// mixing step was there.
++fn bit_of(term: &str, index: u8) -> usize {
++    let mut hasher = crc32fast::Hasher::new();
++    hasher.update(term.as_bytes());
++    hasher.update(&[index]);
++    avalanche(hasher.finalize()) as usize % BITS
++}
++
++/// `fmix32`: the checksum's bits spread over the whole word.
++fn avalanche(mut value: u32) -> u32 {
++    value ^= value >> 16;
++    value = value.wrapping_mul(0x85eb_ca6b);
++    value ^= value >> 13;
++    value = value.wrapping_mul(0xc2b2_ae35);
++    value ^ (value >> 16)
++}
++
++/// One `Error::Protocol` about these bytes.
++fn refused(detail: impl Into<String>) -> Error {
++    Error::Protocol {
++        detail: detail.into(),
+     }
+ }
+diff --git a/src/engine/index/mod.rs b/src/engine/index/mod.rs
+index cd14a31..efad0fa 100644
+--- a/src/engine/index/mod.rs
++++ b/src/engine/index/mod.rs
+@@ -82,6 +82,8 @@ pub mod zone;
+ 
+ use std::path::{Path, PathBuf};
+ 
++use crate::engine::query::series::Series;
++use crate::engine::wal::checksum;
+ use crate::error::Error;
+ use crate::protocol::batch::Record;
+ 
+@@ -118,7 +120,7 @@ const HEADER: usize = MAGIC.len() + 1 + LENGTH;
+ /// the segments are and where their indexes are without either being confused for the other.
+ #[must_use]
+ pub fn file_of(directory: &Path, ordinal: u64) -> PathBuf {
+-    todo!("lakelet/4.14-index-pruning: the file one segment's sidecar lives in")
++    directory.join(DIRECTORY).join(file_name(ordinal))
+ }
+ 
+ /// What consulting one segment's index found.
+@@ -147,7 +149,10 @@ impl Lookup {
+     /// rather than a field of it.
+     #[must_use]
+     pub fn into_index(self) -> Option<SegmentIndex> {
+-        todo!("lakelet/4.14-index-pruning: the index, when there was one to read")
++        match self {
++            Self::Found(index) => Some(index),
++            Self::Missing | Self::Damaged => None,
++        }
+     }
+ }
+ 
+@@ -174,9 +179,14 @@ impl SegmentIndex {
+     /// never asks about.
+     #[must_use]
+     pub fn of(records: &[Record]) -> Self {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the zone of the records and the vocabulary of their series"
+-        )
++        let mut terms: Vec<String> = Vec::new();
++        for record in records {
++            terms.extend(terms_of(&record.series));
++        }
++        Self {
++            zone: Zone::of(records),
++            series: Bloom::of(terms.iter().map(String::as_str)),
++        }
+     }
+ 
+     /// The index of a segment nobody could state: a zone that meets every range and a filter that may
+@@ -189,27 +199,28 @@ impl SegmentIndex {
+     /// a read; pruning wrongly costs a record.
+     #[must_use]
+     pub fn unstated() -> Self {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the index that prunes nothing, which is the safe answer for what nobody wrote down"
+-        )
++        Self {
++            zone: Zone::of(&[]),
++            series: Bloom::everything(),
++        }
+     }
+ 
+     /// The bounds of the segment's timestamps and values.
+     #[must_use]
+     pub const fn zone(&self) -> &Zone {
+-        todo!()
++        &self.zone
+     }
+ 
+     /// The filter over the segment's series vocabulary.
+     #[must_use]
+     pub const fn series(&self) -> &Bloom {
+-        todo!()
++        &self.series
+     }
+ 
+     /// `true` when a record here **may** have a timestamp inside the half-open `[from, to)`.
+     #[must_use]
+     pub fn may_meet(&self, from: u64, to: u64) -> bool {
+-        todo!("lakelet/4.14-index-pruning: may a record here be inside the range")
++        self.zone.may_meet(from, to)
+     }
+ 
+     /// `true` when a series here **may** carry the tag pair `pair`, spelled `key=value`.
+@@ -220,7 +231,7 @@ impl SegmentIndex {
+     /// somebody inserted.
+     #[must_use]
+     pub fn may_hold(&self, pair: &str) -> bool {
+-        todo!("lakelet/4.14-index-pruning: may a series here carry this tag pair")
++        self.series.may_contain(pair)
+     }
+ 
+     /// The index that covers both segments: the zones' union and both vocabularies.
+@@ -231,14 +242,28 @@ impl SegmentIndex {
+     /// merge's entry states.
+     #[must_use]
+     pub fn union(&self, other: &Self) -> Self {
+-        todo!("lakelet/4.14-index-pruning: the index that covers both segments")
++        Self {
++            zone: self.zone.union(&other.zone),
++            series: self.series.union(&other.series),
++        }
+     }
+ 
+     /// This index as the bytes the layout in the module docs states: the header, the zone map, the
+     /// filter, and the seal over all of it.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        todo!("lakelet/4.14-index-pruning: the header, the zone map, the filter and the seal")
++        let zone = self.zone.encode();
++        let series = self.series.encode();
++        let mut bytes = Vec::with_capacity(HEADER + zone.len() + series.len() + checksum::LEN);
++        bytes.extend_from_slice(&MAGIC);
++        bytes.push(VERSION);
++        let length = zone.len() as u32;
++        bytes.extend_from_slice(&length.to_le_bytes());
++        bytes.extend_from_slice(&zone);
++        bytes.extend_from_slice(&series);
++        let seal = checksum::seal(length_of(&bytes), &bytes);
++        bytes.extend_from_slice(&seal.to_le_bytes());
++        bytes
+     }
+ 
+     /// Read the index these bytes are, or refuse them.
+@@ -254,9 +279,61 @@ impl SegmentIndex {
+     /// does not decode, or bytes after the seal — an index with something appended is refused rather
+     /// than read as one that is whole (`lakelet/4.7-columnar-segments` refuses a segment the same way).
+     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the index these bytes are, or a refusal: magic, version, seal, then the two halves"
+-        )
++        let shortest = HEADER + zone::BYTES + 2 + bloom::BYTES + checksum::LEN;
++        if bytes.len() < shortest {
++            return Err(refused(format!(
++                "an index is at least {shortest} bytes and this file holds {} — a header, a zone map, \
++                 a filter and a seal are what make these bytes an index at all",
++                bytes.len()
++            )));
++        }
++        let Some(header) = bytes.get(..HEADER) else {
++            return Err(not_this_index(bytes));
++        };
++        if header.get(..MAGIC.len()) != Some(MAGIC.as_slice()) {
++            return Err(not_this_index(bytes));
++        }
++        if header.get(MAGIC.len()) != Some(&VERSION) {
++            return Err(not_this_index(bytes));
++        }
++        let Some(sealed_at) = bytes.len().checked_sub(checksum::LEN) else {
++            return Err(not_this_index(bytes));
++        };
++        let Some(seal) = u32_at(bytes, sealed_at) else {
++            return Err(refused(
++                "the last four bytes of an index are its seal, and this file holds no seal",
++            ));
++        };
++        let Some(payload) = bytes.get(..sealed_at) else {
++            return Err(not_this_index(bytes));
++        };
++        let stated = u32::try_from(sealed_at).unwrap_or(u32::MAX);
++        if !checksum::verifies(stated, payload, seal) {
++            return Err(refused(format!(
++                "the seal of this index is {seal} and the {sealed_at} bytes it covers compute {} — \
++                 these bytes changed after they were written, and an index nobody can trust is one a \
++                 reader does without instead of acting on",
++                checksum::seal(stated, payload)
++            )));
++        }
++        let Some(length) = u32_at(bytes, MAGIC.len() + 1) else {
++            return Err(not_this_index(bytes));
++        };
++        let length = usize::try_from(length).unwrap_or(usize::MAX);
++        let Some(zone_bytes) = bytes.get(HEADER..HEADER.saturating_add(length)) else {
++            return Err(refused(format!(
++                "the index states a {length}-byte zone map at {HEADER} and the file ends before it \
++                 does — the length is part of what the seal covers, so this file is not one this \
++                 build wrote"
++            )));
++        };
++        let series_bytes = bytes
++            .get(HEADER.saturating_add(length)..sealed_at)
++            .ok_or_else(|| not_this_index(bytes))?;
++        Ok(Self {
++            zone: Zone::decode(zone_bytes)?,
++            series: Bloom::decode(series_bytes)?,
++        })
+     }
+ }
+ 
+@@ -268,7 +345,16 @@ impl SegmentIndex {
+ /// own data.
+ #[must_use]
+ pub fn load(directory: &Path, ordinal: u64) -> Lookup {
+-    todo!("lakelet/4.14-index-pruning: the index of one segment, or why there is none to consult")
++    // Absent and unreadable are one answer to a reader: nothing was consulted. A permission this
++    // process does not have and a file that is not there are both "this store has no index for that
++    // segment", and both cost the same read.
++    let Ok(bytes) = std::fs::read(file_of(directory, ordinal)) else {
++        return Lookup::Missing;
++    };
++    match SegmentIndex::decode(&bytes) {
++        Ok(index) => Lookup::Found(index),
++        Err(_) => Lookup::Damaged,
++    }
+ }
+ 
+ /// Write `index` as the index of segment `ordinal`.
+@@ -283,7 +369,101 @@ pub fn load(directory: &Path, ordinal: u64) -> Lookup {
+ /// store that cannot write down what it knows is a store that answers from what it read, which is why
+ /// this is an error and not a shrug: the alternative is a store that silently prunes less for ever.
+ pub fn write(directory: &Path, ordinal: u64, index: &SegmentIndex) -> Result<(), Error> {
+-    todo!(
+-        "lakelet/4.14-index-pruning: write it, flush it, and let a failure be an error: derived state is still state"
+-    )
++    let sidecar = directory.join(DIRECTORY);
++    std::fs::create_dir_all(&sidecar).map_err(store)?;
++    // The name is a write of its own (`docs/crash-points.md`, point 4): an index file the device never
++    // kept the name of is an index nobody finds, and a missing index costs reads on every query from
++    // then on.
++    flush(&sidecar)?;
++    let path = file_of(directory, ordinal);
++    std::fs::write(&path, index.encode()).map_err(store)?;
++    flush(&path)
++}
++
++/// The terms one series name contributes to a segment's vocabulary: the name itself, and every
++/// `key=value` pair it carries.
++///
++/// The reading is `lakelet/4.11-query-engine`'s (`Series::of`) and deliberately not a second one: what
++/// counts as a tag — a pair with a non-empty key, matched exactly — is that step's decision, and a
++/// store that read the strings again with its own rule would prune on a term the query never asks
++/// about. The name itself is a term as well, because a name is what a query's `FROM` and `WHERE`
++/// together can spell out in full, and adding it costs a hash.
++fn terms_of(name: &str) -> Vec<String> {
++    let series = Series::of(name);
++    let mut terms = Vec::with_capacity(1 + series.tags().len());
++    terms.push(name.to_owned());
++    terms.extend(
++        series
++            .tags()
++            .iter()
++            .map(|(key, value)| format!("{key}={value}")),
++    );
++    terms
++}
++
++/// The name an index file has.
++fn file_name(ordinal: u64) -> String {
++    format!("{ordinal:0DIGITS$}.{EXTENSION}")
++}
++
++/// How many bytes these are, as the four-byte length a seal states.
++fn length_of(bytes: &[u8]) -> u32 {
++    u32::try_from(bytes.len()).unwrap_or(u32::MAX)
++}
++
++/// The `u32` four bytes at `offset` are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset.checked_add(4)?)?;
++    let mut array = [0u8; 4];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The refusal for bytes that are not this build's index, phrased for whoever has the file.
++fn not_this_index(bytes: &[u8]) -> Error {
++    let detail = match bytes.get(MAGIC.len()) {
++        Some(version) if bytes.starts_with(&MAGIC) => format!(
++            "the file says this index is layout version {version} and this build writes version \
++             {VERSION} — an index it cannot read is not one it may guess at"
++        ),
++        _ => format!(
++            "the file starts with `{}` and an index starts with `{}` — this is not this store's \
++             index, and it is refused rather than read as one that says a segment holds nothing",
++            shown(bytes),
++            shown(&MAGIC)
++        ),
++    };
++    refused(detail)
++}
++
++/// The first bytes of a file, as hex, for a message that shows what was found.
++fn shown(bytes: &[u8]) -> String {
++    bytes
++        .iter()
++        .take(MAGIC.len())
++        .map(|byte| format!("{byte:02x}"))
++        .collect::<Vec<String>>()
++        .join(" ")
++}
++
++/// One `Error::Store` about this input or output.
++fn store(source: std::io::Error) -> Error {
++    Error::Store {
++        source: Box::new(source),
++    }
++}
++
++/// Wait for the device to have what was written to `path`.
++fn flush(path: &Path) -> Result<(), Error> {
++    std::fs::File::open(path)
++        .map_err(store)?
++        .sync_all()
++        .map_err(store)
++}
++
++/// One `Error::Protocol` about these bytes.
++fn refused(detail: impl Into<String>) -> Error {
++    Error::Protocol {
++        detail: detail.into(),
++    }
+ }
+diff --git a/src/engine/index/zone.rs b/src/engine/index/zone.rs
+index 6d06d3d..303eed3 100644
+--- a/src/engine/index/zone.rs
++++ b/src/engine/index/zone.rs
+@@ -90,31 +90,72 @@ impl Zone {
+     /// record.
+     #[must_use]
+     pub fn of(records: &[Record]) -> Self {
+-        todo!("lakelet/4.14-index-pruning: the bounds of the two columns that have an order")
++        let mut first: Option<u64> = None;
++        let mut last: Option<u64> = None;
++        let mut low: Option<f64> = None;
++        let mut high: Option<f64> = None;
++        // Whether the value column can be stated at all, which is a different question from "has a
++        // number been seen yet": a NaN seen once has to keep the pair unstated, and a `None` pair
++        // alone could not tell "nothing seen" from "stated as nothing".
++        let mut values = true;
++        for record in records {
++            let at = millis_of(record.ts_millis);
++            first = Some(first.map_or(at, |current| current.min(at)));
++            last = Some(last.map_or(at, |current| current.max(at)));
++            let value = record.value;
++            if value.is_nan() {
++                values = false;
++            } else {
++                low = Some(low.map_or(
++                    value,
++                    |current| if value < current { value } else { current },
++                ));
++                high = Some(high.map_or(
++                    value,
++                    |current| if value > current { value } else { current },
++                ));
++            }
++        }
++        Self {
++            ts: first.zip(last),
++            value: if values { low.zip(high) } else { None },
++        }
+     }
+ 
+     /// The earliest timestamp this zone states, or nothing when none was stated.
+     #[must_use]
+     pub const fn first_millis(&self) -> Option<u64> {
+-        todo!()
++        match self.ts {
++            Some((first, _)) => Some(first),
++            None => None,
++        }
+     }
+ 
+     /// The latest timestamp it states, or nothing.
+     #[must_use]
+     pub const fn last_millis(&self) -> Option<u64> {
+-        todo!()
++        match self.ts {
++            Some((_, last)) => Some(last),
++            None => None,
++        }
+     }
+ 
+     /// The smallest value it states, or nothing.
+     #[must_use]
+     pub const fn min_value(&self) -> Option<f64> {
+-        todo!()
++        match self.value {
++            Some((low, _)) => Some(low),
++            None => None,
++        }
+     }
+ 
+     /// The largest value it states, or nothing.
+     #[must_use]
+     pub const fn max_value(&self) -> Option<f64> {
+-        todo!()
++        match self.value {
++            Some((_, high)) => Some(high),
++            None => None,
++        }
+     }
+ 
+     /// `true` when a record here **may** have the timestamp `at`.
+@@ -124,9 +165,10 @@ impl Zone {
+     /// every instant, which is the module's rule for everything nobody wrote down.
+     #[must_use]
+     pub fn may_contain_ts(&self, at: u64) -> bool {
+-        todo!(
+-            "lakelet/4.14-index-pruning: may, and never does: an unstated bound answers yes to everything"
+-        )
++        match self.ts {
++            Some((first, last)) => at >= first && at <= last,
++            None => true,
++        }
+     }
+ 
+     /// `true` when a record here **may** hold the value `value`.
+@@ -139,7 +181,10 @@ impl Zone {
+     /// method unused rather than to leave a column unmapped.
+     #[must_use]
+     pub fn may_contain_value(&self, value: f64) -> bool {
+-        todo!("lakelet/4.14-index-pruning: the same question for the other column")
++        match self.value {
++            Some((low, high)) => value >= low && value <= high,
++            None => true,
++        }
+     }
+ 
+     /// `true` when a record here **may** have a timestamp inside the half-open `[from, to)`.
+@@ -153,9 +198,10 @@ impl Zone {
+     /// direction that answers `false` there would be the one failure a plan may not have.
+     #[must_use]
+     pub fn may_meet(&self, from: u64, to: u64) -> bool {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the half-open rule the manifest is pruned by, over this zone"
+-        )
++        match self.ts {
++            Some((first, last)) => first < to && last >= from,
++            None => true,
++        }
+     }
+ 
+     /// The zone that covers the records of both: the smallest first, the largest last, per column.
+@@ -167,15 +213,31 @@ impl Zone {
+     /// (`lakelet/4.9-retention`).
+     #[must_use]
+     pub fn union(&self, other: &Self) -> Self {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the interval that covers both, and nothing at all when either states nothing"
+-        )
++        Self {
++            ts: cover(self.ts, other.ts),
++            value: cover(self.value, other.value),
++        }
+     }
+ 
+     /// This zone as the [`BYTES`] bytes the layout above states.
+     #[must_use]
+     pub fn encode(&self) -> Vec<u8> {
+-        todo!("lakelet/4.14-index-pruning: thirty-three bytes: a flags byte and four numbers")
++        let mut flags = 0u8;
++        if self.ts.is_some() {
++            flags |= TIMESTAMPS;
++        }
++        if self.value.is_some() {
++            flags |= VALUES;
++        }
++        let (first, last) = self.ts.unwrap_or((0, 0));
++        let (low, high) = self.value.unwrap_or((0.0, 0.0));
++        let mut bytes = Vec::with_capacity(BYTES);
++        bytes.push(flags);
++        bytes.extend_from_slice(&first.to_le_bytes());
++        bytes.extend_from_slice(&last.to_le_bytes());
++        bytes.extend_from_slice(&low.to_le_bytes());
++        bytes.extend_from_slice(&high.to_le_bytes());
++        bytes
+     }
+ 
+     /// Read the zone these bytes are, or refuse them.
+@@ -187,9 +249,35 @@ impl Zone {
+     /// reader does without (`Index::load` answers `Lookup::Damaged`), and refusing here is what keeps
+     /// a damaged hint from being read as a different one.
+     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+-        todo!(
+-            "lakelet/4.14-index-pruning: the zone these bytes are, or a refusal naming what is wrong"
+-        )
++        if bytes.len() != BYTES {
++            return Err(refused(format!(
++                "a zone is {BYTES} bytes and these are {} — the flags, two timestamps and two values \
++                 are the whole of it",
++                bytes.len()
++            )));
++        }
++        let Some(flags) = bytes.first().copied() else {
++            return Err(refused("a zone is a flags byte and four numbers"));
++        };
++        if flags & !STATED != 0 {
++            return Err(refused(format!(
++                "the zone's flags byte is {flags:#04x} and this build writes {STATED:#04x} at most — \
++                 a bit nobody wrote is a statement nobody made, and a reader may not guess at it"
++            )));
++        }
++        let stated_ts = flags & TIMESTAMPS != 0;
++        let stated_values = flags & VALUES != 0;
++        let ts = if stated_ts {
++            Some((u64_at(bytes, 1)?, u64_at(bytes, 9)?))
++        } else {
++            None
++        };
++        let value = if stated_values {
++            Some((f64_at(bytes, 17)?, f64_at(bytes, 25)?))
++        } else {
++            None
++        };
++        Ok(Self { ts, value })
+     }
+ }
+ 
+@@ -202,8 +290,67 @@ impl fmt::Display for Zone {
+     /// decision was made from* — a zone that printed only the half it was asked about would be a
+     /// different value in the log than in the store.
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        todo!(
+-            "lakelet/4.14-index-pruning: one line: `ts=[first,last] value=[min,max]`, or `unstated`"
+-        )
++        write!(f, "ts={} value={}", span(self.ts), span(self.value))
++    }
++}
++
++/// The two bounds of one column as one line does, or the word for a pair nobody stated.
++fn span<T: fmt::Display>(range: Option<(T, T)>) -> String {
++    match range {
++        Some((low, high)) => format!("[{low},{high}]"),
++        None => "unstated".to_owned(),
++    }
++}
++
++/// The interval that covers both, or nothing when either of them states nothing.
++fn cover<T: PartialOrd + Copy>(mine: Option<(T, T)>, theirs: Option<(T, T)>) -> Option<(T, T)> {
++    match (mine, theirs) {
++        (Some((low, high)), Some((their_low, their_high))) => Some((
++            if low < their_low { low } else { their_low },
++            if high > their_high { high } else { their_high },
++        )),
++        _ => None,
++    }
++}
++
++/// One record's timestamp in the units this zone states: milliseconds since the Unix epoch, with
++/// anything before it counted as `0`.
++///
++/// The manifest's own rule, spelled the same way, so that a zone and the entry a segment has in the
++/// manifest cannot come to mean two different instants.
++fn millis_of(ts_millis: i64) -> u64 {
++    u64::try_from(ts_millis).unwrap_or(0)
++}
++
++/// The `u64` these eight bytes are, or the refusal saying they are not there.
++fn u64_at(bytes: &[u8], offset: usize) -> Result<u64, Error> {
++    let number: [u8; 8] = eight(bytes, offset)?;
++    Ok(u64::from_le_bytes(number))
++}
++
++/// The `f64` these eight bytes are, or the refusal saying they are not there.
++fn f64_at(bytes: &[u8], offset: usize) -> Result<f64, Error> {
++    let number: [u8; 8] = eight(bytes, offset)?;
++    Ok(f64::from_le_bytes(number))
++}
++
++/// The eight bytes at `offset`, or the one refusal both readers above share.
++fn eight(bytes: &[u8], offset: usize) -> Result<[u8; 8], Error> {
++    let missing = || {
++        refused(format!(
++            "a zone holds an eight-byte number at {offset} and these {} byte(s) do not reach it",
++            bytes.len()
++        ))
++    };
++    let slice = bytes
++        .get(offset..offset.saturating_add(8))
++        .ok_or_else(missing)?;
++    <[u8; 8]>::try_from(slice).map_err(|_| missing())
++}
++
++/// One `Error::Protocol` about these bytes.
++fn refused(detail: impl Into<String>) -> Error {
++    Error::Protocol {
++        detail: detail.into(),
+     }
+ }
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index da53127..de00d48 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -10,7 +10,9 @@
+ //! Step `lakelet/4.1-ingest-protocol` brings the first inhabitant: [`spool`], the append-only file
+ //! every accepted frame is written to. `lakelet/4.3-write-path-adr` decides how hard it is flushed,
+ //! `lakelet/4.4-wal-recovery` turns it into a log that survives a torn write, and everything from
+-//! `4.7` on is written *by* a flush of it.
++//! `4.7` on is written *by* a flush of it. `lakelet/4.14-index-pruning` is the one module whose
++//! files are *beside* the store's rather than part of what the store is: an index is derived state,
++//! and a store without one answers the same questions having read more.
+ 
+ pub mod spool;
+ 
+diff --git a/src/engine/query/exec.rs b/src/engine/query/exec.rs
+index 95a3858..63ac7bc 100644
+--- a/src/engine/query/exec.rs
++++ b/src/engine/query/exec.rs
+@@ -29,13 +29,20 @@
+ //!
+ //! # What the outcome is for
+ //!
+-//! [`Outcome`] carries the answers *and* six counts, because the three questions a caller asks
++//! [`Outcome`] carries the answers *and* eleven counts, because the three questions a caller asks
+ //! after a query are all counts: what did it cost (`rows_scanned`), what did it answer with
+ //! (`rows_answered`), and how much of the store did it have to touch (`segments_opened` against
+-//! `segments_pruned`). They are the counters `lakelet/4.14-index-pruning` and
+-//! `lakelet/4.15-budget-regression` act on, and the identities between them — what was read is at
++//! `segments_pruned` and the index's `blocks_pruned`). They are the counters
++//! `lakelet/4.15-budget-regression` acts on, and the identities between them — what was read is at
+ //! most what the plan said, and what was answered is at most what was read — are what make them
+ //! worth printing.
++//!
++//! Five of them are `lakelet/4.14-index-pruning`'s, and they are the plan's decision rather than the
++//! pass's work: `blocks_pruned` is what the index saved, `bytes_read` and `bytes_avoided` are that
++//! decision in the units a store is measured in, and `index_missing` and `index_unusable` are the
++//! two ways a store can have been *unable* to prune. The last pair is why they are counters at all:
++//! an index is derived state, so a store without one answers the same question, opens more files,
++//! and says which of the two happened instead of answering differently.
+ 
+ use std::collections::BTreeSet;
+ 
+@@ -97,6 +104,16 @@ pub struct Outcome {
+     /// How many of those the answer is about: all of them for one mixed answer, and at most
+     /// `LIMIT` of them for a grouped one.
+     series_answered: u64,
++    /// How many segments the plan's **index** ruled out, so nothing was read from them.
++    blocks_pruned: u64,
++    /// How many bytes the segments that were opened cost, from the manifest.
++    bytes_read: u64,
++    /// How many bytes the segments the index ruled out cost.
++    bytes_avoided: u64,
++    /// How many of the segments the range met had no index to consult.
++    index_missing: u64,
++    /// How many of them had one that could not be read.
++    index_unusable: u64,
+ }
+ 
+ impl Outcome {
+@@ -141,6 +158,48 @@ impl Outcome {
+     pub const fn series_answered(&self) -> u64 {
+         self.series_answered
+     }
++
++    /// How many segments the plan's index ruled out (`lakelet/4.14-index-pruning`).
++    ///
++    /// The pruning this store did not have before the index existed, counted beside
++    /// [`Outcome::segments_pruned`] rather than inside it: that one is the manifest's stated spans,
++    /// this one is the sidecar, and a store that has both should be able to say which did the work.
++    #[must_use]
++    pub const fn blocks_pruned(&self) -> u64 {
++        self.blocks_pruned
++    }
++
++    /// How many bytes the segments this query opened cost, from the manifest.
++    #[must_use]
++    pub const fn bytes_read(&self) -> u64 {
++        self.bytes_read
++    }
++
++    /// How many bytes the segments it did not open cost — what the index was worth here.
++    #[must_use]
++    pub const fn bytes_avoided(&self) -> u64 {
++        self.bytes_avoided
++    }
++
++    /// How many segments the range met had no index at all.
++    ///
++    /// Not zero on a store that lost its index directory, and not an error either: the query answered
++    /// by opening those segments, and this is the count that says a store is doing more work than it
++    /// should rather than the number that says the answer is wrong.
++    #[must_use]
++    pub const fn index_missing(&self) -> u64 {
++        self.index_missing
++    }
++
++    /// How many of them had an index that could not be read.
++    ///
++    /// Counted apart from [`Outcome::index_missing`] because "there is no index file" and "there is
++    /// one and it is damaged" are different states of a store, and a reader who is told only one
++    /// number cannot tell which to go and look at.
++    #[must_use]
++    pub const fn index_unusable(&self) -> u64 {
++        self.index_unusable
++    }
+ }
+ 
+ /// Answer `query` against `snapshot` with no zone named.
+@@ -283,5 +342,13 @@ pub fn execute_in(
+         rows_answered,
+         series_matched: names.len() as u64,
+         series_answered,
++        // The index's half of the decision, carried from the plan rather than measured here: what a
++        // query *would* read is the plan's answer (`lakelet/4.14-index-pruning`), and the pass adds
++        // the work it did on top of it.
++        blocks_pruned: plan.blocks_pruned(),
++        bytes_read: plan.bytes_read(),
++        bytes_avoided: plan.bytes_avoided(),
++        index_missing: plan.index_missing(),
++        index_unusable: plan.index_unusable(),
+     })
+ }
+diff --git a/src/engine/query/plan.rs b/src/engine/query/plan.rs
+index 4a5ebbf..768d97e 100644
+--- a/src/engine/query/plan.rs
++++ b/src/engine/query/plan.rs
+@@ -32,6 +32,25 @@
+ //! same fact: a decision made from a number nobody wrote down is a decision nobody can defend, and
+ //! opening one file too many is cheaper than answering without data.
+ //!
++//! # The second pruning decision
++//!
++//! `lakelet/4.14-index-pruning` adds the other half of what a store knows about a closed segment: a
++//! **sidecar index** beside every segment file, holding the bounds of its columns and a filter over
++//! its series vocabulary. A plan therefore prunes twice, and the two are counted apart because they
++//! are different facts:
++//!
++//! * first by the **manifest's stated span**, which `segments_pruned` counts — the rule above, and the
++//!   only pruning this store had before the index existed;
++//! * then by the **index**, which `blocks_pruned` counts: a segment whose stated span meets the range
++//!   is still skipped when its zone map cannot meet the range or its series filter cannot hold a tag
++//!   pair the query named. That is the pruning a selective predicate pays for — `WHERE host = 'h0'`
++//!   opens the segments that may hold `h0`, and no others.
++//!
++//! The index is *derived state*, and the plan treats it as one: an entry that is **missing** or
++//! **damaged** (`index_missing`, `index_unusable`) costs pruning and nothing else. The segment is
++//! opened — the safe direction, because a read that was saved is invisible and a record that was
++//! dropped is not — and the counters say which of the two happened rather than the answer changing.
++//!
+ //! # What a plan is not allowed to say
+ //!
+ //! [`Plan::explain`] prints what the plan *would* do: the segments it opens, the ones it prunes,
+@@ -43,6 +62,7 @@
+ //! (`blocks_pruned`) on top of this one.
+ 
+ use crate::engine::compaction::{SegmentInfo, Snapshot};
++use crate::engine::index::Lookup;
+ use crate::engine::query::downsample::{Aggregate, Range, Window};
+ use crate::engine::query::lex::Refusal;
+ use crate::engine::query::parse::Query;
+@@ -52,9 +72,14 @@ use crate::engine::query::parse::Query;
+ /// `series` carries the metric and the tags — it is what `FROM` and `WHERE` ask about, so a query
+ /// always decodes it, even the one that groups by nothing — `ts_millis` places a record on the
+ /// window grid, and `value` is what the aggregate is over. Three of the columns a segment holds,
+-/// and the plan says which because "what would you read" is a question about bytes as much as
+-/// about files: `lakelet/4.14-index-pruning` is where a query with a narrower need decodes fewer
+-/// of them.
++/// and the plan says which because "what would you read" is a question about bytes as much as about
++/// files. It is one list and not a per-query one, deliberately: which columns a query *needs* is a
++/// property of the grammar and the aggregate, and a plan that narrowed this line would be pinning a
++/// decision the reader has not made yet.
++///
++/// `lakelet/4.14-index-pruning` is where bytes-not-read becomes a number, and it does it over
++/// **segments** rather than columns: a selective predicate leaves whole files unopened
++/// ([`Plan::blocks_pruned`]), which is the read this store was paying for.
+ pub const COLUMNS: &str = "series,ts_millis,value";
+ 
+ /// What a query would do: the segments it opens, the ones it does not, and the facts a reader
+@@ -80,8 +105,20 @@ pub struct Plan {
+     opened: Vec<SegmentInfo>,
+     /// The segments whose stated span rules them out, in the manifest's order.
+     pruned: Vec<SegmentInfo>,
++    /// The segments the *index* rules out: the ones whose stated span meets the range and whose
++    /// sidecar says no. In the manifest's order.
++    blocks: Vec<SegmentInfo>,
+     /// How many records the opened segments hold, from the manifest alone.
+     records: u64,
++    /// How many bytes the segments the query would open cost, from the manifest alone.
++    bytes_read: u64,
++    /// How many bytes the segments the index ruled out cost — what this plan's index is worth in the
++    /// units the store is measured in.
++    bytes_avoided: u64,
++    /// How many segments had no index to consult: pruning lost, answer unchanged.
++    index_missing: u64,
++    /// How many segments had one, and it could not be read: pruning lost, answer unchanged.
++    index_unusable: u64,
+     /// How many series the answer may cover, when the grammar asked for a bound.
+     limit: Option<u64>,
+ }
+@@ -97,9 +134,17 @@ impl Plan {
+     /// a caller who wrote a range that reaches into what the store has forgotten wants to be told,
+     /// not handed a shorter answer that looks complete.
+     ///
++    /// A segment the range meets is then asked of its **index** (`lakelet/4.14-index-pruning`), which
++    /// is one small file read per segment the range kept: its zone map has to be able to meet the
++    /// range, and its filter has to be able to hold every tag pair the query named. A segment no pair
++    /// was named for is not asked about its vocabulary at all — a query with no tag predicate has no
++    /// vocabulary question, and the filter is not consulted.
++    ///
+     /// # Errors
+     ///
+-    /// [`Refusal::Forgot`] when the range begins below the store's floor.
++    /// [`Refusal::Forgot`] when the range begins below the store's floor. Nothing an index does can
++    /// fail here: a missing or damaged one is counted and opened, never raised
++    /// (`lakelet/4.14-index-pruning`'s central rule).
+     pub fn of(snapshot: &Snapshot, query: &Query) -> Result<Self, Refusal> {
+         let range = query.range();
+         let floor = snapshot.floor();
+@@ -109,16 +154,46 @@ impl Plan {
+                 floor,
+             });
+         }
++        // The pairs the query named, spelled the way a record's series spells them: this is what the
++        // index's filter is asked about, and it is asked nothing when the query named no pair.
++        let asked: Vec<String> = query
++            .predicates()
++            .iter()
++            .map(|(key, value)| format!("{key}={value}"))
++            .collect();
+         let mut opened = Vec::new();
+         let mut pruned = Vec::new();
++        let mut blocks = Vec::new();
+         let mut records = 0u64;
++        let mut bytes_read = 0u64;
++        let mut bytes_avoided = 0u64;
++        let mut index_missing = 0u64;
++        let mut index_unusable = 0u64;
+         for info in snapshot.segments() {
+-            if meets(info, range) {
+-                opened.push(*info);
+-                records = records.saturating_add(info.records);
+-            } else {
++            if !meets(info, range) {
+                 pruned.push(*info);
++                continue;
++            }
++            match snapshot.index_of(info) {
++                Lookup::Found(index) => {
++                    let answers = index.may_meet(range.from(), range.to())
++                        && asked.iter().all(|pair| index.may_hold(pair));
++                    if !answers {
++                        blocks.push(*info);
++                        bytes_avoided = bytes_avoided.saturating_add(info.bytes);
++                        continue;
++                    }
++                }
++                // Derived state, and the two ways it goes missing are counted apart: this one says the
++                // store has no index for a segment, which is a store that lost one.
++                Lookup::Missing => index_missing = index_missing.saturating_add(1),
++                // And this one says a file is there and is not an index this build can read, which is
++                // a store to go and look at. Neither changes what the query opens.
++                Lookup::Damaged => index_unusable = index_unusable.saturating_add(1),
+             }
++            opened.push(*info);
++            records = records.saturating_add(info.records);
++            bytes_read = bytes_read.saturating_add(info.bytes);
+         }
+         Ok(Self {
+             metric: query.metric().to_owned(),
+@@ -129,7 +204,12 @@ impl Plan {
+             windows: windows_of(range, query.window()),
+             opened,
+             pruned,
++            blocks,
+             records,
++            bytes_read,
++            bytes_avoided,
++            index_missing,
++            index_unusable,
+             limit: query.limit(),
+         })
+     }
+@@ -145,11 +225,66 @@ impl Plan {
+     }
+ 
+     /// The segments the manifest's stated spans rule out, in the manifest's order.
++    ///
++    /// `lakelet/4.11-query-engine`'s count, and it keeps its meaning: this is the pruning a store did
++    /// before an index existed. The segments the *index* rules out are counted apart
++    /// ([`Plan::blocks_pruned`]), and the three counts together are the whole store:
++    /// `opened + pruned + blocks_pruned` is every segment the manifest names, and no segment is in
++    /// two of them.
+     #[must_use]
+     pub fn pruned(&self) -> &[SegmentInfo] {
+         &self.pruned
+     }
+ 
++    /// How many segments the **index** rules out: the ones whose stated span meets the range and
++    /// whose sidecar index says no.
++    ///
++    /// This is the number the step is about, and the one a budget watches: a query whose predicate is
++    /// selective prunes here, and a store with no index prunes nothing here. It is a count of
++    /// *segments*, so it is comparable with [`Plan::opened`] and with the manifest's own length, and
++    /// the bytes it is worth are [`Plan::bytes_avoided`].
++    #[must_use]
++    pub fn blocks_pruned(&self) -> u64 {
++        self.blocks.len() as u64
++    }
++
++    /// How many bytes the segments this plan would open cost.
++    ///
++    /// The manifest's own number for each of them, not a `stat`: what a segment costs is what the
++    /// store wrote down when it closed it, and asking the device would make a plan a reader of files.
++    #[must_use]
++    pub const fn bytes_read(&self) -> u64 {
++        self.bytes_read
++    }
++
++    /// How many bytes the segments the index ruled out cost — what the index is worth, in bytes.
++    #[must_use]
++    pub const fn bytes_avoided(&self) -> u64 {
++        self.bytes_avoided
++    }
++
++    /// How many segments had no index to consult.
++    ///
++    /// An answer that is not an error: the store lost its index (or has one for a layout this build
++    /// cannot read — that is [`Plan::index_unusable`]), and the query answered by opening the segment.
++    /// A count that is not zero is a store to repair, and a count that is zero with an empty
++    /// [`Plan::blocks_pruned`] is a store with nothing to prune rather than one without an index.
++    #[must_use]
++    pub const fn index_missing(&self) -> u64 {
++        self.index_missing
++    }
++
++    /// How many segments had an index that could not be read.
++    ///
++    /// Counted apart from [`Plan::index_missing`] because the two are different facts: a store with no
++    /// index files has lost them, and a store with files that do not parse or whose seal does not
++    /// verify has a damaged one — which is the answer a repair tool needs and the reason both counters
++    /// exist rather than one.
++    #[must_use]
++    pub const fn index_unusable(&self) -> u64 {
++        self.index_unusable
++    }
++
+     /// How many records the opened segments hold, from the manifest alone.
+     ///
+     /// This is what the *segments hold*, not what an answer returns: a store with a floor keeps
+@@ -208,6 +343,11 @@ impl Plan {
+     /// Deterministic on purpose: it is a value a script diffs, a ticket quotes and a reviewer
+     /// compares across two runs, so the keys are always all present — `limit = none` rather than a
+     /// missing line — and the numbers are the ones the manifest states.
++    ///
++    /// `blocks_pruned` sits beside `segments_pruned`, and the order says how the two relate: the
++    /// twelve keys `lakelet/4.11-query-engine` shipped keep their names, their order and their
++    /// meanings, and this one is the pruning decision `lakelet/4.14-index-pruning` adds. A reader of
++    /// the twelve lines who never looks at the thirteenth sees exactly what that step answered.
+     #[must_use]
+     pub fn explain(&self) -> String {
+         let limit = match self.limit {
+@@ -225,6 +365,7 @@ impl Plan {
+             ("columns", COLUMNS.to_owned()),
+             ("segments_opened", self.opened.len().to_string()),
+             ("segments_pruned", self.pruned.len().to_string()),
++            ("blocks_pruned", self.blocks_pruned().to_string()),
+             ("records", self.records.to_string()),
+             ("limit", limit),
+         ]

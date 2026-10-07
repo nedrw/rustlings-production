@@ -310,7 +310,7 @@ plan §9 要六条腿，每条要“原始输出 + 回滚对比”。做不到�
 | 2 注入泄漏 | `slow:soak` 红并点名计数 → 回滚绿 | 等 4.17（`slow:soak@N` 第一次上场） |
 | 3 换掉合并顺序 | 用 `HashMap` 迭代顺序替换一处合并 → `slow:sim` 红 → 回滚绿 | **已做**（段 11，4.6）：写者拿到帧的顺序换成 `HashMap` 迭代 → `✗ slow:sim@3 the same seed produced two different transcripts: seed 1 came out as 5da24ff3 and 45197a26`；回滚 → `✓ … transcripts 4b891aaf/59a2e06b/59d4f669 — seed 1 replayed identically` |
 | 4 未分类的截断帧 | 注入 → fuzz/spec 红 → 回滚绿 | **已做**（段 5）：bug 种回去 → `kiln run` `FAILED. 5 passed; 2 failed`、`✗ slow:fuzz@3 3 of 3 seed(s) did not pass … panicked at src/protocol/sniff.rs:89:32`；回滚 → `7 passed` / `10/10 must gate(s) passed` |
-| 5 拿掉 4.14 的剪枝 | `bench-budget` 红 → 回滚绿 | 等 4.14 |
+| 5 拿掉 4.14 的剪枝 | `bench-budget` 红 → 回滚绿 | **已做**（段 19，4.14）：把计划的索引查询去掉 → `✗ slow:bench-budget@10 6 of 18 metric(s) moved out of budget … pruning_rate is 50, -45 of the baseline 95`、`7/10 must gate(s) passed`；回滚 → `pruning_rate 95`、`10/10 must gate(s) passed`（作者与我各自跑了一遍，数字逐字一致） |
 | 6 改一个协议向量 / 弄坏 Dockerfile | `spec-integrity` 红 / `container-repro` 红 | 前半每步的 selftest 都在跑；后半等 4.22 的 Dockerfile |
 
 腿 1 的无网那一半，4.3 上实测（冷目标目录 + 全新 `XDG_CACHE_HOME`，只复用已缓存的 registry 源码）：
@@ -1019,3 +1019,70 @@ GREEN  回滚 → spec 18 passed · 单种子 harness ok
    这条写进 handoff-m3 §1 第 13 条。
 4. **规格与装置的分工**：规格读的是**固定种子**（环境变量 `KILN_SIM_SEED` 是给门跑的 harness 的，规格读环境
    就等于让规格判机器），而 harness 读 `KILN_SIM_SEED`/`KILN_SIM_OPS` 并打印 transcript。
+
+## 段 19：B3f — 4.14 `query/index-pruning@apply`（剪枝是可数的，侧车索引是派生状态）
+
+**做了什么**：`spec/4.14/index_pruning.rs`（1675 行、20 用例）、`scaffold/4.14-index-pruning.patch`
+（1098 行、**0 删除**：新建 `src/engine/index/{mod,zone,bloom}.rs` 的契约桩与课程装置
+`tests/budget_pruning.rs`，并在 `engine/mod.rs` 的标记块里插 `pub mod index;`）、
+`solutions/4.14-index-pruning.patch`（774 加 / 75 删：三个模块的函数体 + `compaction/{mod,snapshot}.rs`、
+`query/{plan,exec}.rs`、`cli/mod.rs`、`docs/query.md`）、`budget/4.14-index-pruning.toml`（123 行、18 计数）、
+`course/docs/steps/en/lakelet/4.14-index-pruning.md`（257 行）。另加两处**早期契约的兼容式修改**：
+`spec/4.11/query_engine.rs` 的 `assert_eq!(keys.len(), 12)` 放宽成 `>=`（在 4.11 自己的树上是 12、在最终树
+上是 13，两边都过——rule 10 的正解），并重钉它的哈希；`spec/manifest.toml` 增加 4.14。
+
+**这一步钉下来的五条不变量**：① **索引在段的旁边，不在段里**（`<store>/index/<ordinal>.lki`）：4.7 的
+规格钉着 `segment::VERSION == 1` 且拒绝段尾多出的字节，4.8 的规格数 `segments/` 里的文件——所以段格式
+一个字节没动，索引也不会污染 4.8 的孤儿规则；② **索引是派生状态，安全方向**：缺失、损坏、过期（manifest
+不再认的 ordinal）只损失剪枝，永不改变答案，且两种“没有索引”分开计数（`index_missing` / `index_unusable`）；
+③ **布隆过滤的是“词”而不只是系列名**（`SegmentIndex::of` 同时插入名字与它带的每个 `key=value`，用 4.11 的
+`Series::of` 读标签），因为查询问的是**对**（`WHERE host='h0'` 也要选中 `cpu,host=h0,dc=east`）——只插名字
+会给出假阴性，也就是丢记录；④ **计划两级剪枝**：manifest 的时间范围（4.11 的 `segments_pruned`）+ 索引
+（新增 `blocks_pruned`），于是 `opened + pruned + blocks_pruned` 就是 manifest 认的全部段；
+⑤ **可数**：18 个计数器里 `pruning_rate`（整数百分比）就是 plan §9 演练第 5 条要推动的那个数。
+
+**原始结论行**（我在自己的构建与**全新**副本 `l4b3-check5` 上重取，阶梯 4.1…4.14 全部 `run` 红 / `solution` 绿）：
+
+```
+$ kiln check lakelet/4.14-index-pruning --slow      # 10/10 must gate(s) passed
+  ✓ slow:bench-budget@10 18 metric(s) judged（12 within ±10%，6 at or below an upper bound）:
+    segments_total 24, bytes_total 5896, bytes_outside_range 2945, segments_opened 1,
+    segments_pruned_by_time 12, blocks_pruned 11, bytes_read 243, bytes_avoided 2708, pruning_rate 95,
+    segments_unaccounted_max 0, bytes_unaccounted_max 0, rows_scanned 60, rows_answered 30,
+    answer_mismatch_max 0, index_files 24, index_missing_max 0, index_unusable_max 0, refused_max 0
+  ✓ slow:mutants@80 5/6 mutant(s) killed (83%, needs ≥80%)（活下来的是 §5 记的那个 with_capacity 位点）
+$ kiln verify lakelet → 14/14 judged step(s) pass · 0 failed · 0 not prepared · 10 without content
+$ kiln selftest lakelet/{4.7,4.11,4.14} --track lakelet → 三步各自 1/1 hold the contract（4.11 放宽后的断言在它自己的树上依旧过）
+$ cargo test -q -p kiln → 320 + 21 + 1 · clippy 干净 · fmt 干净 · lint-caps no issues · links 104 page(s) · i18n 0 error · probe 41/41
+```
+
+**演练（plan §9 第 5 条，我重取了一遍）**：把计划里的索引查询去掉（`Lookup::Found` 一律当作“可能答”，
+即回到 4.11 的行为）——
+
+```
+RED   ✗ slow:bench-budget@10 6 of 18 metric(s) moved out of budget: segments_opened is 12, 11 of the
+      baseline 1; blocks_pruned is 0, -11 of the baseline 11; bytes_read is 2951, 2708 of the baseline
+      243; bytes_avoided is 0, -2708 of the baseline 2708; pruning_rate is 50, -45 of the baseline 95;
+      rows_scanned is 720, 660 of the baseline 60 —— 7/10 must gate(s) passed（✗，mutants 也 ⚠“规格没在未变异
+      的树上是绿的”，因为四条规格用例同时红了）
+GREEN 回滚 → ✓ slow:bench-budget@10 … pruning_rate 95 … · ✓ slow:mutants@80 5/6 · 10/10 must gate(s) passed
+```
+
+与作者的数字逐字一致（`pruning_rate 95 → 50`、`blocks_pruned 11 → 0`、`segments_opened 1 → 12`），
+而**该不动的东西一个都没动**（`segments_total`、`bytes_total`、`bytes_outside_range`、
+`segments_pruned_by_time`、`rows_answered`、`answer_mismatch_max`、`index_*`、`refused_max`、两条守恒式）。
+
+**这一段钉下来的四件事**：
+
+1. **B3 收口**：4.9–4.14 六步全部落地（`kiln verify lakelet` 14/14），plan §9 的腿 5 完成。剩下的腿：
+   腿 2（4.17 的 soak 抓泄漏）、腿 6 后半（4.22 弄坏 Dockerfile）、腿 1 的完整一半（24 步齐后无网跑
+   `kiln verify lakelet`）。
+2. **§5 的抽样缺陷又添一个方向**：4.14 的补丁必须碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是
+   抽样抽到了 **4.10 的行** `if windows > MAX_WINDOWS`，作者一开始只有 66%，补了一条命令行边界的用例才到
+   83%。结论：**一个步骤只要碰到共享文件，就会“继承”那个文件里没被覆盖的行**——收尾时写进 §5。
+3. **作业书里我写错的命令**：`rustfmt --config path rustfmt.toml` 不合法（要 `--config-path`）；作者纠正了。
+   给下一位的提醒记在这里，别再写错。
+4. **规则 9 家族的新失败模式**：用**终端**往工作树的**新未跟踪目录**里写文件，Delta 会报
+   `<skipped-untracked-directory>` 并让整个工作树的终端停摆（“the checkout kept changing”）；恢复办法是
+   先把那棵树恢复到 Delta 认识的样子（撤掉 shell 写的那次编辑、删掉未跟踪目录），然后用**文件工具**建文件、
+   再 `cp` 内容过去。**工作树里的文件只用文件工具创建**（第 9 条的姊妹条，见 §1 第 14 条）。
