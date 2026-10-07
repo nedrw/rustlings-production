@@ -1,0 +1,770 @@
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index ded95ff..4601612 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -68,6 +68,23 @@
+ //! diagnosis" is what this step is about, and an [`Outcome`] that already knew the rule would be
+ //! the answer.
+ 
++use std::path::Path;
++
++use crate::engine::compaction::Segments;
++use crate::engine::query::downsample::{self, Aggregate, Bucket, Range, Window};
++use crate::error::Error;
++
++/// The command answered.
++const ANSWERED: u8 = 0;
++/// This deployment is broken, rather than the call.
++const BROKEN: u8 = 1;
++/// The call was wrong.
++const WRONG: u8 = 2;
++/// The thing asked about is not there.
++const ABSENT: u8 = 3;
++/// The store refused.
++const REFUSED: u8 = 4;
++
+ /// The usage text: what the tool is, what it reads, and the codes it leaves behind.
+ pub const USAGE: &str = "\
+ usage: lakeletq [OPTIONS] <COMMAND>
+@@ -128,19 +145,83 @@ impl Outcome {
+     /// The bytes standard output would have received.
+     #[must_use]
+     pub fn stdout(&self) -> &str {
+-        todo!()
++        &self.stdout
+     }
+ 
+     /// The bytes standard error would have received.
+     #[must_use]
+     pub fn stderr(&self) -> &str {
+-        todo!()
++        &self.stderr
+     }
+ 
+     /// The code the process would have ended with.
+     #[must_use]
+     pub fn code(&self) -> u8 {
+-        todo!()
++        self.code
++    }
++
++    /// The answer, and the code that says the question was answered.
++    fn answered(stdout: impl Into<String>) -> Self {
++        Self {
++            code: ANSWERED,
++            stdout: stdout.into(),
++            stderr: String::new(),
++        }
++    }
++
++    /// A refusal: nothing on the answer stream, one sentence of diagnosis, and the class it is.
++    ///
++    /// The two halves are decided in one place because they are one decision: a caller that printed
++    /// half an answer and then failed is worse than one that printed nothing, and a script reads
++    /// the code and the sentence together.
++    fn refused(code: u8, detail: impl Into<String>) -> Self {
++        Self {
++            code,
++            stdout: String::new(),
++            stderr: format!("{}\n", detail.into()),
++        }
++    }
++}
++
++/// Everything one `query` call decided, once the text on the command line is numbers and values.
++#[derive(Debug, Clone, Copy)]
++struct Query<'a> {
++    /// The store directory the question is about.
++    store: &'a Path,
++    /// The half-open span of time it is about.
++    range: Range,
++    /// How many milliseconds wide one bucket is.
++    width_millis: u64,
++    /// How a window's records become one number.
++    aggregate: Aggregate,
++    /// The series to answer about, or every series.
++    series: Option<&'a str>,
++    /// Whether the answer is one JSON document rather than one line per bucket.
++    json: bool,
++}
++
++/// One bucket as the JSON shape writes it: three fields, in the order a script reads them.
++///
++/// A struct rather than a map, because a map is sorted by key and this shape's order is part of the
++/// contract: `start`, `count`, `value`.
++#[derive(Debug, serde::Serialize)]
++struct Shown {
++    /// The window's start: milliseconds since the Unix epoch, on the absolute grid.
++    start: u64,
++    /// How many records of the range went into the window.
++    count: u64,
++    /// The aggregate over them.
++    value: f64,
++}
++
++impl Shown {
++    /// One bucket in the JSON shape.
++    fn of(bucket: &Bucket) -> Self {
++        Self {
++            start: bucket.start(),
++            count: bucket.count(),
++            value: bucket.value(),
++        }
+     }
+ }
+ 
+@@ -154,8 +235,330 @@ impl Outcome {
+ /// store that is not there, a store that refused — comes back as an [`Outcome`].
+ #[must_use]
+ pub fn run(args: impl IntoIterator<Item = String>) -> Outcome {
+-    todo!(
+-        "lakelet/4.10-downsampling: `USAGE` and `MAX_WINDOWS` are above and the rules are in \
+-         this module's header — the grammar, the two renderers and the exit codes are yours"
++    let args: Vec<String> = args.into_iter().collect();
++
++    // Asking for help is not a command that can fail, and it is answered wherever it appears:
++    // `--store` with a typo in front of it still deserves the usage page rather than a complaint
++    // about the typo. `--version` is the same kind of answer.
++    if args
++        .iter()
++        .any(|argument| argument == "--help" || argument == "-h")
++    {
++        return Outcome::answered(USAGE);
++    }
++    if args.iter().any(|argument| argument == "--version") {
++        return Outcome::answered(format!("lakeletq {}\n", env!("CARGO_PKG_VERSION")));
++    }
++
++    // `--json` is not a command and not a flag of one: it is a format, so it is taken out of the
++    // line wherever it was put and the command is what is left. That is the whole of "before or
++    // after the subcommand".
++    let mut json = false;
++    let mut rest: Vec<&str> = Vec::new();
++    for argument in &args {
++        if argument == "--json" {
++            json = true;
++        } else {
++            rest.push(argument.as_str());
++        }
++    }
++
++    let Some((command, flags)) = rest.split_first() else {
++        return Outcome::answered(USAGE);
++    };
++    match *command {
++        "help" if flags.is_empty() => Outcome::answered(USAGE),
++        "help" => unknown(&flags.join(" "), "help takes no argument"),
++        "query" => query(flags, json),
++        other => unknown(other, "the commands are `query` and `help`"),
++    }
++}
++
++/// The refusal for something the caller typed that is not a command: an argument, when it looks
++/// like one, and a command otherwise. The word matters — "unknown argument" tells a reader their
++/// flag is misspelled, and "unknown command" tells them their verb is.
++fn unknown(typed: &str, hint: &str) -> Outcome {
++    if typed.starts_with('-') {
++        Outcome::refused(WRONG, format!("unknown argument `{typed}`: {hint}"))
++    } else {
++        Outcome::refused(WRONG, format!("unknown command `{typed}`: {hint}"))
++    }
++}
++
++/// Parse and answer one `query`.
++fn query(flags: &[&str], json: bool) -> Outcome {
++    let mut store: Option<&str> = None;
++    let mut from: Option<&str> = None;
++    let mut to: Option<&str> = None;
++    let mut window: Option<&str> = None;
++    let mut aggregate: Option<&str> = None;
++    let mut series: Option<&str> = None;
++
++    let mut index = 0;
++    while let Some(flag) = flags.get(index).copied() {
++        let Some(value) = flags.get(index + 1) else {
++            return Outcome::refused(WRONG, format!("`{flag}` takes a value and did not get one"));
++        };
++        let slot = match flag {
++            "--store" => &mut store,
++            "--from" => &mut from,
++            "--to" => &mut to,
++            "--window" => &mut window,
++            "--agg" => &mut aggregate,
++            "--series" => &mut series,
++            other => return unknown(other, "`lakeletq --help` lists the flags `query` takes"),
++        };
++        // A flag given twice is refused rather than resolved: a script that appends its own
++        // defaults to a caller's arguments would otherwise have one of them silently ignored.
++        if slot.is_some() {
++            return Outcome::refused(WRONG, format!("`{flag}` was given twice"));
++        }
++        *slot = Some(value);
++        index += 2;
++    }
++
++    // Every caller mistake is answered here, before a store is opened, so a `2` is the script's
++    // problem wherever the deployment happens to be.
++    let Some(store) = store else {
++        return missing("--store");
++    };
++    let Some(from) = from else {
++        return missing("--from");
++    };
++    let Some(to) = to else {
++        return missing("--to");
++    };
++    let Some(window) = window else {
++        return missing("--window");
++    };
++    let Some(aggregate) = aggregate else {
++        return missing("--agg");
++    };
++
++    let Ok(from_millis) = from.parse::<u64>() else {
++        return Outcome::refused(
++            WRONG,
++            format!(
++                "`--from` takes milliseconds since the Unix epoch, and `{from}` is not a number of \
++                 them"
++            ),
++        );
++    };
++    let Ok(to_millis) = to.parse::<u64>() else {
++        return Outcome::refused(
++            WRONG,
++            format!("`--to` takes milliseconds since the Unix epoch, and `{to}` is not a number"),
++        );
++    };
++    // An empty range is a question with no possible answer, and the usual way to write one is to
++    // type the two flags in the wrong order — which a store answering "no data" would confirm.
++    if to_millis <= from_millis {
++        return Outcome::refused(
++            WRONG,
++            format!(
++                "`--to` must be after `--from`, and the range asked for is [{from_millis}, \
++                 {to_millis})"
++            ),
++        );
++    }
++    let Some(aggregate) = Aggregate::parse(aggregate) else {
++        return Outcome::refused(
++            WRONG,
++            format!(
++                "`--agg {aggregate}` is not an aggregate: it is `count`, `sum`, `mean`, `min` or \
++                 `max`"
++            ),
++        );
++    };
++    let width_millis = match duration_millis(window) {
++        Ok(width_millis) => width_millis,
++        Err(detail) => return Outcome::refused(WRONG, detail),
++    };
++
++    // How many buckets the question asks for is arithmetic, and it is done before a store is
++    // opened: `--window 1ms` over a year of range is a typo, not a question, and a tool that
++    // started allocating for it would be a tool that hangs on a typo.
++    let first = from_millis / width_millis;
++    let last = (to_millis - 1) / width_millis;
++    let windows = last - first + 1;
++    if windows > MAX_WINDOWS {
++        return Outcome::refused(
++            WRONG,
++            format!(
++                "that range and window ask for {windows} buckets, and this tool answers at most \
++                 {MAX_WINDOWS}: `--window` is {window} and the range is {} millisecond(s) wide",
++                to_millis - from_millis
++            ),
++        );
++    }
++
++    let query = Query {
++        store: Path::new(store),
++        range: Range::new(from_millis, to_millis),
++        width_millis,
++        aggregate,
++        series,
++        json,
++    };
++    answer(&query)
++}
++
++/// The refusal for a `query` that did not say everything it has to.
++fn missing(flag: &str) -> Outcome {
++    Outcome::refused(
++        WRONG,
++        format!("`query` did not say `{flag}`: `lakeletq --help` lists what a query takes"),
+     )
+ }
++
++/// The milliseconds a `--window` duration names, or the sentence that says why it does not.
++///
++/// A duration is a number of milliseconds and one unit — `1500ms`, `90s`, `5m`, `1h`, `2d` — and
++/// nothing else. A number with no unit is a caller who did not say what they meant, and zero is a
++/// window with no bucket in it; both are refused rather than guessed at, because the guess is a
++/// wrong answer that looks like a right one.
++fn duration_millis(text: &str) -> Result<u64, String> {
++    let mut digits = String::new();
++    let mut unit = String::new();
++    for character in text.chars() {
++        if character.is_ascii_digit() && unit.is_empty() {
++            digits.push(character);
++        } else {
++            unit.push(character);
++        }
++    }
++    let factor = match unit.as_str() {
++        "ms" => 1u64,
++        "s" => 1_000,
++        "m" => 60_000,
++        "h" => 3_600_000,
++        "d" => 86_400_000,
++        other => {
++            return Err(format!(
++                "`--window {text}` has no unit this tool knows: `ms`, `s`, `m`, `h` and `d` are \
++                 the ones it takes, and `{other}` is not one of them"
++            ));
++        }
++    };
++    let Ok(count) = digits.parse::<u64>() else {
++        return Err(format!(
++            "`--window {text}` does not start with a number of milliseconds: write the width as a \
++             number and a unit, as in `90s` or `1500ms`"
++        ));
++    };
++    let Some(width_millis) = count.checked_mul(factor) else {
++        return Err(format!(
++            "`--window {text}` is wider than the millisecond count this store can state"
++        ));
++    };
++    if width_millis == 0 {
++        return Err(
++            "`--window 0` has no bucket in it: a window is a positive number of milliseconds, and \
++             a range that counts in nothing has no answer"
++                .to_owned(),
++        );
++    }
++    Ok(width_millis)
++}
++
++/// Read the store, ask the question, and put the answer into the shape a caller asked for.
++fn answer(query: &Query<'_>) -> Outcome {
++    let buckets = match ask(query) {
++        Ok(buckets) => buckets,
++        Err(outcome) => return outcome,
++    };
++    match render(&buckets, query.json) {
++        Ok(stdout) => Outcome::answered(stdout),
++        Err(outcome) => outcome,
++    }
++}
++
++/// Ask the store, or say why it could not be asked.
++///
++/// This is the whole of the query: open, snapshot, read, downsample. There is no second way to
++/// open a store and no place that remembers what the second one would have been.
++fn ask(query: &Query<'_>) -> Result<Vec<Bucket>, Outcome> {
++    // A read does not create a store. `Segments::open` would, which is right for a daemon and
++    // wrong here: a typo in `--store` would leave an empty store behind and answer `0` with no
++    // lines, so the two ways a path can be wrong are told apart first — nothing there is the
++    // caller's, something that is not a directory is the deployment's.
++    match std::fs::metadata(query.store) {
++        Err(_) => {
++            return Err(Outcome::refused(
++                ABSENT,
++                format!(
++                    "there is no store directory at `{}`: `--store` names the directory a store \
++                     was written to, and this tool does not create one",
++                    query.store.display()
++                ),
++            ));
++        }
++        Ok(metadata) if !metadata.is_dir() => {
++            return Err(Outcome::refused(
++                BROKEN,
++                format!(
++                    "`{}` is not a directory, so this deployment cannot be a store: nothing about \
++                     the call is wrong, and nothing can be read either",
++                    query.store.display()
++                ),
++            ));
++        }
++        Ok(_) => {}
++    }
++
++    let store = match Segments::open(query.store) {
++        Ok(store) => store,
++        Err(error) => return Err(class(&error, "the store could not be opened")),
++    };
++    // The store's floor is not an error here (`lakelet/4.10-downsampling`'s page): a store that has
++    // forgotten something answers with what it still keeps, and the answer simply begins later
++    // than `--from` asked.
++    let records = match store.snapshot().records() {
++        Ok(records) => records,
++        Err(error) => return Err(class(&error, "the store's segments could not be read")),
++    };
++    let answered = downsample::downsample(
++        &records,
++        query.series,
++        query.range,
++        Window::new(query.width_millis),
++        query.aggregate,
++    );
++    Ok(answered.buckets().to_vec())
++}
++
++/// The class a failure belongs to, and the sentence a reader acts on.
++///
++/// The variant is what says which class it is — a call the engine refused, a deployment that cannot
++/// work, a store that would not answer — and this is the only place in the tool that turns one into
++/// a number.
++fn class(error: &Error, what: &str) -> Outcome {
++    let code = match error {
++        Error::Invalid { .. } => WRONG,
++        Error::Config { .. } => BROKEN,
++        Error::Protocol { .. } | Error::Store { .. } => REFUSED,
++    };
++    Outcome::refused(code, format!("{what}: {error}"))
++}
++
++/// The answer in the shape that was asked for: one line per bucket, or one JSON document.
++fn render(buckets: &[Bucket], json: bool) -> Result<String, Outcome> {
++    if json {
++        let shown: Vec<Shown> = buckets.iter().map(Shown::of).collect();
++        return match serde_json::to_string(&shown) {
++            Ok(document) => Ok(format!("{document}\n")),
++            Err(error) => Err(Outcome::refused(
++                BROKEN,
++                format!("the answer could not be written as JSON: {error}"),
++            )),
++        };
++    }
++    let mut stdout = String::new();
++    for bucket in buckets {
++        let start = bucket.start();
++        let count = bucket.count();
++        let value = bucket.value();
++        stdout.push_str(&format!("{start} {count} {value}\n"));
++    }
++    Ok(stdout)
++}
+diff --git a/src/engine/query/downsample.rs b/src/engine/query/downsample.rs
+index 5e3b07a..eb7754c 100644
+--- a/src/engine/query/downsample.rs
++++ b/src/engine/query/downsample.rs
+@@ -68,6 +68,9 @@
+ //! the windows, not of the arithmetic. So every comparison of two computed numbers in this step's
+ //! spec goes through [`agree`], and none of them writes `==` between two `f64`s.
+ 
++use std::collections::BTreeMap;
++use std::collections::btree_map::Entry;
++
+ use crate::engine::retention::partition::Partition;
+ use crate::protocol::batch::Record;
+ 
+@@ -93,7 +96,8 @@ pub const TOLERANCE: f64 = 0.05;
+ /// a broken aggregation reaches a dashboard looking healthy.
+ #[must_use]
+ pub fn agree(left: f64, right: f64) -> bool {
+-    todo!("lakelet/4.10-downsampling: TOLERANCE is declared above; the comparison is yours")
++    let magnitude = left.abs().max(right.abs()).max(1.0);
++    (left - right).abs() <= TOLERANCE * magnitude
+ }
+ 
+ /// One window of the absolute time axis: `width_millis` milliseconds wide, named by the millisecond
+@@ -120,13 +124,13 @@ impl Window {
+     /// refuses it in a sentence.
+     #[must_use]
+     pub const fn new(width_millis: u64) -> Self {
+-        todo!()
++        Self { width_millis }
+     }
+ 
+     /// How many milliseconds one window covers, exactly as it was given.
+     #[must_use]
+     pub const fn width_millis(&self) -> u64 {
+-        todo!()
++        self.width_millis
+     }
+ 
+     /// The window `ts_millis` falls in.
+@@ -137,9 +141,7 @@ impl Window {
+     /// to land in.
+     #[must_use]
+     pub fn partition(&self, ts_millis: i64) -> Partition {
+-        todo!(
+-            "lakelet/4.10-downsampling: `Partition::of` is the arithmetic; the conversion is yours"
+-        )
++        Partition::of(millis_of(ts_millis), self.width_millis)
+     }
+ 
+     /// Every window the half-open range `[from_millis, to_millis)` touches, in ascending order.
+@@ -151,7 +153,23 @@ impl Window {
+     /// one bucket for the instant.
+     #[must_use]
+     pub fn partitions(&self, from_millis: u64, to_millis: u64) -> Vec<Partition> {
+-        todo!("lakelet/4.10-downsampling: from the bucket of `from` to the bucket of `to - 1`")
++        if to_millis <= from_millis {
++            return Vec::new();
++        }
++        // The width the buckets are actually made with, which is the width a zero was turned into:
++        // stepping by the number the caller typed would walk for ever over a zero-width window.
++        let width = self.width_millis.max(1);
++        let first = Partition::of(from_millis, width);
++        // The last window the half-open range touches is the one `to_millis - 1` falls in: the
++        // millisecond at `to_millis` itself belongs to the next question.
++        let last = Partition::of(to_millis - 1, width);
++        let mut windows = Vec::new();
++        let mut start = first.start();
++        while start <= last.start() {
++            windows.push(Partition::of(start, width));
++            start = start.saturating_add(width);
++        }
++        windows
+     }
+ }
+ 
+@@ -187,7 +205,13 @@ impl Aggregate {
+     /// quadrillion records has a different problem than this one.
+     #[must_use]
+     pub const fn name(&self) -> &'static str {
+-        todo!()
++        match self {
++            Aggregate::Count => "count",
++            Aggregate::Sum => "sum",
++            Aggregate::Mean => "mean",
++            Aggregate::Min => "min",
++            Aggregate::Max => "max",
++        }
+     }
+ 
+     /// The aggregate a name names, or `None`.
+@@ -198,7 +222,9 @@ impl Aggregate {
+     /// naming the five that do exist.
+     #[must_use]
+     pub fn parse(name: &str) -> Option<Self> {
+-        todo!("lakelet/4.10-downsampling: compare against `Aggregate::ALL`, exactly")
++        Aggregate::ALL
++            .into_iter()
++            .find(|aggregate| aggregate.name() == name)
+     }
+ }
+ 
+@@ -224,31 +250,34 @@ impl Range {
+     /// line is where a caller who typed the two flags the wrong way round is told so.
+     #[must_use]
+     pub const fn new(from_millis: u64, to_millis: u64) -> Self {
+-        todo!()
++        Self {
++            from_millis,
++            to_millis,
++        }
+     }
+ 
+     /// The first millisecond the range is about.
+     #[must_use]
+     pub const fn from(&self) -> u64 {
+-        todo!()
++        self.from_millis
+     }
+ 
+     /// The first millisecond the range is not about.
+     #[must_use]
+     pub const fn to(&self) -> u64 {
+-        todo!()
++        self.to_millis
+     }
+ 
+     /// `true` when `ts_millis` is the range's: at or after its start and before its end.
+     #[must_use]
+     pub const fn contains(&self, ts_millis: u64) -> bool {
+-        todo!()
++        self.from_millis <= ts_millis && ts_millis < self.to_millis
+     }
+ 
+     /// `true` when the range holds no millisecond at all — `to` at or below `from`.
+     #[must_use]
+     pub const fn is_empty(&self) -> bool {
+-        todo!()
++        self.to_millis <= self.from_millis
+     }
+ }
+ 
+@@ -273,20 +302,20 @@ impl Bucket {
+     /// The millisecond this window starts at, on the absolute grid.
+     #[must_use]
+     pub const fn start(&self) -> u64 {
+-        todo!()
++        self.start_millis
+     }
+ 
+     /// How many records of the range this bucket was computed from.
+     #[must_use]
+     pub const fn count(&self) -> u64 {
+-        todo!()
++        self.count
+     }
+ 
+     /// The aggregate over them — a mean, a sum, a count, a minimum or a maximum, whichever was
+     /// asked for.
+     #[must_use]
+     pub const fn value(&self) -> f64 {
+-        todo!()
++        self.value
+     }
+ }
+ 
+@@ -313,7 +342,7 @@ impl Answer {
+     /// The buckets, oldest window first. Windows with no records are not here at all.
+     #[must_use]
+     pub fn buckets(&self) -> &[Bucket] {
+-        todo!()
++        &self.buckets
+     }
+ 
+     /// How many records the pass looked at: every record it was handed.
+@@ -323,27 +352,27 @@ impl Answer {
+     /// query answer the same question without opening the file at all.
+     #[must_use]
+     pub fn scanned(&self) -> u64 {
+-        todo!()
++        self.scanned
+     }
+ 
+     /// How many records were inside the range *and* of the series that was asked for: the records
+     /// the buckets were computed from.
+     #[must_use]
+     pub fn in_range(&self) -> u64 {
+-        todo!()
++        self.in_range
+     }
+ 
+     /// How many records were of that series, whether or not they were in the range. With no
+     /// series filter this is every record, so the three counts are one number.
+     #[must_use]
+     pub fn series_matched(&self) -> u64 {
+-        todo!()
++        self.series_matched
+     }
+ 
+     /// `true` when the range held no record at all, so there is nothing to draw.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!()
++        self.buckets.is_empty()
+     }
+ }
+ 
+@@ -373,8 +402,109 @@ pub fn downsample(
+     window: Window,
+     aggregate: Aggregate,
+ ) -> Answer {
+-    todo!(
+-        "lakelet/4.10-downsampling: one walk, one bucketing, five ways to summarize a window — \
+-         the rules are in this module's header"
+-    )
++    let mut scanned = 0u64;
++    let mut series_matched = 0u64;
++    let mut in_range = 0u64;
++    let mut windows: BTreeMap<u64, Tally> = BTreeMap::new();
++
++    for record in records {
++        scanned += 1;
++        if series.is_some_and(|name| name != record.series.as_str()) {
++            continue;
++        }
++        series_matched += 1;
++        let at = millis_of(record.ts_millis);
++        if !range.contains(at) {
++            continue;
++        }
++        in_range += 1;
++        let start = window.partition(record.ts_millis).start();
++        match windows.entry(start) {
++            Entry::Occupied(mut window) => window.get_mut().add(record.value),
++            Entry::Vacant(window) => {
++                window.insert(Tally::of(record.value));
++            }
++        }
++    }
++
++    // A map keyed by the window's start is the answer's order for free, and the windows it never
++    // saw are the ones it does not have: a window with no records in the range is *absent* rather
++    // than present with a zero in it.
++    let buckets = windows
++        .into_iter()
++        .map(|(start, tally)| tally.bucket(start, aggregate))
++        .collect();
++    Answer {
++        buckets,
++        scanned,
++        in_range,
++        series_matched,
++    }
++}
++
++/// One window's records while the pass is inside it: what a summary needs, and nothing else.
++///
++/// The four numbers are kept rather than the records, because a window of a day's samples is not
++/// something to hold in memory in order to answer a mean — and because the four are exactly what
++/// the five aggregates need, which is why `min` and `max` are accumulated as the pass goes rather
++/// than computed at the end.
++#[derive(Debug, Clone, Copy)]
++struct Tally {
++    /// How many records have gone in.
++    count: u64,
++    /// What they add up to.
++    sum: f64,
++    /// The smallest value seen.
++    min: f64,
++    /// The largest value seen.
++    max: f64,
++}
++
++impl Tally {
++    /// The tally of one record.
++    fn of(value: f64) -> Self {
++        Self {
++            count: 1,
++            sum: value,
++            min: value,
++            max: value,
++        }
++    }
++
++    /// Add one more record's value.
++    fn add(&mut self, value: f64) {
++        self.count += 1;
++        self.sum += value;
++        // `f64::min`/`f64::max` rather than a comparison: a value that is not a number is not an
++        // extreme, and a comparison would let one of them poison the whole window's answer.
++        self.min = self.min.min(value);
++        self.max = self.max.max(value);
++    }
++
++    /// This window as the answer reports it.
++    fn bucket(&self, start: u64, aggregate: Aggregate) -> Bucket {
++        let value = match aggregate {
++            Aggregate::Count => self.count as f64,
++            Aggregate::Sum => self.sum,
++            Aggregate::Mean => self.sum / self.count as f64,
++            Aggregate::Min => self.min,
++            Aggregate::Max => self.max,
++        };
++        Bucket {
++            start_millis: start,
++            count: self.count,
++            value,
++        }
++    }
++}
++
++/// One record's timestamp in the units a window counts in: milliseconds since the Unix epoch, with
++/// anything before it counted as the epoch.
++///
++/// The same conversion the store's index makes when it writes a segment's time range
++/// (`crate::engine::compaction`), and for the same reason: the manifest states an unsigned
++/// millisecond, and there is no bucket below the epoch for a clock that was wrong to land in. A
++/// record before 1970 therefore falls in the first window rather than in no window at all.
++fn millis_of(ts_millis: i64) -> u64 {
++    u64::try_from(ts_millis).unwrap_or(0)
+ }

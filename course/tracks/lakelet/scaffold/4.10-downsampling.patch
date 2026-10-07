@@ -1,0 +1,993 @@
+diff --git a/src/bin/lakeletq.rs b/src/bin/lakeletq.rs
+new file mode 100644
+index 0000000..3db0c59
+--- /dev/null
++++ b/src/bin/lakeletq.rs
+@@ -0,0 +1,24 @@
++//! The `lakeletq` binary: a shell around the library.
++//!
++//! Everything this file decides is about *this process*: the arguments it was given, the two
++//! streams its answer goes to, and the code it leaves behind. What the answer *is* — which command
++//! ran, which bytes went to which stream, which class of failure is which number — belongs to
++//! `lakelet::cli` (step `lakelet/4.10-downsampling`), and the point of keeping it there is that
++//! this file has nowhere to disagree with it.
++
++use std::process::ExitCode;
++
++fn main() -> ExitCode {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    let outcome = lakelet::cli::run(args);
++
++    // The two streams, and the code. `print!` rather than `println!`: the newlines are part of the
++    // answer, and a second one per line is a second thing a script would have to strip.
++    if !outcome.stdout().is_empty() {
++        print!("{}", outcome.stdout());
++    }
++    if !outcome.stderr().is_empty() {
++        eprint!("{}", outcome.stderr());
++    }
++    ExitCode::from(outcome.code())
++}
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+new file mode 100644
+index 0000000..ded95ff
+--- /dev/null
++++ b/src/cli/mod.rs
+@@ -0,0 +1,161 @@
++//! The read side of the store, as an interface another program consumes.
++//!
++//! `lakeletd` is a process a supervisor starts; `lakeletq` is a tool a *script* runs, and a script
++//! is a customer with no patience and no imagination: it reads `$?`, it reads stdout, it reads
++//! stderr into a log, and it cannot answer a question. This module is the grammar that customer
++//! gets, and it is `jobq/3.15-cli-contract`'s contract re-stood rather than a fifth idea about
++//! command lines:
++//!
++//! * **stdout is the answer, stderr is the diagnosis.** A command that answered prints its answer
++//!   on stdout and nothing on stderr; a command that failed prints *nothing* on stdout and one
++//!   sentence on stderr. A script that pipes stdout into a parser must never be handed half an
++//!   answer plus a warning, so the two streams are decided here, as one value ([`Outcome`]),
++//!   instead of at five call sites that each remember the rule.
++//! * **one exit code per failure class.** `0` answered, `2` the call was wrong, `3` the thing
++//!   asked about is not there, `4` the store refused, `1` this deployment is broken. Every caller
++//!   mistake is answered *before* a store is opened, so a `2` is the script's problem wherever the
++//!   deployment happens to be.
++//! * **`--json` is a format, not a second command.** It changes what the answer looks like and
++//!   nothing else: the code and the diagnosis are identical with and without it, and an empty
++//!   answer is `[]` rather than nothing at all.
++//! * **nothing prompts.** Every input arrives as a flag, a call that is missing one names what is
++//!   missing, and a run that was not asked to read standard input never touches it — a tool that
++//!   blocked on a terminal would be a tool that hangs the pipeline it was meant to feed.
++//!
++//! # What this tool reads, and what it refuses to create
++//!
++//! `query` opens a store directory with
++//! [`Segments::open`](crate::engine::compaction::Segments::open), takes a
++//! [`snapshot`](crate::engine::compaction::Segments::snapshot), reads the records it names, hands
++//! them to [`downsample`](crate::engine::query::downsample::downsample) and writes the answer.
++//! Three things about that are decisions rather than plumbing:
++//!
++//! * **a store that is not there is not a store with nothing in it.** `Segments::open` *creates*
++//!   the directory it is given, which is right for a daemon and wrong for a read: a typo in
++//!   `--store` would leave an empty store behind and answer `0` with no lines, so `query` checks
++//!   first — no directory at that path is `3`, the thing asked about is not there;
++//! * **a path that is not a directory is a broken deployment, not a missing store.** A file where
++//!   the store should be is `1`: nothing about the *call* is wrong and nothing can be answered
++//!   either, and the difference between those two is the difference between the script's problem
++//!   and the operator's;
++//! * **the store's floor is an answer, not an error.** A store that has forgotten up to a
++//!   millisecond (`lakelet/4.9-retention`) answers with the records it still keeps, so an answer
++//!   may begin later than `--from` asked. That is `0` with fewer buckets, and
++//!   `lakelet/4.11-query-engine` is where a query *refuses* a range the store cannot answer
++//!   rather than answering what is left of it.
++//!
++//! # The two shapes
++//!
++//! ```text
++//! lakeletq query --store ./s --from 1700000000000 --to 1700003600000 --window 1h --agg mean
++//!   →  1700000000000 41 12.5
++//!      1700003600000 37 12.7
++//! lakeletq query … --json
++//!   →  [{"start":1700000000000,"count":41,"value":12.5},{"start":1700003600000,"count":37,"value":12.7}]
++//! ```
++//!
++//! One line per bucket, oldest window first, fields in the order `start count value` and separated
++//! by single spaces; a window that held no records is not a line (`lakelet/4.10-downsampling`'s
++//! "absent, not zero"). `--json` prints one array of objects with those three fields in that
++//! order, and `[]` when the range held nothing — a script that has to special-case "no output" is
++//! a script that gets it wrong once and then stops trusting the tool.
++//!
++//! # What the course gives you, and what is yours
++//!
++//! [`USAGE`] is the grammar — it is the interface a script reads and the contract this module
++//! keeps — and [`Outcome`] is the shape every path answers with. The parser, the two renderers and
++//! the constructors that put them together are yours: "stdout is the answer, stderr is the
++//! diagnosis" is what this step is about, and an [`Outcome`] that already knew the rule would be
++//! the answer.
++
++/// The usage text: what the tool is, what it reads, and the codes it leaves behind.
++pub const USAGE: &str = "\
++usage: lakeletq [OPTIONS] <COMMAND>
++
++COMMANDS:
++    query                   answer a question about a store
++    help                    print this help
++
++OPTIONS:
++    --json                  print the answer as one JSON value on stdout
++    --help, -h              print this help and exit
++    --version               print the version and exit
++
++QUERY OPTIONS:
++    query --store <DIR> --from <MS> --to <MS> --window <DURATION> --agg <NAME> [--series <SERIES>]
++          --store <DIR>     the store directory to read
++          --from <MS>       first millisecond of the range, since the Unix epoch (inclusive)
++          --to <MS>         first millisecond after it (exclusive)
++          --window <D>      how wide one bucket is: a number and a unit — 1500ms, 90s, 5m, 1h, 2d
++          --agg <NAME>      count, sum, mean, min or max
++          --series <SERIES> only this series (the default is every series, which is rarely what a
++                            mean wants)
++
++The answer is one line per bucket on stdout, `start count value`, oldest window first; a window
++that held no records is not a line. With --json it is one array of {\"start\":…,\"count\":…,\"value\":…},
++and [] when the range held nothing.
++
++Exit codes: 0 the command answered, 2 the call was wrong, 3 the thing asked about is not there,
++4 the store refused, 1 this deployment is broken.
++";
++
++/// Most buckets one query will answer.
++///
++/// A range and a window are two numbers a caller types, and their ratio is a number nobody types:
++/// `--window 1ms` over a year of range is thirty billion windows, which is a typo rather than a
++/// question. The count is arithmetic the parser can do before a store is opened, so it is a caller
++/// error (`2`) naming both numbers — and the number is high enough that it is never a page size: a
++/// million one-hour buckets is a hundred and fourteen years.
++pub const MAX_WINDOWS: u64 = 1_000_000;
++
++/// What the process would have written, and the code it would have ended with.
++///
++/// One value rather than three writes, and that is the shape of the contract: "stdout is the
++/// answer, stderr is the diagnosis, the code is the class" is a decision about *this* value, so a
++/// spec can assert it directly and a subprocess test asserts the same decision from outside. The
++/// binary that writes these bytes is a handful of lines because there is nothing left to decide.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Outcome {
++    /// What the process would exit with.
++    code: u8,
++    /// What standard output would have received.
++    stdout: String,
++    /// What standard error would have received.
++    stderr: String,
++}
++
++impl Outcome {
++    /// The bytes standard output would have received.
++    #[must_use]
++    pub fn stdout(&self) -> &str {
++        todo!()
++    }
++
++    /// The bytes standard error would have received.
++    #[must_use]
++    pub fn stderr(&self) -> &str {
++        todo!()
++    }
++
++    /// The code the process would have ended with.
++    #[must_use]
++    pub fn code(&self) -> u8 {
++        todo!()
++    }
++}
++
++/// Run one command line: `args` without the program name.
++///
++/// Synchronous on purpose, and it takes nothing else: this tool reads no settings from the
++/// environment and none from a file — the store directory is a flag, because it is what the
++/// question is *about* — and it has nothing to wait for on standard input.
++///
++/// Nothing here panics and nothing here exits: every path a caller can take — a usage error, a
++/// store that is not there, a store that refused — comes back as an [`Outcome`].
++#[must_use]
++pub fn run(args: impl IntoIterator<Item = String>) -> Outcome {
++    todo!(
++        "lakelet/4.10-downsampling: `USAGE` and `MAX_WINDOWS` are above and the rules are in \
++         this module's header — the grammar, the two renderers and the exit codes are yours"
++    )
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index fd2d4db..c068e24 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -34,6 +34,9 @@ pub mod compaction;
+ // `lakelet/4.9-retention`: what leaves the store, decided from time alone — the rule as a value
+ // (`retention`), and a pass that deletes whole segments and writes down how far it has forgotten.
+ pub mod retention;
++// `lakelet/4.10-downsampling`: what a question about the store is — the windows of the
++// absolute time axis, the five aggregates, and the pass that answers from records.
++pub mod query;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/query/downsample.rs b/src/engine/query/downsample.rs
+new file mode 100644
+index 0000000..5e3b07a
+--- /dev/null
++++ b/src/engine/query/downsample.rs
+@@ -0,0 +1,380 @@
++//! The window arithmetic and the five aggregates: what a question about the store is made of, and
++//! nothing else.
++//!
++//! Step `lakelet/4.10-downsampling`. A store of records has no answers in it — an answer is what
++//! you get when you ask records a question, and the question every dashboard, alert and capacity
++//! plan asks is *"how did this move over time"*. That question is about windows, and this module
++//! is the whole of it: a [`Window`] is a width, a [`Range`] is two numbers, an [`Aggregate`] is
++//! one of five ways to summarize a window, and [`downsample`] is the pass that answers.
++//!
++//! # A window is a bucket of the time axis, not of the data
++//!
++//! The one decision everything else follows from is where a window's edges are. They are on the
++//! **absolute grid**: window `n` covers `[n * width, (n + 1) * width)`, counted from the Unix
++//! epoch, and [`Window::partition`] hands the answer to the same
++//! [`Partition`](crate::engine::retention::partition::Partition) arithmetic
++//! `lakelet/4.9-retention` snaps its cutoff with — the same `floor(ts / width) * width`, the same
++//! half-open `[start, end)`.
++//!
++//! The alternative — a window anchored at the first record the pass happens to see — looks
++//! harmless and is not:
++//!
++//! * **the same question would answer differently as the data moves.** One more sample at the
++//!   front shifts every boundary, so a dashboard refreshed twice in an hour draws two different
++//!   step functions for the same hour, and neither of them is wrong.
++//! * **two readers would disagree.** A retention pass counts in whole buckets
++//!   (`Policy::width_millis`), and a query's buckets that are not on the same grid cannot be
++//!   compared with what the store still keeps — "the last hour" would be one thing to the pass
++//!   and another to the query over it.
++//! * **a bucket would stop being a function of the time it covers.** Two servers querying the
++//!   same store from two different slices of it would print different `start` values, which is
++//!   the one thing a time series *is*.
++//!
++//! # A bucket counts what is in the range, not what is in the window
++//!
++//! A range begins and ends where the caller asked, and a window begins and ends on the grid, so
++//! the first and last windows of an answer are usually **partial**: they hold the records between
++//! the range's edge and the window's edge, and no others. There is no reaching outside the range
++//! to fill them — a bucket that borrowed the samples before `from_millis` would be an answer to a
++//! question nobody asked — and [`Bucket::count`] is the honest number beside [`Bucket::value`]:
++//! `12` next to `0.31` says the mean of twelve samples, `1` next to `0.31` says the mean of one,
++//! and a reader who cannot tell them apart is reading a number that means nothing.
++//!
++//! # An empty window is absent, not zero
++//!
++//! A window with no records in the range does not appear in [`Answer::buckets`] at all. It could
++//! be printed as `0` — and that is exactly the lie this rule refuses: a stored counter that
++//! really measured nothing and an hour in which nothing was *reported* are completely different
++//! facts (a store that is down and a store that is idle), and one number claiming to be both
++//! makes the difference unreadable for ever. The gap is information, and a caller who wants to
++//! draw it as a gap has what it needs: the windows the range touches ([`Window::partitions`])
++//! minus the buckets the answer holds.
++//!
++//! # `series`, and why the filter is an exact name
++//!
++//! `series` is an exact match on the record's series — no prefix, no pattern, no case folding —
++//! and `None` means *every* series. Both halves matter: a filter that matched loosely would
++//! silently fold one host's samples into another's, and `None` is what a caller uses when they
++//! genuinely want the fleet's traffic together. Mixing series in one `mean` is usually the bug
++//! behind a graph nobody can explain, which is why `lakelet/4.11-query-engine` makes the grammar
++//! ask for a series rather than defaulting to all of them.
++//!
++//! # The tolerance is a number in the code
++//!
++//! [`TOLERANCE`] and [`agree`] are where this step states how far a downsampled answer may be from
++//! the raw one. Floating point is not associative, and — far more important — **the mean of the
++//! buckets is not the mean of the range**: they agree exactly only when every window holds records
++//! with the same mean, and the difference otherwise is a property of how the range falls across
++//! the windows, not of the arithmetic. So every comparison of two computed numbers in this step's
++//! spec goes through [`agree`], and none of them writes `==` between two `f64`s.
++
++use crate::engine::retention::partition::Partition;
++use crate::protocol::batch::Record;
++
++/// How far apart two numbers may be and still be the same answer: a twentieth of the larger one.
++///
++/// This is a **declared** tolerance, not a floating-point epsilon, and the number is chosen from
++/// what it has to cover rather than from taste. The comparison it exists for is the mean of the
++/// buckets against the raw mean of the range, and those differ by however unevenly the range's
++/// records fall across its partial windows: a twentieth is wide enough that a window boundary
++/// landing a sample or two off the data's own edges does not change what an operator reads, and
++/// narrow enough that an answer computed from the *wrong records* — another series, a bucket that
++/// filled itself from outside the range — does not fit inside it. The spec carries both halves,
++/// and the budget lane measures the real gap this step's own workload produces.
++pub const TOLERANCE: f64 = 0.05;
++
++/// `true` when `left` and `right` are the same answer, inside [`TOLERANCE`].
++///
++/// The scale is the larger of the two magnitudes with a floor of one, and the floor is what makes
++/// "the same answer" mean the same thing at every size: a purely relative test would call two
++/// values a thousandth apart disagreeing when they are near zero, and `agree(0.0, 0.0)` — this
++/// step's most common comparison — has to be true. `NaN` agrees with nothing, itself included: a
++/// value that is not a number is not an answer this can certify, and quietly certifying it is how
++/// a broken aggregation reaches a dashboard looking healthy.
++#[must_use]
++pub fn agree(left: f64, right: f64) -> bool {
++    todo!("lakelet/4.10-downsampling: TOLERANCE is declared above; the comparison is yours")
++}
++
++/// One window of the absolute time axis: `width_millis` milliseconds wide, named by the millisecond
++/// it starts at.
++///
++/// A window is a value and nothing else: it is made from a width, it answers which bucket a
++/// timestamp falls in, and it holds nothing that changes. The reason it is a type rather than a
++/// number passed around is the one in this module's header — a query's windows, a retention
++/// policy's buckets and a dashboard's `step` all have to be counting the same thing.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Window {
++    /// How many milliseconds one window covers. Zero is treated as the narrowest window there is;
++    /// see [`Window::new`].
++    width_millis: u64,
++}
++
++impl Window {
++    /// A window `width_millis` milliseconds wide.
++    ///
++    /// A width of zero is *not* refused here. This is arithmetic: `0` asks for an empty bucket, and
++    /// the answer a value type can give is the narrowest bucket that exists — one millisecond —
++    /// rather than a bucket nothing can be in. A caller's typo is caught where a caller is: the
++    /// command line refuses `--window 0`, and `lakelet/4.11-query-engine` is where the grammar
++    /// refuses it in a sentence.
++    #[must_use]
++    pub const fn new(width_millis: u64) -> Self {
++        todo!()
++    }
++
++    /// How many milliseconds one window covers, exactly as it was given.
++    #[must_use]
++    pub const fn width_millis(&self) -> u64 {
++        todo!()
++    }
++
++    /// The window `ts_millis` falls in.
++    ///
++    /// This is the whole of the alignment rule. A timestamp before the Unix epoch belongs to the
++    /// first bucket: a record's `ts_millis` is an `i64`, the manifest and this module state
++    /// milliseconds since the epoch, and there is no bucket below zero for a clock that was wrong
++    /// to land in.
++    #[must_use]
++    pub fn partition(&self, ts_millis: i64) -> Partition {
++        todo!(
++            "lakelet/4.10-downsampling: `Partition::of` is the arithmetic; the conversion is yours"
++        )
++    }
++
++    /// Every window the half-open range `[from_millis, to_millis)` touches, in ascending order.
++    ///
++    /// This is the grid a range sits on, and it is what makes a gap *countable* rather than
++    /// invisible: the windows here minus the buckets an [`Answer`] holds are the windows in which
++    /// nothing was reported ([`Answer::buckets`]). A range that is empty — `to_millis` at or
++    /// below `from_millis` — touches no window at all, and the answer is an empty list rather than
++    /// one bucket for the instant.
++    #[must_use]
++    pub fn partitions(&self, from_millis: u64, to_millis: u64) -> Vec<Partition> {
++        todo!("lakelet/4.10-downsampling: from the bucket of `from` to the bucket of `to - 1`")
++    }
++}
++
++/// One of the five ways a window's records become a single number.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Aggregate {
++    /// How many records the window held, as a whole number carried in an `f64`.
++    Count,
++    /// What they add up to.
++    Sum,
++    /// What they average to: the sum divided by the count.
++    Mean,
++    /// The smallest of them.
++    Min,
++    /// The largest of them.
++    Max,
++}
++
++impl Aggregate {
++    /// Every aggregate there is, in the order a caller and the command line's `--agg` name them.
++    pub const ALL: [Aggregate; 5] = [
++        Aggregate::Count,
++        Aggregate::Sum,
++        Aggregate::Mean,
++        Aggregate::Min,
++        Aggregate::Max,
++    ];
++
++    /// The name this aggregate is written and spoken as: `count`, `sum`, `mean`, `min`, `max`.
++    ///
++    /// `count` and `sum` are exact whole numbers for any input this store can hold: an `f64`
++    /// carries every integer up to 2^53 exactly, and a store that answered a window of nine
++    /// quadrillion records has a different problem than this one.
++    #[must_use]
++    pub const fn name(&self) -> &'static str {
++        todo!()
++    }
++
++    /// The aggregate a name names, or `None`.
++    ///
++    /// Exact and lower case: `mean` is an aggregate, `Mean` and `avg` are not. A near miss that
++    /// quietly answered something else would be a query that returns a plausible number for a
++    /// question nobody asked, and the caller's typo — `--agg avgerage` — is worth a refusal
++    /// naming the five that do exist.
++    #[must_use]
++    pub fn parse(name: &str) -> Option<Self> {
++        todo!("lakelet/4.10-downsampling: compare against `Aggregate::ALL`, exactly")
++    }
++}
++
++/// The half-open span of time a question is about: `from_millis <= ts < to_millis`.
++///
++/// Half-open for the reason `Partition` is: an hourly answer and the hour after it must not both
++/// claim a record, and a range that named the same instant at both ends would hold it twice. A
++/// record whose timestamp is exactly `from_millis` is in, and one whose timestamp is exactly
++/// `to_millis` is the first record of the *next* question.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Range {
++    /// The first millisecond the question is about.
++    from_millis: u64,
++    /// The first millisecond it is not.
++    to_millis: u64,
++}
++
++impl Range {
++    /// The range `[from_millis, to_millis)`.
++    ///
++    /// Nothing is refused here: a range that ends before it starts is [empty](Range::is_empty),
++    /// and an empty range is a question with no answer rather than a broken value. The command
++    /// line is where a caller who typed the two flags the wrong way round is told so.
++    #[must_use]
++    pub const fn new(from_millis: u64, to_millis: u64) -> Self {
++        todo!()
++    }
++
++    /// The first millisecond the range is about.
++    #[must_use]
++    pub const fn from(&self) -> u64 {
++        todo!()
++    }
++
++    /// The first millisecond the range is not about.
++    #[must_use]
++    pub const fn to(&self) -> u64 {
++        todo!()
++    }
++
++    /// `true` when `ts_millis` is the range's: at or after its start and before its end.
++    #[must_use]
++    pub const fn contains(&self, ts_millis: u64) -> bool {
++        todo!()
++    }
++
++    /// `true` when the range holds no millisecond at all — `to` at or below `from`.
++    #[must_use]
++    pub const fn is_empty(&self) -> bool {
++        todo!()
++    }
++}
++
++/// One window's records, summarized: where the window starts, how many records went into the
++/// number, and the number.
++///
++/// The count is not decoration. It is what distinguishes a window that held four hundred samples
++/// from a window that held two, it is what turns a sum back into a mean, and it is what a reader
++/// compares against the window's width to see whether the data is dense or sparse.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Bucket {
++    /// The millisecond the window starts at: a multiple of the window's width, counted from the
++    /// Unix epoch.
++    start_millis: u64,
++    /// How many records of the range this window held.
++    count: u64,
++    /// The aggregate over those records.
++    value: f64,
++}
++
++impl Bucket {
++    /// The millisecond this window starts at, on the absolute grid.
++    #[must_use]
++    pub const fn start(&self) -> u64 {
++        todo!()
++    }
++
++    /// How many records of the range this bucket was computed from.
++    #[must_use]
++    pub const fn count(&self) -> u64 {
++        todo!()
++    }
++
++    /// The aggregate over them — a mean, a sum, a count, a minimum or a maximum, whichever was
++    /// asked for.
++    #[must_use]
++    pub const fn value(&self) -> f64 {
++        todo!()
++    }
++}
++
++/// What a question answered: the buckets that held records, in order, and what the pass cost.
++///
++/// The three counts are the pass's own account of itself, and they are three different questions:
++/// [`Answer::scanned`] is what it looked at, [`Answer::series_matched`] is what survived the
++/// series filter, and [`Answer::in_range`] is what actually landed in a bucket. The last one is
++/// the identity a caller checks the rest of the answer against: it is the sum of the buckets'
++/// counts, so an answer whose buckets do not add up to it has lost or invented records.
++#[derive(Debug, Clone)]
++pub struct Answer {
++    /// The windows that held records, in ascending order of `start`.
++    buckets: Vec<Bucket>,
++    /// How many records of the input the pass looked at.
++    scanned: u64,
++    /// How many of those were inside the range.
++    in_range: u64,
++    /// How many of those were of the series that was asked for.
++    series_matched: u64,
++}
++
++impl Answer {
++    /// The buckets, oldest window first. Windows with no records are not here at all.
++    #[must_use]
++    pub fn buckets(&self) -> &[Bucket] {
++        todo!()
++    }
++
++    /// How many records the pass looked at: every record it was handed.
++    ///
++    /// This is the cost of a query before there is an index to avoid it, and it is why
++    /// `lakelet/4.14-index-pruning` exists: a segment's stated time range is what lets a later
++    /// query answer the same question without opening the file at all.
++    #[must_use]
++    pub fn scanned(&self) -> u64 {
++        todo!()
++    }
++
++    /// How many records were inside the range *and* of the series that was asked for: the records
++    /// the buckets were computed from.
++    #[must_use]
++    pub fn in_range(&self) -> u64 {
++        todo!()
++    }
++
++    /// How many records were of that series, whether or not they were in the range. With no
++    /// series filter this is every record, so the three counts are one number.
++    #[must_use]
++    pub fn series_matched(&self) -> u64 {
++        todo!()
++    }
++
++    /// `true` when the range held no record at all, so there is nothing to draw.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!()
++    }
++}
++
++/// Answer one question about `records`: a range of time, a window to count in, and an aggregate to
++/// put each window's records through.
++///
++/// The pass is one walk over the records and answers four things, in this order:
++///
++/// * it **looks at every record** ([`Answer::scanned`]) — there is no index yet, and pretending
++///   otherwise by stopping early would be a plan this store cannot keep;
++/// * it **keeps the series that was asked for** ([`Answer::series_matched`]), all of them when
++///   `series` is `None`;
++/// * it **keeps the ones in the range** ([`Answer::in_range`]), by the half-open rule
++///   [`Range::contains`] states;
++/// * it **puts each one in its window** ([`Window::partition`]) and accumulates.
++///
++/// Then it summarizes: `count` is how many records landed in the window, `sum` is what they add
++/// up to, `mean` is the sum divided by the count (never the other way round — a mean that
++/// overflowed a window's count would be a mean of nothing), and `min` and `max` are the extremes.
++/// The buckets come out in ascending order of `start`, one per window that held records, and only
++/// those.
++#[must_use]
++pub fn downsample(
++    records: &[Record],
++    series: Option<&str>,
++    range: Range,
++    window: Window,
++    aggregate: Aggregate,
++) -> Answer {
++    todo!(
++        "lakelet/4.10-downsampling: one walk, one bucketing, five ways to summarize a window — \
++         the rules are in this module's header"
++    )
++}
+diff --git a/src/engine/query/mod.rs b/src/engine/query/mod.rs
+new file mode 100644
+index 0000000..48bc5e2
+--- /dev/null
++++ b/src/engine/query/mod.rs
+@@ -0,0 +1,26 @@
++//! Where a question about the store is answered.
++//!
++//! `lakelet/4.10-downsampling` opens this module, and what it answers is the first question
++//! anybody asks of a telemetry store: not "give me every sample" but *"how did this move"*. A
++//! dashboard wants a point a minute, an alert wants a point an hour, and a year of one-second
++//! samples is thirty million records nobody wants to read — so a query is almost never about
++//! records. It is about **windows** of time, and every window is a bucket of the absolute time
++//! axis rather than of the data (`[`downsample::Window`]`).
++//!
++//! Three things are deliberately absent from everything below:
++//!
++//! * **a file and a store.** Which segments an answer may read, and what a query may ask for, is
++//!   `lakelet/4.11-query-engine`'s; this module is handed records and answers about them.
++//! * **a clock.** A window is a width and a range is two numbers, both passed in — so the same
++//!   question answers the same way on every machine and in every process.
++//! * **a side effect.** Everything here is a value in and a value out, which is what lets a spec
++//!   name a bucket boundary instead of hoping for one.
++
++// The steps that come after this one add their own files here — the grammar, the parser, the plan
++// and the executor of `lakelet/4.11-query-engine` are the next four — and a scaffold may only
++// write inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
++// kiln:scaffold:begin
++// `lakelet/4.10-downsampling`: the window arithmetic and the five aggregates, as a pure function
++// over records.
++pub mod downsample;
++// kiln:scaffold:end
+diff --git a/src/lib.rs b/src/lib.rs
+index caa90c6..fd2eba6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,6 +19,10 @@ pub mod service;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.10-downsampling`: the command line a script reads — the grammar, the two
++// streams its answer goes to, and the exit codes it leaves behind. The binary on top of it
++// (`src/bin/lakeletq.rs`) decides nothing else.
++pub mod cli;
+ // kiln:scaffold:end
+ 
+ /// The crate's error type, at the root so a caller writes `lakelet::Error`.
+diff --git a/tests/budget_downsample.rs b/tests/budget_downsample.rs
+new file mode 100644
+index 0000000..c5c3352
+--- /dev/null
++++ b/tests/budget_downsample.rs
+@@ -0,0 +1,343 @@
++//! The downsampling budget's harness for `lakelet/4.10-downsampling`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.10-downsampling
++//! --slow` runs, and the counts it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.10-downsampling.toml`.
++//!
++//! What it measures is **records, windows and buckets, never the clock**: a store is built from a
++//! fixed set of timestamps and a fixed series list, one query is asked at a range the harness
++//! passes in, and what that cost is a set of counts — what the pass looked at, what landed in a
++//! bucket, how many windows it skipped, and how far the two ways of computing a mean are apart. A
++//! count is the same number on a loaded machine as on an idle one, which is why `kiln`'s budget
++//! gate compares counts (`handoff M2 §1.1`) and why no run of this file can flake because
++//! something else was compiling. `cargo test -p lakelet --test budget_downsample -- --nocapture`
++//! prints the lines by hand; the `lakelet-budget` prefix is what the gate reads.
++//!
++//! The workload is **shaped so the range starts and ends mid-window**, and so that five windows in
++//! the middle of it hold nothing at all. Both are load-bearing: a range that began and ended on
++//! window boundaries would never produce a partial bucket, and a workload with no gap would never
++//! exercise the rule that an empty window is *absent* from the answer rather than present with a
++//! zero in it. The shape is visible in the baselines — `windows` against `buckets_emitted` against
++//! `gaps` — and the counts that would move if either rule broke are `invented_windows_max` (a
++//! bucket that is not one of the range's windows — a gap printed as a bucket, windows anchored at
++//! the first record, or a window that reached outside the range to fill a partial one) and
++//! `records_unaccounted_max` (the buckets against the records the pass says it used).
++//!
++//! Three numbers are the ones this lane exists for:
++//!
++//! * `gaps` is the windows the range touches that the answer says nothing about — the "absent, not
++//!   zero" rule as a count, in a workload built to have five of them;
++//! * `records_per_bucket_max` bounds how much one window may hold, so a query that answered the
++//!   range as a single bucket fails here rather than in a graph;
++//! * `mean_gap_max` is the tolerance's own metric: the mean of the buckets against the **raw mean
++//!   of the same records**, computed by this file from the store's own records rather than from
++//!   the answer. The two are the same number only when every window holds records with the same
++//!   mean, and this workload is deliberately not that even: the first and the last window are
++//!   partial, so the two answers differ — slightly. The bound says they differ by no more than
++//!   that, which is the claim `lakelet/4.10-downsampling`'s `TOLERANCE` is written to make.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file
++//! is the course's, and a harness a learner can break by editing their own fixture would judge the
++//! fixture instead of the query.
++
++use std::collections::BTreeSet;
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::compaction::Segments;
++use lakelet::engine::query::downsample::{self, Aggregate, Range, Window};
++use lakelet::protocol::batch::Record;
++
++/// One hour, in milliseconds: the unit the timestamps below are built on.
++const HOUR: u64 = 3_600_000;
++
++/// The window every bucket of the answer counts in: one minute.
++const WINDOW_MILLIS: u64 = 60_000;
++
++/// Milliseconds between two samples of one series: four a minute.
++const STEP_MILLIS: u64 = 15_000;
++
++/// The first timestamp of the workload, on an hour boundary — and therefore on the window grid,
++/// which is what makes every `start` in the answer a number a reader can predict.
++///
++/// `1_699_999_200_000` is `472_222 * HOUR` exactly: the same epoch `lakelet/4.9-retention`'s budget
++/// counts from, so the two lanes describe stores on the same grid.
++const ORIGIN: u64 = 472_222 * HOUR;
++
++/// The series the store holds, four of them at every timestamp.
++const SERIES: [&str; 4] = ["cpu,host=h0", "cpu,host=h1", "cpu,host=h2", "cpu,host=h3"];
++
++/// The one series the query asks for. Not the first, so an answer that quietly used the whole
++/// store's records is a different number rather than the same one.
++const ASKED: &str = "cpu,host=h2";
++
++/// The minutes of the workload that hold samples, as `[start, end)` pairs.
++///
++/// Minutes `8..13` hold nothing, which is five windows of the answer with no records in them: the
++/// gap is what `gaps` counts and what `invented_windows_max` refuses to see printed as a zero.
++const RUNS: [(u64, u64); 2] = [(0, 8), (13, 30)];
++
++/// The first millisecond the query asks about: half a minute into the first window of the
++/// workload, so that window is **partial**.
++const FROM_MILLIS: u64 = ORIGIN + 30_000;
++
++/// The first millisecond after it: twenty seconds into the twenty-eighth window, so that one is
++/// partial too, from the other side.
++const TO_MILLIS: u64 = ORIGIN + 27 * WINDOW_MILLIS + 20_000;
++
++/// How many segments the workload is sealed into.
++const SEGMENTS: usize = 4;
++
++/// The count every line of this harness reports, and where each number came from.
++#[derive(Debug, Default)]
++struct Counted {
++    /// Segments the store was sealed into.
++    sealed: u64,
++    /// Records the store answered before the query ran.
++    records: u64,
++    /// Distinct series among them.
++    series: u64,
++    /// Windows the range touches — the grid, whether or not anything happened in them.
++    windows: u64,
++    /// Records the pass looked at.
++    scanned: u64,
++    /// Records that were of the asked-for series.
++    series_matched: u64,
++    /// Records that were in the range and of that series: what went into the buckets.
++    in_range: u64,
++    /// Buckets the answer holds.
++    buckets: u64,
++    /// Windows of the range the answer says nothing about.
++    gaps: u64,
++    /// Buckets whose `start` is not one of the range's windows, and buckets that count nothing.
++    invented: u64,
++    /// The most records any one bucket holds.
++    per_bucket_max: u64,
++    /// Every bucket's count added up, against `in_range`.
++    bucketed: u64,
++    /// The mean of the buckets against the raw mean of the same records.
++    mean_gap: f64,
++    /// Calls that refused, anywhere in the run.
++    refused: u64,
++}
++
++/// The store directory this run owns, removed when the harness is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path = std::env::temp_dir().join(format!(
++            "lakelet-downsample-budget-{label}-{}",
++            std::process::id()
++        ));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// Every 15-second slot of the workload that holds samples, in order.
++fn slots() -> Vec<u64> {
++    let mut times = Vec::new();
++    for (start, end) in RUNS {
++        for minute in start..end {
++            for slot in 0..(WINDOW_MILLIS / STEP_MILLIS) {
++                times.push(minute * WINDOW_MILLIS + slot * STEP_MILLIS);
++            }
++        }
++    }
++    times
++}
++
++/// The value of the sample at `position`, for series `series`.
++///
++/// A wedge with a jitter on it: a value that grows over the whole workload, so a window's mean is
++/// not the range's mean for any reason a columnar encoding could explain away, plus a bit pattern
++/// with no structure at all — a column codec that found a pattern here would be a codec worth
++/// asking about, and a mean computed from the wrong records would land somewhere else.
++fn value_of(position: usize, series: usize) -> f64 {
++    let mixed = (position as u64)
++        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
++        .wrapping_add(series as u64 * 0x2545_F491_4F6C_DD1D);
++    let jitter = ((mixed >> 12) & 0x3FF) as f64 / 512.0;
++    position as f64 * 0.25 + series as f64 * 10.0 + jitter
++}
++
++/// The records of the slots `from..to` of the workload, every series at every slot.
++fn batch(from: usize, to: usize) -> Vec<Record> {
++    let times = slots();
++    let mut records = Vec::new();
++    for (position, offset) in times.iter().enumerate().take(to).skip(from) {
++        for (index, name) in SERIES.iter().enumerate() {
++            records.push(Record {
++                series: (*name).to_owned(),
++                ts_millis: (ORIGIN + offset) as i64,
++                value: value_of(position, index),
++            });
++        }
++    }
++    records
++}
++
++/// Metric line prefix and one metric, in the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++/// The whole run: build the store, ask one question, count what happened.
++fn pass() -> Counted {
++    let directory = Dir::new("load");
++    let mut counted = Counted::default();
++    let mut store = match Segments::open(directory.path()) {
++        Ok(store) => store,
++        Err(error) => {
++            eprintln!("the store could not be opened: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++
++    let times = slots();
++    let chunk = times.len().div_ceil(SEGMENTS);
++    for from in (0..times.len()).step_by(chunk.max(1)) {
++        let records = batch(from, (from + chunk).min(times.len()));
++        if let Err(error) = store.seal(&records) {
++            eprintln!("a segment could not be sealed: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        counted.sealed += 1;
++    }
++
++    let records = match store.snapshot().records() {
++        Ok(records) => records,
++        Err(error) => {
++            eprintln!("the store could not be read back: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    counted.records = records.len() as u64;
++    counted.series = SERIES.len() as u64;
++
++    let window = Window::new(WINDOW_MILLIS);
++    let range = Range::new(FROM_MILLIS, TO_MILLIS);
++    let grid: BTreeSet<u64> = window
++        .partitions(FROM_MILLIS, TO_MILLIS)
++        .iter()
++        .map(|partition| partition.start())
++        .collect();
++    counted.windows = grid.len() as u64;
++
++    let answer = downsample::downsample(&records, Some(ASKED), range, window, Aggregate::Mean);
++    counted.scanned = answer.scanned();
++    counted.series_matched = answer.series_matched();
++    counted.in_range = answer.in_range();
++    counted.buckets = answer.buckets().len() as u64;
++
++    let mut emitted: BTreeSet<u64> = BTreeSet::new();
++    for bucket in answer.buckets() {
++        let start = bucket.start();
++        emitted.insert(start);
++        counted.bucketed += bucket.count();
++        counted.per_bucket_max = counted.per_bucket_max.max(bucket.count());
++        if !grid.contains(&start) || bucket.count() == 0 {
++            counted.invented += 1;
++        }
++    }
++    counted.gaps = grid.iter().filter(|start| !emitted.contains(start)).count() as u64;
++
++    // The raw mean of exactly the records the buckets were computed from, out of the store's own
++    // list rather than out of the answer: this is the other way of answering the same question,
++    // and the difference between the two is what `TOLERANCE` declares.
++    let raw: Vec<f64> = records
++        .iter()
++        .filter(|record| record.series == ASKED)
++        .filter(|record| range.contains(u64::try_from(record.ts_millis).unwrap_or(0)))
++        .map(|record| record.value)
++        .collect();
++    if !raw.is_empty() && counted.buckets > 0 {
++        let raw_mean = raw.iter().sum::<f64>() / raw.len() as f64;
++        let bucket_mean = answer
++            .buckets()
++            .iter()
++            .map(|bucket| bucket.value())
++            .sum::<f64>()
++            / counted.buckets as f64;
++        counted.mean_gap = (bucket_mean - raw_mean).abs();
++    }
++    counted
++}
++
++#[test]
++fn the_downsampling_budget() {
++    let counted = pass();
++
++    // The shape of the store the query was handed: how many segments it is made of, how many
++    // records it holds, and how many series they belong to. A store with nothing in it cannot pass
++    // any of the counts below, and a `seal` that wrote the wrong records is caught before anything
++    // is asked.
++    metric("segments_sealed", counted.sealed);
++    metric("records", counted.records);
++    metric("series", counted.series);
++
++    // The grid the range sits on, against what the answer says about it. `windows` is every window
++    // the half-open range touches; `buckets_emitted` is the ones that held records; `gaps` is the
++    // rest, and this workload was built to have five of them. A query that printed an empty window
++    // as a zero would answer more buckets than it has records for, and one that anchored its
++    // windows at the first record would answer a different number of them entirely — which is why
++    // this count is judged alongside `invented_windows_max` rather than believed on its own.
++    metric("windows", counted.windows);
++    metric("buckets_emitted", counted.buckets);
++    metric("gaps", counted.gaps);
++    // An upper bound of zero: a bucket whose `start` is not one of the range's windows — a grid
++    // anchored at the data, or a window reaching outside the range for a partial bucket — and a
++    // bucket that counted nothing, which is the zero the "absent, not zero" rule exists to refuse.
++    metric("invented_windows_max", counted.invented);
++
++    // What the pass cost and where it went: every record is looked at, the series filter is what
++    // survives next, and the range is what survives after that. The three numbers are different
++    // here on purpose — a query that compared series as a prefix, or that took the range for the
++    // whole store, answers a different `records_in_range`.
++    metric("records_scanned", counted.scanned);
++    metric("series_matched", counted.series_matched);
++    metric("records_in_range", counted.in_range);
++
++    // One bucket holds one window's records and no more. An upper bound, so a query that spent
++    // fewer records per bucket passes it and one that answered the range as a single bucket does
++    // not: `records_in_range` is the ceiling of what any honest bucket can hold, and the bound is
++    // where the workload's density sits.
++    metric("records_per_bucket_max", counted.per_bucket_max);
++
++    // The identity the answer has to satisfy: the buckets' own counts added up are the records the
++    // pass says it used. Zero, or the answer lost or invented records on the way out.
++    metric(
++        "records_unaccounted_max",
++        counted.in_range.abs_diff(counted.bucketed),
++    );
++
++    // The tolerance's own metric: the mean of the buckets against the raw mean of the same
++    // records. The bound is an upper bound — "the two ways of answering agree to at least this
++    // well" — and this workload's partial first and last window are the whole reason the two
++    // numbers are not identical.
++    println!("lakelet-budget mean_gap_max={}", counted.mean_gap);
++
++    // A store or a query that refused is one this lane cannot judge by counts alone: a refusal
++    // shows up as the numbers moving, and this says why in one line. An upper bound of zero.
++    metric("refused_max", counted.refused);
++}

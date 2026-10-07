@@ -1,0 +1,83 @@
+# The downsampling budget of `lakelet/4.10-downsampling`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_downsample.rs`, which this step's scaffold ships); the metrics are the lines it
+# prints, and every one of them is a count or a ratio of two counts rather than a time — a count is
+# the same number on a loaded machine as on an idle one, which is why this lane judges counts at
+# all (handoff M2 §1.1).
+#
+# What the harness does: it seals four segments of a store — thirty minutes of four series, a sample
+# every fifteen seconds, with five minutes in the middle in which nothing at all was reported — and
+# asks one question of it at a range it passes in itself, with a one-minute window and the `mean`
+# aggregate, about one of the four series. Nothing in it reads a clock or measures a duration: the
+# timestamps, the series, the range, the window and the aggregate are all constants, so two runs of
+# this file on two machines print the same counts.
+#
+# The workload is deliberately shaped in **two** ways, and the baselines below are where both
+# shapes are visible:
+#
+# * **the range starts and ends mid-window** — a minute and a half after a boundary at one end and
+#   twenty seconds into a window at the other — so the first and last bucket are **partial**. A
+#   workload whose range sat on window boundaries would never exercise the rule that a bucket counts
+#   what is in the range rather than what is in the window;
+# * **five windows in the middle hold nothing**, so an answer that printed a zero for an empty
+#   window and one that left it out are different answers. `graded` in `windows` against
+#   `buckets_emitted` against `gaps` is that shape as three numbers: 28 windows touched, 23 with
+#   records in them, 5 with nothing.
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: "no worse than this", not "about this", so a query that answers fewer buckets, reads the
+# same records and prints a smaller gap passes, and only a bigger number fails. The one float here
+# carries a tenth of slack for the reason `budget/4.5-batch-writes.toml`'s `calls_per_record_max`
+# does: it is a ratio of two floating-point sums, and the bound is a statement about the two ways of
+# answering agreeing, not a fingerprint of one summation order.
+command = "cargo test -p lakelet --test budget_downsample -- --nocapture"
+
+[metric]
+# The shape of the store the question was asked of: the segments it is made of, the records they
+# hold, and the series those records belong to. A store with nothing in it cannot pass any count
+# below, and a `seal` that wrote the wrong records is caught before anything is asked.
+segments_sealed = 4
+records = 400
+series = 4
+# The grid, and what the answer said about it. `windows` is every window the half-open range
+# touches; `buckets_emitted` is the ones that held records of the series that was asked for; `gaps`
+# is the rest, and this workload was built to have five of them. A query that invented buckets — one
+# per window including the empty ones, or a window split in two — moves these three numbers away
+# from 28/23/5 whatever else it gets right.
+windows = 28
+buckets_emitted = 23
+gaps = 5
+# What the pass cost and where it went: every record is looked at, the series filter is what
+# survives next, and the range is what survives after that. The three numbers are different here on
+# purpose — a filter compared as a prefix, or a range taken for the whole store, answers a different
+# `records_in_range` — and `records_scanned` is the count `lakelet/4.14-index-pruning` exists to
+# bring down.
+records_scanned = 400
+series_matched = 100
+records_in_range = 88
+# An upper bound: the most records any one bucket holds. A query that answered the whole range as a
+# single bucket, or that filled a partial window from outside the range, reports a bigger number.
+# `records_in_range` is the ceiling of what any honest bucket can hold.
+records_per_bucket_max = 4
+# An upper bound of zero, and it covers two shapes of the same defect: a bucket whose `start` is not
+# one of the range's windows — windows anchored at the first record instead of the absolute grid, or
+# a window reaching past `--from` to fill a partial one — and a bucket that counted nothing, which
+# is the zero the "absent, not zero" rule exists to refuse.
+invented_windows_max = 0
+# The identity the answer has to satisfy, as a count that must be zero: the buckets' own counts
+# added up are the records the pass says it used. An answer that lost or invented a record on the
+# way out fails here whatever its other numbers say.
+records_unaccounted_max = 0
+# The tolerance's own metric: the mean of the buckets against the **raw mean of the same records**,
+# measured by the harness out of the store's own record list rather than out of the answer. The two
+# are the same number only when every window holds records with the same mean, and this workload is
+# not that: the first and last bucket are partial. The bound says they agree to at least this well
+# — it is an upper bound, so a query whose two answers are closer than this passes — and the number
+# is two orders of magnitude inside the `TOLERANCE` the code declares, which is the point: the
+# tolerance is a statement about wrong records, not about this workload's arithmetic.
+mean_gap_max = 0.034
+# A store or a query that refused is one this lane cannot judge by counts alone: a refusal shows up
+# as the numbers moving, and this says why in one line. An upper bound of zero.
+refused_max = 0
