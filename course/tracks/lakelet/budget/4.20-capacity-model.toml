@@ -1,0 +1,128 @@
+# The capacity lane of `lakelet/4.20-capacity-model`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_cost.rs`, which this step's scaffold ships complete); the metrics are the lines it
+# prints, and every one of them is a count or a ratio of two counts rather than a time — a count is
+# the same number on a loaded machine as on an idle one, which is why this lane judges counts at all
+# (handoff M2 §1.1).
+#
+# What the harness does: it builds a store through the real write path — twenty-four sealed segments,
+# one hour each and sixty records each, thirty samples of `cpu,host=h{i}` and thirty of
+# `cpu,host=fleet` — writing every payload to the log first (`Spool::append`) and closing the same
+# records into a segment (`Segments::seal`), then asks **two** queries through the planner and the
+# executor: a selective one (`host = 'h20'`) and a wide one (`host = 'fleet'`) over the last twelve
+# hours. Nothing in it reads a clock or a seeded generator: the epoch, the timestamps, the series and
+# the values are constants, so two runs of this file on two machines write the same bytes.
+#
+# # This lane is the step, and it is the only lane in T4 where a *model* is at stake
+#
+# Every other budget lane pins the store: what the write path cost (`budget/4.5-batch-writes.toml`),
+# what a segment weighs (`budget/4.7-columnar-segments.toml`), how much pruning saved
+# (`budget/4.14-index-pruning.toml`). This one pins the gap between **what the code says the store
+# costs and what the store actually wrote**. That gap is the failure this step exists for: a constant
+# in `Model::DEFAULT` that was measured once and never again goes on being quoted by
+# `docs/capacity.md` long after the encoder under it changed, and a capacity plan built on it is
+# wrong in a confident voice. So the model's own numbers (`model_*`, from `Model::predicts`) and the
+# store's (`segment_bytes`, `index_bytes`, `log_bytes`, the two query readings) are judged in one
+# lane, and the `drift_*_permille_max` lines are the comparison between them.
+#
+# The drift is a ratio of two counts and it is an **upper bound**: the model's job is to be close,
+# not to be equal. Its bounds are tighter than the tolerance the model states
+# (`agreement_permille_max`, which may only go *down*): that tolerance is what the model claims about
+# any store, while this lane knows exactly which store it built. `within_max` is the verdict as a
+# count — zero when the model agreed with the store — and it is here so that a run in which the model
+# drifted is a red gate naming a number rather than a reader's arithmetic.
+#
+# A metric is judged within ±10% of its baseline here, except a name ending in `_max`, which is an
+# **upper bound** instead: "no worse than this", not "about this". `segment_bytes`, `index_bytes`,
+# `log_bytes` and the two query readings carry the compressor's own slack — a `zstd` release may
+# answer different bytes for the same input, and the course never pins a compressor's output — which
+# is why `budget/4.8-compaction.toml` and `budget/4.9-retention.toml` bound their byte counts the
+# same way.
+command = "cargo test -p lakelet --test budget_cost -- --nocapture"
+
+[metric]
+# The shape of the store the model was measured against: how many segments, records and series, and
+# how many (segment, series) pairs the sidecars were written for. The last of those is what the
+# per-series overhead is divided by and it is a different number from `series` whenever a series
+# appears in more than one segment — twenty-four segments of two series each is forty-eight pairs
+# against twenty-five distinct names.
+segments = 24
+records = 1440
+series = 25
+series_slots = 48
+
+# What the store weighs, measured on the disk rather than asked of the manifest, and the three parts
+# of it. The log is the largest by far and that is not an accident of this workload: this store's
+# write path never truncates the log, so a record costs its bytes twice — once compressed in a
+# segment and once raw in the log — and a capacity model that counted only segments would price a
+# tenth of this store. `docs/capacity.md` names that as what a next version would have to change.
+segment_bytes = 5896
+index_bytes = 4224
+log_bytes = 44633
+on_disk_bytes = 54753
+
+# The three rates `Model::DEFAULT` carries, re-measured the way each constant's own documentation
+# says it was measured, as per-mille integers: bytes per thousand records in the segments, per
+# thousand (segment, series) pairs in the sidecars, and per thousand records in the log.
+bytes_per_sample_milli = 4094
+series_overhead_bytes_milli = 88000
+log_bytes_per_sample_milli = 30995
+
+# What the two queries read, from the plan's own decision, with the records behind each reading.
+# `lakelet/4.14-index-pruning` as a cost rather than a rate: the selective query's host lives in one
+# segment and the wide query's series is in every segment, so the same store answers the same shape
+# of question reading twelve times as much. The model prices each from the records the plan opened,
+# which is why the two `drift_*_query_bytes_permille_max` lines below are the ones to read when this
+# pair moves.
+selective_query_bytes = 243
+selective_query_records = 60
+wide_query_bytes = 2951
+wide_query_records = 720
+
+# The model's version of the same store (`Model::predicts`): the three file sets, their sum, and the
+# rate it says it is working at. These are the page's constants applied to the store this harness
+# just wrote, and the four lines below them are the constants themselves — the numbers
+# `docs/capacity.md` quotes, in the lane that judges them.
+model_segment_bytes = 5760
+model_index_bytes = 4224
+model_log_bytes = 44640
+model_on_disk_bytes = 54624
+model_bytes_per_sample_milli = 4000
+model_bytes_per_sample = 4
+model_series_overhead_bytes = 88
+model_log_bytes_per_sample = 31
+model_bytes_per_query = 240
+model_selective_query_bytes = 240
+model_wide_query_bytes = 2880
+
+# The comparison, one line per quantity, in whole per-mille of what the model said. Each name is the
+# *quantity* rather than the constant behind it, because a constant has more than one use and which
+# use moved is what a reader needs: `bytes_per_sample` answers for the segments, for the disk total
+# and for both query readings, and `series_overhead_bytes` answers for the sidecar alone.
+#
+# The reference solution's own drifts are 23, 0, 0, 2, 12 and 24 per-mille. The first is the whole of
+# `bytes_per_sample`'s rounding (4094 per-mille measured, 4000 carried); the other zero is exact by
+# construction, because the sidecar's term is two integers from the same store multiplied. The bounds
+# are set where a constant that stopped matching this store lands, and a step's drill is one line:
+# change one constant in `Model::DEFAULT` by twenty percent and the quantity it answers for goes red
+# under its own name.
+drift_segment_bytes_permille_max = 40
+drift_index_bytes_permille_max = 10
+drift_log_bytes_permille_max = 10
+drift_on_disk_bytes_permille_max = 10
+drift_selective_query_bytes_permille_max = 40
+drift_wide_query_bytes_permille_max = 40
+
+# The tolerance the model states for itself, in per-mille: an upper bound, so a later version of the
+# model may tighten what it claims and may not loosen it. Widening this is the one way a drifting
+# model could be made to look green, which is why the baseline holds it down.
+agreement_permille_max = 100
+
+# And the verdict, as a count: zero when the model agreed with the store at the tolerance it states.
+# It is here so that a drift the bounds above did not name is still a red gate.
+within_max = 0
+
+# A store that refused something is a store this lane cannot judge by counts alone.
+refused_max = 0

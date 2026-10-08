@@ -18,6 +18,7 @@ format_version = 1
 "spec/4.18/cardinality.rs" = "sha256:e6db77b76fd30decaa41458bb03582948d11c744cc5b6e30c58d7b326cb6fdb5"
 "spec/4.19/backup_restore.rs" = "sha256:de1de0eadf34888b54ff24894d61dcb600181eec300e15b4a1dee4cdfa85339d"
 "spec/4.2/parser_fuzz.rs" = "sha256:cb5b26fe86f923cb4f6d997dc1c2dc01a12fb6b74a128dbdfe88967fbe3c0c9c"
+"spec/4.20/capacity.rs" = "sha256:e4ba1970e4a6884d522c5b25fdc929c1d1577fdd21d30c65f935bf5e1a94b3fa"
 "spec/4.3/write_path.rs" = "sha256:370a7a0e3b7d75aeebd7dd6bfe3953e8567388eaeb0a3f03df1bf67afd57c635"
 "spec/4.4/wal_recovery.rs" = "sha256:381075965c01289a0dece3f816f3a5f0d5c13fa98620fbfd277f05d4fae14850"
 "spec/4.5/batch_writes.rs" = "sha256:a4a83d86080e534f1d87445002911e404fa85a0cf2979be2a6bd858a53630002"

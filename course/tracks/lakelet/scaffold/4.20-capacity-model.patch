@@ -1,0 +1,1381 @@
+diff --git a/docs/capacity.md b/docs/capacity.md
+new file mode 100644
+index 0000000..dd69012
+--- /dev/null
++++ b/docs/capacity.md
+@@ -0,0 +1,92 @@
++# Capacity is a model with numbers in it, not a feeling
++
++<!-- TODO: one paragraph, in this project's voice, on why a capacity question is answered by a model
++rather than by a measurement — a number somebody wrote down, arithmetic over it, and a list price —
++and why that is dangerous in a way a measurement is not (a model that drifts keeps being quoted in a
++confident voice). Say what keeps *this* model honest: the constants in `src/engine/cost.rs` and the
++store's own numbers are judged in the same lane, so a constant that stopped matching the store is a
++red gate and not a stale sentence. -->
++
++[TODO](TODO)
++
++## The answer, from the model
++
++<!-- TODO: quote the model's own output for the shipped usage — the whole
++`Estimate::of(Model::DEFAULT)` block, line for line, in the fenced block below — and say which call
++produced it and which test re-runs it (the spec compares the block against that call, so edit it from
++the model and never by hand). Then read the numbers: the month's bill in micro-units, the cost per
++million events, and the three shares of each. Name the one finding in the bytes that a reader would
++not guess (which of the three file sets the disk is mostly made of). -->
++
++```text
++events_per_day=TODO
++cost_per_million_events_micros=TODO
++```
++
++## What a byte costs
++
++<!-- TODO: `bytes_per_sample` is one record's share of a sealed segment. Where it comes from
++(`lakelet/4.7-columnar-segments`'s layout, the compressor), what the harness measured on its store
++(`tests/budget_cost.rs`'s `segment_bytes`, `records` and `bytes_per_sample_milli`), and the drift
++between the two, named as the line of `budget/4.20-capacity-model.toml` that carries it. Say what
++would move the constant and why a wider tolerance is not the answer. -->
++
++## What a series costs
++
++<!-- TODO: `series_overhead_bytes` is the sidecar of `lakelet/4.14-index-pruning`, not the series'
++data: one index file per segment, a fixed size whatever the segment holds, so a series' share is that
++file over the series sharing its segment. Give the arithmetic and the harness's own lines. Then say
++the direction this term errs in at high cardinality and what the cap in
++`lakelet/4.18-cardinality-cost` is actually about, since the model prices series linearly and the
++store does not. Link the cardinality page. -->
++
++## The retention tradeoff
++
++<!-- TODO: retention is the only multiplier a person chooses. `stored_bytes` is
++`stored_bytes_per_day` times it. Give the three-row table — retention, stored bytes, storage
++micro-units, the month's bill, and the cost per million events — each cell a call to the same model,
++and read the ends against each other: what keeping a year instead of a week holds, and what it costs.
++State that a retention of zero means one day's worth rather than nothing, and why. -->
++
++| retention | stored_bytes | storage_micros | monthly_micros | cost_per_million_events_micros |
++| --- | --- | --- | --- | --- |
++| TODO | TODO | TODO | TODO | TODO |
++
++## What a query reads
++
++<!-- TODO: the query term, which is where `lakelet/4.14-index-pruning` becomes a cost instead of a
++rate. Quote the harness's two readings — the selective query and the wide one, with the records each
++one read — and say why one is twelve times the other. Cite that step's own lane rather than
++re-measuring it (`budget/4.14-index-pruning.toml`'s pruning rate and its avoided bytes), and say why
++the term is a per-mille of the bill rather than a share. -->
++
++## The prices
++
++<!-- TODO: the three price fields are the one input this model does not measure. Name each one with
++its unit, then the source: the vendor, the region, the pricing page, and the date the list was read.
++Say which unit the vendor's own arithmetic divides by (a gigabyte or a gibibyte, and what assuming
++the wrong one would cost). Then the sentence this section exists for: a list price is the one input
++no gate can tell you changed, which is why it is a named field with its unit in the name and a date
++on this page. -->
++
++## What the model is not
++
++<!-- TODO: the things a reader will otherwise assume. One line each: it does not predict latency
++(point at the profiling and perf pages); it prices no cardinality cap; it does not price
++`lakelet/4.8-compaction`'s rewrite of bytes; it does not price the store's own manifest; and its
++query term is one pruned reading rather than an average. Add anything the numbers on this page would
++mislead a reader about. -->
++
++## What keeps this page true
++
++<!-- TODO: the three files and how they fit: the model and its comparison in `src/engine/cost.rs`,
++the harness in `tests/budget_cost.rs` (complete, and the only thing here that touches a store), and
++the course baseline in `budget/4.20-capacity-model.toml`. Say what the `drift_*` bounds are for, and
++what a reader should do when one of them goes red. Then state that every number on the page is a line
++of the block, a cell of the table, or a line of the harness named where it is quoted. -->
++
++## FURTHER
++
++<!-- TODO: the files and pages a reader follows next — the model, the encoder whose layout the first
++constant is a property of, the sidecar's layout, the cardinality page, the write-amplification page,
++the profiling page, and the pricing page the three prices came from. -->
+diff --git a/src/engine/cost.rs b/src/engine/cost.rs
+new file mode 100644
+index 0000000..03ea006
+--- /dev/null
++++ b/src/engine/cost.rs
+@@ -0,0 +1,816 @@
++//! What a store this shape costs to run, and whether the model still matches the store.
++//!
++//! Step `lakelet/4.20-capacity-model`. Everything before this step *measures*: `lakelet/4.5-batch-writes`
++//! counts what the write path spent, `lakelet/4.7-columnar-segments` pins the bytes a segment holds,
++//! `lakelet/4.14-index-pruning` turns pruning into a rate, `lakelet/4.15-budget-regression` attributes
++//! work to the phase that paid for it. A capacity question — *what does a million events a day cost* —
++//! is answered before the load arrives, from numbers somebody wrote down, and that is a different kind
++//! of artifact: a **model**. A model is not a measurement, and the whole difficulty is that the two
++//! drift apart quietly: a constant that was true when it was written keeps being used after the encoder
++//! under it changed, and the page that quotes it goes on being wrong in a confident voice.
++//!
++//! So this module is arithmetic over values and nothing else, and it is built so that the drift is a
++//! *failing case* rather than a stale sentence:
++//!
++//! * [`Model`] is the model: named, unit-carrying integers, every one of which came from a measurement
++//!   of this store or from a named list price ([`Model::DEFAULT`] says which, field by field);
++//! * [`Usage`] is the question as a value (a million events a day, a thousand series, ten thousand
++//!   queries, thirty days of retention), and the model's methods answer it in bytes first and money
++//!   second: per sample, per series, per day, per retention period, and finally the three shares of the
++//!   bill and the identity `total == ingest + storage + query` — written as arithmetic a case can
++//!   falsify, not as a sentence on a page;
++//! * [`Measured`] is what a store actually wrote (segments, sidecars, log, records, series, and what
++//!   each query read), and [`Model::agrees`] compares the model with it. That comparison is the reason
++//!   this is a *design* capability rather than a page: `tests/budget_cost.rs` prints both sides, the
++//!   course baseline in `budget/4.20-capacity-model.toml` bounds the difference, and a constant that
++//!   stopped matching the store turns that lane red with the quantity that moved.
++//!
++//! # The money path has no floating point in it
++//!
++//! Every amount is an integer number of **micro-units** of the currency the list prices are quoted in
++//! (a millionth of a dollar for [`Model::DEFAULT`]'s prices, which [`docs/capacity.md`] names with the
++//! date and the source). A cost that depends on how a machine rounds a `f64` is a cost two machines
++//! disagree about, and the lane that judges this step compares counts: `0.1 + 0.2` is not `0.3`, and a
++//! bill that is off by a micro-unit because of it is a bill nobody can reconcile. Shares are per-mille
++//! integers for the same reason.
++//!
++//! The month is a named constant ([`DAYS_PER_MONTH`]) and not a number written into three formulas,
++//! and a year is [`MONTHS_PER_YEAR`] of those months rather than 365 days: the two are not the same
++//! number after the first division, and a report that answered differently depending on which one it
++//! had been asked for would be a report nobody could add up.
++//!
++//! # What this module does not do
++//!
++//! **It reads nothing.** No file, no directory, no clock, no environment variable: it is arithmetic
++//! over values a caller hands it. That is what makes it a model, and it is the line
++//! `lakelet/4.20-capacity-model` exists to draw — measuring the store is the harness's job
++//! (`tests/budget_cost.rs`, which builds a store through the real write path and hands the numbers
++//! in). The step's spec reads this file for the rule, because "a model is not a measurement" stops
++//! being a slogan the moment it is a property of the code.
++//!
++//! It also does not model three things, and the page says so: a query's *latency* (the model prices
++//! bytes read, and a plan's cost in time is what `lakelet/4.15-budget-regression` and
++//! `lakelet/4.16-profiling` are for), the *merge* traffic of `lakelet/4.8-compaction` (a merge rewrites
++//! bytes this model never counts, and `budget/4.8-compaction.toml` is where that cost is measured),
++//! and the store's own manifest (one entry per segment, which a version of this model with a segment
++//! count in it would price).
++
++use std::fmt;
++
++/// Micro-units in one unit of the currency the prices are quoted in.
++///
++/// `Model::DEFAULT`'s prices are dollars, so this is a millionth of a dollar. The prices are stored in
++/// micro-units because a per-event price is a fraction of a cent and an integer cent would round the
++/// whole month to zero.
++pub const MICROS: u64 = 1_000_000;
++
++/// Bytes in one gibibyte, the unit the storage price is quoted per.
++///
++/// 2^30 and not 10^9, because that is the number the vendor's own worked example divides by
++/// (`docs/capacity.md` quotes it), and because the two differ by 7.4% — which is more than the
++/// tolerance this model allows itself, so guessing which one a price means is guessing in the one place
++/// the model has no measurement to check against.
++pub const GIB: u64 = 1 << 30;
++
++/// Days in the month every price here is quoted per.
++///
++/// Named rather than written into three formulas, and thirty rather than a calendar month: a price list
++/// says "per month" and every bill a reader of this page has seen treats that as thirty days. A model
++/// that asked the calendar would answer differently in February, which is not a property a capacity
++/// plan wants.
++pub const DAYS_PER_MONTH: u64 = 30;
++
++/// Months in the year [`Model::yearly_micros`] reports.
++///
++/// A year is exactly this many months, each of them rounded once, rather than 365 days rounded once: the
++/// two arithmetic paths disagree by up to eleven micro-units on the same store, and a model that
++/// reported two different prices for the same year depending on how it was asked would be a model an
++/// invoice could not be reconciled against. See [`Model::yearly_micros`].
++pub const MONTHS_PER_YEAR: u64 = 12;
++
++/// The model of what this store costs, as named integers.
++///
++/// Nine numbers, and each of them is one of three kinds, which the field's own documentation states:
++///
++/// * **measured** on this store — the three byte rates ([`Model::bytes_per_sample`],
++///   [`Model::series_overhead_bytes`], [`Model::log_bytes_per_sample`]) and the bytes one query reads
++///   ([`Model::bytes_per_query`]). `tests/budget_cost.rs` builds a store through the real write path and
++///   prints its own version of each, so a measured number here that stopped matching the store fails
++///   the step's budget lane rather than ageing quietly;
++/// * **policy** — [`Model::retention_days`], which is a decision rather than a measurement, and the one
++///   multiplier a person chooses;
++/// * **a list price** with a date and a source, written down on `docs/capacity.md` — the three `price_*`
++///   fields. This is the one input the model does not measure, and it is why the price fields are
++///   documented as prices rather than as facts about this store.
++///
++/// The fields are public because a model is a value two readers compare: a spec that wants to know what
++/// a 20% error in one constant costs writes `Model { bytes_per_sample: …, ..Model::DEFAULT }` and asks.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Model {
++    /// Bytes one record costs in a **sealed segment** on this store.
++    ///
++    /// Measured, not derived: `lakelet/4.7-columnar-segments` encodes a segment by column and hands the
++    /// block to `zstd`, so the number depends on the encoding *and* on the compressor's release. It is
++    /// the store's own answer on `tests/budget_cost.rs`'s workload (twenty-four sealed segments of sixty
++    /// records, 4094 bytes per thousand records), rounded down to a whole byte because a fractional byte
++    /// per record is not a number a store writes.
++    pub bytes_per_sample: u64,
++    /// Bytes one series costs the sidecar index, per segment it appears in.
++    ///
++    /// Measured the way `lakelet/4.14-index-pruning` writes it: one index file per closed segment, and
++    /// the file is a fixed size — a header, a 33-byte zone map and a 1024-bit filter — whatever its
++    /// segment holds, so what a *series* costs is that file divided by the series sharing the segment
++    /// (176 bytes over the reference store's two, which is 88). The division is where this model is
++    /// least exact, and the page says so: a store that seals a thousand series into one segment pays 176
++    /// bytes for all of them where this constant would charge 88 000.
++    pub series_overhead_bytes: u64,
++    /// Bytes one record costs in the **log**, before any flush closes it.
++    ///
++    /// Measured on the same workload. The log holds what the client sent — `protocol::batch::encode`'s
++    /// payload, framed by `lakelet/4.4-wal-recovery`'s record — so this is not the same shape of number
++    /// as `bytes_per_sample`: it is the raw bytes of a series *name* and two numbers per record, which
++    /// is why it is larger than the compressed segment's share. It is one measurement rather than a
++    /// function of the name's length, which the page names as a limit.
++    pub log_bytes_per_sample: u64,
++    /// Bytes one query reads, for the query this model prices.
++    ///
++    /// The reference query is `lakelet/4.14-index-pruning`'s: one host over one hour, which the index
++    /// prunes down to a single segment and sixty records — `bytes_per_sample` times the sixty. A query
++    /// that cannot prune reads twelve times this, and `tests/budget_cost.rs` prints both readings, so
++    /// the number here is a *floor* rather than an average: the page's query term is the cheapest a
++    /// question can be on this store.
++    pub bytes_per_query: u64,
++    /// Days of data the deployment's policy keeps, which is the default [`Usage`] runs at.
++    ///
++    /// A decision and not a measurement: `lakelet/4.9-retention` deletes whole segments older than this,
++    /// and this model multiplies bytes-per-day by it. Zero is *not* an empty store — see
++    /// [`Model::stored_bytes`] — because a store that is running has a day's data on the disk before
++    /// anything expires, and a model that priced a running store at nothing would answer "keep nothing"
++    /// for every deployment that had not got round to setting the policy.
++    pub retention_days: u64,
++    /// Micro-units one gibibyte-month of storage costs, on the price list the page names.
++    ///
++    /// The one kind of input this model does not measure. `docs/capacity.md` writes down the vendor, the
++    /// region, the unit the vendor's own arithmetic divides by, and the date the list was read.
++    pub price_per_gib_month_micros: u64,
++    /// Micro-units one **million events** ingested costs, on the same list.
++    ///
++    /// A metered ingest price, which is what makes a capacity question answerable before the load
++    /// arrives: it is charged per event rather than per byte or per hour, so it scales with the same
++    /// number [`Usage::events_per_day`] states.
++    pub price_per_million_events_micros: u64,
++    /// Micro-units one gibibyte **read back** costs, on the same list.
++    ///
++    /// What makes `lakelet/4.14-index-pruning` a cost rather than a rate: a query that opens one segment
++    /// instead of twelve reads a twelfth of the bytes, and this is the price those bytes carry. Latency
++    /// is not in here — this is bytes, not seconds.
++    pub price_per_gib_read_micros: u64,
++    /// How far the model may be from a measurement and still be called agreed, in per-mille.
++    ///
++    /// The model states its own tolerance, because "the model is close enough" is a decision somebody has
++    /// to make and defend. A hundred per-mille is ten percent: wide enough to hold the compressor's slack
++    /// (`lakelet/4.15-budget-regression` bounds byte counts the same way) and narrow enough that a
++    /// constant that stopped matching the store — the failure this step is about — is outside it.
++    pub agreement_permille: u64,
++}
++
++impl Model {
++    /// The model this project ships.
++    ///
++    /// Every measured number came out of `tests/budget_cost.rs`'s workload, every price out of the list
++    /// `docs/capacity.md` names with its date, and the retention out of the policy
++    /// `lakelet/4.9-retention` ships. The constants are what the page argues term by term; the harness
++    /// re-measures them on the same store, and the budget lane is red when they stop matching.
++    pub const DEFAULT: Model = Model {
++        bytes_per_sample: 4,
++        series_overhead_bytes: 88,
++        log_bytes_per_sample: 31,
++        bytes_per_query: 240,
++        retention_days: 30,
++        price_per_gib_month_micros: 23_000,
++        price_per_million_events_micros: 14_000,
++        price_per_gib_read_micros: 21_000,
++        agreement_permille: 100,
++    };
++
++    /// The question this model's own page asks: a million events a day, at the retention the deployment
++    /// ships and a cardinality and a query rate that go with it.
++    ///
++    /// The model answers a `Usage` and not a bare event rate, so "what does a million events a day cost"
++    /// is only a question once three other numbers are stated — how many series those events are spread
++    /// over, how many questions are asked of them, and how long they are kept. [`Usage::DEFAULT`] is the
++    /// set this page uses, and this method is where the retention comes from, so the policy in
++    /// [`Model::retention_days`] is a number the model actually answers with rather than one a reader has
++    /// to remember to pass.
++    #[must_use]
++    pub const fn default_usage(&self) -> Usage {
++        Usage {
++            events_per_day: Usage::EVENTS_PER_DAY,
++            series: Usage::SERIES,
++            queries_per_day: Usage::QUERIES_PER_DAY,
++            retention_days: self.retention_days,
++        }
++    }
++
++    /// Bytes a day's records cost once they are sealed into segments.
++    ///
++    /// Linear in the event rate by construction: `events × bytes_per_sample`, two integers multiplied,
++    /// which is the property a capacity model is *for* — doubling the load doubles the answer, exactly,
++    /// with no curve to fit.
++    #[must_use]
++    pub const fn sample_bytes_per_day(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: what a day's records cost once they are sealed: the event \
++            rate times `bytes_per_sample`"
++        )
++    }
++
++    /// Bytes a day's series cost the index sidecar.
++    ///
++    /// One segment's share per series per day, which is the model's least exact term and the direction it
++    /// errs in: the sidecar is one file per segment, so a store that seals many series into a segment
++    /// pays this once for all of them. See [`Model::series_overhead_bytes`] and `docs/capacity.md`.
++    #[must_use]
++    pub const fn series_bytes_per_day(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: what a day's series cost the sidecar: the series count \
++            times `series_overhead_bytes`"
++        )
++    }
++
++    /// Bytes a day's records cost in the log, which nothing truncates.
++    ///
++    /// The log is the half of the store that `lakelet/4.8-compaction` does not change and
++    /// `lakelet/4.9-retention` does not expire: every payload this store accepted is still in it, which
++    /// is why a capacity model that counted only segments would under-price a store by everything its
++    /// write path has taken (`lakelet/4.17-soak` counts the same bytes as `store_bytes`).
++    #[must_use]
++    pub const fn log_bytes_per_day(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: what a day's records cost in the log: the event rate times \
++            `log_bytes_per_sample`"
++        )
++    }
++
++    /// Bytes one day of this usage costs on the disk: samples, series overhead, and the log.
++    ///
++    /// The three terms are separate methods as well as one sum, because a page has to argue each of them
++    /// and a case can check that this is exactly their sum rather than approximately it.
++    #[must_use]
++    pub const fn bytes_per_day(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: a day is its three terms added, and this is the method a \
++            case checks that against"
++        )
++    }
++
++    /// Bytes the disk holds at steady state: one day times the retention.
++    ///
++    /// Retention is **the** multiplier in this model, the only one a person chooses, and it is applied to
++    /// everything a day writes rather than to the segments alone: a store that keeps thirty days keeps
++    /// thirty days of log too.
++    ///
++    /// A retention of zero days answers *what one day holds* and not nothing. The alternatives are both
++    /// wrong on a running store: an empty store is a store that is not ingesting, and a division by the
++    /// number of days is not arithmetic this model needs at all. The floor is applied here rather than
++    /// stored into the usage, so a caller reading [`Usage::retention_days`] back gets the number they
++    /// wrote.
++    #[must_use]
++    pub const fn stored_bytes(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: the retention is the multiplier — and zero days is what one \
++            day holds, not nothing"
++        )
++    }
++
++    /// Bytes a day's queries read, at the reference query's size.
++    ///
++    /// The one term that *falls* when the store does more work: `lakelet/4.14-index-pruning` is what keeps
++    /// this small, and the number is the pruned reading — see [`Model::bytes_per_query`].
++    #[must_use]
++    pub const fn query_bytes_per_day(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!("lakelet/4.20-capacity-model: a day's questions at `bytes_per_query` each")
++    }
++
++    /// The samples' share of a day's bytes, in whole per-mille.
++    #[must_use]
++    pub fn sample_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the samples' share of a day's bytes, in whole per-mille of \
++            the three terms"
++        )
++    }
++
++    /// The series overhead's share of a day's bytes, in whole per-mille.
++    ///
++    /// The number a page names when it says what cardinality costs: it is the only term of the three that
++    /// a person changes by *modelling their metrics better* rather than by writing less data or changing
++    /// a policy.
++    #[must_use]
++    pub fn series_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the series overhead's share of a day's bytes, in whole \
++            per-mille of the three terms"
++        )
++    }
++
++    /// The log's share of a day's bytes, in whole per-mille.
++    #[must_use]
++    pub fn log_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the log's share of a day's bytes, in whole per-mille of the \
++            three terms"
++        )
++    }
++
++    /// What a month of ingesting this usage costs, in micro-units.
++    #[must_use]
++    pub const fn ingest_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: a month of events at the ingest price, in micro-units and \
++            in integers"
++        )
++    }
++
++    /// What a month of holding this usage's bytes costs, in micro-units.
++    ///
++    /// Steady state, which is the only state a capacity question is about: the store holds
++    /// [`Model::stored_bytes`] all month, and one gibibyte-month is that many bytes held for a month.
++    #[must_use]
++    pub const fn storage_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: a month of holding `stored_bytes` at the storage price"
++        )
++    }
++
++    /// What a month of asking questions costs, in micro-units.
++    #[must_use]
++    pub const fn query_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: a month of reading what the queries read, at the read price"
++        )
++    }
++
++    /// The month's bill: the three terms added, which is the identity the page's block is built on.
++    ///
++    /// Written as one expression over the three methods rather than as a fourth formula, so that
++    /// `total == ingest + storage + query` is arithmetic rather than a claim — a case checks it across a
++    /// matrix of usages, and a version of this method that priced something the three terms do not would
++    /// be red immediately.
++    #[must_use]
++    pub const fn monthly_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: the month's bill as the three terms added — the identity \
++            the page's block is built on"
++        )
++    }
++
++    /// The year's bill: [`MONTHS_PER_YEAR`] of [`Model::monthly_micros`].
++    ///
++    /// Twelve months rather than three hundred and sixty-five days, and multiplied rather than
++    /// recomputed, because the two paths round differently: a year computed from 365 days is up to
++    /// eleven micro-units away from twelve monthly answers, and a model that reported both would be
++    /// reporting two prices for one year. The month is where the rounding happens, once, and the year is
++    /// twelve of those.
++    #[must_use]
++    pub const fn yearly_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: a year is `MONTHS_PER_YEAR` of those months, not a second \
++            computation over 365 days"
++        )
++    }
++
++    /// The ingest term's share of the month, in whole per-mille.
++    #[must_use]
++    pub fn ingest_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the ingest term's share of the month, in whole per-mille"
++        )
++    }
++
++    /// The storage term's share of the month, in whole per-mille.
++    #[must_use]
++    pub fn storage_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the storage term's share of the month, in whole per-mille"
++        )
++    }
++
++    /// The query term's share of the month, in whole per-mille.
++    #[must_use]
++    pub fn query_share_permille(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        todo!(
++            "lakelet/4.20-capacity-model: the query term's share of the month, in whole per-mille"
++        )
++    }
++
++    /// What a month of this usage costs **per million events**, in micro-units.
++    ///
++    /// The number the catalogue promises (`每百万事件`), and the one number that lets two deployments of
++    /// different sizes be compared: the month's bill divided by the millions of events that month
++    /// ingested. It is per month because every price here is quoted per month — a per-event figure with
++    /// no period in it would not be a price.
++    #[must_use]
++    pub const fn cost_per_million_events_micros(&self, usage: &Usage) -> u64 {
++        let _ = usage;
++        panic!(
++            "lakelet/4.20-capacity-model: the month's bill over the millions of events that month \
++            ingested"
++        )
++    }
++
++    /// The model's version of what a store wrote.
++    ///
++    /// Same question, same multipliers, no disk: bytes per record in the segments, the sidecar's share
++    /// per (segment, series) pair, bytes per record in the log, and their sum. [`Model::agrees`] is what
++    /// finally compares the two.
++    #[must_use]
++    pub fn predicts(&self, measured: &Measured) -> Predicted {
++        let _ = measured;
++        todo!(
++            "lakelet/4.20-capacity-model: the model's version of what the store wrote: the same \
++            multipliers, no disk"
++        )
++    }
++
++    /// The model's version of what one query read.
++    ///
++    /// A query reads whole segments, so this is the records the plan opened times what a record costs in
++    /// a segment. The reading says *how many* records, because that is the plan's decision and the point
++    /// of `lakelet/4.14-index-pruning`: the model prices the bytes the index left for the query to read,
++    /// not the query's own shape.
++    #[must_use]
++    pub const fn query_bytes(&self, reading: &Reading) -> u64 {
++        let _ = reading;
++        panic!(
++            "lakelet/4.20-capacity-model: a query reads whole segments, so this is the records the \
++            plan opened times what a record costs"
++        )
++    }
++
++    /// Compare the model with what a store wrote.
++    ///
++    /// One [`Drift`] per quantity, in a fixed order — the store's three file sets, their sum, then one per
++    /// query the run asked — and each of them names the constant it came out of and which way it is off.
++    /// [`Agreement::within`] is the verdict the budget lane turns into a number.
++    #[must_use]
++    pub fn agrees(&self, measured: &Measured) -> Agreement {
++        let _ = measured;
++        todo!(
++            "lakelet/4.20-capacity-model: one drift per quantity — the three file sets, their sum, \
++            then one per query — and the verdict against `agreement_permille`"
++        )
++    }
++
++    /// One quantity's difference, as the per-mille of the model's own answer, and the direction.
++    ///
++    /// Per-mille rather than a percentage because it is an integer either way: `100` is a tenth, and a
++    /// ratio of two counts stays a count. The denominator is what the *model* said, which is the reading
++    /// that makes "a measurement ten percent larger than the prediction is one hundred per-mille" the
++    /// arithmetic it looks like; a model that said nothing at all (`0`) is a drift of nothing only when
++    /// the store wrote nothing either. Direction is carried separately so that a model that
++    /// *under*-predicts is a different answer from one that over-predicts — an operator who is told "the
++    /// model is 20% off" and not which way has been told nothing they can act on.
++    #[must_use]
++    fn drift(
++        &self,
++        constant: &'static str,
++        quantity: &'static str,
++        model: u64,
++        measured: u64,
++    ) -> Drift {
++        let _ = (constant, quantity, model, measured);
++        todo!(
++            "lakelet/4.20-capacity-model: one quantity's distance from the store, in per-mille of \
++            what the model said, and the direction"
++        )
++    }
++}
++
++/// The question a model is asked: a rate, a cardinality, a query rate, and a retention.
++///
++/// Four integers, and the three that are not the retention are the shape of the load rather than a
++/// measurement of it — which is the difference between this and an [`Estimate`]: an `Estimate` is an
++/// answer *about* a `Usage`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Usage {
++    /// Events ingested per day.
++    pub events_per_day: u64,
++    /// Distinct series those events are spread over.
++    pub series: u64,
++    /// Queries asked per day.
++    pub queries_per_day: u64,
++    /// Days of data kept, which [`Model::stored_bytes`] is the multiplier of.
++    pub retention_days: u64,
++}
++
++impl Usage {
++    /// Events a day in [`Usage::DEFAULT`]: one million, which is the question in this step's title and
++    /// the size at which every term is visible.
++    pub const EVENTS_PER_DAY: u64 = 1_000_000;
++
++    /// Series [`Usage::DEFAULT`] spreads those events over: a thousand, which is a fleet of machines
++    /// reporting a handful of metrics each rather than a per-request label.
++    pub const SERIES: u64 = 1_000;
++
++    /// Queries a day in [`Usage::DEFAULT`]: ten thousand, which is a dashboard refreshing every few
++    /// seconds plus the questions a person asks by hand.
++    pub const QUERIES_PER_DAY: u64 = 10_000;
++
++    /// The usage this step's page answers: a million events a day, a thousand series, ten thousand
++    /// queries, and the model's own retention policy.
++    pub const DEFAULT: Usage = Model::DEFAULT.default_usage();
++}
++
++/// What one query read, as the plan decided it.
++///
++/// The plan is the measurement (`lakelet/4.14-index-pruning` counts what a query did not open) and this is
++/// the other half: the records the segments it *did* open held, and the bytes those segments cost. The
++/// quantity's name travels with it so that a run's two readings — a query that pruned and one that could
++/// not — are told apart in the drift list without the model knowing what a dashboard is.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Reading {
++    /// The name this reading is reported under (`selective_query_bytes`, `wide_query_bytes`).
++    pub quantity: &'static str,
++    /// Records in the segments the plan opened, from the manifest.
++    pub records: u64,
++    /// Bytes those segments cost, from the manifest (`Plan::opened`'s stated sizes, summed).
++    pub bytes: u64,
++}
++
++/// What a store actually wrote, as a value a model can be compared with.
++///
++/// The numbers a store can honestly be asked for: the three file sets (segments, their sidecar indexes,
++/// and the log), the records and the series behind them, how many (segment, series) pairs the sidecars
++/// were written for, and what each query read. It knows nothing about money — a store cannot measure a
++/// price — which is why the comparison this type feeds is about bytes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Measured {
++    /// Segments the store holds.
++    pub segments: u64,
++    /// Records those segments hold.
++    pub records: u64,
++    /// Distinct series the store holds.
++    pub series: u64,
++    /// (segment, series) pairs the sidecars were written for: what the per-series overhead is divided
++    /// by, and a different number from [`Measured::series`] whenever a series appears in more than one
++    /// segment.
++    pub series_slots: u64,
++    /// Bytes the segment files cost together, measured on the disk.
++    pub segment_bytes: u64,
++    /// Bytes the sidecar index files cost together, measured on the disk.
++    pub index_bytes: u64,
++    /// Bytes the log costs, measured on the disk.
++    pub log_bytes: u64,
++    /// What each query of the run read, in the order it was asked.
++    pub queries: Vec<Reading>,
++}
++
++impl Measured {
++    /// What the store holds on the disk: the three file sets together.
++    ///
++    /// The store's own manifest is deliberately *not* in here, and the page says so: it is one entry per
++    /// segment, so its cost is a function of the segment count rather than of the load, and this model
++    /// does not carry a segment count.
++    #[must_use]
++    pub const fn on_disk_bytes(&self) -> u64 {
++        panic!(
++            "lakelet/4.20-capacity-model: the three file sets added: what a backup copies and an \
++            operator pays for"
++        )
++    }
++}
++
++/// The model's version of [`Measured`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Predicted {
++    /// Bytes the model says the segments cost.
++    pub segment_bytes: u64,
++    /// Bytes the model says the sidecars cost.
++    pub index_bytes: u64,
++    /// Bytes the model says the log costs.
++    pub log_bytes: u64,
++    /// The three together.
++    pub on_disk_bytes: u64,
++    /// The model's bytes-per-record figure as a per-mille integer, for a reader who wants the rate rather
++    /// than the total.
++    pub bytes_per_sample_milli: u64,
++}
++
++/// Which way a model's answer is off.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Direction {
++    /// The model and the store said exactly the same number.
++    Exact,
++    /// The model said more than the store wrote.
++    Over,
++    /// The model said less than the store wrote.
++    Under,
++}
++
++impl Direction {
++    /// The word a report uses.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::Exact => "exactly",
++            Self::Over => "over",
++            Self::Under => "under",
++        }
++    }
++}
++
++impl fmt::Display for Direction {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(self.as_str())
++    }
++}
++
++/// One quantity the model answered, and how far its answer is from the store's.
++///
++/// The two names are both needed and they are not the same name: `constant` is what the model's answer
++/// came out of — the thing that has to stop matching the store for this to be red — and `quantity` is
++/// what was compared, which is how a reader knows *which* of a constant's uses moved. A constant that
++/// drifts moves every quantity it answers for, and the step's drill is exactly that: change one number in
++/// [`Model::DEFAULT`] by twenty percent and watch which lines go red.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Drift {
++    /// The model constant the answer came out of.
++    pub constant: &'static str,
++    /// The quantity that was compared.
++    pub quantity: &'static str,
++    /// What the model says.
++    pub model: u64,
++    /// What the store wrote.
++    pub measured: u64,
++    /// How far apart the two are, in whole per-mille of what the store wrote.
++    pub permille: u64,
++    /// Which way.
++    pub direction: Direction,
++}
++
++impl fmt::Display for Drift {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "{}: {} is {} against the store's {} — {}‰ {}",
++            self.constant, self.quantity, self.model, self.measured, self.permille, self.direction
++        )
++    }
++}
++
++/// The verdict of comparing a model with a store, and the tolerance it was judged at.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Agreement {
++    /// Every quantity compared, in a fixed order: the store's three file sets, their sum, then one per
++    /// query the run asked.
++    pub drifts: Vec<Drift>,
++    /// How far apart the model and the store may be, in per-mille — the model's own
++    /// [`Model::agreement_permille`], carried here so a report can state the rule it applied.
++    pub tolerance_permille: u64,
++    /// `true` when every drift is inside the tolerance.
++    pub within: bool,
++}
++
++impl fmt::Display for Agreement {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        // A report lists what failed when something failed, and everything when nothing did: a reader of a
++        // green line wants the numbers, and a reader of a red one wants the two or three that moved rather
++        // than the whole list.
++        let listed: Vec<&Drift> = if self.within {
++            self.drifts.iter().collect()
++        } else {
++            self.drifts
++                .iter()
++                .filter(|drift| drift.permille > self.tolerance_permille)
++                .collect()
++        };
++        let said: Vec<String> = listed.iter().map(|drift| drift.to_string()).collect();
++        if self.within {
++            write!(
++                formatter,
++                "the model agrees with the store within {}‰: {}",
++                self.tolerance_permille,
++                said.join("; ")
++            )
++        } else {
++            write!(
++                formatter,
++                "the model has drifted from the store (more than {}‰): {}",
++                self.tolerance_permille,
++                said.join("; ")
++            )
++        }
++    }
++}
++
++/// The model's answer for one usage, as the lines a page quotes.
++///
++/// [`Estimate::lines`] is `name=value`, one metric per line, in a fixed order — the shape
++/// `lakelet/4.19-backup-restore`'s drill prints and the shape a counter gate parses — so that
++/// `docs/capacity.md` can carry the model's own output rather than a table somebody typed. The spec
++/// re-runs [`Estimate::text`] and compares it with the block on the page line for line, which is the only
++/// thing that keeps a page full of numbers from ageing (`lakelet/4.16-profiling`'s rule), and the reason
++/// there is no clock, no float and no path in any line.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Estimate {
++    /// The model that answered.
++    pub model: Model,
++    /// The question it answered.
++    pub usage: Usage,
++}
++
++impl Estimate {
++    /// The answer for the model's own default question ([`Model::default_usage`]).
++    ///
++    /// This is the block `docs/capacity.md` carries: the page answers its title question with the model's
++    /// output, so the page cannot say something the model does not say.
++    #[must_use]
++    pub const fn of(model: &Model) -> Self {
++        let _ = model;
++        panic!("lakelet/4.20-capacity-model: the answer for the model's own default question")
++    }
++
++    /// The answer for a usage somebody states, which is what a tradeoff table is made of.
++    #[must_use]
++    pub const fn for_usage(model: &Model, usage: &Usage) -> Self {
++        let _ = (model, usage);
++        panic!("lakelet/4.20-capacity-model: the answer for a usage somebody states")
++    }
++
++    /// The answer as `name=value` lines, in a fixed order.
++    ///
++    /// Integers only, and the two groups are the two halves of the answer: what the store holds (bytes,
++    /// then the shares of those bytes) and what it costs (micro-units, then the shares of the bill). The
++    /// period every money line is for is [`DAYS_PER_MONTH`] days.
++    #[must_use]
++    pub fn lines(&self) -> Vec<String> {
++        todo!(
++            "lakelet/4.20-capacity-model: the answer as `name=value` lines, in a fixed order, \
++            integers only"
++        )
++    }
++
++    /// The same lines as one string, which is what a page carries and what a spec compares.
++    #[must_use]
++    pub fn text(&self) -> String {
++        todo!(
++            "lakelet/4.20-capacity-model: the same lines as one string, which is what a page carries"
++        )
++    }
++}
++
++impl fmt::Display for Estimate {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.text())
++    }
++}
++
++/// Three parts as whole per-mille of their total, with the largest carrying the rounding.
++///
++/// The three add up to exactly `1000` or the page's percentages would add up to 99, which is the shape
++/// `lakelet/4.15-budget-regression`'s phase shares have. The largest part answers for the rounding
++/// because it is the one whose figure is least sensitive to being one per-mille off. A total of zero —
++/// a usage with no events, no series and no queries — is three zero shares rather than a division.
++fn shares(parts: (u64, u64, u64)) -> (u64, u64, u64) {
++    let (first, second, third) = parts;
++    let whole = first.saturating_add(second).saturating_add(third);
++    if whole == 0 {
++        return (0, 0, 0);
++    }
++    let floored = (
++        first.saturating_mul(1000) / whole,
++        second.saturating_mul(1000) / whole,
++        third.saturating_mul(1000) / whole,
++    );
++    let rounding = 1000u64.saturating_sub(
++        floored
++            .0
++            .saturating_add(floored.1)
++            .saturating_add(floored.2),
++    );
++    if first >= second && first >= third {
++        (floored.0.saturating_add(rounding), floored.1, floored.2)
++    } else if second >= third {
++        (floored.0, floored.1.saturating_add(rounding), floored.2)
++    } else {
++        (floored.0, floored.1, floored.2.saturating_add(rounding))
++    }
++}
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 925bbe6..752d87e 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -59,6 +59,10 @@ pub mod cardinality;
+ // manifest is a log, a restore that verifies what it reads before it writes anything, and the two
+ // numbers a drill measures.
+ pub mod backup;
++// `lakelet/4.20-capacity-model`: what a store this shape costs to run — the constants a page
++// answers a capacity question from, the arithmetic that answers it, and the comparison that goes
++// red when a constant stops matching what the store wrote.
++pub mod cost;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/tests/budget_cost.rs b/tests/budget_cost.rs
+new file mode 100644
+index 0000000..2d9c649
+--- /dev/null
++++ b/tests/budget_cost.rs
+@@ -0,0 +1,440 @@
++//! The capacity lane's harness for `lakelet/4.20-capacity-model`.
++//!
++//! This file is the course's, not the learner's. It is what `kiln check lakelet/4.20-capacity-model
++//! --slow` runs, and the numbers it prints are compared with the baselines in
++//! `course/tracks/lakelet/budget/4.20-capacity-model.toml`.
++//!
++//! What it measures is **bytes and counts, never the clock**: a store is built through the real write
++//! path, the model in `src/engine/cost.rs` is asked what it thinks that store weighs, and the two are
++//! put side by side. A count is the same number on a loaded machine as on an idle one, which is why
++//! `kiln`'s budget gate compares counts (handoff M2 §1.1) and why no run of this file can flake because
++//! something else was compiling. `cargo test -p lakelet --test budget_cost -- --nocapture` prints the
++//! lines by hand; the `lakelet-budget` prefix is what the gate reads.
++//!
++//! # This lane is the step's judgement, and the only lane where a *model* is at stake
++//!
++//! Every other budget lane in this track pins the store: what the write path cost
++//! (`tests/budget.rs`), what a segment weighs (`tests/budget_segments.rs`), how much pruning saved
++//! (`tests/budget_pruning.rs`). This one pins the gap between **what the code says the store costs and
++//! what the store actually wrote**. That gap is the failure the step exists for: a constant in
++//! `Model::DEFAULT` that was measured once and never again keeps being quoted by
++//! `docs/capacity.md` long after the encoder under it changed, and a capacity plan built on it is wrong
++//! in a confident voice. So the model's constants and the store's own numbers are in one lane, and the
++//! `drift_*` lines are the comparison in per-mille — an integer ratio of two counts, which is the only
++//! kind of number this gate can judge.
++//!
++//! # The workload
++//!
++//! Deliberately the same store `lakelet/4.14-index-pruning` and `lakelet/4.15-budget-regression` build:
++//! **twenty-four sealed segments, one hour each, sixty records each** — thirty samples of
++//! `cpu,host=h{i}`, the segment's own host, and thirty of `cpu,host=fleet`, a series every segment
++//! carries. Nothing here reads a clock or a seeded generator: the epoch, the timestamps, the series and
++//! the values are arithmetic on constants, so two runs on two machines write the same bytes.
++//!
++//! Where this file differs from its siblings is that it also writes the **log**: every batch goes
++//! through `Spool::append` before `Segments::seal` closes it, because the log is part of what a store
++//! weighs (`lakelet/4.17-soak` counts the same bytes as `store_bytes`) and the write path never
++//! truncates it. A capacity model that counted only segments would miss the majority of the bytes this
++//! store holds, and the `log_bytes` line is where that is visible.
++//!
++//! # What each count is, and why the drift lines are ratios
++//!
++//! The first block is the store, measured on the disk rather than asked of the manifest: `segment_bytes`,
++//! `index_bytes`, `log_bytes` and their sum `on_disk_bytes`, with `records`, `series` and `series_slots`
++//! behind them. `series_slots` is the number of (segment, series) pairs — twenty-four segments holding
++//! two series each is forty-eight — and it is a different number from `series` whenever a series appears
++//! in more than one segment: it is what the sidecar's per-series share is divided by, so it is the number
++//! the model's `series_overhead_bytes` is measured against.
++//!
++//! The two `*_query_bytes` lines are the other half of the model: what a query read, from the plan's own
++//! decision. The **selective** query asks for `h20`, which the manifest and then the index prune to a
++//! single segment; the **wide** one asks for `fleet`, which every segment carries, so the index can rule
++//! none of the twelve segments the range meets out. That pair is `lakelet/4.14-index-pruning` as a
++//! *cost*: twelve segments read instead of one, and the model predicts each from the records the plan
++//! opened rather than from anything about the query.
++//!
++//! Then the model's own numbers (`model_*`, from `Model::predicts`) and the comparison
++//! (`drift_*_permille_max`, one per quantity, and `agreement_permille_max`, the tolerance the model
++//! itself states). Each drift is a ratio of two counts — what the model said over what the store wrote —
++//! so it is as steady as the counts are, and it is an **upper bound** in the baseline because the model's
++//! job is to be close, not to be equal: `zstd` is allowed to answer different bytes for the same block
++//! across releases (`budget/4.15-budget-regression.toml` bounds byte counts the same way).
++//!
++//! `within_max` is the verdict, as a count: zero when the model agreed with the store at the tolerance
++//! it states, one when it did not. It is here so that a run in which the model drifted is a red gate
++//! naming a number rather than a reader's arithmetic, and `refused_max` is here for the usual reason: a
++//! store that refused something is a store this lane cannot judge by counts alone.
++//!
++//! A store directory of this run's own, made here rather than taken from `tests/support`: this file is
++//! the course's, and a harness a learner can break by editing their own fixture would judge the fixture
++//! instead of the store.
++
++use std::collections::BTreeSet;
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::compaction::{Segments, file_of};
++use lakelet::engine::cost::{Measured, Model, Reading};
++use lakelet::engine::index;
++use lakelet::engine::query::exec;
++use lakelet::engine::query::parse::{Statement, parse};
++use lakelet::engine::query::plan::Plan;
++use lakelet::engine::spool::Spool;
++use lakelet::protocol::batch::{self, Record};
++
++/// Segments the store is built from.
++const SEGMENTS: u64 = 24;
++
++/// Records one sealed segment holds: thirty of its own host and thirty of the fleet's.
++const PER_SERIES: usize = 30;
++
++/// Milliseconds between two samples of one series: two minutes, so one hour is thirty samples.
++const STEP: u64 = 120_000;
++
++/// One hour — the width of a segment, of a window, and of the arithmetic below.
++const HOUR: u64 = 3_600_000;
++
++/// The first timestamp of every segment, on an hour boundary.
++///
++/// `1_699_999_200_000` is `472_222 * HOUR` exactly, so a segment's span, the query's range and the
++/// grid its windows count on all start on numbers a reader can check by hand.
++const EPOCH: u64 = 472_222 * HOUR;
++
++/// The first hour the query asks about: half the store, so that the *manifest* prunes the other
++/// half.
++const FROM_HOUR: u64 = SEGMENTS / 2;
++
++/// The series every segment carries, so that a segment's vocabulary is never one term.
++const FLEET: &str = "fleet";
++
++/// The host the selective query asks for: the one series that appears in exactly one segment, and in
++/// the second half of the store.
++const SELECTIVE: u64 = 20;
++
++/// The records one sealed segment holds: its own host, then the fleet's, one series after the other.
++fn segment_records(segment: u64) -> Vec<Record> {
++    let start = EPOCH + segment * HOUR;
++    let mut records: Vec<Record> = (0..PER_SERIES)
++        .map(|offset| Record {
++            series: format!("cpu,host=h{segment}"),
++            ts_millis: (start + offset as u64 * STEP) as i64,
++            value: value_of(segment * PER_SERIES as u64 + offset as u64),
++        })
++        .collect();
++    records.extend((0..PER_SERIES).map(|offset| Record {
++        series: format!("cpu,host={FLEET}"),
++        ts_millis: (start + offset as u64 * STEP) as i64,
++        value: value_of(segment * PER_SERIES as u64 + offset as u64),
++    }));
++    records
++}
++
++/// The value of sample `position`: distinct bit patterns, and no structure a column can exploit.
++///
++/// The bytes a segment costs are half of what this lane compares, and a store of values a compressor
++/// likes would make the comparison an argument about `zstd` rather than about the model.
++fn value_of(position: u64) -> f64 {
++    let mixed = position.wrapping_mul(2_654_435_761) % 100_003;
++    mixed as f64 / 8.0
++}
++
++/// One query of this run, spelled over the last half of the store.
++fn text(series: &str) -> String {
++    format!(
++        "SELECT count(value) FROM cpu WHERE host = '{series}' AND ts BETWEEN {} AND {} \
++         GROUP BY time(1h), series",
++        EPOCH + FROM_HOUR * HOUR,
++        EPOCH + SEGMENTS * HOUR
++    )
++}
++
++/// A store directory of this run's own, removed when it is dropped.
++struct Dir {
++    /// Where the store lives.
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    fn new(label: &str) -> Self {
++        let path = std::env::temp_dir().join(format!(
++            "lakelet-budget-cost-{label}-{}",
++            std::process::id()
++        ));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where the store lives.
++    fn path(&self) -> &Path {
++        &self.path
++    }
++
++    /// How many bytes a file costs on the disk, or zero when it is not there.
++    ///
++    /// The disk's own answer and not the manifest's: what a segment *weighs* is what a backup copies
++    /// and an operator pays for (`lakelet/4.19-backup-restore` reads the same numbers), and a file
++    /// shorter than the manifest says it is would be caught here first.
++    fn bytes_of(&self, path: &Path) -> u64 {
++        std::fs::metadata(path)
++            .map(|metadata| metadata.len())
++            .unwrap_or(0)
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// One metric line: the shape `kiln`'s `bench-budget` gate parses.
++fn metric(name: &str, value: u64) {
++    println!("lakelet-budget {name}={value}");
++}
++
++/// What the run measured, before the model is asked anything.
++struct Counted {
++    /// Segments the store was built from.
++    segments: u64,
++    /// Records those segments hold.
++    records: u64,
++    /// Distinct series the store holds.
++    series: u64,
++    /// (segment, series) pairs the sidecars were written for.
++    series_slots: u64,
++    /// Bytes the segment files cost together.
++    segment_bytes: u64,
++    /// Bytes the sidecar index files cost together.
++    index_bytes: u64,
++    /// Bytes the log costs.
++    log_bytes: u64,
++    /// What the two queries read, selective first.
++    queries: Vec<Reading>,
++    /// Something the store refused, counted rather than raised.
++    refused: u64,
++}
++
++/// Build the store, ask both queries, and count what came out of the disk.
++///
++/// Failures are counted rather than raised for the reason `tests/budget_pruning.rs` counts its own:
++/// this file's numbers are what a gate compares, and a harness that panicked would report nothing at
++/// all instead of the count that moved. A build that failed leaves zeros behind, and a model compared
++/// with zeros drifts past every bound — so a store that could not be built is a red lane that says so
++/// rather than a blocked gate that says the course is unfinished.
++fn measure(directory: &Dir) -> Counted {
++    let mut counted = Counted {
++        segments: 0,
++        records: 0,
++        series: 0,
++        series_slots: 0,
++        segment_bytes: 0,
++        index_bytes: 0,
++        log_bytes: 0,
++        queries: Vec::new(),
++        refused: 0,
++    };
++    let mut vocabulary: BTreeSet<String> = BTreeSet::new();
++    let mut store = match Segments::open(directory.path()) {
++        Ok(store) => store,
++        Err(error) => {
++            eprintln!("the store could not be opened: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    let mut spool = match Spool::open(directory.path()) {
++        Ok(spool) => spool,
++        Err(error) => {
++            eprintln!("the log could not be opened: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++    };
++    for segment in 0..SEGMENTS {
++        let records = segment_records(segment);
++        // The write path, in the order a deployment uses it: the payload goes to the log first, and
++        // the flush closes the same records into a segment.
++        if let Err(error) = spool.append(&batch::encode(&records)) {
++            eprintln!("segment {segment} could not be appended: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        if let Err(error) = store.seal(&records) {
++            eprintln!("segment {segment} could not be sealed: {error}");
++            counted.refused += 1;
++            return counted;
++        }
++        counted.segments += 1;
++        counted.records += records.len() as u64;
++        // The vocabulary of this segment, which is what its sidecar was written for: from the records
++        // this file made rather than from the store, because what a *series* costs the index is a
++        // division by how many series share a segment and only the writer knows that.
++        let local: BTreeSet<String> = records.iter().map(|record| record.series.clone()).collect();
++        counted.series_slots += local.len() as u64;
++        vocabulary.extend(local);
++        counted.segment_bytes += directory.bytes_of(&file_of(directory.path(), segment));
++        counted.index_bytes += directory.bytes_of(&index::file_of(directory.path(), segment));
++    }
++    counted.series = vocabulary.len() as u64;
++    counted.log_bytes = directory.bytes_of(&spool.path());
++
++    let snapshot = store.snapshot();
++    for (quantity, series) in [
++        ("selective_query_bytes", format!("h{SELECTIVE}")),
++        ("wide_query_bytes", FLEET.to_owned()),
++    ] {
++        let query = match parse(&text(&series)) {
++            Ok(Statement::Query(query)) | Ok(Statement::Explain(query)) => query,
++            Err(refusal) => {
++                eprintln!("the {quantity} query was refused by the grammar: {refusal}");
++                counted.refused += 1;
++                return counted;
++            }
++        };
++        let plan = match Plan::of(&snapshot, &query) {
++            Ok(plan) => plan,
++            Err(refusal) => {
++                eprintln!("the {quantity} query was refused by the store: {refusal}");
++                counted.refused += 1;
++                return counted;
++            }
++        };
++        // What the plan decided to read, which is the number a capacity model prices: the segments it
++        // opens and the bytes they state. The executor is asked as well, and the two have to agree —
++        // a plan whose stated sizes were not what the reader paid would make this lane's query numbers
++        // a fiction.
++        let opened_records: u64 = plan
++            .opened()
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.records));
++        let opened_bytes: u64 = plan
++            .opened()
++            .iter()
++            .fold(0u64, |total, info| total.saturating_add(info.bytes));
++        let outcome = match exec::execute(&snapshot, &query) {
++            Ok(outcome) => outcome,
++            Err(refusal) => {
++                eprintln!("the {quantity} query could not run: {refusal}");
++                counted.refused += 1;
++                return counted;
++            }
++        };
++        if outcome.bytes_read() != opened_bytes || outcome.rows_scanned() != opened_records {
++            eprintln!(
++                "{quantity}: the plan stated {opened_bytes} bytes over {opened_records} records and \
++                 the run read {} over {}",
++                outcome.bytes_read(),
++                outcome.rows_scanned()
++            );
++            counted.refused += 1;
++        }
++        counted.queries.push(Reading {
++            quantity,
++            records: opened_records,
++            bytes: opened_bytes,
++        });
++    }
++    counted
++}
++
++#[test]
++fn the_capacity_lane() {
++    let directory = Dir::new("budget");
++    let counted = measure(&directory);
++
++    // The store, measured on the disk: what the three file sets weigh together, and the three counts
++    // behind them. Nothing below can mean anything about a store that has nothing in it.
++    metric("segments", counted.segments);
++    metric("records", counted.records);
++    metric("series", counted.series);
++    metric("series_slots", counted.series_slots);
++    metric("segment_bytes", counted.segment_bytes);
++    metric("index_bytes", counted.index_bytes);
++    metric("log_bytes", counted.log_bytes);
++    metric(
++        "on_disk_bytes",
++        counted
++            .segment_bytes
++            .saturating_add(counted.index_bytes)
++            .saturating_add(counted.log_bytes),
++    );
++
++    // The three rates the model carries, measured the way the model's own documentation says each one
++    // was: bytes per thousand records in the segments, per thousand (segment, series) pairs in the
++    // sidecars, and per thousand records in the log. Per-mille integers, never floats.
++    metric(
++        "bytes_per_sample_milli",
++        counted.segment_bytes.saturating_mul(1000) / counted.records.max(1),
++    );
++    metric(
++        "series_overhead_bytes_milli",
++        counted.index_bytes.saturating_mul(1000) / counted.series_slots.max(1),
++    );
++    metric(
++        "log_bytes_per_sample_milli",
++        counted.log_bytes.saturating_mul(1000) / counted.records.max(1),
++    );
++
++    // What each query read: the records the plan opened and the bytes those segments state. The pair of
++    // them is `lakelet/4.14-index-pruning` as a cost — a query the index cannot help reads twelve times
++    // the records — and it is what the model's query term is compared against.
++    for reading in &counted.queries {
++        metric(reading.quantity, reading.bytes);
++        metric(
++            &format!("{}_records", reading.quantity.trim_end_matches("_bytes")),
++            reading.records,
++        );
++    }
++
++    // The model, and the comparison. One `Measured` built from the counts above, one `agrees` call, and
++    // every line below is a number the model or the comparison produced — no line of this file is
++    // written by hand.
++    let measured = Measured {
++        segments: counted.segments,
++        records: counted.records,
++        series: counted.series,
++        series_slots: counted.series_slots,
++        segment_bytes: counted.segment_bytes,
++        index_bytes: counted.index_bytes,
++        log_bytes: counted.log_bytes,
++        queries: counted.queries.clone(),
++    };
++    let model = Model::DEFAULT;
++    let predicted = model.predicts(&measured);
++    metric("model_segment_bytes", predicted.segment_bytes);
++    metric("model_index_bytes", predicted.index_bytes);
++    metric("model_log_bytes", predicted.log_bytes);
++    metric("model_on_disk_bytes", predicted.on_disk_bytes);
++    metric(
++        "model_bytes_per_sample_milli",
++        predicted.bytes_per_sample_milli,
++    );
++    // The model's own constants, as counts: what the page quotes, in the lane that judges it.
++    metric("model_bytes_per_sample", model.bytes_per_sample);
++    metric("model_series_overhead_bytes", model.series_overhead_bytes);
++    metric("model_log_bytes_per_sample", model.log_bytes_per_sample);
++    metric("model_bytes_per_query", model.bytes_per_query);
++    for reading in &measured.queries {
++        metric(
++            &format!("model_{}", reading.quantity),
++            model.query_bytes(reading),
++        );
++    }
++
++    let agreement = model.agrees(&measured);
++    for drift in &agreement.drifts {
++        // An upper bound, and named after the *quantity* that was compared rather than the constant
++        // behind it: a constant has more than one use, and which use moved is what a reader needs.
++        metric(
++            &format!("drift_{}_permille_max", drift.quantity),
++            drift.permille,
++        );
++    }
++    metric("agreement_permille_max", agreement.tolerance_permille);
++    metric("within_max", u64::from(!agreement.within));
++
++    // A store that refused something is a store this lane cannot judge by counts alone.
++    metric("refused_max", counted.refused);
++}
