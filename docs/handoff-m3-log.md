@@ -1419,3 +1419,60 @@ $ kiln verify lakelet（作者在同一副本上）→ 20/20 judged step(s) pass
 **这一步钉下来的两件事**：① **4.20 落地**（**B4 完成**：4.15–4.20 六步；phase D 余 4.21–4.24）；
 ② **一条新的造题经验**：`const` 会把“桩”逼成两种形状，写作业书时要先看签名能不能容下 `todo!()`。
 发现的四件事（日志吃掉 885‰ 的字节、侧车每系列开销是个除法、`SegmentInfo` 字段可见性不一致）记在 §5。
+
+## 段 26：B5a — 4.21 `store/tiering@apply` + `outbound/http-client@design`（端口两个实现，套件跑两遍）
+
+**4.21 做了什么**：`spec/4.21/tiering.rs`（1656 行、**27** 用例）、`scaffold/4.21-cold-tiering.patch`
+（2726 行、**+2651 / −0**、10 个文件：四个 tier 契约桩（**50 个 `todo!()`**）+ 完整端点 `tests/s3_stub.rs`（700）+ 夹具
+`tests/support/tier.rs`（318）+ `conformance.toml`（`backends = ["local"]`）+ `Cargo.toml` 的 `sha2`/`hmac` 与三处标记块）、
+`solutions/4.21-cold-tiering.patch`（1124 行、**+641 / −196**，只碰五个文件：四个 tier 件与 `conformance.toml`）、正文 360 行。
+`track.toml` 未动（10 must）。两个树比对过：把两份补丁打到全新 `base20` 副本上与开发树 `diff -r` → **完全一致**。
+
+五条不变量：① **端口是 blob 而不是段**（`put`/`get`/`delete`/**分页 `list`**，前缀随端口携带，两个实现：本地目录与 S3 形状）；
+② **tier 的 listing 是权威**，不新增任何持久格式（清单不动——4.9 的规格钉了 v2 的版本字节并拒绝 v1）；
+③ **两个过程与它们的顺序**：`sweep` 先 `put` 再删本地（中间那个窗口从两侧都读得出来：文件还在、对象是同一批字节），
+`hydrate` 把缺失/长度不对的本地文件取回来并照清单的长度校验；④ **引擎的读路径一行未改**：冷店靠 hydrate 使目录与清单重新一致；
+⑤ **HTTP 到 design 深度**：规范请求 + 签名头 + `x-amz-content-sha256` + 有界重试（安全的原因是 **key 就是幂等键**）+ 分页循环。
+SigV4 的独立地面：用例 13 钉的是 **AWS 自己文档里的 get-vanilla 向量**（`5fa00fa3…fbf31`），不是自洽。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane21`：4.1…4.21 逐级 `run`+`solution`，再 `check --slow`）：
+
+```
+$ kiln selftest lakelet/4.21-cold-tiering --track lakelet      # 80s
+    scaffold ✓ the spec fails as it must（第一条红：a_listing_that_never_advances_is_refused…）
+    solution ✓ reference patch applies / solution ✓ the spec passes
+    gates ✓ 10/10 must green
+$ kiln check lakelet/4.21-cold-tiering --slow                  # 全新副本，56s
+  ✓ slow:conformance@2 2 backend(s) pass the same suite: local ✓, s3 ✓
+  ✓ slow:mutants@80 10/12 mutant(s) killed (83%, needs ≥80%)（走查 26s）  → 10/10 must gate(s) passed
+$ 同一棵树两个后端手工重跑：KILN_BACKEND=local 27 passed · KILN_BACKEND=s3 27 passed
+$ kiln spec manifest --track lakelet → 21 pinned（4.21 的 sha256 与清单一致：beaa846a…）；scaffold 删除 0 行
+$ kiln lint-caps / links / i18n status / probe --check → 全 exit 0 · cargo test -q -p kiln → 322+21+1 · clippy 干净 · fmt 干净
+$ cargo build --offline -q → exit 0（`sha2`/`hmac` 都在本机缓存里，没加 `base64`）
+```
+
+**顺序演练**（我自己重做，不只读报告）：把 `sweep` 里的 `objects.put` 与 `remove_file` 对调 →
+
+```
+the_window_between_the_object_and_the_delete_is_readable_from_both_sides --- FAILED
+  panicked at tests/spec_tiering.rs:611: and the local file is still where it was, because the delete
+  had not happened yet: the ordering is what leaves the segment in both places rather than in neither
+回滚 → test result: ok. 1 passed; 0 failed（26 filtered out）
+```
+
+**两个不可杀位点**（`slow:mutants@80` 10/12）：都在 `http.rs`——读循环的 `buffer.len() >= end + length`（`>=`→`>` 只对“不关连接的对端”
+有区别，而那是超时不是失败）与防御性的 `HEAD_LIMIT` 边界（64 KiB 的头部两种写法都被同一类拒绝）。与 4.9 的 `with_capacity` 同一类
+（§1 第 11 条），门未改；作者补的是真缺口（第一轮走查的 3 个存活位点里 `filesystem.rs` 的“不存在的 tier 根是空列表而不是拒绝”
+现在有一条用例）。
+
+**与作业书不同的六处**（都被接受）：S3 那一半**每次运行都跑**（见 §1 第 20 条的框架分歧）；case 8 的窗口从 `put` 进入（`Losing` 端点）
+而不是从 delete；分页循环放在 `tier::listing`（两个后端都要判到）；前缀随端口携带；不加 `base64`；`hydrate` 接活着的 `&Segments`
+且页面把“已停店的后果”写清楚（第三个证人，§5 已记）。规格因此从 ~20 变成 27 条。
+
+**环境事实（影响 plan §9 腿 6）**：本机的容器引擎目前坏了——`podman run --rm alpine:3.20 true`（以及 `debian:bookworm-slim`、
+强制 arm64/amd64）全报 `creating overlay mount … input/output error`，`podman images` 只能列出 `<none>:<none>`，`podman info` 连 host 段都回不来；
+而 B0b 当时实测过容器能启。因此 4.22 的 `container-repro` 会落到 **blocked**，腿 6 的第二半（弄坏 Dockerfile → 门红）在引擎恢复前
+无法取证。已告知用户；不在未确认的情况下动 `podman system reset`（那会抹掉离线故事依赖的 15 个本地镜像）。
+
+**这一步钉下来的两件事**：① **4.21 落地**（phase E 开始；还差 4.22–4.24）；② **新的框架分歧成了规则（第 20 条）**：
+`mutants` 跑一遍、`conformance` 按后端跑——同时上两道门的步骤必须让每次运行都覆盖后端特有的那些行。

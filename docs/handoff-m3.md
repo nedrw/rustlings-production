@@ -32,8 +32,9 @@
 | B4d | `course(lakelet/4.18-cardinality-cost): cardinality is the bill, and the cap is a counted policy`（`dc8f159`；框架 `2d1c585` + `0c0300d` + `76b755f`，文档 `f4fd31c`） | 4.18 正文（teach，16 用例）+ `cardinality/{cap,mod}.rs`（带上限的准入、按系列计价、从日志与侧车索引重建的账本、`offered = admitted + rejected`）+ `lakeletq inspect series` + `docs/cardinality.md` + `soak/4.18-cardinality-cost.toml`（复跑 4.17 的界，未动）；**变异门的三次修正**：位点按文本锚定（`76b755f`）、抽样 12（`0c0300d`）、范围＝本步写下的行（`2d1c585`），并因此给 4.14/4.17 各补了三条真缺口的用例 |
 | B4e | `course(lakelet/4.19-backup-restore): a copy is a log, a restore is an ordered write` | 4.19 正文（teach，19 用例）+ `backup/{mod,manifest,restore}.rs`（副本清单＝4.4 的日志格式、只取清单点名的段与日志已证前缀、先全验后写且最后写 `segments.manifest`）+ `cli/backup.rs`（`backup`/`restore`/`drill` 三命令）+ 装置 `tests/sim_backup.rs`（完整，695 行）+ `sim/4.19-backup-restore.toml` + `docs/dr-drill.md`（RTO/RPO，带一块可逐行复跑的确定性输出）；`slow:sim@3` `5b740412/aacc05b0/b52d27f8`、`slow:mutants@80` 12/12 |
 | B4f | `course(lakelet/4.20-capacity-model): the model and the comparison, judged in one lane` | 4.20 正文（teach，14 用例）+ `engine/cost.rs`（`Model`/`Usage`/`Estimate`/`Measured`/`Predicted`/`Drift`/`Agreement`：整数微单位、无浮点、不读任何东西）+ 完整装置 `tests/budget_cost.rs` + `budget/4.20-capacity-model.toml`（35 计数）+ `docs/capacity.md`（模型的 25 行块 + 保留期表，规格逐行/逐格重算）；`slow:bench-budget@10` 实测：模型与店之间的漂移 23/0/0/2/12/24 ‰；**演练**：把 `bytes_per_sample` 4→5（20%）→ 35 个计数里 10 个越界（点名 `drift_segment_bytes_permille_max 181 > 40`、`within_max 1 > 0`）、`9/10 must`；回滚 `10/10` |
+| B5a | `course(lakelet/4.21-cold-tiering): the tier is a port, the client signs, and the suite runs twice` | 4.21 正文（deepen，**27** 用例）+ `tier/{mod,http,s3,filesystem}.rs`（blob 端口 `put/get/delete/分页 list`、`Policy`、`sweep`（先 put 后删本地）与 `hydrate`）+ 完整装置 `tests/s3_stub.rs`（进程内 S3 形状端点，带请求日志与故障注入）+ `tests/support/tier.rs`（`KILN_BACKEND`）+ `conformance.toml`；`slow:conformance@2` `local ✓ s3 ✓`、`slow:mutants@80` 10/12（83%，两个不可见位点见 §5）；SigV4 用 AWS 自己的 get-vanilla 向量钉住；演练：把顺序倒过来（先删本地）→ `the_window_between_the_object_and_the_delete_is_readable_from_both_sides` 红 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.20；还差 4.21–4.24）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.21；还差 4.22–4.24）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -146,6 +147,18 @@
   规格没有为此发明一个新输入。收尾时可考虑在 `docs/cardinality.md` 里点一句与它的关系。
 - **`SegmentInfo` 的字段可见性不一致（4.20 顺带发现，未修）**：`bytes`/`records` 是 pub 字段，而时间范围是私有
   字段 + 访问器。无实害，但“计划自己算出来的数”与“清单里读出来的数”被两种方式读。
+- **没有只读的 manifest 入口（4.19 发现，4.21 再次撞上，仍未修）**：4.21 的 `hydrate` 因此只能接一个**活着的**
+  `&Segments`（`Segments::open` 是唯一的门且会写），于是“一个已停进程的冷店根本无法打开”的后果只能写进页面与用例
+  （`a_stopped_store_whose_segments_are_cold_is_not_openable_at_all`、`the_way_back_for_a_stopped_store_is_one_copy_per_segment`），
+  key 恰好就是店自己的路径，所以手工回来的办法是“每段一次 copy”。**三个证人之后，这笔修正值得单独一批**：给
+  `compaction` 一个只读的 `Manifest::load(directory)`（`decode` 已存在，只是没暴露），让 4.19 的 `copy` 与 4.21 的
+  `hydrate` 都改用它——代价是两步的解补丁与 lane 要重跑（已向用户确认是否放进收尾）。
+- **`mutants` 只跑一遍 `run.cmd`（不带 `KILN_BACKEND`），与 `conformance` 的后端轮询不一致（4.21 发现，未修）**：
+  见 §1 第 20 条；当步的弥补是让每次运行都跑到 S3 那一半。框架侧两选一：走查也按后端跑（代价大），
+  或用 `conformance.toml` 里第一个声明的后端（代价小、语义清楚）。
+- **scaffold 状态的警示与 `tests/support/mod.rs` 的耦合（4.21 提醒，未修）**：4.21 的 scaffold 里有 31 条未使用警告
+  （`todo!()` 之后才被调用的私有助手、未用 import），学员在写完之前一直看着；另外 `tests/support/**` 被每个规格目标
+  编译，所以新增一个 support 模块会进入**所有**规格的编译面（一处坏掉就红一片）。两条都是课程造题的已知代价，记着即可。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
   第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
@@ -208,3 +221,11 @@
     const 上下文允许的），所以那些方法用单字面量的 `panic!("lakelet/<step>: …")`，行为一样是运行时失败、
     能过 `no-todo`门，但形状不同。**推论**：如果一个 `const`（如 4.20 的 `Usage::DEFAULT`）调用了某个函数，
     那个函数不能是桩——否则 scaffold 连编译都过不了，而契约要求 scaffold “能编译、跑测试失败”而不是“编译失败”。
+
+20. **`mutants` 与 `conformance` 对“这个套件跑几遍”的意见不一致——同时上两道门的步骤要自己弥补**（4.21 实测）。
+    `conformance@N` 会把 step 的 `run.cmd` 按 `conformance.toml` 的每个后端各跑一遍（带 `KILN_BACKEND=<name>`），
+    而 `mutants` 只跑**一遍、不带这个变量**——于是“走在非默认后端才被覆盖的那些行”变异门根本走不到，会成批存活。
+    4.21 的实测：第一轮 6 个 S3 侧位点全数存活（`if !scheme.eq_ignore_ascii_case("http")`、`class() == Retryable`、
+    payload 哈希、读循环）。**当步的做法**：让**每一次**运行都跑 S3 形状的那一半（进程内端点每次开，`KILN_BACKEND`
+    只决定端口用例走哪个实现），于是走查的单次运行也能看到——这是“更多 conformance”而不是更少。
+    **框架侧的正解**（未做）：走查应当像 conformance 一样按后端跑，或至少用第一个声明的后端——已记入 §5。
