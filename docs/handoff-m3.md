@@ -1,9 +1,10 @@
 # M3 交接简报（T4 `lakelet` 的 24 步 + 三条新慢门 + 容器与性能基建）
 
-> **状态：施工中。** 计划与要拍板的决策在 [m3-plan.md](m3-plan.md)（已拍板：六个决策点全部按推荐）。
-> 分段施工记录在 [handoff-m3-log.md](handoff-m3-log.md)，按批次追加。
-> M3 收尾时这份文件会像 [handoff-m2.md](handoff-m2.md) 一样补全：范围与验收（§0）、三条新门的实测契约（§1）、
-> T4 的项目形状（§2）、施工中钉下来的决定（§3）、实测数字与验收演练（§4）、缺口（§5）。
+> **状态：T4 的 24 步已全部写成，M3 进入收尾。** 计划与要拍板的决策在 [m3-plan.md](m3-plan.md)（已拍板：六个决策点全部按推荐）。
+> 分段施工记录在 [handoff-m3-log.md](handoff-m3-log.md)，按批次追加（§0 的表逐行对应）。
+> T4 对课程侧的交接简介是 [t4-lakelet.md](t4-lakelet.md)（与 t1/t2/t3 同构）。
+> 收尾还差的事：探题（BP，T4 的 24 道）与验收跑（`cargo xtask ci`、离线快路、`verify lakelet --slow --json`）——
+> 后两项之一的第二半（腿 6）卡在本机容器引擎上（§5）。
 
 ## 0. 已落地的部分（截至本次提交）
 
@@ -106,6 +107,53 @@
     （`/private/tmp/l4b3-book-<step>.md`），派活时只说“先读那份文件”：worker 死掉时重派只要一段短提示，
     不必重贴整份契约（实测：4.10 的第一个 worker 因“terminal 建不了临时目录”而死，草稿只有
     拾起来才知道——那次是同一个 worker 的继承风险，也是第 11 条的同族问题）。
+
+## 2. T4 的项目形状
+
+一句话：**一个包 `app/lakelet`**（库 + 三个 bin：`lakeletd`/`lakeletq`/`lakelet-load`），模块边界是 4.1 建立并
+一直保持的（`src/engine/**` 不得命名服务层或 CLI，规格读源码杆住它）。完整的末态清单（引擎/服务/CLI/文档/装置）
+在 [t4-lakelet.md](t4-lakelet.md) §3；24 步各自建立的槽位在同一文件的 §2 表里。数据模型是 `Record { series, ts_millis,
+value }`，`series` = 指标名 + 标签集。
+
+## 3. 施工中钉下来的决定（架构类；逐步的决定见日志各段）
+
+1. **清单停在 v2**：4.9 的规格杆住版本字节并拒绝 v1，所以 4.21 的“段在哪里”不进清单——tier 的 listing 就是权威。
+2. **副本的清单就是 4.4 的日志格式**（4.19）：被中断的副本按前缀恢复，与写被中断的日志同一条规则。
+3. **先写下名字再写字节的顺序出现在每个新能力里**：副本（字节 → 清单条目）、恢复（清单最后写）、
+   tier（put → 删本地）、分层（put → 删本地）、可复现（两次构建只比字节）。
+4. **模型不测量**（4.20）：`cost.rs` 不读文件、不读钟，`Measured` 由装置拿真店给出；漂移是门的红，不是页面上的话。
+5. **端口用两次就值得一个 conformance 门**（4.21 的 tier 后端）；**一条命令被装置将在进程内调用的签名会被冻住**
+   （§1 规则 10 第三句）。
+6. **最深的 rung 是把页面跑起来**（4.24）：`operate` 不是再一页文档，而是“装置拿页面上的命令当自家二进制跑”。
+7. **每个门只判它能判的**：墙钟、RTO、分钟数永远不进判据（页面承载它们，机器名写清楚）；
+   而页面上的确定性块由规格重跑逐行比对（§1 规则 18）。
+
+## 4. 实测数字与验收演练
+
+- **全步判定**（24 步尾巴树，`kiln verify lakelet` 快路）：**23/24 pass · 1 failed · 0 not prepared ·
+  0 without content**（98 s）；唯一失败是 4.22 的 `container-repro`，原始行是引擎的
+  `creating overlay mount … input/output error`（§5）。
+- **`kiln verify lakelet --slow --json`**（lane24，824 s = 13m44s）：
+  `{blocked: 0, clean: false, failed: 1, not_authored: 0, passed: 23, steps: 24}`；唯一 `NOT PASSED`
+  是 `lakelet/4.22-reproducible-build failed — the specs pass but a must gate does not`。每步跑的门数（4.1→24）：
+  9/11/9/11/10/9/12/10/10/10/11/10/10/10/10/9/11/10/11/10/10/12/10/9。引擎修好后目标形状是
+  `{passed: 24, failed: 0, blocked: 0, not_authored: 0, clean: true}`。
+- **离线快路（plan §9 腿 1 的后半）**：全新副本 + `CARGO_NET_OFFLINE=true` + 全新 `XDG_CACHE_HOME`：
+  24 步的梯子全部在无网下建起来（`r=1 s=0` × 24），`verify lakelet` → `23/24 judged pass · 1 failed ·
+  0 not prepared`（255 s）；声明的四个镜像都在本机（`kiln images`）。差的那一个仍然是容器门。
+- **逐步**：4.1–4.24 的 `kiln selftest` 全部 `1/1 step(s) hold the contract`；慢门各自的原始行（三个种子与摘要、
+  变异比、预算计数、soak 计数器）在 [handoff-m3-log.md](handoff-m3-log.md) 的对应段里。
+- **plan §9 的六条腿**：① 离线快路的构建那一半已验（`cargo build --offline` 全绿）；② soak 抓到注入的泄漏（4.17）；
+  ③ sim 抓到不确定性（4.6）；④ 未分类的截断帧（4.2）；⑤ 去掉索引剪枝 → `pruning_rate 95→50`（4.14）；
+  ⑥ 弄坏 Dockerfile → `container-repro` 红（**欠，等引擎**）。
+- **课程自有检查**：`lint-caps` no issues · `links` 115 页/538 链全解 · `i18n` 0 error · `probe --check` 41/41 ·
+  `cargo test -q -p kiln` 344 passed（322+21+1）。
+- **`cargo xtask ci`**（`/private/tmp/l4b3-wrapup`）：全局阶段全绿——`cargo fmt --all --check`、
+  `rustfmt --check`（223 份课程文件）、`cargo clippy --workspace --all-targets -- -D warnings`、
+  `cargo test --workspace`（322+21+1）、spec integrity、`lint-caps`、`links`、`probe --check`——
+  然后是 `selftest --track mailer` → **`21/22 step(s) hold the contract`**，唯一失败
+  `mailer/1.21-container`（也是引擎）；`CI EXIT=1`，538 s（它在第一个失败 track 上停）。
+  **所以 ci 的 exit 0 与「`24/24 step(s) hold the contract`」卡的是引擎，不是树。**
 
 ## 5. 施工中记录、收尾时并入 §5 的缺口
 

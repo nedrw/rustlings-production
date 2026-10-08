@@ -1637,3 +1637,39 @@ stage 6 does not say what its `signal` is: the five parts are the whole of what 
 ② **规则 22**：尾巴树编译每一份规格，所以一份新规格的 lint 会让 24 步全红（4.24 的第一轮 lane 就是 `0/24`）——`clippy@4`
 比 `cargo clippy --all-targets` 多几条 lint。发现的四件事（tier 命令缺失、query vs inspect 的可见性、soak 界的不可复用、
 停守护的竞态）记在 §5。**下一步收尾**：探题（BP）与 `xtask ci`/离线/`verify --slow --json`（BV）。
+
+## 段 30：BV 收尾（T4 24/24 已写成；三条验收跑完两条半）
+
+**收尾新写的文档**：`docs/t4-lakelet.md`（T4 对课程侧的交接简介，与 t1/t2/t3 同构：一句话与资产、24 步一览、
+项目末态、装置与可复用模式、实测数字、范围内的缺口）；`docs/handoff-m3.md` 的 §2/§3/§4 补齐（项目形状指向 t4-lakelet、
+架构类决定七条、验收数字与六条腿状态），§0 表的“尚未落地”行改成“探题 + 收尾”。
+
+**原始结论行**（全在副本里跑，工作树未动）：
+
+```
+$ cargo xtask ci（/private/tmp/l4b3-wrapup）        # 538s 后停在第一个失败 track
+  ✓ cargo fmt --all --check / ✓ rustfmt --check（223 份课程文件）
+  ✓ cargo clippy --workspace --all-targets -- -D warnings / ✓ cargo test --workspace（322+21+1）
+  ✓ spec integrity / ✓ lint-caps / ✓ links / ✓ probe --check（41/41）
+  ✗ kiln selftest --track mailer → 21/22 step(s) hold the contract
+      唯一失败：mailer/1.21-container——`podman build` 的 overlay 挂载 I/O 错误
+  CI EXIT=1
+$ kiln verify lakelet --slow --json（lane24）      # 824s
+  totals: {blocked: 0, clean: false, failed: 1, not_authored: 0, passed: 23, steps: 24}
+  NOT PASSED: lakelet/4.22-reproducible-build failed — the specs pass but a must gate does not
+$ 离线快路：全新副本 + CARGO_NET_OFFLINE=true + 全新 XDG_CACHE_HOME
+  24 步梯子全部无网建成（r=1 s=0 × 24）→ verify lakelet → 23/24 judged pass · 1 failed（255s）
+  声明的四个镜像都在本机（kiln images：4 declared, 4 present）
+```
+
+**容器引擎的诊断（不在未确认时动它）**：`podman machine list` → `podman-machine-default* applehv, 6 weeks ago,
+Currently running, 4 CPU / 4 GiB`；VM 在跑，但它的 overlay 存储坏了（任何镜像的任何容器都报 `creating overlay mount …
+input/output error`），而 `kiln images` 仍能看到 4 个声明的镜像（列目录正常、启容器失败）。可逆的修法是
+`podman machine stop` + `start`（镜像在 VM 的盘上，重启不会抹掉）；`podman system reset` 会抹掉那 15 个引用，
+**不做**。已向用户确认。
+
+**它修好之后一次能解四件事**：① plan §9 腿 6 的第二半（弄坏 Dockerfile → `container-repro` 红，尺寸检查先跑，
+所以红是一个真句子）；② `cargo xtask ci` 的 exit 0 与 `24/24 hold the contract`（mailer/1.21 与 lakelet/4.22 同时绿）；
+③ `verify lakelet --slow --json` → `{passed: 24, failed: 0, clean: true}`；④ 4.22 的镜像尺寸与 `--check-config` 比对行。
+
+**收尾还剩**：探题（BP，T4 的 24 道）与上述三条验收（后两条卡引擎）。
