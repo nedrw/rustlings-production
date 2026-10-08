@@ -1,0 +1,2726 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 659597b..303fff4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,6 +26,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
+ # the representation small, this makes the bytes small, and it is the same format the `zstd` command
+ # line writes — so a segment can be looked at with a tool that is not this project.
+ zstd = "0.13"
++# `lakelet/4.21-cold-tiering`: the two crates a signed request is made of — the hash an S3-shaped
++# request names its own payload by, and the keyed MAC the signature is derived with. Neither of them
++# reads a clock: the instant the signature carries is a value the caller builds (`tier::Config`).
++sha2 = "0.10"
++hmac = "0.12"
+ # kiln:scaffold:end
+ 
+ # The test side: a harness a step ships with (`tests/fuzz_protocol.rs`, `tests/sim_wal.rs`) brings
+diff --git a/conformance.toml b/conformance.toml
+new file mode 100644
+index 0000000..05813a1
+--- /dev/null
++++ b/conformance.toml
+@@ -0,0 +1,11 @@
++# One suite, more than one implementation.
++#
++# `lakelet/4.21-cold-tiering` ships one spec (`tests/spec_tiering.rs`) and two implementations of
++# the tier's port: the local filesystem (`src/engine/tier/filesystem.rs`) and an S3-shaped endpoint
++# (`src/engine/tier/s3.rs`). The `conformance@2` gate reads this file, runs this step's `run.cmd`
++# once per backend with `KILN_BACKEND=` set to the name, and requires every run to pass — so the
++# suite is one suite, not two, and a backend that is half-written fails the step.
++#
++# It says one backend, because that is what the scaffold ships: the second entry is this step's
++# own work, and a declaration smaller than the gate's number is a failure rather than a block.
++backends = ["local"]
+diff --git a/src/engine/mod.rs b/src/engine/mod.rs
+index 752d87e..18c8320 100644
+--- a/src/engine/mod.rs
++++ b/src/engine/mod.rs
+@@ -63,6 +63,11 @@ pub mod backup;
+ // answers a capacity question from, the arithmetic that answers it, and the comparison that goes
+ // red when a constant stops matching what the store wrote.
+ pub mod cost;
++// `lakelet/4.21-cold-tiering`: where cold records live when they are not on this box — the port a
++// store hands its segments to, the rule that decides which ones are cold, and the two passes that
++// move them out and bring them back. Nothing here is read by a query: a store's readers go on
++// reading a directory, and hydrating a segment is what puts its bytes back in it.
++pub mod tier;
+ // kiln:scaffold:end
+ 
+ /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
+diff --git a/src/engine/tier/filesystem.rs b/src/engine/tier/filesystem.rs
+new file mode 100644
+index 0000000..5ded632
+--- /dev/null
++++ b/src/engine/tier/filesystem.rs
+@@ -0,0 +1,174 @@
++//! A directory as an object store: the boring implementation, and the reason it exists.
++//!
++//! Step `lakelet/4.21-cold-tiering`. A tier is a port ([`Objects`](super::Objects)), and a port
++//! with one implementation is a port nobody has tested: every function of the rule above it is
++//! written against whatever that one implementation happens to do. So this file is the *reference*
++//! implementation — the one that shows the port is not shaped around S3 — and it is the
++//! implementation this step's own suite runs against by default
++//! (`conformance.toml` at the project's root names it `local`).
++//!
++//! It is also, on purpose, **not a deployment**. A directory is on the same box as the store, in the
++//! same failure domain, on the same disk: moving bytes into one frees no space if it is a directory
++//! under the store, and a deployment that only ever used this implementation would be a deployment
++//! that never needed this step. What it is good for is what it does here — judging the rule, the
++//! passes and the ordering without a socket, a credential or a bucket — and for the shape of a
++//! second implementation, which is the whole reason the tier was written as a port.
++//!
++//! The three decisions in it that are decisions rather than plumbing:
++//!
++//! * **a key is a path, and a key that is not one is refused.** `../../../etc/passwd` is a string a
++//!   caller can hold, and a port that joined it to its root would write outside the tier. Nothing
++//!   here splits a path on the machine's separator either: a key is `/`-separated, so the bytes of
++//!   the tier's layout are the same on every machine, and a key never contains a `\` that a
++//!   different separator would read differently;
++//! * **`put` waits for the device, and for the directory entry that names the object.** The object
++//!   is what a sweep removes a local file *because of*, so an object that is not durable is a local
++//!   file that is gone with no copy behind it — the one state the ordering exists to prevent. The
++//!   file's contents and its name are two writes (`docs/crash-points.md`, point 4), and this is
++//!   both of them;
++//! * **the listing is one prefix, in order, and a cursor is a key.** The order is the key order —
++//!   the same order an S3-shaped endpoint answers in, which is what lets one suite judge both — and
++//!   a cursor is the last key of the previous page rather than an offset, because the tier changes
++//!   while it is walked (`lakelet/4.21`'s module docs argue it).
++
++use std::fs;
++use std::path::{Path, PathBuf};
++
++use super::{Cursor, Error, Objects, PAGE_KEYS, Page};
++
++/// A directory, as a tier.
++///
++/// Keys are paths below [`Directory::root`]: the object for `store-a/segments/0000000007.lks` is the
++/// file `<root>/store-a/segments/0000000007.lks`. A deployment chooses the root and the prefix it
++/// serves ([`Directory::with_prefix`]) — the prefix is what keeps two stores handed one directory
++/// apart from each other — and the page size it lists by ([`Directory::with_page`]).
++#[derive(Debug, Clone)]
++pub struct Directory {
++    /// The directory every object of this port lives below.
++    root: PathBuf,
++    /// The prefix this port's store uses, as [`Objects::prefix`] answers it.
++    prefix: String,
++    /// How many keys one page holds.
++    page: usize,
++}
++
++impl Directory {
++    /// A tier rooted at `root`, serving keys under no prefix, in pages of [`PAGE_KEYS`].
++    ///
++    /// The directory is *not* created here: a port is a value, and where its bytes live is what a
++    /// `put` decides about. A root that is not there yet answers an empty listing and a `get` of
++    /// `None`, which is what an operator with a bucket nobody has written to expects.
++    #[must_use]
++    pub fn new(root: impl Into<PathBuf>) -> Self {
++        Self {
++            root: root.into(),
++            prefix: String::new(),
++            page: PAGE_KEYS,
++        }
++    }
++
++    /// The same tier, serving the store whose keys live under `prefix`.
++    ///
++    /// `prefix` is what a pass derives a segment's key with
++    /// ([`object_key`](super::object_key)), so the two are one value here and a spec that varies it
++    /// varies both.
++    #[must_use]
++    pub fn with_prefix(mut self, prefix: &str) -> Self {
++        self.prefix = prefix.trim_end_matches('/').to_owned();
++        self
++    }
++
++    /// The same tier, listing `keys` keys to a page.
++    ///
++    /// Zero is read as one: a page that holds nothing would be a listing that never advances, and a
++    /// caller that asked for one asked for a bug rather than a size.
++    #[must_use]
++    pub fn with_page(mut self, keys: usize) -> Self {
++        self.page = keys.max(1);
++        self
++    }
++
++    /// Where this tier's objects live.
++    #[must_use]
++    pub fn root(&self) -> &Path {
++        &self.root
++    }
++
++    /// The file one key names, or a refusal when the key is not a path below the root.
++    ///
++    /// One rule, and it is about the **names** a key is made of: a key is one or more `/`-separated
++    /// names, and a name is neither empty nor `.` nor `..`. Everything a key can get wrong lands on
++    /// that one rule, which is why there is no second check beside it — an absolute key starts with
++    /// a name that is empty, a key ending at a separator ends with one, a key of no bytes is a
++    /// single empty name, and `..` is a name that walks up. A port whose keys could walk out of its
++    /// root is a port that can be told to write anywhere on the box, and the caller here is a key
++    /// derived from a store's manifest — a value this module writes and, one refactor later,
++    /// something else might.
++    fn path_of(&self, key: &str) -> Result<PathBuf, Error> {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: the file a key names below the root, and a refusal for a key that is not a path below it"
++        )
++    }
++
++    /// Where `key`'s file is, for a caller that has to look.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the key is not a path below the root ([`Directory::path_of`]).
++    pub fn path_of_key(&self, key: &str) -> Result<PathBuf, Error> {
++        self.path_of(key)
++    }
++
++    /// Every key below the root that starts with `prefix`, in key order.
++    fn keys_under(&self, prefix: &str) -> Result<Vec<String>, Error> {
++        let _ = prefix;
++        todo!(
++            "lakelet/4.21-cold-tiering: every key below the root that starts with a prefix, in key order"
++        )
++    }
++
++    /// Collect the files below `directory`, as keys relative to the root.
++    fn walk(&self, directory: &Path, keys: &mut Vec<String>) -> Result<(), Error> {
++        let _ = (directory, keys);
++        todo!(
++            "lakelet/4.21-cold-tiering: one directory of the tier, and then the directories below it"
++        )
++    }
++}
++
++impl Objects for Directory {
++    fn prefix(&self) -> &str {
++        todo!(
++            "lakelet/4.21-cold-tiering: the prefix this port's store lives under"
++        )
++    }
++
++    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), Error> {
++        let _ = (key, bytes);
++        todo!(
++            "lakelet/4.21-cold-tiering: write the object, and wait for the device — the bytes and the name that makes them an object"
++        )
++    }
++
++    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: the object's bytes, or `None` when there is no such file"
++        )
++    }
++
++    fn delete(&self, key: &str) -> Result<(), Error> {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: remove the object, and treat a key that is not there as the state the call asked for"
++        )
++    }
++
++    fn list(&self, prefix: &str, cursor: Option<Cursor>) -> Result<Page, Error> {
++        let _ = (prefix, cursor);
++        todo!(
++            "lakelet/4.21-cold-tiering: one page under a prefix, continuing after the cursor when one is given"
++        )
++    }
++}
+diff --git a/src/engine/tier/http.rs b/src/engine/tier/http.rs
+new file mode 100644
+index 0000000..07adc98
+--- /dev/null
++++ b/src/engine/tier/http.rs
+@@ -0,0 +1,419 @@
++//! A minimal HTTP/1.1 client: the request as a value, the answer as a value, and a bounded retry.
++//!
++//! Step `lakelet/4.21-cold-tiering`, and the shape it deepens is `relay/2.7-outbound-client`'s: a
++//! request line, headers, a body, and an answer read by the `content-length` it promised. What is
++//! *here* and not there is what a signed request needs and what a tier's caller needs:
++//!
++//! * **one value is both the bytes that are signed and the bytes that are sent.** [`Request`] keeps
++//!   the method, the path, the query **as pairs**, the headers and the body, and renders the wire
++//!   from them; [`Request::canonical_request`] is built from the same fields. The two cannot
++//!   disagree, because there is nothing to keep in step — a request whose signed string was
++//!   assembled beside the bytes it sends is a request that works until the day somebody tidies one
++//!   of the two, and then fails as a `403` nobody can read;
++//! * **a status class as a value.** [`Class`] is the four things a caller has to do something
++//!   about: `2xx` answered, `404` absent, every other `4xx` refused — no second attempt produces a
++//!   different answer — and `5xx` retryable. Nothing in this file knows what a bucket is;
++//! * **a bounded retry with no clock in it.** [`ATTEMPTS`] is a count, not a deadline, and there is
++//!   no sleep and no jitter between attempts: a retry policy that reads a clock is a policy two
++//!   machines disagree about, and this step's subject is a request whose bytes are the same on both
++//!   (`relay/2.8-retry-budget` is where a *budget* with a clock in it belongs, for a service that
++//!   talks to somebody else's server many times a minute; a tier is read and written by a pass, and
++//!   what it needs is a bound).
++//!
++//! Three things it deliberately does not do, each for a reason that costs a sentence rather than a
++//! silence: **no `https`** (a TLS stack is a deployment's decision, not a tier's; an endpoint that
++//! says `https` is [`Error::Invalid`](super::Error::Invalid) and says so), **no chunked answers**
++//! (a body without a `content-length` is read to the close, which is HTTP/1.0's rule and correct;
++//! a `transfer-encoding: chunked` body is *framing characters* read as an object, and the fix is a
++//! decoder here, not a longer deadline), and **no connection pool** (a tier's requests are what a
++//! pass makes — a sweep per hour, a hydrate per cold read — and a pool is a state machine whose
++//! whole cost is in noticing a socket that died while it was idle; one connection per attempt is
++//! the thing that has no state to get wrong).
++
++use std::io;
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpStream;
++use tokio::runtime::Runtime;
++
++use super::Error;
++
++/// How many times one request is sent before the client gives up.
++///
++/// Three, and it is a *count*: no deadline, no backoff, no jitter. What makes repeating safe is the
++/// caller's business and it is settled before this file is reached — a `put` repeats because its
++/// key is the identity of what it writes, a `get` and a `list` repeat because they change nothing,
++/// and a `delete` repeats because it is idempotent (`lakelet/4.21`'s module docs). A request that
++/// was not safe to repeat would be a request this client may not be handed.
++pub const ATTEMPTS: usize = 3;
++
++/// How much of a head a client will read before it calls the answer broken.
++///
++/// An answer's head is a status line and a handful of headers — this build's stub sends five — and
++/// something far longer than this is not a head anybody's endpoint meant to send. The bound exists
++/// because a client without one is a client that can be told to allocate by a socket.
++const HEAD_LIMIT: usize = 64 * 1024;
++
++/// One request: what is signed, and what goes on the wire.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Request {
++    /// The method, as it is written in the request line.
++    method: String,
++    /// The path, `/`-separated and not encoded: this value is what a signature is computed over.
++    path: String,
++    /// The query, as pairs rather than as one string: the canonical form sorts them, and a string
++    /// that arrived pre-sorted cannot be checked by anything.
++    query: Vec<(String, String)>,
++    /// The headers, in the order they were added.
++    headers: Vec<(String, String)>,
++    /// The body, byte for byte. `put` is the only operation here that has one.
++    body: Vec<u8>,
++}
++
++impl Request {
++    /// A request with no headers, no query and no body.
++    #[must_use]
++    pub fn new(method: &str, path: &str) -> Self {
++        Self {
++            method: method.to_owned(),
++            path: path.to_owned(),
++            query: Vec::new(),
++            headers: Vec::new(),
++            body: Vec::new(),
++        }
++    }
++
++    /// The same request, with one query parameter.
++    #[must_use]
++    pub fn with_query(mut self, name: &str, value: &str) -> Self {
++        self.query.push((name.to_owned(), value.to_owned()));
++        self
++    }
++
++    /// The same request, with one more header.
++    #[must_use]
++    pub fn with_header(mut self, name: &str, value: &str) -> Self {
++        self.headers.push((name.to_owned(), value.to_owned()));
++        self
++    }
++
++    /// The same request, carrying `bytes` as its body.
++    #[must_use]
++    pub fn with_body(mut self, bytes: impl Into<Vec<u8>>) -> Self {
++        self.body = bytes.into();
++        self
++    }
++
++    /// The method this request uses.
++    #[must_use]
++    pub fn method(&self) -> &str {
++        &self.method
++    }
++
++    /// The path this request names, as it was given.
++    #[must_use]
++    pub fn path(&self) -> &str {
++        &self.path
++    }
++
++    /// The query parameters, in the order they were added.
++    #[must_use]
++    pub fn query_pairs(&self) -> &[(String, String)] {
++        &self.query
++    }
++
++    /// The headers, in the order they were added.
++    #[must_use]
++    pub fn headers(&self) -> &[(String, String)] {
++        &self.headers
++    }
++
++    /// The body this request sends.
++    #[must_use]
++    pub fn body(&self) -> &[u8] {
++        &self.body
++    }
++
++    /// One header's value, matched without regard to case.
++    #[must_use]
++    pub fn header_of(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(found, _)| found.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++
++    /// The hex sha256 of the body: what this request names its own payload by.
++    ///
++    /// An S3-shaped endpoint wants it in `x-amz-content-sha256` and inside the signature, and the
++    /// one thing that matters is that the two see the same number — which is why the header is set
++    /// from this function *and* the canonical request calls it, rather than either of them holding
++    /// a copy.
++    #[must_use]
++    pub fn payload_hash(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the sha256 of this request's own body, in hex"
++        )
++    }
++
++    /// The path as a canonical request spells it: each segment percent-encoded, `/` kept.
++    fn canonical_uri(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the path as a signature spells it — each segment percent-encoded, `/` kept"
++        )
++    }
++
++    /// The query as a canonical request spells it: sorted by name, each name and value encoded.
++    fn canonical_query(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the query as a signature spells it — sorted by name, names and values encoded"
++        )
++    }
++
++    /// The request line's target: the path, and the query the way this request spells it.
++    fn target(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the request line's target: the path, and the query as this request spells it"
++        )
++    }
++
++    /// The string a signature is computed over: one value, from the request that is sent.
++    ///
++    /// `signed` is the header list the caller means to sign, in lower case and sorted; it is what
++    /// the canonical headers block holds, and the two are the same list by construction — a caller
++    /// that signed a header it did not send, or sent one it did not sign, is a `403` from an
++    /// endpoint that checked (`lakelet/4.21`'s spec asserts both directions).
++    ///
++    /// The payload hash is **this request's own** ([`Request::payload_hash`]) rather than a number
++    /// handed in, which is the whole reason this function takes a `&self`: a body that changes
++    /// after it was hashed changes the signature with it.
++    #[must_use]
++    pub fn canonical_request(&self, signed: &[&str]) -> String {
++        let _ = signed;
++        todo!(
++            "lakelet/4.21-cold-tiering: the string a signature is computed over, built from the request that is sent"
++        )
++    }
++
++    /// The bytes this request is on the wire.
++    fn wire(&self, authority: &str) -> Vec<u8> {
++        let _ = authority;
++        todo!(
++            "lakelet/4.21-cold-tiering: the bytes this request is on the wire: the request line, the headers, the length of the body, and the body"
++        )
++    }
++}
++
++/// One answer: its status, its headers and its body.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Response {
++    /// The status code, as the status line wrote it.
++    status: u16,
++    /// The headers, in the order they arrived.
++    headers: Vec<(String, String)>,
++    /// The body, as long as the `content-length` promised (or as long as the connection).
++    body: Vec<u8>,
++}
++
++impl Response {
++    /// The status code.
++    #[must_use]
++    pub fn status(&self) -> u16 {
++        self.status
++    }
++
++    /// One header's value, matched without regard to case.
++    #[must_use]
++    pub fn header(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(found, _)| found.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++
++    /// The body.
++    #[must_use]
++    pub fn body(&self) -> &[u8] {
++        &self.body
++    }
++
++    /// The body as text, for a caller that has to read a message out of it: an endpoint that
++    /// refuses explains itself in its body, and a refusal with the body thrown away is one an
++    /// operator cannot act on.
++    #[must_use]
++    pub fn text(&self) -> String {
++        String::from_utf8_lossy(&self.body).into_owned()
++    }
++
++    /// What a caller has to *do* about this answer.
++    #[must_use]
++    pub fn class(&self) -> Class {
++        todo!(
++            "lakelet/4.21-cold-tiering: what a caller has to do about this answer: answered, absent, refused or retryable"
++        )
++    }
++}
++
++/// The four things an answer can mean to a caller.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Class {
++    /// The request was carried out; the body is the answer.
++    Answered,
++    /// There is no such object. For a `get`, `None`; for a `delete`, already done.
++    Absent,
++    /// The endpoint refused, and repeating the request gets the same refusal.
++    Refused,
++    /// The endpoint could not answer, and the request may be sent again.
++    Retryable,
++}
++
++impl Class {
++    /// The word this class is spelled with in a report.
++    #[must_use]
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::Answered => "answered",
++            Self::Absent => "absent",
++            Self::Refused => "refused",
++            Self::Retryable => "retryable",
++        }
++    }
++}
++
++/// A client for one endpoint: a runtime, an authority, and the retry rule.
++///
++/// It owns the tokio runtime it blocks on, because everything above it is synchronous: the tier's
++/// port is a `put`/`get`/`delete`/`list` a caller may use from a pass that is not async, and a
++/// caller that had to be `async` would have been an engine that cannot run in a test
++/// (`lakelet/4.1-ingest-protocol`'s boundary). One runtime per port, and a current-thread one: a
++/// tier's requests are sequential, and a work-stealing pool would be threads this module never
++/// uses.
++#[derive(Debug)]
++pub struct Client {
++    /// The runtime every request is blocked on.
++    runtime: Runtime,
++    /// `host:port` — what a connection is opened to and what a `Host` header carries.
++    authority: String,
++}
++
++impl Client {
++    /// A client for `endpoint`, which is `host:port` or `http://host:port`.
++    ///
++    /// A port that is not written is `80`: this client speaks `http` and nothing else, so the
++    /// default is the scheme's. `https` is refused with the reason rather than attempted
++    /// (`Class`'s sibling decision above).
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the endpoint is not an authority this client can speak to, and
++    /// [`Error::Transport`] when the runtime itself cannot be built.
++    pub fn new(endpoint: &str) -> Result<Self, Error> {
++        let _ = endpoint;
++        todo!(
++            "lakelet/4.21-cold-tiering: an authority this client can speak to, and the runtime it blocks on"
++        )
++    }
++
++    /// The `host:port` this client connects to, which is also the `Host` header it sends.
++    ///
++    /// A signer has to put this on the request *before* it signs: `host` is part of every signed
++    /// header list (`lakelet/4.21`'s S3-shaped implementation is the caller), and a signer that
++    /// wrote its own idea of the authority would sign a request the endpoint did not receive.
++    #[must_use]
++    pub fn authority(&self) -> &str {
++        &self.authority
++    }
++
++    /// Send `request`, repeating it while the answer says to.
++    ///
++    /// Retryable is a `5xx` ([`Class::Retryable`]) and a transport failure — which are the same
++    /// thing to a caller: nothing about the request was decided. Everything else is returned as it
++    /// arrived, including a `4xx`, which is the point of [`Class::Refused`]: an attempt after it
++    /// gets the same answer, and the answer is what an operator has to read.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Transport`] when every attempt failed or the last one was retryable: after
++    /// [`ATTEMPTS`] of them, the endpoint's answer is a fact about the endpoint and not about this
++    /// request, and a caller has to decide whether to try the whole pass again (a sweep does, an
++    /// hour later, from a schedule it owns).
++    pub fn send(&self, request: &Request) -> Result<Response, Error> {
++        let _ = request;
++        todo!(
++            "lakelet/4.21-cold-tiering: send the request, and send it again while the answer says to — `ATTEMPTS` times, and no clock anywhere in it"
++        )
++    }
++
++    /// One attempt: connect, write, read the answer.
++    fn attempt(&self, request: &Request) -> Result<Response, Error> {
++        let _ = request;
++        todo!(
++            "lakelet/4.21-cold-tiering: one attempt: connect, write, read the answer"
++        )
++    }
++}
++
++/// Read one answer from `stream`: its head, and then the body it promised.
++///
++/// A body ends where the `content-length` says it does — not at the close of the connection, which
++/// is what reading to the end would wait for and which a keep-alive endpoint never does (`relay/2.7`
++/// measured that trap). An answer with no `content-length` is read to the close, which is HTTP/1.0's
++/// rule and the only other thing a body can mean.
++async fn read_answer(stream: &mut TcpStream) -> io::Result<Response> {
++        let _ = stream;
++        todo!(
++            "lakelet/4.21-cold-tiering: read a head, and then the body it promised"
++        )
++    }
++
++/// How many bytes the head promises, or `None` when it promises none.
++fn promised_length(buffer: &[u8], end: usize) -> io::Result<Option<usize>> {
++        let _ = (buffer, end);
++        todo!(
++            "lakelet/4.21-cold-tiering: how many bytes an answer's head promises, if it promises any"
++        )
++    }
++
++/// The status line and headers of `head`, with `body` as the answer's body.
++fn parse(head: &[u8], body: Vec<u8>) -> io::Result<Response> {
++        let _ = (head, body);
++        todo!(
++            "lakelet/4.21-cold-tiering: the status line and the headers of an answer"
++        )
++    }
++
++/// Where `needle` first stands in `haystack`.
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++        let _ = (haystack, needle);
++        todo!(
++            "lakelet/4.21-cold-tiering: where a needle first stands in a haystack"
++        )
++    }
++
++/// `text` with everything that is not unreserved percent-encoded, upper case, byte for byte.
++///
++/// The rule SigV4 writes down, and the reason it is here rather than in a caller: the path and the
++/// query are encoded the same way for the signature and for the wire, so a key with a space or a
++/// `+` in it is one request rather than two.
++fn encoded(text: &str) -> String {
++        let _ = text;
++        todo!(
++            "lakelet/4.21-cold-tiering: everything that is not unreserved percent-encoded, upper case"
++        )
++    }
++
++/// The sha256 of `bytes`.
++fn sha256(bytes: &[u8]) -> [u8; 32] {
++        let _ = bytes;
++        todo!(
++            "lakelet/4.21-cold-tiering: the hash every signed request is made of"
++        )
++    }
++
++/// `bytes` as lower-case hex.
++pub(crate) fn hex_of(bytes: &[u8]) -> String {
++        let _ = bytes;
++        todo!(
++            "lakelet/4.21-cold-tiering: bytes as lower-case hex"
++        )
++    }
+diff --git a/src/engine/tier/mod.rs b/src/engine/tier/mod.rs
+new file mode 100644
+index 0000000..62e9813
+--- /dev/null
++++ b/src/engine/tier/mod.rs
+@@ -0,0 +1,613 @@
++//! Where cold records live when they are not on this box: a port, a rule, and the two passes that
++//! carry it out.
++//!
++//! Step `lakelet/4.21-cold-tiering`. Every step before this one treated the store as a place on one
++//! machine: `lakelet/4.4-wal-recovery` replays its log, `lakelet/4.8-compaction` merges its
++//! segments, `lakelet/4.9-retention` decides what leaves for ever, `lakelet/4.19-backup-restore`
++//! moves the whole thing somewhere else. None of them has asked the question a store that is
++//! filling the disk it was given has to ask: the box is expensive, most of these segments are never
++//! read again, and **the bytes of a cold segment do not have to be on it**. This module is the
++//! answer, and the answer is three things rather than a filesystem trick: a *port* that says what a
++//! tier is, a *rule* that says which segments are cold, and two passes that move them out
++//! ([`sweep`]) and bring them back ([`hydrate`]).
++//!
++//! # The port is blobs, not segments
++//!
++//! [`Objects`] is `put`, `get`, `delete` and a listing that pages. Four calls, and every one of
++//! them is about **whole blobs under a key** — nothing in the port knows what a segment is, what a
++//! manifest is, or that this crate exists. That is the point of a port: [`filesystem`] is one
++//! implementation (a directory, and the one this course's own specs run against), [`s3`] is another
++//! (an S3-shaped endpoint over the client in [`http`]), and a deployment may have a third. What the
++//! port buys is the thing a store cannot get any other way: the tiering rule, the two passes and
++//! the safety argument written **once**, and run against every implementation
++//! (`docs/authoring.md`'s conformance gate, and `conformance.toml` at the project's root: this
++//! step's spec is run once per backend it declares).
++//!
++//! Absence is a value: `get` answers `None` for a key nobody wrote rather than an error, because
++//! "that blob is not in the tier" is the ordinary case of `hydrate` and the only honest answer to
++//! a question about something that was never put there. `delete` is idempotent for the same
++//! reason — a pass that deletes what is already gone has not failed — and it is safe to *repeat*
++//! for a third one: deleting the same key twice leaves the same tier.
++//!
++//! # The listing is the authority, and it pages
++//!
++//! A caller with a port must be able to answer "what is in the tier under this prefix" **without**
++//! asking the box's own disk, and [`Objects::list`] is that answer: keys in a deterministic order,
++//! one page at a time, with a [`Cursor`] naming where the next page starts. [`listing`] is the loop
++//! that walks the pages — it lives here, and not in a caller, because "the endpoint said there is
++//! more" is a fact only the loop can act on (`lakelet/4.21`'s page counts it, and the S3-shaped
++//! stub answers a page **shorter than the `max-keys` it was asked for**, which is the shape a
++//! first implementation gets wrong: it stops at the end of the first page and reports a store that
++//! is missing half its objects).
++//!
++//! A cursor is a key rather than an offset, and the reason is that the tier changes while it is
++//! walked: an offset counts what a prefix held when the walk began, so a key that arrives in the
++//! middle of a walk shifts every page after it, and a key that leaves makes the next page skip one.
++//! A key is a position that means the same thing whatever else happened.
++//!
++//! # The ordering, which is the whole safety argument
++//!
++//! [`sweep`] puts the object **first** and removes the local file **second**:
++//!
++//! | crash point | what is on the device | is the store still readable? |
++//! | ----------- | --------------------- | --------------------------- |
++//! | before the `put` returns | the segment's file, where it was | yes, unchanged |
++//! | between the `put` and the delete | the file **and** the object, the same bytes | yes — the reader reads the local file |
++//! | after the delete | the object | through [`hydrate`], before anything reads the segment |
++//!
++//! The middle row is the property: a crash in the window leaves the segment in *both* places, and
++//! the two are the same bytes because the `put` is what put them there. Nothing is ever in neither
++//! place, which is what the other order — delete, then `put` — would give a crash one instruction
++//! later: a manifest that names a segment whose bytes are in neither place, which is not a cold
++//! store, it is a lost one.
++//!
++//! The keys make a retried `put` safe as well. A segment's key is a function of its identity and
++//! the port's own prefix ([`object_key`]), so **the key is the idempotency key**: a `put` that was
++//! sent and answered into a lost connection, and sent again, writes the same object, and the second
++//! one is not a second copy. That is also why an S3-shaped implementation may retry a `put` at all
++//! (`http::ATTEMPTS`) — a request that can be repeated without changing the outcome is a request a
++//! client may repeat, and one whose key carried an instant or a counter would not be.
++//!
++//! # [`hydrate`] is how the store's readers stay untouched
++//!
++//! `lakelet/4.8-compaction` reads a **directory**: the manifest names segments, the files are there,
++//! and a segment whose file is not the length the manifest states is refused rather than read. This
++//! step does not change any of that — it cannot, and `lakelet/4.9-retention` is where the file that
++//! would have to change is pinned by an earlier spec: `segments.manifest` keeps its layout and its
++//! version byte. So the tier writes the bytes of a cold segment **back into the file the manifest
++//! already names**, checks the length it wrote against the manifest's number, and refuses — leaving
++//! no file behind — when the object it fetched is not that length. Hydration is what makes a
++//! directory agree with the manifest again, and it is why nothing in the engine's read path knows
++//! this module exists.
++//!
++//! A store whose cold segments are out of the box is therefore **not openable** by a process
++//! without a tier: `Segments::open` refuses it and names the file that is not there. That is the
++//! honest answer rather than a hole — a store that answered something from a manifest naming
++//! segments nobody has is a store whose answers are missing records — and it is the one thing to
++//! weigh before sweeping: the tier is for the process that owns the store (which holds the manifest
++//! in memory and hydrates the segment it is about to read), not for a stranger with `ls`.
++//!
++//! # The tier holds no manifest of its own
++//!
++//! What the tier holds is answered by [`Objects::list`], and **nothing here is written durably**:
++//! no index, no map from ordinal to key, no epoch. The alternative was a second manifest, and the
++//! argument against it is the one above turned around: a file that says what is in the tier is a
++//! file that can disagree with the tier, and a store that trusted it would refuse to open for a
++//! reason nobody could see — or worse, open and answer a hole. A tier that lost its listing is a
++//! tier that holds nothing, which is a truth a caller can act on (`hydrate` refuses, naming the key
++//! it needed, and the operator restores the bucket).
++//!
++//! Two smaller consequences are deliberate:
++//!
++//! * **the sidecar indexes are not tiered.** `lakelet/4.14-index-pruning`'s files are derived state
++//!   — a store without one answers the same questions having read more — and a tier that carried
++//!   them would be carrying a second copy of something that can be built again. A store that was
++//!   swept and hydrated may find an index beside a segment that was away; that is a *stale* index
++//!   for the same bytes, and `lakelet/4.14` reads a stale index as precision lost, never as a
++//!   record lost;
++//! * **the log is not tiered either.** `lakelet/4.4-wal-recovery`'s file is a prefix that a restart
++//!   replays, and what a segment holds is already derived from it; moving bytes out of the log
++//!   would mean rewriting the file a crash's readability is defined by. `lakelet/4.20-capacity-model`
++//!   measured what that costs (`log_share_permille`), and the honest sentence is that this step
++//!   makes the *segments* cheap and leaves the log where it is.
++//!
++//! # What this module does not do
++//!
++//! It reads no clock: [`Policy`] is applied at a `now` a caller hands in, and the S3-shaped
++//! implementation dates its signatures from a value in its [`s3::Config`] rather than from the
++//! machine, so two runs of the suite sign the same bytes (`lakelet/4.16-profiling` made the same
++//! decision about measurement, and `lakelet/4.3-write-path-adr` about flushing). It does not decide
++//! *when* a pass runs — [`sweep`] and [`hydrate`] are one pass each, for a task that decides the
++//! schedule, exactly as `Segments::compact` and `Segments::expire` are. And it does not delete
++//! anything the tier holds: `delete` is called for a key a `put` just wrote only by a caller that
++//! has decided to undo it, which nothing here does.
++//!
++//! One more thing is deliberately missing and worth naming: nothing here counts a *tier's* handles
++//! or bytes. `lakelet/4.17-soak` counts what a store holds open, and the files this module opens
++//! through [`Open`] are charged to the store that owns them — the segment file a `sweep` reads and
++//! the file a `hydrate` writes are the store's own. The connection an S3-shaped tier holds open is
++//! not counted, because it is not a file of the store's, and a soak that watched this module would
++//! need a counter of its own: that is a later step's business, not a silent hole here.
++
++pub mod filesystem;
++pub mod http;
++pub mod s3;
++
++pub use filesystem::Directory;
++pub use s3::{Bucket, Config};
++
++use std::fmt;
++use std::path::{Path, PathBuf};
++
++use crate::engine::compaction::{self, SegmentInfo, Segments};
++use crate::engine::soak::Open;
++
++/// How many keys a listing asks for in one page when its caller does not say.
++///
++/// The default is the number `ListObjectsV2` answers with when a caller names no `max-keys`, and it
++/// is a *default* rather than a rule: a page size is the caller's decision (it is what `max-keys`
++/// means on the wire), and both implementations here take one
++/// ([`Directory::with_page`](filesystem::Directory::with_page),
++/// [`Bucket::with_page`](s3::Bucket::with_page)). This step's own suite asks for pages of two keys,
++/// because a listing that pages cannot be judged on a store that fits in one page.
++pub const PAGE_KEYS: usize = 1000;
++
++/// One blob's name in the tier, as a page hands it back.
++///
++/// A cursor is a key and not an offset: see the module docs. It is opaque to a caller — the port
++/// promises one thing about it, which is that handing a page's `next` back asks for the page after
++/// that one, and nothing else is promised, because an S3-shaped endpoint hands back a token of its
++/// own invention (a base64 of the last key, in the implementation this course's stub speaks).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Cursor(String);
++
++impl Cursor {
++    /// A cursor naming `key`: where the next page of a listing starts.
++    #[must_use]
++    pub fn new(key: impl Into<String>) -> Self {
++        Self(key.into())
++    }
++
++    /// The text of this cursor, for a port that has to put it in a request.
++    #[must_use]
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for Cursor {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.0)
++    }
++}
++
++/// One page of a listing: the keys, and where the page after this one starts.
++///
++/// `next` is `None` exactly when the endpoint said there is nothing left — not when the page came
++/// back shorter than the size that was asked for. An S3-shaped endpoint answers short pages all the
++/// time (its own page size is not the caller's `max-keys`), so a caller that read `next` out of the
++/// length would call a third of a tier the whole of it.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Page {
++    /// The keys this page holds, in the port's deterministic order.
++    pub keys: Vec<String>,
++    /// Where the page after this one starts, or `None` when this was the last one.
++    pub next: Option<Cursor>,
++}
++
++/// What a tier is: whole blobs under a key, and the listing that says which.
++///
++/// Two implementations ship with this step — a directory ([`filesystem::Directory`]) and an
++/// S3-shaped endpoint ([`s3::Bucket`]) — and the two of them are why the rule and the passes above
++/// can be written once. A third would be a deployment's own (an object store that is not S3, a
++/// different vendor's API); nothing here would have to change for it.
++pub trait Objects {
++    /// The prefix every key of this port's store lives under.
++    ///
++    /// This is the port's one piece of *store* knowledge: a pass derives a segment's key from the
++    /// segment's identity and this prefix ([`object_key`]), so two stores handed the same tier do
++    /// not collide — and a caller that has a port and nothing else can ask what is in the tier
++    /// under this prefix without consulting a local disk.
++    fn prefix(&self) -> &str;
++
++    /// Write `bytes` under `key`, replacing whatever was there.
++    ///
++    /// Idempotent, which is what makes a `put` a request a client may repeat: the same key and the
++    /// same bytes leave the same object, whatever happened to the attempt before this one.
++    ///
++    /// # Errors
++    ///
++    /// The port's own refusals: a tier that could not be reached ([`Error::Transport`]), one that
++    /// refused the request ([`Error::Refused`]), or a local directory that would not take the write
++    /// ([`Error::Local`]).
++    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), Error>;
++
++    /// Read the bytes under `key`, or `None` when the tier holds no such object.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Transport`] when the tier could not be reached, [`Error::Refused`] when it refused,
++    /// and [`Error::Local`] when a local directory could not be read.
++    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error>;
++
++    /// Remove `key` from the tier.
++    ///
++    /// Idempotent: a key that is not there is not a failure, because a pass that deletes what is
++    /// already gone has reached the state it asked for.
++    ///
++    /// # Errors
++    ///
++    /// The same three classes as [`Objects::put`].
++    fn delete(&self, key: &str) -> Result<(), Error>;
++
++    /// One page of the keys under `prefix`, continuing after `cursor` when one is given.
++    ///
++    /// # Errors
++    ///
++    /// The same three classes as [`Objects::put`].
++    fn list(&self, prefix: &str, cursor: Option<Cursor>) -> Result<Page, Error>;
++}
++
++/// The tier rule as a value: how long a segment stays on this box before it may leave.
++///
++/// A policy is data on purpose, and it is the sibling of `lakelet/4.9-retention`'s
++/// [`Policy`](crate::engine::retention::Policy) rather than a second idea: that one says what leaves
++/// the store for ever, this one says what leaves the *box* and stays readable. Both are applied at
++/// a `now` a caller hands in, both answer a cutoff, and both keep what they cannot judge.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Policy {
++    /// How many milliseconds a segment may go untouched before it is cold.
++    cold_after_millis: u64,
++}
++
++impl Policy {
++    /// The policy this build ships: a week.
++    ///
++    /// The number is a decision somebody has to defend, and the argument for this one is where it
++    /// sits against `lakelet/4.9-retention`'s window: the tier's is longer, so a deployment keeps
++    /// data on the box for as long as it is answering questions about it and moves it out after
++    /// that — a store that tiered on a shorter interval than it retained would pay to move and
++    /// fetch records that were about to be expired. Zero is the one value this policy does not
++    /// ship: it makes every segment cold the moment it is written, which is a store that moves what
++    /// it just wrote, and that is a decision an operator makes rather than a default.
++    pub const DEFAULT: Policy = Policy {
++        cold_after_millis: 7 * 24 * 3_600_000,
++    };
++
++    /// A policy that lets a segment go cold `cold_after_millis` after its last record.
++    #[must_use]
++    pub const fn new(cold_after_millis: u64) -> Self {
++        Self { cold_after_millis }
++    }
++
++    /// How long a segment may go untouched before this policy calls it cold.
++    #[must_use]
++    pub const fn cold_after_millis(&self) -> u64 {
++        self.cold_after_millis
++    }
++
++    /// The instant before which a segment's records are cold, at `now_millis`.
++    ///
++    /// Saturating, because a clock that has gone backwards is not a reason to panic: a `now` below
++    /// the policy's window answers a cutoff of zero, which is below every timestamp this store can
++    /// hold, so a pass made at it moves nothing.
++    #[must_use]
++    pub const fn cutoff(&self, now_millis: u64) -> u64 {
++        now_millis.saturating_sub(self.cold_after_millis)
++    }
++
++    /// `true` when this segment may leave the box, as of `now_millis`.
++    ///
++    /// The rule is `lakelet/4.9-retention`'s, one boundary and one number wide: **a segment is cold
++    /// exactly when its last stated timestamp is below the cutoff**, so a segment whose last record
++    /// is on the cutoff stays. The comparison is the *segment's own range* and not the store's
++    /// floor, and the reason is what a segment is: one file, moved as one object, and the newest
++    /// record in it is the one that decides whether anybody is going to read the file again. A
++    /// segment with no stated range ([`SegmentInfo::new`], the constructor for a decision about
++    /// size) is never cold — nobody wrote down when its records happened, and a pass does not move
++    /// bytes on a number nobody wrote, which is the rule that keeps a store from losing data it
++    /// cannot date.
++    #[must_use]
++    pub fn is_cold(&self, info: &SegmentInfo, now_millis: u64) -> bool {
++        let _ = (info, now_millis);
++        todo!(
++            "lakelet/4.21-cold-tiering: a segment is cold exactly when the last timestamp the manifest states for it is below `cutoff(now)`, and one whose age nobody stated is never cold"
++        )
++    }
++}
++
++/// What one pass did, as counts.
++///
++/// One type for both passes because they answer one question each and a script reads them the same
++/// way: `moved`/`bytes` are what [`sweep`] took out of the box, `fetched`/`bytes` are what
++/// [`hydrate`] brought back, and `kept` is what a pass looked at and left where it was (a warm
++/// segment, or one whose local file was already the length the manifest states). Every count is
++/// what the *manifest* says rather than what a directory happens to hold: the manifest is the store
++/// (`lakelet/4.8-compaction`), and a report a reader can check against it is a report that can be
++/// wrong out loud.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Report {
++    /// Segments this pass took out of the box.
++    moved: u64,
++    /// Segments this pass brought back into it.
++    fetched: u64,
++    /// Segments this pass looked at and left alone.
++    kept: u64,
++    /// Bytes these segments weigh, as the manifest states them.
++    bytes: u64,
++    /// Pages of listing this pass read.
++    pages: u64,
++}
++
++impl Report {
++    /// How many segments left the box.
++    #[must_use]
++    pub const fn moved(&self) -> u64 {
++        self.moved
++    }
++
++    /// How many segments came back.
++    #[must_use]
++    pub const fn fetched(&self) -> u64 {
++        self.fetched
++    }
++
++    /// How many segments a pass left where they were.
++    #[must_use]
++    pub const fn kept(&self) -> u64 {
++        self.kept
++    }
++
++    /// How many bytes the segments this pass moved or fetched weigh.
++    #[must_use]
++    pub const fn bytes(&self) -> u64 {
++        self.bytes
++    }
++
++    /// How many listing pages this pass read.
++    #[must_use]
++    pub const fn pages(&self) -> u64 {
++        self.pages
++    }
++}
++
++/// Why a pass, a port or a client did not do what it was asked.
++///
++/// One type for the module, and the same rule `lakelet/4.19-backup-restore`'s `backup::Error` keeps
++/// for the same reason: the *class* is what a caller branches on, and a caller that has to tell a
++/// lost connection from a refused signature writes that branch once. The crate's own
++/// [`Error`](crate::error::Error) has four variants, one per layer that can refuse something, and
++/// these are this module's own — a `Store` variant carrying them would be a class the caller has to
++/// dig back out with a `downcast_ref`.
++#[derive(Debug)]
++pub enum Error {
++    /// A value the tier was built with is not one it can use: an endpoint that is not an authority,
++    /// or a key that is not a path.
++    Invalid {
++        /// What was wrong, phrased for the person who typed it.
++        detail: String,
++    },
++    /// The tier does not hold a key a pass needed.
++    Missing {
++        /// The key it looked for.
++        key: String,
++    },
++    /// The tier holds `key`, and what it holds is not what the manifest states.
++    Damaged {
++        /// The key whose bytes disagree.
++        key: String,
++        /// How many bytes the manifest says the segment is.
++        stated: u64,
++        /// How many bytes the tier handed back.
++        found: u64,
++    },
++    /// The tier answered, and the answer was a refusal.
++    ///
++    /// A 4xx from an S3-shaped endpoint: no attempt after this one gets a different answer, which
++    /// is why nothing retries it.
++    Refused {
++        /// The status the endpoint answered with.
++        status: u16,
++        /// What the endpoint said, and what an operator should check.
++        detail: String,
++    },
++    /// The tier could not be reached, or answered nothing a client could act on.
++    ///
++    /// The class of a connection that was refused, a socket that died mid-answer, and a 5xx that
++    /// survived every attempt ([`http::ATTEMPTS`]): in all three, nothing about *this request* was
++    /// decided, and repeating it is what a caller may do.
++    Transport {
++        /// What happened, in one line.
++        detail: String,
++    },
++    /// The local filesystem refused.
++    ///
++    /// A segment's file that could not be read for a `put`, or written for a `get` of the tier's
++    /// copy: the box's own answer, kept as it is rather than re-worded.
++    Local {
++        /// The file or directory it refused about.
++        path: PathBuf,
++        /// What the operating system said.
++        source: std::io::Error,
++    },
++}
++
++impl fmt::Display for Error {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Invalid { detail } => write!(
++                formatter,
++                "the tier was built with a value it \
++                cannot use: {detail}"
++            ),
++            Self::Missing { key } => write!(
++                formatter,
++                "the tier does not hold `{key}`: a store \
++                whose segments are cold cannot be read without it, and the object that is missing \
++                is the one this refusal names"
++            ),
++            Self::Damaged { key, stated, found } => write!(
++                formatter,
++                "the tier holds `{key}` and it is {found} byte(s) where the \
++                manifest states {stated}: a segment that is not the length the manifest states is \
++                one this store may not read, and the file was not written"
++            ),
++            Self::Refused { status, detail } => write!(
++                formatter,
++                "the tier refused the request \
++                ({status}): {detail}"
++            ),
++            Self::Transport { detail } => write!(
++                formatter,
++                "the tier could not be reached: \
++                {detail}"
++            ),
++            Self::Local { path, source } => write!(formatter, "{}: {source}", path.display()),
++        }
++    }
++}
++
++impl std::error::Error for Error {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Local { source, .. } => Some(source),
++            _ => None,
++        }
++    }
++}
++
++/// Every key a port holds under a prefix, and how many pages it took to hear that.
++///
++/// What [`listing`] answers, and what [`hydrate`] consults before it fetches anything: the tier's
++/// own account of itself, read in full rather than guessed from the manifest.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Listing {
++    /// The keys, in the order the port listed them.
++    keys: Vec<String>,
++    /// How many pages of listing it took.
++    pages: u64,
++}
++
++impl Listing {
++    /// The keys the port held, in the order it answered them.
++    #[must_use]
++    pub fn keys(&self) -> &[String] {
++        &self.keys
++    }
++
++    /// How many pages it took to read them.
++    #[must_use]
++    pub const fn pages(&self) -> u64 {
++        self.pages
++    }
++
++    /// `true` when the listing names `key`.
++    #[must_use]
++    pub fn holds(&self, key: &str) -> bool {
++        self.keys.iter().any(|held| held == key)
++    }
++}
++
++/// Where a segment's bytes live in the tier: its identity under the port's prefix.
++///
++/// The name is the one the store gives the file — `lakelet/4.8-compaction`'s `file_of` is the only
++/// place a segment's path is decided, and the tier's key is that path under the port's prefix, so
++/// **one rule names a segment's bytes wherever they are**. That is deliberate: an operator looking
++/// for a segment's object finds the ordinal the manifest lists, zero-padded the way a directory
++/// listing sorts, and a key a reader derives by hand is the key a pass wrote.
++///
++/// The function is a pure function of its two arguments, which is what makes a retried `put` safe:
++/// the same segment gives the same key on every machine and every run, so the key *is* the
++/// idempotency key (`lakelet/4.21`).
++#[must_use]
++pub fn object_key(prefix: &str, ordinal: u64) -> String {
++        let _ = (prefix, ordinal);
++        todo!(
++            "lakelet/4.21-cold-tiering: the key a segment's bytes live under — the file the store gives it, under the port's prefix"
++        )
++    }
++
++/// Every key a port holds under `prefix`, walking its pages.
++///
++/// The loop is here rather than in a caller because the endpoint's own words decide it: a page is
++/// finished when the port says so ([`Page::next`]), and never when it came back shorter than the
++/// size that was asked for — an S3-shaped endpoint answers short pages as a matter of course. The
++/// walk is bounded in one more way, and it is a way a client has to have: a port that answers the
++/// *same* cursor twice is not making progress, and a loop that took its word for it would ask
++/// forever. That is [`Error::Transport`] rather than a shorter listing, because a caller who is
++/// handed half a tier and no error would go on to read a store with a hole in it.
++///
++/// # Errors
++///
++/// Everything [`Objects::list`] refuses, and [`Error::Transport`] when the cursor does not advance.
++pub fn listing(objects: &dyn Objects, prefix: &str) -> Result<Listing, Error> {
++        let _ = (objects, prefix);
++        todo!(
++            "lakelet/4.21-cold-tiering: walk the pages a port answers with, and refuse an endpoint that never advances"
++        )
++    }
++
++/// Move every cold segment out of the box and into the tier.
++///
++/// `store` is the store to take segments from, `objects` the tier they go to, `policy` the rule
++/// that decides which ones are cold, and `now_millis` the instant that rule is applied at — passed
++/// in rather than read here, because a pass is a value a caller decides the time of
++/// (`lakelet/4.9-retention` made the same argument about `Segments::expire`).
++///
++/// The order is the safety argument and the module docs carry the table: the object first, the
++/// local file second, so a crash between the two leaves the segment in both places and the reader
++/// reads the local one. A `put` that fails stops the pass with the segment where it was; a delete
++/// that fails stops it with the segment in *both* places, which is a readable store and a report
++/// the caller never sees, because this answers `Err`.
++///
++/// Nothing is written down: the tier's own listing is what says which objects are there, and the
++/// store's manifest is not touched at all — `lakelet/4.9-retention`'s spec pins its layout, and a
++/// segment that moved out of the box is still a segment the manifest names.
++///
++/// # Errors
++///
++/// [`Error::Local`] when a cold segment's file cannot be read or removed, and the port's own
++/// refusals ([`Error::Refused`], [`Error::Transport`]) when the tier would not take the object.
++pub fn sweep(
++    store: &Segments,
++    objects: &dyn Objects,
++    policy: &Policy,
++    now_millis: u64,
++) -> Result<Report, Error> {
++        let _ = (store, objects, policy, now_millis);
++        todo!(
++            "lakelet/4.21-cold-tiering: the object first and the local file second, for every segment the policy calls cold"
++        )
++    }
++
++/// Put back every segment of `store` whose local file is missing, or is not what the manifest says.
++///
++/// The second half of the round trip, and the reason the engine's readers are untouched: a store
++/// whose cold segments are out of the box cannot be opened (`Segments::open` refuses a segment the
++/// manifest names and the directory does not hold), and hydrating it is what makes the directory
++/// agree with the manifest again. Both halves of "the file is not right" are repaired — a file that
++/// is gone, and one that is the wrong length — because the tier's copy is what the manifest says
++/// the segment is, and it is the only copy left that is.
++///
++/// The listing is consulted **once**, before anything is fetched: the tier is the authority on what
++/// it holds, a key that is not in it is [`Error::Missing`] naming that key (rather than a `get` per
++/// segment that answers `None`), and the pages that took are counted in the report. A store whose
++/// local files are all the length the manifest states asks the tier **nothing** — no listing, no
++/// request — which is what makes a `hydrate` cheap enough to run before every read.
++///
++/// A fetched object whose length is not the manifest's number is refused ([`Error::Damaged`]) and
++/// **no file is left behind**: the check happens before the bytes are written, and a local file that
++/// was already wrong is removed rather than left for an open to refuse with a reason nobody could
++/// trace to the tier.
++///
++/// # Errors
++///
++/// [`Error::Missing`] when the tier does not hold a segment the store needs, [`Error::Damaged`] when
++/// what it holds is not the length the manifest states, [`Error::Local`] when a file cannot be
++/// written or looked at, and the port's own refusals.
++pub fn hydrate(store: &Segments, objects: &dyn Objects) -> Result<Report, Error> {
++        let _ = (store, objects);
++        todo!(
++            "lakelet/4.21-cold-tiering: fetch back every segment whose file is missing or is not the length the manifest states, checking that length before anything is written"
++        )
++    }
+diff --git a/src/engine/tier/s3.rs b/src/engine/tier/s3.rs
+new file mode 100644
+index 0000000..c1cfedb
+--- /dev/null
++++ b/src/engine/tier/s3.rs
+@@ -0,0 +1,402 @@
++//! An S3-shaped endpoint as a tier: SigV4, the five operations, and the page token.
++//!
++//! Step `lakelet/4.21-cold-tiering`. [`super::filesystem`] is a tier on the same box as the store;
++//! this is the one that is not. It is the second implementation the port exists for, and it is the
++//! half of this step that is at **design depth** for `outbound/http-client`: `relay/2.7`'s client
++//! established a request, a deadline and an answer, and what a *signed* request adds is the part
++//! that cannot be got wrong quietly —
++//!
++//! * **the canonical request is built from the request that is sent.** The signature is computed
++//!   over [`http::Request::canonical_request`], which reads the method, the path, the query pairs,
++//!   the signed headers and a payload hash taken from the body *of that value*, and the bytes that
++//!   leave the socket are rendered from the same value ([`http`]). There is no second assembly of
++//!   the same request anywhere in this file, which is the only way "the string that is signed
++//!   cannot disagree with the bytes that are sent" is a property rather than a hope — and a
++//!   disagreement is a `403` whose message says the signature did not match, with nothing in it
++//!   about which of the fifteen lines differed;
++//! * **the instant is a value.** `x-amz-date`, the credential scope's date stamp and the signature
++//!   all come from [`Config::date`], which a caller builds. Nothing here reads a clock, so two
++//!   machines sign the same bytes for the same request — the same rule `lakelet/4.16-profiling`
++//!   applied to measurement and `lakelet/4.3-write-path-adr` to flushing, and here it is what makes
++//!   a pinned signature vector a test rather than a flake;
++//! * **the key is the idempotency key.** `put` is a `PUT` to an object whose name is a function of
++//!   the segment's identity ([`super::object_key`]), so a `put` that was sent twice wrote one
++//!   object; that is what [`http::ATTEMPTS`] is allowed to repeat, and it is the reason a tier's
++//!   retry is safe while a delivery's retry (`relay/2.8-retry-budget`) needs a whole budget;
++//! * **a listing is followed by its token.** `ListObjectsV2` answers at most `max-keys` keys and
++//!   says whether it is truncated; the page a caller gets is one request's worth, and the token is
++//!   what the *next* request carries. The loop that follows those tokens is
++//!   [`super::listing`](super::listing), deliberately not here: a directory's pages follow the same
++//!   rule, and a loop that lives in one implementation is a loop the other one's cases cannot judge
++//!   (an endpoint is allowed to answer a page *shorter* than the `max-keys` it was asked for, which
++//!   this course's stub does on purpose);
++//! * **a `403` is read, not retried.** It is the one refusal an operator has to act on, and the two
++//!   usual causes are a scope that does not match the endpoint's (region, service, date) and a
++//!   credential that is not the one the bucket knows. [`Error::Refused`]'s message says so, and
++//!   `lakelet/4.21-cold-tiering`'s page is where the operator is told to look.
++
++use std::fmt;
++
++use hmac::Mac;
++use hmac::digest::Key;
++
++use super::http::{self, Class, Request, Response};
++use super::{Cursor, Error, Objects, PAGE_KEYS, Page};
++
++/// How many bytes one HMAC block is: sha256's block size.
++const BLOCK: usize = 64;
++
++/// The algorithm name every signature this build makes carries.
++const ALGORITHM: &str = "AWS4-HMAC-SHA256";
++
++/// What a caller tells the tier about the endpoint it speaks to.
++///
++/// A value, built by hand and never read from the environment or the clock: what a signature is
++/// computed over must be the same bytes on the machine that signs and the machine that checks, and
++/// the two values this struct carries that usually come from somewhere else — the instant and the
++/// credentials — are exactly the two that make a `403` undebuggable when they are implicit.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Config {
++    /// The endpoint a request goes to: `host:port` or `http://host:port`.
++    pub endpoint: String,
++    /// The bucket every key of this port lives in. The bucket is the first path segment (path-style
++    /// addressing, which is what an endpoint that is not AWS itself speaks).
++    pub bucket: String,
++    /// The region the credential scope names. It must be the endpoint's own: a signature's scope is
++    /// part of what is signed, and a scope that is not the bucket's is a `403`.
++    pub region: String,
++    /// The service the credential scope names. `s3`, for S3; it is here rather than a constant
++    /// because the scope is the endpoint's business and this course's spec pins a signature vector
++    /// from the vendor's own documentation, which was signed for a service with another name.
++    pub service: String,
++    /// The instant the signature is dated with, `YYYYMMDDTHHMMSSZ` — never a clock reading. Two
++    /// runs of the same request with the same config sign the same bytes, and that is what makes
++    /// "the signature is pinned" a case a spec can assert.
++    pub date: String,
++    /// The access key id the credential scope names.
++    pub access_key: String,
++    /// The secret the signing key is derived from.
++    pub secret_key: String,
++}
++
++impl Config {
++    /// The date stamp the credential scope starts with: `20261008`.
++    fn stamp(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the date stamp the credential scope starts with"
++        )
++    }
++
++    /// The credential scope: `date/region/service/aws4_request`.
++    ///
++    /// The `aws4_request` terminator is not configuration: it names the algorithm the string to
++    /// sign is computed with, and a scope that spelled it `aws4_request` in one place and something
++    /// else in another would sign a request nobody accepts.
++    #[must_use]
++    pub fn scope(&self) -> String {
++        todo!(
++            "lakelet/4.21-cold-tiering: the credential scope: date, region, service and the algorithm's own name"
++        )
++    }
++
++    /// A config for an endpoint, with a date a caller states.
++    #[must_use]
++    pub fn new(
++        endpoint: &str,
++        bucket: &str,
++        region: &str,
++        date: &str,
++        access_key: &str,
++        secret_key: &str,
++    ) -> Self {
++        Self {
++            endpoint: endpoint.to_owned(),
++            bucket: bucket.to_owned(),
++            region: region.to_owned(),
++            service: "s3".to_owned(),
++            date: date.to_owned(),
++            access_key: access_key.to_owned(),
++            secret_key: secret_key.to_owned(),
++        }
++    }
++}
++
++/// An S3-shaped bucket, as an [`Objects`] port.
++///
++/// It owns a [`http::Client`] and the [`Config`] its signatures are computed from, and it derives
++/// every object's path from the bucket, the key and the prefix this port serves
++/// ([`Bucket::with_prefix`]). One value, one endpoint, one prefix: the same port may be handed to
++/// every pass of one store, and two stores are two ports with two prefixes.
++#[derive(Debug)]
++pub struct Bucket {
++    /// What the signatures are computed from.
++    config: Config,
++    /// The endpoint, and the retry rule.
++    client: http::Client,
++    /// The prefix this port's store uses, as [`Objects::prefix`] answers it.
++    prefix: String,
++    /// How many keys one listing asks for.
++    page: usize,
++}
++
++impl Bucket {
++    /// A tier for `config`'s bucket, serving keys under no prefix.
++    ///
++    /// Nothing is connected to here: a port is a value, and the first request is what finds out
++    /// whether the endpoint is there. What *is* checked is what can be checked without a socket —
++    /// the endpoint is an authority this client can speak to, the bucket has a name, and the date is
++    /// a date — because a config that cannot sign a request a deployment will accept is a mistake
++    /// worth answering at the line that built it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the endpoint is not one this client can speak to, the bucket's name
++    /// is empty, or the date is not `YYYYMMDDTHHMMSSZ`.
++    pub fn new(config: Config) -> Result<Self, Error> {
++        if config.bucket.trim().is_empty() {
++            return Err(Error::Invalid {
++                detail: "a bucket needs a name: path-style addressing puts it in the request's \
++                         first path segment, and an endpoint asked for `//key` answers 400"
++                    .to_owned(),
++            });
++        }
++        check_date(&config.date)?;
++        let client = http::Client::new(&config.endpoint)?;
++        Ok(Self {
++            config,
++            client,
++            prefix: String::new(),
++            page: PAGE_KEYS,
++        })
++    }
++
++    /// The same tier, serving the store whose keys live under `prefix`.
++    #[must_use]
++    pub fn with_prefix(mut self, prefix: &str) -> Self {
++        self.prefix = prefix.trim_end_matches('/').to_owned();
++        self
++    }
++
++    /// The same tier, asking for `keys` keys to a page.
++    ///
++    /// It is what `max-keys` carries, and it is a *request*: an endpoint may answer fewer, and this
++    /// client follows the token until the endpoint says it is done rather than trusting the count
++    /// ([`super::listing`](super::listing)). Zero is read as one, because a page that holds nothing
++    /// is a page a loop would ask for again.
++    #[must_use]
++    pub fn with_page(mut self, keys: usize) -> Self {
++        self.page = keys.max(1);
++        self
++    }
++
++    /// What this port signs with.
++    #[must_use]
++    pub fn config(&self) -> &Config {
++        &self.config
++    }
++
++    /// The endpoint this port speaks to, as the `Host` header spells it.
++    #[must_use]
++    pub fn authority(&self) -> &str {
++        self.client.authority()
++    }
++
++    /// The path one key of this bucket is addressed by: `/bucket/key`.
++    fn path(&self, key: &str) -> String {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: the path one key of this bucket is addressed by"
++        )
++    }
++
++    /// The headers a signature covers: every header the request carries except the signature.
++    ///
++    /// Derived from the request rather than declared beside it, and that is the decision this whole
++    /// file is shaped around: a signed-header list a caller maintains by hand is a list that stops
++    /// matching the request the day somebody adds a header, and the endpoint's answer to that is a
++    /// refusal with no useful message. Sorted and lower-cased, which is the form SigV4 signs.
++    #[must_use]
++    pub fn signed_headers(&self, request: &Request) -> Vec<String> {
++        let _ = request;
++        todo!(
++            "lakelet/4.21-cold-tiering: every header the request carries except the signature, lower-cased and sorted"
++        )
++    }
++
++    /// The signing key: the secret, folded through the date, the region, the service and the
++    /// request type.
++    ///
++    /// Four keyed MACs, and the order is the algorithm's rather than a choice — a key derived in
++    /// another order verifies nowhere. It is derived per request rather than cached, deliberately:
++    /// the derivation is five hashes over a few dozen bytes, a cache would need the config to be
++    /// immutable (which is why [`Config`]'s fields are values and not a lock), and a signature that
++    /// depended on a cached key would be a signature that depended on which request came first.
++    fn signing_key(&self) -> [u8; 32] {
++        todo!(
++            "lakelet/4.21-cold-tiering: the secret folded through the date, the region, the service and the request type"
++        )
++    }
++
++    /// The `authorization` header for `request`: what makes it a signed request.
++    ///
++    /// Public because a signature is a value a spec may pin (`lakelet/4.21-cold-tiering` does, on a
++    /// vector from the vendor's own documentation): the header this answers with, over a request a
++    /// caller built by hand, is the same string the operations below put on their own requests.
++    #[must_use]
++    pub fn authorization(&self, request: &Request) -> String {
++        let _ = request;
++        todo!(
++            "lakelet/4.21-cold-tiering: the `authorization` header for a request: the canonical request, the string to sign, and the signature"
++        )
++    }
++
++    /// One request of this tier, with everything a signature covers and no signature yet.
++    ///
++    /// The payload hash is set from the request's own body *after* the body is: it is the header an
++    /// endpoint checks the bytes against, and a header set before the bytes would be a request that
++    /// names one payload and sends another (`lakelet/4.21-cold-tiering`'s spec compares the two).
++    /// The query pairs are added by the caller before [`Bucket::signed`], because the query is part
++    /// of what a signature covers: a request signed before its query was written is a request that
++    /// signs one URL and sends another, which is the failure this whole file is arranged around.
++    fn signable(&self, method: &str, key: &str, body: Vec<u8>) -> Request {
++        let _ = (method, key, body);
++        todo!(
++            "lakelet/4.21-cold-tiering: a request with everything a signature covers and no signature yet"
++        )
++    }
++
++    /// The same request, signed: the one place `authorization` is added.
++    fn signed(&self, request: Request) -> Request {
++        let _ = request;
++        todo!(
++            "lakelet/4.21-cold-tiering: the same request, signed"
++        )
++    }
++
++    /// Send a signed request, and answer what the endpoint said.
++    fn exchange(&self, request: &Request) -> Result<Response, Error> {
++        self.client.send(request)
++    }
++
++    /// What the endpoint's refusal means, phrased for an operator.
++    ///
++    /// The `403` is the one worth writing out: S3 answers it for a signature that did not match and
++    /// for a credential that may not do this, the two look identical from here, and the body says
++    /// which. The scope is quoted because a scope is what most mismatches are — a region, a service
++    /// or a date that is not the endpoint's.
++    fn refusal(&self, request: &Request, response: &Response) -> Error {
++        let _ = (request, response);
++        todo!(
++            "lakelet/4.21-cold-tiering: what the endpoint's refusal means, phrased for an operator"
++        )
++    }
++}
++
++impl Objects for Bucket {
++    fn prefix(&self) -> &str {
++        todo!(
++            "lakelet/4.21-cold-tiering: the prefix this port's store lives under"
++        )
++    }
++
++    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), Error> {
++        let _ = (key, bytes);
++        todo!(
++            "lakelet/4.21-cold-tiering: `PutObject`: a PUT of the object's own path"
++        )
++    }
++
++    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: `GetObject`: a 404 is `None` rather than a refusal"
++        )
++    }
++
++    fn delete(&self, key: &str) -> Result<(), Error> {
++        let _ = key;
++        todo!(
++            "lakelet/4.21-cold-tiering: `DeleteObject`: idempotent, which is what the endpoint's own answer says"
++        )
++    }
++
++    fn list(&self, prefix: &str, cursor: Option<Cursor>) -> Result<Page, Error> {
++        let _ = (prefix, cursor);
++        todo!(
++            "lakelet/4.21-cold-tiering: `ListObjectsV2`: one page, and the token the next request carries"
++        )
++    }
++}
++
++/// The text between the first `<name>` and the `</name>` after it.
++fn element(text: &str, name: &str) -> Option<String> {
++        let _ = (text, name);
++        todo!(
++            "lakelet/4.21-cold-tiering: the text between an element's tags"
++        )
++    }
++
++/// The text between every `<name>` and its `</name>`.
++fn elements(text: &str, name: &str) -> Vec<String> {
++        let _ = (text, name);
++        todo!(
++            "lakelet/4.21-cold-tiering: the text between every one of them"
++        )
++    }
++
++/// `true` when `date` is the one shape a credential scope and an `x-amz-date` may have.
++fn check_date(date: &str) -> Result<(), Error> {
++        let _ = date;
++        todo!(
++            "lakelet/4.21-cold-tiering: whether a date is one a signature can be dated with"
++        )
++    }
++
++/// The HMAC-SHA256 of `data` under `key`.
++///
++/// The MAC itself is the `hmac` crate's; the one thing done here is HMAC's own rule for the key —
++/// hashed when it is longer than a block, zero-padded to a block when it is shorter — written out
++/// because that is what makes this a value rather than a fallible call: the crate's constructor
++/// takes a key of any length and answers a `Result` for a length no byte string can have, and a
++/// signature is not a thing this build should be able to fail at.
++fn mac(key: &[u8], data: &[u8]) -> [u8; 32] {
++        let _ = (key, data);
++        todo!(
++            "lakelet/4.21-cold-tiering: HMAC-SHA256 of the data under the key, with HMAC's own rule for the key"
++        )
++    }
++
++/// The typed name of the MAC this build signs with.
++type HmacSha256 = hmac::Hmac<sha2::Sha256>;
++
++/// The sha256 of `bytes`.
++fn sha256(bytes: &[u8]) -> [u8; 32] {
++        let _ = bytes;
++        todo!(
++            "lakelet/4.21-cold-tiering: the hash every signed request is made of"
++        )
++    }
++
++/// `bytes` as lower-case hex.
++fn hex(bytes: &[u8]) -> String {
++        let _ = bytes;
++        todo!(
++            "lakelet/4.21-cold-tiering: bytes as lower-case hex"
++        )
++    }
++
++impl fmt::Display for Config {
++    /// The endpoint, the bucket and the scope — and the access key, which is an identifier rather
++    /// than a secret. The secret key is not here, and a config that reached a log line is a config
++    /// whose secret is in a log the day somebody writes one.
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            formatter,
++            "{} bucket `{}` scope `{}` as `{}`",
++            self.endpoint,
++            self.bucket,
++            self.scope(),
++            self.access_key
++        )
++    }
++}
+diff --git a/tests/s3_stub.rs b/tests/s3_stub.rs
+new file mode 100644
+index 0000000..a6c85d6
+--- /dev/null
++++ b/tests/s3_stub.rs
+@@ -0,0 +1,700 @@
++//! An S3-shaped endpoint, in this process: the tier's second backend without a network.
++//!
++//! `lakelet/4.21-cold-tiering` ships this file **complete**, and it is the thing that makes
++//! "one suite, two implementations" mean what it says. The step's spec (`tests/spec_tiering.rs`)
++//! declares it as a module (`mod s3_stub;`), so the same cases that run against
++//! `src/engine/tier/filesystem.rs` run against a real socket, a real request line and a real
++//! `authorization` header — with no MinIO, no container and no credentials
++//! (`docs/m3-plan.md` §7 D-3: three image routes were refused, and what a gate can judge here is
++//! the **request shape**, which is exactly what `outbound/http-client@design` is about).
++//!
++//! Four things it does, and each is a decision:
++//!
++//! * **it answers the five operations this build uses** — `PutObject`, `GetObject`,
++//!   `DeleteObject`, `ListObjectsV2` and a `HEAD` — path-style (`/bucket/key`), with the error
++//!   bodies S3 writes (`<Error><Code>…</Code><Message>…</Message></Error>`), because an endpoint
++//!   that answers a bare `500` teaches nothing about what a client has to do with a `403`;
++//! * **it keeps a log**, and the log is what the spec asserts the *shape* of: the method, the path,
++//!   the query, the `authorization` header, `x-amz-content-sha256`, `host` and `x-amz-date`. A
++//!   signature cannot be verified here (this endpoint has no secret, and inventing one would make
++//!   the stub a second implementation of the thing the step is teaching), so what is judged is the
++//!   request: which headers were signed, which were sent, and whether the payload hash names the
++//!   body that arrived;
++//! * **it is hostile where an endpoint may be.** It answers at most [`Stub::page`] keys a page
++//!   whatever `max-keys` asked for (an endpoint is allowed to, and a client that trusted the
++//!   length of a page would report a third of a tier); it refuses a request whose
++//!   `x-amz-content-sha256` does not name the body it sent, and one that carries no signature at
++//!   all; and it can be told to fail the next *n* requests with a status of the caller's choosing
++//!   ([`Stub::fail_next`]), which is how a retry and a refusal are judged without a clock or a
++//!   flaky network;
++//! * **it never panics.** A stub that panicked on a malformed request would turn a client's bug
++//!   into a harness failure — the test would fail with "the connection was reset" rather than with
++//!   the request the client wrote. Every parse here is total, a request it cannot read is answered
++//!   `400` with a reason, and a connection that ends early is closed.
++//!
++//! It is offline (loopback only, a port the kernel picks), clock-free (nothing here reads the time;
++//! the `x-amz-date` a request carries is echoed into the log rather than checked) and
++//! deterministic (one page size, one fault queue, no timing).
++
++#![allow(dead_code)] // the spec uses the part of the endpoint it needs, not all of it
++
++use std::collections::{BTreeMap, VecDeque};
++use std::net::{SocketAddr, TcpListener as StdListener, TcpStream as StdStream};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread::JoinHandle;
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++
++/// How much of a request this endpoint will read before it calls it broken.
++const LIMIT: usize = 1024 * 1024;
++
++/// The bucket name this endpoint answers under.
++///
++/// One bucket, and it answers for any name a request carries: a stub with a bucket per test would
++/// be a second configuration surface, and what the spec judges about the bucket is that the path
++/// carries it (`/bucket/key`), not that this file can spell two of them.
++pub const BUCKET: &str = "lakelet-tier";
++
++/// What one request looked like, as this endpoint saw it.
++///
++/// The log is the deliverable of the *client* half of this step: a request's shape is the only
++/// thing about a signature a spec can assert without a secret, and every field here is one the
++/// client wrote.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Call {
++    /// `PUT`, `GET`, `DELETE`, `HEAD`.
++    pub method: String,
++    /// The path, percent-decoded: `/lakelet-tier/segments/0000000000.lks`.
++    pub path: String,
++    /// The raw query string, exactly as it arrived.
++    pub query: String,
++    /// The headers, in the order they arrived.
++    pub headers: Vec<(String, String)>,
++}
++
++impl Call {
++    /// One header's value, matched without regard to case.
++    #[must_use]
++    pub fn header(&self, name: &str) -> Option<&str> {
++        self.headers
++            .iter()
++            .find(|(found, _)| found.eq_ignore_ascii_case(name))
++            .map(|(_, value)| value.as_str())
++    }
++
++    /// One query parameter's value, percent-decoded.
++    #[must_use]
++    pub fn query_of(&self, name: &str) -> Option<String> {
++        self.query
++            .split('&')
++            .filter(|pair| !pair.is_empty())
++            .find_map(|pair| {
++                let (found, value) = pair.split_once('=').unwrap_or((pair, ""));
++                (found == name).then(|| decoded(value))
++            })
++    }
++
++    /// The key this request named, or `None` when it named no key (a listing names a bucket).
++    #[must_use]
++    pub fn key(&self) -> Option<String> {
++        let rest = self.path.strip_prefix('/')?;
++        let (_, key) = rest.split_once('/')?;
++        (!key.is_empty()).then(|| key.to_owned())
++    }
++
++    /// `GET /bucket/key?list-type=2` — how a report names a call.
++    #[must_use]
++    pub fn line(&self) -> String {
++        if self.query.is_empty() {
++            return format!("{} {}", self.method, self.path);
++        }
++        format!("{} {}?{}", self.method, self.path, self.query)
++    }
++}
++
++/// The endpoint's state, shared with the thread that serves it.
++#[derive(Debug, Default)]
++struct State {
++    /// What the endpoint holds.
++    objects: Mutex<BTreeMap<String, Vec<u8>>>,
++    /// Every request it has answered, in the order they arrived.
++    log: Mutex<Vec<Call>>,
++    /// Statuses to answer instead of doing the work, oldest first.
++    faults: Mutex<VecDeque<u16>>,
++    /// How many keys one page holds, whatever `max-keys` asked for.
++    page: AtomicUsize,
++    /// `true` when answers carry no `content-length` at all, and their bodies end at the close.
++    bare: AtomicBool,
++    /// Set when the endpoint is being dropped.
++    stopped: AtomicBool,
++}
++
++/// An S3-shaped endpoint on a loopback port the kernel picks.
++///
++/// `Stub::start` binds the port and starts the thread that serves it, so a client may connect the
++/// moment it returns — there is no sleep and no wait-for-ready anywhere in this file, which is one
++/// of the two reasons the suite is deterministic (the other is that nothing here reads a clock).
++///
++/// Dropping it stops the thread: the flag is set and one connection to the endpoint wakes the
++/// accept loop, which sees the flag and returns. Nothing outlives a case.
++#[derive(Debug)]
++pub struct Stub {
++    /// The address a client connects to.
++    address: SocketAddr,
++    /// `http://127.0.0.1:<port>` — what a config's `endpoint` takes.
++    endpoint: String,
++    /// What the endpoint holds and what it has been told to do.
++    state: Arc<State>,
++    /// The thread serving it.
++    server: Option<JoinHandle<()>>,
++}
++
++impl Stub {
++    /// Start an endpoint on a port the kernel picks, holding nothing and failing nothing.
++    #[must_use]
++    pub fn start() -> Self {
++        let listener = StdListener::bind(("127.0.0.1", 0))
++            .unwrap_or_else(|error| panic!("a loopback port cannot be claimed: {error}"));
++        let address = listener
++            .local_addr()
++            .unwrap_or_else(|error| panic!("a listener that is bound has an address: {error}"));
++        let _ = listener.set_nonblocking(true);
++        let state = Arc::new(State {
++            page: AtomicUsize::new(2),
++            ..State::default()
++        });
++        let shared = Arc::clone(&state);
++        let server = std::thread::spawn(move || {
++            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            else {
++                return;
++            };
++            runtime.block_on(async move {
++                let Ok(listener) = TcpListener::from_std(listener) else {
++                    return;
++                };
++                loop {
++                    let Ok((stream, _)) = listener.accept().await else {
++                        continue;
++                    };
++                    if shared.stopped.load(Ordering::SeqCst) {
++                        return;
++                    }
++                    serve(stream, &shared).await;
++                }
++            });
++        });
++        Self {
++            address,
++            endpoint: format!("http://{address}"),
++            state,
++            server: Some(server),
++        }
++    }
++
++    /// The endpoint a config takes: `http://127.0.0.1:<port>`.
++    #[must_use]
++    pub fn endpoint(&self) -> &str {
++        &self.endpoint
++    }
++
++    /// The address it is bound to.
++    #[must_use]
++    pub fn address(&self) -> SocketAddr {
++        self.address
++    }
++
++    /// How many keys one page holds, whatever a request's `max-keys` says.
++    ///
++    /// Two by default, and that is the hostile half of this endpoint: the client asks for a
++    /// thousand, this answers two and says it is truncated, and the only correct answer is to
++    /// follow the token. Zero is read as one.
++    pub fn with_page(&self, keys: usize) -> &Self {
++        self.state.page.store(keys.max(1), Ordering::SeqCst);
++        self
++    }
++
++    /// Answer without a `content-length`, so that a body ends at the close of the connection.
++    ///
++    /// Every answer this endpoint makes normally carries a length, because that is what S3 does and
++    /// what a reader should expect. This is the *other* HTTP/1.0 shape — a head that promises
++    /// nothing, a body, and then the close — and it exists because a client that read only the
++    /// header would answer an empty object for a body that was right there, and would do it only
++    /// against endpoints that are not S3. A proxy that strips a header is exactly that endpoint.
++    pub fn without_length(&self) -> &Self {
++        self.state.bare.store(true, Ordering::SeqCst);
++        self
++    }
++
++    /// Answer the next `count` requests with `status` instead of doing the work.
++    ///
++    /// A `403` gets the body S3 writes for a signature that did not match and a `5xx` the one it
++    /// writes for an endpoint that could not answer, so the two cases this drives — a refusal that
++    /// must not be retried and a failure that must be — see what a client sees in a deployment.
++    pub fn fail_next(&self, count: usize, status: u16) -> &Self {
++        if let Ok(mut faults) = self.state.faults.lock() {
++            for _ in 0..count {
++                faults.push_back(status);
++            }
++        }
++        self
++    }
++
++    /// Every request this endpoint has answered, oldest first.
++    #[must_use]
++    pub fn calls(&self) -> Vec<Call> {
++        self.state
++            .log
++            .lock()
++            .map(|log| log.clone())
++            .unwrap_or_default()
++    }
++
++    /// The requests of one method, oldest first.
++    #[must_use]
++    pub fn calls_of(&self, method: &str) -> Vec<Call> {
++        self.calls()
++            .into_iter()
++            .filter(|call| call.method == method)
++            .collect()
++    }
++
++    /// Every key this endpoint holds, in key order.
++    #[must_use]
++    pub fn keys(&self) -> Vec<String> {
++        self.state
++            .objects
++            .lock()
++            .map(|objects| objects.keys().cloned().collect())
++            .unwrap_or_default()
++    }
++
++    /// What this endpoint holds under `key`, if anything.
++    #[must_use]
++    pub fn object(&self, key: &str) -> Option<Vec<u8>> {
++        self.state
++            .objects
++            .lock()
++            .ok()
++            .and_then(|objects| objects.get(key).cloned())
++    }
++
++    /// Put `bytes` under `key` without a request: how a case plants an object that is the wrong
++    /// length, or one nobody's `put` wrote.
++    pub fn seed(&self, key: &str, bytes: &[u8]) {
++        if let Ok(mut objects) = self.state.objects.lock() {
++            objects.insert(key.to_owned(), bytes.to_vec());
++        }
++    }
++}
++
++impl Drop for Stub {
++    fn drop(&mut self) {
++        self.state.stopped.store(true, Ordering::SeqCst);
++        // One connection wakes a listener that is parked in `accept`: without it the loop would
++        // outlive the case, and the runtime it holds would outlive the process's own tests.
++        let _ = StdStream::connect(self.address);
++        if let Some(server) = self.server.take() {
++            let _ = server.join();
++        }
++    }
++}
++
++/// Serve one connection: read a request, answer it, close.
++///
++/// One connection at a time, deliberately: this endpoint's client is a synchronous one that reads
++/// its whole answer before it returns, so a pool of connections is a thing nothing here needs — and
++/// a concurrency bug in a *stub* would be a case that fails on the machine that happened to
++/// interleave. `Connection: close` on every answer is what makes that honest rather than lucky.
++async fn serve(mut stream: TcpStream, state: &Arc<State>) {
++    let Ok((head, mut body)) = read_head(&mut stream).await else {
++        return;
++    };
++    let Some(head) = Head::parse(&head) else {
++        let _ = answer(
++            &mut stream,
++            400,
++            error_body("InvalidRequest", "unreadable request"),
++        )
++        .await;
++        return;
++    };
++    if read_body(&mut stream, &mut body, head.length)
++        .await
++        .is_err()
++    {
++        return;
++    }
++    let call = Call {
++        method: head.method.clone(),
++        path: decoded(&head.path),
++        query: head.query.clone(),
++        headers: head.headers.clone(),
++    };
++    if let Ok(mut log) = state.log.lock() {
++        log.push(call.clone());
++    }
++    let (status, content_type, body) = route(state, &call, &body);
++    let length = !state.bare.load(Ordering::SeqCst);
++    let _ = answer_with(&mut stream, status, content_type, &body, length).await;
++}
++
++/// One request's head, as this endpoint read it.
++#[derive(Debug)]
++struct Head {
++    /// The headers, in the order they arrived.
++    headers: Vec<(String, String)>,
++    /// The method.
++    method: String,
++    /// The path, still percent-encoded.
++    path: String,
++    /// The query string, exactly as it arrived.
++    query: String,
++    /// How many body bytes the head promised.
++    length: usize,
++}
++
++impl Head {
++    /// Parse a request's head, or `None` when it is not one this endpoint can read.
++    fn parse(head: &[u8]) -> Option<Self> {
++        let text = String::from_utf8_lossy(head).into_owned();
++        let mut lines = text.split("\r\n");
++        let mut parts = lines.next()?.split(' ');
++        let method = parts.next()?.to_owned();
++        let target = parts.next()?.to_owned();
++        if method.is_empty() || !target.starts_with('/') {
++            return None;
++        }
++        let (path, query) = match target.split_once('?') {
++            Some((path, query)) => (path.to_owned(), query.to_owned()),
++            None => (target, String::new()),
++        };
++        let mut headers: Vec<(String, String)> = Vec::new();
++        for line in lines {
++            if line.is_empty() {
++                break;
++            }
++            if let Some((name, value)) = line.split_once(':') {
++                headers.push((name.trim().to_owned(), value.trim().to_owned()));
++            }
++        }
++        let length = headers
++            .iter()
++            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
++            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
++            .unwrap_or(0);
++        Some(Self {
++            headers,
++            method,
++            path,
++            query,
++            length,
++        })
++    }
++}
++
++/// What one request's answer is, without a socket.
++fn route(state: &Arc<State>, call: &Call, body: &[u8]) -> (u16, &'static str, Vec<u8>) {
++    if let Ok(mut faults) = state.faults.lock()
++        && let Some(status) = faults.pop_front()
++    {
++        let code = if status == 403 {
++            "SignatureDoesNotMatch"
++        } else {
++            "InternalError"
++        };
++        let detail = if status == 403 {
++            "the request signature we calculated does not match the signature you provided"
++        } else {
++            "this endpoint could not answer, and the request may be sent again"
++        };
++        return (status, XML, error_body(code, detail));
++    }
++    // What any endpoint checks before it does the work, and what this one refuses: a request with no
++    // signature at all cannot be attributed to anybody, and a payload hash that does not name the
++    // body that arrived is a request that lied about itself.
++    let Some(authorization) = call.header("authorization") else {
++        return (
++            403,
++            XML,
++            error_body(
++                "AccessDenied",
++                "no authorization header: nothing signed this request",
++            ),
++        );
++    };
++    if !authorization.starts_with("AWS4-HMAC-SHA256 Credential=") {
++        return (
++            403,
++            XML,
++            error_body(
++                "AccessDenied",
++                "the authorization header is not an AWS4-HMAC-SHA256 one",
++            ),
++        );
++    }
++    if let Some(stated) = call.header("x-amz-content-sha256") {
++        let found = hex(&sha256(body));
++        if stated != found {
++            return (
++                400,
++                XML,
++                error_body(
++                    "XAmzContentSHA256Mismatch",
++                    "the x-amz-content-sha256 header does not name the body that arrived",
++                ),
++            );
++        }
++    }
++    let Some(key) = call.key() else {
++        // A request on the bucket itself: the only one this build makes is a listing.
++        if call.method == "GET" && call.query_of("list-type").as_deref() == Some("2") {
++            return listing(state, call);
++        }
++        return (
++            400,
++            XML,
++            error_body(
++                "InvalidRequest",
++                "this endpoint knows one operation on a bucket",
++            ),
++        );
++    };
++    match call.method.as_str() {
++        "PUT" => {
++            if let Ok(mut objects) = state.objects.lock() {
++                objects.insert(key, body.to_vec());
++            }
++            (200, EMPTY, Vec::new())
++        }
++        "HEAD" => match state.objects.lock().ok().and_then(|o| o.get(&key).cloned()) {
++            Some(bytes) => (200, EMPTY, bytes),
++            None => (404, EMPTY, Vec::new()),
++        },
++        "GET" => match state.objects.lock().ok().and_then(|o| o.get(&key).cloned()) {
++            Some(bytes) => (200, BINARY, bytes),
++            None => (404, XML, error_body("NoSuchKey", "the key does not exist")),
++        },
++        "DELETE" => {
++            // S3 answers `204 No Content` for a delete, whether or not the object was there: the
++            // state the call asked for is the state it left behind.
++            if let Ok(mut objects) = state.objects.lock() {
++                objects.remove(&key);
++            }
++            (204, EMPTY, Vec::new())
++        }
++        _ => (
++            400,
++            XML,
++            error_body("InvalidRequest", "this endpoint does not know that method"),
++        ),
++    }
++}
++
++/// The listing shape `ListObjectsV2` answers with, paged by the stub's own page size.
++fn listing(state: &Arc<State>, call: &Call) -> (u16, &'static str, Vec<u8>) {
++    let prefix = call.query_of("prefix").unwrap_or_default();
++    let asked = call
++        .query_of("max-keys")
++        .and_then(|value| value.parse::<usize>().ok())
++        .unwrap_or(1000)
++        .max(1);
++    let size = asked.min(state.page.load(Ordering::SeqCst)).max(1);
++    let after = call.query_of("continuation-token").unwrap_or_default();
++    let held = state
++        .objects
++        .lock()
++        .map(|objects| objects.keys().cloned().collect::<Vec<String>>())
++        .unwrap_or_default();
++    let remaining: Vec<String> = held
++        .into_iter()
++        .filter(|key| {
++            key.starts_with(&prefix) && (after.is_empty() || key.as_str() > after.as_str())
++        })
++        .collect();
++    let page: Vec<&String> = remaining.iter().take(size).collect();
++    let truncated = remaining.len() > page.len();
++    let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");
++    body.push_str(&format!("<Name>{BUCKET}</Name>"));
++    body.push_str(&format!("<Prefix>{prefix}</Prefix>"));
++    body.push_str(&format!("<MaxKeys>{asked}</MaxKeys>"));
++    body.push_str(&format!(
++        "<IsTruncated>{}</IsTruncated>",
++        if truncated { "true" } else { "false" }
++    ));
++    for key in &page {
++        body.push_str(&format!("<Contents><Key>{key}</Key></Contents>"));
++    }
++    // The token is the last key of this page. S3's is opaque and this one is not — a client may not
++    // read anything out of a token, and the port's contract is only that handing a page's `next`
++    // back asks for the page after it.
++    if truncated && let Some(last) = page.last() {
++        body.push_str(&format!(
++            "<NextContinuationToken>{last}</NextContinuationToken>"
++        ));
++    }
++    body.push_str("</ListBucketResult>");
++    (200, XML, body.into_bytes())
++}
++
++/// Read a request's head, up to and including the empty line that ends it, and whatever body bytes
++/// arrived with it.
++///
++/// The second half is not a detail: a client writes its head and its body in one buffer more often
++/// than not, so a reader that returned only the head would drop the first bytes of the object — a
++/// bug that would show up as a segment one syscall shorter than the manifest says, on some
++/// machines and not others.
++async fn read_head(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
++    let mut buffer: Vec<u8> = Vec::new();
++    let mut chunk = vec![0u8; 8192];
++    loop {
++        if let Some(at) = find(&buffer, b"\r\n\r\n") {
++            let head = buffer.get(..at + 4).unwrap_or_default().to_vec();
++            let rest = buffer.get(at + 4..).unwrap_or_default().to_vec();
++            return Ok((head, rest));
++        }
++        if buffer.len() > LIMIT {
++            return Err(std::io::Error::other(
++                "the request's head is longer than any head",
++            ));
++        }
++        let read = stream.read(&mut chunk).await?;
++        if read == 0 {
++            return Ok((buffer, Vec::new()));
++        }
++        buffer.extend_from_slice(chunk.get(..read).unwrap_or_default());
++    }
++}
++
++/// Read the rest of a body that arrived in pieces.
++async fn read_body(
++    stream: &mut TcpStream,
++    body: &mut Vec<u8>,
++    length: usize,
++) -> std::io::Result<()> {
++    let mut chunk = vec![0u8; 4096];
++    while body.len() < length {
++        let read = stream.read(&mut chunk).await?;
++        if read == 0 {
++            return Ok(());
++        }
++        body.extend_from_slice(chunk.get(..read).unwrap_or_default());
++    }
++    Ok(())
++}
++
++/// Write an answer and close.
++async fn answer(stream: &mut TcpStream, status: u16, body: Vec<u8>) -> std::io::Result<()> {
++    answer_with(stream, status, XML, &body, true).await
++}
++
++/// Write an answer with a content type and close.
++///
++/// `length` is whether the head says how long the body is: without it the body ends where the
++/// connection does ([`Stub::without_length`]).
++async fn answer_with(
++    stream: &mut TcpStream,
++    status: u16,
++    content_type: &str,
++    body: &[u8],
++    length: bool,
++) -> std::io::Result<()> {
++    let reason = match status {
++        200 => "OK",
++        204 => "No Content",
++        400 => "Bad Request",
++        403 => "Forbidden",
++        404 => "Not Found",
++        500 => "Internal Server Error",
++        503 => "Service Unavailable",
++        _ => "Status",
++    };
++    let declared = if length {
++        format!("Content-Length: {}\r\n", body.len())
++    } else {
++        String::new()
++    };
++    let head = format!(
++        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{declared}\
++         Connection: close\r\n\r\n"
++    );
++    stream.write_all(head.as_bytes()).await?;
++    stream.write_all(body).await?;
++    stream.flush().await
++}
++
++/// The content types this endpoint answers with.
++const XML: &str = "application/xml";
++/// What an object's bytes are.
++const BINARY: &str = "application/octet-stream";
++/// What an answer with no body carries.
++const EMPTY: &str = "application/xml";
++
++/// The body an S3-shaped refusal carries.
++fn error_body(code: &str, message: &str) -> Vec<u8> {
++    format!(
++        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code>\
++         <Message>{message}</Message></Error>"
++    )
++    .into_bytes()
++}
++
++/// Percent-decode `text`, byte for byte.
++fn decoded(text: &str) -> String {
++    let bytes = text.as_bytes();
++    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
++    let mut at = 0usize;
++    while at < bytes.len() {
++        match bytes.get(at).copied() {
++            Some(b'%') => {
++                let pair = bytes.get(at + 1..at + 3).and_then(|pair| {
++                    std::str::from_utf8(pair)
++                        .ok()
++                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
++                });
++                match pair {
++                    Some(byte) => {
++                        out.push(byte);
++                        at += 3;
++                    }
++                    None => {
++                        out.push(b'%');
++                        at += 1;
++                    }
++                }
++            }
++            Some(byte) => {
++                out.push(byte);
++                at += 1;
++            }
++            None => break,
++        }
++    }
++    String::from_utf8_lossy(&out).into_owned()
++}
++
++/// Where `needle` first stands in `haystack`.
++fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    if needle.is_empty() || haystack.len() < needle.len() {
++        return None;
++    }
++    (0..=haystack.len() - needle.len())
++        .find(|at| haystack.get(*at..at + needle.len()) == Some(needle))
++}
++
++/// The sha256 of `bytes`, lower-case hex.
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++/// The sha256 of `bytes`.
++fn sha256(bytes: &[u8]) -> [u8; 32] {
++    use sha2::Digest as _;
++    let mut hasher = sha2::Sha256::new();
++    hasher.update(bytes);
++    hasher.finalize().into()
++}
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index b5f4f3d..391e223 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -19,6 +19,10 @@ pub mod service;
+ // and the shrinking of a sequence that disagreed.
+ pub mod model;
+ pub mod walk;
++// `lakelet/4.21-cold-tiering`: the one factory the tiering spec builds a port with — `local` or
++// `s3`, read out of the environment variable the conformance gate sets — and the store both
++// backends' cases are run through.
++pub mod tier;
+ // kiln:scaffold:end
+ 
+ use std::path::{Path, PathBuf};
+diff --git a/tests/support/tier.rs b/tests/support/tier.rs
+new file mode 100644
+index 0000000..f722ed0
+--- /dev/null
++++ b/tests/support/tier.rs
+@@ -0,0 +1,318 @@
++//! The one factory the tiering spec builds a port with: `local`, or `s3`, and nothing else.
++//!
++//! `lakelet/4.21-cold-tiering` ships this file **complete**, and it is where the step's
++//! `conformance@2` gate meets the spec. The gate runs the step's `run.cmd` once per backend named in
++//! `conformance.toml`, with `KILN_BACKEND` set to the name (`kiln/src/gates/conformance.rs` owns
++//! that variable and its meaning, not this file), so "one suite, two implementations" is one suite
++//! run twice — the cases decide nothing about which backend they are on, and this module is the only
++//! place that reads the variable.
++//!
++//! Four things it knows, and the spec knows none of them:
++//!
++//! * **which backend to build.** `local` is `src/engine/tier/filesystem.rs` on a directory of this
++//!   process's own; `s3` is `src/engine/tier/s3.rs` against the in-process endpoint in
++//!   `tests/s3_stub.rs` — or against `KILN_S3_ENDPOINT`, when the machine has a real S3-compatible
++//!   endpoint to point at (`docs/m3-plan.md` §7 D-3: the same suite must be pointable at MinIO
++//!   without a line of the spec changing). With a real endpoint there is no request log, and
++//!   [`Tier::stub`] answers `None` so a case that reads one can say so rather than fail;
++//!
++//! and one thing it deliberately does *not* make conditional: **the endpoint exists on every run**,
++//! and [`Tier::bucket`] builds an S3-shaped port whichever backend `KILN_BACKEND` names. What the
++//! variable decides is which implementation [`Tier::objects`] answers with — the port a case is run
++//! through, which is what the conformance gate judges — and a case about the *client* (a signature,
++//! a retry, a request's shape) is about the same thing on both runs; leaving it out of one run
++//! would leave that half of the step out of the mutation walk, which runs this suite exactly once.
++//! * **the store's own directory**, a [`StoreDir`](super::StoreDir) — and a second one for the
++//!   local tier's root, because a tier that shares a directory with the store it tiers is a tier
++//!   that frees nothing;
++//! * **the prefix** this store's keys live under. It is derived from the case's label, so two cases
++//!   in one process cannot collide, and [`Tier::port`] takes one so that a case can build two of
++//!   them and see that two stores handed one bucket do not overwrite each other;
++//! * **the shape of the store both backends are run through**: segments one hour apart, a handful of
++//!   records each, at timestamps derived from arithmetic rather than from a clock
++//!   ([`EPOCH`], [`records`], [`last_of`]). A fixture that read the time would make a policy case
++//!   flake at midnight.
++//!
++//! What it deliberately does **not** know is any assertion: it builds values, it does not judge
++//! them. The rule is `tests/support/mod.rs`'s, and it is the reason a case can be about the rule
++//! rather than about the fixture.
++
++#![allow(dead_code)] // the spec uses the part of the fixture it needs, not all of it
++
++#[path = "../s3_stub.rs"]
++pub mod stub;
++
++use std::path::{Path, PathBuf};
++
++use lakelet::engine::compaction::{self, Segments};
++use lakelet::engine::tier::{Bucket, Config, Directory, Listing, Objects, Report};
++use lakelet::protocol::batch::Record;
++
++use super::StoreDir;
++
++/// The environment variable the conformance gate sets to pick a backend.
++pub const BACKEND: &str = "KILN_BACKEND";
++
++/// The environment variable a deployment points at a real S3-compatible endpoint.
++pub const ENDPOINT: &str = "KILN_S3_ENDPOINT";
++
++/// How many keys one page holds, in this fixture.
++///
++/// Two, because a listing that pages cannot be judged on a store that fits in one page: the store
++/// both backends are run through has more segments than this. For the local backend it is the port's
++/// own page size. For the S3-shaped one the *client* asks for a thousand and the endpoint answers
++/// two — an endpoint is allowed to, and following the token is the half of a listing a first
++/// implementation gets wrong.
++pub const PAGE: usize = 2;
++
++/// The bucket the S3-shaped port names in every path.
++pub const BUCKET: &str = "lakelet-tier";
++
++/// The region, service and instant the S3-shaped port signs with.
++///
++/// A fixed date, because a signature is bytes: [`DATE`] is what `x-amz-date` and the credential
++/// scope carry, and a port whose date came from a clock would sign a different request every second.
++pub const REGION: &str = "eu-central-1";
++/// The instant the fixture's signatures are dated with.
++pub const DATE: &str = "20261008T000000Z";
++/// The access key the fixture signs as. An identifier, not a secret, and not a real one.
++pub const ACCESS_KEY: &str = "AKIDLAKELETTIER4X21";
++/// The secret the fixture derives its signing key from. Not a real one, and not a secret.
++pub const SECRET: &str = "lakelet-tier-fixture-secret";
++
++/// One hour, in the units the manifest states: milliseconds.
++pub const HOUR: u64 = 3_600_000;
++
++/// The instant the fixture's store starts at.
++///
++/// A number rather than a clock reading: every timestamp a case compares against is this value plus
++/// arithmetic, so the same case says the same thing on every machine and at every hour.
++pub const EPOCH: u64 = 4_700_000 * HOUR;
++
++/// How many records one sealed segment holds.
++pub const PER_SEGMENT: usize = 4;
++
++/// Milliseconds between two records of one segment.
++pub const STEP: u64 = 60_000;
++
++/// The records segment `ordinal` holds: its own series, one minute apart from its start.
++#[must_use]
++pub fn records(ordinal: u64) -> Vec<Record> {
++    let start = EPOCH + ordinal * HOUR;
++    (0..PER_SEGMENT)
++        .map(|at| Record {
++            series: format!("cpu,host=h{ordinal}"),
++            ts_millis: (start + at as u64 * STEP) as i64,
++            value: (ordinal * 100 + at as u64) as f64,
++        })
++        .collect()
++}
++
++/// The instant segment `ordinal`'s *last* record falls at: what a tier policy compares.
++#[must_use]
++pub fn last_of(ordinal: u64) -> u64 {
++    EPOCH + ordinal * HOUR + (PER_SEGMENT as u64 - 1) * STEP
++}
++
++/// The instant segment `ordinal`'s *first* record falls at.
++#[must_use]
++pub fn first_of(ordinal: u64) -> u64 {
++    EPOCH + ordinal * HOUR
++}
++
++/// Open a store in `directory` and seal `segments` segments in it.
++#[must_use]
++pub fn sealed(directory: &Path, segments: u64) -> Segments {
++    let mut store = Segments::open(directory)
++        .unwrap_or_else(|error| panic!("a directory this process owns is a store: {error}"));
++    for ordinal in 0..segments {
++        store
++            .seal(&records(ordinal))
++            .unwrap_or_else(|error| panic!("segment {ordinal} is what a flush closes: {error}"));
++    }
++    store
++}
++
++/// Every record a store answers with, in the order its segments hold them.
++#[must_use]
++pub fn answers(store: &Segments) -> Vec<Record> {
++    store
++        .snapshot()
++        .records()
++        .unwrap_or_else(|error| panic!("the store's own segments are readable: {error}"))
++}
++
++/// One case's fixture: a store directory, a tier, and the backend that tier is.
++#[derive(Debug)]
++pub struct Tier {
++    /// The backend's name, exactly as `KILN_BACKEND` spelled it.
++    backend: String,
++    /// The store's directory.
++    store: StoreDir,
++    /// The local tier's root. Unused by the S3-shaped backend, and created anyway so that the two
++    /// backends' fixtures are the same shape.
++    root: StoreDir,
++    /// The prefix this case's store uses.
++    prefix: String,
++    /// The endpoint, when one was started here.
++    stub: Option<stub::Stub>,
++    /// Where the S3-shaped port connects.
++    endpoint: String,
++}
++
++impl Tier {
++    /// Build the fixture for `label`, with the backend `KILN_BACKEND` names (`local` by default).
++    ///
++    /// The label is part of every path and every prefix this fixture makes, so two cases in one
++    /// process — the test harness runs them in parallel — cannot share a store, a tier or a key
++    /// space.
++    #[must_use]
++    pub fn start(label: &str) -> Self {
++        let backend = std::env::var(BACKEND).unwrap_or_else(|_| "local".to_owned());
++        let store = StoreDir::new(&format!("tier-store-{label}"));
++        let root = StoreDir::new(&format!("tier-root-{label}"));
++        // The endpoint is started on **every** run, not only the S3-shaped one: half of this
++        // step's cases are about the *client* rather than about the port — a signature, a payload
++        // hash, a retry, a request shape, a page token — and a case about the client that only ran
++        // on one backend would be a case the other run's suite (and the mutation walk, which runs
++        // the suite exactly once) never reaches. What `KILN_BACKEND` decides is which
++        // implementation *the port cases* are run through, which is what `conformance@2` judges.
++        let named = std::env::var(ENDPOINT).ok();
++        let stub = if named.is_none() {
++            Some(stub::Stub::start())
++        } else {
++            None
++        };
++        let endpoint = named.unwrap_or_else(|| {
++            stub.as_ref()
++                .map(|stub| stub.endpoint().to_owned())
++                .unwrap_or_default()
++        });
++        Self {
++            backend,
++            store,
++            root,
++            prefix: format!("lakelet-store-{label}"),
++            stub,
++            endpoint,
++        }
++    }
++
++    /// The name of the backend this fixture built, as `KILN_BACKEND` spelled it.
++    #[must_use]
++    pub fn backend(&self) -> &str {
++        &self.backend
++    }
++
++    /// The store's directory: where `segments/` and `segments.manifest` live.
++    #[must_use]
++    pub fn store_dir(&self) -> &Path {
++        self.store.path()
++    }
++
++    /// The prefix this case's store uses.
++    #[must_use]
++    pub fn prefix(&self) -> &str {
++        &self.prefix
++    }
++
++    /// A port for the store whose keys live under `prefix`.
++    ///
++    /// Every call builds a new port, which is what lets a case hold two *stores* — two prefixes —
++    /// against one tier. A port is a value, and nothing in it is shared with another one.
++    #[must_use]
++    pub fn port(&self, prefix: &str) -> Box<dyn Objects> {
++        if self.backend == "s3" {
++            return Box::new(self.bucket(prefix));
++        }
++        Box::new(
++            Directory::new(self.root.path())
++                .with_prefix(prefix)
++                .with_page(PAGE),
++        )
++    }
++
++    /// The S3-shaped port for `prefix`: the endpoint's, whichever backend this run is on.
++    ///
++    /// A case about the client builds one of these whatever `KILN_BACKEND` says, because what it is
++    /// about — a signature, a payload hash, a retry, a request shape — is the same question on both
++    /// runs. The *port* cases are the ones that go through [`Tier::objects`].
++    #[must_use]
++    pub fn bucket(&self, prefix: &str) -> Bucket {
++        let config = Config::new(&self.endpoint, BUCKET, REGION, DATE, ACCESS_KEY, SECRET);
++        Bucket::new(config)
++            .unwrap_or_else(|error| panic!("the fixture's config is one a tier can use: {error}"))
++            .with_prefix(prefix)
++    }
++
++    /// The port for this case's own store.
++    #[must_use]
++    pub fn objects(&self) -> Box<dyn Objects> {
++        self.port(&self.prefix)
++    }
++
++    /// A store with `segments` sealed segments, at this fixture's known instants.
++    #[must_use]
++    pub fn store(&self, segments: u64) -> Segments {
++        sealed(self.store_dir(), segments)
++    }
++
++    /// Every record the store answers with, in the order its segments hold them.
++    #[must_use]
++    pub fn answers(&self, store: &Segments) -> Vec<Record> {
++        answers(store)
++    }
++
++    /// What the tier holds under `prefix`, asked of the port rather than of a directory.
++    #[must_use]
++    pub fn held(&self, prefix: &str) -> Vec<String> {
++        let port = self.port(prefix);
++        let listing: Listing = lakelet::engine::tier::listing(&*port, port.prefix())
++            .unwrap_or_else(|error| panic!("the tier's own listing answers: {error}"));
++        listing.keys().to_vec()
++    }
++
++    /// The in-process endpoint, when this fixture started one.
++    ///
++    /// `None` when the machine's `KILN_S3_ENDPOINT` was used instead: a real endpoint has no request
++    /// log, and a case that reads one has to be able to say so.
++    #[must_use]
++    pub fn stub(&self) -> Option<&stub::Stub> {
++        self.stub.as_ref()
++    }
++
++    /// Every request the in-process endpoint answered — empty when there is none.
++    #[must_use]
++    pub fn calls(&self) -> Vec<stub::Call> {
++        self.stub().map(stub::Stub::calls).unwrap_or_default()
++    }
++
++    /// The requests of one method the in-process endpoint answered.
++    #[must_use]
++    pub fn calls_of(&self, method: &str) -> Vec<stub::Call> {
++        self.stub()
++            .map(|stub| stub.calls_of(method))
++            .unwrap_or_default()
++    }
++}
++
++/// The path of one segment's file inside a store directory.
++#[must_use]
++pub fn file_of(directory: &Path, ordinal: u64) -> PathBuf {
++    compaction::file_of(directory, ordinal)
++}
++
++/// What a pass reported, as the `name=value` lines a report prints.
++///
++/// A pass's own numbers, in one place, so that a case can say what it compared without a second
++/// spelling of the fields: `moved=2 kept=1 bytes=… fetched=0 pages=0`.
++#[must_use]
++pub fn report_lines(report: &Report) -> Vec<String> {
++    vec![
++        format!("moved={}", report.moved()),
++        format!("fetched={}", report.fetched()),
++        format!("kept={}", report.kept()),
++        format!("bytes={}", report.bytes()),
++        format!("pages={}", report.pages()),
++    ]
++}
