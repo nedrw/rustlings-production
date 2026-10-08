@@ -9,6 +9,12 @@
 name = "lakelet"
 version = "0.1.0"
 edition = "2024"
+# The binary a bare `cargo run --package lakelet` means, and the one an image ships. This project
+# has three binaries (`lakeletd`, `lakeletq`, `lakelet-load`), so without this line cargo refuses
+# to guess which one was meant — and a judge that asks the project a question *through* `cargo run`
+# (`lakelet/4.22-reproducible-build`'s `container-repro` gate asks `--check-config` that way)
+# cannot get an answer at all. The daemon is what a deployment starts, so the daemon is the default.
+default-run = "lakeletd"
 
 [dependencies]
 # kiln:scaffold:begin
