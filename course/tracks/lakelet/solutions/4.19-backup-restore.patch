@@ -1,0 +1,2042 @@
+diff --git a/docs/dr-drill.md b/docs/dr-drill.md
+index 5fc610c..84d4ce6 100644
+--- a/docs/dr-drill.md
++++ b/docs/dr-drill.md
+@@ -1,62 +1,234 @@
+ # Backups are only real once you have restored one
+ 
+-<!-- TODO: one paragraph, in this project's voice, on what a backup of *this* store is — a directory
+-that somebody else moves — and why a copy nothing has ever restored is a hope rather than a backup.
+-Name the two numbers the page is about (RPO, what the crash had already lost, and RTO, how long
+-putting the store back takes) and say which of the two belongs to the write path's policy rather than
+-to a copy. -->
++A store is a directory: a manifest that names its segments, the segment files themselves, and the log
++nothing has closed into one yet. Everything this project has built so far treats that directory as
++somewhere a *process* writes — [`lakelet/4.4-wal-recovery`](../src/engine/wal/replay.rs) replays the
++log at open, [`lakelet/4.8-compaction`](../src/engine/compaction/mod.rs) swaps the manifest and
++deletes what it does not name, [`lakelet/4.14-index-pruning`](../src/engine/index/mod.rs) keeps a
++sidecar beside every segment. This page is about the other use: an operator *moving* the directory,
++and the two numbers that decide whether moving it was worth anything.
+ 
+-[TODO](TODO)
++**RPO** is what the crash had already lost before the copy began. It is not a property of a backup
++tool at all — it is the write path's own policy, written down in
++[the write-path record](adr/0001-write-path.md) and answered by `Policy::losses` — and a copy tool
++that reported a different number would be guessing about somebody else's decision.
++
++**RTO** is how long putting the store back takes. It is a wall clock, so it belongs on a page with
++the machine named and nowhere in a judgement: this project's gates compare counts, never seconds
++(`lakelet/4.15-budget-regression`'s rule, and [the soak page](soak.md) makes the same argument about
++minutes).
++
++And the sentence the title is: a copy nothing has ever restored is a *hope*. The only thing that
++makes it a backup is a restore that ends in a store somebody read a record out of — which is why the
++command this page is built around does the whole thing and not half of it.
+ 
+ ## What a copy of this store is
+ 
+-<!-- TODO: the three things a copy takes, in the order it reads them — the store's own manifest (it is
+-the file list: `lakelet/4.8-compaction`), every segment the manifest names, and the prefix of the log
+-a replay proves (`lakelet/4.4-wal-recovery`). Say what is deliberately *not* taken (the sidecar
+-indexes are derived state; `*.pending` is a file the store's own open deletes) and where the copy's
+-own manifest is: what it is made of, and why it is a log in that format rather than a new one. Link
+-the two files that implement it. -->
++Three parts, in the order they are read:
++
++- **the store's own manifest**, `segments.manifest` — the file list. The manifest is the store
++  (`lakelet/4.8-compaction`): a file in `segments/` the manifest does not name is an orphan a crash
++  left behind, and an orphan is not part of what a store is, so it is not part of a copy either;
++- **every segment the manifest names, in the manifest's order** — the closed files a query is
++  answered from;
++- **the prefix of the log a replay proves** — `lakelet/4.4-wal-recovery`'s `Recovered::bytes()`, and
++  not one byte past it. This is where a copy differs from `cp -r`: the tail no replay can prove is
++  the middle of a record nobody finished, and carrying it into a backup carries it into every store
++  restored from that backup.
++
++Two things are deliberately **not** taken. The sidecar indexes are derived state
++(`lakelet/4.14-index-pruning`): a restored store without them answers the same questions having read
++more, so a copy of them would be a copy of something the store can rebuild by itself. And
++`*.pending` is a half-written manifest the store's own open deletes — copying it would copy a file
++the store has already decided not to keep.
++
++The copy records what it took in **its own manifest**, `<copy>/backup.manifest`, which is
++`lakelet/4.4-wal-recovery`'s log byte for byte: one entry per file, the file's length, the crc32 over
++its bytes, and the numbers the store's own index states about it. That choice is what makes an
++*interrupted* copy usable rather than mysterious — see
++[`src/engine/backup/manifest.rs`](../src/engine/backup/manifest.rs) for the layout and the argument.
+ 
+ ## The ordering, which is the whole design
+ 
+-<!-- TODO: a copy writes a file's bytes, waits for the device, and only then appends the entry that
+-names it; a restore verifies every entry before it writes anything and writes the store's own
+-manifest *last*. Why each order matters: what an interrupted copy declares, what a refused restore
+-leaves behind, and what a half-restore is (a directory that is not a store — and one an operator must
+-not open to look at, because opening a store deletes what its manifest does not name). -->
++A copy writes a file's bytes, waits for the device, and only then appends the entry that names it
++([`src/engine/backup/mod.rs`](../src/engine/backup/mod.rs), `Copying::step`). So "the manifest says
++what is complete" is a property of the code and not a claim about a filesystem: an entry is there
++only after the bytes it describes were on the device, and a file whose entry never arrived is a file
++the copy does not claim. A copy that was interrupted inside a segment therefore declares the segments
++it finished and stays silent about the one it was writing — and a restore of that copy writes exactly
++what it declared.
++
++A restore does the same thing from the other end
++([`src/engine/backup/restore.rs`](../src/engine/backup/restore.rs)): it loads the copy's manifest,
++**verifies every entry it names**, and only then writes. The last file it writes is the store's own
++`segments.manifest`, because that file is the commit point — the file a directory becomes a store by
++having. A restore interrupted before it leaves a directory that no store opens as a store, and that
++is worth one sentence of warning rather than a shrug: **do not open a half-restore to look at it**,
++because opening a store deletes what its manifest does not name, and a directory with segments and no
++manifest is a store whose segments are all orphans.
+ 
+ ## The operator's procedure
+ 
+-<!-- TODO: the five steps as commands, and the one thing this copy deliberately does not do: it is not
+-a live copy. Say what a live copy would need that this one does not have (a checkpoint the store can
+-hand out, and its agreement not to retire the segments a copy in flight has named), and why "stop
+-the writer" is the honest answer instead. -->
++Five steps, four commands, and the order is the point:
++
++```sh
++# 1. stop the writer. A store being written while it is copied is two stores at once.
++# 2. copy it.
++lakeletq backup --store /var/lib/lakelet --to /backup/lakelet-20231114
++# 3. restore the copy into a directory that is not the store.
++lakeletq restore --from /backup/lakelet-20231114 --to /var/lib/lakelet.restoring
++# 4. read a record out of it, and compare it with what the store answers.
++#    A restore that ends in a directory nobody queried has proven nothing.
++# 5. stop the store, move the restored directory into place, start it again.
++```
++
++Step 2 refuses a destination that already holds a store, and step 1 is not optional. **This copy is
++not a live copy**, and the difference is worth being explicit about: the store's files agree with
++each other only if nothing writes them while they are read. A copy reads the manifest, then each
++segment, then the log, and a flush or a merge between two of those reads leaves a copy of two
++different stores — a manifest from before a merge and segments from after it, or a log whose first
++bytes describe records a segment has already swallowed. Making this live needs a **checkpoint** the
++store can hand out: a manifest, a set of segments and a log offset that belong *together*, plus the
++store's agreement not to retire the segments a copy in flight has named. `lakelet/4.8-compaction`'s
++snapshots are that promise for a reader inside one process, and a copy is a reader in another. Until
++that exists, the answer is the boring one: stop the writer, copy, restore, swap.
+ 
+ ## What "verified" means, one class at a time
+ 
+-<!-- TODO: the four ways a copy can be wrong — a file missing, one that is not the length its entry
+-states, one whose bytes hash to another checksum, and one that cannot be read or is named as a path
+-no store could hold — with the sentence `lakeletq restore` prints for each and what an operator does
+-about it. Say what the checksum covers and who computes it. -->
++A copy that cannot be restored is worth nothing, and the useful question is not "is it damaged" but
++*which* damage it is, because an operator does something different about each. Four answers, and a
++restore refuses on every one of them *before* it writes a byte:
++
++| what is wrong | the sentence | what it usually means |
++| --- | --- | --- |
++| a named file is not there | `segments/0000000007.lks: the copy's manifest names it and the copy does not hold it` | the copy was interrupted or a transfer dropped a file — take a new copy |
++| the file is not the length the manifest states | `segments/0000000007.lks: 4102 bytes expected, 990 found` | a transfer that stopped early, or a disk that lost a piece of the file |
++| the bytes are not the bytes the manifest states | `segments/0000000007.lks: crc32 1f3a0c7e expected, 92b41de5 found` | the file was written by something else: a device that lied, a restore of a restore, an edit somebody made by hand |
++| the file cannot be read at all, or its name is not one a store could have | `segments/0000000007.lks: Permission denied (os error 13)` | a filesystem or a permission problem — not a copy problem |
++
++The checksum is the fourth kind of confidence and the cheapest: it is `crc32fast` over the whole file,
++the same family `lakelet/4.4-wal-recovery` seals a log record with, and it catches a shortened file, a
++flipped byte and a file that is somebody else's — which is why a copy of this store can be *verified*
++on a machine that has nothing but the copy.
+ 
+ ## The two numbers
+ 
+-<!-- TODO: RPO first, measured rather than asserted: run the drill and quote the two lines it prints
+-for the loss, and name the policy that produced them (and what the other two policies would accept
+-losing). Then RTO: a wall clock, with the machine named, from a store whose size you state — copy it,
+-restore it, `time` both, and say which half is the expensive one and why. If you like, give the
+-drill's own restore time as the floor of the measurement. -->
++**RPO, measured.** The store below ran the write path's `Policy::Never`: nothing waits for the
++device, so everything written since the last flush is in the page cache and nowhere else, and that is
++`Losses::EverythingSinceTheLastFlush` — the write path's own answer, not this page's opinion. The
++drill killed the machine at the last offset the device had been told about and copied what was left:
++
++```
++write_policy=never
++rpo_bytes=128
++rpo_records=4
++```
++
++Four records and 128 bytes of log lost, out of the twelve the script wrote. A deployment running this build's
++default (`interval(50ms)`, `Policy::DEFAULT`) bounds that window by time rather than by count, and a
++deployment running `per-record` has no window at all — the same three policies the write-path record
++prices, answering the question a backup plan is really about. What a *copy* adds to that number is
++nothing: the copy takes the log's proven prefix, so it loses only what the log could not prove, and
++the records above were already gone before the copy started.
++
++**RTO, measured, with the machine named.** This is a debug build (`rustc 1.98.1`) on an Apple M2
++(`Darwin 25.6.0 arm64`), and the store is a 2.4 MB one of 202 segments, a 261-byte log and 200,008
++records — built by the drill's own store plus `lakelet-load --profile --cycles 200 --store …`:
++
++```sh
++time lakeletq backup  --store <store> --to <copy>        # 1.85s, 1.86s, 1.86s
++time lakeletq restore --from <copy>  --to <restored>     # 1.02s, 1.01s, 1.02s
++```
++
++**Copying is the expensive half, and the reason is the flush rather than the bytes**: 204 files were
++written and each one waits for the device before it is named, 971,700 bytes in total. That is the
++trade this design makes on purpose — an entry that is there names bytes the device kept — and it is
++the same finding `lakelet/4.16-profiling`'s page came to from the other side: this store is not slow
++at *computing*, it is slow at *committing*. The restore is faster because its writes are not waiting
++for a policy decision, and because reading 204 files costs less than reading them and syncing each
++one.
++
++A restore of the drill's own 569-byte copy — four files — takes **18–20 ms**, which is the floor of
++this measurement: process start, four file writes and one store open. The RTO an operator plans with
++is the number for *their* store size, and the shape of it is the one above: two passes over the
++bytes, one of them syncing every file.
+ 
+ ## The drill, and the block a reader can re-run
+ 
+-<!-- TODO: `lakeletq drill` is this page's procedure run on a store it builds itself. Say what it
+-does — the real write path, a modelled machine death, a copy, a restore, and then the same again for
+-a copy interrupted inside a segment — then quote its *whole* output, line for line, in the block
+-below, and walk a reader through the numbers in it: what the copy states, what the interruption cost,
+-and what a restore of that interrupted copy would leave behind. The spec re-runs the command and
+-compares the block, so edit it from a run and never by hand. If you quote a timed run, keep the
+-timing line out of this block — the block has to be the same bytes on every machine. -->
++`lakeletq drill` **is** the procedure on this page, run on a store it builds itself: it writes a
++store through the real write path, models a machine death by cutting the log back to the last offset
++the device was told about, copies it, restores it, and then does the same again with a copy that was
++interrupted *inside a segment*. No clock reaches its output, so the block below is the same bytes on
++any machine, and the spec re-runs the command and compares it line for line:
+ 
+ ```text
+-write_policy=TODO
++write_policy=never
++source_files=4
++source_records=8
++source_digest=1a08ac1519a00eac
++rpo_bytes=128
++rpo_records=4
++copy_files=4
++copy_entries=4
++copy_bytes=569
++copy_records=8
++copy_log_bytes=261
++copy_log_records=2
++copy_interrupted=false
++restored_files=4
++restored_bytes=569
++restored_records=8
++restored_log_records=2
++restored_digest=1a08ac1519a00eac
++records_missing=0
++half_files=3
++half_entries=2
++half_interrupted=true
++half_records=4
++half_restored_files=2
++half_records_missing=4
++half_store_opens=false
++agreed=true
+ ```
++
++Read it in four parts. `write_policy`, `source_files`, `source_records` and `source_digest` are the
++store: four files, eight records, and a digest over them in order — a digest and not a count, because
++a copy that lost one record and invented another keeps the count. `rpo_bytes` and `rpo_records` are
++what the machine death took. The `copy_…` lines are what the copy took and what its own manifest
++states: `copy_entries=4` equals `copy_files=4` because nothing interrupted it, and `copy_bytes=569`
++with `copy_log_bytes=261` says the log's proven prefix is part of the copy and the tail is not. The
++`restored_…` lines are the restore, and `records_missing=0` with two equal digests is the sentence
++the title is about: the store came back, record for record.
++
++Then the interrupted copy, which is the half a backup plan usually skips: `half_files=3` and
++`half_entries=2` are the copy that stopped inside its second segment — three files were written and
++only two were named — `half_records_missing=4` is what an operator would lose by restoring it, and
++`half_store_opens=false` is the other half of the warning above: the restored directory holds a
++manifest naming a segment nobody kept, so no store opens it. It is a directory to *look at with
++`ls`*, and not one to open.
++
++Adding `LAKELET_DRILL_TIMED=1` prints one more line — the restore's wall clock — which is why the
++block above has no clock in it and why the page's RTO numbers come from the timed run rather than
++from this block.
++
++## Where the ideas come from
++
++- **`pg_basebackup` and `pg_start_backup`** — the closest thing in a database people operate: the
++  server is told to take a checkpoint and to keep the write-ahead log until the copy is finished,
++  which is the *live copy* this step deliberately does not do. Its failure mode is the one the
++  checkpoint exists for, and it is worth reading the reason rather than the flags.
++- [**`borg`**](https://borgbackup.readthedocs.io/) **and `restic`** — backup tools that made
++  *verifying* a first-class verb rather than an afterthought. The checksum-per-file in this step's
++  copy manifest is the same idea at the scale a course project can afford, and those tools' `check`
++  subcommands are the source of the sentence at the top of this page.
++- **the write-ahead log** — `lakelet/4.4-wal-recovery`'s prefix argument, which this step applies to a
++  directory instead of a file: what a replay can prove is the store, and what it cannot is not.
++- [`src/engine/backup/`](../src/engine/backup/mod.rs) — the copy and the restore, their ordering, and
++  the refusals this page's table is made of.
++- [`src/cli/backup.rs`](../src/cli/backup.rs) — the three commands, and the drill the block above is.
++- [`lakelet/4.3-write-path-adr`](adr/0001-write-path.md) — what waiting for the device costs, and the
++  three policies the RPO above is one of.
++- [The crash-point table](crash-points.md) — every point a machine can stop at, and what each one
++  leaves — the RPO number this page measures is one row of it.
++- [`lakelet/4.18-cardinality-cost`](cardinality.md) — what a restored store's ledger is rebuilt from,
++  and why a copy that does not take the sidecar indexes still rebuilds it.
+diff --git a/src/cli/backup.rs b/src/cli/backup.rs
+index 4fe4ca6..64536ed 100644
+--- a/src/cli/backup.rs
++++ b/src/cli/backup.rs
+@@ -13,110 +13,833 @@
+ //!   so an operator who gets a non-zero code still has an empty directory and not a half store;
+ //! * **`drill`** is the rehearsal, and it is the reason the other two are checkable: it builds a
+ //!   store with the real write path, models a machine death, copies it, restores it, does the same
+-//!   with a copy interrupted inside a segment, and prints what it observed — [`DRILL_LINES`] is that
+-//!   output's format, written out here for the reason `lakelet/4.16-profiling` wrote its mode's into
+-//!   its `USAGE`: a command's output is an interface a script *and a page* read, and an interface
+-//!   that exists only in the code that produces it is one nobody can be handed.
++//!   with a copy interrupted inside a segment, and prints what it observed. One command, no clock,
++//!   no seed, the same bytes on any machine — which is what lets `docs/dr-drill.md` carry a block
++//!   that a reader can re-run and that the step's spec compares line for line.
+ //!
+-//! The drill asserts what it observes rather than only printing it — a restored store that does not
+-//! answer what its source answered fails the command — and the counts it prints are the ones those
+-//! assertions were made of, so a reader can check the claim instead of trusting the exit code.
++//! # Why the drill prints counts rather than a verdict
+ //!
+-//! # What is yours here
++//! The drill *asserts* what it observes — a restored store that does not answer what its source
++//! answered is a failure and exits non-zero — and it prints the counts those assertions are made of
++//! (`source_records`, `restored_records`, `records_missing`, and a digest over the ordered records on
++//! each side). A verdict on its own would be a claim a reader has to trust; the two digests are the
++//! claim they can check.
+ //!
+-//! The three bodies below. Everything they need from the command line already exists: the flags
+-//! arrive as `flags` and `--json` as `json` (`lakelet/4.10-downsampling`'s dispatch takes the format
+-//! flag out of the line before a command sees it), and `Outcome` is the answer — one value holding
+-//! the code, stdout and stderr, so a command cannot print half an answer and then fail.
++//! # The two operator commands do not read the clock
+ //!
+-//! Two rules come with it, and both are the tool's and not this file's (`jobq/3.15-cli-contract`):
+-//! a **caller mistake is answered before a store is opened** (`2`), and a refusal writes *nothing* on
+-//! standard output — a script that pipes this tool into a parser is never handed half an answer.
+-//!
+-//! The dispatch arm, the `USAGE` lines and the failure class each command leaves are not yours:
+-//! they are in `src/cli/mod.rs`, where every command in this tool is named.
++//! RTO is a wall clock, and a wall clock is the one thing this project never judges by
++//! (`lakelet/4.15-budget-regression`'s rule): a copy and a restore answer *what* they moved, and the
++//! page is where the seconds live, measured on the machine the page names. The drill is the one place
++//! a timing line exists at all, and it is printed only when `LAKELET_DRILL_TIMED` is set — so the
++//! block the page quotes has no clock in it and two runs of the same command agree.
++
++use std::path::{Path, PathBuf};
++use std::time::Instant;
++
++use crate::engine::backup::{self, Error as Refusal, Interruption};
++use crate::engine::compaction::Segments;
++use crate::engine::spool::Spool;
++use crate::engine::wal::Policy;
++use crate::engine::wal::replay;
++use crate::protocol::batch::{self, Record};
+ 
+-use super::Outcome;
++use super::{Outcome, WRONG, readable};
+ 
+ /// The variable that adds the one timing line the drill can print.
+ ///
+ /// An environment variable rather than a flag, because it is not a *choice about the drill*: it is
+-/// the difference between the run a page quotes (no clock at all, so the same bytes on any machine)
+-/// and the run a person measures on their own.
++/// the difference between the run a page quotes (no clock at all) and the run a person measures on
++/// their own machine.
+ pub const TIMED: &str = "LAKELET_DRILL_TIMED";
+ 
+-/// The lines one drill prints, in the order it prints them: the format `docs/dr-drill.md` quotes.
+-///
+-/// `<…>` stands for a number the run produces. The last line is the one `LAKELET_DRILL_TIMED` adds;
+-/// nothing else in a drill's output may depend on a clock, because the block a page carries is
+-/// compared line for line with a fresh run.
+-pub const DRILL_LINES: &str = "\
+-write_policy=<name>          the durability policy the drill's own store ran
+-source_files=<n>             files a complete copy of that store takes
+-source_records=<n>           records its segments answer with
+-source_digest=<digest>       over those records, in the order the store answers them
+-rpo_bytes=<n>                bytes the modelled machine death took off the log
+-rpo_records=<n>              the records those bytes carried
+-copy_files=<n>               files anything was written for, the partial one included
+-copy_entries=<n>             files the copy's own manifest names
+-copy_bytes=<n>               bytes of file contents the copy wrote
+-copy_records=<n>             records the segments it named hold, from the store's index
+-copy_log_bytes=<n>           bytes of the log's proven prefix it took
+-copy_log_records=<n>         the payloads that prefix holds
+-copy_interrupted=<bool>      whether the copy stopped before the store was done
+-restored_files=<n>           files the restore wrote
+-restored_bytes=<n>           what they cost together
+-restored_records=<n>         records the segments it wrote hold
+-restored_log_records=<n>     payloads its log proves
+-restored_digest=<digest>     over the records the restored store answers with
+-records_missing=<n>          records the copy did not name
+-half_files=<n>               the same for a copy interrupted inside a segment
+-half_entries=<n>
+-half_interrupted=<bool>
+-half_records=<n>
+-half_restored_files=<n>
+-half_records_missing=<n>
+-half_store_opens=<bool>      whether a store opens the directory that restore wrote
+-agreed=<bool>                whether every claim above held
+-restore_millis=<n>           only under LAKELET_DRILL_TIMED: the drill's own restore, in milliseconds
+-";
+-
+ /// `lakeletq backup --store <DIR> --to <DIR>`: copy a store, and answer what was taken.
+ #[must_use]
+ pub fn backup(flags: &[&str], json: bool) -> Outcome {
+-    let _ = (flags, json);
+-    todo!(
+-        "lakelet/4.19-backup-restore: read `--store` and `--to`, refuse a store that is not there \
+-         before opening anything, copy it with `Interruption::None`, and print the report as the \
+-         `name=value` lines `lakeletq --help` states — or as the same object under `--json`"
+-    )
++    let (store, to) = match paths(flags, "--store", "backup") {
++        Ok(paths) => paths,
++        Err(outcome) => return outcome,
++    };
++    // The store has to be there before anything is opened: `lakelet/4.8-compaction`'s open *creates*
++    // the directory it is given, and a copy of a typo would be an empty backup that reports success.
++    if let Err(outcome) = readable(&store, "--store", "store") {
++        return outcome;
++    }
++    if let Err(outcome) = target(&to, "backup") {
++        return outcome;
++    }
++    match backup::copy(&store, &to, Interruption::None) {
++        Ok(report) => {
++            let observed: Vec<(&str, Measurement)> = vec![
++                ("files", Measurement::Count(report.files())),
++                ("entries", Measurement::Count(report.entries())),
++                ("bytes", Measurement::Count(report.bytes())),
++                ("records", Measurement::Count(report.records())),
++                ("log_bytes", Measurement::Count(report.log_bytes())),
++                ("log_records", Measurement::Count(report.log_records())),
++                ("interrupted", Measurement::Flag(report.interrupted())),
++                ("epoch", Measurement::Count(report.epoch())),
++                ("floor", Measurement::Count(report.floor())),
++            ];
++            answered(&observed, json)
++        }
++        Err(error) => complained(&error, "the store could not be copied"),
++    }
+ }
+ 
+ /// `lakeletq restore --from <DIR> --to <DIR>`: put a copy back, and answer what was written.
+ #[must_use]
+ pub fn restore(flags: &[&str], json: bool) -> Outcome {
+-    let _ = (flags, json);
+-    todo!(
+-        "lakelet/4.19-backup-restore: read `--from` and `--to`, restore, and print the outcome as \
+-         its `name=value` lines — or as the same object under `--json`. A damaged copy and a \
+-         destination that already holds a store are refusals, and a refusal answers nothing on \
+-         stdout"
+-    )
++    let (from, to) = match paths(flags, "--from", "restore") {
++        Ok(paths) => paths,
++        Err(outcome) => return outcome,
++    };
++    if let Err(outcome) = readable(&from, "--from", "copy") {
++        return outcome;
++    }
++    if let Err(outcome) = target(&to, "restore") {
++        return outcome;
++    }
++    match backup::restore(&from, &to) {
++        Ok(outcome) => {
++            let observed: Vec<(&str, Measurement)> = vec![
++                ("files", Measurement::Count(outcome.files())),
++                ("bytes", Measurement::Count(outcome.bytes())),
++                ("records", Measurement::Count(outcome.records())),
++                ("log_records", Measurement::Count(outcome.log_records())),
++                ("epoch", Measurement::Count(outcome.epoch())),
++                ("floor", Measurement::Count(outcome.floor())),
++            ];
++            answered(&observed, json)
++        }
++        Err(error) => complained(&error, "the copy could not be restored"),
++    }
+ }
+ 
+ /// `lakeletq drill [--store <DIR>]`: rehearse a backup and a restore, and answer what was observed.
+ ///
+-/// The store is built by the drill itself, so that the command is a *rehearsal* rather than a report
+-/// about somebody's store: a reader can run it on any machine and compare the answer with the block
+-/// `docs/dr-drill.md` carries. `--store` names where that store is built; everything else the drill
+-/// writes goes into a directory of this process's own and is removed when it ends.
++/// The store is built by the drill itself ([`rehearse`]) so that the command is a *rehearsal* rather
++/// than a report about somebody's store: a reader can run it on any machine and compare the answer
++/// with the block `docs/dr-drill.md` carries. `--store` names where that store is built, which is
++/// useful for looking at what a drill left behind; everything else the drill writes (the copy, the
++/// restored store, the interrupted copy) goes into a directory of this process's own and is removed
++/// when it ends.
+ #[must_use]
+ pub fn drill(flags: &[&str], json: bool) -> Outcome {
+-    let _ = (flags, json);
+-    todo!(
+-        "lakelet/4.19-backup-restore: build a store with the real write path, model a machine death \
+-         by cutting the log back to what the device was told about, copy it, restore it, do the same \
+-         for a copy interrupted inside a segment, and print `DRILL_LINES` with the numbers that run \
+-         produced — `restore_millis` only when the environment asks for it"
+-    )
++    let mut store: Option<&str> = None;
++    let mut index = 0;
++    while let Some(flag) = flags.get(index).copied() {
++        let Some(value) = flags.get(index + 1) else {
++            return Outcome::refused(WRONG, format!("`{flag}` takes a value and did not get one"));
++        };
++        match flag {
++            "--store" if store.is_none() => store = Some(value),
++            "--store" => return Outcome::refused(WRONG, "`--store` was given twice"),
++            other => {
++                return super::unknown(other, "`drill` reads `--store <DIR>` and nothing else");
++            }
++        }
++        index += 2;
++    }
++
++    let owned = match workspace(store.map(Path::new)) {
++        Ok(owned) => owned,
++        Err(outcome) => return outcome,
++    };
++    match rehearse(owned.store(), owned.scratch()) {
++        Ok(observed) => answered(&observed, json),
++        Err(outcome) => outcome,
++    }
++}
++
++/// The one class a refusal belongs to, and the sentence a reader acts on.
++///
++/// The class is the refusal's own (`crate::engine::backup::Error::class`), so this file does not keep
++/// a second table of what a failed copy exits with: the module that can tell the failures apart is
++/// the place that knows which exit code each one is — `lakelet/4.10-downsampling`'s rule for a query,
++/// and the same rule here.
++fn complained(error: &Refusal, what: &str) -> Outcome {
++    Outcome::refused(error.class(), format!("{what}: {error}"))
++}
++
++/// The answer in the shape that was asked for: one `name=value` per line, or one JSON object.
++///
++/// The order of the measurements is the order the lines are printed in, and it is the same order the
++/// object's keys are written in — a script reads the names, and a person reads the order.
++fn answered(observed: &[(&str, Measurement)], json: bool) -> Outcome {
++    if json {
++        return match serde_json::to_string(&Answer(observed)) {
++            Ok(document) => Outcome::answered(format!("{document}\n")),
++            Err(error) => Outcome::refused(
++                super::BROKEN,
++                format!("the answer could not be written as JSON: {error}"),
++            ),
++        };
++    }
++    let mut stdout = String::new();
++    for (name, measurement) in observed {
++        stdout.push_str(&format!("{name}={}\n", measurement.text()));
++    }
++    Outcome::answered(stdout)
++}
++
++/// One measurement of a command's answer: a count, a flag, or a name.
++///
++/// Three shapes because that is what these commands answer with — `interrupted=false` is not a count
++/// of anything, and `write_policy=never` is a name the write path gave itself
++/// (`lakelet/4.3-write-path-adr`) rather than a number — and one type rather than a
++/// `serde_json::Value`, because a value built by hand is a shape nobody checks at compile time.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Measurement {
++    /// How many of something.
++    Count(u64),
++    /// Whether something was the case.
++    Flag(bool),
++    /// What something is called.
++    Name(&'static str),
++}
++
++impl Measurement {
++    /// The measurement as the text after a `=` in a line of the answer.
++    #[must_use]
++    pub fn text(self) -> String {
++        match self {
++            Self::Count(count) => count.to_string(),
++            Self::Flag(flag) => flag.to_string(),
++            Self::Name(name) => name.to_owned(),
++        }
++    }
++}
++
++impl serde::Serialize for Measurement {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        match self {
++            Self::Count(count) => serializer.serialize_u64(*count),
++            Self::Flag(flag) => serializer.serialize_bool(*flag),
++            Self::Name(name) => serializer.serialize_str(name),
++        }
++    }
++}
++
++/// The measurements of one command as one JSON object, in the order they were observed.
++///
++/// An object built from the list rather than a struct with one field per count, for the reason
++/// `lakelet/4.15-budget-regression` built its phase profile that way: the names are one list, and a
++/// struct would spell them a second time — with the second spelling free to drift from the lines.
++struct Answer<'a>(&'a [(&'a str, Measurement)]);
++
++impl serde::Serialize for Answer<'_> {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        use serde::ser::SerializeMap;
++
++        let mut map = serializer.serialize_map(Some(self.0.len()))?;
++        for (name, measurement) in self.0 {
++            map.serialize_entry(name, measurement)?;
++        }
++        map.end()
++    }
++}
++
++/// The two paths a `backup` or a `restore` line names, or the refusal for a line that is not one.
++///
++/// `first` is the flag this command's *source* is: `--store` for a copy, `--from` for a restore. The
++/// other is `--to` in both, because both write somewhere. A flag given twice is refused rather than
++/// resolved, which is `lakelet/4.10-downsampling`'s rule for its own flags: a script that appends
++/// defaults to a caller's line would otherwise have one of them silently ignored.
++fn paths(flags: &[&str], first: &str, command: &str) -> Result<(PathBuf, PathBuf), Outcome> {
++    let mut source: Option<&str> = None;
++    let mut destination: Option<&str> = None;
++    let mut index = 0;
++    while let Some(flag) = flags.get(index).copied() {
++        let Some(value) = flags.get(index + 1) else {
++            return Err(Outcome::refused(
++                WRONG,
++                format!("`{flag}` takes a value and did not get one"),
++            ));
++        };
++        let slot = if flag == first {
++            &mut source
++        } else if flag == "--to" {
++            &mut destination
++        } else {
++            return Err(super::unknown(
++                flag,
++                &format!("`{command}` reads `{first} <DIR>` and `--to <DIR>`"),
++            ));
++        };
++        if slot.is_some() {
++            return Err(Outcome::refused(WRONG, format!("`{flag}` was given twice")));
++        }
++        *slot = Some(value);
++        index += 2;
++    }
++    match (source, destination) {
++        (Some(source), Some(destination)) => {
++            Ok((PathBuf::from(source), PathBuf::from(destination)))
++        }
++        (None, _) => Err(Outcome::refused(
++            WRONG,
++            format!("`{command}` did not say `{first}`: `lakeletq --help` lists what it takes"),
++        )),
++        (_, None) => Err(Outcome::refused(
++            WRONG,
++            format!("`{command}` did not say `--to`: `lakeletq --help` lists what it takes"),
++        )),
++    }
++}
++
++/// The check a destination gets before anything is written.
++///
++/// A path that exists and is not a directory is nothing about the call and nothing the store can do
++/// either, which is the class `lakelet/4.10-downsampling` gave the read side of this project (`1`).
++/// A path that is *not* there is fine: both commands create it.
++fn target(path: &Path, command: &str) -> Result<(), Outcome> {
++    match std::fs::metadata(path) {
++        Ok(metadata) if !metadata.is_dir() => Err(Outcome::refused(
++            super::BROKEN,
++            format!(
++                "`{}` is not a directory, so `{command}` cannot write a store there: nothing about \
++                 the call is wrong, and nothing can be written either",
++                path.display()
++            ),
++        )),
++        _ => Ok(()),
++    }
++}
++
++/// The directories one drill uses, and which of them this process has to remove.
++///
++/// A drill writes three places — the store it builds, the copies it takes and the directories it
++/// restores into — and only the store is a path a caller can name. The rest are this process's own,
++/// because the drill's *point* is that a reader can run it anywhere and compare the answer with the
++/// block on the page: a command that needed four directories to be set up first would be a command
++/// nobody runs.
++struct Workspace {
++    /// Where the source store is built.
++    store: PathBuf,
++    /// Where the copy, the interrupted copy and the restored stores go.
++    scratch: PathBuf,
++    /// Whether this process made the store and so owes the filesystem a `remove_dir_all`.
++    ///
++    /// The scratch directory is always this process's own and always removed: what a drill leaves
++    /// behind on purpose is the store it built, because that is the one thing a caller can name and
++    /// look at afterwards. The copies are what the drill *measured*, and the answer already says what
++    /// was in them.
++    temporary: bool,
++}
++
++impl Workspace {
++    /// The store at `named`, or one of this process's own, and a scratch directory of its own.
++    fn of(named: Option<&Path>) -> Self {
++        let base = std::env::temp_dir().join(format!("lakelet-drill-{}", std::process::id()));
++        let (store, temporary) = match named {
++            Some(store) => (store.to_path_buf(), false),
++            None => (base.join("store"), true),
++        };
++        Self {
++            store,
++            scratch: base.join("scratch"),
++            temporary,
++        }
++    }
++
++    /// Where the source store is built.
++    fn store(&self) -> &Path {
++        &self.store
++    }
++
++    /// Where the copies and the restores go.
++    fn scratch(&self) -> &Path {
++        &self.scratch
++    }
++}
++
++impl Drop for Workspace {
++    fn drop(&mut self) {
++        if self.temporary {
++            let _ = std::fs::remove_dir_all(&self.store);
++        }
++        let _ = std::fs::remove_dir_all(&self.scratch);
++        // The directory the scratch lives in holds nothing else once it is gone, and a run that
++        // named its own store holds only that scratch there — so a drill leaves no directory behind
++        // either way, and `remove_dir` (not `remove_dir_all`) refuses to take anything that is not
++        // this run's own.
++        if let Some(base) = self.scratch.parent() {
++            let _ = std::fs::remove_dir(base);
++        }
++    }
++}
++
++/// Claim the directories of one drill, refusing a store that is already there.
++fn workspace(named: Option<&Path>) -> Result<Workspace, Outcome> {
++    let workspace = Workspace::of(named);
++    // A drill *builds* the store it copies, so a directory that already holds one is a directory this
++    // command would write over. Emptying it instead is not on offer: a drill is not a delete.
++    let occupied = workspace.store().join(crate::engine::compaction::MANIFEST);
++    if occupied.exists() {
++        return Err(Outcome::refused(
++            super::REFUSED,
++            format!(
++                "`{}` already holds a store: `drill` builds the store it copies, so give it a \
++                 directory that is not one — `drill` never writes over a store",
++                workspace.store().display()
++            ),
++        ));
++    }
++    Ok(workspace)
++}
++
++/// The series the drill's store holds: one metric, two hosts.
++///
++/// Two, and not one, because a copy that lost a *file* and a copy that lost a *record* have to be
++/// distinguishable in the answer: with one series a segment's record count moves for every reason a
++/// store's can, and the drill's own counts would be the same number twice.
++const SERIES: [&str; 2] = ["cpu,host=h0", "cpu,host=h1"];
++
++/// The first timestamp the drill writes: 2023-11-14T22:13:20Z, a round number and not a date.
++const BASE: i64 = 1_700_000_000_000;
++
++/// How far apart two records of one batch are, in milliseconds.
++const STEP: i64 = 15_000;
++
++/// How many records one batch carries.
++const BATCH: usize = 4;
++
++/// How many batches the drill's workload writes.
++const BATCHES: usize = 3;
++
++/// How many of them a flush seals into a segment.
++///
++/// One fewer than [`BATCHES`] on purpose: the last batch is written to the log and never closed into
++/// a segment, so the machine death below takes records that exist in exactly one place — which is the
++/// shape every store's tail has and the shape a backup is judged on.
++const SEALED: usize = 2;
++
++/// After which batch the write path waits for the device.
++///
++/// `lakelet/4.3-write-path-adr`'s decision as a number, and the reason the drill's RPO is not zero:
++/// everything written after this point is in the page cache and nowhere else, so the modelled machine
++/// death is what the policy's `Losses` says it is — everything since the last flush.
++const DURABLE: usize = 2;
++
++/// How many files *fewer* than a complete copy the drill's interrupted copy names.
++///
++/// The drill stops that copy inside the second file after the store's own manifest — a segment —
++/// which leaves that file unnamed and the two before it named. The number is written down because the
++/// drill asserts it: an interruption that named everything, or nothing, would be a drill that did not
++/// test the thing it is for.
++const HALF: u64 = 2;
++
++/// Build a store, kill the machine, copy it, restore it, and do the same with a copy that was
++/// interrupted inside a segment.
++///
++/// The order is the drill's whole argument: the write path is the real one (`Spool` appends,
++/// `Segments::seal` closes what a flush wrote), the death is `lakelet/4.4-wal-recovery`'s machine
++/// death modelled as "cut the log to the last offset the device was told about", and every step after
++/// it is the two commands an operator runs. What it answers is what it *observed*, and every claim in
++/// it was asserted before it was printed — a drill that reported numbers nobody checked would be a
++/// page full of numbers nobody can trust.
++fn rehearse(store: &Path, scratch: &Path) -> Result<Vec<(&'static str, Measurement)>, Outcome> {
++    let batches = workload();
++    let written_records = batches.iter().map(Vec::len).sum::<usize>() as u64;
++    let building = "the drill's own store could not be written";
++    std::fs::create_dir_all(scratch).map_err(|error| {
++        Outcome::refused(
++            super::BROKEN,
++            format!("the drill cannot use {}: {error}", scratch.display()),
++        )
++    })?;
++
++    // 1. The store, through the write path a deployment uses. Nothing here waits for the device
++    //    (`Policy::Never`): the drill decides when the store is durable, so the RPO it measures is a
++    //    number of *records* and not a number of milliseconds on this machine.
++    let policy = Policy::Never;
++    let mut spool =
++        Spool::with_policy(store, policy).map_err(|error| super::class(&error, building))?;
++    let mut segments = Segments::open(store).map_err(|error| super::class(&error, building))?;
++    for (index, records) in batches.iter().enumerate() {
++        spool
++            .append(&batch::encode(records))
++            .map_err(|error| super::class(&error, building))?;
++        if index < SEALED {
++            segments
++                .seal(records)
++                .map_err(|error| super::class(&error, building))?;
++        }
++        if index + 1 == DURABLE {
++            spool
++                .sync()
++                .map_err(|error| super::class(&error, building))?;
++        }
++    }
++
++    // 2. The machine death: the bytes above the last offset the device was told about are gone with
++    //    the page cache, and the store that comes back is the one `lakelet/4.4-wal-recovery` opens.
++    let written = spool.len();
++    let durable = spool.durable_offset();
++    drop(spool);
++    let dying = "the drill's store could not be cut back";
++    replay::truncate(store, durable).map_err(|error| super::class(&error, dying))?;
++    let proved = replay::recover(store).map_err(|error| super::class(&error, dying))?;
++    let reopened = Spool::open(store).map_err(|error| super::class(&error, dying))?;
++    expect(
++        reopened.len() == proved.bytes(),
++        format!(
++            "the store came back with {} byte(s) of log where the replay proved {}: opening a store \
++             continues where the bytes it could prove end, and nowhere else",
++            reopened.len(),
++            proved.bytes()
++        ),
++    )?;
++    drop(reopened);
++
++    let source = segments
++        .snapshot()
++        .records()
++        .map_err(|error| super::class(&error, "the drill's own store could not be read"))?;
++    let source_log = replay::recover(store)
++        .map_err(|error| super::class(&error, "the drill's own store could not be read"))?;
++    // What the log it kept *carries*: the RPO below is a count of records in the store's own unit,
++    // and a log holds payloads rather than records — so each one is decoded here rather than counted
++    // as the one thing it happens to be on the wire.
++    let mut proved_records = 0u64;
++    for payload in proved.records() {
++        let carried = batch::decode(payload).map_err(|error| {
++            super::class(
++                &error,
++                "the drill's log does not hold the batches it was given",
++            )
++        })?;
++        proved_records = proved_records.saturating_add(carried.len() as u64);
++    }
++
++    // 3. A complete copy, restored, and compared with the store it came from.
++    let copy = scratch.join("copy");
++    let restored = scratch.join("restored");
++    let copying = "the drill's own store could not be copied";
++    let report = backup::copy(store, &copy, Interruption::None)
++        .map_err(|error| complained(&error, copying))?;
++    let started = Instant::now();
++    let outcome = backup::restore(&copy, &restored)
++        .map_err(|error| complained(&error, "the drill's own copy could not be restored"))?;
++    let millis = started.elapsed().as_millis() as u64;
++
++    let after = Segments::open(&restored)
++        .map_err(|error| super::class(&error, "the restored store could not be opened"))?;
++    let restored_records = after
++        .snapshot()
++        .records()
++        .map_err(|error| super::class(&error, "the restored store could not be read"))?;
++    expect(
++        restored_records == source,
++        format!(
++            "the restored store answers {} record(s) where the store it was copied from answered \
++             {}: a complete copy loses nothing, and a copy that lost a record and invented another \
++             would pass a count",
++            restored_records.len(),
++            source.len()
++        ),
++    )?;
++    expect(
++        after.manifest().epoch() == segments.manifest().epoch()
++            && after.manifest().floor() == segments.manifest().floor(),
++        format!(
++            "the restored store is at epoch {} floor {} and the store it came from is at epoch {} \
++             floor {}: the manifest that makes a directory a store is copied, not rebuilt",
++            after.manifest().epoch(),
++            after.manifest().floor(),
++            segments.manifest().epoch(),
++            segments.manifest().floor()
++        ),
++    )?;
++    let restored_log = replay::recover(&restored)
++        .map_err(|error| super::class(&error, "the restored store's log could not be read"))?;
++    expect(
++        restored_log.records() == source_log.records()
++            && restored_log.bytes() == source_log.bytes(),
++        format!(
++            "the restored store's log proves {} byte(s) and {} record(s) where the source's proves \
++             {} and {}: what a copy takes is the prefix a replay proves, and all of it",
++            restored_log.bytes(),
++            restored_log.records().len(),
++            source_log.bytes(),
++            source_log.records().len()
++        ),
++    )?;
++
++    // 4. A copy interrupted inside a segment: the interruption point is past the store's own manifest
++    //    and the first segment, half way into the second, so the copy names what it completed and
++    //    says nothing about the file it was writing.
++    let half = scratch.join("interrupted");
++    let store_manifest = std::fs::metadata(store.join(crate::engine::compaction::MANIFEST))
++        .map_err(|error| {
++            Outcome::refused(
++                super::REFUSED,
++                format!("the drill's own store has no manifest: {error}"),
++            )
++        })?
++        .len();
++    let first = segments
++        .manifest()
++        .segments()
++        .first()
++        .map(|info| info.bytes)
++        .unwrap_or_default();
++    let second = segments
++        .manifest()
++        .segments()
++        .get(1)
++        .map(|info| info.bytes)
++        .unwrap_or_default();
++    let budget = store_manifest
++        .saturating_add(first)
++        .saturating_add(second / 2);
++    let cut = backup::copy(store, &half, Interruption::AfterBytes(budget))
++        .map_err(|error| complained(&error, copying))?;
++    let half_loaded = backup::Manifest::load(&half).map_err(|error| complained(&error, copying))?;
++    let half_named: u64 = half_loaded
++        .entries()
++        .iter()
++        .filter(|entry| entry.kind() == backup::Kind::Segment)
++        .map(|entry| entry.records().unwrap_or_default())
++        .fold(0u64, u64::saturating_add);
++    expect(
++        cut.interrupted(),
++        "the copy the drill interrupted took every file of the store: the budget is drawn from the \
++         store's own lengths, so this cannot mean the store is unusual — it means the interruption \
++         is not being asked for"
++            .to_owned(),
++    )?;
++    expect(
++        cut.entries() == report.entries().saturating_sub(HALF),
++        format!(
++            "the interrupted copy names {} file(s) where the complete one names {}: the drill stops \
++             it inside the {HALF}nd file after the store's own manifest, so it names exactly {HALF} \
++             fewer, and the copy's own manifest is what says which files it has",
++            cut.entries(),
++            report.entries()
++        ),
++    )?;
++    expect(
++        half_named == cut.records(),
++        format!(
++            "the copy's manifest states {half_named} record(s) for the segments it named and the \
++             copy reports {}",
++            cut.records()
++        ),
++    )?;
++
++    // 5. Restoring it: every file the manifest named, and a directory no store opens as a store.
++    let half_restored = scratch.join("half");
++    let half_outcome = backup::restore(&half, &half_restored)
++        .map_err(|error| complained(&error, "the interrupted copy could not be restored"))?;
++    let held = files_under(&half_restored)?;
++    let named: Vec<(String, u64)> = half_loaded
++        .entries()
++        .iter()
++        .map(|entry| (entry.name().to_owned(), entry.bytes()))
++        .collect();
++    expect(
++        held == named,
++        format!(
++            "the restored directory holds {held:?} and the copy's manifest named {named:?}: a \
++             restore writes the files the manifest covered and nothing else",
++        ),
++    )?;
++    let opens = Segments::open(&half_restored).is_ok();
++    expect(
++        !opens,
++        "a store opened a directory restored from a copy that was missing a segment: the manifest is \
++         the store, so a store whose manifest names a file nobody kept must refuse rather than answer \
++         with a hole in it"
++            .to_owned(),
++    )?;
++
++    let mut observed: Vec<(&'static str, Measurement)> = vec![
++        ("write_policy", Measurement::Name(policy.name())),
++        ("source_files", Measurement::Count(report.files())),
++        ("source_records", Measurement::Count(source.len() as u64)),
++        ("source_digest", Measurement::Name(leak(digest(&source)))),
++        (
++            "rpo_bytes",
++            Measurement::Count(written.saturating_sub(durable)),
++        ),
++        (
++            "rpo_records",
++            Measurement::Count(written_records.saturating_sub(proved_records)),
++        ),
++        ("copy_files", Measurement::Count(report.files())),
++        ("copy_entries", Measurement::Count(report.entries())),
++        ("copy_bytes", Measurement::Count(report.bytes())),
++        ("copy_records", Measurement::Count(report.records())),
++        ("copy_log_bytes", Measurement::Count(report.log_bytes())),
++        ("copy_log_records", Measurement::Count(report.log_records())),
++        ("copy_interrupted", Measurement::Flag(report.interrupted())),
++        ("restored_files", Measurement::Count(outcome.files())),
++        ("restored_bytes", Measurement::Count(outcome.bytes())),
++        (
++            "restored_records",
++            Measurement::Count(restored_records.len() as u64),
++        ),
++        (
++            "restored_log_records",
++            Measurement::Count(restored_log.records().len() as u64),
++        ),
++        (
++            "restored_digest",
++            Measurement::Name(leak(digest(&restored_records))),
++        ),
++        (
++            "records_missing",
++            Measurement::Count((source.len() as u64).saturating_sub(restored_records.len() as u64)),
++        ),
++        ("half_files", Measurement::Count(cut.files())),
++        ("half_entries", Measurement::Count(cut.entries())),
++        ("half_interrupted", Measurement::Flag(cut.interrupted())),
++        ("half_records", Measurement::Count(cut.records())),
++        (
++            "half_restored_files",
++            Measurement::Count(half_outcome.files()),
++        ),
++        (
++            "half_records_missing",
++            Measurement::Count((source.len() as u64).saturating_sub(cut.records())),
++        ),
++        ("half_store_opens", Measurement::Flag(opens)),
++        ("agreed", Measurement::Flag(true)),
++    ];
++    // The one line a page may not carry: a wall clock. It is printed only when the environment asks
++    // for it (`LAKELET_DRILL_TIMED`), so the block `docs/dr-drill.md` quotes is the same bytes on a
++    // loaded machine and on an idle one.
++    if timed() {
++        observed.push(("restore_millis", Measurement::Count(millis)));
++    }
++    Ok(observed)
++}
++
++/// Whether this run was asked for the timing line.
++fn timed() -> bool {
++    match std::env::var(TIMED) {
++        Ok(value) => !value.is_empty() && value != "0",
++        Err(_) => false,
++    }
++}
++
++/// The records the drill's workload writes, batch by batch.
++///
++/// A fixed script rather than a seeded one, because this command's answer is compared line for line
++/// with the block on a page: a reader on another machine has to be able to run the same command and
++/// read the same numbers. `tests/sim_backup.rs` is where the same drill runs under a seed.
++fn workload() -> Vec<Vec<Record>> {
++    let mut batches: Vec<Vec<Record>> = Vec::with_capacity(BATCHES);
++    for batch in 0..BATCHES {
++        let mut records: Vec<Record> = Vec::with_capacity(BATCH);
++        for index in 0..BATCH {
++            let at = batch * BATCH + index;
++            let series = SERIES
++                .get(index % SERIES.len())
++                .copied()
++                .unwrap_or_default();
++            records.push(Record {
++                series: series.to_owned(),
++                ts_millis: BASE + (at as i64) * STEP,
++                value: (at as f64) * 1.5,
++            });
++        }
++        batches.push(records);
++    }
++    batches
++}
++
++/// Every file below `directory`, as its name relative to it and how many bytes it holds, in name
++/// order.
++///
++/// The order and the names are the copy's own: an entry names a file the way this walk does, so the
++/// two lists can be compared without either side translating.
++fn files_under(directory: &Path) -> Result<Vec<(String, u64)>, Outcome> {
++    let mut found: Vec<(String, u64)> = Vec::new();
++    let mut pending: Vec<PathBuf> = vec![directory.to_path_buf()];
++    while let Some(current) = pending.pop() {
++        let entries = std::fs::read_dir(&current).map_err(|error| {
++            Outcome::refused(
++                super::REFUSED,
++                format!("{} could not be listed: {error}", current.display()),
++            )
++        })?;
++        for entry in entries {
++            let entry = entry.map_err(|error| {
++                Outcome::refused(
++                    super::REFUSED,
++                    format!("{} could not be listed: {error}", current.display()),
++                )
++            })?;
++            let path = entry.path();
++            if path.is_dir() {
++                pending.push(path);
++                continue;
++            }
++            let name = path
++                .strip_prefix(directory)
++                .unwrap_or(&path)
++                .to_string_lossy()
++                .replace('\\', "/");
++            let length = entry.metadata().map(|meta| meta.len()).map_err(|error| {
++                Outcome::refused(
++                    super::REFUSED,
++                    format!("{} could not be measured: {error}", path.display()),
++                )
++            })?;
++            found.push((name, length));
++        }
++    }
++    found.sort();
++    Ok(found)
++}
++
++/// A digest over records in order: the series, the timestamp and the value's bits, folded together.
++///
++/// A *digest* and not a count, because those are two different questions: a copy that lost one record
++/// and invented another keeps the count, and the pair of digests before and after a restore is what
++/// says the two stores answer the same thing. The value is hashed as its bits
++/// (`f64::to_bits`), so nothing here formats a float — a number whose text depends on a formatter is
++/// a number two machines can disagree about.
++fn digest(records: &[Record]) -> String {
++    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++    for record in records {
++        for byte in record.series.as_bytes() {
++            hash = fold(hash, *byte);
++        }
++        // A separator, so that a series name and the bytes after it cannot be shifted against each
++        // other to produce the same digest from two different stores.
++        hash = fold(hash, 0xff);
++        for byte in record.ts_millis.to_le_bytes() {
++            hash = fold(hash, byte);
++        }
++        for byte in record.value.to_bits().to_le_bytes() {
++            hash = fold(hash, byte);
++        }
++    }
++    format!("{hash:016x}")
++}
++
++/// FNV-1a's step: exclusive-or one byte in and multiply by the prime.
++fn fold(hash: u64, byte: u8) -> u64 {
++    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
++}
++
++/// Anchor a digest with an owned string.
++///
++/// The measurements borrow their *names* from this file's own literals; a digest is computed, so it
++/// is leaked into the same shape. A drill's answer holds a handful of short strings and lives for one
++/// command, which is why this is a `Box::leak` rather than a `String` every measurement has to own —
++/// and why `Measurement` stays `Copy`.
++fn leak(text: String) -> &'static str {
++    Box::leak(text.into_boxed_str())
++}
++
++/// A claim the drill makes, and the sentence when the store did not keep it.
++fn expect(held: bool, detail: String) -> Result<(), Outcome> {
++    if held {
++        return Ok(());
++    }
++    Err(Outcome::refused(super::REFUSED, detail))
+ }
+diff --git a/src/cli/mod.rs b/src/cli/mod.rs
+index e55ed4c..145ae9d 100644
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -33,7 +33,7 @@
+ //! * **a store that is not there is not a store with nothing in it.** `Segments::open` *creates*
+ //!   the directory it is given, which is right for a daemon and wrong for a read: a typo in
+ //!   `--store` would leave an empty store behind and answer `0` with no lines, so `query` checks
+-//!   first — no directory at that path is `3`, the thing asked about is not there;
++//!   first ([`readable`]) — no directory at that path is `3`, the thing asked about is not there;
+ //! * **a path that is not a directory is a broken deployment, not a missing store.** A file where
+ //!   the store should be is `1`: nothing about the *call* is wrong and nothing can be answered
+ //!   either, and the difference between those two is the difference between the script's problem
+@@ -92,6 +92,15 @@
+ //! has never held. Each of them arrives as a typed refusal that carries its own class
+ //! (`Refusal::class`), so this file does not decide what a wrong query exits with — it asks.
+ //!
++//! # The operator's commands
++//!
++//! `lakelet/4.19-backup-restore` added three more subcommands beside `query` and `inspect`, and they
++//! keep this contract rather than making a second one: `backup` copies a store, `restore` puts a copy
++//! back, and `drill` rehearses both on a store it builds itself. They live in [`backup`], and their
++//! answers are the same two shapes every other command answers in — one `name=value` per line, or one
++//! object with `--json` — because a script that reads this tool should not have to learn a second
++//! grammar per verb.
++//!
+ //! # What the course gives you, and what is yours
+ //!
+ //! [`USAGE`] is the grammar — it is the interface a script reads and the contract this module
+@@ -131,6 +140,9 @@ usage: lakeletq [OPTIONS] <COMMAND>
+ COMMANDS:
+     query                   answer a question about a store
+     inspect series          list the series a store holds, and what each one costs
++    backup                  copy a store into a directory of its own
++    restore                 put a copy back
++    drill                   rehearse both, on a store this command builds
+     help                    print this help
+ 
+ OPTIONS:
+@@ -174,6 +186,22 @@ the bytes charged to it, and the first and last millisecond it was seen at. `--j
+ {\"series\":…,\"records\":…,\"bytes\":…,\"first_millis\":…,\"last_millis\":…} and [] when
+ the store holds no series at all.
+ 
++BACKUP AND RESTORE
++    backup --store <DIR> --to <DIR>
++    restore --from <DIR> --to <DIR>
++          --store <DIR>     the store to copy
++          --from <DIR>      the copy to restore
++          --to <DIR>        where to write. It is created if it is not there, and a restore refuses
++                            a directory that already holds a store: a restore never overwrites and
++                            never merges
++
++What a copy takes is the store's own manifest, every segment that manifest names, and the prefix of
++the log a replay proves — never the sidecar indexes (a store rebuilds those by reading more) and
++never a byte no replay can prove. The copy's own manifest is `backup.manifest` inside --to, one entry
++per file, written after the file it names was flushed: a copy that was interrupted names exactly the
++files that survived it. What the lines mean is `docs/dr-drill.md`, and `drill` is the same procedure
++with a store this command builds itself, so it prints the same numbers on any machine.
++
+ Exit codes: 0 the command answered, 2 the call was wrong, 3 the thing asked about is not there,
+ 4 the store refused, 1 this deployment is broken.
+ ";
+@@ -343,7 +371,13 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Outcome {
+         "help" => unknown(&flags.join(" "), "help takes no argument"),
+         "query" => query(flags, json),
+         "inspect" => inspect(flags, json),
+-        other => unknown(other, "the commands are `query`, `inspect` and `help`"),
++        "backup" => backup::backup(flags, json),
++        "restore" => backup::restore(flags, json),
++        "drill" => backup::drill(flags, json),
++        other => unknown(
++            other,
++            "the commands are `query`, `inspect`, `backup`, `restore`, `drill` and `help`",
++        ),
+     }
+ }
+ 
+@@ -578,31 +612,36 @@ fn answer(query: &Query<'_>) -> Outcome {
+     }
+ }
+ 
+-/// The store directory a call names, or the two ways a path can be wrong.
++/// The directory a call reads from, or the two ways a path can be wrong.
+ ///
+-/// A read does not create a store. `Segments::open` would, which is right for a daemon and wrong
++/// A read does not create a directory. `Segments::open` would, which is right for a daemon and wrong
+ /// here: a typo in `--store` would leave an empty store behind and answer `0` with no lines, so
+ /// the two ways a path can be wrong are told apart first — nothing there is the caller's (`3`),
+ /// something that is not a directory is the deployment's (`1`).
+ ///
+-/// Both input forms ask this, and both ask it *before* a store is opened, which is what makes the
+-/// two codes mean the same thing however the question was written.
+-fn directory(store: &Path) -> Result<(), Outcome> {
+-    match std::fs::metadata(store) {
++/// `flag` is the flag the path arrived on and `what` is the thing it should name (`--store` and
++/// `store` for a query, `--from` and `copy` for a restore), because the sentence a reader acts on has
++/// to name the argument they typed: this became one call rather than a second copy of the check the
++/// day `lakelet/4.19-backup-restore` gave the tool three more things to read.
++///
++/// Every input form asks this, and all of them ask it *before* a store is opened, which is what makes
++/// the two codes mean the same thing however the question was written.
++fn readable(path: &Path, flag: &str, what: &str) -> Result<(), Outcome> {
++    match std::fs::metadata(path) {
+         Err(_) => Err(Outcome::refused(
+             ABSENT,
+             format!(
+-                "there is no store directory at `{}`: `--store` names the directory a store was \
++                "there is no {what} directory at `{}`: `{flag}` names the directory a {what} was \
+                  written to, and this tool does not create one",
+-                store.display()
++                path.display()
+             ),
+         )),
+         Ok(metadata) if !metadata.is_dir() => Err(Outcome::refused(
+             BROKEN,
+             format!(
+-                "`{}` is not a directory, so this deployment cannot be a store: nothing about the \
++                "`{}` is not a directory, so this deployment cannot be a {what}: nothing about the \
+                  call is wrong, and nothing can be read either",
+-                store.display()
++                path.display()
+             ),
+         )),
+         Ok(_) => Ok(()),
+@@ -614,7 +653,7 @@ fn directory(store: &Path) -> Result<(), Outcome> {
+ /// This is the whole of the query: open, snapshot, read, downsample. There is no second way to
+ /// open a store and no place that remembers what the second one would have been.
+ fn ask(query: &Query<'_>) -> Result<Vec<Bucket>, Outcome> {
+-    directory(query.store)?;
++    readable(query.store, "--store", "store")?;
+     let store = match Segments::open(query.store) {
+         Ok(store) => store,
+         Err(error) => return Err(class(&error, "the store could not be opened")),
+@@ -708,7 +747,7 @@ fn sql_query(store: &str, text: &str, json: bool, zone: &Zone) -> Outcome {
+     }
+ 
+     let path = Path::new(store);
+-    if let Err(outcome) = directory(path) {
++    if let Err(outcome) = readable(path, "--store", "store") {
+         return outcome;
+     }
+     let store = match Segments::open(path) {
+@@ -1039,7 +1078,7 @@ fn inspect_series(flags: &[&str], json: bool) -> Outcome {
+         );
+     };
+     let path = Path::new(store);
+-    if let Err(outcome) = directory(path) {
++    if let Err(outcome) = readable(path, "--store", "store") {
+         return outcome;
+     }
+     let ledger = match Registry::of_store(path, Cap::DEFAULT) {
+diff --git a/src/engine/backup/manifest.rs b/src/engine/backup/manifest.rs
+index 7d1ffcd..8f403b5 100644
+--- a/src/engine/backup/manifest.rs
++++ b/src/engine/backup/manifest.rs
+@@ -68,8 +68,9 @@
+ 
+ use std::path::{Path, PathBuf};
+ 
++use crate::engine::soak::Open;
+ use crate::engine::wal::checksum;
+-use crate::engine::wal::segment::Stop;
++use crate::engine::wal::segment::{self, Stop};
+ 
+ use super::{Damage, Error};
+ 
+@@ -264,6 +265,110 @@ impl Entry {
+     pub const fn crc32(&self) -> u32 {
+         self.crc32
+     }
++
++    /// This entry as the payload of one manifest record.
++    ///
++    /// The name's length is stated in four bytes and a name is a path inside a store directory, so
++    /// the two never meet: a name longer than four gigabytes of bytes is not a path any machine this
++    /// build runs on can hold — the same argument `lakelet/4.7-columnar-segments`' payload length
++    /// makes about a frame.
++    pub(crate) fn encode(&self) -> Vec<u8> {
++        let mut bytes = Vec::with_capacity(FIXED + self.name.len());
++        bytes.push(self.kind.code());
++        bytes.extend_from_slice(&(self.name.len() as u32).to_le_bytes());
++        bytes.extend_from_slice(self.name.as_bytes());
++        bytes.extend_from_slice(&self.bytes.to_le_bytes());
++        bytes.extend_from_slice(&self.stated(self.records).to_le_bytes());
++        let (first, last) = match self.range {
++            Some((first, last)) => (first, last),
++            None => (NONE, NONE),
++        };
++        bytes.extend_from_slice(&first.to_le_bytes());
++        bytes.extend_from_slice(&last.to_le_bytes());
++        let (epoch, floor) = self.store.unwrap_or((NONE, NONE));
++        bytes.extend_from_slice(&epoch.to_le_bytes());
++        bytes.extend_from_slice(&floor.to_le_bytes());
++        bytes.extend_from_slice(&self.crc32.to_le_bytes());
++        bytes
++    }
++
++    /// The payload's bytes as an entry, or the sentence saying which field is not one.
++    ///
++    /// Every read answers `None` and none of them can panic: the payload's length is what decides
++    /// whether a field is there, so a short entry is a refusal naming the field it ran out inside
++    /// rather than a read past the end of a buffer.
++    pub(crate) fn decode(payload: &[u8]) -> Result<Self, String> {
++        let Some(code) = payload.first().copied() else {
++            return Err("it holds no kind byte".to_owned());
++        };
++        let Some(kind) = Kind::of(code) else {
++            return Err(format!(
++                "its first byte says kind {code}, and the kinds this build writes are 1 (the \
++                 store's own manifest), 2 (a segment) and 3 (the log)"
++            ));
++        };
++        let Some(length) = u32_at(payload, 1) else {
++            return Err("it is cut before the name's length".to_owned());
++        };
++        let start = 1 + NAME_LENGTH;
++        let Some(name) = payload
++            .get(start..start + length as usize)
++            .and_then(|bytes| std::str::from_utf8(bytes).ok())
++        else {
++            return Err(format!(
++                "it says its name is {length} byte(s) and does not hold them as UTF-8"
++            ));
++        };
++        let mut at = start + length as usize;
++        let mut number = |what: &str| -> Result<u64, String> {
++            let value =
++                u64_at(payload, at).ok_or_else(|| format!("it is cut inside its {what}"))?;
++            at += 8;
++            Ok(value)
++        };
++        let bytes = number("byte count")?;
++        let records = number("record count")?;
++        let first = number("first millisecond")?;
++        let last = number("last millisecond")?;
++        let epoch = number("epoch")?;
++        let floor = number("floor")?;
++        let Some(crc32) = u32_at(payload, at) else {
++            return Err("it is cut inside its checksum".to_owned());
++        };
++        at += checksum::LEN;
++        if payload.len() != at {
++            return Err(format!(
++                "it says everything it has to say in {at} byte(s) and holds {} — the byte(s) after \
++                 it are no part of an entry this build wrote",
++                payload.len()
++            ));
++        }
++        Ok(Self {
++            name: name.to_owned(),
++            kind,
++            bytes,
++            records: stated(records),
++            range: match (stated(first), stated(last)) {
++                (Some(first), Some(last)) => Some((first, last)),
++                _ => None,
++            },
++            store: match (stated(epoch), stated(floor)) {
++                (Some(epoch), Some(floor)) => Some((epoch, floor)),
++                _ => None,
++            },
++            crc32,
++        })
++    }
++
++    /// The number an entry writes for an optional field.
++    fn stated(&self, number: Option<u64>) -> u64 {
++        number.unwrap_or(NONE)
++    }
++}
++
++/// The number a field came back with, or `None` when the field stated [`NONE`].
++const fn stated(number: u64) -> Option<u64> {
++    if number == NONE { None } else { Some(number) }
+ }
+ 
+ /// What the copy's manifest proves: the entries of its proven prefix, and what could not be read.
+@@ -383,10 +488,17 @@ impl Manifest {
+     ///
+     /// [`Error::Store`] when the directory cannot be created or the manifest cannot be written.
+     pub(crate) fn begin(&self) -> Result<(), Error> {
+-        todo!(
+-            "lakelet/4.19-backup-restore: create the copy's directory and truncate its manifest, so \
+-             that the entries of a run are the files that run wrote"
+-        )
++        std::fs::create_dir_all(&self.directory).map_err(|source| Error::Store {
++            path: self.directory.clone(),
++            source,
++        })?;
++        let path = self.path();
++        Open::of_file(&path)
++            .write(&path, &[])
++            .map_err(|source| Error::Store {
++                path: path.clone(),
++                source,
++            })
+     }
+ 
+     /// Append one complete file's entry, and wait for the device before believing it.
+@@ -400,12 +512,39 @@ impl Manifest {
+     ///
+     /// [`Error::Store`] when the manifest cannot be read, opened, written or flushed.
+     pub(crate) fn append(&self, entry: &Entry) -> Result<(), Error> {
+-        let _ = entry;
+-        todo!(
+-            "lakelet/4.19-backup-restore: encode the entry, frame it as a record of the log — \
+-             `segment::introduce` for the first one, `segment::encode` for every later one — append \
+-             it, and wait for the device before believing it"
+-        )
++        let path = self.path();
++        let payload = entry.encode();
++        let empty = std::fs::metadata(&path)
++            .map_err(|source| Error::Store {
++                path: path.clone(),
++                source,
++            })?
++            .len()
++            == 0;
++        // The first entry is written with `introduce`, because that is what makes the file a *log*:
++        // the five bytes of magic and version a reader refuses anything else for. Every later entry
++        // is a record after it. Which of the two this is comes from the file's own length rather
++        // than from a counter, so a copy that is restarted, or that begins on a directory somebody
++        // left behind, still writes one well-formed log.
++        let bytes = if empty {
++            segment::introduce(&payload)
++        } else {
++            segment::encode(&payload)
++        };
++        let open = Open::of_file(&path);
++        let mut file = open.append(&path).map_err(|source| Error::Store {
++            path: path.clone(),
++            source,
++        })?;
++        use std::io::Write;
++        file.write_all(&bytes).map_err(|source| Error::Store {
++            path: path.clone(),
++            source,
++        })?;
++        file.sync_all().map_err(|source| Error::Store {
++            path: path.clone(),
++            source,
++        })
+     }
+ 
+     /// What the copy at `directory` says, read back.
+@@ -422,12 +561,51 @@ impl Manifest {
+     /// manifest that names nothing — [`Error::Damaged`] when the file is not a log this build wrote
+     /// or an entry is not an entry, and [`Error::Store`] when the file cannot be read.
+     pub fn load(directory: &Path) -> Result<Loaded, Error> {
+-        let _ = directory;
+-        todo!(
+-            "lakelet/4.19-backup-restore: read the manifest, `scan` it as the log it is, decode the \
+-             entries of the proven prefix, and answer them with the bytes nobody could prove and the \
+-             `Stop` that says why the walk ended. A directory with no manifest at all is \
+-             `Error::NoManifest`, never an empty list."
+-        )
++        let manifest = Self::of(directory);
++        let path = manifest.path();
++        let bytes = match Open::of_file(&path).read(&path) {
++            Ok(bytes) => bytes,
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                return Err(Error::NoManifest { path });
++            }
++            Err(source) => return Err(Error::Store { path, source }),
++        };
++        let scanned = segment::scan(&bytes).map_err(|error| {
++            Error::Damaged(Damage::Unreadable {
++                name: FILE.to_owned(),
++                detail: error.to_string(),
++            })
++        })?;
++        let mut entries: Vec<Entry> = Vec::with_capacity(scanned.records().len());
++        for (at, payload) in scanned.records().iter().enumerate() {
++            let entry = Entry::decode(payload).map_err(|detail| {
++                Error::Damaged(Damage::Unreadable {
++                    name: FILE.to_owned(),
++                    detail: format!("entry {} is not an entry: {detail}", at + 1),
++                })
++            })?;
++            entries.push(entry);
++        }
++        Ok(Loaded {
++            entries,
++            discarded: bytes.len().saturating_sub(scanned.verified()) as u64,
++            stop: scanned.stop(),
++        })
+     }
+ }
++
++/// The `u32` these four bytes are, little endian, or `None` when there are not four of them.
++fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
++    let slice = bytes.get(offset..offset.checked_add(NAME_LENGTH)?)?;
++    let mut array = [0u8; NAME_LENGTH];
++    array.copy_from_slice(slice);
++    Some(u32::from_le_bytes(array))
++}
++
++/// The `u64` these eight bytes are, little endian, or `None` when there are not eight of them.
++fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
++    let slice = bytes.get(offset..offset.checked_add(8)?)?;
++    let mut array = [0u8; 8];
++    array.copy_from_slice(slice);
++    Some(u64::from_le_bytes(array))
++}
+diff --git a/src/engine/backup/mod.rs b/src/engine/backup/mod.rs
+index 53458dd..c2d6581 100644
+--- a/src/engine/backup/mod.rs
++++ b/src/engine/backup/mod.rs
+@@ -75,6 +75,10 @@ pub use restore::{Damage, Outcome, restore};
+ use std::fmt;
+ use std::path::{Path, PathBuf};
+ 
++use crate::engine::compaction::{self, SegmentInfo, Segments};
++use crate::engine::soak::Open;
++use crate::engine::spool::FILE as LOG;
++use crate::engine::wal::replay;
+ use crate::error::Error as StoreError;
+ 
+ /// How far a copy is allowed to get: the death this step is about, as a value.
+@@ -318,11 +322,256 @@ pub fn copy(
+     destination: &Path,
+     interruption: Interruption,
+ ) -> Result<Report, Error> {
+-    let _ = (source, destination, interruption);
+-    todo!(
+-        "lakelet/4.19-backup-restore: the store's own manifest first (it is the file list), then \
+-         every segment it names in its order, then the log's proven prefix — and per file: write the \
+-         bytes, wait for the device, and only then append the entry that names it. Stop where \
+-         `interruption` says, leaving the file it cut through partial and unnamed."
+-    )
++    let store_manifest = source.join(compaction::MANIFEST);
++    if !store_manifest.is_file() {
++        return Err(Error::NoManifest {
++            path: store_manifest,
++        });
++    }
++    // A copy is not written over a store — and a copy's own directory *holds* a `segments.manifest`,
++    // because that file is one of the things a copy takes. So the two are told apart by the copy's
++    // own manifest beside it: a directory that holds a store and no copy manifest is a store, and a
++    // copy that already has one is replaced (its manifest is truncated below, which is what says
++    // which files this run wrote).
++    let commit = destination.join(compaction::MANIFEST);
++    if commit.exists() && !destination.join(manifest::FILE).is_file() {
++        return Err(Error::Occupied { path: commit });
++    }
++    // The store's own reader, which is what makes this a copy of a *store*: it reads the manifest,
++    // finishes a crash's leftovers the way every open of this store does, and checks every segment
++    // the manifest names against its file.
++    let segments = Segments::open(source).map_err(|source| Error::Source { source })?;
++    let store = segments.manifest();
++    // The log's half: the bytes a replay proves, and no more. Read once, because the prefix's length
++    // and the records it holds are the same answer seen twice.
++    let recovered = replay::recover(source).map_err(|source| Error::Source { source })?;
++    let log = source.join(LOG);
++    let held = match read(&log) {
++        Ok(bytes) => Some(bytes),
++        Err(Error::Store { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
++        Err(error) => return Err(error),
++    };
++
++    let manifest = Manifest::of(destination);
++    manifest.begin()?;
++    let budget = interruption.budget();
++    let mut copying = Copying::default();
++
++    let bytes = read(&store_manifest)?;
++    let entry = Entry::new(
++        name_of(source, &store_manifest),
++        Kind::Manifest,
++        bytes.len() as u64,
++        None,
++        None,
++        Some((store.epoch(), store.floor())),
++        crc32(&bytes),
++    );
++    if !copying.step(&manifest, &entry, &bytes, budget)? {
++        return Ok(copying.report(store.epoch(), store.floor()));
++    }
++
++    for info in store.segments() {
++        let path = compaction::file_of(source, info.index);
++        let bytes = read(&path)?;
++        let entry = Entry::new(
++            name_of(source, &path),
++            Kind::Segment,
++            bytes.len() as u64,
++            Some(info.records),
++            range_of(info),
++            None,
++            crc32(&bytes),
++        );
++        if !copying.step(&manifest, &entry, &bytes, budget)? {
++            return Ok(copying.report(store.epoch(), store.floor()));
++        }
++    }
++
++    let Some(held) = held else {
++        return Ok(copying.report(store.epoch(), store.floor()));
++    };
++    let proven = held
++        .get(..recovered.bytes() as usize)
++        .unwrap_or(held.as_slice());
++    let entry = Entry::new(
++        name_of(source, &log),
++        Kind::Log,
++        proven.len() as u64,
++        Some(recovered.records().len() as u64),
++        None,
++        None,
++        crc32(proven),
++    );
++    copying.step(&manifest, &entry, proven, budget)?;
++    Ok(copying.report(store.epoch(), store.floor()))
++}
++
++/// What one copy has done so far: where the budget is, and what the manifest holds.
++#[derive(Debug, Default)]
++struct Copying {
++    /// Bytes of file contents written.
++    written: u64,
++    /// Files anything was written for.
++    files: u64,
++    /// Files named in the copy's manifest.
++    entries: u64,
++    /// Records the named segments hold.
++    records: u64,
++    /// Bytes of the log's proven prefix taken.
++    log_bytes: u64,
++    /// Records that prefix holds.
++    log_records: u64,
++    /// `true` once the budget stopped the copy.
++    interrupted: bool,
++}
++
++impl Copying {
++    /// Write one file and name it, or stop where the budget says.
++    ///
++    /// Answers `false` when the copy is over: the caller has nothing left to do but report what
++    /// happened. A file the budget cuts through is written in part and never named — the entry is
++    /// what says a file is complete, and an entry for a partial file would be a copy that lies about
++    /// the only thing it is for.
++    fn step(
++        &mut self,
++        manifest: &Manifest,
++        entry: &Entry,
++        bytes: &[u8],
++        budget: Option<u64>,
++    ) -> Result<bool, Error> {
++        if let Some(budget) = budget {
++            let room = budget.saturating_sub(self.written);
++            if room == 0 {
++                self.interrupted = true;
++                return Ok(false);
++            }
++            if room < bytes.len() as u64 {
++                // The bytes that fit are written, the file is left partial and the copy ends here.
++                // `room` is below this file's own length, so the split is inside it — the `get` is
++                // what says so without a slice that could panic (`docs/authoring.md` §7.4).
++                let Some(fits) = bytes.get(..room as usize) else {
++                    self.interrupted = true;
++                    return Ok(false);
++                };
++                self.put(manifest, entry.name(), fits)?;
++                self.written = self.written.saturating_add(room);
++                self.files = self.files.saturating_add(1);
++                self.interrupted = true;
++                return Ok(false);
++            }
++        }
++        self.put(manifest, entry.name(), bytes)?;
++        manifest.append(entry)?;
++        self.written = self.written.saturating_add(bytes.len() as u64);
++        self.files = self.files.saturating_add(1);
++        self.entries = self.entries.saturating_add(1);
++        match entry.kind() {
++            Kind::Segment => {
++                self.records = self
++                    .records
++                    .saturating_add(entry.records().unwrap_or_default());
++            }
++            Kind::Log => {
++                self.log_bytes = self.log_bytes.saturating_add(entry.bytes());
++                self.log_records = self
++                    .log_records
++                    .saturating_add(entry.records().unwrap_or_default());
++            }
++            Kind::Manifest => {}
++        }
++        Ok(true)
++    }
++
++    /// Write one file's bytes into the copy, and name it.
++    fn put(&self, manifest: &Manifest, name: &str, bytes: &[u8]) -> Result<(), Error> {
++        put(&manifest.file_of(name), bytes)
++    }
++
++    /// What the copy did, as the report a caller reads.
++    fn report(&self, epoch: u64, floor: u64) -> Report {
++        Report {
++            files: self.files,
++            entries: self.entries,
++            bytes: self.written,
++            records: self.records,
++            log_bytes: self.log_bytes,
++            log_records: self.log_records,
++            interrupted: self.interrupted,
++            epoch,
++            floor,
++        }
++    }
++}
++
++/// The name an entry gives a file: its path relative to the store's root, `/`-separated.
++///
++/// The name is derived from the path rather than composed, so the copy cannot disagree with the
++/// store about where a segment lives: `lakelet/4.8-compaction`'s `file_of` decides that, and this
++/// takes the answer and makes it relative.
++fn name_of(root: &Path, path: &Path) -> String {
++    path.strip_prefix(root)
++        .unwrap_or(path)
++        .to_string_lossy()
++        .replace('\\', "/")
++}
++
++/// The span a segment's entry states, or `None` when nobody stated one (`lakelet/4.9-retention`).
++fn range_of(info: &SegmentInfo) -> Option<(u64, u64)> {
++    match (info.first_millis(), info.last_millis()) {
++        (Some(first), Some(last)) => Some((first, last)),
++        _ => None,
++    }
++}
++
++/// The crc32 of a file's whole contents: the checksum family `lakelet/4.4-wal-recovery` seals a log
++/// record and `lakelet/4.7-columnar-segments` a column block with.
++fn crc32(bytes: &[u8]) -> u32 {
++    let mut hasher = crc32fast::Hasher::new();
++    hasher.update(bytes);
++    hasher.finalize()
++}
++
++/// Write one file's whole contents, wait for the device, and charge the handle to the store it
++/// belongs to (`lakelet/4.17-soak`).
++///
++/// A store's files are written once and are as long as they say they are, and a copy is a store's
++/// file written somewhere else — so the wait is part of writing one rather than a decision about
++/// when to make it durable: the entry that names this file is appended after this call returns, and
++/// an entry that named bytes the device never kept would be a copy that lies about what is complete.
++/// The directory above the file is created if it is not there, which is what puts `segments/` in a
++/// copy the first time a segment is written into it.
++fn put(path: &Path, bytes: &[u8]) -> Result<(), Error> {
++    if let Some(parent) = path.parent()
++        && !parent.is_dir()
++    {
++        std::fs::create_dir_all(parent).map_err(|source| Error::Store {
++            path: parent.to_path_buf(),
++            source,
++        })?;
++    }
++    let open = Open::of_file(path);
++    let mut file = open.hold(std::fs::File::create(path).map_err(|source| Error::Store {
++        path: path.to_path_buf(),
++        source,
++    })?);
++    use std::io::Write;
++    file.write_all(bytes).map_err(|source| Error::Store {
++        path: path.to_path_buf(),
++        source,
++    })?;
++    file.sync_all().map_err(|source| Error::Store {
++        path: path.to_path_buf(),
++        source,
++    })
++}
++
++/// Read a whole file, charging the handle to the store it belongs to (`lakelet/4.17-soak`).
++fn read(path: &Path) -> Result<Vec<u8>, Error> {
++    Open::of_file(path)
++        .read(path)
++        .map_err(|source| Error::Store {
++            path: path.to_path_buf(),
++            source,
++        })
+ }
+diff --git a/src/engine/backup/restore.rs b/src/engine/backup/restore.rs
+index c35ace5..c883716 100644
+--- a/src/engine/backup/restore.rs
++++ b/src/engine/backup/restore.rs
+@@ -40,7 +40,10 @@
+ use std::fmt;
+ use std::path::Path;
+ 
+-use super::{Entry, Error};
++use crate::engine::compaction;
++
++use super::manifest::{Kind, Manifest};
++use super::{Entry, Error, Loaded, crc32, put, read};
+ 
+ /// Why a copy is not what its own manifest says it is.
+ ///
+@@ -141,6 +144,37 @@ pub struct Outcome {
+ }
+ 
+ impl Outcome {
++    /// A restore that has written nothing yet, of the store `loaded` describes.
++    fn of(loaded: &Loaded) -> Self {
++        Self {
++            files: 0,
++            bytes: 0,
++            records: 0,
++            log_records: 0,
++            epoch: loaded.epoch(),
++            floor: loaded.floor(),
++        }
++    }
++
++    /// Count one file this restore wrote.
++    fn wrote(&mut self, entry: &Entry) {
++        self.files = self.files.saturating_add(1);
++        self.bytes = self.bytes.saturating_add(entry.bytes());
++        match entry.kind() {
++            Kind::Segment => {
++                self.records = self
++                    .records
++                    .saturating_add(entry.records().unwrap_or_default());
++            }
++            Kind::Log => {
++                self.log_records = self
++                    .log_records
++                    .saturating_add(entry.records().unwrap_or_default());
++            }
++            Kind::Manifest => {}
++        }
++    }
++
+     /// Files written into the destination.
+     #[must_use]
+     pub const fn files(&self) -> u64 {
+@@ -197,11 +231,101 @@ impl Outcome {
+ /// says it is (a file missing, short, hashing to another checksum, unreadable, or named as a path no
+ /// store could hold) — and [`Error::Store`] when the filesystem refuses.
+ pub fn restore(source: &Path, destination: &Path) -> Result<Outcome, Error> {
+-    let _ = (source, destination);
+-    todo!(
+-        "lakelet/4.19-backup-restore: load the copy's manifest, refuse a destination that already \
+-         holds a store, verify every entry before writing anything, and then write the files — the \
+-         store's own manifest last, because that file is the commit point that makes a directory a \
+-         store"
+-    )
++    let loaded = Manifest::load(source)?;
++    let commit = destination.join(compaction::MANIFEST);
++    if commit.exists() {
++        return Err(Error::Occupied { path: commit });
++    }
++    // Every entry, before anything is written: this is the pass that makes a refused restore leave
++    // the destination exactly as it found it.
++    for entry in loaded.entries() {
++        verified(source, entry)?;
++    }
++
++    std::fs::create_dir_all(destination).map_err(|source| Error::Store {
++        path: destination.to_path_buf(),
++        source,
++    })?;
++    let mut outcome = Outcome::of(&loaded);
++    // The store's own manifest is the commit point and is written last, so it is held back here and
++    // written after everything else — whatever position the copy's own manifest gives it in.
++    let mut commit_point: Option<&Entry> = None;
++    for entry in loaded.entries() {
++        if entry.kind() == Kind::Manifest {
++            commit_point = Some(entry);
++            continue;
++        }
++        put(&destination.join(entry.name()), &verified(source, entry)?)?;
++        outcome.wrote(entry);
++    }
++    if let Some(entry) = commit_point {
++        put(&commit, &verified(source, entry)?)?;
++        outcome.wrote(entry);
++    }
++    Ok(outcome)
++}
++
++/// The bytes of one entry's file, or the reason this copy is not what its manifest says.
++///
++/// Three comparisons and one check on the name, and each of them is a way a copy can be wrong that
++/// nothing else notices: the file is there, it is the length the manifest states, its bytes hash to
++/// the checksum the manifest states, and its name is a path inside the copy (a manifest is a file a
++/// machine can write anything into, and a restore that followed a name out of the copy would write
++/// wherever it pointed — `../..`, an absolute path — which is not a store and not this call's
++/// business).
++fn verified(source: &Path, entry: &Entry) -> Result<Vec<u8>, Error> {
++    let name = entry.name();
++    if !inside(name) {
++        return Err(damaged(Damage::Unreadable {
++            name: name.to_owned(),
++            detail: "this name is not a file inside the copy: an entry names a file the way the \
++                     store's own reader names one — relative to the store's root, and never out of \
++                     it"
++            .to_owned(),
++        }));
++    }
++    let path = source.join(name);
++    let bytes = match read(&path) {
++        Ok(bytes) => bytes,
++        Err(Error::Store { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
++            return Err(damaged(Damage::Missing {
++                name: name.to_owned(),
++            }));
++        }
++        Err(Error::Store { source, .. }) => {
++            return Err(damaged(Damage::Unreadable {
++                name: name.to_owned(),
++                detail: source.to_string(),
++            }));
++        }
++        Err(error) => return Err(error),
++    };
++    if bytes.len() as u64 != entry.bytes() {
++        return Err(damaged(Damage::Short {
++            name: name.to_owned(),
++            expected: entry.bytes(),
++            found: bytes.len() as u64,
++        }));
++    }
++    let found = crc32(&bytes);
++    if found != entry.crc32() {
++        return Err(damaged(Damage::Checksum {
++            name: name.to_owned(),
++            expected: entry.crc32(),
++            found,
++        }));
++    }
++    Ok(bytes)
++}
++
++/// `true` when an entry's name is a path inside the copy it is written into.
++fn inside(name: &str) -> bool {
++    !name.is_empty()
++        && !name.starts_with('/')
++        && !name.split('/').any(|part| part.is_empty() || part == "..")
++}
++
++/// One refusal of a copy that is not what it says it is.
++fn damaged(damage: Damage) -> Error {
++    Error::Damaged(damage)
+ }

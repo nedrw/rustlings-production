@@ -1,0 +1,53 @@
+# The drill `lakelet/4.19-backup-restore` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_backup.rs`, which this
+# step's scaffold ships complete); the gate runs it once per seed below with `KILN_SIM_SEED` set, and
+# every run has to be green — a drill that only holds under the seed somebody happened to try is
+# exactly the failure this gate is about.
+#
+# What the seed decides here is the **whole drill**: how many batches the workload writes, how many
+# records each carries, which of three series they are of, after which batch the write path waits for
+# the device (which is where the machine death cuts the log), how many batches a flush closes into a
+# segment, and *where the copy is interrupted*. All of it comes out of the store's own generator
+# (`src/engine/rng.rs`), so the same seed drills the same store on every machine.
+#
+# What the transcript holds is the whole argument of the step, one line per observation: the store the
+# drill built; the machine death, modelled the way `lakelet/4.4-wal-recovery`'s crash scenario models
+# it — cut the log to the store's own `durable_offset`, because a machine that stopped after a write
+# and before a flush is not something a test can wait for; the copy's own report beside what the
+# copy's manifest says, which have to be the same copy; what the restore wrote; and the comparison at
+# the end, as a digest over the ordered records on each side rather than as a count — a copy that lost
+# one record and duplicated another keeps the count. Nothing in it is a path, an address, a wall clock
+# or an unmasked float: the values in the store are hashed by their bits.
+#
+# The three seeds differ in the shape of the drill and in what the deaths cost it, and that is
+# measured rather than argued:
+#
+#   seed 1:        four batches, twenty records, two segments; the machine death takes eleven of them
+#                  (343 bytes); a complete copy of 608 bytes in four files; records_missing=0, and
+#                  the restored store's digest is the source's, record for record.
+#   seed 7:        four batches, fifteen records, two segments; ten records lost (326 bytes); the
+#                  copy complete at 462 bytes; records_missing=0.
+#   seed 20260101: five batches, twenty records, *one* segment; thirteen records lost (413 bytes);
+#                  and the copy this seed asks for stops inside the log — three files written, two
+#                  named, `log_bytes=0` — so its restore loses seven records that its manifest does
+#                  not name, and the transcript says so (`complete=false`, `missing_records=7`).
+#
+# So one of the three published seeds is a complete copy and another is an interrupted one, which is
+# the contrast the step is about; the harness also *asserts* the claims rather than printing them, so
+# a run in which a complete copy lost something fails instead of reporting a smaller number.
+#
+# `replay = 1` is the seed that is run *twice*: the two transcripts have to be byte-identical, which
+# is why no line of a run that agreed carries the seed. Three identical transcripts would mean the
+# harness never read `KILN_SIM_SEED` — so one seed was run three times — and the gate refuses that;
+# a transcript that printed its own seed would satisfy the demand without drilling anything, which is
+# the argument `tests/sim_model.rs` makes for the walk it ships, and this harness follows it.
+#
+# RTO is deliberately *not* in this file or in any transcript: it is a wall clock, and a wall clock in
+# a `slow:sim@N` transcript would make one seed print two different bytes on a loaded machine. The one
+# timing line in this step is `LAKELET_DRILL_TIMED=1 lakeletq drill`, and `docs/dr-drill.md` is where
+# the numbers it printed are written down with the machine they came from.
+command = "cargo test -p lakelet --test sim_backup -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
