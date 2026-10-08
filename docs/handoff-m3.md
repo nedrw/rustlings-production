@@ -33,8 +33,9 @@
 | B4e | `course(lakelet/4.19-backup-restore): a copy is a log, a restore is an ordered write` | 4.19 正文（teach，19 用例）+ `backup/{mod,manifest,restore}.rs`（副本清单＝4.4 的日志格式、只取清单点名的段与日志已证前缀、先全验后写且最后写 `segments.manifest`）+ `cli/backup.rs`（`backup`/`restore`/`drill` 三命令）+ 装置 `tests/sim_backup.rs`（完整，695 行）+ `sim/4.19-backup-restore.toml` + `docs/dr-drill.md`（RTO/RPO，带一块可逐行复跑的确定性输出）；`slow:sim@3` `5b740412/aacc05b0/b52d27f8`、`slow:mutants@80` 12/12 |
 | B4f | `course(lakelet/4.20-capacity-model): the model and the comparison, judged in one lane` | 4.20 正文（teach，14 用例）+ `engine/cost.rs`（`Model`/`Usage`/`Estimate`/`Measured`/`Predicted`/`Drift`/`Agreement`：整数微单位、无浮点、不读任何东西）+ 完整装置 `tests/budget_cost.rs` + `budget/4.20-capacity-model.toml`（35 计数）+ `docs/capacity.md`（模型的 25 行块 + 保留期表，规格逐行/逐格重算）；`slow:bench-budget@10` 实测：模型与店之间的漂移 23/0/0/2/12/24 ‰；**演练**：把 `bytes_per_sample` 4→5（20%）→ 35 个计数里 10 个越界（点名 `drift_segment_bytes_permille_max 181 > 40`、`within_max 1 > 0`）、`9/10 must`；回滚 `10/10` |
 | B5a | `course(lakelet/4.21-cold-tiering): the tier is a port, the client signs, and the suite runs twice` | 4.21 正文（deepen，**27** 用例）+ `tier/{mod,http,s3,filesystem}.rs`（blob 端口 `put/get/delete/分页 list`、`Policy`、`sweep`（先 put 后删本地）与 `hydrate`）+ 完整装置 `tests/s3_stub.rs`（进程内 S3 形状端点，带请求日志与故障注入）+ `tests/support/tier.rs`（`KILN_BACKEND`）+ `conformance.toml`；`slow:conformance@2` `local ✓ s3 ✓`、`slow:mutants@80` 10/12（83%，两个不可见位点见 §5）；SigV4 用 AWS 自己的 get-vanilla 向量钉住；演练：把顺序倒过来（先删本地）→ `the_window_between_the_object_and_the_delete_is_readable_from_both_sides` 红 |
+| B5b | `course(lakelet/4.22-reproducible-build): the same source, the same bytes`（+ `course(lakelet): the project names the default binary a bare cargo run means`） | 4.22 正文（deepen，16 用例）+ 项目七个文件（两阶段 `Dockerfile`、项目自己的 `rust-toolchain.toml`、`.github/workflows/ci.yml`、`deny.toml`（从 lockfile 用 `cargo metadata` 推导）、`scripts/repro.sh`（两次构建逐字节比较，只印计数与名字）、`docs/build.md`、`docs/supply-chain.md`）；实测 `scripts/repro.sh` → `artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（34 s）；**`images` 绿**（两个声明镜像在本机），**`container-repro` 红——但是引擎的**（见 §5）；骨架补 `default-run = "lakeletd"`（否则门问宿主用 `cargo run --package lakelet` 根本得不到答案），并补一条用例钉住它 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.21；还差 4.22–4.24）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.22；还差 4.23–4.24）、探题、验收演练。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -159,6 +160,21 @@
 - **scaffold 状态的警示与 `tests/support/mod.rs` 的耦合（4.21 提醒，未修）**：4.21 的 scaffold 里有 31 条未使用警告
   （`todo!()` 之后才被调用的私有助手、未用 import），学员在写完之前一直看着；另外 `tests/support/**` 被每个规格目标
   编译，所以新增一个 support 模块会进入**所有**规格的编译面（一处坏掉就红一片）。两条都是课程造题的已知代价，记着即可。
+- **容器引擎坏了，plan §9 腿 6 的第二半还欠着（4.22 期间实测，等用户修）**：`podman run --rm alpine:3.20 true`（包括
+  `debian:bookworm-slim`、强制 arm64/amd64）均报 `creating overlay mount …: input/output error`，`podman images` 只列出
+  `<none>:<none>`；而 `kiln images` 仍能找到声明的镜像，所以 `images` 门是绿的。后果：4.22 的 `container-repro`
+  报 `the image did not build, so there is nothing to judge … input/output error`（`podman build` exit 125，< 1 s），
+  步骤因此是 `10/11 must`。引擎恢复后要做的：在 lane 里重跑 `check --slow`（应 `11/11`，带镜像大小与 `--check-config`
+  比对行），并补跑腿 6 的 drill（把 `FROM ${RUNTIME} AS runtime` 改成 `${BUILDER}` → 尺寸检查先跑，应该红在
+  “the image is NNN MB, over the 25 MB this step allows”）。**镜像构建需要暖的 registry**：门把
+  `$XDG_CACHE_HOME/kiln/container-registry` 挂进 builder；`~/.cache/kiln/container-registry` 是暖的（144 MB），
+  而一个全新的私有 `XDG_CACHE_HOME` 会递给 builder 一个空缓存（有网时它去取，离线则建不出来）。
+- **`container_repro.rs` 只把 `MAILER__` 前缀的环境变量带进宿主运行（4.22 发现，未修，暂时潜伏）**：镜像是
+  `ENV` 里的任何 `LAKELET__*` 都会让门报“the image does not run the binary this tree builds”。4.22 的 Dockerfile
+  因此一个 `ENV` 都不写（页面写明理由）。正解：前缀应当从项目/ track 推出来，或那次比较忽略镜像的环境——收尾时一并。
+- **`kiln` 的补丁器忽略 `new file mode`（4.22 发现，未修）**：`src/patch.rs` 不设文件模式，所以 `scripts/repro.sh`
+  在学员的树里是 `-rw-r--r--`（`kiln run` 后直接 `./scripts/repro.sh` 会 EACCES）。4.22 的正解是让规格跑 `sh
+  scripts/repro.sh` 并查 `#!` 行，页面写 `chmod +x`；修 `patch.rs` 可以以后做（代价是要重验所有含可执行文件的补丁）。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
   第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
@@ -229,3 +245,11 @@
     payload 哈希、读循环）。**当步的做法**：让**每一次**运行都跑 S3 形状的那一半（进程内端点每次开，`KILN_BACKEND`
     只决定端口用例走哪个实现），于是走查的单次运行也能看到——这是“更多 conformance”而不是更少。
     **框架侧的正解**（未做）：走查应当像 conformance 一样按后端跑，或至少用第一个声明的后端——已记入 §5。
+
+21. **多个 bin 的项目必须用 `default-run` 说出“默认跑哪个”**（4.22 实测并已修：骨架 + 一条用例）。
+    `container-repro` 问宿主的那半是 `cargo run --package <包> -- --check-config`；一个有三个 bin
+    （`lakeletd`/`lakeletq`/`lakelet-load`）而没有 `default-run` 的项目会直接 `exit=101`
+    （“could not determine which binary to run”），于是门在“宿主答不出”上变红/阻塞——**与镜像无关**。
+    修法（已落地）：骨架的 `[package]` 里写 `default-run = "lakeletd"`（守护进程才是部署启动的那个），
+    并让规格用一条用例钉住“默认二进制就是镜像入口点跑的那个”；验证：重建 base22 后
+    `cargo run --quiet --package lakelet -- --check-config` → 配置报告 + `exit=0`。以后的 track 同理。

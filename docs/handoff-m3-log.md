@@ -1476,3 +1476,52 @@ the_window_between_the_object_and_the_delete_is_readable_from_both_sides --- FAI
 
 **这一步钉下来的两件事**：① **4.21 落地**（phase E 开始；还差 4.22–4.24）；② **新的框架分歧成了规则（第 20 条）**：
 `mutants` 跑一遍、`conformance` 按后端跑——同时上两道门的步骤必须让每次运行都覆盖后端特有的那些行。
+
+## 段 27：B5b — 4.22 `build/reproducibility@apply` + 四个 design 槽（同一份源码，同样的字节）+ 默认二进制
+
+**4.22 做了什么**：`spec/4.22/reproducible.rs`（1342 行、**16** 用例）、`scaffold/4.22-reproducible-build.patch`
+（226 行、**+190 / −0**、六个新文件：`Dockerfile`/`scripts/repro.sh`/`deny.toml`/`.github/workflows/ci.yml` 与两个页面的桩）、
+`solutions/4.22-reproducible-build.patch`（913 行、**+688 / −119**，七个文件）、正文 307 行。`track.toml` 未动
+（**11 must + `?deny` should**）。交付的七个项目文件：`Dockerfile` 86、`rust-toolchain.toml` 20、`.github/workflows/ci.yml` 45、
+`deny.toml` 95、`scripts/repro.sh` 194、`docs/build.md` 179、`docs/supply-chain.md` 140。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane22`：4.1…4.22 逐级 `run`+`solution`，再 `check --slow`）：
+
+```
+$ kiln selftest lakelet/4.22-reproducible-build --track lakelet      # 73s
+    scaffold ✓ the spec fails as it must（第一条红：the_pin_is_a_file_and_the_compiler_answering…）
+    solution ✓ reference patch applies / solution ✓ the spec passes
+    gates ✗ 10/11 must green
+    ✗ container-repro the image did not build, so there is nothing to judge（podman build exit 125，
+      `creating overlay mount …: input/output error`）
+$ kiln check lakelet/4.22-reproducible-build --slow                  # 全新副本，22s → 10/11 must
+  ✓ images rust:1.98-alpine — in the local image store …；alpine:3.20 — in the local image store …
+  ✓ links 104 link(s) in 15 page(s) · 其余九道全绿 · · ?deny not implemented yet（should）
+$ sh scripts/repro.sh   # 我手跑，lane 的解树，34s
+  toolchain=1.98.1 · locked=true · builds=2 · artifacts=lakeletd,lakeletq,lakelet-load,liblakelet.rlib
+  artifacts_compared=4 · artifacts_identical=4 · artifacts_differing=0
+  difference_path=remapped · difference_timestamp=mtimes_differ · verdict=reproducible
+$ kiln spec manifest --track lakelet → 22 pinned（4.22 的 sha256 与清单一致：d729d3b2…）
+$ cargo test -q -p kiln → 322+21+1 · clippy 干净 · fmt 干净
+```
+
+**父目录补的一行（修一个真缺口，并入本批）**：`container-repro` 问宿主的那半是
+`cargo run --package lakelet -- --check-config`，而 4.22 之前的树有三个 bin 且无 `default-run` → `exit=101`
+（“could not determine which binary to run”）——这会让腿 6 **在引擎修好后仍然无法变绿**。修法：骨架 `[package]` 加
+`default-run = "lakeletd"`（守护进程是部署启动的那个），并在 4.22 的规格里加一条用例钉住“默认二进制就是镜像入口点跑的那个”。
+验证：重建 `base22` 后 `cargo run --quiet --package lakelet -- --check-config` → 配置报告、`exit=0`；用例的 drill：
+无此行 → `declares no package.default-run … the gate never gets to judge an answer`（红），加回 → `ok. 1 passed`。
+提交顺序是先骨架后步骤，所以历史里没有一条“自己会红”的中间态。
+
+**腿 6 的第二半（我重做）：欠着，因为引擎**。把 `FROM ${RUNTIME} AS runtime` 改成 `${BUILDER}` 后 `container-repro`
+的句子与回滚后一字不差——两句都是引擎的 overlay 错误，不是断点的。**不伪造**：这半条验收要等容器能用（§5 写了重跑配方、
+暖 registry 的位置，以及尺寸检查先跑、所以变红会是一个真句子）。
+
+**与作业书不同的六处**（都被接受）：可执行位无法随补丁交付（`patch.rs` 忽略 `new file mode`，于是规格跑 `sh` 并查 `#!`）；
+`podman info` 在这里能完成，所以门是 failed 而非 blocked；“二进制里记录时间戳”对本构建不真（rfc 档案成员的 mtime 为零，
+差异是两份拷贝自己的 mtime，页面写的是后者）；`container_repro.rs` 的宿主环境只带 `MAILER__` 前缀（所以 Dockerfile 一个
+`ENV` 都不写）；`Cargo.toml` 没有 `license` → `deny.toml` 用 `private = { ignore = true }`；无 `.dockerignore` →
+`Dockerfile` 列出四个源输入而不是 `COPY . .`。
+
+**这一步钉下来的两件事**：① **4.22 落地**（只差 4.23/4.24；腿 6 的第二半等引擎）；② **规则 21**（多个 bin 的项目
+必须 `default-run`，已落地并有用例把守）。发现的四件事（引擎、`MAILER__` 前缀、补丁模式位、暖 registry）记在 §5。
