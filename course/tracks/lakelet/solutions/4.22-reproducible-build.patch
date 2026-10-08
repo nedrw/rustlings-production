@@ -1,0 +1,913 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index beabd34..f2df5cc 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,20 +1,24 @@
+-# The pipeline, as code (step `lakelet/4.22-reproducible-build`).
++# The pipeline, as code (concept `ci/pipeline@design`; `mailer/1.3-ci` is where a human first met
++# it). Four commands, in the order a failure costs the least: formatting, then lints, then the
++# tests, then the reproducer — the last one is a whole extra pair of release builds, so it is the
++# one worth reaching last.
+ #
+-# The commands this file has to run, in the order the course's own CI runs them — cheapest failure
+-# first, and the reproducer last because it is two whole release builds:
++# **This file is read as text and not parsed.** Nothing in this project carries a YAML parser and
++# `cargo test` must not start needing one: the step's spec reads these lines and asserts the
++# commands and the order, which is the part of a workflow a reviewer argues about. A YAML-aware
++# check would judge indentation instead.
+ #
+-#   cargo fmt --all --check
+-#   cargo clippy --workspace --all-targets --locked -- -D warnings
+-#   cargo test --workspace --locked
+-#   scripts/repro.sh
++# **The toolchain is not named here.** `rust-toolchain.toml` at the root is the one place the
++# channel is written down, and the runner's `rustup` honours it because the file sits in the
++# checkout. A version in this file would be a second pin, and two pins disagree eventually —
++# `mailer/1.3-ci` argued the same point about a second list of checks.
+ #
+-# The toolchain is not named here: `rust-toolchain.toml` in the repository is the one place the
+-# channel is written down, and the runner's `rustup` reads it because the file is in the checkout. A
+-# version in this file would be a second pin.
+-#
+-# The step's spec reads this file **as text** — no YAML parser is a dependency of this project and one
+-# must not become one — so what it judges is the commands and their order, which is the part a
+-# reviewer argues about.
++# `cargo deny check` is deliberately *not* a step. `deny.toml` at the root is a real policy file and
++# `docs/supply-chain.md` is where a reader learns what it refuses, but `cargo-deny` is not a
++# component of the pinned toolchain and is not installed on the machine this step was authored on
++# (`kiln doctor` says so). A step that ran it would be a check that passes on nobody's laptop and
++# fails on the runner. When the tool is in the pin's components, it belongs here — one line, after
++# `clippy`, before the tests.
+ name: ci
+ 
+ on:
+@@ -23,6 +27,19 @@ on:
+ 
+ jobs:
+   check:
++    # Ubuntu because the release build is the cheap one there and the image this project ships is
++    # musl-based: the runner's glibc is not an input to anything here.
+     runs-on: ubuntu-24.04
+     steps:
+       - uses: actions/checkout@v4
++
++      # One line, and it is not decoration: it prints which toolchain the file above selected, so a
++      # log with the wrong compiler in it is visible in the first twenty lines of the job.
++      - run: rustup show
++
++      - run: cargo fmt --all --check
++      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
++      - run: cargo test --workspace --locked
++      # `sh` in front of it, deliberately: the file arrives as a patch, and a patch carries content
++      # rather than a mode bit, so a checkout is not guaranteed to have the executable bit set.
++      - run: sh scripts/repro.sh
+diff --git a/Dockerfile b/Dockerfile
+index 80e1e38..a57da30 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,24 +1,86 @@
+-# The image this daemon ships as (step `lakelet/4.22-reproducible-build`).
++# The image this daemon ships as (concept `release/container-image@design`; `mailer/1.21-container` is
++# where the first project of this course built one, and this is the same shape one project later).
+ #
+-# One stage, for now, and it is the shape `mailer/1.21-container` started from: the toolchain and the
+-# sources that built the binary stay in the image that *runs*, so what ships is a build environment
+-# with a binary inside it. This step's spec says what that costs, one failed case at a time, and
+-# `container-repro` is the gate that prices it: the runtime stage is held to 25 MB, and a stage that
+-# is really the builder weighs hundreds of megabytes.
++# Two stages, and the split is the whole design. The builder has the toolchain, the compiler's C
++# dependencies and the sources; the runtime has one binary, one unprivileged user and nothing that
++# could compile another one. What that buys is not disk space as much as surface: an image with no
++# `cargo`, no `rustc` and no sources is an image where a shipped vulnerability has fewer places to
++# live, and where "the image runs the binary this tree builds" is a claim somebody can check, because
++# there is nothing else in there to run. The step's gate holds the *runtime* stage to a 25 MB ceiling,
++# which is the assertion that this stage is a runtime and not a build environment.
+ #
+-# The base image is a build argument rather than a literal, because behind a registry mirror the same
+-# image lives under another name and the gate passes the name this engine actually stores
+-# (`--build-arg BUILDER=…`). This step declares **two** images — a builder and a runtime — and only one
+-# of them is in this file so far.
++# The base images are build arguments rather than literals, which is the convention the first project's
++# container step established and the reason is the machine rather than taste: behind a registry mirror
++# `rust:1.98-alpine` is stored as `docker.1ms.run/library/rust:1.98-alpine`, and a literal `FROM` would
++# not find it. The `container-repro` gate reads these defaults, resolves each against the local image
++# store, and passes the names this engine actually has back as `--build-arg`. The defaults below are
++# what a machine with Docker Hub access uses.
++#
++# The builder image is pinned to the same compiler as `rust-toolchain.toml`: `rust:1.98-alpine`
++# carries `RUST_VERSION=1.98.1`. That is not a coincidence to rely on — it is the reason the binary
++# built here and the binary built on this machine come from one toolchain (`docs/build.md`).
+ ARG BUILDER=rust:1.98-alpine
+-FROM ${BUILDER}
++ARG RUNTIME=alpine:3.20
++
++FROM ${BUILDER} AS builder
++
++# The build cache. The gate mounts one at `/opt/kiln/target` and passes its path as this argument, so
++# a second build of the same image copies layers instead of compiling the whole dependency tree again.
++# A mount is not a layer, which is why the binary is copied *out* of this directory below: a build
++# that left its output in the mounted path would hand the next stage an empty file. A Dockerfile that
++# ignored the argument would still build, just without the cache — which is why it is an `ARG` with a
++# default rather than something imposed.
++ARG CARGO_TARGET_DIR=/opt/kiln/target
++ENV CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+ 
+ WORKDIR /src
+-COPY . .
+-RUN cargo build --release --locked --bin lakeletd
+ 
+-# The daemon answers `--check-config` with the configuration it would run with, without opening a
+-# store or binding a port. That is the question `container-repro` asks the finished image and this
+-# host's binary, and the answer has to be `lakeletd`'s.
++# The sources, named one by one. Deliberately not `COPY . .`: this project has no `.dockerignore`, and
++# a build context is the whole directory a deployment happens to be standing in — including the host's
++# own `target/`, hundreds of megabytes of *this machine's* artifacts that no build in the image can
++# use. Naming what the build reads is one line more than copying everything and it is the difference
++# between a context that is the sources and a context that is a directory.
++COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
++COPY src ./src
++
++# One release build, locked to the versions the tree was tested with. No `apk add` above it: the
++# official `rust:alpine` image already carries `gcc`, `musl-dev` and `ca-certificates`, which is what
++# this tree needs — `zstd-sys` compiles C, and the C compiler is part of the base image.
++RUN cargo build --release --locked --bin lakeletd \
++    && cp "$CARGO_TARGET_DIR/release/lakeletd" /lakeletd
++
++FROM ${RUNTIME} AS runtime
++
++# One user, no privileges, no home directory. The process is pid 1 inside the container either way,
++# and a daemon that needs no privileges should have none. `/data` is created and owned here because it
++# is where the configuration's default store directory lands (the default is the relative path `data`,
++# and this image's working directory is `/`) — a deployment mounts a volume there, or points
++# `LAKELET_STORE_DIR` somewhere else.
++RUN adduser -D -H -u 10001 -s /sbin/nologin lakelet \
++    && mkdir -p /data \
++    && chown lakelet:lakelet /data
++
++# The one thing that crosses from the builder: the binary. Not the sources, not the target directory,
++# not the toolchain.
++COPY --from=builder /lakeletd /usr/local/bin/lakeletd
++
++USER lakelet
++
++# **No configuration is baked in, and that is a decision with a reason.** A container needs a listen
++# address a client can reach (`127.0.0.1` is "this container only") and a store directory on a volume
++# it may write, so the obvious lines would be `ENV LAKELET_LISTEN_ADDR=0.0.0.0:7000` and an
++# `ENV LAKELET_STORE_DIR=/data`. Neither is here: the `container-repro` gate compares the
++# configuration report the image answers with the report this machine's binary answers, and it copies
++# the image's environment into the host's process only for names in the `MAILER__` namespace — a
++# leftover from the gate being written for the first project. A `LAKELET_*` variable baked into the
++# image is therefore a difference the gate reports as "the image does not run the binary this tree
++# builds", which is true and is not the reason anybody would guess. Environment is the deployment's
++# half of the four layers (`lakelet/4.1-ingest-protocol`): it arrives at `docker run -e …`, and the
++# two variables above are the two a deployment has to supply.
+ EXPOSE 7000
+-ENTRYPOINT ["/src/target/release/lakeletd"]
++
++# The daemon as the entry point, with no `CMD` after it, so the arguments a deployment passes are the
++# daemon's own: `docker run <tag> --check-config` prints the configuration report and exits without
++# opening a store or binding a port, which is exactly what the gate asks the image and the host to
++# agree on.
++ENTRYPOINT ["/usr/local/bin/lakeletd"]
+diff --git a/deny.toml b/deny.toml
+index 35f552b..0194c3e 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -1,16 +1,95 @@
+-# The supply-chain policy (step `lakelet/4.22-reproducible-build`): four questions, named here and not
+-# answered yet.
++# The supply-chain policy of this project, as a file a tool can run and a reviewer can read.
+ #
+-# This is a file a tool runs (`cargo-deny`; `docs/supply-chain.md` says whether it is installed here)
+-# and a file a reviewer reads. Each section below is one of the four questions a dependency review
+-# asks, and each has to end up carrying the policy *and* the sentence it is there for:
++# `supply/deny-policy@apply — relay/2.21` wrote the first version of this policy; this is the same
++# four questions in a fourth project, at the depth a maintainer is answerable for: what the tree
++# admits, what it refuses, and what each refusal costs. `docs/supply-chain.md` is the prose half and
++# states the same four things in this order — the step's spec reads both files and objects when they
++# disagree, which is the one drift a policy file cannot see by itself.
++#
++# **The tool is not installed here.** `cargo-deny` is not on this machine and is not a component of
++# the pinned toolchain (`kiln doctor` says so; `.github/workflows/ci.yml` says so where it would
++# belong), so on this machine this file is judged as a *file*: its shape, and the policy it states.
++# What keeps it from being decoration anyway is that its lists are not invented. The licence
++# allow-list, the exception, the four duplicated crates and the registry are read off this tree's own
++# `Cargo.lock` (`cargo metadata` over the pinned toolchain), and the step's spec re-reads them the
++# same way — so a lockfile that grew a licence or a duplicate nobody wrote down is a red case rather
++# than a paragraph nobody updates.
++
++# 1. Vulnerabilities. The sentence: a crate with a known advisory does not ship.
+ [advisories]
+-# What is vulnerable: a crate with a known advisory, and what a yanked release means for a lockfile
+-# that still names it.
++version = 2
++db-urls = ["https://github.com/rustsec/advisory-db"]
++# A yanked release is an advisory with the reason attached: somebody pulled the version back, and a
++# lockfile that still names it is a lockfile nobody has looked at.
++yanked = "deny"
++# Empty on purpose, and it is a decision rather than a blank: an entry here ships a known problem,
++# and this policy's position is that such a decision belongs in the pull request that needed it,
++# with the reason and the date, not in a list nobody rereads.
++ignore = []
++
++# 2. Licences. The sentence: the tree is built from what this list allows, and something new is a
++# decision somebody makes rather than a rebuild nobody notices.
+ [licenses]
+-# What this tree may be built from: the licence families this lockfile actually declares, and anything
+-# that needs an exception of its own.
++version = 2
++confidence-threshold = 0.93
++# This crate is not published and declares no licence: the policy covers what the tree *depends on*,
++# and demanding a licence file from the workspace's own package would be a rule about publishing.
++private = { ignore = true }
++# Every family this lockfile declares, and nothing else — derived, not guessed. A crate whose
++# licence is not on this list (or covered by an exception below) fails the check, which is the whole
++# point: adding a dependency under a new licence is a decision, and this is where it gets written
++# down.
++allow = [
++    "Apache-2.0",
++    "Apache-2.0 WITH LLVM-exception",
++    "BSD-2-Clause",
++    "BSD-3-Clause",
++    "MIT",
++    # The one entry that is not an SPDX expression: `scoped-tls` and `version_check` (both build
++    # dependencies of the toolchain's own crates) still declare their dual licence the way crates
++    # did before SPDX expressions were common. It is here under the string they use, with this
++    # comment, rather than rewritten as `MIT OR Apache-2.0` — because the file has to state what
++    # the crates say, not what they meant.
++    "MIT/Apache-2.0",
++    "Unicode-3.0",
++    "Unlicense",
++]
++# Exactly one exception, and it is a copyleft one, so it is written as an exception rather than as
++# an entry in the allow-list: `r-efi` (LGPL-2.1-or-later) arrives through `getrandom`, which needs it
++# for UEFI targets — a target this project does not build for, so nothing of it is distributed here.
++# `allow = ["LGPL-2.1-or-later"]` would admit the next copyleft crate without anybody reading this
++# comment; naming the crate is the difference between a policy and a shrug.
++exceptions = [{ name = "r-efi", allow = ["LGPL-2.1-or-later"] }]
++
++# 3. Bans. The sentence: two versions of one crate are two things to audit and one of them is
++# usually forgotten, so a *new* duplicate fails the check.
+ [bans]
+-# What may be here twice: two versions of one crate are two things to audit.
++multiple-versions = "deny"
++# A wildcard requirement (`serde = "*"`) makes the lockfile the only pin, which is the thing a
++# lockfile-controlled tree is not supposed to need.
++wildcards = "deny"
++# The four crates this lockfile holds twice, each because two crates that cannot see each other
++# depend on different lines. Measured, not assumed:
++#   `syn` 2.0.119 (`tracing-attributes`, `zerocopy-derive`) and 3.0.6 (`serde_derive`,
++#     `thiserror-impl`, `tokio-macros`) — proc-macro crates move majors independently;
++#   `winnow` 0.7.15 (`toml`) and 1.0.4 (`toml_parser`) — one parser crate's internals split;
++#   `getrandom` 0.3.4 (`rand_core`) and 0.4.3 (`jobserver`) — a dev-dependency's tree and a build
++#     dependency's tree need different majors;
++#   `r-efi` 5.3.0 and 6.0.0, both from `getrandom`, for the same UEFI target as the licence
++#     exception above.
++# A name here is not a permanent exemption: a fifth duplicate, or one of these four arriving in a
++# second place this file cannot see, is a failing check and a decision to make.
++skip = ["getrandom", "r-efi", "syn", "winnow"]
++# Nothing is refused by name. An entry here is the "we know about this crate and took it anyway"
++# list, and the two lists above are already where a deliberate exception goes.
++deny = []
++
++# 4. Sources. The sentence: a crate comes from crates.io, or the build stops.
+ [sources]
+-# Where a crate may come from: one registry, or the build stops.
++unknown-registry = "deny"
++# A git dependency is a promise that a repository will still have that commit... and the lockfile
++# records the commit rather than a release, so this tree ships code nobody has published.
++unknown-git = "deny"
++# The 92 registry entries this lockfile names are all this one.
++allow-registry = ["https://github.com/rust-lang/crates.io-index"]
++allow-git = []
+diff --git a/docs/build.md b/docs/build.md
+index 44a228b..ede3687 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -1,58 +1,179 @@
+ # The same source, the same bytes
+ 
+-<!-- TODO: one paragraph, in this project's voice, on what a build is a claim about — a compiler, a set
+-of dependency versions, a set of options and a directory — and why a claim that does not name all
+-four is a claim nobody can check. Say that the comparison is a file (`scripts/repro.sh`) rather than a
+-paragraph, for the same reason the pipeline is a file. -->
++## Why this page exists
+ 
+-[TODO](TODO)
++"The build produced this binary" is a claim about a moment. The moment had a compiler, a set of
++dependency versions, a set of options, and a directory — and a claim that does not name all four is
++not something anybody can check. This page is the checkable half of it: two builds of this tree, in
++two different directories, with the same pinned compiler and the same locked dependencies, compared
++byte for byte.
++
++The comparison is a file rather than a paragraph — [scripts/repro.sh](../scripts/repro.sh), run as
++`sh scripts/repro.sh` — for the same reason the pipeline is a file: a procedure somebody has to
++remember is a procedure that gets done differently at 2 a.m. The interpreter is spelled out because
++the file arrives as a patch and a patch carries content rather than a mode bit: `chmod +x` makes it a
++command you can run directly, and `sh` does the same thing for a checkout that never got one. The script copies this tree's sources into two directories of deliberately
++different depth, builds each with `--locked` and the channel [rust-toolchain.toml](../rust-toolchain.toml)
++names, and compares the library and the three binaries a release build produces.
+ 
+ ## The comparison
+ 
+-<!-- TODO: the command (`scripts/repro.sh`), and then the block it prints, in a fenced block, line for
+-line — the step's spec re-runs the command and compares that block, so it is edited from a run and
+-never by hand. Say that the block is stdout and that both builds' progress goes to stderr, and that no
+-digest, path or time is in it because those are the numbers that move. Name the two environment
+-variables the script documents for the spec (`LAKELET_REPRO_ROOT`, `LAKELET_REPRO_KEEP`). -->
++```sh
++sh scripts/repro.sh
++```
+ 
+ ```text
+-toolchain=TODO
+-verdict=TODO
++toolchain=1.98.1
++locked=true
++builds=2
++build_roots=differ
++target_roots=differ
++artifacts=lakeletd,lakeletq,lakelet-load,liblakelet.rlib
++artifacts_compared=4
++artifacts_identical=4
++artifacts_differing=0
++difference_path=remapped
++difference_timestamp=mtimes_differ
++verdict=reproducible
+ ```
+ 
++The block is what the script prints on **stdout**, and nothing else is printed there: progress,
++including both `cargo build` runs, goes to stderr. That is not tidiness — the step's spec re-runs this
++script and compares the block line for line, so a line that moved between two machines would fail the
++step. Which is also why the block carries counts and names and never a digest, a path or a time: a
++digest of a binary changes the day a crate moves, and a page carrying one is a page that goes stale
++quietly. `docs/dr-drill.md` made the same trade for a restore's numbers and `docs/capacity.md` for a
++model's, and this is the third time the project has paid it.
++
++Two knobs exist for the spec rather than for a reader, and they are part of the script's interface:
++`LAKELET_REPRO_ROOT=<dir>` builds the two copies under `<dir>` instead of a temporary path, and
++`LAKELET_REPRO_KEEP=1` leaves them there. The step's spec sets both, then looks inside the trees at
++the artifacts the block says it compared — which is the difference between a script that compares
++files and a script that prints a verdict.
++
+ ## The two differences a run can have, and what happened to each
+ 
+-<!-- TODO: one subsection each. The path: what a compiler writes into what it produces, why the
+-dependency rlibs' location is in the library's metadata, what `--remap-path-prefix` is passed over
+-(the whole build location, in both builds), and how the script *checks* that no artifact still names
+-it. The timestamp: the copies' modification times differ and are deliberately not compared, nothing in
+-these artifacts records a time, and `SOURCE_DATE_EPOCH` is named so a reader knows it was considered.
+-Then the toolchain: why the pin is a file and what the script does when the answering compiler is not
+-the channel it names. -->
++Two builds of one tree can differ for two reasons. The script's block names both:
++
++**The path.** A build directory is not neutral. A compiler writes the names of the files it read into
++what it produces, and one of the files it read is the library it was linked against — which lives
++under the target directory. So two builds in two directories produce two artifacts whose metadata
++names two different places, at two different lengths, and everything that counts bytes afterwards
++moves with it. The mechanism is the standard one:
++[`--remap-path-prefix`](https://doc.rust-lang.org/rustc/command-line-arguments.html#--remap-path-prefix),
++passed by the script to **both** builds with the whole build location — the copy of the tree and the
++target directory beside it — renamed to the same `/build`. That is what `difference_path=remapped`
++means, and it is checked rather than asserted: before the block is printed, the script fails the run
++if any artifact still contains the directory it was built in. A remap over the sources alone is not
++enough, which is the trap this page exists to save somebody: `cargo` records where the *dependency
++rlibs* were, and those are under the target directory.
++
++The three binaries do not carry the location in a release build at all; the library's metadata does.
++That asymmetry is worth knowing before deciding the mechanism is unnecessary — `liblakelet.rlib` is
++the artifact this comparison would fail on without the flags, and a project that only compared its
++binaries would have a green block and an unexplained difference in the file its dependencies were
++compiled against.
++
++**The timestamp.** The two copies were written at different moments, so their modification times
++differ — that is `difference_timestamp=mtimes_differ`, and it is the difference the script
++deliberately does **not** remove. Nothing compares metadata here: the comparison is over bytes,
++because a modification time is a property of the copy and not of the artifact, and a reader who wants
++to know whether two builds are the same file has to look at content. What is worth stating plainly is
++that no timestamp is in these bytes to begin with: the archive members of an rlib carry a zero
++modification time (rustc writes them that way, so this is not a flag this project sets), and
++`SOURCE_DATE_EPOCH` — the standard lever for the tools that do stamp time into their output —
++changes nothing about this build. It is named here so that a reader who has met it elsewhere knows it
++was considered rather than missed.
++
++**The toolchain is the third input, and it is pinned rather than described.** A floating `stable` is
++a compiler that changes under a build that changed nothing, and two builds compared across that
++moment differ for a reason no flag removes — which is why the pin is a file in the tree and not a line
++in this page:
++[rust-toolchain.toml](../rust-toolchain.toml) names `1.98.1` and the two components the gates run, and
++the script refuses to build at all when the compiler answering is not the channel the file names. That
++refusal is the difference between "two builds agree" and "two builds agree *and* this machine is the
++one the file describes".
+ 
+ ## What `--locked` and the lockfile buy
+ 
+-<!-- TODO: `Cargo.lock` committed plus `--locked` on every build, what that makes impossible (a
+-resolution this tree never saw), and the part it does *not* pin: the bytes of a fetched crate. Link
+-`docs/supply-chain.md` for that half. -->
++[Cargo.lock](../Cargo.lock) is the other half of "the same inputs", and it is committed for one
++reason: with it, `cargo build` builds the versions this tree was tested with, and `--locked` — which
++the script passes and the pipeline passes — makes cargo refuse rather than quietly resolve something
++newer. Without a lockfile, "the same source" describes a tree whose dependencies are whatever the
++registry answers with that afternoon; the difference between the two is not academic, it is the
++difference between a build somebody can reproduce and a build somebody can only re-run.
++
++`--locked` is also what makes the comparison honest in a second sense: both builds resolve from the
++same file, so a difference between their bytes cannot be a difference between their dependency
++versions. The dependency *fetch* is the part the lockfile does not pin to bytes — the crates come from
++crates.io by name and version, not from a vendored copy in this repository, and `docs/supply-chain.md`
++names that gap rather than leaving the reader to find it.
+ 
+ ## What the image changes
+ 
+-<!-- TODO: two things — the path is different again inside the image (and nothing compares the image's
+-binary with this host's by bytes), and the runtime image carries the binary rather than the compiler,
+-which is what the 25 MB ceiling asserts. Then the part that is sharper than taste: no `LAKELET_*`
+-variable is baked in, because `container-repro` compares the image's configuration report with this
+-host's and passes the image's environment through only for `MAILER__` names. -->
++[Dockerfile](../Dockerfile) builds the same binary from the same sources, and the comparison above is
++the reason it can be trusted to: the build inside the image is the tree's own release build with
++`--locked`, and the `container-repro` gate then asks the binary inside the finished image the same
++question this machine's binary answers. The differences the image introduces are the interesting part
++and there are exactly two:
++
++- **the path is different, and different again.** The image builds in `/build`, so its artifacts
++  record that path; the host built in a directory under this project's parent. Nothing in the image's
++  build tries to hide that, and nothing compares the two builds byte for byte — comparing an image's
++  binary with a host binary by bytes would be comparing two *locations*, not two builds, which is the
++  whole subject of the section above;
++- **the runtime image carries the binary and not the compiler.** `alpine:3.20` plus one user plus
++  `/usr/local/bin/lakeletd`: no cargo, no rustc, no sources. The step's gate holds that stage to a
++  25 MB ceiling, and the ceiling is the assertion that the shipped thing is a runtime rather than a
++  build environment — the same claim, and the same number, that `mailer/1.21-container` makes for the
++  first project.
++
++What the image deliberately does **not** carry is configuration. It bakes in no `LAKELET_*` variable
++at all, not even the listen address a container needs, and the reason is sharper than taste: the
++`container-repro` gate compares the configuration report the image answers with the one this host's
++binary answers, and it passes the image's environment through to the host only for names in the
++`MAILER__` namespace (a leftover from the step that first built that gate for the first project). A
++`LAKELET_*` variable baked into the image is therefore a difference the gate reports as a failure. The
++listen address and the store directory arrive from the deployment — `LAKELET_LISTEN_ADDR` and
++`LAKELET_STORE_DIR`, which is what the four layers of `lakelet/4.1-ingest-protocol`'s configuration
++are for.
+ 
+ ## When the image is wrong, and how to see it
+ 
+-<!-- TODO: what `container-repro` does, its three ways to be red (the image does not build; the runtime
+-stage is over 25 MB; the two configuration reports differ), and the drill one line long: point the
+-runtime stage at the builder and read the size. -->
++The image has a gate of its own — `container-repro` — and it is worth knowing what it does before
++trusting it, because it is the only check in this project that builds the shipped artifact and then
++*asks it a question*. It builds the image the Dockerfile describes, holds the runtime stage to a 25 MB
++ceiling, and runs `--check-config` inside the image, comparing the answer line by line with the answer
++this machine's binary gives. Three ways to be red, and each names the decision that was wrong: the
++image does not build; the runtime stage is over 25 MB (which is what a stage that is really the
++builder weighs — hundreds of megabytes); or the two configuration reports differ, which means the
++binary in the image is not the binary this tree builds.
++
++So the drill is one line long, and it is the reason the ceiling is a number rather than a preference:
++point the runtime stage at the builder — `FROM ${BUILDER} AS runtime` — and the gate answers with the
++size, because a runtime stage that carries `cargo`, `rustc` and the sources is not a runtime. Put the
++line back and the gate is green again. A step's own page (`lakelet/4.22-reproducible-build`) carries
++the same drill as the thing a learner does before this page is finished; this paragraph is the same
++sentence for a reader of the project.
+ 
+ ## What this does not achieve
+ 
+-<!-- TODO: the three gaps, named the way `docs/dr-drill.md` and `docs/capacity.md` name theirs:
+-bit-identical across machines is not measured here; the crates are fetched rather than vendored; and a
+-build script that writes a date into a generated file would reintroduce a difference nothing here
+-compares. -->
++Three things, named here so that nobody reads a green block as more than it is:
++
++- **bit-identical across machines.** The block is one machine comparing two directories. Two machines
++  differ in the compiler's build, the C library a `zstd-sys` build links against, the linker, and the
++  processor the code is compiled for; nothing here measures any of that. What is measured is what a
++  single machine can hold still — the same compiler, the same locked dependencies, two directories —
++  and the honest claim is the narrower one: *this tree builds into these bytes, twice, from two
++  places*;
++- **a vendored registry.** The crates are fetched, not stored in this repository, so a build with no
++  network needs a warm local registry cache, and the bytes of a crate are trusted to what crates.io
++  serves for that name and version rather than to a copy this project keeps. `cargo vendor` plus a
++  `[source]` replacement in `.cargo/config.toml` is the answer for a project that needs to build with
++  the network gone, and it is a decision about repository size that this step does not make;
++- **a build that never reads a clock.** `SOURCE_DATE_EPOCH` is honoured by toolchains that stamp time
++  into their output; this build's artifacts carry no timestamp to remove (see above), but a future
++  dependency with a build script that writes `date` into a generated file would reintroduce the
++  difference, and nothing here would catch it: the script compares the artifacts a build produces, not
++  the files a build reads. A build that must be reproducible on the strictest reading runs its build
++  scripts under a fixed date, and this project does not.
+diff --git a/docs/supply-chain.md b/docs/supply-chain.md
+index 1e13ef8..8abfd38 100644
+--- a/docs/supply-chain.md
++++ b/docs/supply-chain.md
+@@ -1,41 +1,140 @@
+ # The supply chain, written down where a reviewer can argue with it
+ 
+-<!-- TODO: one paragraph on what this page is: a dependency is code somebody else wrote running in the
+-same process as this store, and the policy is three artifacts — `deny.toml` (the policy a tool runs),
+-this page (the policy a reviewer reads), `scripts/repro.sh` and `docs/build.md` (the half that is a
+-build) — plus the habit that a new dependency is a decision with a name on it. Say that the step's spec
+-reads this page and `deny.toml` and objects when they disagree. -->
++## What this page is
+ 
+-[TODO](TODO)
++A dependency is code somebody else wrote, running in the same process as this store, and "somebody
++else wrote it" is not a risk — ignoring that they did is. The supply-chain policy of this project is
++three artifacts and one habit:
++
++- [deny.toml](../deny.toml) is the policy as a **file a tool can run**. Its four sections are the four
++  questions below, and the file states each answer as data rather than as prose;
++- this page is the policy as **prose a reviewer reads**: what is pinned and where, what each section
++  refuses, what would make the policy a lie, and what is missing;
++- [scripts/repro.sh](../scripts/repro.sh) and [docs/build.md](build.md) are the half of the policy
++  that is a *build*: a pinned compiler, a locked dependency set, and two builds that agree byte for
++  byte;
++- the habit is that a new dependency is a decision with a name on it — a licence on a list, a
++  duplicate somebody skipped on purpose, a source somebody trusted — rather than a lockfile update
++  nobody read.
++
++The step's spec reads this page and `deny.toml` together and objects when they disagree: a page that
++promises a stricter policy than the file states, or a file that refuses something this page never
++mentions, is exactly the drift this pair exists to catch. So the two are written to be read side by
++side, and every list in the file is named here for that reason.
+ 
+ ## What is pinned, and where
+ 
+-<!-- TODO: a table — the compiler (the toolchain file and its channel), the dependency versions (the
+-committed lockfile plus `--locked`), the base images (the `ARG` defaults in the `Dockerfile`, resolved
+-against the local store), and the crate bytes (nothing; point at the gap below). Then one sentence on
+-why the builder image's own `RUST_VERSION` being the same channel matters. -->
++| what | where it is written | what it buys |
++| --- | --- | --- |
++| the compiler | [rust-toolchain.toml](../rust-toolchain.toml), `channel = "1.98.1"` | a build by a compiler somebody chose, and a `rustup` that installs the same one on the next machine |
++| the dependency versions | [Cargo.lock](../Cargo.lock), committed, plus `--locked` on every build | the versions this tree was tested with, and a cargo that refuses rather than re-resolving |
++| the base images | the `ARG` defaults in [Dockerfile](../Dockerfile), resolved against the local image store | a build that does not reach a registry for its bases, and a mirror-friendly name that a deployment can override |
++| the crate bytes | — nothing | see "What would make this a lie" below: the crates are fetched, not vendored |
++| the pipeline's own action | [.github/workflows/ci.yml](../.github/workflows/ci.yml), `actions/checkout@v4` | a runner that checks out this tree; pinned by tag, not by commit digest, which is a gap this page names rather than hides |
++
++The compiler row is worth one more sentence, because it is the row that a container step usually gets
++wrong: `rust:1.98-alpine` carries `RUST_VERSION=1.98.1`, the same channel the file names, so the
++binary built in the image and the binary built on this machine come from the same toolchain — the
++image is a base, not a second opinion about which Rust this project uses.
+ 
+ ## The four sections, and the sentence each one enforces
+ 
+-<!-- TODO: one paragraph per section of `deny.toml`, naming every key the file sets and the policy it
+-states: `[advisories]` and what a yanked release means, `[licenses]` and the exact list this lockfile
+-declares plus the one exception with its reason, `[bans]` and the four crates this lockfile holds twice
+-with where each came from, `[sources]` and the one registry. Say plainly that `cargo-deny` is not
+-installed here, so the file is judged as a file on this machine. -->
++`deny.toml` is written for [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny), which **is not
++installed on the machine this step was authored on** and is not a component of the pinned toolchain
++(`kiln doctor` says so). So on this machine the file is judged as a file, and one honest sentence
++belongs right here: **nobody has run this policy against this lockfile.** What keeps it from being
++decoration anyway is that its lists are read off the tree's own `Cargo.lock` with `cargo metadata`,
++and this page repeats them so that the two can be compared.
++
++**`[advisories]`** — the sentence: *a crate with a known advisory does not ship.* The database is
++RustSec's, named in `db-urls` (`https://github.com/rustsec/advisory-db`), and `yanked = "deny"` refuses a release that was pulled back — a
++version somebody withdrew is an advisory with the reason attached, and a lockfile that still names it
++is a lockfile nobody has looked at. `ignore` is empty on purpose: an entry there ships a known
++problem, and this policy's position is that the decision belongs in the pull request that needed it,
++with a reason and a date, not in a list nobody rereads. `version = 2` is the schema the file is
++written against.
++
++**`[licenses]`** — the sentence: *the tree is built from what this list allows, and something new is a
++decision.* `allow` is the exact set of licence families this lockfile declares — Apache-2.0,
++Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, MIT, `MIT/Apache-2.0` (the one legacy
++string in the list, which is what `scoped-tls` and `version_check` say rather than what they mean),
++Unicode-3.0 and Unlicense — and nothing else, so a dependency under a new licence fails the check
++instead of arriving unnoticed. `confidence-threshold = 0.93` is how sure the scanner has to be before
++it calls a file's licence that licence, and `version = 2` is again the schema. `private = { ignore =
++true }` says the policy is about what the tree *depends on*: this project is not published and states
++no licence of its own, and demanding a licence file from the workspace's own package would be a rule
++about publishing. `exceptions` holds exactly one crate, `r-efi`, and it is a copyleft one —
++LGPL-2.1-or-later — pulled in by `getrandom` for UEFI targets, which this project does not build for.
++It is an *exception with a name in it* rather than an entry in `allow`, and that distinction is the
++policy: `allow` would admit the next LGPL crate without anybody reading this paragraph.
++
++**`[bans]`** — the sentence: *two versions of one crate are two things to audit and one of them is
++usually forgotten, so a new duplicate fails the check.* `multiple-versions = "deny"` is that
++sentence, and this lockfile holds four crates twice, so each is in `skip` with its reason rather than
++exempted by a rule: `syn` (2.0.119 through `tracing-attributes` and `zerocopy-derive`, 3.0.6 through
++`serde_derive`, `thiserror-impl` and `tokio-macros`), `winnow` (0.7.15 through `toml`, 1.0.4 through
++`toml_parser`), `getrandom` (0.3.4 through `rand_core`, 0.4.3 through `jobserver`) and `r-efi` (5.3.0
++and 6.0.0, both through `getrandom`). A fifth duplicate — or one of these four arriving somewhere
++this file cannot see — is a failing check and a decision to make. `wildcards = "deny"` refuses a
++requirement like `serde = "*"`, because a wildcard makes the lockfile the only pin in a tree whose
++whole point is that the pin is written down. `deny` is empty: it is the "we know about this crate and
++took it anyway" list, and the two lists above are where a deliberate exception already goes.
++
++**`[sources]`** — the sentence: *a crate comes from crates.io, or the build stops.* `allow-registry`
++names exactly one index — `https://github.com/rust-lang/crates.io-index` — and all 92 registry
++entries in `Cargo.lock` come from it. `unknown-registry = "deny"` refuses a second one, and
++`unknown-git = "deny"` refuses a git dependency with the reason that matters for a lockfile: a commit
++is not a release, so a git dependency ships code nobody has published and nobody can audit by
++version. `allow-git` is empty, because this tree has no git dependency to trust.
+ 
+ ## What the pipeline runs, and why it is the same list
+ 
+-<!-- TODO: the four commands in order, why the toolchain is not named in the workflow, and why
+-`cargo deny check` is deliberately not a step (and where it would go when the tool is in the pin). -->
++[ci.yml](../.github/workflows/ci.yml) is four commands in the order the course's own CI runs them:
++`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
++`cargo test --workspace --locked`, and then `sh scripts/repro.sh`. The two commands that resolve the
++dependency graph pass `--locked`, so a pipeline cannot pass because it quietly resolved something
++newer than the lockfile this project committed. Formatting first because it fails in a second,
++lints second because they fail in a minute, tests third, and the reproducer last because it is two
++whole release builds. The toolchain is not named there: it is the row in the table above, and a second
++pin is a pin that disagrees eventually.
++
++`cargo deny check` is deliberately **not** a step, and this page is where that is written down rather
++than left as an absence: the tool is not in the pinned toolchain, so a step that ran it would be a
++check that passes on whichever laptop has it installed and fails on the runner. The command is named
++here in prose and not in a shell block for the same reason — this project cannot run it yet. When
++`cargo-deny` is a component of the channel, the check belongs in that file, between `clippy` and the
++tests.
+ 
+ ## What would make this policy a lie
+ 
+-<!-- TODO: the changes somebody could make without touching this page: an unpinned action, a floating
+-toolchain, a lockfile that is not committed or a build without `--locked`, an exception list entry
+-without its reason, and a licence list edited to fit a new dependency. -->
++Five things, each of them a change somebody could make without touching a line of this page:
++
++- **an unpinned action.** `actions/checkout@v4` follows a tag, and a tag is a pointer somebody else
++  can move — the commit digest is the pin, and this workflow does not use one. This is the one gap in
++  the table above that is a gap *today* rather than in principle, and it is named here instead of
++  being papered over with a digest nobody verified;
++- **a floating toolchain.** `channel = "stable"` would make every build a build of whatever the day's
++  Rust is, and the reproduction in `docs/build.md` would then be a comparison of two moments rather
++  than two directories;
++- **a `Cargo.lock` that is not committed, or a build without `--locked`.** Either one turns the
++  dependency pin into a story about a Tuesday afternoon: cargo resolves what the registry offers, and
++  two builds of one commit differ for a reason nothing in this repository records;
++- **a `skip`, `ignore` or `exceptions` entry added without its reason.** The three lists are the
++  policy's escape hatches; their whole value is that the reason sits next to the entry, in the file,
++  where the next reviewer reads it;
++- **a dependency added under a licence that is not on `allow`, with the list edited to fit.** The list
++  is the decision; editing it as a side effect of adding a crate is the drift this pair of files
++  exists to catch.
+ 
+ ## What `cargo-deny` would add, if it were installed
+ 
+-<!-- TODO: the four things — running the lists against the resolved graph, querying advisory data,
+-reporting the licences it cannot decide, and failing a build instead of describing one — and the honest
+-sentence about which half of this page is doing the work today. -->
++Four things, and the shape of the gap matters more than its size. It would **run the lists** — the
++allow-list, the four `skip` entries, the registry — against the resolved graph, including the packages
++that are in `Cargo.lock` for other targets and never compiled here, which is precisely the set a
++person reading this page forgets. It would **fetch and query advisory data**, the one input of this
++page that no amount of local reasoning can supply: RustSec's database is a network resource, and the
++advisory half of the file is therefore unverified on this machine in a way the other three sections
++are not. It would **report the licences it cannot decide**, which is where `confidence-threshold`
++stops being a number and becomes a list of files somebody has to read. And it would make the policy
++**fail a build** rather than describe one — the difference between a policy and a page. Until then this
++project has the page, the file, and an honest sentence about which of the two is doing the work.
+diff --git a/rust-toolchain.toml b/rust-toolchain.toml
+new file mode 100644
+index 0000000..cee5574
+--- /dev/null
++++ b/rust-toolchain.toml
+@@ -0,0 +1,20 @@
++# The compiler this project builds with, as a file rather than as a habit.
++#
++# `repo/toolchain-pinning@apply — mailer/1.2` established the file; this step keeps it in a second
++# project for the reason the whole step is about: **a build is reproducible only if the compiler is
++# one of its inputs**. `stable` is not an input — it is a pointer that moves once every six weeks,
++# and the day it moves this project builds with a Rust nobody wrote down. That is a difference no
++# comparison of two builds can see on the machine that moved, and it is the first of the three
++# differences this step's page names.
++#
++# `1.98.1` is the course's own pin, the same channel `rust:1.98-alpine` carries
++# (`RUST_VERSION=1.98.1` in that image), so the binary this machine builds and the binary the
++# Dockerfile builds are built by the same compiler unless somebody says otherwise on purpose.
++#
++# Two components, because two gates run them: `fmt` runs `rustfmt`, and `clippy@4` and `no-todo`
++# run `clippy`. A toolchain without them is a `cargo fmt` that fails on a machine nobody pinned.
++# `profile = "minimal"` keeps the rest out: a toolchain nobody installed is not a toolchain.
++[toolchain]
++channel = "1.98.1"
++components = ["rustfmt", "clippy"]
++profile = "minimal"
+diff --git a/scripts/repro.sh b/scripts/repro.sh
+index c71833f..ee8b8f7 100755
+--- a/scripts/repro.sh
++++ b/scripts/repro.sh
+@@ -1,23 +1,194 @@
+ #!/bin/sh
+-# The reproducer (step `lakelet/4.22-reproducible-build`) — the job, and the job not done.
+-#
+-# A build is reproducible when two builds of the same source are the same artifact. What this file has
+-# to become:
+-#
+-#   * copy this tree's sources into **two different directories** — different depths, so a difference
+-#     that is only the path shows up in the bytes;
+-#   * build each with the pinned toolchain (`rust-toolchain.toml`) and the locked dependencies
+-#     (`--locked`);
+-#   * neutralise the one difference two builds of one tree structurally have — *where* they happened —
+-#     with `--remap-path-prefix`, passed to both builds, over everything that names the location (the
+-#     copy of the tree *and* the target directory beside it);
+-#   * compare the library and the binaries byte for byte, and print the comparison as one
+-#     `name=value` line per fact: which artifacts, how many compared, how many identical, how many
+-#     differing, what happened to each named difference, and a verdict. Never a hash, a path or a
+-#     timestamp: a page quotes this output and compares it line for line.
+-#   * exit non-zero when something differs that the block does not name.
++# The reproducer: one tree, built twice in two different places, and the bytes compared.
++#
++# A build is reproducible when two builds of the same source are the same artifact, and that is a
++# claim about *inputs*: the compiler, the dependencies, the options, and the place the build
++# happens. This script is the half of the claim a machine can check. It copies this tree's sources
++# into two directories of deliberately different depth, builds each with the pinned toolchain and
++# the locked dependencies, and compares the files a release build produces.
++#
++# Three decisions, and each of them is why the output looks the way it does.
++#
++# 1. **Two different locations.** A build directory is not a neutral choice: a path is written into
++#    an artifact's metadata, so the copies live at `<work>/a/tree` and `<work>/b/deeper/tree` —
++#    different widths, so a difference that is *only* the path has to show up as a difference in
++#    bytes rather than being hidden by two paths that happen to be the same length.
++# 2. **`--remap-path-prefix`, passed to both builds.** Every name a build renders for its own
++#    location — the copy of the tree, the target directory it compiles into, the dependency rlibs
++#    it reads there — is renamed to the same `/build`, so neither build records *where* it happened.
++#    Both, and not just the source root: a remap over the sources alone leaves the target directory
++#    in the bytes, and `cargo` writes the paths of the rlibs it linked against into the library's
++#    metadata. Rule here: rename everything that names the location, in both builds, to one name.
++#    And rename the *resolved* location: a path that can be spelled two ways is two paths, which on
++#    Darwin is `/var/folders/…` and `/private/var/folders/…` — the same directory under two names.
++#    A root that is not canonicalised therefore produces two artifacts even with the flags, and the
++#    difference is a spelling rather than a build, so the work root below is resolved first.
++# 3. **Nothing that moves goes on stdout.** This block is what `docs/build.md` quotes and what the
++#    step's spec re-runs and compares line for line (handoff-m3 §1 rule 18). A digest would make
++#    the page stale the next time a crate moved; a path or a timestamp would make it different on
++#    the machine that reads it. So the block carries the *verdict and the names* — which artifacts,
++#    how many, how many identical, and what happened to the two differences two builds of one tree
++#    can have — and never a number that moves. Progress goes to stderr.
++#
++# What it does not do: it does not build an image (that is the `Dockerfile` and
++# `docs/supply-chain.md`), it does not compare the copies' mtimes (they differ and always will:
++# `difference_timestamp=mtimes_differ`), and it does not reach the network unless the crates are
++# not in the local registry already.
++#
++# How it is run: `sh scripts/repro.sh`. The file carries a `#!/bin/sh` line and is a command on any
++# machine where somebody has set the executable bit (`chmod +x`), but the step's files arrive as a
++# patch and this course's applier writes content rather than mode bits — so the pipeline, the page and
++# the step's spec all spell the interpreter out, which does the same thing with the bit and without
++# it. Nothing here needs a shell feature beyond POSIX `sh`.
++#
++# Two environment variables, for the step's own spec rather than for a reader:
++#
++#   LAKELET_REPRO_ROOT=/somewhere   where the two copies are built (default: $TMPDIR/lakelet-repro-$$)
++#   LAKELET_REPRO_KEEP=1            leave them there instead of removing them
++#
++# The layout under that root is part of the interface — `a/tree`, `b/deeper/tree`, one `target/`
++# beside each — because the spec looks at the artifacts this script says it compared, which is the
++# difference between a script that compares files and a script that prints a verdict.
+ set -eu
+ 
+-echo "repro: not written yet." >&2
+-echo "repro: the two builds, the comparison and the block are what this step is about." >&2
+-exit 1
++root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
++work=${LAKELET_REPRO_ROOT:-${TMPDIR:-/tmp}/lakelet-repro-$$}
++# Resolved, not as written: see decision 2 — a location reachable under two names is two locations,
++# and the remap below can only name the one this script builds in.
++mkdir -p "$work"
++work=$(CDPATH= cd -- "$work" && pwd -P)
++left=$work/a
++right=$work/b/deeper
++
++say() { printf '%s\n' "$*" >&2; }
++
++# Whether an artifact still names the directory it was built in: the one measurement that says
++# `--remap-path-prefix` did what decision 2 says it does.
++names_its_location() {
++    grep -a -q -F "$2" "$1" 2>/dev/null
++}
++
++# The modification time of a file, in seconds, on a BSD `stat` and on a GNU one.
++mtime() {
++    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '0'
++}
++
++# The files a build reads. Deliberately not the whole directory: a project that has been built once
++# carries its own `target/` — hundreds of megabytes of this machine's artifacts — and none of it is
++# an input to a build.
++copy_sources() {
++    mkdir -p "$1"
++    for file in Cargo.toml Cargo.lock rust-toolchain.toml; do
++        [ -f "$root/$file" ] || { say "$file is missing: a build needs it"; exit 2; }
++        cp "$root/$file" "$1/$file"
++    done
++    cp -R "$root/src" "$1/src"
++    [ -f "$root/rust-toolchain.toml" ] || { say "rust-toolchain.toml is missing: an unpinned \
++build is not the build this script compares"; exit 2; }
++}
++
++cleanup() {
++    if [ "${LAKELET_REPRO_KEEP:-0}" = "1" ]; then
++        say "the two trees are still under $work (LAKELET_REPRO_KEEP=1)"
++    else
++        rm -rf "$work"
++    fi
++}
++trap cleanup EXIT
++trap 'exit 130' INT TERM
++
++rm -rf "$work"
++copy_sources "$left/tree"
++copy_sources "$right/tree"
++
++# The pin, checked rather than assumed: the channel in the file has to be the compiler that is about
++# to run, or the comparison below is a comparison of two builds by a toolchain nobody chose. The
++# file sits *inside* each copy, so rustup picks it up for the builds this script starts.
++pin=$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/ {print $2; exit}' "$root/rust-toolchain.toml")
++[ -n "$pin" ] || { say "rust-toolchain.toml declares no channel: nothing here is pinned"; exit 2; }
++running=$( (cd "$left/tree" && cargo --version) | awk '{print $2}' )
++if [ "$pin" != "$running" ]; then
++    say "rust-toolchain.toml pins $pin and the compiler answering here is $running: the two builds \
++below would not be by the toolchain this project pinned (rustup installs it with \`rustup toolchain \
++install $pin\`)"
++    exit 2
++fi
++
++# One release build per copy. `--locked` is the dependency half of "the same inputs": cargo builds
++# the versions in `Cargo.lock` or refuses, and it never quietly updates one.
++build() {
++    say "building $1 ..."
++    ( cd "$1/tree" && \
++      CARGO_TARGET_DIR="$1/target" \
++      RUSTFLAGS="--remap-path-prefix=$1=/build" \
++      cargo build --release --locked 1>&2 )
++}
++
++build "$left"
++build "$right"
++
++# What gets compared: the library and every binary this tree builds, which is what a deployment
++# ships. Nothing else on the target directory is an artifact — fingerprints, `.d` files and the
++# incremental cache are this machine's bookkeeping.
++artifacts="lakeletd,lakeletq,lakelet-load,liblakelet.rlib"
++compared=0
++identical=0
++differing=0
++differing_names=""
++mtimes_differ=false
++for name in $(printf '%s' "$artifacts" | tr ',' ' '); do
++    x="$left/target/release/$name"
++    y="$right/target/release/$name"
++    if [ ! -f "$x" ] || [ ! -f "$y" ]; then
++        say "the build produced no \`$name\` on one side ($x, $y): there is nothing to compare"
++        exit 2
++    fi
++    compared=$((compared + 1))
++    if cmp -s "$x" "$y"; then
++        identical=$((identical + 1))
++    else
++        differing=$((differing + 1))
++        differing_names="${differing_names}${differing_names:+,}$name"
++        say "  $name differs"
++    fi
++    # The path half of the claim, checked instead of asserted: if an artifact names the directory it
++    # was built in, the remap did not do its work and this run proves nothing about the other side.
++    if names_its_location "$x" "$left" || names_its_location "$y" "$right"; then
++        say "  \`$name\` names the directory it was built in: the remap did not cover the build \
++location — either a prefix is missing, or the location was not resolved (a path reachable under two \
++names, like /var/folders and /private/var/folders on Darwin, is two locations) — so the comparison \
++above is not a comparison of two builds that do not record where they happened"
++        exit 2
++    fi
++    # The timestamp half: the two copies were written at different moments, and that is a difference
++    # this script does not remove and does not compare — the block says so rather than hiding it.
++    if [ "$(mtime "$x")" != "$(mtime "$y")" ]; then
++        mtimes_differ=true
++    fi
++done
++
++if [ "$differing" -eq 0 ]; then
++    verdict=reproducible
++else
++    verdict=differs
++fi
++
++printf 'toolchain=%s\n' "$pin"
++printf 'locked=true\n'
++printf 'builds=2\n'
++printf 'build_roots=differ\n'
++printf 'target_roots=differ\n'
++printf 'artifacts=%s\n' "$artifacts"
++printf 'artifacts_compared=%s\n' "$compared"
++printf 'artifacts_identical=%s\n' "$identical"
++printf 'artifacts_differing=%s\n' "$differing"
++printf 'difference_path=remapped\n'
++printf 'difference_timestamp=%s\n' "$([ "$mtimes_differ" = true ] && printf 'mtimes_differ' || printf 'mtimes_equal')"
++printf 'verdict=%s\n' "$verdict"
++
++if [ "$differing" -ne 0 ]; then
++    say "the two builds differ in $differing_names: name the difference (the path, the timestamp) \
++or fix the input that moved — a build whose bytes depend on something unnamed is the thing this \
++script exists to refuse"
++    exit 1
++fi
