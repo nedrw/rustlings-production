@@ -22,6 +22,7 @@ format_version = 1
 "spec/4.21/tiering.rs" = "sha256:beaa846a20b1893e1e3fed80b0b8c2a6222fb1b9db0be00d00121745f5a738a1"
 "spec/4.22/reproducible.rs" = "sha256:83fd3a8ac6be9be5f7e0ac2e4fd858d46592814a7ffd929becdcd7e6812b94e0"
 "spec/4.23/rotation.rs" = "sha256:b8a6b81317710fafeb6e8f502c3bbe32d85115256e5b5afd1b61dded05ea751b"
+"spec/4.24/runbook.rs" = "sha256:59d6df2427c3a7b818d7bc133216d348a2a4c47d6b3c30fd2a09efe5328ac54d"
 "spec/4.3/write_path.rs" = "sha256:370a7a0e3b7d75aeebd7dd6bfe3953e8567388eaeb0a3f03df1bf67afd57c635"
 "spec/4.4/wal_recovery.rs" = "sha256:381075965c01289a0dece3f816f3a5f0d5c13fa98620fbfd277f05d4fae14850"
 "spec/4.5/batch_writes.rs" = "sha256:a4a83d86080e534f1d87445002911e404fa85a0cf2979be2a6bd858a53630002"

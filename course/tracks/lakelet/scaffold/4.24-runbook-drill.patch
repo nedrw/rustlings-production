@@ -1,0 +1,2234 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+new file mode 100644
+index 0000000..c9c2ce8
+--- /dev/null
++++ b/docs/runbook.md
+@@ -0,0 +1,151 @@
++# The runbook: the procedure this deployment is operated by
++
++[TODO](TODO)
++
++This page is the procedure an operator follows, in this order: **8 stages**, each one a command of
++this deployment, the signal to watch while it runs, the state that says it worked, the way back, and
++who is told. `tests/runbook_harness.rs` is the instrument that reads this page, runs every command
++below against a store of its own, and makes every state; what a stage owes, which states it may
++name, and which programs its commands may start with are written down in that file's module docs.
++[the SLO page](slo.md) is the number each stage protects.
++
++## Symptoms
++
++What is noticed first, from the outside, and which stage below each one belongs to.
++
++- [TODO](TODO)
++
++## Signals
++
++The numbers this deployment publishes, and where they are read: the daemon's log lines
++(`queue drained`, `series ledger`, `store recovered`, `store write cost`, `connection closed`), the
++counters a harness prints, and the numbers a page of this project states.
++
++- [TODO](TODO)
++
++## Steps
++
++### 1. Read what this deployment says it is
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 2. Take a copy
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 3. Put the copy back somewhere that is not the store
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 4. Rehearse the procedure
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 5. Put a load shape on the live deployment
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 6. Read the bill the store is paying
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 7. Ask for the span that left the box
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++### 8. Retire a key
++
++- command:
++
++```sh
++[TODO](TODO)
++```
++
++- signal: [TODO](TODO)
++- state: [TODO](TODO)
++- rollback: [TODO](TODO)
++- audience: [TODO](TODO)
++
++## Verification
++
++The command that runs this whole page, and the report it prints:
++
++- `cargo test -p lakelet --test runbook_harness -- --nocapture`
++
++```text
++[TODO](TODO)
++```
++
++## Escalation
++
++What to hand over when a stage fails, and what not to change.
++
++- [TODO](TODO)
++
++## Where the code is
++
++- `tests/runbook_harness.rs` — the instrument: the reader, the checks, and the report.
++- [the SLO page](slo.md) — the numbers this procedure protects.
+diff --git a/docs/slo.md b/docs/slo.md
+new file mode 100644
+index 0000000..82815e9
+--- /dev/null
++++ b/docs/slo.md
+@@ -0,0 +1,24 @@
++# What this deployment promises, and what each number costs
++
++[TODO](TODO)
++
++## The numbers, and where each one comes from
++
++| the number | where it comes from | the stage that protects it | what breaks it |
++| --- | --- | --- | --- |
++| [TODO](TODO) | [TODO](TODO) | [TODO](TODO) | [TODO](TODO) |
++
++## The error budget
++
++In the units this deployment's failures are paid in — refusals counted, records lost, minutes to
++restore — spent against the numbers the table above carries.
++
++- [TODO](TODO)
++
++## What happens when a budget is spent
++
++- [TODO](TODO)
++
++## Where the numbers are kept true
++
++- [the runbook](runbook.md) — the procedure, stage by stage.
+diff --git a/tests/runbook_harness.rs b/tests/runbook_harness.rs
+new file mode 100644
+index 0000000..b345ade
+--- /dev/null
++++ b/tests/runbook_harness.rs
+@@ -0,0 +1,2041 @@
++//! The instrument `lakelet/4.24-runbook-drill` is judged by: it reads `docs/runbook.md`, parses it
++//! into stages, runs the command each stage names **against a live store**, and reports what each
++//! stage owed.
++//!
++//! This file is **course content**, like `tests/budget.rs` and `tests/soak.rs`: the step ships it,
++//! `kiln run` keeps it, and `kiln reset lakelet/4.24-runbook-drill` puts it back. Editing it edits
++//! the measurement rather than the thing it measures — the page is the deliverable.
++//!
++//! # The shape a page must have
++//!
++//! This is the whole contract between `docs/runbook.md` and this instrument, and it is a decision
++//! rather than a convention: a procedure an instrument can walk has to be *data*.
++//!
++//! * **a stage** is a `###` heading carrying a number and a title (`### 3. Put the copy back`), and
++//!   the stages run from `1.` upwards with no number repeated and none skipped. A `####` heading is
++//!   prose inside the stage it stands in, and a heading above `###` ends the last stage;
++//! * **a stage owes five parts** ([`PARTS`]), on the page, every one of them:
++//!   * the **command** — a fenced `sh` block inside the stage holding **one** command. A line
++//!     starting with `#` is a comment, a blank line separates nothing (the command is one), and a
++//!     command wrapped onto the next line is read as one command;
++//!   * the **signal** — the counter or the number an operator watches while this stage runs. Every
++//!     name it puts in backticks has to be something **this project really reports**: a field a
++//!     daemon logs, a counter a harness prints, a number a page states. A signal nobody reports is
++//!     a reader sent to a dashboard that does not exist;
++//!   * the **state** — the name of the check this instrument makes after the command ran
++//!     ([`CHECKS`]). "It looked fine" is not an assertion, and a stage whose state nobody can check
++//!     is a stage nobody finishes;
++//!   * the **rollback** — what puts the deployment back: a command of this deployment, `none` for
++//!     an act that cannot be undone, or `nothing was taken` for a stage that changes nothing.
++//!     Which of the three it is *is judged*: an act that writes the store cannot say nothing was
++//!     taken, and an act that changes nothing should not invent a way back;
++//!   * the **audience** — who is told, by role;
++//! * **a stage is written for an operator, not for a shell.** The command is one of the programs
++//!   this deployment ships ([`PROGRAMS`]) and its arguments, and this instrument runs the program
++//!   directly rather than handing the line to a shell: a stage cannot smuggle in a pipeline, and a
++//!   command nobody has is a finding rather than a process that does something else. The
++//!   deployment's own variables ([`VARS`]) are the paths of the world this instrument built;
++//! * the page's **first numeral is the number of stages**, and this instrument holds the page to
++//!   it: a procedure that says it has eight stages and writes nine is two documents.
++//!
++//! # What it runs, and what it checks
++//!
++//! [`drill`] builds **a store of its own** through the real write path — payloads through `Spool`,
++//! a segment per batch through `Segments::seal` — starts `lakeletd` on it where a stage needs a
++//! live deployment, and walks the page's stages **in the page's order**: it runs each stage's
++//! command as the program it names and then makes that stage's check. The world is the deployment
++//! the page is written for: one store of two sealed segments, the eight series this project's own
++//! load generator spreads over, and a key ring with two keys on it.
++//!
++//! Nothing here reads a clock, and nothing here prints a path: the report is counts, stage numbers,
++//! the commands **as the page writes them** and verdicts, so the block `docs/runbook.md` quotes is
++//! the same bytes on every machine — and `lakelet/4.19-backup-restore`'s rule for its own page
++//! holds here: the numbers a page carries are re-run rather than trusted.
++//!
++//! # A gap is a finding, never a panic
++//!
++//! Every obligation this file finds is a [`Gap`] carrying the stage, the part and one sentence:
++//! a part a stage does not name, a command this deployment does not ship, a signal nobody reports,
++//! a state that is not a check, a rollback that is not a command, a command that exits non-zero.
++//! The reader is callable **on text** ([`Runbook::of`] takes a page from anywhere) because the spec
++//! that judges the reader has to hand it pages this file wrote.
++//!
++//! # Two ways to use it
++//!
++//! * `cargo test -p lakelet --test runbook_harness -- --nocapture` runs [`the_runbook_page_holds`]
++//!   and prints the report;
++//! * the same functions are what `course/tracks/lakelet/spec/4.24/runbook.rs` calls, through
++//!   `#[path = "runbook_harness.rs"] mod harness;` — the spec reaches the instrument instead of
++//!   writing a second one, which is what keeps one answer to "is this page runnable".
++
++#![allow(dead_code)] // a spec uses the part of the instrument it needs, not all of it
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::fmt;
++use std::io::{BufRead, BufReader, Read};
++use std::path::{Path, PathBuf};
++use std::process::{Child, Command, Stdio};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use std::time::{Duration, Instant};
++
++use lakelet::engine::Spool;
++use lakelet::engine::backup::manifest::{self, Kind};
++use lakelet::engine::cardinality::{Cap, Registry};
++use lakelet::engine::compaction::Segments;
++use lakelet::engine::soak::Live;
++use lakelet::engine::tier::{self, Policy as Cold, filesystem};
++use lakelet::engine::wal::replay;
++use lakelet::protocol::batch::{self, Record};
++use lakelet::service::keys::{self, KeyId, KeyRing, Window};
++
++/// The page this step delivers, relative to the project.
++pub const PAGE: &str = "docs/runbook.md";
++
++/// The five parts a stage owes, in the order a page writes them.
++///
++/// `command` is not written as a line: it is the stage's fenced `sh` block. The other four are
++/// `- name: …` lines, because a responder under pressure reads a column rather than a paragraph.
++pub const PARTS: [&str; 5] = ["command", "signal", "state", "rollback", "audience"];
++
++/// The programs this deployment ships: what a stage's command has to start with.
++pub const PROGRAMS: [&str; 3] = ["lakeletd", "lakeletq", "lakelet-load"];
++
++/// Where each program's own grammar is written down: the usage text it prints for itself.
++///
++/// A command is a member of this deployment's grammar when its program is one of [`PROGRAMS`],
++/// its verb is a word that program declares, and every flag it carries is one too. The words are
++/// read out of the program's own source rather than listed here, so a step that teaches a new verb
++/// teaches the page about it in the same edit — and a plausible-looking command
++/// (`lakeletq tier sweep …`, a flag with a typo) is a finding rather than a process that does
++/// something else.
++pub const GRAMMAR: [(&str, &str); 3] = [
++    ("lakeletd", "src/bin/lakeletd.rs"),
++    ("lakeletq", "src/cli/mod.rs"),
++    ("lakelet-load", "src/bin/lakelet-load.rs"),
++];
++
++/// The variables a page may use, and the world this instrument points them at.
++pub const VARS: [&str; 4] = [
++    "LAKELET_STORE",
++    "LAKELET_COPY",
++    "LAKELET_RESTORED",
++    "LAKELET_ADDR",
++];
++
++/// The word a rollback uses for a stage that changes nothing.
++pub const NOTHING_TAKEN: &str = "nothing was taken";
++
++/// The word a rollback uses for an act that cannot be undone.
++pub const NOT_UNDONE: &str = "none";
++
++/// The prefix every line of the report carries: the track and the page it is about.
++pub const PREFIX: &str = "lakelet-runbook";
++
++/// One thing a stage has to say before this instrument can run it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Check {
++    /// The name a page's `state` line carries.
++    pub name: &'static str,
++    /// The words the stage's command has to carry for this check to be about that act.
++    pub act: &'static [&'static str],
++    /// Whether the act writes something the deployment serves.
++    ///
++    /// `true` means the stage's rollback may not say that nothing was taken: an operator who put
++    /// records on the store has something to put back.
++    pub takes: bool,
++}
++
++/// The checks this instrument makes, in the order a procedure meets them.
++pub const CHECKS: [Check; 8] = [
++    Check {
++        name: "settings-print",
++        act: &["lakeletd", "--check-config"],
++        takes: false,
++    },
++    Check {
++        name: "copy-holds-the-store",
++        act: &["lakeletq", "backup"],
++        takes: false,
++    },
++    Check {
++        name: "restore-holds-the-records",
++        act: &["lakeletq", "restore"],
++        takes: false,
++    },
++    Check {
++        name: "drill-agrees",
++        act: &["lakeletq", "drill"],
++        takes: false,
++    },
++    Check {
++        name: "counters-flat",
++        act: &["lakelet-load"],
++        takes: true,
++    },
++    Check {
++        name: "bill-adds-up",
++        act: &["lakeletq", "inspect", "series"],
++        takes: false,
++    },
++    Check {
++        name: "cold-span-answered",
++        act: &["lakeletq", "query"],
++        takes: false,
++    },
++    Check {
++        name: "window-respected",
++        act: &["lakeletq", "rotate", "--retire"],
++        takes: true,
++    },
++];
++
++/// The first instant the world's records are stamped at: 2023-11-14T22:13:20Z, a round number.
++const BASE: u64 = 1_700_000_000_000;
++
++/// How far apart two of the world's records are.
++const STEP: u64 = 1_000;
++
++/// How many series the world's records — and this project's own load generator — spread over.
++const SERIES: usize = 8;
++
++/// How many records one sealed segment of the world's store holds.
++const PER_SEGMENT: usize = 128;
++
++/// How many segments the world's store is opened with: two, so a cold one has a neighbour.
++const SEGMENTS: usize = 2;
++
++/// How wide the window the cold-span stage asks about is.
++const WINDOW_MILLIS: u64 = 60_000;
++
++/// How old a segment has to be before the tier takes it.
++const COLD_AFTER_MILLIS: u64 = 60_000;
++
++/// The instant the world's sweep runs at, chosen so the first segment is cold and the second is
++/// not: `BASE + 200_000` is past the first segment's last record plus the policy's age.
++const SWEEP_AT: u64 = BASE + 200_000;
++
++/// The first instant the world's older key may sign at.
++const OLD_KEY_FROM: u64 = 1_700_000_000_000;
++
++/// The first instant the world's newer key may sign at: an hour later, which is the successor an
++/// operator adds before retiring anything.
++const NEW_KEY_FROM: u64 = 1_700_003_600_000;
++
++/// The name of the world's older key.
++const OLD_KEY: &str = "sunset";
++
++/// The name of the world's newer key, and the one the ring signs with.
++const NEW_KEY: &str = "sunrise";
++
++/// The worlds' key material.
++///
++/// Example material and nothing else: this instrument builds a store of its own on the machine that
++/// runs the suite, and a key that never leaves it is not a secret anybody has to keep. A deployment
++/// supplies its own (`openssl rand -hex 32`), and `docs/rotation.md` says so next to the command.
++const EXAMPLE_SECRET: &str = "9f2b0c1d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e";
++
++/// How long a daemon is given to say where it listens, or to exit after being asked to stop.
++const DEADLINE: Duration = Duration::from_secs(30);
++
++/// How often a waiting drill looks again.
++const RETRY: Duration = Duration::from_millis(20);
++
++/// One obligation a stage did not meet: where, which part, and one sentence.
++///
++/// `number` is `0` for a finding about the page as a whole, which is how a placeholder and a stage
++/// count that disagrees with the stages are reported.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Gap {
++    number: u32,
++    part: String,
++    said: String,
++}
++
++impl Gap {
++    /// A finding about stage `number`'s `part`.
++    fn of(number: u32, part: &str, said: impl Into<String>) -> Self {
++        Self {
++            number,
++            part: part.to_owned(),
++            said: said.into(),
++        }
++    }
++
++    /// The stage it is about, or `0` for the page as a whole.
++    #[must_use]
++    pub fn number(&self) -> u32 {
++        self.number
++    }
++
++    /// The part it is about: one of [`PARTS`], `number` for a stage out of place, `page` for the
++    /// document, or the name of the check whose assertion failed.
++    #[must_use]
++    pub fn part(&self) -> &str {
++        &self.part
++    }
++
++    /// The sentence a reader acts on.
++    #[must_use]
++    pub fn said(&self) -> &str {
++        &self.said
++    }
++}
++
++impl fmt::Display for Gap {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if self.number == 0 {
++            write!(formatter, "{}: {}", self.part, self.said)
++        } else {
++            write!(
++                formatter,
++                "stage {} does not meet `{}`: {}",
++                self.number, self.part, self.said
++            )
++        }
++    }
++}
++
++/// One stage of a page: where it stands, what it is about, and what it says.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Stage {
++    number: u32,
++    title: String,
++    command: Option<String>,
++    answers: BTreeMap<String, String>,
++}
++
++impl Stage {
++    /// The place this stage holds in the procedure.
++    #[must_use]
++    pub fn number(&self) -> u32 {
++        self.number
++    }
++
++    /// What the stage is about, from its heading.
++    #[must_use]
++    pub fn title(&self) -> &str {
++        &self.title
++    }
++
++    /// The command, as the page writes it: one line, comments and wrapping removed.
++    #[must_use]
++    pub fn command(&self) -> Option<&str> {
++        self.command.as_deref()
++    }
++
++    /// What this stage says about `part`, or `None` when it says nothing.
++    ///
++    /// All five parts answer through here, the command included — a stage's command is not written
++    /// as a line, and a caller that had to remember which of five parts is the odd one would get it
++    /// wrong once and read a stage as incomplete.
++    #[must_use]
++    pub fn answer(&self, part: &str) -> Option<&str> {
++        if part == "command" {
++            return self.command();
++        }
++        self.answers.get(part).map(String::as_str)
++    }
++
++    /// The first name in backticks where the page's `signal` says what to watch.
++    ///
++    /// It is what the report prints for the stage: the number an operator's eyes are on. `None`
++    /// when the stage names no signal at all.
++    #[must_use]
++    pub fn signal(&self) -> Option<String> {
++        self.answer("signal")
++            .and_then(|answer| backticked(answer).first().map(|name| (*name).to_owned()))
++    }
++
++    /// The check this stage's `state` names, when it names one this instrument knows.
++    #[must_use]
++    pub fn check(&self) -> Option<Check> {
++        let answer = self.answer("state")?;
++        let first = unbacktick(answer);
++        let first = first.split_whitespace().next()?;
++        CHECKS.iter().copied().find(|check| check.name == first)
++    }
++
++    /// What the page says its rollback is, once it is a rollback this instrument understands.
++    #[must_use]
++    pub fn rollback(&self) -> Rollback {
++        let Some(answer) = self.answer("rollback") else {
++            return Rollback::Unnamed;
++        };
++        let Some(first) = tokens(answer).into_iter().next() else {
++            return Rollback::Unnamed;
++        };
++        if first == NOT_UNDONE {
++            return Rollback::Undone;
++        }
++        if answer.to_lowercase().contains(NOTHING_TAKEN) {
++            return Rollback::Reads;
++        }
++        if PROGRAMS.contains(&first.as_str()) {
++            return Rollback::Command(answer.trim().to_owned());
++        }
++        Rollback::Unnamed
++    }
++}
++
++/// What a page says puts the deployment back.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Rollback {
++    /// A command of this deployment.
++    Command(String),
++    /// The act cannot be undone, and the page says so in the word for it.
++    Undone,
++    /// The stage changes nothing, and the page says so.
++    Reads,
++    /// The page says something this instrument cannot act on.
++    Unnamed,
++}
++
++impl Rollback {
++    /// The word the report prints for it.
++    #[must_use]
++    pub fn word(&self) -> &'static str {
++        match self {
++            Self::Command(_) => "command",
++            Self::Undone => "none",
++            Self::Reads => "read",
++            Self::Unnamed => "unnamed",
++        }
++    }
++}
++
++/// A page, read as a procedure.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Runbook {
++    stages: Vec<Stage>,
++    /// The first numeral the page carries, which has to be the number of stages.
++    claim: Option<u64>,
++    /// The placeholders the page still carries, lowercased.
++    placeholders: Vec<String>,
++}
++
++impl Runbook {
++    /// Read a page: the stages, what each one says, and the count it claims.
++    #[must_use]
++    pub fn of(page: &str) -> Self {
++        let mut stages: Vec<Stage> = Vec::new();
++        let mut current: Option<Stage> = None;
++        let mut fence: Option<String> = None;
++        let mut fence_lines: Vec<String> = Vec::new();
++        for line in page.lines() {
++            if fence.is_none() {
++                if let Some(info) = fence_open(line) {
++                    fence = Some(info);
++                    fence_lines.clear();
++                    continue;
++                }
++            } else {
++                if line.trim_start().starts_with("```") {
++                    // The block ends. A fenced `sh` block is the stage's command; every other
++                    // fence is a block a reader copies — a report, a table, a log line.
++                    if fence.as_deref() == Some("sh")
++                        && let Some(stage) = current.as_mut()
++                        && stage.command.is_none()
++                    {
++                        stage.command = Some(joined(&fence_lines));
++                    }
++                    fence = None;
++                    fence_lines.clear();
++                } else {
++                    fence_lines.push(line.to_owned());
++                }
++                continue;
++            }
++            if let Some((number, title)) = heading(line) {
++                stages.extend(current.take());
++                current = Some(Stage {
++                    number,
++                    title,
++                    command: None,
++                    answers: BTreeMap::new(),
++                });
++                continue;
++            }
++            if heading_ends_a_stage(line) {
++                stages.extend(current.take());
++                continue;
++            }
++            if let Some(stage) = current.as_mut()
++                && let Some((name, answer)) = part(line)
++            {
++                stage.answers.insert(name.to_owned(), answer.to_owned());
++            }
++        }
++        stages.extend(current.take());
++        let lowered = page.to_lowercase();
++        let placeholders = ["todo", "tbd", "fixme", "placeholder"]
++            .into_iter()
++            .filter(|word| lowered.contains(word))
++            .map(str::to_owned)
++            .collect();
++        Self {
++            claim: first_numeral(page),
++            stages,
++            placeholders,
++        }
++    }
++
++    /// The stages, in the order the page writes them.
++    #[must_use]
++    pub fn stages(&self) -> &[Stage] {
++        &self.stages
++    }
++
++    /// The number of stages the page's opening claims, when it claims one.
++    #[must_use]
++    pub fn claim(&self) -> Option<u64> {
++        self.claim
++    }
++
++    /// Every obligation the page does not meet, judged against `project`'s own files.
++    ///
++    /// The project is read for one thing: the names a stage's signal puts in backticks have to be
++    /// something this tree reports somewhere — a source under `src/` or `tests/`, or a page under
++    /// `docs/`. Everything else here is the page's own text.
++    #[must_use]
++    pub fn gaps(&self, project: &Path) -> Vec<Gap> {
++        let reported = Corpus::of(project);
++        let grammar = Grammar::of(project);
++        let mut gaps = Vec::new();
++        if !self.placeholders.is_empty() {
++            gaps.push(Gap::of(
++                0,
++                "page",
++                format!(
++                    "`{PAGE}` still says {}(s): a page with a blank in it is a page nobody has \
++                     written down, and the number between the placeholders is what the drill is \
++                     for",
++                    self.placeholders
++                        .iter()
++                        .map(|word| format!("`{word}`"))
++                        .collect::<Vec<_>>()
++                        .join(", ")
++                ),
++            ));
++        }
++        if let Some(claim) = self.claim
++            && claim != self.stages.len() as u64
++        {
++            gaps.push(Gap::of(
++                0,
++                "page",
++                format!(
++                    "the page's opening claims {claim} stage(s) and writes {}: the count a reader \
++                     is given is the first thing they check this document against",
++                    self.stages.len()
++                ),
++            ));
++        }
++        for (index, stage) in self.stages.iter().enumerate() {
++            gaps.extend(number_gaps(stage, index));
++            gaps.extend(command_gaps(stage, &grammar));
++            for part in ["signal", "state", "rollback", "audience"] {
++                match stage.answer(part) {
++                    None => gaps.push(Gap::of(stage.number, part, owes(part))),
++                    Some(answer) if answer.trim().is_empty() => gaps.push(Gap::of(
++                        stage.number,
++                        part,
++                        format!("this stage names its `{part}` and answers nothing"),
++                    )),
++                    Some(_) => {}
++                }
++            }
++            if let Some(signal) = stage.answer("signal") {
++                let names = backticked(signal);
++                if names.is_empty() {
++                    gaps.push(Gap::of(
++                        stage.number,
++                        "signal",
++                        "the signal names nothing: the counter or the number an operator watches \
++                         goes in backticks, or nobody knows what to look at",
++                    ));
++                }
++                for name in names {
++                    if !reported.holds(name) {
++                        gaps.push(Gap::of(
++                            stage.number,
++                            "signal",
++                            format!(
++                                "`{name}` is a signal nothing in this project reports: no source \
++                                 under `src/` or `tests/`, and no page under `docs/`, writes that \
++                                 name down"
++                            ),
++                        ));
++                    }
++                }
++            }
++            gaps.extend(rollback_gaps(stage));
++            gaps.extend(state_gaps(stage));
++        }
++        gaps
++    }
++}
++
++/// What a part is for, in the sentence a stage that forgot it is answered with.
++fn owes(part: &str) -> &'static str {
++    match part {
++        "command" => {
++            "the command is the one part of a stage that cannot be a sentence, and it is a fenced \
++             `sh` block"
++        }
++        "signal" => {
++            "an operator watching this stage needs a number to watch, and this deployment reports \
++             every number it has"
++        }
++        "state" => "the state is the check this instrument makes, from the list `CHECKS` names",
++        "rollback" => {
++            "the column a responder reads while the incident is still happening: a command of this \
++             deployment, `none`, or `nothing was taken`"
++        }
++        _ => "who is told, by role: a stage nobody is told about is an act taken in private",
++    }
++}
++
++/// A stage that does not hold the place its number says.
++fn number_gaps(stage: &Stage, index: usize) -> Vec<Gap> {
++    if stage.number as usize == index + 1 {
++        return Vec::new();
++    }
++    vec![Gap::of(
++        stage.number,
++        "number",
++        format!(
++            "this stage claims {} and holds place {}: a procedure is followed in the page's order, \
++             and its numbers are what a reader uses to say where they are",
++            stage.number,
++            index + 1
++        ),
++    )]
++}
++
++/// A stage whose command is not one this deployment ships.
++fn command_gaps(stage: &Stage, grammar: &Grammar) -> Vec<Gap> {
++    let number = stage.number;
++    let Some(command) = stage.command() else {
++        return vec![Gap::of(number, "command", owes("command"))];
++    };
++    let words = tokens(command);
++    let mut gaps = Vec::new();
++    match words.first() {
++        None => gaps.push(Gap::of(
++            number,
++            "command",
++            "the stage's `sh` block holds no command at all",
++        )),
++        Some(program) if !PROGRAMS.contains(&program.as_str()) => gaps.push(Gap::of(
++            number,
++            "command",
++            format!(
++                "`{program}` is not a program this deployment ships: its programs are {}, and a \
++                 runbook naming a command this project does not have is a procedure about an \
++                 imagined deployment",
++                PROGRAMS.join(", ")
++            ),
++        )),
++        Some(program) => {
++            // What the program declares for itself: its verbs, up to the first flag, and every
++            // flag the command carries. A value a flag takes is the operator's (a path, an id, a
++            // millisecond), so it is the words this deployment chose that are held to the grammar.
++            let declared: Vec<&str> = words[1..]
++                .iter()
++                .take_while(|word| !word.starts_with('-'))
++                .map(String::as_str)
++                .chain(
++                    words[1..]
++                        .iter()
++                        .filter(|word| word.starts_with('-'))
++                        .map(String::as_str),
++                )
++                .collect();
++            for word in declared {
++                if !grammar.declares(program, word) {
++                    gaps.push(Gap::of(
++                        number,
++                        "command",
++                        format!(
++                            "`{word}` is not part of `{program}`'s grammar: this deployment's \
++                             programs declare what they take, and a runbook that names a verb or a \
++                             flag nobody has is a stage that cannot be taken"
++                        ),
++                    ));
++                }
++            }
++        }
++    }
++    for word in &words {
++        let Some(name) = word.strip_prefix('$') else {
++            continue;
++        };
++        let name = name
++            .split(|byte: char| !byte.is_ascii_alphanumeric() && byte != '_')
++            .next()
++            .unwrap_or_default();
++        if !VARS.contains(&name) {
++            gaps.push(Gap::of(
++                number,
++                "command",
++                format!(
++                    "`${name}` is not a variable this instrument sets: it points {} at the world \
++                     it built, and a command that needs anything else cannot be run",
++                    VARS.join(", ")
++                ),
++            ));
++        }
++    }
++    gaps
++}
++
++/// A stage whose rollback is not one this instrument can act on, or is the wrong one.
++fn rollback_gaps(stage: &Stage) -> Vec<Gap> {
++    if stage
++        .answer("rollback")
++        .is_none_or(|answer| answer.trim().is_empty())
++    {
++        // The missing part is reported where every missing part is; this is about a rollback that
++        // is written and is not one this instrument can act on.
++        return Vec::new();
++    }
++    match (stage.rollback(), stage.check().map(|check| check.takes)) {
++        (Rollback::Unnamed, _) => vec![Gap::of(
++            stage.number,
++            "rollback",
++            format!(
++                "this stage's rollback is not a command of this deployment, not `{NOT_UNDONE}` for \
++                 an act that cannot be undone, and does not say `{NOTHING_TAKEN}`: a responder \
++                 reads that column before they act, not after"
++            ),
++        )],
++        (Rollback::Reads, Some(true)) => vec![Gap::of(
++            stage.number,
++            "rollback",
++            "this stage's command writes what the deployment serves, so its rollback cannot be that \
++             nothing was taken: an act that takes something says how it goes back, or says that it \
++             cannot",
++        )],
++        _ => Vec::new(),
++    }
++}
++
++/// A stage whose state is not the check of the act beside it.
++fn state_gaps(stage: &Stage) -> Vec<Gap> {
++    let Some(answer) = stage.answer("state") else {
++        return Vec::new();
++    };
++    let first = unbacktick(answer);
++    let first = first
++        .split_whitespace()
++        .next()
++        .unwrap_or_default()
++        .to_owned();
++    let Some(check) = CHECKS.iter().find(|check| check.name == first) else {
++        return vec![Gap::of(
++            stage.number,
++            "state",
++            format!(
++                "`{first}` is not a check this instrument makes: the states it knows are {}, and \
++                 one of them is what tells an operator the stage is over",
++                CHECKS
++                    .iter()
++                    .map(|check| check.name)
++                    .collect::<Vec<_>>()
++                    .join(", ")
++            ),
++        )];
++    };
++    let Some(command) = stage.command() else {
++        return Vec::new();
++    };
++    let words = tokens(command);
++    let missing: Vec<&str> = check
++        .act
++        .iter()
++        .copied()
++        .filter(|word| !words.iter().any(|token| token == word))
++        .collect();
++    if missing.is_empty() {
++        return Vec::new();
++    }
++    vec![Gap::of(
++        stage.number,
++        "state",
++        format!(
++            "`{}` is the check for `{}`, and this stage runs `{command}`: a state that is not the \
++             check of the act it stands beside proves nothing about the stage",
++            check.name,
++            check.act.join(" ")
++        ),
++    )]
++}
++
++/// The names between backticks, in the order they are written.
++fn backticked(text: &str) -> Vec<&str> {
++    let mut names = Vec::new();
++    let mut rest = text;
++    while let Some(open) = rest.find('`') {
++        let after = &rest[open + 1..];
++        let Some(close) = after.find('`') else {
++            break;
++        };
++        let name = &after[..close];
++        if !name.is_empty() {
++            names.push(name);
++        }
++        rest = &after[close + 1..];
++    }
++    names
++}
++
++/// The text with the backticks taken out, so a name can be read as a word.
++fn unbacktick(text: &str) -> String {
++    text.chars().filter(|byte| *byte != '`').collect()
++}
++
++/// One command's words: its program and its arguments, backticks removed.
++fn tokens(text: &str) -> Vec<String> {
++    unbacktick(text)
++        .split_whitespace()
++        .map(str::to_owned)
++        .collect()
++}
++
++/// The heading of a stage, or `None` when the line is not one.
++fn heading(line: &str) -> Option<(u32, String)> {
++    let text = line.trim_start();
++    let rest = text.strip_prefix("### ")?;
++    if rest.starts_with('#') {
++        return None;
++    }
++    let (number, title) = rest.split_once('.')?;
++    let number = number.trim().parse().ok()?;
++    let title = title.trim();
++    if title.is_empty() {
++        return None;
++    }
++    Some((number, title.to_owned()))
++}
++
++/// Whether a heading ends the stage it stands after.
++fn heading_ends_a_stage(line: &str) -> bool {
++    let text = line.trim_start();
++    text.starts_with("# ") || text.starts_with("## ")
++}
++
++/// The info string of a fence that opens, or `None` when the line is not one.
++fn fence_open(line: &str) -> Option<String> {
++    let text = line.trim_start();
++    let rest = text.strip_prefix("```")?;
++    if rest.starts_with('`') {
++        return None;
++    }
++    Some(rest.trim().to_owned())
++}
++
++/// One part of a stage, or `None` when the line is prose.
++fn part(line: &str) -> Option<(&str, &str)> {
++    let text = line.trim_start();
++    let rest = text.strip_prefix("- ")?;
++    let (name, answer) = rest.split_once(':')?;
++    if !PARTS.contains(&name.trim()) {
++        return None;
++    }
++    Some((name.trim(), answer.trim()))
++}
++
++/// One command out of a fenced block: comments and blank lines dropped, wrapping joined.
++fn joined(lines: &[String]) -> String {
++    lines
++        .iter()
++        .map(|line| line.trim())
++        .filter(|line| !line.is_empty() && !line.starts_with('#'))
++        .collect::<Vec<_>>()
++        .join(" ")
++}
++
++/// The first numeral a page carries, which its opening claims is the number of stages.
++fn first_numeral(page: &str) -> Option<u64> {
++    let mut digits = String::new();
++    for byte in page.chars() {
++        if byte.is_ascii_digit() {
++            digits.push(byte);
++        } else if !digits.is_empty() {
++            break;
++        }
++    }
++    digits.parse().ok()
++}
++
++/// The project's own words: every source and page, read once into one haystack.
++///
++/// A signal is held against *this* and nothing else: a name an operator watches is a name some file
++/// in this tree writes down, which is the difference between a procedure and a hope.
++struct Corpus {
++    text: String,
++}
++
++impl Corpus {
++    /// Read every `.rs` under `src/` and `tests/`, and every `.md` under `docs/`.
++    ///
++    /// The spec targets are skipped: a `tests/spec_*.rs` is the course's own file, copied into the
++    /// project by `kiln run`, and it is not something the deployment reports. A case that hands the
++    /// reader a page naming a signal nobody has would otherwise be answered by the case's own
++    /// source naming it.
++    fn of(project: &Path) -> Self {
++        let mut text = String::new();
++        for directory in ["src", "tests", "docs"] {
++            let extension = if directory == "docs" { "md" } else { "rs" };
++            collect(&project.join(directory), extension, &mut text);
++        }
++        Self { text }
++    }
++
++    /// Whether the project writes this name down anywhere.
++    fn holds(&self, name: &str) -> bool {
++        !name.is_empty() && self.text.contains(name)
++    }
++}
++
++/// The words each program declares for itself, keyed by the program's name.
++struct Grammar {
++    words: BTreeMap<&'static str, String>,
++}
++
++impl Grammar {
++    /// Read the three usage texts.
++    fn of(project: &Path) -> Self {
++        let mut words = BTreeMap::new();
++        for (program, source) in GRAMMAR {
++            let text = std::fs::read_to_string(project.join(source)).unwrap_or_default();
++            words.insert(program, text);
++        }
++        Self { words }
++    }
++
++    /// Whether `program` declares this word.
++    fn declares(&self, program: &str, word: &str) -> bool {
++        self.words
++            .get(program)
++            .is_some_and(|text| text.contains(word))
++    }
++}
++
++/// Every file below `directory` whose extension is `extension`, appended to `text`.
++fn collect(directory: &Path, extension: &str, text: &mut String) {
++    let Ok(entries) = std::fs::read_dir(directory) else {
++        return;
++    };
++    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
++    paths.sort();
++    for path in paths {
++        if path.is_dir() {
++            collect(&path, extension, text);
++        } else if path.extension().is_some_and(|found| found == extension) {
++            let name = path.file_name().unwrap_or_default().to_string_lossy();
++            if name.starts_with("spec_") {
++                continue;
++            }
++            if let Ok(read) = std::fs::read_to_string(&path) {
++                text.push_str(&read);
++                text.push('\n');
++            }
++        }
++    }
++}
++
++/// A directory under the system's temporary directory that belongs to this instrument.
++///
++/// The fixture the project's specs share (`tests/support/**`) is the learner's own code, and this
++/// instrument does not use it: a page is judged by a course file, and a course file that leaned on
++/// code a learner may rewrite would measure whatever that code became. This is the whole of what a
++/// drill needs from a filesystem — a directory nobody else has, named after the process that owns
++/// it and removed when the drill ends.
++#[derive(Debug)]
++pub struct Dir {
++    path: PathBuf,
++}
++
++impl Dir {
++    /// Claim a directory for `label`.
++    #[must_use]
++    pub fn new(label: &str) -> Self {
++        let path = std::env::temp_dir().join(format!("lakelet-{label}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path)
++            .unwrap_or_else(|error| panic!("{} cannot be created: {error}", path.display()));
++        Self { path }
++    }
++
++    /// Where it lives.
++    #[must_use]
++    pub fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.path);
++    }
++}
++
++/// One run of a real binary: what a script would have seen.
++#[derive(Debug, Clone)]
++pub struct Ran {
++    code: i32,
++    stdout: String,
++    stderr: String,
++}
++
++impl Ran {
++    /// What the program exited with.
++    #[must_use]
++    pub fn code(&self) -> i32 {
++        self.code
++    }
++
++    /// What it printed as its answer.
++    #[must_use]
++    pub fn stdout(&self) -> &str {
++        &self.stdout
++    }
++
++    /// What it printed as its diagnosis.
++    #[must_use]
++    pub fn stderr(&self) -> &str {
++        &self.stderr
++    }
++}
++
++/// The daemon the world's live stages run against: a process, its port, and its lines.
++struct Daemon {
++    child: Child,
++    lines: Arc<Mutex<Vec<String>>>,
++    address: String,
++}
++
++impl Daemon {
++    /// Start `lakeletd` on `store`, on a port the kernel picks.
++    ///
++    /// Port `0` on purpose: a port picked by binding and closing races every other suite on the
++    /// machine, and the child is the one that knows what it got. The log format is pinned to
++    /// `text` because the stages watch fields out of those lines.
++    fn start(store: &Path) -> Result<Self, String> {
++        let store = store.display().to_string();
++        let mut child = Command::new(env!("CARGO_BIN_EXE_lakeletd"))
++            .args(["--listen-addr", "127.0.0.1:0", "--store-dir", &store])
++            .env_clear()
++            .env("LAKELET_LOG_FORMAT", "text")
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .map_err(|error| format!("`lakeletd` could not be started: {error}"))?;
++        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| "`lakeletd` was started with a piped stdout".to_owned())?;
++        let stderr = child
++            .stderr
++            .take()
++            .ok_or_else(|| "`lakeletd` was started with a piped stderr".to_owned())?;
++        for stream in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
++            let lines = Arc::clone(&lines);
++            thread::spawn(move || {
++                for line in BufReader::new(stream).lines().map_while(Result::ok) {
++                    match lines.lock() {
++                        Ok(mut held) => held.push(line),
++                        Err(_) => break,
++                    }
++                }
++            });
++        }
++        let mut daemon = Self {
++            child,
++            lines,
++            address: String::new(),
++        };
++        let deadline = Instant::now() + DEADLINE;
++        loop {
++            if let Some(address) = daemon
++                .lines()
++                .iter()
++                .find_map(|line| line.split_once("listening on ").map(|(_, rest)| rest))
++                .and_then(|rest| rest.split_whitespace().next())
++            {
++                daemon.address = address.to_owned();
++                return Ok(daemon);
++            }
++            if Instant::now() > deadline {
++                return Err(format!(
++                    "`lakeletd` never said where it listens: {:?}",
++                    daemon.lines()
++                ));
++            }
++            thread::sleep(RETRY);
++        }
++    }
++
++    /// Where it listens.
++    fn address(&self) -> &str {
++        &self.address
++    }
++
++    /// Every line it has printed so far, in order.
++    fn lines(&self) -> Vec<String> {
++        self.lines
++            .lock()
++            .map(|lines| lines.clone())
++            .unwrap_or_default()
++    }
++
++    /// Ask it to stop the way an orchestrator does, and answer everything it printed.
++    fn stop(&mut self) -> Result<Vec<String>, String> {
++        let pid = self.child.id().to_string();
++        let status = Command::new("kill")
++            .args(["-TERM", &pid])
++            .status()
++            .map_err(|error| format!("`kill -TERM {pid}` could not be run: {error}"))?;
++        if !status.success() {
++            return Err(format!("`kill -TERM {pid}` answered {status}"));
++        }
++        let deadline = Instant::now() + DEADLINE;
++        loop {
++            match self.child.try_wait() {
++                Ok(Some(_)) => return Ok(self.lines()),
++                Ok(None) => {}
++                Err(error) => return Err(format!("`lakeletd` could not be waited for: {error}")),
++            }
++            if Instant::now() > deadline {
++                return Err(format!("`lakeletd` did not stop: {:?}", self.lines()));
++            }
++            thread::sleep(RETRY);
++        }
++    }
++}
++
++/// The deployment the page is written for: one store, a daemon where a stage needs one, a ring.
++struct World {
++    store: Dir,
++    copy: Dir,
++    restored: Dir,
++    tier: Dir,
++    project: PathBuf,
++    daemon: Option<Daemon>,
++    /// The records this instrument wrote into the store, in the order they were sealed.
++    records: Vec<Record>,
++}
++
++impl World {
++    /// Build the world: a store of [`SEGMENTS`] sealed segments through the real write path.
++    ///
++    /// Every world's directories are its own: one process drills several pages (a spec's cases run
++    /// in parallel), and two worlds sharing a path would be two deployments writing one store.
++    fn new(project: &Path) -> Result<Self, String> {
++        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++        let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let label = |what: &str| format!("runbook-{what}-{index}");
++        let store = Dir::new(&label("store"));
++        let copy = Dir::new(&label("copy"));
++        let restored = Dir::new(&label("restored"));
++        let tier = Dir::new(&label("tier"));
++        let records: Vec<Record> = (0..SEGMENTS * PER_SEGMENT)
++            .map(|index| Record {
++                series: format!("cpu,host=h{}", index % SERIES),
++                ts_millis: (BASE + index as u64 * STEP) as i64,
++                value: index as f64 / 100.0,
++            })
++            .collect();
++        {
++            let mut spool = Spool::open(store.path())
++                .map_err(|error| format!("the world's store cannot be opened: {error}"))?;
++            let mut segments = Segments::open(store.path())
++                .map_err(|error| format!("the world's segments cannot be opened: {error}"))?;
++            for batch in records.chunks(PER_SEGMENT) {
++                spool
++                    .append(&batch::encode(batch))
++                    .map_err(|error| format!("the world's write path refused a batch: {error}"))?;
++                segments
++                    .seal(batch)
++                    .map_err(|error| format!("the world's flush refused a batch: {error}"))?;
++            }
++        }
++        Ok(Self {
++            store,
++            copy,
++            restored,
++            tier,
++            project: project.to_path_buf(),
++            daemon: None,
++            records,
++        })
++    }
++
++    /// The path a page's variable stands for.
++    fn var(&self, name: &str) -> Result<String, String> {
++        let path = match name {
++            "LAKELET_STORE" => self.store.path(),
++            "LAKELET_COPY" => self.copy.path(),
++            "LAKELET_RESTORED" => self.restored.path(),
++            "LAKELET_ADDR" => {
++                let Some(daemon) = self.daemon.as_ref() else {
++                    return Err(
++                        "`$LAKELET_ADDR` is the address of the deployment's daemon, and this stage \
++                         is the one that starts it: the load stage is where a client connects"
++                            .to_owned(),
++                    );
++                };
++                return Ok(daemon.address().to_owned());
++            }
++            other => return Err(format!("`${other}` is not a variable this instrument sets")),
++        };
++        Ok(path.display().to_string())
++    }
++
++    /// Put the world in the state a check needs before the stage's command runs.
++    ///
++    /// A stage is run *in a world*, and the three that need one built for them are the three whose
++    /// acts nobody performs by hand: a deployment that is running, a segment that has left the
++    /// box, and a ring somebody has already rotated once. Which setup a stage needs is the stage's
++    /// check, read from the same list the page reads.
++    fn ready(&mut self, check: &Check) -> Result<(), String> {
++        match check.name {
++            "counters-flat" => {
++                if self.daemon.is_none() {
++                    let store = self.store.path().to_path_buf();
++                    self.daemon = Some(Daemon::start(&store)?);
++                }
++                Ok(())
++            }
++            "cold-span-answered" => self.sweep_and_return(),
++            "window-respected" => self.write_ring(),
++            _ => Ok(()),
++        }
++    }
++
++    /// Take the oldest segment out of the box, and bring it back.
++    ///
++    /// The sweep is the *store's* own act: this build has no command that performs it (`sweep` and
++    /// `hydrate` are the engine's, and nothing under `src/cli` or `src/bin` calls them), which is
++    /// what the page says next to the stage. What an operator can do is ask the store for the span
++    /// the segment carried, and that is the command the stage runs.
++    fn sweep_and_return(&mut self) -> Result<(), String> {
++        let segments = Segments::open(self.store.path())
++            .map_err(|error| format!("the world's segments cannot be opened: {error}"))?;
++        let objects = filesystem::Directory::new(self.tier.path());
++        let policy = Cold::new(COLD_AFTER_MILLIS);
++        let took = tier::sweep(&segments, &objects, &policy, SWEEP_AT)
++            .map_err(|error| format!("the world's sweep refused: {error}"))?;
++        if took.moved() == 0 {
++            return Err(
++                "the sweep moved no segment out of the box, so the stage would be about nothing: \
++                 the world's oldest segment is not cold at the instant the sweep runs"
++                    .to_owned(),
++            );
++        }
++        let back = tier::hydrate(&segments, &objects)
++            .map_err(|error| format!("the world's way back refused: {error}"))?;
++        if back.fetched() != took.moved() {
++            return Err(format!(
++                "the way back brought {} segment(s) of the {} that left: a store whose files are \
++                 not all home is a store no command can open",
++                back.fetched(),
++                took.moved()
++            ));
++        }
++        Ok(())
++    }
++
++    /// Put the ring on the store: a key, and the successor somebody added after it.
++    fn write_ring(&mut self) -> Result<(), String> {
++        let directory = self.store.path().join(keys::DIRECTORY);
++        std::fs::create_dir_all(&directory)
++            .map_err(|error| format!("the ring's directory cannot be created: {error}"))?;
++        for (id, from) in [(OLD_KEY, OLD_KEY_FROM), (NEW_KEY, NEW_KEY_FROM)] {
++            let id = KeyId::new(id);
++            let path = keys::key_file(&directory, &id);
++            std::fs::write(&path, keys::render(&id, EXAMPLE_SECRET, from, None))
++                .map_err(|error| format!("{} cannot be written: {error}", path.display()))?;
++        }
++        Ok(())
++    }
++
++    /// Wait until the daemon has counted every frame the client sent.
++    ///
++    /// A client that has flushed its socket has not been *read* yet, and a daemon stopped at that
++    /// moment has counted some of the frames: `connection closed` is the line the daemon prints
++    /// when it has drained what a client offered, and waiting for the count is what makes this
++    /// stage's numbers the same on a loaded machine as on an idle one. A runbook never sleeps.
++    fn wait_for_the_connection(&self, frames: u64) -> Result<(), String> {
++        let Some(daemon) = self.daemon.as_ref() else {
++            return Err("the deployment's daemon is not running".to_owned());
++        };
++        let deadline = Instant::now() + DEADLINE;
++        loop {
++            let lines = daemon.lines();
++            if lines.iter().any(|line| {
++                line.contains("connection closed")
++                    && counter(std::slice::from_ref(line), "connection closed", "accepted")
++                        == Some(frames)
++            }) {
++                return Ok(());
++            }
++            if Instant::now() > deadline {
++                return Err(format!(
++                    "the daemon never reported a closed connection with `accepted={frames}`: a                      client that has flushed its socket has not been read, and stopping the                      deployment there counts some of the frames — {}",
++                    lines.join(" | ")
++                ));
++            }
++            thread::sleep(RETRY);
++        }
++    }
++
++    /// Stop the daemon, and answer everything it printed.
++    fn stop_daemon(&mut self) -> Result<Vec<String>, String> {
++        match self.daemon.as_mut() {
++            Some(daemon) => daemon.stop(),
++            None => Err("the deployment's daemon is not running".to_owned()),
++        }
++    }
++
++    /// Run one stage's command: the program it names, with the world's own paths in its arguments.
++    fn run(&mut self, command: &str) -> Result<Ran, String> {
++        let words = tokens(command);
++        let Some(program) = words.first() else {
++            return Err("the stage's `sh` block holds no command at all".to_owned());
++        };
++        let binary = match program.as_str() {
++            "lakeletd" => env!("CARGO_BIN_EXE_lakeletd"),
++            "lakeletq" => env!("CARGO_BIN_EXE_lakeletq"),
++            "lakelet-load" => env!("CARGO_BIN_EXE_lakelet-load"),
++            other => {
++                return Err(format!(
++                    "`{other}` is not a program this deployment ships: its programs are {}",
++                    PROGRAMS.join(", ")
++                ));
++            }
++        };
++        let mut args = Vec::new();
++        for word in &words[1..] {
++            args.push(self.expand(word)?);
++        }
++        let output = Command::new(binary)
++            .args(&args)
++            .current_dir(&self.project)
++            .env_clear()
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .output()
++            .map_err(|error| format!("`{command}` could not be started: {error}"))?;
++        Ok(Ran {
++            code: output.status.code().unwrap_or(-1),
++            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
++            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
++        })
++    }
++
++    /// One word of a command: `$NAME` becomes what the world points it at.
++    fn expand(&self, word: &str) -> Result<String, String> {
++        let mut expanded = String::new();
++        let mut rest = word;
++        while let Some(at) = rest.find('$') {
++            expanded.push_str(&rest[..at]);
++            let after = &rest[at + 1..];
++            let end = after
++                .find(|byte: char| !byte.is_ascii_alphanumeric() && byte != '_')
++                .unwrap_or(after.len());
++            expanded.push_str(&self.var(&after[..end])?);
++            rest = &after[end..];
++        }
++        expanded.push_str(rest);
++        Ok(expanded)
++    }
++
++    /// Make the check a stage's `state` names, after its command ran.
++    fn check(&mut self, check: Check, ran: &Ran) -> Result<(), String> {
++        match check.name {
++            "settings-print" => self.settings_print(ran),
++            "copy-holds-the-store" => self.copy_holds_the_store(),
++            "restore-holds-the-records" => self.restore_holds_the_records(),
++            "drill-agrees" => drill_agrees(ran),
++            "counters-flat" => self.counters_flat(ran),
++            "bill-adds-up" => self.bill_adds_up(ran),
++            "cold-span-answered" => self.cold_span_answered(ran),
++            "window-respected" => self.window_respected(ran),
++            other => Err(format!("`{other}` is not a check this instrument makes")),
++        }
++    }
++
++    /// The deployment's own settings, as `lakeletd --check-config` prints them.
++    fn settings_print(&self, ran: &Ran) -> Result<(), String> {
++        for needle in [
++            "listen.addr",
++            "store.dir",
++            "queue.capacity = 1024",
++            "queue.policy = block",
++            "series.limit = 1024",
++        ] {
++            if !ran.stdout.contains(needle) {
++                return Err(format!(
++                    "the deployment's own report does not state `{needle}`: the numbers a \
++                     procedure is written against are the numbers the box is configured with, and \
++                     this one did not say\n{}",
++                    ran.stdout
++                ));
++            }
++        }
++        Ok(())
++    }
++
++    /// The copy holds the store: every file its own manifest names, whole.
++    fn copy_holds_the_store(&self) -> Result<(), String> {
++        let loaded = manifest::Manifest::load(self.copy.path())
++            .map_err(|error| format!("the copy's own manifest cannot be read: {error}"))?;
++        if loaded.is_empty() {
++            return Err(
++                "the copy's manifest names no file at all: a copy is the file list first, and a \
++                 directory nobody can verify is not a backup"
++                    .to_owned(),
++            );
++        }
++        for entry in loaded.entries() {
++            let path = self.copy.path().join(entry.name());
++            let bytes = std::fs::read(&path)
++                .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
++            if bytes.len() as u64 != entry.bytes() {
++                return Err(format!(
++                    "{}: the copy's manifest states {} bytes and the copy holds {}",
++                    entry.name(),
++                    entry.bytes(),
++                    bytes.len()
++                ));
++            }
++            if checksum(&bytes) != entry.crc32() {
++                return Err(format!(
++                    "{}: the copy's manifest states crc32 {:08x} and the bytes are {:08x}",
++                    entry.name(),
++                    entry.crc32(),
++                    checksum(&bytes)
++                ));
++            }
++        }
++        for kind in [Kind::Manifest, Kind::Segment, Kind::Log] {
++            if !loaded.entries().iter().any(|entry| entry.kind() == kind) {
++                return Err(format!(
++                    "the copy names no `{}`: a store is its manifest, the segments the manifest \
++                     names and the log's proven prefix, and a copy of fewer of them is a copy of \
++                     another store",
++                    kind.name()
++                ));
++            }
++        }
++        let proven = replay::recover(self.store.path())
++            .map_err(|error| format!("the store's log cannot be replayed: {error}"))?
++            .bytes();
++        let Some(log) = loaded
++            .entries()
++            .iter()
++            .find(|entry| entry.kind() == Kind::Log)
++        else {
++            return Err("the copy names no log".to_owned());
++        };
++        if log.bytes() != proven {
++            return Err(format!(
++                "the copy took {} byte(s) of log and a replay of the store proves {}: the tail no \
++                 replay can prove is the middle of a record nobody finished, and a copy that \
++                 carries it carries it into every store restored from that copy",
++                log.bytes(),
++                proven
++            ));
++        }
++        let segments = Segments::open(self.store.path())
++            .map_err(|error| format!("the store's segments cannot be opened: {error}"))?;
++        let named = segments.manifest().segments().len() as u64;
++        let copied = loaded
++            .entries()
++            .iter()
++            .filter(|entry| entry.kind() == Kind::Segment)
++            .count() as u64;
++        if named != copied {
++            return Err(format!(
++                "the store's manifest names {named} segment(s) and the copy holds {copied}: the \
++                 manifest is the store, so a copy that lost one is a copy of a smaller store"
++            ));
++        }
++        Ok(())
++    }
++
++    /// The restored directory holds the records the copy held: series for series, count for count.
++    fn restore_holds_the_records(&self) -> Result<(), String> {
++        let source = ledger(self.store.path())?;
++        let restored = ledger(self.restored.path())?;
++        if source != restored {
++            let missing: Vec<&str> = source
++                .keys()
++                .filter(|name| !restored.contains_key(*name))
++                .map(String::as_str)
++                .collect();
++            return Err(format!(
++                "the restored store answers with {} series and {} records, and the store it came \
++                 from answers with {} and {}: a restore that ends in a directory nobody queried \
++                 has proven nothing{}",
++                restored.len(),
++                restored.values().sum::<u64>(),
++                source.len(),
++                source.values().sum::<u64>(),
++                if missing.is_empty() {
++                    String::new()
++                } else {
++                    format!(", and `{}` is not in it", missing.join("`, `"))
++                }
++            ));
++        }
++        Ok(())
++    }
++
++    /// The load run left nothing owed, and nothing held open.
++    fn counters_flat(&mut self, ran: &Ran) -> Result<(), String> {
++        let frames: u64 = value(&ran.stdout, "batches")
++            .and_then(|text| text.parse().ok())
++            .ok_or_else(|| {
++                format!(
++                    "`lakelet-load` printed no `batches=` line, so there is nothing to hold the \
++                     daemon's own counters against:\n{}",
++                    ran.stdout
++                )
++            })?;
++        self.wait_for_the_connection(frames)?;
++        let lines = self.stop_daemon()?;
++        let accepted = counter(&lines, "queue drained", "accepted").ok_or_else(|| owed(&lines))?;
++        let dropped = counter(&lines, "queue drained", "dropped").ok_or_else(|| owed(&lines))?;
++        let written = counter(&lines, "queue drained", "written").ok_or_else(|| owed(&lines))?;
++        let offered = counter(&lines, "series ledger", "offered").ok_or_else(|| owed(&lines))?;
++        let admitted = counter(&lines, "series ledger", "admitted").ok_or_else(|| owed(&lines))?;
++        let rejected = counter(&lines, "series ledger", "rejected").ok_or_else(|| owed(&lines))?;
++        let tracked = counter(&lines, "series ledger", "tracked").ok_or_else(|| owed(&lines))?;
++        if accepted != frames {
++            return Err(format!(
++                "the client says it sent {frames} frame(s) and the daemon says it accepted \
++                 {accepted}: the frames a client offered and the frames the store took are the \
++                 two halves of what an ingest promise is"
++            ));
++        }
++        if dropped != 0 {
++            return Err(format!(
++                "the daemon dropped {dropped} frame(s): with `queue.policy = block` nothing is \
++                 dropped, and a deployment that sheds data under load is a deployment whose \
++                 numbers mean something else"
++            ));
++        }
++        if written != accepted {
++            return Err(format!(
++                "{accepted} frame(s) were accepted and {written} made it to the file: what the \
++                 queue took in and what the writer wrote are the same number, or the run left \
++                 work owed"
++            ));
++        }
++        if offered != admitted + rejected {
++            return Err(format!(
++                "the ledger was offered {offered} series, admitted {admitted} and refused \
++                 {rejected}: every offer lands on exactly one side, and a name a refusal inserted \
++                 anyway is a cap that leaks"
++            ));
++        }
++        if rejected != 0 {
++            return Err(format!(
++                "the cap refused {rejected} series offer(s): this deployment's cap is 1024 and \
++                 this workload names {SERIES} series, so a refusal here is the cap turning away \
++                 the store's own traffic"
++            ));
++        }
++        if tracked != SERIES as u64 {
++            return Err(format!(
++                "the store tracks {tracked} series and this workload names {SERIES}: the live set \
++                 is the bill, and a series that was charged and is not tracked is a leak the other \
++                 two counters cannot see"
++            ));
++        }
++        let segments = Segments::open(self.store.path())
++            .map_err(|error| format!("the store's segments cannot be opened: {error}"))?;
++        let live = Live::of(self.store.path(), segments.manifest(), 0);
++        if live.open_handles() != 0 {
++            return Err(format!(
++                "the store holds {} file handle(s) open after the run: an append, a read and a \
++                 segment write are each open and closed inside the call that made them, and one \
++                 per cycle is the leak a soak exists to find",
++                live.open_handles()
++            ));
++        }
++        let sealed = (SEGMENTS * PER_SEGMENT) as u64;
++        if live.records() != sealed {
++            return Err(format!(
++                "the store's manifest names {} record(s) and the flushes closed {sealed}: the \
++                 manifest is what a flush wrote, and the records still in the log are the ones no \
++                 segment holds yet",
++                live.records()
++            ));
++        }
++        Ok(())
++    }
++
++    /// The bill an operator reads adds up to what the store's own log holds.
++    fn bill_adds_up(&self, ran: &Ran) -> Result<(), String> {
++        let mut rows = 0u64;
++        let mut records = 0u64;
++        let mut bytes = 0u64;
++        let mut names = BTreeSet::new();
++        for line in ran.stdout.lines() {
++            let fields: Vec<&str> = line.split_whitespace().collect();
++            let [name, charged, cost, first, last] = fields[..] else {
++                return Err(format!(
++                    "`inspect series` printed a line that is not `<series> <records> <bytes> \
++                     <first> <last>`: {line}"
++                ));
++            };
++            let charged: u64 = charged.parse().map_err(|_| {
++                format!("`inspect series` printed `{charged}` where a record count belongs")
++            })?;
++            let cost: u64 = cost.parse().map_err(|_| {
++                format!("`inspect series` printed `{cost}` where a byte count belongs")
++            })?;
++            for field in [first, last] {
++                let _: u64 = field.parse().map_err(|_| {
++                    format!("`inspect series` printed `{field}` where a millisecond belongs")
++                })?;
++            }
++            rows += 1;
++            records += charged;
++            bytes += cost;
++            names.insert(name.to_owned());
++        }
++        if rows == 0 {
++            return Err(
++                "the store's own table is empty: the ledger is rebuilt from the log and the live \
++                 indexes, and a store that holds records names at least one series"
++                    .to_owned(),
++            );
++        }
++        let recovered = replay::recover(self.store.path())
++            .map_err(|error| format!("the store's log cannot be replayed: {error}"))?;
++        let mut in_log = 0u64;
++        let mut logged = 0u64;
++        for payload in recovered.records() {
++            let decoded = batch::decode(payload).map_err(|error| {
++                format!("a payload in the log is not this build's batch: {error}")
++            })?;
++            in_log += decoded.len() as u64;
++            logged += payload.len() as u64;
++        }
++        if records != in_log || bytes != logged {
++            return Err(format!(
++                "the table charges {records} record(s) and {bytes} byte(s), and the store's own \
++                 log holds {in_log} record(s) in {logged} byte(s): the ledger's numbers add up to \
++                 exactly the bytes the write path accepted, and a table that does not is a bill \
++                 for another store"
++            ));
++        }
++        let tracked: BTreeSet<String> = Registry::of_store(self.store.path(), Cap::DEFAULT)
++            .map_err(|error| format!("the store's ledger cannot be read: {error}"))?
++            .tracked()
++            .map(|(name, _)| name.to_owned())
++            .collect();
++        if names != tracked {
++            return Err(format!(
++                "the table names {} series and the store's ledger holds {}: the table is the live \
++                 set an operator is charged for, and the two are read from the same store",
++                names.len(),
++                tracked.len()
++            ));
++        }
++        if tracked.len() > Cap::DEFAULT.limit() {
++            return Err(format!(
++                "the store tracks {} series and its cap allows {}: the cap is the budget this \
++                 deployment's cardinality is measured against",
++                tracked.len(),
++                Cap::DEFAULT.limit()
++            ));
++        }
++        Ok(())
++    }
++
++    /// The span that left the box came back record for record.
++    fn cold_span_answered(&self, ran: &Ran) -> Result<(), String> {
++        let printed: Vec<String> = ran.stdout.lines().map(str::to_owned).collect();
++        let expected = expected_windows(&self.records[..PER_SEGMENT]);
++        if printed != expected {
++            return Err(format!(
++                "the store answered\n    {}\nand the records the segment that left the box carried \
++                 are\n    {}: the sweep puts the object first and removes the file second, and the \
++                 way back is what makes a store that answers the same thing afterwards",
++                printed.join("\n    "),
++                expected.join("\n    ")
++            ));
++        }
++        Ok(())
++    }
++
++    /// The ring's arithmetic held: the key left at the instant it may.
++    fn window_respected(&self, ran: &Ran) -> Result<(), String> {
++        let ring = KeyRing::load(self.store.path().join(keys::DIRECTORY))
++            .map_err(|error| format!("the ring cannot be read: {error}"))?;
++        let safe = NEW_KEY_FROM + Window::MAX_TOKEN_LIFETIME_MILLIS;
++        let Some(key) = ring.keys().iter().find(|key| key.id().as_str() == OLD_KEY) else {
++            return Err(format!("the ring holds no key `{OLD_KEY}`"));
++        };
++        if key.not_after_millis() != Some(safe) {
++            return Err(format!(
++                "`{OLD_KEY}` is retired at {:?} and the instant it may leave is {safe}: the last \
++                 instant a key could have signed is the latest `not_before` among the keys newer \
++                 than it plus this deployment's longest token lifetime",
++                key.not_after_millis()
++            ));
++        }
++        if !ring
++            .keys()
++            .iter()
++            .any(|key| key.id().as_str() == NEW_KEY && key.is_open())
++        {
++            return Err(format!(
++                "`{NEW_KEY}` is the key this ring signs with and it is not open: retiring a key \
++                 must not take the signing with it"
++            ));
++        }
++        if ring.preferred().map(|key| key.id().as_str()) != Some(NEW_KEY) {
++            return Err(format!(
++                "the ring signs with {:?} and the newest open key is `{NEW_KEY}`",
++                ring.preferred().map(|key| key.id().as_str())
++            ));
++        }
++        if !ran.stdout.contains(&format!("not_after={safe}")) {
++            return Err(format!(
++                "the command's own answer does not state `not_after={safe}`, so the number the \
++                 operator wrote down is not the number the ring holds:\n{}",
++                ran.stdout
++            ));
++        }
++        Ok(())
++    }
++}
++
++/// The drill's own answer: the store came back record for record.
++///
++/// `lakeletq drill` is the whole procedure on a store it builds itself, so its block is the one
++/// number a page can quote without a machine named beside it — and `agreed` is the sentence the
++/// step's page is written on.
++fn drill_agrees(ran: &Ran) -> Result<(), String> {
++    let agreed = value(&ran.stdout, "agreed");
++    if agreed.as_deref() != Some("true") {
++        return Err(format!(
++            "the rehearsal of the whole procedure did not agree with itself (`agreed={:?}`): a \
++             restore that ends in a directory nobody queried has proven nothing, and the drill is \
++             the command that queries it\n{}",
++            agreed.as_deref().unwrap_or("nothing"),
++            ran.stdout
++        ));
++    }
++    let source = value(&ran.stdout, "source_digest");
++    let restored = value(&ran.stdout, "restored_digest");
++    if source.is_none() || source != restored {
++        return Err(format!(
++            "the drill's two digests are {source:?} and {restored:?}: a digest and not a count, \
++             because a copy that lost one record and invented another keeps the count"
++        ));
++    }
++    for (key, wanted) in [("records_missing", "0"), ("half_store_opens", "false")] {
++        let found = value(&ran.stdout, key);
++        if found.as_deref() != Some(wanted) {
++            return Err(format!(
++                "the drill states `{key}={}` where the procedure promises `{wanted}`: the half a \
++                 backup plan usually skips is the half a drill exists to walk",
++                found.as_deref().unwrap_or("nothing")
++            ));
++        }
++    }
++    Ok(())
++}
++
++/// The series and their record counts in a ledger, name order.
++fn ledger(directory: &Path) -> Result<BTreeMap<String, u64>, String> {
++    let registry = Registry::of_store(directory, Cap::DEFAULT)
++        .map_err(|error| format!("{}'s ledger cannot be read: {error}", directory.display()))?;
++    Ok(registry
++        .tracked()
++        .map(|(name, cost)| (name.to_owned(), cost.records()))
++        .collect())
++}
++
++/// The answer `lakeletq query` prints for `records`: one line per window that held any.
++fn expected_windows(records: &[Record]) -> Vec<String> {
++    let mut buckets: BTreeMap<u64, u64> = BTreeMap::new();
++    for record in records {
++        let at = record.ts_millis.max(0) as u64;
++        let start = at - (at % WINDOW_MILLIS);
++        *buckets.entry(start).or_default() += 1;
++    }
++    buckets
++        .into_iter()
++        .map(|(start, count)| format!("{start} {count} {count}"))
++        .collect()
++}
++
++/// A line's `key=value` field, when the line carries it.
++fn value(text: &str, key: &str) -> Option<String> {
++    text.lines().find_map(|line| {
++        line.split_whitespace()
++            .find_map(|word| word.strip_prefix(&format!("{key}=")).map(str::to_owned))
++    })
++}
++
++/// One counter out of the daemon's lines: the `key=` field of the line carrying `needle`.
++fn counter(lines: &[String], needle: &str, key: &str) -> Option<u64> {
++    let line = lines.iter().find(|line| line.contains(needle))?;
++    line.split_whitespace()
++        .find_map(|word| word.strip_prefix(&format!("{key}="))?.parse().ok())
++}
++
++/// The daemon's lines, quoted, when a counter a stage watches is not among them.
++fn owed(lines: &[String]) -> String {
++    format!(
++        "the daemon printed no line for a counter this stage watches, and the stop path is where it \
++         prints them: {}",
++        lines.join(" | ")
++    )
++}
++
++/// The crc32 of a file's bytes, the checksum a copy's entries state.
++fn checksum(bytes: &[u8]) -> u32 {
++    let mut hasher = crc32fast::Hasher::new();
++    hasher.update(bytes);
++    hasher.finalize()
++}
++
++/// What one drill of a page found.
++#[derive(Debug, Clone)]
++pub struct Report {
++    lines: Vec<String>,
++    findings: Vec<Gap>,
++    stages: usize,
++    ran: usize,
++    holds: usize,
++    rolled_back: usize,
++    undone: usize,
++}
++
++impl Report {
++    /// The report, line by line: what `docs/runbook.md` quotes and what the spec re-runs.
++    #[must_use]
++    pub fn lines(&self) -> &[String] {
++        &self.lines
++    }
++
++    /// The report as one text, which is what a page carries.
++    #[must_use]
++    pub fn text(&self) -> String {
++        let mut text = self.lines.join("\n");
++        text.push('\n');
++        text
++    }
++
++    /// Everything the page owes: the reader's findings, and the ones the run found.
++    #[must_use]
++    pub fn findings(&self) -> &[Gap] {
++        &self.findings
++    }
++
++    /// How many stages the page names.
++    #[must_use]
++    pub fn stages(&self) -> usize {
++        self.stages
++    }
++
++    /// How many stages' commands ran.
++    #[must_use]
++    pub fn ran(&self) -> usize {
++        self.ran
++    }
++
++    /// How many stages' states were made and held.
++    #[must_use]
++    pub fn holds(&self) -> usize {
++        self.holds
++    }
++
++    /// How many stages roll back with a command.
++    #[must_use]
++    pub fn rolled_back(&self) -> usize {
++        self.rolled_back
++    }
++
++    /// How many stages say their act cannot be undone.
++    #[must_use]
++    pub fn undone(&self) -> usize {
++        self.undone
++    }
++
++    /// Whether the page held: every stage ran, every state held, nothing owed.
++    #[must_use]
++    pub fn holds_everything(&self) -> bool {
++        self.findings.is_empty() && self.stages > 0 && self.holds == self.stages
++    }
++}
++
++/// Drill a page against the world this instrument builds: run every stage, check every state.
++pub fn drill(page: &str, project: &Path) -> Report {
++    let runbook = Runbook::of(page);
++    let mut findings = runbook.gaps(project);
++    let mut lines = Vec::new();
++    let mut report = Report {
++        lines: Vec::new(),
++        findings: Vec::new(),
++        stages: runbook.stages().len(),
++        ran: 0,
++        holds: 0,
++        rolled_back: 0,
++        undone: 0,
++    };
++    let world = World::new(project);
++    let mut world = match world {
++        Ok(world) => Some(world),
++        Err(said) => {
++            findings.push(Gap::of(0, "page", said));
++            None
++        }
++    };
++    for stage in runbook.stages() {
++        let number = stage.number;
++        let rollback = stage.rollback();
++        match &rollback {
++            Rollback::Command(_) => report.rolled_back += 1,
++            Rollback::Undone => report.undone += 1,
++            _ => {}
++        }
++        let signal = stage.signal().unwrap_or_else(|| "-".to_owned());
++        let state = stage
++            .check()
++            .map_or_else(|| "-".to_owned(), |check| check.name.to_owned());
++        let command = stage.command().unwrap_or("-").to_owned();
++        let Some(held) = world.as_mut() else {
++            lines.push(format!(
++                "{PREFIX} stage={number} runs=\"{command}\" signal={signal} state={state} \
++                 rollback={} verdict=blocked",
++                rollback.word()
++            ));
++            continue;
++        };
++        let Some(check) = stage.check() else {
++            lines.push(format!(
++                "{PREFIX} stage={number} runs=\"{command}\" signal={signal} state={state} \
++                 rollback={} verdict=unrunnable",
++                rollback.word()
++            ));
++            continue;
++        };
++        if let Err(said) = held.ready(&check) {
++            findings.push(Gap::of(number, check.name, said));
++            lines.push(format!(
++                "{PREFIX} stage={number} runs=\"{command}\" signal={signal} state={state} \
++                 rollback={} verdict=blocked",
++                rollback.word()
++            ));
++            continue;
++        }
++        match held.run(&command) {
++            Err(said) => {
++                findings.push(Gap::of(number, "command", said));
++                lines.push(format!(
++                    "{PREFIX} stage={number} runs=\"{command}\" signal={signal} state={state} \
++                     rollback={} verdict=unrunnable",
++                    rollback.word()
++                ));
++            }
++            Ok(ran) => {
++                report.ran += 1;
++                if ran.code != 0 {
++                    findings.push(Gap::of(
++                        number,
++                        "command",
++                        format!(
++                            "this stage's command exited {} and answered `{}`: a stage whose \
++                             command does not run is a stage nobody has taken",
++                            ran.code,
++                            clip(ran.stderr.trim())
++                        ),
++                    ));
++                    lines.push(format!(
++                        "{PREFIX} stage={number} runs=\"{command}\" exit={} signal={signal} \
++                         state={state} rollback={} verdict=failed",
++                        ran.code,
++                        rollback.word()
++                    ));
++                    continue;
++                }
++                let verdict = match held.check(check, &ran) {
++                    Ok(()) => {
++                        report.holds += 1;
++                        "holds".to_owned()
++                    }
++                    Err(said) => {
++                        findings.push(Gap::of(number, check.name, said));
++                        "owes".to_owned()
++                    }
++                };
++                lines.push(format!(
++                    "{PREFIX} stage={number} runs=\"{command}\" exit=0 signal={signal} \
++                     state={state} rollback={} verdict={verdict}",
++                    rollback.word()
++                ));
++            }
++        }
++    }
++    let header = format!(
++        "{PREFIX} stages={} ran={} holds={} rolled_back={} undone={} findings={}",
++        report.stages,
++        report.ran,
++        report.holds,
++        report.rolled_back,
++        report.undone,
++        findings.len()
++    );
++    report.findings = findings;
++    report.lines = lines;
++    report.lines.insert(0, header);
++    report
++}
++
++/// A refusal's first sentence, for a one-line report.
++fn clip(text: &str) -> String {
++    let first = text.lines().next().unwrap_or(text).trim();
++    if first.chars().count() > 160 {
++        let cut: String = first.chars().take(157).collect();
++        format!("{cut}...")
++    } else {
++        first.to_owned()
++    }
++}
++
++/// The page this step delivers holds: every stage names its parts, every command runs, every state
++/// is what the stage promised.
++#[test]
++fn the_runbook_page_holds() {
++    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++    let page = std::fs::read_to_string(project.join(PAGE)).unwrap_or_else(|error| {
++        panic!("{PAGE} is the page this step delivers, and it cannot be read: {error}")
++    });
++    let report = drill(&page, &project);
++    print!("{}", report.text());
++    let owed: Vec<String> = report.findings().iter().map(ToString::to_string).collect();
++    assert!(
++        report.holds_everything(),
++        "{PAGE} does not hold ({} stage(s) ran, {} held out of {}):\n    {}\n\nthe report:\n{}",
++        report.ran(),
++        report.holds(),
++        report.stages(),
++        owed.join("\n    "),
++        report.text()
++    );
++}

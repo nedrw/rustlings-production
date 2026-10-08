@@ -1,0 +1,427 @@
+diff --git a/docs/runbook.md b/docs/runbook.md
+index c9c2ce8..ce249cb 100644
+--- a/docs/runbook.md
++++ b/docs/runbook.md
+@@ -1,151 +1,249 @@
+ # The runbook: the procedure this deployment is operated by
+ 
+-[TODO](TODO)
+-
+-This page is the procedure an operator follows, in this order: **8 stages**, each one a command of
+-this deployment, the signal to watch while it runs, the state that says it worked, the way back, and
+-who is told. `tests/runbook_harness.rs` is the instrument that reads this page, runs every command
+-below against a store of its own, and makes every state; what a stage owes, which states it may
+-name, and which programs its commands may start with are written down in that file's module docs.
+-[the SLO page](slo.md) is the number each stage protects.
++This is the procedure, in the order an operator takes it: **8 stages**, each one a command that
++runs, the signal to watch while it runs, the state that says it worked, the way back, and who is
++told. Every command is a program this deployment ships (`lakeletd`, `lakeletq`, `lakelet-load`) and
++takes its paths from the deployment's own variables — `$LAKELET_STORE` is the store being operated
++on, `$LAKELET_COPY` where a copy goes, `$LAKELET_RESTORED` where a restored store lands, and
++`$LAKELET_ADDR` the ingest address of the daemon that is running.
++
++`tests/runbook_harness.rs` is the instrument this page is judged by: it builds a store of its own,
++runs the command of every stage below **in this order**, makes the state each stage names, and
++prints the report quoted in [Verification](#verification). A stage whose command exits non-zero, or
++whose state does not hold, is a line in that report naming this page's stage number — and nothing on
++this page is written from memory: the numbers here are the ones [the SLO page](slo.md) promises, and
++`docs/slo.md` names the stage that protects each of them.
+ 
+ ## Symptoms
+ 
+-What is noticed first, from the outside, and which stage below each one belongs to.
+-
+-- [TODO](TODO)
++The store has stopped answering, or is answering in a way nobody believes. What an operator sees
++first is one of these, and each one has a stage below:
++
++- **a query returns nothing for a range that held records** — the store may be answering from
++  segments whose files are not all on this box ([the tier](capacity.md), stage 7), or the range may
++  be outside what retention keeps;
++- **a restart reports that it discarded bytes** — the log ended in the middle of a record nobody
++  finished (`lakelet/4.4-wal-recovery`; `lakeletd` logs `store recovered` with `discarded` beside
++  the counts, and anything but zero is bytes no append completed);
++- **ingest is being refused** — either the queue's policy shed frames or the series cap turned a
++  name away; both are counted, and stage 5 and stage 6 are where they are read;
++- **the disk is filling** — the log is what this build charges for, and stage 6 is where the bill
++  is read;
++- **a client says its token was refused** — the ring moved under it: somebody retired a key before
++  the last token it signed expired, which is stage 8's arithmetic.
+ 
+ ## Signals
+ 
+-The numbers this deployment publishes, and where they are read: the daemon's log lines
+-(`queue drained`, `series ledger`, `store recovered`, `store write cost`, `connection closed`), the
+-counters a harness prints, and the numbers a page of this project states.
++Five lines, and nothing else on this deployment reports numbers. They are on the log at `info`,
++one line per event, fields rather than prose (`src/service/logging.rs`):
++
++- `store recovered` — `records`, `bytes`, `discarded`: what the replay proved when the daemon
++  opened the store;
++- `queue drained`, printed at the stop path — `policy`, `capacity`, `offered`, `accepted`,
++  `dropped`, `written` (`src/service/backpressure.rs`). `written == accepted` says nothing was
++  left behind, and `dropped` is what a policy shed;
++- `series ledger`, also at the stop path — `limit`, `tracked`, `admitted`, `rejected`, `offered`
++  ([the cardinality page](cardinality.md)): `offered == admitted + rejected` is the identity a
++  cap that leaks crosses;
++- `store write cost` — `records`, `bytes`, `batches`, `calls`, `syncs` ([write amplification](write-amplification.md));
++- `connection closed` — `accepted`, `rejected`, `bytes`, one line per client that sent anything.
+ 
+-- [TODO](TODO)
++Everything a stage watches is one of those fields, a counter a harness prints, or a number a page
++of this project states; there is no metrics endpoint to consult, and this page does not pretend
++there is one.
+ 
+ ## Steps
+ 
+ ### 1. Read what this deployment says it is
+ 
+-- command:
++Before anything is touched, read the numbers this box was configured with. The defaults are not
++facts about the deployment: they are what it has *unless* something wrote one down, and the four
++layers a setting comes from (`lakelet/4.1-ingest-protocol`'s `src/service/config.rs`) are the
++first thing to check when an incident's numbers do not match the ones in a plan.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletd --check-config
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `series.limit`, `queue.capacity` and `queue.policy` (`src/service/config.rs`; what the cap means is [the cardinality page](cardinality.md)), and `listen.addr` and `store.dir` beside them
++- state: `settings-print` — the report states `series.limit = 1024`, `queue.capacity = 1024` and `queue.policy = block`, which are the three numbers every stage below is written against
++- rollback: nothing was taken — this stage reads the settings out and starts nothing
++- audience: the on-call engineer, who reads these numbers into the incident channel before anybody changes anything
+ 
+-### 2. Take a copy
++### 2. Stop the writer and take a copy
+ 
+-- command:
++A store being written while it is copied is two stores at once (`docs/dr-drill.md`: the copy reads
++a manifest, then segments, then a log, and a flush between two of those reads leaves a copy of two
++different stores). Stop the daemon first — `SIGTERM`, which flushes what the log holds — and take
++the copy while nothing is writing.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq backup --store $LAKELET_STORE --to $LAKELET_COPY
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `copy_files`, `copy_entries`, `copy_bytes` and `copy_records` from the command's own answer (`docs/dr-drill.md` quotes the same block from `lakeletq drill`), and what the copy does not close: the `rpo_bytes` and `rpo_records` the crash had already lost before it began
++- state: `copy-holds-the-store` — every file the copy's own manifest names is there, at the length and the crc32 it states, and the log it took is the prefix a replay proves and not one byte past it
++- rollback: nothing was taken — a copy reads its source and never writes through it (`src/engine/backup/mod.rs`), and the copy taken here is what the stages after this one go back to
++- audience: the on-call engineer and the incident channel, because a copy nobody knows about is a copy nobody will take
+ 
+-### 3. Put the copy back somewhere that is not the store
++### 3. Put the copy back somewhere that is not the store, and read it
+ 
+-- command:
++A copy nothing has ever restored is a hope. Restore it *beside* the store, into a directory no
++serve is reading, and compare the two: this is the stage that turns a copy into a backup.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq restore --from $LAKELET_COPY --to $LAKELET_RESTORED
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `restored_files`, `restored_records` and `records_missing` from `lakeletq drill`'s block, and the `write_policy` the store below was written under (`docs/dr-drill.md`; a deployment running `per-record` has no window at all)
++- state: `restore-holds-the-records` — the restored directory answers the same series and the same record counts as the store it came from, series for series
++- rollback: nothing was taken — a restore verifies every entry before it writes, and refuses a destination that already holds a store, so the store being served is untouched (`src/cli/backup.rs`)
++- audience: the on-call engineer
+ 
+-### 4. Rehearse the procedure
++### 4. Rehearse the whole procedure before you need it
+ 
+-- command:
++`lakeletq drill` is stages 2 and 3 run on a store it builds itself, plus the half a backup plan
++usually skips: a copy interrupted inside a segment, and what an operator would lose by restoring
++it. It reads no clock into its answer, so its block is the same bytes on every machine. This is the
++stage to run on a quiet afternoon; stages 2 and 3 are the same commands under pressure.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq drill
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `agreed`, `records_missing` and `half_store_opens` ([the DR page](dr-drill.md)'s block is this command's own output, line for line)
++- state: `drill-agrees` — the drill agrees with itself (`agreed = true`), loses no record in its restored store, and reports that the half-restore is a directory no store opens
++- rollback: nothing was taken — the drill builds a store of its own, in a directory of its own, and removes it
++- audience: whoever signs off the incident review, and whoever owns the deployment's backup plan
+ 
+-### 5. Put a load shape on the live deployment
++### 5. Put the load shape on the live deployment and read what it owes
+ 
+-- command:
++Shaped like [a soak](soak.md), at the size an incident can afford: 4000 samples in frames of 64,
++over the eight series this deployment's load generator names, from a seed — so two runs send the
++same bytes. Stop the daemon afterwards, because the counters this stage watches are printed at the
++stop path. The long form is the same shape: `cargo test -p lakelet --test soak` under the bounds of
++`course/tracks/lakelet/soak/4.17-soak.toml`, and `LAKELET_SOAK_MINUTES=30` is what a real soak sets
++— the cycle is identical and only the clock differs. The wall clock is never the verdict; a count
++is.
+ 
+ ```sh
+-[TODO](TODO)
++lakelet-load --target $LAKELET_ADDR --samples 4000 --batch 64 --series 8 --seed 1
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `open_handles`, `store_files`, `store_bytes` and `records` ([the soak page](soak.md)'s counters), and the `dropped`, `accepted` and `written` of the daemon's `queue drained` line at the stop path
++- state: `counters-flat` — the client's `batches` are the daemon's `accepted`, `dropped` is zero, `written == accepted`, the ledger's `offered == admitted + rejected` with `rejected = 0` and `tracked = 8`, and the store holds no file open once the writer has stopped
++- rollback: `lakeletq restore --from $LAKELET_COPY --to $LAKELET_RESTORED` and move the restored directory into place — the copy from stage 2 predates this load, and a store that took records it should not have is a store that goes back
++- audience: the on-call engineer, before anybody changes a setting to make a number look better
+ 
+ ### 6. Read the bill the store is paying
+ 
+-- command:
++The store's own table: one line per series, its records, its bytes, and the first and last
++millisecond it was seen at. It is the live set an operator is charged for, rebuilt from the log and
++the live indexes every time the store is opened (`lakelet/4.18-cardinality-cost`), and it is the
++measurement the model in [the capacity page](capacity.md) is held against: what a series costs
++here is what `bytes_per_sample` and `stored_bytes_per_day` are answers *about*.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq inspect series --store $LAKELET_STORE
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `tracked`, `series_admitted` and `series_rejected` ([the cardinality page](cardinality.md)'s ledger line and its table), and the `bytes` column, which is what `bytes_per_sample` and `stored_bytes_per_day` in [the capacity page](capacity.md) price
++- state: `bill-adds-up` — the table's records and bytes add up to exactly what the store's own log holds, and the names in it are the ledger's live set
++- rollback: nothing was taken — this stage reads a ledger, and the ledger is derived state the store rebuilds
++- audience: whoever owns what this deployment costs (`ops/capacity-cost@design`, `lakelet/4.20-capacity-model`)
++- note: a series the store has never seen is what the cap refuses; a series it *already* tracks is always admitted, which is why `series_rejected` is the number to read here and not the size of the table
+ 
+ ### 7. Ask for the span that left the box
+ 
+-- command:
++Segments older than the tier's policy live in the object store rather than on this box
++(`lakelet/4.21-cold-tiering`), and **no command of this deployment sweeps or hydrates them**: the
++sweep is the store's own act, and the way back is `hydrate`, one copy per segment — a stopped store
++whose segments are cold is not openable at all. So what an operator does in this stage is ask for
++the span that left and see it answered; if it is not, the way back has not finished.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq query --store $LAKELET_STORE --from 1700000000000 --to 1700000128000 --window 1m --agg count
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `moved`, `fetched` and `kept`, which are the sweep's own report (`src/engine/tier/mod.rs`), and the `count` this command answers with per window
++- state: `cold-span-answered` — the windows of that span answer the records the segment that left the box carried, window for window
++- rollback: nothing was taken — this stage reads, and the bytes that moved are the sweep's own act rather than this command's; the way back is `hydrate` before anything reads the store
++- audience: the on-call engineer, and whoever owns the tier (`store/tiering@apply`, `lakelet/4.21-cold-tiering`)
+ 
+-### 8. Retire a key
++### 8. Retire the key you meant to retire, and not one instant earlier
+ 
+-- command:
++The ring is the `keys` directory below the store, and the key that signs is the open one with the
++latest `not_before` (`lakelet/4.23-secret-rotation`). Whoever rotated this store last added the
++successor — `lakeletq rotate --store $LAKELET_STORE --add --id <ID> --secret <HEX> --from <MILLIS>`
++— and `lakeletq rotate --store $LAKELET_STORE --list` is how the window is read before anything is
++retired. A key may leave **only** after the longest token lifetime this deployment issues has
++passed since something newer took the signing over; retiring under that instant is refused, and the
++refusal names the instant. The ring below holds two keys: `sunset` (open since `1700000000000`) and
++`sunrise` (open since `170000003600000`, the newest, and the one that signs), so `sunset` may leave
++at `170000003600000` plus the longest token lifetime — `1700007200000`.
+ 
+ ```sh
+-[TODO](TODO)
++lakeletq rotate --store $LAKELET_STORE --retire sunset --at 1700007200000
+ ```
+ 
+-- signal: [TODO](TODO)
+-- state: [TODO](TODO)
+-- rollback: [TODO](TODO)
+-- audience: [TODO](TODO)
++- signal: `safe_retire` and `not_after`, the two numbers `lakeletq rotate --list` prints ([the rotation page](rotation.md)), and `MAX_TOKEN_LIFETIME_MILLIS`, which is where `3600000` comes from (`src/service/keys.rs`)
++- state: `window-respected` — `sunset` ends exactly at `sunrise`'s `not_before` plus this deployment's longest token lifetime, the ring still signs with `sunrise`, and the command's own answer states that instant
++- rollback: none — a retirement is written once and nothing unsays it (`src/cli/rotate.rs`), because the last token the retired key signed is already out there; the way back is the ring as the operator's own configuration management has it, which is why the instant is worth checking twice
++- audience: the security owner and the on-call engineer
+ 
+ ## Verification
+ 
+-The command that runs this whole page, and the report it prints:
+-
+-- `cargo test -p lakelet --test runbook_harness -- --nocapture`
++Two commands, and the first one is the whole page. `cargo test -p lakelet --test runbook_harness
++-- --nocapture` builds a store through the real write path, starts a daemon on it where a stage
++needs one, runs every command above in this order, and makes every stage's check; the report it
++prints is below, and `kiln run lakelet/4.24-runbook-drill` re-runs it and compares it line for line.
++The second is one stage by hand, on the store being served:
++`lakeletq inspect series --store $LAKELET_STORE`.
+ 
+ ```text
+-[TODO](TODO)
++lakelet-runbook stages=8 ran=8 holds=8 rolled_back=1 undone=1 findings=0
++lakelet-runbook stage=1 runs="lakeletd --check-config" exit=0 signal=series.limit state=settings-print rollback=read verdict=holds
++lakelet-runbook stage=2 runs="lakeletq backup --store $LAKELET_STORE --to $LAKELET_COPY" exit=0 signal=copy_files state=copy-holds-the-store rollback=read verdict=holds
++lakelet-runbook stage=3 runs="lakeletq restore --from $LAKELET_COPY --to $LAKELET_RESTORED" exit=0 signal=restored_files state=restore-holds-the-records rollback=read verdict=holds
++lakelet-runbook stage=4 runs="lakeletq drill" exit=0 signal=agreed state=drill-agrees rollback=read verdict=holds
++lakelet-runbook stage=5 runs="lakelet-load --target $LAKELET_ADDR --samples 4000 --batch 64 --series 8 --seed 1" exit=0 signal=open_handles state=counters-flat rollback=command verdict=holds
++lakelet-runbook stage=6 runs="lakeletq inspect series --store $LAKELET_STORE" exit=0 signal=tracked state=bill-adds-up rollback=read verdict=holds
++lakelet-runbook stage=7 runs="lakeletq query --store $LAKELET_STORE --from 1700000000000 --to 1700000128000 --window 1m --agg count" exit=0 signal=moved state=cold-span-answered rollback=read verdict=holds
++lakelet-runbook stage=8 runs="lakeletq rotate --store $LAKELET_STORE --retire sunset --at 1700007200000" exit=0 signal=safe_retire state=window-respected rollback=none verdict=holds
+ ```
+ 
+ ## Escalation
+ 
+-What to hand over when a stage fails, and what not to change.
+-
+-- [TODO](TODO)
++- **the copy does not verify** (stage 2's state does not hold: a file missing, a length wrong, a
++  crc32 different) — the copy is not a backup. Take another one with the writer stopped, and if the
++  *source* refuses to be read, the incident is a store problem rather than a copy problem; escalate
++  to whoever owns the store's filesystem;
++- **the restore holds fewer records than the store** (stage 3) — the copy predates something the
++  store kept. That is what a copy is: what has been written since it was taken is not in it. Say
++  which span is missing before anybody swaps the restored directory in;
++- **the counters are not flat** (stage 5) — a handle or a task is not being released. Do not
++  restart into it blindly: a restart that resets the counters hides the leak, and
++  [the soak page](soak.md) is the argument for the long form of this check;
++- **the bill does not add up** (stage 6) — the ledger and the log disagree, which is a store bug
++  rather than a workload one; stop writing and keep the directory;
++- **the cold span does not answer** (stage 7) — the way back has not finished. Do not open the
++  store "to look": opening it deletes what its manifest does not name, and a segment that is in
++  neither place is a lost segment;
++- **a client's token is refused after a rotation** (stage 8) — the key left too early. The last
++  token signed under it is still live until the instant this page's arithmetic names; there is no
++  command that unsays a retirement, so the repair is a new key with a *newer* `not_before` and a
++  client that rekeys on its next connection.
++
++What to hand over: which stage failed, the command and the class it exited with (`2` a wrong call,
++`3` something not there, `4` the store refused, `1` this deployment is broken — `lakeletq --help`),
++the line the deployment printed, and the two pages this procedure is written against: this one and
++[the SLO page](slo.md).
+ 
+ ## Where the code is
+ 
+-- `tests/runbook_harness.rs` — the instrument: the reader, the checks, and the report.
+-- [the SLO page](slo.md) — the numbers this procedure protects.
++- `tests/runbook_harness.rs` — the instrument: the reader, the checks, and the report above.
++- `src/service/backpressure.rs` — the queue and its counters, and the command that prints them.
++- `src/service/keys.rs` and `docs/rotation.md` — the ring, the window, and `--add`/`--list`/`--retire`.
++- `src/engine/backup/` and [the DR page](dr-drill.md) — the copy, the restore, and the drill.
++- `src/engine/tier/mod.rs` — the sweep and the way back, and the report this page's stage 7 watches.
++- [The soak page](soak.md), [the cardinality page](cardinality.md) and [the capacity page](capacity.md) — the counters and the model this page's stages 5, 6 and 7 read.
+diff --git a/docs/slo.md b/docs/slo.md
+index 82815e9..3ac6027 100644
+--- a/docs/slo.md
++++ b/docs/slo.md
+@@ -1,24 +1,84 @@
+ # What this deployment promises, and what each number costs
+ 
+-[TODO](TODO)
++An SLO is a number somebody promised, a place that number comes from, and a way of noticing that it
++is no longer true. This page is the three together, for the numbers this store actually publishes:
++every one of them is a counter a daemon logs, a counter a harness prints, or a number a page of this
++project states — there is no inventory here, no service level for a component this build does not
++have, and nothing that requires a dashboard to read. The procedure that keeps each one is
++[the runbook](runbook.md), and each row below names the stage that protects it.
+ 
+ ## The numbers, and where each one comes from
+ 
+ | the number | where it comes from | the stage that protects it | what breaks it |
+ | --- | --- | --- | --- |
+-| [TODO](TODO) | [TODO](TODO) | [TODO](TODO) | [TODO](TODO) |
++| `queue.capacity`, `queue.policy` | `src/service/config.rs` — the four layers, and what `lakeletd --check-config` prints | stage 1 | a deployment whose bound was never written down: the default is 1024 frames and `block`, and an operator reading a plan written for another box |
++| `series.limit` | `docs/cardinality.md` — `Cap::DEFAULT`, and the `series.limit` setting beside the queue's bound | stage 1 | a cap raised "to stop the refusals" without asking what the store is charged for |
++| `accepted`, `dropped` | `src/service/backpressure.rs` — the queue's counters, printed by `lakeletd`'s `queue drained` line at the stop path | stage 5 | a policy that sheds frames rather than making a producer wait: `drop-newest`, `drop-oldest` and `sample` all move `dropped`, and `dropped` is data nobody will ever read |
++| `open_handles`, `store_files`, `records` | `docs/soak.md` — the five counters a long run is judged by, and the bounds `course/tracks/lakelet/soak/4.17-soak.toml` holds them to | stage 5 | a handle or a task nobody released: the growth is one per cycle, and the machine stops at the descriptor limit long before the disk is full |
++| `tracked`, `series_admitted`, `series_rejected` | `docs/cardinality.md` — the ledger, and the identity `offered == admitted + rejected` a leak crosses | stage 6 | a label whose values come from a pod name or a request id: every frame is valid and the bill is the series |
++| `bytes_per_sample`, `stored_bytes_per_day` | `docs/capacity.md` — the model's constants, and the drift bound `course/tracks/lakelet/budget/4.20-capacity-model.toml` holds them to | stage 6 | an encoder or a workload the constant was never measured on: the model is then wrong in a confident voice |
++| `rpo_bytes`, `rpo_records` | `docs/dr-drill.md` — the write path's own `Policy::losses`, answered about the store's log | stage 2 | a flush policy that leaves more in the page cache: `never` loses everything since the last flush, `per-record` loses nothing |
++| `restored_records`, `records_missing` | `docs/dr-drill.md` — the drill's own block, and the digest comparison that makes a copy a backup | stage 3 | a copy that was never restored: the restore is the only thing that turns one into a backup |
++| `agreed` | `docs/dr-drill.md` — `lakeletq drill`'s verdict over a store it builds itself | stage 4 | a procedure that has never been rehearsed: the interrupted copy is the half that is usually skipped |
++| `moved`, `fetched`, `kept` | `src/engine/tier/mod.rs` — the sweep's and the way back's own report | stage 7 | a segment whose file was removed before its object was on the tier, or a way back nobody finished |
++| `safe_retire` | `docs/rotation.md` — `lakeletq rotate --list`, and the arithmetic `src/service/keys.rs` states | stage 8 | retiring a key before the longest token it signed has expired: every client still holding one is refused mid-flight |
++
++Two numbers are deliberately **not** here. Query latency and throughput are not promised, because
++this course never measures a wall clock into a verdict ([the perf page](perf.md) profiles a run and
++a person reads it, and [the soak page](soak.md) makes the same argument about minutes). And the
++container image's size is [the build page](build.md)'s number: it is a property of the artifact
++rather than of the deployment that serves it.
+ 
+ ## The error budget
+ 
+-In the units this deployment's failures are paid in — refusals counted, records lost, minutes to
+-restore — spent against the numbers the table above carries.
++This deployment has no percentage, and that is a decision rather than an omission: a percentage of
++an unmeasured total is a number nobody can act on. What it has is three budgets, in the units each
++failure is actually paid in — refusals counted, records lost, minutes to restore — and each one is
++spent against a number in the table above. Nothing here is a new number: every name in this section
++is one the table already carries.
+ 
+-- [TODO](TODO)
++- **refusals.** Two counters refuse. The queue's `dropped` is budgeted at zero under the policy this
++  deployment ships, because a deployment that chose `queue.policy = block` chose to make a producer
++  wait rather than to lose a frame; a `dropped` above zero is either a policy somebody changed or a
++  producer that has to be told. The cap's `series_rejected` is budgeted at zero for a series this
++  store already tracks — that must never happen, and a non-zero count of those is the cap breaking
++  the data it already holds — and above zero for names it has never seen, which is the cap doing its
++  job; the action there is the workload's `tracked`, not the cap;
++- **records lost.** Budgeted at zero per incident on the write path this deployment ships: what a
++  crash can lose is what was written inside the flush interval, which is the write path's policy
++  rather than the backup's. `rpo_records` is that budget as a count, and `records_missing` is the
++  same budget as a restore: anything above zero there is a copy that predates what the store kept,
++  and the answer is a newer copy rather than a repair;
++- **minutes to restore.** The budget is the RTO an operator plans with, and the only honest form of
++  it is a measurement with the machine named — [the DR page](dr-drill.md) has one, on an Apple M2
++  with a debug build: 1.02 s for a 2.4 MB store, and 18–20 ms for the drill's own 569-byte copy. A
++  restore that takes longer than the budget is a restore nobody has practised, and the fix is
++  stage 4 rather than a faster disk.
+ 
+ ## What happens when a budget is spent
+ 
+-- [TODO](TODO)
++- **a refusal budget is spent** — stop adding series before changing the cap. The cap is a policy
++  about state, and raising it is the one change that makes the number look better while the store
++  goes on paying for it; `lakeletq inspect series --store $LAKELET_STORE` is what that decision is
++  made from, and [the cardinality page](cardinality.md) is the argument;
++- **the records-lost budget is spent** — the incident becomes a data-loss incident. Restore the
++  newest copy that verifies into a directory that is not the store (stage 3), say which span is
++  missing before anything is swapped in, and write the loss into the postmortem, because the write
++  path's policy is what has to change;
++- **the minutes-to-restore budget is spent** — rehearse, do not optimise: the copy that has never
++  been restored is the one that will be slow, and stage 4 is the rehearsal rather than an experiment
++  on the store being served.
++
++## What this page does not do
++
++It does not invent a dashboard, it does not promise a query latency, and it does not count a number
++this project does not print. Every counter above is read out of a log line or a command a page
++names, which is what makes each of them something an operator can check during an incident with the
++runbook open beside this page.
+ 
+ ## Where the numbers are kept true
+ 
+-- [the runbook](runbook.md) — the procedure, stage by stage.
++- [the runbook](runbook.md) — the procedure, stage by stage, and the report the harness prints.
++- `docs/soak.md`, `docs/cardinality.md`, `docs/capacity.md`, `docs/dr-drill.md` and `docs/rotation.md` — the pages each row cites, each with the measurement behind its own numbers.
++- `tests/runbook_harness.rs` — the instrument that runs the procedure and makes each stage's check.
++- `tests/soak.rs` and `tests/budget_cost.rs` — the two harnesses that produce the steady state's and the model's numbers in a lane, rather than on this page.
