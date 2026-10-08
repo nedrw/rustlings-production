@@ -29,8 +29,10 @@
 | B4a | `course(lakelet/4.15-budget-regression): the engine counts work per phase, and the profile names the phase that moved` | 4.15 正文（deepen，15 用例）+ `trace/{mod,counters}.rs`（七相位计数与恒等式：计数工作不计数时间）+ `query/exec.rs` 按相位计费 + `Outcome` 带 `trace`（`EXPLAIN` 的键不动——rule 10）+ 装置 `tests/attribution.rs` 与 `budget/4.15-budget-regression.toml`（36 计数）+ 项目页 `docs/perf.md`（`links`）；框架修复：`bench-budget` 不再静默忽略基线里没有的计数 |
 | B4b | `course(lakelet/4.16-profiling): a profile is evidence, and the page carries the run that produced every number` | 4.16 正文（teach，13 用例、8 条 TRAP）+ `lakelet-load --profile`（`--cycles` 可重复、`--seconds` 按钟停）+ 项目页 `docs/profile.md`（顶部两符号 = 每次 `seal` 的四次 `sync_all`，**七个相位没有一个计到 flush**——正文据此建议段路径也走 4.3 的 `wal::Policy`）+ 规格**逐行重跑并比对页面上的那段输出**；骨架改了 17 加/2 删（补两个标记块、改单线程 runtime，实测八条 parked worker 线程会淹掉 profile）；框架无改动 |
 | B4c | `course(lakelet/4.17-soak): the gate judges counters, and the harness fails on the counter that moved` | 4.17 正文（teach，17 用例）+ 五个活计数器（`open_tasks`/`open_handles`/`store_files`/`store_bytes`/`records`）+ 装置 `tests/soak.rs`（稳态断言、`LAKELET_SOAK_MINUTES` 长形态）与 `soak/4.17-soak.toml`（`cycles_min = 4000` 下界 + 全上界）+ 项目页 `docs/soak.md`（`links`）。**plan §9 腿 2 完成**：在 `ingest::serve` 注入“句柄不放”的泄漏 → `✗ slow:soak@4000 … panicked at tests/soak.rs:356 (after 149s)`（装置点名 `open_tasks 2003 → 4002`）、`7/11 must`；回滚 → `open_tasks 2`、`11/11 must`。计时：soak 门 ~146 s |
+| B4d | `course(lakelet/4.18-cardinality-cost): cardinality is the bill, and the cap is a counted policy`（`dc8f159`；框架 `2d1c585` + `0c0300d` + `76b755f`，文档 `f4fd31c`） | 4.18 正文（teach，16 用例）+ `cardinality/{cap,mod}.rs`（带上限的准入、按系列计价、从日志与侧车索引重建的账本、`offered = admitted + rejected`）+ `lakeletq inspect series` + `docs/cardinality.md` + `soak/4.18-cardinality-cost.toml`（复跑 4.17 的界，未动）；**变异门的三次修正**：位点按文本锚定（`76b755f`）、抽样 12（`0c0300d`）、范围＝本步写下的行（`2d1c585`），并因此给 4.14/4.17 各补了三条真缺口的用例 |
+| B4e | `course(lakelet/4.19-backup-restore): a copy is a log, a restore is an ordered write` | 4.19 正文（teach，19 用例）+ `backup/{mod,manifest,restore}.rs`（副本清单＝4.4 的日志格式、只取清单点名的段与日志已证前缀、先全验后写且最后写 `segments.manifest`）+ `cli/backup.rs`（`backup`/`restore`/`drill` 三命令）+ 装置 `tests/sim_backup.rs`（完整，695 行）+ `sim/4.19-backup-restore.toml` + `docs/dr-drill.md`（RTO/RPO，带一块可逐行复跑的确定性输出）；`slow:sim@3` `5b740412/aacc05b0/b52d27f8`、`slow:mutants@80` 12/12 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.17，B4 进行中）、探题、验收演练。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.19；还差 4.20–4.24）、探题、验收演练。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -123,6 +125,17 @@
   代价是全部变异比值要重测；在那之前，比值低于 100% 要先看它是“本步的真缺口”还是“后来者的代码被抽中”。
   对照：4.7 的 `decode.rs:422 if shift > 63` 确实是 4.7 自己写的行，那是**真缺口**（一个需要第十个字节的
   varint 没被覆盖），与仪器无关。
+- **`compaction` 没有只读的 manifest 读入口（4.19 发现，未修）**：唯一的门 `Segments::open` 会**写**（删孤儿、
+  删 `segments.manifest.pending`、sync 目录），所以 4.19 的 `copy` 打开它的源就是“一次会写的读”，源在只读挂载上时
+  连打开都会失败——而线上备份工具不该改它的源。修法：给 `compaction` 一个只读的 `Manifest::load(directory)`
+  （`decode` 早已存在，只是没暴露），4.19 的 `copy` 改用它；代价是 4.19 的解补丁与规格要重跑一次。
+- **恢复后的账本窗口与源不同（4.19 发现，未修）**：`Registry::of_store` 的窗口来自活着的侧车索引（整段的 zone），
+  恢复出来的店没有 `index/`，窗口只来自日志记录。4.19 的第 12 条用例断言了成立的那个方向（系列与计数相同）、
+  并在用例里写明理由，但 `docs/cardinality.md`（4.18 的项目页）没提这个差别——收尾时可补一句。
+- **正文与规格点名了一个参考解删掉的常量（4.19 发现，未修）**：4.19 的 scaffold 在 `cli/backup.rs` 顶部给了
+  `DRILL_LINES`（27 行接口声明），正文（TASK 段）与规格的失败消息都点它的名，而参考解重写这个文件时把它删了
+  （名字活在 drill 自己的 `(name, Measurement)` 列表里）。两种修法：参考解保留常量（并可加一条“打印的名字就是它
+  声明的那些”的用例），或把正文与消息改成指“接口”而不指常量。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
   第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
@@ -168,4 +181,14 @@
     4.14–4.18 移动过的代码，因为它**不是自己写的**而红）。`Written { line, text }`：行号给读者，文本给走查。
     **例外只有一个**：4.17 的 `slow:mutants@70`——它**只有 8 个可判位点**，其中两个经实测任何测试都看不见
     （`fsync` 与 `F_FULLFSYNC` 在 `O_RDONLY` 描述符上都成功），所以 6/8 = 75% 就是它的天花板；
-    阈值写在元数据里、理由写在日志里。
+    阈值写在元数据里、理由写在日志里。**第二次实证（4.19）**：抽样收窄到本步自己的行之后，本步的
+    “管道”里仍有几行没有用例看得见——4.19 抽到 drill 的旗标循环两行与两处守卫，作者补了第 19 条用例
+    （drill 的路径处理）才把 12 个位点全杀。教训：**“本步写下的每一行都要有一条用例抵达”不是自动成立的**；
+    抽样存活时先问“谁该看见它”，再谈噪声。
+
+18. **页面上那些门判不了的数字，要有一个可复跑的确定性块**（4.16 立、4.19 收）。4.16 的 `docs/profile.md` 与
+    4.19 的 `docs/dr-drill.md` 都带一段“命令 + 逐行输出”，规格**重跑那条命令并逐行比对**——页面上的数字是量出来的，
+    让它保持真实的唯一办法是让产出它的命令被判（4.19 实测：把页面上 `copy_bytes=569` 改成 `570`，
+    `the_page_carries_the_drill_the_command_prints` 立刻红）。**墙钟不进那块**：RTO/耗时写在正文里、机器名写清楚，
+    需要打印时放在环境变量后面（4.19 的 `LAKELET_DRILL_TIMED=1`），否则同一台机器两次运行就会给出不同字节，
+    而 `slow:sim@N` 的重放会因此失败。

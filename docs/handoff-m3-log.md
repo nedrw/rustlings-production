@@ -1304,3 +1304,66 @@ $ cargo test -q -p kiln → 322 + 21 + 1 · clippy 干净 · fmt 干净
 （t lakelet 18/18 + jobq 八步；`verify --slow` 第一次在尾巴树上全绿，M3 验收的形状达成）；③ **一个新的
 经验**：门的“位点”必须按内容锚定，按行号锚定等于把后来者的代码算在前面的步骤头上——这条与 §5 的
 “抽样范围”是同一个教训的两半。
+
+## 段 24：B4e — 4.19 `ops/backup-restore@apply`（副本自己就是一本日志，恢复是一次有顺序的写）
+
+**4.19 做了什么**：`spec/4.19/backup_restore.rs`（1709 行、**19** 用例）、`scaffold/4.19-backup-restore.patch`
+（1912 行、**0 删除**：`engine/backup/{mod,manifest,restore}.rs` 与 `cli/backup.rs` 的契约桩、完整的
+`tests/sim_backup.rs`（695 行）、`docs/dr-drill.md` 的桩、两处标记块插入）、
+`solutions/4.19-backup-restore.patch`（2042 行、碰 6 个文件：四个契约件写满 + `cli/mod.rs` 的 dispatch/USAGE/`readable()`）、
+`sim/4.19-backup-restore.toml`（53 行）、正文 177 行、`docs/dr-drill.md`（234 行）。`track.toml` 未动（11 must）。
+
+五条不变量：
+① **副本的清单是一本日志**——`<copy>/backup.manifest` 用 4.4 的格式（`introduce`/`encode`/`scan`），所以被中断的副本
+   按前缀恢复，与写被中断的日志同一条规则；
+② **复制的是“清单点名的那套文件”**——清单先读（它就是文件清单；4.8：manifest 就是 store）、点名的段按序、
+   日志只取 `Recovered::bytes()` 证得出的前缀，`index/` 与 `*.pending` 明确不取；
+③ **顺序即语义**：每个文件先写字节、`sync_all`，再追加清单条目并 `sync_all` 清单——“清单说什么是完整的”是代码的
+   顺序，不是对文件系统的断言；
+④ **恢复先全验后写**，且最后写 `segments.manifest`（4.8 的提交点）——被拒的恢复把目标目录原样留下，半吊子恢复
+   目录不是 store（正文与 TRAP 各写一遍“不要打开它看”）；
+⑤ **RPO 是写路径的策略、不是备份工具的观点**（4.3 的 `Losses`），**RTO 是带机器名的墙钟**
+   （页面：Apple M2 / Darwin 25.6.0 / 2.4 MB、202 段、200,008 记录 → backup 1.85s、restore 1.02s）。
+`lakeletq drill` 是这条不变量的可复跑形态：无时钟、同一台机器上字节相同，页面逐行引用、规格重跑比对。
+
+**与作业书不同的几处决定**（正文/规格与它们一致）：`backup::Error` 用模块内枚举 + `class()`（照 4.11 `Refusal` 的
+先例；`error.rs` 没有标记块，且“哪类失败是哪个退出码”属于能分辨它们的模块）；`lakeletq drill` 是第三个子命令
+（页面引用的确定性块需要一个出处）；恢复的 `Outcome` 里 `epoch`/`floor` 来自副本清单本身而不是打开恢复出来的店
+（被中断的副本恢复出的目录根本不是 store）。规格从 16–18 用例变成 19：第 19 条（drill 的旗标处理）是变异门看得到的
+唯一出路。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane19`：4.1…4.19 逐级 `run`+`solution`，再 `check --slow`）：
+
+```
+$ kiln selftest lakelet/4.19-backup-restore --track lakelet      # 90s
+    scaffold ✓ the spec fails as it must（第一条红：a_copy_interrupted_before_its_first_byte…）
+    solution ✓ reference patch applies / solution ✓ the spec passes
+    gates ✓ 11/11 must green
+$ kiln check lakelet/4.19-backup-restore --slow                  # 全新副本，72s
+  ✓ links 74 link(s) in 12 page(s) resolve
+  ✓ slow:sim@3 transcripts 5b740412/aacc05b0/b52d27f8（seed 1 逐字节重放）
+  ✓ slow:mutants@80 12/12 mutant(s) killed (100%)   → 11/11 must gate(s) passed
+$ kiln spec manifest --track lakelet → 19 file(s) pinned（4.19 的 sha256 与清单一致：de1de0ea…）
+$ kiln lint-caps / links / i18n status / probe --check → 全 exit 0（probe 41/41）
+$ cargo test -q -p kiln → 322 + 21 + 1 · clippy --workspace --all-targets -D warnings 干净 · fmt --all --check 干净
+$ 4.19 落上之后再跑被它改过 `cli/mod.rs` 的那几步规格：spec_downsampling 17 · spec_query_engine 18 ·
+  spec_index_pruning 22 · spec_cardinality 16 · spec_retention 15 · spec_soak 18 → 全绿（rule 10 的实测）
+```
+
+**三条演练**（每条红→回滚→绿）：
+1. 作者：去掉 `verified()` 的长度比较 → `a_flipped_byte_and_a_cut_file_are_two_different_refusals` 红
+   （实际打印 `Damage::Checksum`，用例要的是 `Damage::Short` 那条句子）。
+2. 作者：把“先全验后写”改成“写一个验一个” → `a_copy_missing_a_named_file_is_refused_and_leaves_the_destination_as_it_was` 红。
+3. 我（父）：删掉整个 `for entry in loaded.entries() { verified(source, entry)? }` 前置校验 → **17 passed 2 failed**
+   （`…leaves_the_destination_as_it_was` 与 `the_restore_command_refuses_a_damaged_copy_and_a_destination_that_is_a_store`）；
+   回滚 19 passed。**页面那块也是被判的**：把页面上 `copy_bytes=569` 改成 `570` →
+   `the_page_carries_the_drill_the_command_prints` 红（打印 left/right 两份 27 行），回滚绿——4.16 的
+   “页面上的数字是跑出来的”在这里第二次成立（已写成 §1 第 18 条）。
+
+**三处坑与一个小瑕疵（未修，§5 有记）**：`compaction` 没有只读的 manifest 读入口（`Segments::open` 会写，
+所以 copy 的读会改源）；恢复后的账本窗口与源不同（`Registry::of_store` 的窗口来自侧车索引，恢复的店没有
+`index/`），第 12 条用例只断言成立的那个方向；正文与规格的失败消息点名 `DRILL_LINES`，而参考解重写
+`cli/backup.rs` 时删了这个常量。
+
+**这一步钉下来的两件事**：① **4.19 落地**（B4 只剩 4.20）；② **规则 17 的第二次实证**：变异门抽到的 4 行
+（drill 旗标循环两行、两处守卫）只有靠新增第 19 条用例才能杀——“规格必须抵达本步写下的每一行”不是自动成立的。
