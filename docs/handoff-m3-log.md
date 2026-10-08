@@ -1525,3 +1525,59 @@ $ cargo test -q -p kiln → 322+21+1 · clippy 干净 · fmt 干净
 
 **这一步钉下来的两件事**：① **4.22 落地**（只差 4.23/4.24；腿 6 的第二半等引擎）；② **规则 21**（多个 bin 的项目
 必须 `default-run`，已落地并有用例把守）。发现的四件事（引擎、`MAILER__` 前缀、补丁模式位、暖 registry）记在 §5。
+
+## 段 28：B5c — 4.23 `sec/secrets-management@design`（两把钥匙都有效，一把优先，窗口是算术）
+
+**4.23 做了什么**：`spec/4.23/rotation.rs`（1327 行、**16** 用例 + `slow:sim@3`）、
+`scaffold/4.23-secret-rotation.patch`（1245 行、**+1104 / −0**、7 个文件：`service/keys.rs` 与 `cli/rotate.rs` 的契约桩、
+**完整的** `tests/sim_rotation.rs`、`docs/rotation.md` 的桩、两处标记块、`Cargo.toml` 的 `subtle = "2.6"`）、
+`solutions/4.23-secret-rotation.patch`（1605 行、**+1254 / −48**，5 个文件）、`sim/4.23-secret-rotation.toml`（60 行）、
+正文 227 行、`docs/rotation.md` 211 行。`track.toml` 未动（10 must）。两份补丁打到全新 `base22` 副本上与开发树
+`diff -r` 一致。
+
+五条不变量：① **令牌是 4.1 帧里的一个载荷**（帧布局一字未动；载荷 = 长度前缀的 `client_id`/`key_id` + 两个 u64 + 
+64 字节小写十六进制的 HMAC-SHA-256，签的字节就是发出去的字节）；② **空环 = 鉴权关**（4.6/4.17 的装置不带令牌直接
+连，这是 rule 10 的硬约束），而**存在但一个 `*.key` 也没有的目录是拒绝**（fail-open 是环唯一不能给的答案）；
+③ **环按连接读**——所以轮换在一台**运行中**的守护进程上立即生效、不用重启（代价是每连接一次目录读，页面写明）；
+④ **窗口是算术**：`earliest_safe_retirement` = 后继的 `not_before` + `MAX_TOKEN_LIFETIME_MILLIS`，而正在签发的那把
+是 `None`（所以“先把后继加进来”是一句被拒绝的拒绝，不是一句警告）；提前退休是 `4` 类拒绝并点名那个时刻；
+⑤ **标签比较走 `subtle`**（relay/2.11 的课），而守护进程**只在一个私有位置读钟**（`service/ingest.rs::now_millis`），
+规格把“`src/service/**` 里只有这一处读钟”杆住——因为这处不能再传给 `serve`（见下）。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane23`：4.1…4.23 逐级 `run`+`solution`，再 `check --slow`）：
+
+```
+$ kiln selftest lakelet/4.23-secret-rotation --track lakelet      # 44s
+    scaffold ✓ the spec fails as it must · solution ✓ passes · gates ✓ 10/10 must green
+$ kiln check lakelet/4.23-secret-rotation --slow                  # 全新副本，23s
+  ✓ slow:sim@3 3 seed(s) ran, transcripts 7867e017/a3de9fc0/f43918f3（seed 1 逐字节重放）
+  ✓ links 111 link(s) in 16 page(s) · 其余八道全绿  → 10/10 must gate(s) passed
+$ 尾巴树上重跑“被 4.23 改过的路径”的旧装置（rule 10 的实测）：
+  spec_backpressure 13 · spec_soak 18 · spec_rotation 16 · sim_backpressure 1 · sim_rotation 1 → 全绿
+$ kiln spec manifest --track lakelet → 24 pinned（4.23 的 sha256 与清单一致：b8a6b813…）；scaffold 删除 0 行
+$ kiln lint-caps / links / i18n status / probe --check → 全 exit 0 · cargo test -q -p kiln → 322+21+1 · clippy/fmt 干净
+$ CARGO_TARGET_DIR=… cargo build --offline -q（base23）→ exit 0
+```
+
+**演练**（我自己重做）：把窗口从“后继的 `not_before` + 最长寿命”改成“接管即退休”：
+
+```
+the_rotation_window_is_arithmetic_and_a_retirement_one_millisecond_early_is_refused --- FAILED
+  left: Some(1700001000000)   right: Some(1700004600000)     （差 3 600 000 ms = 窗口）
+以及 sim：a_rotation_across_the_boundary_does_not_strand_a_client --- FAILED
+回滚 → 1 passed（两条都绿）
+```
+
+**三个种子实测**（写进 sim 文件的注释）：seed 1 — 4 个客户端 / 轮换落在第 2 批后 / k1 签 1、k2 签 2 / 6 批；
+seed 7 — 5 个 / 第 3 批后 / 3 : 1 / 8 批；seed 20260101 — 5 个 / 第 2 批后 / 2 : 2 / 8 批；三个种子都是
+`refused inside_lifetime=0 late=1`、`ring keys=2 preferred=k2`、`verdict held`（“晚到”的那一个客户端的令牌在跑之前就已过期）。
+
+**十个与作业书不同之处**（关键词，都已接受）：**守护的钟**只能自己读——`tests/soak.rs`（4.17 交付的课程文件）在
+**进程内**调四参数的 `ingest::serve`，签名被 rule 10 冻住；`Refusal` 多一个 `Malformed`（“这不是令牌”与“令牌不好”
+是两件事）；`--list` 的**每**行都带 `safe_retire=`；签名的那把的 `safe_retire` 是 `None`；空目录拒绝；`--retire`
+的 `--at` 默认就是最早安全时刻；`--add` 拒绝重复 id（把钥匙在活客户端底下换掉正是这一步的失败模式）；`cli/mod.rs`
+属于解（4.19 的先例）；16 条里两条在 scaffold 状态就绿（空环接受、旧装置的守卫）是设计，不是缺口。
+
+**这一步钉下来的两件事**：① **4.23 落地**（只差 4.24）；② **规则 10 的第三次补充**：冻结签名的不是只有规格——
+**已有的课程装置在进程内调过的签名同样被冻住**，写新步骤前要先查。发现的四件事（就绪探测、两个块长得像、
+没有“只检查钉”的命令）记在 §5。

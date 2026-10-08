@@ -34,8 +34,9 @@
 | B4f | `course(lakelet/4.20-capacity-model): the model and the comparison, judged in one lane` | 4.20 正文（teach，14 用例）+ `engine/cost.rs`（`Model`/`Usage`/`Estimate`/`Measured`/`Predicted`/`Drift`/`Agreement`：整数微单位、无浮点、不读任何东西）+ 完整装置 `tests/budget_cost.rs` + `budget/4.20-capacity-model.toml`（35 计数）+ `docs/capacity.md`（模型的 25 行块 + 保留期表，规格逐行/逐格重算）；`slow:bench-budget@10` 实测：模型与店之间的漂移 23/0/0/2/12/24 ‰；**演练**：把 `bytes_per_sample` 4→5（20%）→ 35 个计数里 10 个越界（点名 `drift_segment_bytes_permille_max 181 > 40`、`within_max 1 > 0`）、`9/10 must`；回滚 `10/10` |
 | B5a | `course(lakelet/4.21-cold-tiering): the tier is a port, the client signs, and the suite runs twice` | 4.21 正文（deepen，**27** 用例）+ `tier/{mod,http,s3,filesystem}.rs`（blob 端口 `put/get/delete/分页 list`、`Policy`、`sweep`（先 put 后删本地）与 `hydrate`）+ 完整装置 `tests/s3_stub.rs`（进程内 S3 形状端点，带请求日志与故障注入）+ `tests/support/tier.rs`（`KILN_BACKEND`）+ `conformance.toml`；`slow:conformance@2` `local ✓ s3 ✓`、`slow:mutants@80` 10/12（83%，两个不可见位点见 §5）；SigV4 用 AWS 自己的 get-vanilla 向量钉住；演练：把顺序倒过来（先删本地）→ `the_window_between_the_object_and_the_delete_is_readable_from_both_sides` 红 |
 | B5b | `course(lakelet/4.22-reproducible-build): the same source, the same bytes`（+ `course(lakelet): the project names the default binary a bare cargo run means`） | 4.22 正文（deepen，16 用例）+ 项目七个文件（两阶段 `Dockerfile`、项目自己的 `rust-toolchain.toml`、`.github/workflows/ci.yml`、`deny.toml`（从 lockfile 用 `cargo metadata` 推导）、`scripts/repro.sh`（两次构建逐字节比较，只印计数与名字）、`docs/build.md`、`docs/supply-chain.md`）；实测 `scripts/repro.sh` → `artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（34 s）；**`images` 绿**（两个声明镜像在本机），**`container-repro` 红——但是引擎的**（见 §5）；骨架补 `default-run = "lakeletd"`（否则门问宿主用 `cargo run --package lakelet` 根本得不到答案），并补一条用例钉住它 |
+| B5c | `course(lakelet/4.23-secret-rotation): two keys valid, one preferred, and the window is arithmetic` | 4.23 正文（deepen，16 用例 + `slow:sim@3`）+ `service/keys.rs`（环/令牌/`Refusal`/`Window`/`earliest_safe_retirement`）+ `ingest.rs` 的连接级鉴权（令牌是首载荷，拒绝计在 4.6 已经数拒绝的地方）+ `cli/rotate.rs`（`--add`/`--retire`/`--list`）+ 完整 `tests/sim_rotation.rs` + `docs/rotation.md`；sim 三个种子 `7867e017/a3de9fc0/f43918f3`（seed 1 重放）；演练：把窗口改成“接管即退休”→ 算术用例 `left Some(1700001000000) / right Some(1700004600000)` 红 + sim 红；回滚绿 |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.22；还差 4.23–4.24）、探题、验收演练。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
+尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.23；**只差 4.24**）、探题、验收演练。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -175,6 +176,14 @@
 - **`kiln` 的补丁器忽略 `new file mode`（4.22 发现，未修）**：`src/patch.rs` 不设文件模式，所以 `scripts/repro.sh`
   在学员的树里是 `-rw-r--r--`（`kiln run` 后直接 `./scripts/repro.sh` 会 EACCES）。4.22 的正解是让规格跑 `sh
   scripts/repro.sh` 并查 `#!` 行，页面写 `chmod +x`；修 `patch.rs` 可以以后做（代价是要重验所有含可执行文件的补丁）。
+- **服务夹具的就绪探测会在规格写钥匙环之前连一次（4.23 发现，未修，无実害）**：`support::service` 的启动探测
+  带着空载荷连一次，如果规格是“先 `Service::start` 再写环”，那次探测的环加载可能先跑并记下一行
+  `the key ring could not be read … holds no `*.key``（探测本身不计数、不判红）。规格作者读日志时会看到它。
+- **“环的块”与“钥匙文件的块”在页面上长得像（4.23 给出解法）**：`docs/rotation.md` 展示一个钥匙文件（也含 `id=` 行），
+  而 `lakeletq rotate --list` 的行是 `id=… safe_retire=…`；后来写页面的人要用后者的形状才能把两个块分开。
+- **没有“只检查钉、不写文件”的 `kiln` 命令（4.23 遇到）**：验证手钉的 `spec/manifest.toml` 行只能靠在副本里重跑
+  `kiln spec manifest --track lakelet` 再 `diff`（4.23 的作者就是这么做的，结果一致）。收尾时可以考虑给 `spec manifest`
+  加一个 `--check`。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
   第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
@@ -224,6 +233,10 @@
     “管道”里仍有几行没有用例看得见——4.19 抽到 drill 的旗标循环两行与两处守卫，作者补了第 19 条用例
     （drill 的路径处理）才把 12 个位点全杀。教训：**“本步写下的每一行都要有一条用例抵达”不是自动成立的**；
     抽样存活时先问“谁该看见它”，再谈噪声。
+    **第三次（4.23，关于签名而不是变异）**：冻结一个签名的不是只有规格——**项目里的装置也会在进程内直接调它**。
+    `tests/soak.rs`（4.17 交付的课程文件）调的是四参数的 `ingest::serve`，于是 4.23 不能在它的签名上加“时钟”参数
+    （只能让服务在**一个**私有位置自己读钟，并让规格把“只有这一处读钟”钉住）。写新步骤前先看有没有**已有的装置**
+    在调那个签名。
 
 18. **页面上那些门判不了的数字，要有一个可复跑的确定性块**（4.16 立、4.19 收）。4.16 的 `docs/profile.md` 与
     4.19 的 `docs/dr-drill.md` 都带一段“命令 + 逐行输出”，规格**重跑那条命令并逐行比对**——页面上的数字是量出来的，
