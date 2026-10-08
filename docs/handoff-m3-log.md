@@ -1581,3 +1581,59 @@ seed 7 — 5 个 / 第 3 批后 / 3 : 1 / 8 批；seed 20260101 — 5 个 / 第 
 **这一步钉下来的两件事**：① **4.23 落地**（只差 4.24）；② **规则 10 的第三次补充**：冻结签名的不是只有规格——
 **已有的课程装置在进程内调过的签名同样被冻住**，写新步骤前要先查。发现的四件事（就绪探测、两个块长得像、
 没有“只检查钉”的命令）记在 §5。
+
+## 段 29：B5d — 4.24 `ops/runbook-drill@operate`（页子是程序，装置是证据）—— **T4 的 24 步全部写成**
+
+**4.24 做了什么**：`spec/4.24/runbook.rs`（855 行、**14** 用例 + 装置自己的一条 = 15）、
+`scaffold/4.24-runbook-drill.patch`（2234 行、**+2216 / −0**：完整的 `tests/runbook_harness.rs`（2041 行）+ 两页的桩）、
+`solutions/4.24-runbook-drill.patch`（427 行、**+242 / −84**：只改两页）、正文 232 行、`docs/runbook.md` 249 行（8 阶段）、
+`docs/slo.md` 84 行（11 行数字表 + 错误预算）。`track.toml` 未动（9 must）。
+
+四件不变事：① **页面即数据**：装置把 `docs/runbook.md` 读成 stages-as-data（`### N. 标题` + 五个义务：命令/信号/状态/回滚/告知谁）；
+② **义务就是判据**：缺一项是一个 **finding**（带阶段号、名、一句话），不是 panic；读者可以喂**文本**（所以规格能用变形页判缺口）；
+③ **命令真跑**：装置拿页面上的命令当 `CARGO_BIN_EXE_*` 二进制，在它自己建的店上跑（8 个真检查：
+`settings-print`/`copy-holds-the-store`/`restore-holds-the-records`/`drill-agrees`/`counters-flat`/`bill-adds-up`/`cold-span-answered`/`window-respected`），
+每个命令都必须是工程自己语法里的成员（写成 `lakeletq tier sweep …` 会被报成“不是 `lakeletq` 的语法”）；
+④ **规格拿装置当仪器**：`#[path = "runbook_harness.rs"] mod harness;`（先验证能编译再动其它东西），
+所以“页面上的命令真能跑”是判出来的，不是声称的。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane24`：4.1…4.24 逐级 `run`+`solution`，再 `check --slow`，再 `verify lakelet`）：
+
+```
+$ kiln selftest lakelet/4.24-runbook-drill --track lakelet      # 9/9 must
+    scaffold ✓ the spec fails as it must · solution ✓ passes · gates ✓ 9/9 must green
+$ kiln check lakelet/4.24-runbook-drill --slow（全新副本）→ 9/9 must gate(s) passed
+$ 同一棵树：cargo test --test spec_runbook → 15 passed（2.81s）；--test runbook_harness → 1 passed
+$ kiln verify lakelet      # 24 步齐了！98s
+  23/24 judged step(s) pass · 1 failed · 0 not prepared · 0 without content
+  ✗ 4.22 failed — the specs pass but a must gate does not（就是 container-repro / 引擎）
+$ kiln spec manifest --track lakelet → 25 pinned（4.24 的 sha256 与清单一致：59d6df24…）；scaffold 删除 0 行
+$ kiln lint-caps / links / i18n status / probe --check → 全 exit 0 · cargo test -q -p kiln → 344 passed · clippy/fmt 干净
+```
+
+**装置对页面的报告**（页面引用它、规格重跑逐行比对）：
+
+```
+lakelet-runbook stages=8 ran=8 holds=8 rolled_back=1 undone=1 findings=0
+stage=1 runs="lakeletd --check-config" … stage=5 的 rollback=command（写了记录，回滚是那个 copy），
+stage=8 的 rollback=none（改了环，回滚不重要），其余六个读阶段 `nothing was taken`
+```
+
+**演练**（我自己重做）：删掉第 6 阶段的 `- signal:` 行：
+
+```
+stage 6 does not say what its `signal` is: the five parts are the whole of what a stage owes, and the one
+  nobody writes is the one somebody needs at three in the morning      → FAILED（规格用例）
+装置：docs/runbook.md does not hold (8 stage(s) ran, 8 held out of 8): stage 6 does not meet `signal` …
+回滚 → 页面的报告回到 stages=8 ran=8 holds=8 findings=0，两条都绿
+```
+
+**与作业书不同的六处**（都被接受）：用例 12/14 的两半改由课程侧门判（`app/lakelet` 里的规格读不到 `course/docs/steps/…`）；
+**阶段 7 点不出 tier 命令**（`sweep`/`hydrate` 只有引擎侧——页面写明，装置把 sweep 演成“世界”，§5 有记）；
+**8 个阶段而不是 9**（容量评审并入阶段 6，两页交叉引用仍然双向判）；**装置自带 `Dir` 不用 `tests/support/**`**（
+既避开 `duplicate_mod`，也不让课程文件依赖学员拥有的夹具）；信号规则把 `spec_*.rs` 排除在外（否则用例自己的源码会回答它发明的名字）。
+
+**这一步钉下来的两件事**：① **T4 的 24 步全部写成**（`verify lakelet` 第一次判满 24 步：**23/24**，唯一失败是环境）；
+② **规则 22**：尾巴树编译每一份规格，所以一份新规格的 lint 会让 24 步全红（4.24 的第一轮 lane 就是 `0/24`）——`clippy@4`
+比 `cargo clippy --all-targets` 多几条 lint。发现的四件事（tier 命令缺失、query vs inspect 的可见性、soak 界的不可复用、
+停守护的竞态）记在 §5。**下一步收尾**：探题（BP）与 `xtask ci`/离线/`verify --slow --json`（BV）。

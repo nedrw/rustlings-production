@@ -35,8 +35,9 @@
 | B5a | `course(lakelet/4.21-cold-tiering): the tier is a port, the client signs, and the suite runs twice` | 4.21 正文（deepen，**27** 用例）+ `tier/{mod,http,s3,filesystem}.rs`（blob 端口 `put/get/delete/分页 list`、`Policy`、`sweep`（先 put 后删本地）与 `hydrate`）+ 完整装置 `tests/s3_stub.rs`（进程内 S3 形状端点，带请求日志与故障注入）+ `tests/support/tier.rs`（`KILN_BACKEND`）+ `conformance.toml`；`slow:conformance@2` `local ✓ s3 ✓`、`slow:mutants@80` 10/12（83%，两个不可见位点见 §5）；SigV4 用 AWS 自己的 get-vanilla 向量钉住；演练：把顺序倒过来（先删本地）→ `the_window_between_the_object_and_the_delete_is_readable_from_both_sides` 红 |
 | B5b | `course(lakelet/4.22-reproducible-build): the same source, the same bytes`（+ `course(lakelet): the project names the default binary a bare cargo run means`） | 4.22 正文（deepen，16 用例）+ 项目七个文件（两阶段 `Dockerfile`、项目自己的 `rust-toolchain.toml`、`.github/workflows/ci.yml`、`deny.toml`（从 lockfile 用 `cargo metadata` 推导）、`scripts/repro.sh`（两次构建逐字节比较，只印计数与名字）、`docs/build.md`、`docs/supply-chain.md`）；实测 `scripts/repro.sh` → `artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（34 s）；**`images` 绿**（两个声明镜像在本机），**`container-repro` 红——但是引擎的**（见 §5）；骨架补 `default-run = "lakeletd"`（否则门问宿主用 `cargo run --package lakelet` 根本得不到答案），并补一条用例钉住它 |
 | B5c | `course(lakelet/4.23-secret-rotation): two keys valid, one preferred, and the window is arithmetic` | 4.23 正文（deepen，16 用例 + `slow:sim@3`）+ `service/keys.rs`（环/令牌/`Refusal`/`Window`/`earliest_safe_retirement`）+ `ingest.rs` 的连接级鉴权（令牌是首载荷，拒绝计在 4.6 已经数拒绝的地方）+ `cli/rotate.rs`（`--add`/`--retire`/`--list`）+ 完整 `tests/sim_rotation.rs` + `docs/rotation.md`；sim 三个种子 `7867e017/a3de9fc0/f43918f3`（seed 1 重放）；演练：把窗口改成“接管即退休”→ 算术用例 `left Some(1700001000000) / right Some(1700004600000)` 红 + sim 红；回滚绿 |
+| B5d | `course(lakelet/4.24-runbook-drill): the procedure, and the instrument that runs it` | 4.24 正文（deepen，**`ops/runbook-drill@operate`**，14 用例）+ 完整装置 `tests/runbook_harness.rs`（2041 行：把页面读成 stages-as-data、五个义务、八个真检查、将页面命令当 `CARGO_BIN_EXE_*` 拿真店跑、缺口当 finding）+ 学习者的两页 `docs/runbook.md`（8 阶段）/`docs/slo.md`（11 行数字表 + 错误预算）；规格通过 `#[path = "runbook_harness.rs"] mod harness;` 拿装置当仪器；演练：删掉第 6 阶段的 `- signal:` → 用例与仪器双双点名；回滚绿。**T4 的 24 步至此全部写成** |
 
-尚未落地：T4 的 24 步正文/规格/参考解（已交付 4.1–4.23；**只差 4.24**）、探题、验收演练。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
+尚未落地：**探题（BP，T4 的 24 道）**与 **收尾（BV）**——`cargo xtask ci`、离线快路、`verify lakelet --slow --json`、`docs/t4-lakelet.md`、本文件 §0–§5 补全。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
 
 ## 1. 施工中钉下来的规则（收尾时并入 §3）
 
@@ -184,6 +185,18 @@
 - **没有“只检查钉、不写文件”的 `kiln` 命令（4.23 遇到）**：验证手钉的 `spec/manifest.toml` 行只能靠在副本里重跑
   `kiln spec manifest --track lakelet` 再 `diff`（4.23 的作者就是这么做的，结果一致）。收尾时可以考虑给 `spec manifest`
   加一个 `--check`。
+- **tier 的 `sweep`/`hydrate` 在 `src/cli`/`src/bin` 里没有入口（4.24 发现，未修）**：4.21 只交了引擎侧的两个 pass，
+  于是 4.24 的 runbook 阶段 7 无法点出一个 tier 命令（页面写明这一点，装置把 sweep 当“世界”自己演）；且已停的冷店
+  根本打不开（§5 的只读 manifest 那条）。两条一起修最自然：一个 `lakeletq tier --sweep/--hydrate`（或把 sweep 接进
+  守护的维护 tick），并在 `compaction` 里开一个只读的 manifest 载入。
+- **`lakeletq query` 只看段，`inspect series` 看日志 + 活索引（4.24 发现，未修）**：记录还在日志里的店，query 答不出
+  任何东西，而账单却能列出一切。4.24 是有意用它（阶段 5 的 `records` 是清单的数，装载的记录对阶段 7 不可见），
+  但一个操作员会跌进去——以后某页写一句。
+- **`soak/4.17-soak.toml` 的界是它自己那台店的形状（4.24 发现，未修）**：13 个文件、2743 字节，没有任何 runbook 能复用；
+  4.24 的阶段 5 改判形状（`open_handles = 0`、`records` = flush 封过的数、客户端的 `batches` == 守护的 `accepted`），
+  只把那份文件引为长形态。
+- **客户端返回就立刻停守护会少数几帧（4.24 发现，已写进装置）**：第一次实测 61/63。正解是等守护那行 `connection closed`；
+  任何以后启动/停一个活守护的装置都该知道这一条。
   第三个实测点（4.12）：活下来的位点是 `src/cli/mod.rs:678 if windows > MAX_WINDOWS`，而 `MAX_WINDOWS`
   在 4.12 的参考解补丁里出现 **0 次**（4.10 有 3 次、4.11 有 5 次）——更早两步的行被 4.12 的规格判了。
   第四个实测点（4.14）：它的补丁**必须**碰 `cli/mod.rs`（4.11 的 JSON 键断言逼出来的），于是抽样抽到
@@ -266,3 +279,10 @@
     修法（已落地）：骨架的 `[package]` 里写 `default-run = "lakeletd"`（守护进程才是部署启动的那个），
     并让规格用一条用例钉住“默认二进制就是镜像入口点跑的那个”；验证：重建 base22 后
     `cargo run --quiet --package lakelet -- --check-config` → 配置报告 + `exit=0`。以后的 track 同理。
+
+22. **尾巴树会编译每一个规格，所以一份新规格的 lint 会让 24 步全红**（4.24 实测）。`clippy@4` 不是
+    `cargo clippy --all-targets -- -D warnings`：它另开 `missing_errors_doc`、`manual_let_else`、
+    `match_wildcard_for_single_variants`、`semicolon_if_nothing_returned`、`uninlined_format_args` 等效额外的 lint；
+    4.24 的第一轮 lane 里，作者的新规格有一条 `uninlined_format_args`，于是 `verify lakelet` 一次报 **0/24**
+    （每个步骤的 clippy 都要过那棵树的所有测试目标，而那份规格在里面）。写规格时就把这五条当格式要求，
+    并在 lane 里先跑一次 `check --slow` 而不是直接相信 `cargo clippy`。
