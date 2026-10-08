@@ -1367,3 +1367,55 @@ $ 4.19 落上之后再跑被它改过 `cli/mod.rs` 的那几步规格：spec_dow
 
 **这一步钉下来的两件事**：① **4.19 落地**（B4 只剩 4.20）；② **规则 17 的第二次实证**：变异门抽到的 4 行
 （drill 旗标循环两行、两处守卫）只有靠新增第 19 条用例才能杀——“规格必须抵达本步写下的每一行”不是自动成立的。
+
+## 段 25：B4f — 4.20 `ops/capacity-cost@design`（模型与比较同在一个门里判）+ B4 完成
+
+**4.20 做了什么**：`spec/4.20/capacity.rs`（960 行、**14** 用例）、`scaffold/4.20-capacity-model.patch`
+（1381 行、**0 删除**：`src/engine/cost.rs` 的契约桩 + 完整装置 `tests/budget_cost.rs` + `docs/capacity.md` 的桩
++ `pub mod cost;` 一行）、`solutions/4.20-capacity-model.patch`（839 行，只碰两个文件）、
+`budget/4.20-capacity-model.toml`（128 行、**35 计数**）、正文 190 行、`docs/capacity.md`（271 行）。`track.toml` 未动（10 must）。
+
+三条不变量：① **模型是带单位的整数值**（`Model` 八个常数、微单位美元、钱路上一个 `f64` 都没有；三个字节率分别
+  来自 4.7 的编码、4.14 的侧车、写路径的日志）；② **算术写在名字带单位的方法里**，`monthly_micros == ingest +
+  storage + query` 是一个可以被反例推翻的表达式而不是一句文言；③ **比较是代码**：`Measured`（店真写的）对
+  `Model::predicts`，每个量一条 `Drift`（点名哪个常数、往哪个方向、差多少‰）——模型漂了是**门的红**，
+  不是页面上的一句陈话。头行：`Usage::DEFAULT`（百万事件/天）→ **$0.444/月**、**14 798 微单位/百万事件**，
+  份额 ingest 947‰ / storage 50‰ / query 3‰（字节侧：样本 113‰ / 系列 2‰ / **日志 885‰**）。
+
+**原始结论行**（我自己的构建 + 全新副本 `l4b3-lane20`：4.1…4.20 逐级 `run`+`solution`，再 `check --slow`）：
+
+```
+$ kiln selftest lakelet/4.20-capacity-model --track lakelet      # 40s
+    scaffold ✓ the spec fails as it must（第一条红：agreement_accepts_a_model_five_percent_off…）
+    solution ✓ reference patch applies / solution ✓ the spec passes
+    gates ✓ 10/10 must green
+$ kiln check lakelet/4.20-capacity-model --slow                  # 全新副本，20s
+  ✓ slow:bench-budget@10 35 metric(s) judged（26 在 ±10% 内、9 条上界）
+    漂移：drift_segment_bytes 23‰ / index 0 / log 0 / on_disk 2 / selective_query 12 / wide_query 24
+    agreement_permille_max 100、within_max 0、refused_max 0   → 10/10 must gate(s) passed
+$ kiln spec manifest --track lakelet → 20 pinned（4.20 的 sha256 与清单一致：e4ba1970…）
+$ kiln lint-caps / links / i18n status / probe --check → 全 exit 0
+$ cargo test -q -p kiln → 322 + 21 + 1 · clippy 干净 · fmt 干净
+$ kiln verify lakelet（作者在同一副本上）→ 20/20 judged step(s) pass · 0 failed · 4 without content
+```
+
+**漂移演练**（我复现，不只读报告——这才是这一步的判据）：把 `Model::DEFAULT` 的 `bytes_per_sample` 从 4 改成 5
+（+20%）后重跑 `check --slow`：
+
+```
+✗ slow:bench-budget@10 10 of 35 metric(s) moved out of budget: model_segment_bytes is 7200 …
+  drift_segment_bytes_permille_max is 181 and has to stay ≤ 40；drift_on_disk 23 > 10；
+  drift_selective_query 190 > 40；drift_wide_query 180 > 40；within_max is 1 and has to stay ≤ 0
+  9/10 must gate(s) passed
+回滚 → 35 metric(s) judged … within_max 0 → 10/10 must gate(s) passed
+```
+
+**与作业书不同的两处**：① `drift_*` 用 **`_max` 上界**而不是基线的 ±10%——漂移是个比值，其中两条的基线是 0，
+0 没有 ±10% 的余地，而“不得高于此”正是门已有的形状；② 16 个 `const fn` 方法的桩用单字面量
+`panic!("lakelet/4.20-capacity-model: …")`（`todo!()` 在 `const` 上下文是 `E0015`），且
+`Model::default_usage` 是**发下去的实现**而不是桩——`Usage::DEFAULT` 是个 `const` 调用它，桩会让 scaffold 编译不过，
+而契约要求 scaffold “能编译、跑测试失败”。这条已写成 §1 第 19 条。
+
+**这一步钉下来的两件事**：① **4.20 落地**（**B4 完成**：4.15–4.20 六步；phase D 余 4.21–4.24）；
+② **一条新的造题经验**：`const` 会把“桩”逼成两种形状，写作业书时要先看签名能不能容下 `todo!()`。
+发现的四件事（日志吃掉 885‰ 的字节、侧车每系列开销是个除法、`SegmentInfo` 字段可见性不一致）记在 §5。
