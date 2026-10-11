@@ -219,6 +219,13 @@ value }`，`series` = 指标名 + 标签集。
   “the image is NNN MB, over the 25 MB this step allows”）。**镜像构建需要暖的 registry**：门把
   `$XDG_CACHE_HOME/kiln/container-registry` 挂进 builder；`~/.cache/kiln/container-registry` 是暖的（144 MB），
   而一个全新的私有 `XDG_CACHE_HOME` 会递给 builder 一个空缓存（有网时它去取，离线则建不出来）。
+  **2026-10-11 补记（用户要求的清理，不改变这一条）**：镜像店清过一次——`podman images --all` 39 → 20 个、
+  `podman system df` `4.569GB → 1.452GB`、VM 盘上的 `containers/storage` `3.8G → 1.5G`；声明面一根没动，
+  `kiln images` 仍是 `4 declared image(s): 4 present`。留下的（四个声明镜像、`localhost/tgw-cpp-rs:prod` 与课程自己的
+  `localhost/kiln-mailer-*`）与不碰的理由、以及全部原始行，见 [handoff-m3-log.md](handoff-m3-log.md) 段 31。
+  **清理不修引擎**：`podman run --rm docker.1ms.run/library/alpine:3.20 true` 仍报同一个
+  `creating overlay mount …: input/output error`（现在的 exit code 是 126），所以这一条与它牵的三件验收照旧等着
+  `podman machine stop && podman machine start`（可逆，镜像在 VM 盘上；需用户点头）。
 - **`container_repro.rs` 只把 `MAILER__` 前缀的环境变量带进宿主运行（4.22 发现，未修，暂时潜伏）**：镜像是
   `ENV` 里的任何 `LAKELET__*` 都会让门报“the image does not run the binary this tree builds”。4.22 的 Dockerfile
   因此一个 `ENV` 都不写（页面写明理由）。正解：前缀应当从项目/ track 推出来，或那次比较忽略镜像的环境——收尾时一并。

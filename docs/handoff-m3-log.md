@@ -1673,3 +1673,52 @@ input/output error`），而 `kiln images` 仍能看到 4 个声明的镜像（�
 ③ `verify lakelet --slow --json` → `{passed: 24, failed: 0, clean: true}`；④ 4.22 的镜像尺寸与 `--check-config` 比对行。
 
 **收尾还剩**：探题（BP，T4 的 24 道）与上述三条验收（后两条卡引擎）。
+
+## 段 31：清理镜像店（用户要求；只删「没有名字的」与「本机没有任何 Dockerfile 用的」）
+
+**只读侦察先做**：`podman images --all` 39 个镜像（14 个有标签、25 个中间层）；
+`podman system df` → `Images 39 · 4.569GB · 4.284GB (94%) reclaimable`；
+`podman machine ssh 'df -h /dev/vda4'` → 100G 里用了 13G（磁盘不是坏因，overlay 的 I/O error 与空间无关）。
+三条证据决定哪些是「无用」：① `podman ps -a` 只有一个容器（`auto-writer-pg-dev`，用 `docker.1ms.run/library/postgres:17-alpine`，**留**）；
+② 课程声明的镜像只有四个（`grep -rn '^images = ' course/tracks/*/track.toml` → `postgres:17-alpine`、`axllent/mailpit:v1.21`、
+`rust:1.98-alpine`、`alpine:3.20`）；③ 本机所有 Dockerfile（`find ~/RustroverProjects ~/CLionProjects ~/Desktop ~/Documents ~/worktrees ~ -maxdepth 3 -name 'Dockerfile*' -o -name 'compose*.y*ml'` →
+8 份）里，`ironclaw` 用 `debian:bookworm-slim`，没人用 `rust:1.88-bookworm` 或 `rust:1.98-slim`。
+
+**原始行**（命令 → 结论，全部只读侦察之外的操作都在这一节里列全）：
+
+```
+$ podman rmi dd3d5e558df3                       # 一个 10 MB 的 <none>，试删除能力
+  (exit 0，无输出)                                # 结论：引擎能删镜像，虽然不能起容器
+$ podman image prune -f                         # 只删「没有名字的」
+  Deleted 111f6bb8d551 27d8492a2544 f34f244fc342 dfc68ef37d4b c820c835c211 …
+                                                # （只有 tail 的五行留下来了；含两个 1.02/1.58 GB 的上层悬空镜像，共享层很多）
+$ podman system df                              # 39 → 24 个、4.569GB → 3.929GB
+$ podman machine ssh 'du -sh …/containers/storage; df -h /dev/vda4'
+  3.8G  /var/home/core/.local/share/containers/storage ；12G used / 88G avail (12%)
+$ podman rmi docker.m.daocloud.io/library/debian:bookworm-slim
+  Untagged: …（exit 0）
+$ podman rmi docker.m.daocloud.io/library/rust:1.88-bookworm
+  Deleted: 1dc2982f2cd4…（exit 0，1.55 GB）
+$ podman rmi docker.1ms.run/library/rust:1.98-slim
+  Deleted: 9aa8fafc9254…（exit 0，828 MB）
+$ podman rmi docker.1ms.run/library/debian:bookworm-slim
+  Deleted: 813cd0370d82…（exit 0，100 MB）
+$ podman image prune -f                         # 再来一次：这次一个也不删
+  (无输出)                                        # 剩下的 <none> 都是活标签镜像的父层，删不动
+$ podman system df                              # 24 → 20 个、3.929GB → 1.452GB（1.167GB reclaimable）
+$ podman machine ssh 'du -sh …/containers/storage; df -h /dev/vda4'
+  1.5G  /var/home/core/.local/share/containers/storage ；9.4G used / 91G avail (10%)
+$ kiln images                                   # 声明面没被动到
+  ✓ postgres:17-alpine（在本地是 docker.1ms.run/library/postgres:17-alpine）
+  ✓ axllent/mailpit:v1.21 / ✓ rust:1.98-alpine / ✓ alpine:3.20
+  4 declared image(s): 4 present — a step can start its container without the network once its image is here
+  ! a container did not start: … creating overlay mount …: input/output error   # 起容器仍然坏着，与本节的清理无关
+```
+
+**留在店里的 9 个活标签 + 11 个中间层，以及为什么**：四个声明镜像（`rust:1.98-alpine` 982 MB、`postgres:17-alpine` 294 MB、
+`axllent/mailpit:v1.21` 30.1 MB、`alpine:3.20`——两份镜像路径 `docker.1ms.run` 9.12 MB 与 `dockerproxy.net`/`docker.m.daocloud.io` 8.1 MB，
+声明名 `alpine:3.20` 只按仓库名匹配 `is_declared_image`，两份都算「本地有」，于是留作离线冗余）；
+`localhost/tgw-cpp-rs:prod`（130 MB，**本机另一项目 `/Users/drmin/RustroverProjects/tgw-cpp-rs` 的本地构建，拉不回来，不碰**）；
+`localhost/kiln-mailer-spec:latest` + `kiln-mailer-repro:latest`（同一个 17.3 MB 镜像，课程 1.21 容器门自己建的，可重建，留）。
+**镜像大小是共享层的和**，所以 `system df` 的 4.569GB→1.452GB 与 VM 盘上的 3.8G→1.5G 是两个数、都对（前者含共享层，后者是真实占用）。
+**没动的东西**：`podman system reset`（禁令，会抹掉声明镜像）、暖 registry `~/.cache/kiln/container-registry`（144 MB，容器门把它挂进 builder）。
