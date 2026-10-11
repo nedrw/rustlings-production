@@ -79,7 +79,7 @@ query、perf、profile、soak、cardinality、dr-drill、capacity、rotation、b
 | `kiln verify lakelet --slow --json` | **待收尾时跑**（`{passed:24, failed:0, …}` 需要先修好容器引擎）|
 | 全量套件（尾巴树）| `cargo test -p lakelet`：各规格 + 装置全绿（4.24 那次：spec_runbook 15 passed · runbook_harness 1 passed；4.17 的 soak 目标 ~138 s）|
 | 慢门实测 | `fuzz@3` 4.2（≥20000 次 + 语料条数）；`sim@3` 4.4/4.6/4.8/4.13/4.19/4.23（各自的三个种子与摘要）；`soak@4000` 4.17/4.18（~146 s）；`mutants@80` 十二步：多数 6/6 或 5/6，4.12/4.14 10/12，4.17 6/8（阈值 `@70`），4.19 12/12，4.21 10/12；`bench-budget@10` 4.5/4.7/4.8/4.9/4.10/4.14/4.15/4.20 |
-| 课程自有检查 | `lint-caps` `no issues.`（97/136/119/97）；`links` **113 page(s) · 525 link(s) · 329 external target(s)**，全部解析；`i18n` 0 error；`probe --check` 41/41；`cargo test -q -p kiln` **344 passed**（322+21+1）|
+| 课程自有检查 | `lint-caps` `no issues.`（97/136/119/97）；`links` **115 page(s) · 544 link(s) · 330 external target(s)**，全部解析；`i18n` 0 error；`probe --check` **65/65**（47 s）；`cargo test -q -p kiln` **327+21+1 passed**（题池扩到 65 道之前是 41/41 与 322+21+1 = 344）|
 | 4.22 的可复现构建 | `sh scripts/repro.sh`：`artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（手跑 34 s）|
 | `cargo xtask ci` | **待收尾时跑**（M2 的记录：30–39 分钟，最后一行是 `<n>/<n> step(s) hold the contract`）|
 
