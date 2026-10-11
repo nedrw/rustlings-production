@@ -580,10 +580,10 @@ index 07adc98..416926c 100644
 +    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 +}
 diff --git a/src/engine/tier/mod.rs b/src/engine/tier/mod.rs
-index 62e9813..55fa199 100644
+index 114f32a..1962250 100644
 --- a/src/engine/tier/mod.rs
 +++ b/src/engine/tier/mod.rs
-@@ -309,10 +309,10 @@ impl Policy {
+@@ -313,10 +313,10 @@ impl Policy {
      /// cannot date.
      #[must_use]
      pub fn is_cold(&self, info: &SegmentInfo, now_millis: u64) -> bool {
@@ -598,7 +598,7 @@ index 62e9813..55fa199 100644
      }
  }
  
-@@ -521,11 +521,13 @@ impl Listing {
+@@ -539,11 +539,13 @@ impl Listing {
  /// idempotency key (`lakelet/4.21`).
  #[must_use]
  pub fn object_key(prefix: &str, ordinal: u64) -> String {
@@ -616,7 +616,7 @@ index 62e9813..55fa199 100644
  
  /// Every key a port holds under `prefix`, walking its pages.
  ///
-@@ -541,11 +543,28 @@ pub fn object_key(prefix: &str, ordinal: u64) -> String {
+@@ -559,11 +561,28 @@ pub fn object_key(prefix: &str, ordinal: u64) -> String {
  ///
  /// Everything [`Objects::list`] refuses, and [`Error::Transport`] when the cursor does not advance.
  pub fn listing(objects: &dyn Objects, prefix: &str) -> Result<Listing, Error> {
@@ -649,7 +649,7 @@ index 62e9813..55fa199 100644
  
  /// Move every cold segment out of the box and into the tier.
  ///
-@@ -574,11 +593,33 @@ pub fn sweep(
+@@ -592,11 +611,33 @@ pub fn sweep(
      policy: &Policy,
      now_millis: u64,
  ) -> Result<Report, Error> {
@@ -685,20 +685,23 @@ index 62e9813..55fa199 100644
 +    Ok(report)
 +}
  
- /// Put back every segment of `store` whose local file is missing, or is not what the manifest says.
- ///
-@@ -606,8 +647,59 @@ pub fn sweep(
- /// what it holds is not the length the manifest states, [`Error::Local`] when a file cannot be
- /// written or looked at, and the port's own refusals.
- pub fn hydrate(store: &Segments, objects: &dyn Objects) -> Result<Report, Error> {
--        let _ = (store, objects);
+ /// Put back every segment of the store at `directory` whose local file is missing, or is not what
+ /// the manifest says.
+@@ -633,8 +674,62 @@ pub fn sweep(
+ /// [`Error::Damaged`] when what it holds is not the length the manifest states, [`Error::Local`]
+ /// when a file cannot be written or looked at, and the port's own refusals.
+ pub fn hydrate(directory: impl AsRef<Path>, objects: &dyn Objects) -> Result<Report, Error> {
+-        let _ = (directory, objects);
 -        todo!(
 -            "lakelet/4.21-cold-tiering: fetch back every segment whose file is missing or is not the length the manifest states, checking that length before anything is written"
 -        )
++    let directory: &Path = directory.as_ref();
++    let manifest =
++        compaction::Manifest::read(directory).map_err(|source| Error::Manifest { source })?;
 +    let mut report = Report::default();
 +    let mut needed: Vec<&SegmentInfo> = Vec::new();
-+    for info in store.manifest().segments() {
-+        let path = compaction::file_of(store.directory(), info.index);
++    for info in manifest.segments() {
++        let path = compaction::file_of(directory, info.index);
 +        match std::fs::metadata(&path) {
 +            Ok(metadata) if metadata.len() == info.bytes => report.kept += 1,
 +            // A file that is the wrong length is as absent as one that is gone: it is not what the
@@ -721,7 +724,7 @@ index 62e9813..55fa199 100644
 +    report.pages = held.pages();
 +    for info in needed {
 +        let key = object_key(objects.prefix(), info.index);
-+        let path = compaction::file_of(store.directory(), info.index);
++        let path = compaction::file_of(directory, info.index);
 +        if !held.holds(&key) {
 +            return Err(Error::Missing { key });
 +        }

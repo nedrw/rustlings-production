@@ -1,9 +1,9 @@
 diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
 new file mode 100644
-index 0000000..8975ac5
+index 0000000..bcf7755
 --- /dev/null
 +++ b/src/engine/compaction/mod.rs
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,538 @@
 +//! The closed segments a store is made of, and the one operation that changes them: a merge.
 +//!
 +//! Step `lakelet/4.8-compaction`. `lakelet/4.7-columnar-segments` gave the store a file worth
@@ -70,6 +70,13 @@ index 0000000..8975ac5
 +
 +pub use plan::{Plan, Policy, SegmentInfo};
 +pub use snapshot::Snapshot;
++
++// `lakelet/4.19-backup-restore` is what adds to this module's surface, and what it adds is
++// declared inside this block: a scaffold may only write inside a
++// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
++// (docs/authoring.md §5).
++// kiln:scaffold:begin
++// kiln:scaffold:end
 +
 +use std::path::{Path, PathBuf};
 +use std::sync::Arc;

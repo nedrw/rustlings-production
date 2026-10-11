@@ -654,10 +654,10 @@ index 0000000..07adc98
 +    }
 diff --git a/src/engine/tier/mod.rs b/src/engine/tier/mod.rs
 new file mode 100644
-index 0000000..62e9813
+index 0000000..114f32a
 --- /dev/null
 +++ b/src/engine/tier/mod.rs
-@@ -0,0 +1,613 @@
+@@ -0,0 +1,640 @@
 +//! Where cold records live when they are not on this box: a port, a rule, and the two passes that
 +//! carry it out.
 +//!
@@ -740,12 +740,16 @@ index 0000000..62e9813
 +//! directory agree with the manifest again, and it is why nothing in the engine's read path knows
 +//! this module exists.
 +//!
-+//! A store whose cold segments are out of the box is therefore **not openable** by a process
-+//! without a tier: `Segments::open` refuses it and names the file that is not there. That is the
-+//! honest answer rather than a hole — a store that answered something from a manifest naming
-+//! segments nobody has is a store whose answers are missing records — and it is the one thing to
-+//! weigh before sweeping: the tier is for the process that owns the store (which holds the manifest
-+//! in memory and hydrates the segment it is about to read), not for a stranger with `ls`.
++//! A store whose cold segments are out of the box is **not openable as it stands**: `Segments::open`
++//! refuses it and names the file that is not there. That is the honest answer rather than a hole —
++//! a store that answered something from a manifest naming segments nobody has is a store whose
++//! answers are missing records — and what undoes it is [`hydrate`], which takes the store's
++//! **directory** rather than a live store ([`compaction::Manifest::read`]: nothing is created,
++//! nothing is flushed and nothing is deleted). A process that owns the store hydrates the segment
++//! it is about to read and goes on answering; a process that finds the store stopped hydrates the
++//! whole of it before its first open. What still wants the store *running* is [`sweep`] — removing
++//! a file the manifest names is a change its owner makes — and that refusal is the one thing to
++//! weigh before sweeping.
 +//!
 +//! # The tier holds no manifest of its own
 +//!
@@ -1090,6 +1094,18 @@ index 0000000..62e9813
 +        /// What the operating system said.
 +        source: std::io::Error,
 +    },
++    /// The store's own manifest refused to be read.
++    ///
++    /// `lakelet/4.8-compaction`'s error, unaltered: a manifest that is not this build's, or a
++    /// directory that cannot be read. [`hydrate`] is the pass that has to ask a store's *manifest*
++    /// rather than a live store — which is what lets it work on one whose process has stopped —
++    /// and a pass that re-worded that refusal would be a second diagnosis of a file the store has
++    /// already diagnosed. `lakelet/4.19-backup-restore`'s `Error::Source` is the same decision one
++    /// step earlier, for a copy.
++    Manifest {
++        /// What the store's own reader refused with.
++        source: crate::error::Error,
++    },
 +}
 +
 +impl fmt::Display for Error {
@@ -1123,6 +1139,7 @@ index 0000000..62e9813
 +                {detail}"
 +            ),
 +            Self::Local { path, source } => write!(formatter, "{}: {source}", path.display()),
++            Self::Manifest { source } => write!(formatter, "{source}"),
 +        }
 +    }
 +}
@@ -1131,6 +1148,7 @@ index 0000000..62e9813
 +    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
 +        match self {
 +            Self::Local { source, .. } => Some(source),
++            Self::Manifest { source } => Some(source),
 +            _ => None,
 +        }
 +    }
@@ -1240,7 +1258,8 @@ index 0000000..62e9813
 +        )
 +    }
 +
-+/// Put back every segment of `store` whose local file is missing, or is not what the manifest says.
++/// Put back every segment of the store at `directory` whose local file is missing, or is not what
++/// the manifest says.
 +///
 +/// The second half of the round trip, and the reason the engine's readers are untouched: a store
 +/// whose cold segments are out of the box cannot be opened (`Segments::open` refuses a segment the
@@ -1248,6 +1267,12 @@ index 0000000..62e9813
 +/// agree with the manifest again. Both halves of "the file is not right" are repaired — a file that
 +/// is gone, and one that is the wrong length — because the tier's copy is what the manifest says
 +/// the segment is, and it is the only copy left that is.
++///
++/// What it takes is the store's **directory**, and that is the difference between a hydrate a
++/// running process can use and one an operator can: the manifest comes in through
++/// `lakelet/4.19-backup-restore`'s read-only door ([`compaction::Manifest::read`] — nothing is
++/// created, nothing is flushed and nothing is deleted), so a store whose process has stopped with
++/// its segments in the tier is put back *before* it is opened rather than being unopenable.
 +///
 +/// The listing is consulted **once**, before anything is fetched: the tier is the authority on what
 +/// it holds, a key that is not in it is [`Error::Missing`] naming that key (rather than a `get` per
@@ -1262,11 +1287,13 @@ index 0000000..62e9813
 +///
 +/// # Errors
 +///
-+/// [`Error::Missing`] when the tier does not hold a segment the store needs, [`Error::Damaged`] when
-+/// what it holds is not the length the manifest states, [`Error::Local`] when a file cannot be
-+/// written or looked at, and the port's own refusals.
-+pub fn hydrate(store: &Segments, objects: &dyn Objects) -> Result<Report, Error> {
-+        let _ = (store, objects);
++/// [`Error::Manifest`] when the store's own manifest cannot be read — a directory that holds no
++/// manifest is an empty store rather than a refusal, exactly as an open answers it — and
++/// [`Error::Missing`] when the tier does not hold a segment the store needs. Then
++/// [`Error::Damaged`] when what it holds is not the length the manifest states, [`Error::Local`]
++/// when a file cannot be written or looked at, and the port's own refusals.
++pub fn hydrate(directory: impl AsRef<Path>, objects: &dyn Objects) -> Result<Report, Error> {
++        let _ = (directory, objects);
 +        todo!(
 +            "lakelet/4.21-cold-tiering: fetch back every segment whose file is missing or is not the length the manifest states, checking that length before anything is written"
 +        )

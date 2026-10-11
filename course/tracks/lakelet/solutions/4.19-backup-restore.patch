@@ -1599,21 +1599,21 @@ index 7d1ffcd..8f403b5 100644
 +    Some(u64::from_le_bytes(array))
 +}
 diff --git a/src/engine/backup/mod.rs b/src/engine/backup/mod.rs
-index 53458dd..c2d6581 100644
+index 53458dd..8091df4 100644
 --- a/src/engine/backup/mod.rs
 +++ b/src/engine/backup/mod.rs
 @@ -75,6 +75,10 @@ pub use restore::{Damage, Outcome, restore};
  use std::fmt;
  use std::path::{Path, PathBuf};
  
-+use crate::engine::compaction::{self, SegmentInfo, Segments};
++use crate::engine::compaction::{self, SegmentInfo};
 +use crate::engine::soak::Open;
 +use crate::engine::spool::FILE as LOG;
 +use crate::engine::wal::replay;
  use crate::error::Error as StoreError;
  
  /// How far a copy is allowed to get: the death this step is about, as a value.
-@@ -318,11 +322,256 @@ pub fn copy(
+@@ -318,11 +322,258 @@ pub fn copy(
      destination: &Path,
      interruption: Interruption,
  ) -> Result<Report, Error> {
@@ -1639,11 +1639,13 @@ index 53458dd..c2d6581 100644
 +    if commit.exists() && !destination.join(manifest::FILE).is_file() {
 +        return Err(Error::Occupied { path: commit });
 +    }
-+    // The store's own reader, which is what makes this a copy of a *store*: it reads the manifest,
-+    // finishes a crash's leftovers the way every open of this store does, and checks every segment
-+    // the manifest names against its file.
-+    let segments = Segments::open(source).map_err(|source| Error::Source { source })?;
-+    let store = segments.manifest();
++    // The store's own reader, which is what makes this a copy of a *store*, and the door that does
++    // **not** open it: an open creates the segment directory, flushes it and deletes what the
++    // manifest does not name (`lakelet/4.8-compaction`'s one recovery rule) — and a backup tool
++    // that changed the store it was asked to preserve is not a backup tool. `Manifest::load` is
++    // the same reader the open uses, so a manifest naming a file nobody kept, or naming one that
++    // is not the length it states, is refused here in the store's own words either way.
++    let store = compaction::Manifest::load(source).map_err(|source| Error::Source { source })?;
 +    // The log's half: the bytes a replay proves, and no more. Read once, because the prefix's length
 +    // and the records it holds are the same answer seen twice.
 +    let recovered = replay::recover(source).map_err(|source| Error::Source { source })?;

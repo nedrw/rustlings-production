@@ -187,10 +187,10 @@ index 0000000..82815e9
 +- [the runbook](runbook.md) — the procedure, stage by stage.
 diff --git a/tests/runbook_harness.rs b/tests/runbook_harness.rs
 new file mode 100644
-index 0000000..b345ade
+index 0000000..a19fa2c
 --- /dev/null
 +++ b/tests/runbook_harness.rs
-@@ -0,0 +1,2041 @@
+@@ -0,0 +1,2044 @@
 +//! The instrument `lakelet/4.24-runbook-drill` is judged by: it reads `docs/runbook.md`, parses it
 +//! into stages, runs the command each stage names **against a live store**, and reports what each
 +//! stage owed.
@@ -1430,7 +1430,10 @@ index 0000000..b345ade
 +                    .to_owned(),
 +            );
 +        }
-+        let back = tier::hydrate(&segments, &objects)
++        // `lakelet/4.21-cold-tiering`'s hydrate takes the store's **directory** rather than a live
++        // store (`lakelet/4.19-backup-restore` gave it the read-only door to the manifest), so the
++        // instrument hands it the one this world was built at.
++        let back = tier::hydrate(self.store.path(), &objects)
 +            .map_err(|error| format!("the world's way back refused: {error}"))?;
 +        if back.fetched() != took.moved() {
 +            return Err(format!(

@@ -30,7 +30,9 @@
 //! * **hydration is what keeps the engine's readers untouched.** A store whose cold segments are out
 //!   of the box is not openable (`Segment` open refuses the file that is not there, and the refusal
 //!   names it), and `hydrate` is what puts the bytes back — checking the length the manifest states
-//!   *before* it writes, and leaving nothing behind when the tier's copy disagrees;
+//!   *before* it writes, and leaving nothing behind when the tier's copy disagrees. What it takes is
+//!   the store's **directory** rather than a live store, so a store whose process has stopped with
+//!   its segments in the tier is put back before it is opened instead of being unopenable;
 //! * **the HTTP half is judged where it exists.** Five cases are the S3-shaped half and say so: the
 //!   signed request is pinned against a vector from the vendor's own documentation, the payload hash
 //!   is the hash of the body that was sent, a `5xx` is retried and a `403` is not, the request shape
@@ -547,7 +549,7 @@ fn the_round_trip_answers_record_for_record() {
     );
     let back = ran(
         "a hydrate of everything a sweep moved",
-        hydrate(&store, &*port),
+        hydrate(fixture.store_dir(), &*port),
     );
     assert_eq!(
         (back.fetched(), back.kept()),
@@ -658,7 +660,10 @@ fn hydrate_brings_back_a_store_whose_files_are_gone_and_asks_nothing_when_they_a
     let before: Vec<Record> = fixture.answers(&store);
     // A store whose files are all where the manifest says asks the tier nothing: not a listing, not
     // a request. That is what makes a hydrate cheap enough to run before every read.
-    let complete = ran("a hydrate of a complete store", hydrate(&store, &*port));
+    let complete = ran(
+        "a hydrate of a complete store",
+        hydrate(fixture.store_dir(), &*port),
+    );
     assert_eq!(
         (complete.fetched(), complete.kept(), complete.pages()),
         (0, 3, 0),
@@ -685,7 +690,10 @@ fn hydrate_brings_back_a_store_whose_files_are_gone_and_asks_nothing_when_they_a
         "the sweep is what took the files out of the box, so the hydrate below is the one that has \
          work to do"
     );
-    let back = ran("a hydrate of what the sweep moved", hydrate(&store, &*port));
+    let back = ran(
+        "a hydrate of what the sweep moved",
+        hydrate(fixture.store_dir(), &*port),
+    );
     assert_eq!(
         (back.fetched(), back.kept()),
         (3, 0),
@@ -702,7 +710,7 @@ fn hydrate_brings_back_a_store_whose_files_are_gone_and_asks_nothing_when_they_a
         before,
         "the answers are record for record what they were before anything left"
     );
-    let again = ran("a second hydrate", hydrate(&store, &*port));
+    let again = ran("a second hydrate", hydrate(fixture.store_dir(), &*port));
     assert_eq!(
         (again.fetched(), again.pages()),
         (0, 0),
@@ -735,7 +743,7 @@ fn hydrate_refuses_an_object_that_is_not_the_length_the_manifest_states() {
     port.put(&key, b"short").unwrap_or_else(|error| {
         panic!("the tier takes an object that is the wrong length: {error}")
     });
-    let outcome = hydrate(&store, &*port);
+    let outcome = hydrate(fixture.store_dir(), &*port);
     let Err(error) = outcome else {
         panic!(
             "a segment whose bytes are not the length the manifest states is refused rather than \
@@ -771,7 +779,7 @@ fn hydrate_refuses_an_object_that_is_not_the_length_the_manifest_states() {
         .unwrap_or_else(|error| panic!("the second segment's file is put back whole: {error}"));
     let repaired = ran(
         "a hydrate of a store with one wrong-length file",
-        hydrate(&store, &*port),
+        hydrate(fixture.store_dir(), &*port),
     );
     assert_eq!(
         (repaired.fetched(), repaired.kept()),
@@ -787,8 +795,8 @@ fn hydrate_refuses_an_object_that_is_not_the_length_the_manifest_states() {
 }
 
 #[test]
-fn a_stopped_store_whose_segments_are_cold_is_not_openable_at_all() {
-    let fixture = Tier::start("unreadable");
+fn a_stopped_store_whose_segments_are_cold_is_hydrated_by_path_and_then_opens() {
+    let fixture = Tier::start("stopped-home");
     // The store is written, swept, and **dropped**: what is left is a directory, which is the state
     // a process that stopped leaves behind. The sweep is the pass that came before it.
     let before: Vec<Record> = {
@@ -801,20 +809,20 @@ fn a_stopped_store_whose_segments_are_cold_is_not_openable_at_all() {
         );
         before
     };
+    // Nothing is left under `segments/`, and an open says so. That is the state a stopped store is
+    // in, and it is what the hydrate below has to undo rather than work around.
     let refusal = Segments::open(fixture.store_dir())
         .err()
         .unwrap_or_else(|| {
             panic!(
-                "a store whose segments are in the tier is not openable by a process without one: a \
-                 reader that answered from a manifest naming files nobody has would answer a hole — \
-                 and `Segments::open` is the only door to a store, so there is nothing left to \
-                 hydrate it *with*: the tier is a live store's facility in this build"
+                "a store whose segments are in the tier opened without them: a reader that \
+                 answered from a manifest naming files nobody has would answer a hole"
             )
         });
     let text = refusal.to_string();
     assert!(
         text.contains("0000000000.lks"),
-        "and the refusal names the file that is missing rather than saying a store is broken: {text}"
+        "the refusal names the file that is missing rather than saying a store is broken: {text}"
     );
     assert!(
         text.contains("does not exist"),
@@ -822,33 +830,62 @@ fn a_stopped_store_whose_segments_are_cold_is_not_openable_at_all() {
     );
     assert!(
         !before.is_empty(),
-        "the records that are not answerable any more are real ones, not an empty store: {before:?}"
+        "the records that are not answerable yet are real ones, not an empty store: {before:?}"
+    );
+
+    // There is no live store to hand a hydrate — the process that owned this one is gone — so what
+    // it is handed is the store's **directory**, and the manifest comes in through the read-only
+    // door (`compaction::Manifest::read`): nothing is opened, nothing is created and nothing is
+    // deleted. The files the manifest names and the directory does not hold are what comes back.
+    let port = fixture.objects();
+    let back = ran(
+        "a hydrate of the directory a stopped store left behind",
+        hydrate(fixture.store_dir(), &*port),
+    );
+    assert_eq!(
+        (back.fetched(), back.kept()),
+        (2, 0),
+        "every segment the manifest names comes back, and nothing was left where it was: {}",
+        lines(&back)
+    );
+    assert_eq!(
+        back.bytes(),
+        compaction::Manifest::read(fixture.store_dir())
+            .expect("the store's manifest, read without opening the store")
+            .bytes(),
+        "and what came back weighs what the manifest says the store weighs"
+    );
+    let reopened = Segments::open(fixture.store_dir()).unwrap_or_else(|error| {
+        panic!(
+            "a store whose files are back under the names the manifest lists opens — and the open \
+             is what checks them against the lengths it states: {error}"
+        )
+    });
+    assert_eq!(
+        tier::answers(&reopened),
+        before,
+        "and it answers every record it answered before the sweep, because what came back is what \
+         left"
     );
 }
 
 #[test]
-fn the_way_back_for_a_stopped_store_is_one_copy_per_segment() {
-    let fixture = Tier::start("stopped-copy");
+fn the_way_back_for_a_stopped_store_is_one_object_per_segment_it_names() {
+    let fixture = Tier::start("stopped-sync");
     let port = fixture.objects();
-    let before: Vec<Record> = {
+    {
         let store = fixture.store(2);
-        let before = fixture.answers(&store);
         ran(
             "a sweep of every segment",
             sweep(&store, &*port, &Policy::new(ALL_COLD), after_the_store()),
         );
-        before
-    };
-    // There is no `hydrate` to call: it takes an open store, and this store does not open (the case
-    // above is that refusal). What there *is* is a rule the tier was built on — `object_key` is the
-    // key of an object, and below the port's prefix it is the store's own path — so putting the
-    // store back is one `put`'s worth of bytes per segment, in the store's own directory.
+    }
+    // The keys this step derives *are* the store's own paths, and that is what makes the way back a
+    // `sync` rather than a translation: the object a segment is in is the file the manifest names
+    // for it, so a hydrate writes each one back where it belongs with nothing to look up — and an
+    // operator with a bucket, a shell and no hydrate at all does the same thing by hand.
     for ordinal in 0..2 {
         let key = object_key(fixture.prefix(), ordinal);
-        let bytes = port
-            .get(&key)
-            .unwrap_or_else(|error| panic!("the tier holds `{key}`: {error}"))
-            .unwrap_or_else(|| panic!("the tier holds `{key}`: it is what the sweep wrote"));
         assert_eq!(
             tier::file_of(fixture.store_dir(), ordinal)
                 .strip_prefix(fixture.store_dir())
@@ -858,24 +895,41 @@ fn the_way_back_for_a_stopped_store_is_one_copy_per_segment() {
                 key.trim_start_matches(&format!("{}/", fixture.prefix()))
                     .to_owned()
             ),
-            "and the object's key, minus the port's prefix, is the path the manifest names: that is \
-             what makes the copy below a `sync` rather than a translation"
+            "the object's key, minus the port's prefix, is the path the manifest names: that is what \
+             makes the way back a `sync` rather than a translation"
         );
-        std::fs::write(tier::file_of(fixture.store_dir(), ordinal), bytes)
-            .unwrap_or_else(|error| panic!("a segment's own file is where its bytes go: {error}"));
     }
-    let reopened = Segments::open(fixture.store_dir()).unwrap_or_else(|error| {
-        panic!(
-            "a store whose files are back under the names the manifest lists opens — and the open \
-             is what checks them against the lengths it states, so a file that is not the segment is \
-             still refused rather than read: {error}"
-        )
-    });
+    let home = ran(
+        "a hydrate of the directory a stopped store left behind",
+        hydrate(fixture.store_dir(), &*port),
+    );
     assert_eq!(
-        tier::answers(&reopened),
-        before,
-        "and it answers every record it answered before the sweep, because what came back is what \
-         left: the tier is a copy, never a translation"
+        (home.fetched(), home.kept()),
+        (2, 0),
+        "one object per segment the manifest names is what comes back, and nothing was left where \
+         it was: {}",
+        lines(&home)
+    );
+    for info in compaction::Manifest::read(fixture.store_dir())
+        .expect("the store's manifest, read without opening the store")
+        .segments()
+    {
+        assert_eq!(
+            std::fs::metadata(tier::file_of(fixture.store_dir(), info.index))
+                .expect("every segment the manifest names is back")
+                .len(),
+            info.bytes,
+            "segment {} is not back at the length the manifest states, under the name the manifest \
+             lists for it",
+            info.index
+        );
+    }
+    let again = ran("a second hydrate", hydrate(fixture.store_dir(), &*port));
+    assert_eq!(
+        (again.fetched(), again.pages()),
+        (0, 0),
+        "and a second hydrate asks the tier nothing, because nothing is missing any more: {}",
+        lines(&again)
     );
     assert_eq!(
         fixture.held(fixture.prefix()).len(),
@@ -1581,10 +1635,11 @@ fn the_engine_reads_no_clock_in_the_tiers_files() {
          caller's decision rather than a `now()` this engine calls"
     );
     assert!(
-        ports.contains("pub fn hydrate(")
-            && !ports.contains("hydrate(store: &Segments, objects: &dyn Objects, now"),
+        ports.contains("pub fn hydrate(directory: impl AsRef<Path>, objects: &dyn Objects)")
+            && !ports.contains("objects: &dyn Objects, now"),
         "and hydration has no instant at all: putting a segment's bytes back is not a decision about \
-         time"
+         time. What it takes is the store's directory rather than a live store, so a store whose \
+         process stopped is hydrated before it is opened"
     );
     assert!(
         source("src/engine/tier/s3.rs").contains("pub date: String"),
@@ -1640,7 +1695,10 @@ fn a_report_counts_what_a_pass_looked_at_and_the_tier_holds_no_map_of_its_own() 
     );
     let manifest_before = std::fs::read(fixture.store_dir().join(compaction::MANIFEST))
         .unwrap_or_else(|error| panic!("the store has a manifest: {error}"));
-    ran("a hydrate of the swept store", hydrate(&store, &*port));
+    ran(
+        "a hydrate of the swept store",
+        hydrate(fixture.store_dir(), &*port),
+    );
     assert_eq!(
         std::fs::read(fixture.store_dir().join(compaction::MANIFEST))
             .unwrap_or_else(|error| panic!("the store has a manifest: {error}")),

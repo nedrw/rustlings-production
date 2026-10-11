@@ -1194,6 +1194,67 @@ index 0000000..c35ace5
 +         store"
 +    )
 +}
+diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
+index ff9067c..9db2e4d 100644
+--- a/src/engine/compaction/mod.rs
++++ b/src/engine/compaction/mod.rs
+@@ -129,6 +129,56 @@ pub use snapshot::Snapshot;
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++// `lakelet/4.19-backup-restore`: the two doors a tool comes in by when its job is to *read* a
++// store rather than to run one — the manifest alone, or the manifest and the segments it names.
++impl Manifest {
++    /// The store's manifest, without opening the store.
++    ///
++    /// Opening ([`Segments::open`]) is what a *process* comes in by: it creates the segment
++    /// directory, flushes it, finishes whatever a crash left behind and checks every file the
++    /// manifest names. None of that belongs to a tool that was handed a store to read —
++    /// `lakelet/4.19-backup-restore`'s copy must not change what it copies, and a store on a
++    /// read-only mount cannot be opened at all — so this is the door such a tool comes in by
++    /// instead: **nothing is created, nothing is flushed and nothing is deleted, not even
++    /// [`PENDING`]**, and the store is left exactly as it was found.
++    ///
++    /// A directory that holds no manifest is a store that has closed no segment yet, and this
++    /// answers the empty manifest for it, exactly as an open does. What it does *not* do is look
++    /// at the segments: [`Manifest::load`] is this door plus that check.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the file is not a manifest this build wrote, and [`Error::Store`]
++    /// when the directory cannot be read.
++    pub fn read(directory: &Path) -> Result<Self, Error> {
++        read_manifest(directory)
++    }
++
++    /// As [`Manifest::read`], and every segment it names is there at the length it states.
++    ///
++    /// The check is [`Segments::open`]'s, and it is the same function, so a store this door refuses
++    /// is refused in the words an open of it would use: a manifest naming a file nobody kept, and
++    /// one naming a file that is not the length it states, are refusals rather than a copy with a
++    /// hole in it. This is the door for a caller that is about to read those files — and it is the
++    /// one a caller whose whole job is the files that are *not* there must not use
++    /// (`lakelet/4.21-cold-tiering`'s hydrate asks for the segments the manifest names and the
++    /// directory does not hold, which is exactly the answer this refuses).
++    ///
++    /// A directory that holds no manifest answers the empty manifest here too: a store with
++    /// nothing to check, and not a refusal.
++    ///
++    /// # Errors
++    ///
++    /// The two above, plus the segment the manifest names and nobody kept — missing, or not the
++    /// length the manifest states.
++    pub fn load(directory: &Path) -> Result<Self, Error> {
++        let manifest = read_manifest(directory)?;
++        for info in manifest.segments() {
++            check(directory, info)?;
++        }
++        Ok(manifest)
++    }
++}
+ // kiln:scaffold:end
+ 
+ use std::path::{Path, PathBuf};
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
 index 786cea1..925bbe6 100644
 --- a/src/engine/mod.rs

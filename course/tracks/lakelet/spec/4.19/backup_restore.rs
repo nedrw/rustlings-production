@@ -1,12 +1,17 @@
 //! Spec for `lakelet/4.19-backup-restore`: the store as the unit an operator moves.
 //!
 //! `kiln run` copies this file into the project as `tests/spec_backup_restore.rs`; it is the course's
-//! file, not the learner's (plan §3 D2). Nineteen cases, and the shape of them is the point:
+//! file, not the learner's (plan §3 D2). Twenty cases, and the shape of them is the point:
 //!
 //! * **a copy is the store's own file set.** The manifest is the file list
 //!   (`lakelet/4.8-compaction`), so what a copy names is the manifest, the segments the manifest
 //!   names and the log's proven prefix — no sidecar index (derived state,
 //!   `lakelet/4.14-index-pruning`), no `*.pending`, and nothing the manifest does not name;
+//! * **a copy reads its source and never writes it.** It comes in through the store's manifest
+//!   alone (`compaction::Manifest::load`, the read-only door this step is given) and not through an
+//!   open, which creates `segments/`, flushes the directory and deletes every file the manifest
+//!   does not name: an orphan and a half-written `segments.manifest.pending` are still there after
+//!   a copy, and a source that *is* a read-only mount can be copied at all;
 //! * **the copy's manifest is `lakelet/4.4-wal-recovery`'s log.** A torn tail entry is dropped with
 //!   the bytes it occupied and the `Stop` that says so, which is a case that only holds if the format
 //!   really is that log — the case writes the tail with `wal::segment::encode`;
@@ -1635,6 +1640,78 @@ fn a_copy_reads_the_store_and_is_never_written_over_a_store() {
          so a retry is one copy and not two stacked",
         again.entries(),
         report.entries()
+    );
+}
+
+#[test]
+fn a_copy_reads_the_source_and_leaves_an_orphan_and_a_half_written_manifest_alone() {
+    let source_dir = StoreDir::new("spec-copy-read-only");
+    let copy = StoreDir::new("spec-copy-read-only-copy");
+    built(source_dir.path(), 2, 3);
+
+    // The two files a crash leaves behind, planted where it would leave them: a segment the
+    // manifest does not name, and a manifest nobody finished. **An open of this store deletes
+    // both** — it creates `segments/`, flushes the directory and removes every file the manifest
+    // does not name — so a copy that read its source through an open would take them with it, and a
+    // source on a read-only mount could not be copied at all. What this case pins is the door a
+    // copy comes in by instead: the store's own manifest, read without opening the store.
+    let orphan = source_dir
+        .path()
+        .join(compaction::DIRECTORY)
+        .join("0000000099.lks");
+    let pending = source_dir.path().join(compaction::PENDING);
+    std::fs::write(&orphan, b"an orphan").expect("a directory this process owns is writable");
+    std::fs::write(&pending, b"a manifest nobody finished").expect("and so is this one");
+    let before = files_under(source_dir.path());
+
+    backup::copy(source_dir.path(), copy.path(), Interruption::None).expect("copiable");
+
+    assert_eq!(
+        files_under(source_dir.path()),
+        before,
+        "a copy changed the store it read. A backup is a read, and an open is a write: it creates \
+         `{}`, flushes the directory and deletes every file the manifest does not name — this \
+         store's `{}` and its `{}` among them. The source was {before:?}",
+        compaction::DIRECTORY,
+        compaction::PENDING,
+        orphan
+            .strip_prefix(source_dir.path())
+            .unwrap_or(&orphan)
+            .display()
+    );
+    assert_eq!(
+        std::fs::read(&orphan).expect("the orphan is still where it was"),
+        b"an orphan",
+        "a copy wrote over a file the manifest does not name: the copy either took a file that is \
+         no part of the store or edited one"
+    );
+    assert_eq!(
+        std::fs::read(&pending).expect("the half-written manifest is still where it was"),
+        b"a manifest nobody finished",
+        "a copy finished — or removed — a manifest the store itself never finished"
+    );
+
+    // And what the copy took is still the store's own file list: a file the manifest does not name
+    // is not part of what a store is, so it is not part of a copy of one either. The list is asked
+    // of the manifest through the same door, so this half cannot disagree with the half above.
+    let mut expected = vec![compaction::MANIFEST.to_owned()];
+    for info in compaction::Manifest::read(source_dir.path())
+        .expect("the store's manifest, read without opening the store")
+        .segments()
+    {
+        expected.push(format!(
+            "{}/{index:0>10}.{extension}",
+            compaction::DIRECTORY,
+            index = info.index,
+            extension = compaction::EXTENSION
+        ));
+    }
+    expected.push(LOG.to_owned());
+    assert_eq!(
+        named(copy.path()),
+        expected,
+        "a copy of a store that holds two files the manifest does not name still names the \
+         manifest, the segments the manifest names in their order, and the log — and nothing else"
     );
 }
 
