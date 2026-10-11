@@ -16,7 +16,7 @@
 | track 骨架 | `skeleton/`（整条 track 一份，第一步用它） | `skeleton/src/main.rs` |
 | 参考解 patch | `solutions/<phase>.<index>-<slug>.patch` | `solutions/1.14-worker.patch` |
 | 能力 id | `<domain>/<name>`，小写连字符 | `async/graceful-shutdown` |
-| probe 题 | `probes/<domain>-<name>.<level>.rs`（头部写 `probe = "<能力>@<深度>"`） | `probes/delivery-idempotency.apply.rs` |
+| probe 题 | `probes/<domain>-<name>.<level>.rs`（头部写 `probe = "<能力>@<深度>"`；写法见 §11） | `probes/delivery-idempotency.apply.rs` |
 | probe 参考答案 | `probes/solutions/<同名>.rs` | `probes/solutions/delivery-idempotency.apply.rs` |
 | drill | `drills/<slug>.rs` | `drills/async-select-cancellation.rs` |
 
@@ -290,7 +290,7 @@ track 骨架的规则与 patch 的规则一样）。
 - [ ] `deepen`/`transfer` 步：`RECALL` 点名了更早的步骤（`track/<phase>.<index>`）、点了深度，
       且那一步真的建立过本步的 `requires` 或要深化的槽位（`lint-caps` R5 会查）
 - [ ] `apply` 及以上的槽位：有对应的 probe（`course/probes/`），且 `kiln probe --check` 通过——
-      没有 probe 的槽位要在正文或 handoff 里写明理由（例如需要真实数据库的网络型能力）
+      没有 probe 的槽位要在正文或 handoff 里写明理由（例如需要真实数据库的网络型能力）；写法见 §11
 
 ## 10. 翻译者检查清单
 
@@ -299,3 +299,40 @@ track 骨架的规则与 patch 的规则一样）。
 - [ ] 术语与 `glossary.toml` 一致
 - [ ] front-matter 补 `locale` / `source_hash` / `translator`
 - [ ] `kiln i18n status` 无结构错误（漂移由作者处理，不静默修哈希）
+
+## 11. 探题（probe）的写法
+
+一个 `(能力, 深度)` 槽位两道文件：题面 `course/probes/<domain>-<name>.<level>.rs` 与参考解
+`course/probes/solutions/<同名>.rs`。M3 收尾时全课程 65 道（T2 19 → T3 41 → T4 65），T4 的 29 个槽位里 5 个按
+政策不出题（理由在 [t4-lakelet.md](t4-lakelet.md) §6）。这一节是那 24 道实测出来的写法。
+
+1. **头部三行**，逐字对应文件名：
+
+       //! probe = "<能力>@<深度>"     # 文件名由它推出：能力的 / 换成 -，后面跟 .<深度>
+       //! title = "<列表里读的一行>"   # 句首大写、无句号
+       //! hint  = "<没过时打印的一句祈使句>"
+
+   loader 会核对文件名与头部（对不上就拒绝），并**拒绝 `aware` 槽位的题**——`aware` 按政策不出题。
+2. **两份文件只差函数体。** 先把参考解写通，再把每个要学习者写的函数换回桩做成题面：普通函数 `todo!()`（可以
+   带一句消息），`const fn` 里用单字面量的 `panic!("…")`（`todo!()` 在 const 上下文是 E0015）。落地前
+   `diff -u 题面 参考解` 数 hunk：**每个 hunk 必须正好是那些桩行**（实测：一道题的 hunk 2–6 个）。
+3. **零依赖、只有 `std`、离线、秒级。** 需要真东西的能力（真哈希、真 HTTP、真数据库、真采样器）在文件里手写
+   一个形状，并在正文里说明这个形状仍诚实抽到了那个习惯；**宁可不写题，也不写假证据**（`curriculum.md §11`
+   的 `aware` 政策与 handoff-m1-log 的两条先例）。
+4. **一份文件被编译两次，角色不同**：它既是学习者的 `src/lib.rs`，也是 `probe --check` 里的一个测试目标
+   （`tests/<slug 的 . 换成 _>.rs`）。所以：单 crate root、`#[cfg(test)] mod tests` 在文件末尾、没有 `fn main`、
+   没有 `mod x;` 指向别的文件、没有 `include!`。
+5. **正文四段**（先读两三道已有的题再写）：开头 3–5 条「有人为它付过账」的规则；`## What you write`；给了
+   什么以及为什么（词汇就是接口，别让学习者重造）；`## What the tests ask`；`## Where this is honest, and
+   where it is not`——这一道题**不是**那一步的什么机制（那机制是文件、是守护、是采样器…），以及为什么它仍是
+   值得重抽的习惯。用词必须与那一步的正文、规格、参考解一致，并点名步骤 `<track>/<phase>.<index>`。
+6. **6–10 条测试**，每条失败消息说**理由**而不是机制；至少一条边界（差一）、一条必须被拒绝的用例、一条两个
+   方向都成立的不变量。**不要留只碰「给定」代码的用例**：它要么是在钉夹具本身（那就写明），要么删掉——别让
+   它看起来像学习者已经交过的东西。
+7. **两个方向都要自己跑通**：参考解 `cargo test` 全绿；题面**编译通过**且测试全红（`todo!()` 的失败）。在
+   `/private/tmp` 里一个零依赖 scratch crate（`tests/<…>.rs` + `tests/exercise_<…>.rs`）里跑；别在课程树里留
+   `target/`。fmt 与规格同一把尺：`rustfmt --edition 2024 --config-path rustfmt.toml --config
+   skip_children=true`（`xtask ci` 对 `course/probes/**` 跑 `--check`）。
+8. **池子级检查**：`kiln probe --check` 把每个参考解当一个测试目标编译并跑一遍（一个 crate；目录留在
+   `<cache>/kiln/probe-check/<course>`，只重编变了的文件，被杀时报告说死线、不点某道题的名）。它还会拒绝
+   对不上账本（`capabilities.toml`）的槽位与重复的 slug。
