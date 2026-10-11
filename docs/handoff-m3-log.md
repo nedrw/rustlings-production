@@ -1826,8 +1826,9 @@ $ ls -1 copy → backup.manifest ingest.log segments segments.manifest ; copy/se
 ## 段 34：BP 的最后两道（第一任 worker 静默失败，重派后落地）+ 65 道的整目录验收
 
 **第一任 worker 掉了**：它的 scratch（`/private/tmp/bp-w8/`，里面还有自己写的 Python 生成脚本与 `templates/`）**90 分钟没动过**，
-十二棵 worktree 里都没有那两个文件，也没有汇报。按"worker 会静默失败"的纪律重派（作业书仍在磁盘上，重派只是一句"先读那份文件"），
-并要求接任者动手前先确认两个槽位是空的（实测：空）。**这是 M3 里唯一一次静默失败**——前七个 probe worker 与只读 manifest 那个都正常交付。
+十二棵 worktree 里都没有那两个文件，也没有汇报（运行时事后给出的状态是 `stopped`：没有最终消息）。按“worker 会静默失败”的纪律重派
+（作业书仍在磁盘上，重派只是一句“先读那份文件”），并要求接任者动手前先确认两个槽位是空的（实测：空）。
+**这是 M3 里唯一一次静默失败**——前七个 probe worker 与只读 manifest 那个都正常交付。
 
 **落地**（`d45391c`）：`sec/secrets-management.design`（1264/1361 行，10 用例，6 个 hunk）与
 `ops/runbook-drill.operate`（530/629 行，8 用例，2 个 hunk——`stages`/`gaps` 的函数体只隔 6 行，合成一个 hunk）。
