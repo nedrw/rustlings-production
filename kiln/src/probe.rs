@@ -486,11 +486,20 @@ impl CheckReport {
     }
 }
 
-/// Compile and run every reference solution in one scratch crate.
+/// Compile and run every reference solution in one crate.
 ///
 /// One `cargo test` for the whole catalogue: the probes are dependency-free single files, so the
-/// expensive part of this check is starting cargo, not compiling a test. `scratch` is a throwaway
-/// directory (see [`crate::scratch`]) and `course_dir` is the course the probes live in.
+/// expensive part of this check is cargo itself — and the *first* run, because every reference is
+/// compiled here as its own test target. `scratch` is therefore worth keeping: a file is written
+/// only when its bytes change, and a target the catalogue no longer has is removed, so the run
+/// after this one compiles what changed and nothing else. A fresh directory per run pays for the
+/// whole catalogue every time, and a catalogue of twenty-four more references is what made this
+/// check outgrow its own deadline. `course_dir` is the course the probes live in.
+///
+/// # Errors
+///
+/// [`KilnError::Write`] when the scratch crate cannot be written, and whatever [`process::run`]
+/// reports when `cargo` cannot be started at all.
 pub fn verify_references(
     probes: &[Probe],
     course_dir: &Path,
@@ -506,7 +515,7 @@ pub fn verify_references(
             path: scratch.to_path_buf(),
             source,
         })?;
-    write_file(&scratch.join("Cargo.toml"), CHECK_MANIFEST)?;
+    write_if_changed(&scratch.join("Cargo.toml"), CHECK_MANIFEST)?;
     let tests = scratch.join("tests");
     std::fs::create_dir_all(&tests).map_err(|source| KilnError::Write {
         path: tests.clone(),
@@ -514,6 +523,7 @@ pub fn verify_references(
     })?;
 
     let mut missing = Vec::new();
+    let mut wanted = Vec::with_capacity(probes.len());
     for probe in probes {
         let solution = probe.solution_path(course_dir);
         let Ok(text) = std::fs::read_to_string(&solution) else {
@@ -528,11 +538,15 @@ pub fn verify_references(
         };
         // The reference is a `lib.rs`; as its own test target it gets the same `cfg(test)` compile
         // it would have in the learner's crate, which is where its `#[cfg(test)] mod tests` lives.
-        write_file(
-            &tests.join(format!("{}.rs", test_target_stem(&probe.slug))),
-            &text,
-        )?;
+        let stem = test_target_stem(&probe.slug);
+        write_if_changed(&tests.join(format!("{stem}.rs")), &text)?;
+        wanted.push(stem);
     }
+    // A target a catalogue that has moved on left behind would be compiled and judged as if it
+    // were still a probe: a renamed or deleted exercise would keep its old reference running here,
+    // and a red one would be a failure [`report_of`] cannot name, because it only knows the probes
+    // that are here now.
+    prune_targets(&tests, &wanted)?;
     if !missing.is_empty() {
         return Ok(CheckReport {
             passed: Vec::new(),
@@ -541,13 +555,40 @@ pub fn verify_references(
     }
 
     let ran = process::run("cargo", &["test", "--quiet"], scratch, timeout)?;
+    Ok(report_of(probes, &ran, timeout))
+}
+
+/// The report one `cargo test` run is, given the catalogue it ran.
+///
+/// A run the deadline killed is not a report about probes at all: libtest never reached its
+/// per-target lines, so the names in the truncated output belong to whatever was being compiled
+/// when the kill landed — and this check used to print one of them, which sends a learner to a
+/// probe that is fine. A first run of a large catalogue is exactly that case, so the message names
+/// the deadline and the size instead of a slug.
+fn report_of(probes: &[Probe], ran: &Ran, timeout: Duration) -> CheckReport {
     if ran.success() {
-        return Ok(CheckReport {
+        return CheckReport {
             passed: probes.iter().map(|probe| probe.slug.clone()).collect(),
             failed: Vec::new(),
-        });
+        };
     }
-
+    if ran.timed_out {
+        let seconds = timeout.as_secs();
+        let count = probes.len();
+        return CheckReport {
+            passed: Vec::new(),
+            failed: vec![(
+                "probe --check".to_owned(),
+                format!(
+                    "killed after {seconds}s: the catalogue is {count} reference(s), each compiled \
+                     as its own test target, and a first run pays for every one of them — raise \
+                     `--timeout` and run it again, because the build directory is kept and the run \
+                     after this one compiles only what changed. This says nothing about any single \
+                     probe"
+                ),
+            )],
+        };
+    }
     // One failing reference makes the whole run red, so the report names the ones that are red
     // rather than guessing: libtest prints one line per failing test target.
     let output = format!("{}\n{}", ran.stdout, ran.stderr);
@@ -562,18 +603,54 @@ pub fn verify_references(
         })
         .collect::<Vec<_>>();
     if failed.is_empty() {
-        return Ok(CheckReport {
+        return CheckReport {
             passed: Vec::new(),
             failed: vec![(
                 "cargo test".to_owned(),
                 first_lines(&output, 8).unwrap_or_else(|| "no output".to_owned()),
             )],
-        });
+        };
     }
-    Ok(CheckReport {
+    CheckReport {
         passed: Vec::new(),
         failed,
-    })
+    }
+}
+
+/// Write `text` to `path` unless the file already holds exactly those bytes.
+///
+/// Cargo decides what to rebuild from the files' modification times, so writing a reference with the
+/// bytes it already had would compile the whole catalogue again on every run — which is the
+/// difference between a check that is cheap enough to run after every change and one that is not.
+/// The answer is whether it wrote, which is what the test asserts on.
+fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
+    if std::fs::read(path).is_ok_and(|found| found == text.as_bytes()) {
+        return Ok(false);
+    }
+    write_file(path, text)?;
+    Ok(true)
+}
+
+/// Remove every `tests/*.rs` that is not one of `wanted`, and nothing else.
+fn prune_targets(tests: &Path, wanted: &[String]) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(tests) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_target = path.extension().is_some_and(|ext| ext == "rs");
+        let kept = path
+            .file_stem()
+            .is_some_and(|stem| wanted.iter().any(|keep| keep == &stem.to_string_lossy()));
+        if !is_target || kept {
+            continue;
+        }
+        std::fs::remove_file(&path).map_err(|source| KilnError::Write {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 /// `Cargo.toml` of the scratch crate that compiles every reference.
@@ -826,5 +903,106 @@ mod tests {
         assert!(!report.is_clean());
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].1.contains("no reference solution"));
+    }
+
+    #[test]
+    fn a_reference_whose_bytes_did_not_change_is_not_written_again() {
+        // Cargo rebuilds what carries a new modification time, so rewriting the same bytes would
+        // compile the whole catalogue on every run — which is what the check used to do, with a
+        // fresh scratch directory each time.
+        let temp = TempDir::new("probe-write-if-changed");
+        let path = temp.path().join("tests/delivery-idempotency_apply.rs");
+        assert!(
+            write_if_changed(&path, "// one\n").unwrap(),
+            "the first write happens"
+        );
+        assert!(
+            !write_if_changed(&path, "// one\n").unwrap(),
+            "the same bytes are not written again"
+        );
+        assert!(
+            write_if_changed(&path, "// two\n").unwrap(),
+            "a changed reference is"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// two\n");
+    }
+
+    #[test]
+    fn a_target_the_catalogue_no_longer_has_is_removed() {
+        let temp = TempDir::new("probe-prune");
+        let tests = temp.path().join("tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::write(tests.join("kept_apply.rs"), "// kept\n").unwrap();
+        std::fs::write(tests.join("renamed_apply.rs"), "// stale\n").unwrap();
+        std::fs::write(tests.join("notes.md"), "not a target\n").unwrap();
+
+        prune_targets(&tests, &["kept_apply".to_owned()]).unwrap();
+
+        assert!(
+            tests.join("kept_apply.rs").is_file(),
+            "a target this catalogue has stays"
+        );
+        assert!(
+            !tests.join("renamed_apply.rs").exists(),
+            "one the catalogue dropped goes: a stale reference would be judged as a probe"
+        );
+        assert!(
+            tests.join("notes.md").is_file(),
+            "and nothing that is not a test target is touched"
+        );
+    }
+
+    #[test]
+    fn a_killed_check_is_reported_as_a_deadline_and_names_no_probe() {
+        // The failure this pins: a killed run printed the first probe whose path happened to be in
+        // the truncated output, so the report sent a learner to an exercise that was fine.
+        let temp = course_with("delivery-idempotency.apply", EXERCISE);
+        let course = temp.path().join("course");
+        let probes = load(&course).unwrap();
+        let killed = Ran {
+            code: None,
+            stdout: "Compiling tests/delivery-idempotency_apply.rs\n".to_owned(),
+            stderr: String::new(),
+            timed_out: true,
+            elapsed: Duration::from_secs(300),
+        };
+
+        let report = report_of(&probes, &killed, Duration::from_secs(300));
+
+        assert!(!report.is_clean());
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert_eq!(report.failed[0].0, "probe --check");
+        assert!(
+            report.failed[0].1.contains("killed after 300s"),
+            "the deadline is the subject: {}",
+            report.failed[0].1
+        );
+        assert!(
+            !report.failed[0].1.contains("delivery-idempotency"),
+            "and no probe that was merely compiling is named: {}",
+            report.failed[0].1
+        );
+    }
+
+    #[test]
+    fn a_failing_reference_is_named_from_what_cargo_printed() {
+        let temp = course_with("delivery-idempotency.apply", EXERCISE);
+        let course = temp.path().join("course");
+        let probes = load(&course).unwrap();
+        let failed = Ran {
+            code: Some(101),
+            stdout: String::new(),
+            stderr: "error: test failed, to rerun pass `--test delivery-idempotency_apply`\n  \
+                     --> tests/delivery-idempotency_apply.rs:1:1"
+                .to_owned(),
+            timed_out: false,
+            elapsed: Duration::from_secs(2),
+        };
+
+        let report = report_of(&probes, &failed, Duration::from_secs(300));
+
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert_eq!(report.failed[0].0, "delivery-idempotency.apply");
+        assert!(report.passed.is_empty());
     }
 }

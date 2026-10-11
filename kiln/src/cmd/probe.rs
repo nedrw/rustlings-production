@@ -8,11 +8,20 @@
 //! * `kiln probe --check` validates the *course*: every reference solution compiles and passes, in
 //!   one scratch crate. That is the anti-rot rule the steps have, applied to the review material.
 
+use std::path::{Path, PathBuf};
+
 use crate::cmd::Session;
 use crate::error::{EXIT_ERROR, EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, KilnError, Result};
+use crate::hash;
 use crate::probe::{self, Probe};
-use crate::scratch::Scratch;
+use crate::scratch;
 use crate::state::{Evidence, days_between, unix_now};
+
+/// The name this command's build directories live under: `<cache>/kiln/probe-check/`.
+///
+/// Every reference compiles as its own test target, so the first run of a catalogue is the
+/// expensive one; [`check_directory`] keeps that work between runs.
+const CHECK_DIR: &str = "probe-check";
 
 /// Print the catalogue, run one exercise, or check the course.
 pub fn run(
@@ -199,17 +208,20 @@ fn check_course(session: &Session) -> Result<u8> {
         }
     }
 
-    let scratch = Scratch::new("probe-check").map_err(|source| KilnError::Write {
-        path: std::env::temp_dir(),
-        source,
-    })?;
-    if let Some(target) = crate::scratch::shared_target_dir() {
-        crate::process::share_cargo_target_dir(target);
-    }
+    // The catalogue is one `cargo test` of every reference, so the run after this one should not pay
+    // for what this one built: the directory is the machine's cache, one per course checkout —
+    // [`check_directory`] says why it is neither shared between checkouts nor the shared build
+    // directory the sandboxed runs use.
+    let dir = check_directory(&course.dir())?;
+    println!(
+        "  compiling the {} reference(s) in {} — kept between runs",
+        probes.len(),
+        dir.display()
+    );
     let report = probe::verify_references(
         &probes,
         &course.dir(),
-        scratch.path(),
+        &dir,
         session.timeout().max(std::time::Duration::from_secs(180)),
     )?;
 
@@ -243,5 +255,68 @@ fn print_output(ran: &crate::process::Ran) {
             continue;
         }
         println!("{text}");
+    }
+}
+
+/// The directory this check compiles in: `<cache>/kiln/probe-check/<course>`.
+///
+/// Kept, because every reference is compiled here as its own test target: the first run pays for
+/// all of them and the next one compiles what changed ([`probe::verify_references`] writes only
+/// changed bytes and removes targets the catalogue no longer has). One directory per course
+/// *checkout* rather than one per machine, because two checkouts are two catalogues and a shared
+/// directory would have each run undoing the other's build.
+///
+/// It is deliberately not the shared `<cache>/kiln/target` a sandboxed run uses: this crate has no
+/// dependencies, so there is nothing for that directory to save, and pointing cargo at it puts every
+/// check behind the builds of a twenty-four-step project (measured: the same check took 63 s with
+/// the machine to itself and over three minutes at a load average of 17 on eight cores).
+///
+/// # Errors
+///
+/// [`KilnError::Write`] when the machine has nowhere to put a cache, or the directory cannot be
+/// created.
+fn check_directory(course: &Path) -> Result<PathBuf> {
+    let dir = scratch::cache(CHECK_DIR)?.join(check_key(course));
+    std::fs::create_dir_all(&dir).map_err(|source| KilnError::Write {
+        path: dir.clone(),
+        source,
+    })?;
+    Ok(dir)
+}
+
+/// The name one course checkout's build lives under: eight hex characters of its path.
+///
+/// Plain hex, without the `sha256:` the course writes down: macOS's loader splits
+/// `DYLD_FALLBACK_LIBRARY_PATH` — which cargo builds out of the target directory — on `:`, so a
+/// directory called `sha256:2cc5c06e` made every check fail with `failed to join paths from
+/// $DYLD_FALLBACK_LIBRARY_PATH` (measured, not guessed). Eight characters are enough to tell two
+/// checkouts apart and short enough to read in the line the command prints.
+fn check_key(course: &Path) -> String {
+    let key = hash::bytes(course.to_string_lossy().as_bytes());
+    key[hash::PREFIX.len()..hash::PREFIX.len() + 8].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_check_directory_name_is_one_path_segment_the_same_course_keeps() {
+        let one = check_key(Path::new("/tmp/course-one"));
+        assert_eq!(
+            one,
+            check_key(Path::new("/tmp/course-one")),
+            "the same course keeps its build directory between runs"
+        );
+        assert_ne!(
+            one,
+            check_key(Path::new("/tmp/course-two")),
+            "two checkouts are two catalogues, so they do not undo each other's build"
+        );
+        assert_eq!(one.len(), 8, "eight characters, and no prefix: {one}");
+        assert!(
+            one.chars().all(|character| character.is_ascii_hexdigit()),
+            "the name is a path segment the loader cannot split: {one}"
+        );
     }
 }
