@@ -87,7 +87,12 @@ query、perf、profile、soak、cardinality、dr-drill、capacity、rotation、b
 
 - **容器引擎坏着，plan §9 腿 6 的第二半欠着**：本机 `podman run` 对任何镜像都报 overlay 挂载 I/O 错误，所以 4.22 的
   `container-repro` 无法判；引擎恢复后要重跑（配方与暖 registry 的位置在 [handoff-m3.md](handoff-m3.md) §5）。
-- **探题（BP）待补**：T4 的 24 道（29 个槽位里 5 个按政策不出题）。
+- **探题的 5 个槽位按政策不出题（其余 24 道已写成，见 `docs/authoring.md` §11 的写法）**：
+  `store/wal-recovery@aware`（`aware` 深度不出题——loader 直接拒绍 `aware` 槽位的题）、
+  `ci/pipeline@design` 与 `release/container-image@design`（机制是流水线与容器，单文件题会变成假证据，
+  已由 `xtask ci` 与 `container-repro` 覆盖）、`repo/toolchain-pinning@design`（机制是文件与版本的关系）、
+  `supply/deny-policy@design`（需要真实依赖图；本机没有 `cargo-deny`）。24 道题里多数是 6–10 条用例、
+  约 500–1200 行（含给定的词汇），每道都写明了它**不是**那一步的什么机制。
 - **没有只读的 manifest 入口**（4.19、4.21、4.24 三处撞上）：`Segments::open` 会写，因此 `copy` 会改源、冷店打不开；
   修法是一个只读的 `compaction::Manifest::load`，并让 4.19/4.21 改用它（是否放进 M3 收尾待定）。
 - **tier 在 CLI 里没有入口**：`sweep`/`hydrate` 只有引擎侧，所以 4.24 的 runbook 阶段点不出 tier 命令。

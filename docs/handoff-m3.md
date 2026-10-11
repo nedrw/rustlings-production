@@ -38,9 +38,11 @@
 | B5c | `course(lakelet/4.23-secret-rotation): two keys valid, one preferred, and the window is arithmetic` | 4.23 正文（deepen，16 用例 + `slow:sim@3`）+ `service/keys.rs`（环/令牌/`Refusal`/`Window`/`earliest_safe_retirement`）+ `ingest.rs` 的连接级鉴权（令牌是首载荷，拒绝计在 4.6 已经数拒绝的地方）+ `cli/rotate.rs`（`--add`/`--retire`/`--list`）+ 完整 `tests/sim_rotation.rs` + `docs/rotation.md`；sim 三个种子 `7867e017/a3de9fc0/f43918f3`（seed 1 重放）；演练：把窗口改成“接管即退休”→ 算术用例 `left Some(1700001000000) / right Some(1700004600000)` 红 + sim 红；回滚绿 |
 | B5d | `course(lakelet/4.24-runbook-drill): the procedure, and the instrument that runs it` | 4.24 正文（deepen，**`ops/runbook-drill@operate`**，14 用例）+ 完整装置 `tests/runbook_harness.rs`（2041 行：把页面读成 stages-as-data、五个义务、八个真检查、将页面命令当 `CARGO_BIN_EXE_*` 拿真店跑、缺口当 finding）+ 学习者的两页 `docs/runbook.md`（8 阶段）/`docs/slo.md`（11 行数字表 + 错误预算）；规格通过 `#[path = "runbook_harness.rs"] mod harness;` 拿装置当仪器；演练：删掉第 6 阶段的 `- signal:` → 用例与仪器双双点名；回滚绿。**T4 的 24 步至此全部写成** |
 
-尚未落地：**探题（BP，T4 的 24 道）**与 **收尾（BV）**——`cargo xtask ci`、离线快路、`verify lakelet --slow --json`、`docs/t4-lakelet.md`、本文件 §0–§5 补全。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。
+| BP | `course(probes): …`（七个提交，`fe89ea6`…`1c27ff5`）+ `kiln: probe --check keeps what it builds, and a killed run says so`（`dd07d27`）+ `course(lakelet): the two sites the read-only door left behind`（`33e7d9f`） | T4 的 24 道探题（29 个槽位按 D-6 排除 5 个：`aware` 政策 + 四个机制不在单文件里的 design，理由在 [t4-lakelet.md](t4-lakelet.md) §6）：八批并行、逐批复核（与作者 scratch 副本逐字节 `diff`、`diff -u 题面 参考解` 的每个被删行都必须是桩那一行、参考解全绿 / 题面编译且全红、`rustfmt`）；框架侧修好「每次重编全部参考解、被杀时还会点错名」；写法写进 [authoring.md](authoring.md) §11 |
 
-## 1. 施工中钉下来的规则（收尾时并入 §3）
+尚未落地：**收尾（BV）**——`cargo xtask ci` 的 exit 0、离线快路、`verify lakelet --slow --json`、`docs/t4-lakelet.md` 与本文 §0–§5 的收口。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。探题已全部落地（段 32/34），§5 里那笔只读 manifest 的修正也已落地（段 33）。
+
+## 1. 施工中钉下来的规则（1–12 在这里；13–24 在本文件末尾的 §5 之后——收尾时一并并入 §3）
 
 四条都是 4.2 那一段实测出来的，下一个人直接照做：
 
@@ -146,8 +148,16 @@ value }`，`series` = 指标名 + 标签集。
 - **plan §9 的六条腿**：① 离线快路的构建那一半已验（`cargo build --offline` 全绿）；② soak 抓到注入的泄漏（4.17）；
   ③ sim 抓到不确定性（4.6）；④ 未分类的截断帧（4.2）；⑤ 去掉索引剪枝 → `pruning_rate 95→50`（4.14）；
   ⑥ 弄坏 Dockerfile → `container-repro` 红（**欠，等引擎**）。
-- **课程自有检查**：`lint-caps` no issues · `links` 115 页/538 链全解 · `i18n` 0 error · `probe --check` 41/41 ·
-  `cargo test -q -p kiln` 344 passed（322+21+1）。
+- **探题（BP）**：全课程 **41 → 65 道**（T4 的 24 道；另有 5 个槽位按政策不出题，理由在 [t4-lakelet.md](t4-lakelet.md) §6）。
+  `kiln probe --check`：41 道冷跑 54.8 s → 63 道 54.3 s（复用编译目录之后）；每道题的交付判据是 §1 第 23 条
+  那两件事 `diff`。`rustfmt --check` 扫 126 份探题文件退 0；写法写进 [authoring.md](authoring.md) §11，池子级检查的修正在 §1 第 24 条。
+- **只读 manifest（段 33）**：四个被碰的步骤 `selftest` 21 s / 92 s / 63 s / 28 s，各自 `1/1 step(s) hold the contract`（含慢门）；
+  按规则 12 重建的 tail 树 `clippy --all-targets -- -D warnings` 干净、`tests/runbook_harness` 与 `tests/sim_backup` 各 1 passed；
+  `kiln spec manifest --track lakelet` 重钉 `diff` exit 0。演练（我手跑）：只读源（`dr-xr-xr-x`，里面种着孤儿与半截清单）上
+  `lakeletq backup` → `files=4 entries=4 bytes=569 records=8 log_bytes=261 log_records=2 interrupted=false epoch=2 floor=0` exit 0，
+  而源一字未动、副本只含清单点名的文件。作者侧还留了新旧对照（同一只读源：新 exit=0 / 旧 exit=4）。
+- **课程自有检查**：`lint-caps` no issues · `links` 115 页/540 链全解 · `i18n` 0 error · `probe --check` 65/65 ·
+  `cargo test -q -p kiln` **327 + 21 + 1 passed**（BP 之前是 322+21+1 = 344）。
 - **`cargo xtask ci`**（`/private/tmp/l4b3-wrapup`）：全局阶段全绿——`cargo fmt --all --check`、
   `rustfmt --check`（223 份课程文件）、`cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo test --workspace`（322+21+1）、spec integrity、`lint-caps`、`links`、`probe --check`——
@@ -178,10 +188,10 @@ value }`，`series` = 指标名 + 标签集。
   代价是全部变异比值要重测；在那之前，比值低于 100% 要先看它是“本步的真缺口”还是“后来者的代码被抽中”。
   对照：4.7 的 `decode.rs:422 if shift > 63` 确实是 4.7 自己写的行，那是**真缺口**（一个需要第十个字节的
   varint 没被覆盖），与仪器无关。
-- **`compaction` 没有只读的 manifest 读入口（4.19 发现，未修）**：唯一的门 `Segments::open` 会**写**（删孤儿、
-  删 `segments.manifest.pending`、sync 目录），所以 4.19 的 `copy` 打开它的源就是“一次会写的读”，源在只读挂载上时
-  连打开都会失败——而线上备份工具不该改它的源。修法：给 `compaction` 一个只读的 `Manifest::load(directory)`
-  （`decode` 早已存在，只是没暴露），4.19 的 `copy` 改用它；代价是 4.19 的解补丁与规格要重跑一次。
+- ~~**`compaction` 没有只读的 manifest 读入口（4.19 发现）**~~ **已修（段 33）**：当时唯一的门 `Segments::open`
+  会**写**（删孤儿、删 `segments.manifest.pending`、sync 目录），所以 4.19 的 `copy` 打开它的源就是“一次会写的读”，
+  源在只读挂载上时连打开都会失败——而线上备份工具不该改它的源。现在 `Manifest::read`/`Manifest::load` 是那道门，
+  `copy` 改用了它；演练：只读源（`dr-xr-xr-x`）上 `lakeletq backup` exit 0，源一字未动（段 33 的原始行）。
 - **恢复后的账本窗口与源不同（4.19 发现，未修）**：`Registry::of_store` 的窗口来自活着的侧车索引（整段的 zone），
   恢复出来的店没有 `index/`，窗口只来自日志记录。4.19 的第 12 条用例断言了成立的那个方向（系列与计数相同）、
   并在用例里写明理由，但 `docs/cardinality.md`（4.18 的项目页）没提这个差别——收尾时可补一句。
@@ -198,12 +208,10 @@ value }`，`series` = 指标名 + 标签集。
   规格没有为此发明一个新输入。收尾时可考虑在 `docs/cardinality.md` 里点一句与它的关系。
 - **`SegmentInfo` 的字段可见性不一致（4.20 顺带发现，未修）**：`bytes`/`records` 是 pub 字段，而时间范围是私有
   字段 + 访问器。无实害，但“计划自己算出来的数”与“清单里读出来的数”被两种方式读。
-- **没有只读的 manifest 入口（4.19 发现，4.21 再次撞上，仍未修）**：4.21 的 `hydrate` 因此只能接一个**活着的**
-  `&Segments`（`Segments::open` 是唯一的门且会写），于是“一个已停进程的冷店根本无法打开”的后果只能写进页面与用例
-  （`a_stopped_store_whose_segments_are_cold_is_not_openable_at_all`、`the_way_back_for_a_stopped_store_is_one_copy_per_segment`），
-  key 恰好就是店自己的路径，所以手工回来的办法是“每段一次 copy”。**三个证人之后，这笔修正值得单独一批**：给
-  `compaction` 一个只读的 `Manifest::load(directory)`（`decode` 已存在，只是没暴露），让 4.19 的 `copy` 与 4.21 的
-  `hydrate` 都改用它——代价是两步的解补丁与 lane 要重跑（已向用户确认是否放进收尾）。
+- ~~**没有只读的 manifest 入口（4.19 发现，4.21 再次撞上）**~~ **已修（段 33）**：`compaction::Manifest::read`（只读，
+  不建不刷不删）与 `Manifest::load`（外加逐段长度核对）落 4.19 的 scaffold（4.8 的 scaffold 先补了那个标记区），
+  4.19 的 `copy` 与 4.21 的 `hydrate` 都改了用它；`hydrate` 现在接目录，所以已停的冷店先 hydrate 再 open。
+  当时的两条代价（两步的解补丁与 lane 重跑）已付：四个被碰步骤的 `selftest` 全绿，规矩写进 `authoring.md` §5.4。
 - **`mutants` 只跑一遍 `run.cmd`（不带 `KILN_BACKEND`），与 `conformance` 的后端轮询不一致（4.21 发现，未修）**：
   见 §1 第 20 条；当步的弥补是让每次运行都跑到 S3 那一半。框架侧两选一：走查也按后端跑（代价大），
   或用 `conformance.toml` 里第一个声明的后端（代价小、语义清楚）。
@@ -240,10 +248,10 @@ value }`，`series` = 指标名 + 标签集。
 - **没有“只检查钉、不写文件”的 `kiln` 命令（4.23 遇到）**：验证手钉的 `spec/manifest.toml` 行只能靠在副本里重跑
   `kiln spec manifest --track lakelet` 再 `diff`（4.23 的作者就是这么做的，结果一致）。收尾时可以考虑给 `spec manifest`
   加一个 `--check`。
-- **tier 的 `sweep`/`hydrate` 在 `src/cli`/`src/bin` 里没有入口（4.24 发现，未修）**：4.21 只交了引擎侧的两个 pass，
-  于是 4.24 的 runbook 阶段 7 无法点出一个 tier 命令（页面写明这一点，装置把 sweep 当“世界”自己演）；且已停的冷店
-  根本打不开（§5 的只读 manifest 那条）。两条一起修最自然：一个 `lakeletq tier --sweep/--hydrate`（或把 sweep 接进
-  守护的维护 tick），并在 `compaction` 里开一个只读的 manifest 载入。
+- **tier 的 `sweep`/`hydrate` 在 `src/cli`/`src/bin` 里没有入口（4.24 发现，未修；引擎那一半已修，段 33）**：4.21 只交了引擎侧的两个 pass，
+  于是 4.24 的 runbook 阶段 7 无法点出一个 tier 命令（页面现在写明“引擎能对目录 hydrate，但本部署的 CLI 不暴露”）。
+  只读 manifest 那半已经落地（`hydrate` 现在接目录，已停的冷店先 hydrate 再 open）；**剩下的只有 CLI**：一个
+  `lakeletq tier --sweep/--hydrate`（或把 sweep 接进守护的维护 tick），做它要重跑 4.24 的 case/tests。
 - **`lakeletq query` 只看段，`inspect series` 看日志 + 活索引（4.24 发现，未修）**：记录还在日志里的店，query 答不出
   任何东西，而账单却能列出一切。4.24 是有意用它（阶段 5 的 `records` 是清单的数，装载的记录对阶段 7 不可见），
   但一个操作员会跌进去——以后某页写一句。
@@ -261,6 +269,16 @@ value }`，`series` = 指标名 + 标签集。
 - **`mutants@80` 的样本只有 6 个、比值阈值 80%**：5/6 = 83% 只高出阈值 3 个百分点，
   抽样换一位就会翻盘。这是计划 §6 D-1 定下的形状（“12 步、每步最多 6 个”），没改；
   但如果以后再出现“某个步骤因仪器原因卡在 83%”，值得重新讨论样本数（每再多判一个位点约 +1–2 s）。
+
+- **24 步的 learner lane 没有在 BP 与段 33 之后重跑（等引擎）**：`verify lakelet` 需要一棵走完全部步骤的项目树，
+  而那一趟（连同 `--slow --json` 的 824 s）本来就要在引擎修好后重跑一次收尾验收。这两笔的直接证据是：
+  四个被碰步骤的 `selftest`（含慢门）+ 按规则 12 重建的 tail 树（`clippy --all-targets`、`runbook_harness`、`sim_backup`），
+  受影响面用文本钉住：只有 4.19/4.21 的规格与 4.24 的装置提到那两个门。
+- **课程自己的构建缓存在长（`~/.cache/kiln/target` 34 GB，未处理）**：sandbox 跑共用这一个目录（
+  `scratch::shared_target_dir` + `share_cargo_target_dir`），而每步的项目都是从新的副本路径编译，
+  于是包本身没法复用、只有依赖能复用，目录只增不减（原来它还是“`probe --check` 被杀”的帮凶之一，
+  那个检查已经改成用自己的按 checkout 分的目录，见 §1 第 24 条）。删它安全（下次重建变慢）但它在工作树之外，
+  **要用户点头**；真正的修法是给 sandbox 一个按 track 复用、会自我修剪的构建目录，M4 的活。
 
 13. **每棵树一个 `CARGO_TARGET_DIR`，没有例外**。4.13 的作者在作者侧踩了与砂箱侧同一个坑的新版本：两棵
     副本共用一个 target 目录，cargo 把**旧的** `lakelet` 产物交给了新树（那棵树里 `rng.rs` 是被改坏的），
@@ -336,8 +354,22 @@ value }`，`series` = 指标名 + 标签集。
     `cargo run --quiet --package lakelet -- --check-config` → 配置报告 + `exit=0`。以后的 track 同理。
 
 22. **尾巴树会编译每一个规格，所以一份新规格的 lint 会让 24 步全红**（4.24 实测）。`clippy@4` 不是
+    `clippy@4` 不是
     `cargo clippy --all-targets -- -D warnings`：它另开 `missing_errors_doc`、`manual_let_else`、
     `match_wildcard_for_single_variants`、`semicolon_if_nothing_returned`、`uninlined_format_args` 等效额外的 lint；
     4.24 的第一轮 lane 里，作者的新规格有一条 `uninlined_format_args`，于是 `verify lakelet` 一次报 **0/24**
     （每个步骤的 clippy 都要过那棵树的所有测试目标，而那份规格在里面）。写规格时就把这五条当格式要求，
     并在 lane 里先跑一次 `check --slow` 而不是直接相信 `cargo clippy`。
+
+23. **一道探题是两个文件，核它的前两件事都是 `diff`**（BP 实测，24 道）。① 与作者的 scratch 副本**逐字节** `diff`
+    （题面与参考解各一份）：作者说“我验过了”不等于到你手里的字节就是它验的那份（实测：一次是我自己误碰了两行，
+    一次是编辑 patch 时漏改 hunk 头的行数，交付出去的文件被**静默截断**）；② `diff -u 题面 参考解` 的**每一个被删行
+    都必须正好是桩那一行**（`todo!()`，或 `const fn` 里的单字面量 `panic!`）——它比“参考解绿”更能抓出“题面里
+    混进了只属于参考解的助手”。写法与池子级检查见 `authoring.md` §11，练习数据：24 道题的 hunk 数 2–6 个。
+
+24. **池子级检查的代价随题库增长，所以它必须留着编译产物；被杀必须报死线**（BP 实测，两个 worker 独立撞上）。
+    24 道新题把 `kiln probe --check` 顶过默认死线，而旧实现把被杀的那次报成“某一道题没过”
+    （两次都点名同一个无关的题：它的 warning 里有 `tests/<stem>.rs`）。修法：目录留在
+    `<cache>/kiln/probe-check/<course>`（按 checkout 分，因为两个 checkout 是两套题）、只在字节变了时写文件、
+    删掉题库里没有的目标、被杀时报告说死线与 `--timeout`。**推论**：任何“把整个题库编译一遍”的检查都不能每次
+    用新目录，也不要共享 24 步项目的构建目录（实测：同样的检查独占 63 s、在 `load 17` 下要几分钟并越过死线）。

@@ -1722,3 +1722,103 @@ $ kiln images                                   # 声明面没被动到
 `localhost/kiln-mailer-spec:latest` + `kiln-mailer-repro:latest`（同一个 17.3 MB 镜像，课程 1.21 容器门自己建的，可重建，留）。
 **镜像大小是共享层的和**，所以 `system df` 的 4.569GB→1.452GB 与 VM 盘上的 3.8G→1.5G 是两个数、都对（前者含共享层，后者是真实占用）。
 **没动的东西**：`podman system reset`（禁令，会抹掉声明镜像）、暖 registry `~/.cache/kiln/container-registry`（144 MB，容器门把它挂进 builder）。
+
+## 段 32：BP — T4 的 24 道探题（八批并行，加上框架侧的 `probe --check` 修正）
+
+**派活形状**：29 个 lakelet 槽位里按 D-6 排除 5 个（`aware` 政策 + 四个"机制是流水线/容器/文件与版本/真实依赖图"的 design），
+其余 24 道分成 8 组，一组一个 worker（2–4 道），共同契约写在 `/private/tmp/bp/README.md`、每组一份 `wN.md`。**每个 worker 自查两件事**：
+参考解 `cargo test` 全绿、题面**编译通过且测试全红**，并把两份文件与它自己的 scratch 副本对齐（`shasum`）。
+**我这边逐批复核**：与作者副本逐字节 `diff`（12 个文件全部一致；有一次是我自己误碰了 `ingest-protocol.apply.rs` 两行，`diff` 立刻看出来）、
+`diff -u 题面 参考解` 的每一个被删行都必须是桩那一行（4.1–4.24 实测 hunk 2–6 个）、`rustfmt --check` 退 0、在**我的** scratch crate 里再跑一次两个方向。
+
+**落地**（每批一个提交，全部推 `local`）：
+
+```
+fe89ea6 course(probes): the compaction, retention and pruning slots get their exercises      # 8/8/8 passed
+338dc3c course(probes): the downsampling, engine and aggregation slots get their exercises     # 8/8/8
+ceec8a2 course(probes): the protocol, fuzz and WAL slots get their exercises                   # 7/7/7
+ed5ea0a course(probes): the write-path slots get their exercises (batching, backpressure, columnar)  # 10/10/9
+3c98959 course(probes): the testing and performance slots get their exercises                  # 8/9/8/8
+550c594 course(probes): the bill, the copy and the model get their exercises                    # 7/9/6
+1c27ff5 course(probes): the tier and the build get their exercises                              # 8/10/9
+```
+
+（最后两道的组是 `sec/secrets-management@design` 与 `ops/runbook-drill@operate`，见段 34。）
+
+**三处"按材料而不是按作业书"的改写，都由作者报备并写进文件的诚实段**：4.6 的第四个队列策略是 `Sample` 不是 `Refuse`（`SAMPLE_KEEP = 4` 被钉住）、
+批的封口在 `push` 之内（否则 `offered` 把同一个帧数两次、该步自己的不变量不成立）、4.21 的分类保留步骤自己的四个 `Class`
+（`Answered`/`Absent`/`Refused`/`Retryable`），`w7` 要的那条边界由 `Class::attempts()` 钉（`403` 一次、`5xx` 是 `ATTEMPTS`）。
+一处有意保留的"只碰给定代码的测试"（4.13 的 `a_merge_changes_the_store_and_not_what_a_reader_sees`）在 `authoring.md` §11 第 6 条下说明为"钉夹具本身"。
+
+**框架缺陷：`probe --check` 每次重编全部参考解，被杀时还会点错名**（两个 worker 独立撞上，行文一致）：
+
+```
+$ kiln probe --check                                   # 默认死线
+probe --check · 44 exercise(s) · 0 reference(s) passed
+  ✗ sec-authz-tenant-isolation.apply: the reference solution did not pass      # 那是被杀，不是坏题：单独跑 4 passed
+$ kiln --timeout 3600 probe --check                     # 7m15s（机器被 9 个 worker 打满）
+✓ every probe reference compiles and passes
+```
+
+修法（`kiln: `probe --check` keeps what it builds, and a killed run says so`，`dd07d27`）：① 编译目录留在
+`<cache>/kiln/probe-check/<course>`（一个 checkout 一个），只在字节变了时写文件、删掉题库里没有的目标；
+② 不再共享 sandbox 的 `<cache>/kiln/target`（零依赖的检查没有东西可省，共享只会排在 24 步项目的构建后面）；
+③ 被死线杀掉时报告说死线、目录大小与 `--timeout`，不点任何一道题的名。**实测**：50 道冷跑 63 s；
+改一字节后重跑只编那一份；`cargo test -q -p kiln` 327 passed（含 5 条新用例）；clippy `--all-targets -- -D warnings` 干净。
+踩到的坑也写成了测试：目录名里带 `sha256:` 的冒号被 macOS 的 `DYLD_FALLBACK_LIBRARY_PATH` 当分隔符，
+每次检查都死在 `failed to join paths`。
+
+**整目录验收（63 道时，还剩 W8 的两道）**：`kiln probe --check` → `63 exercise(s) · 63 reference(s) passed ✓`（54.3 s，负载 12）；
+`rustfmt --check` 扫 126 份探题文件退 0；`cargo test -q -p kiln` → 327 passed；`cargo clippy --workspace --all-targets -- -D warnings` 与
+`cargo fmt --all --check` 干净；`links` 115 页/540 链全解、`i18n` 0 error、`lint-caps` no issues。
+
+## 段 33：只读 manifest —— 三证人的那笔修正（4.8/4.19/4.21 + 4.24 的装置）
+
+**三个证人**（§5 早就记着）：4.19 的 `copy` 通过 `Segments::open` 打开它的源（开就是写：建 `segments/`、刷目录、删清单没点名的文件），
+所以备份工具会改它要保存的店、只读挂载上的源根本拷不了；4.21 的 `hydrate` 只能接活着的 `&Segments`（唯一那道门会写，而且拒绝"清单点名而目录没有"的店），
+于是它存在的那一个状态——进程停了、段已经上柜——够不着，规格里两个用例把这件事写成了事实；4.24 的 runbook 阶段 7 因此点不出 tier 命令。
+
+**落地**：4.8 的 scaffold 先给 `compaction/mod.rs` 加一个标记区（它此前没有区，所以后步连一行都插不进去）；
+4.19 的 scaffold 在区里给出 `Manifest::read`（只读，不建不刷不删，连 `segments.manifest.pending` 都不碰）与
+`Manifest::load`（外加逐段长度核对，措辞就是原来 `open` 的）；4.19 的参考解改用 `load`；4.21 的 scaffold+参考解把
+`hydrate` 改成接**目录**并用 `read`（冷店先 hydrate 再 open）；4.21 规格里那两个"钉住打不开"的用例改成"按路径 hydrate，然后它开得起来"；
+4.19 规格新增一条反证用例（种下孤儿与半截清单、拷完必须一字不动）；两页正文同步；`spec/manifest.toml` 重钉两行
+（重跑 `kiln spec manifest --track lakelet` → `diff` exit 0，钉的就是这两份字节）。
+
+**被迫扩的两处**（实测报错抓出来的，不是猜的）：4.24 的装置在进程内调 `tier::hydrate`，所以它的调用点必须跟着签名走
+（§1 第 10 条的第三句），而 `hydrate` 的桩由 4.21 的 scaffold 声明，于是 scaffold 与参考解一起改。全库里只有这两处调用
+（`grep -rn 'hydrate(' src tests` → 定义 + 那一处装置）。
+
+**我的复核**（全部在按规则 12 从仓库重建的树上）：
+```
+$ /private/tmp/l4b3-ro/mkbase24.sh                      # skeleton + 24 步 scaffold/solution，git apply 全过
+$ cargo clippy --all-targets -- -D warnings → exit 0    # tail 树（含每一步交付的装置）编译干净
+$ cargo test -q --test runbook_harness --test sim_backup → 1 passed / 1 passed
+$ kiln selftest lakelet/4.8-compaction  → 1/1 · 21s     # 含 slow:mutants@80
+$ kiln selftest lakelet/4.19-backup-restore → 1/1 · 92s # 含 slow:sim@3 + slow:mutants@80
+$ kiln selftest lakelet/4.21-cold-tiering → 1/1 · 63s   # 含 slow:conformance@2（local ✓ s3 ✓）+ mutants 10/12
+$ kiln selftest lakelet/4.24-runbook-drill → 1/1 · 28s
+$ kiln spec manifest --track lakelet && diff → exit 0   # 重钉稳定
+$ cargo test -q -p kiln → 327+21+1 · kiln links → 115 页/540 链 · lint-caps no issues · i18n 0 error
+```
+**这一笔的演练（我手跑，原始行）**：`lakeletq drill --store` 造店、种下孤儿 `segments/0000000099.lks` 与半截 `segments.manifest.pending`、
+`cp -a` 后 `chmod -R a-w` 把源和他的文件都变成只读：
+```
+dr-xr-xr-x  7 drmin wheel 224 … v1                      # 源是只读的
+$ lakeletq backup --store v1 --to copy
+files=4 entries=4 bytes=569 records=8 log_bytes=261 log_records=2 interrupted=false epoch=2 floor=0   exit=0
+$ ls -1 v1/segments → 0000000000.lks 0000000001.lks 0000000099.lks     # 孤儿还在
+$ cat v1/segments/0000000099.lks → orphan bytes ; cat v1/segments.manifest.pending → unfinished manifest
+$ ls -1 copy → backup.manifest ingest.log segments segments.manifest ; copy/segments → 两个真段
+```
+旧门在同样的只读源上直接 `Permission denied`（作者侧对照：新 exit=0 / 旧 exit=4）。
+
+**两处相邻的同形状缺口，我随后收掉**（`course(lakelet): the two sites the read-only door left behind`，`33e7d9f`）：
+`tests/sim_backup.rs` 的 `Taken::of`（课程交付的装置）也开它的源，改用 `Manifest::load`；4.24 交付的 `docs/runbook.md` 阶段 7 还写着
+"a stopped store whose segments are cold is not openable at all"，改成"回程是对目录做一次 hydrate，然后 open"（CLI 仍没有入口，那是 §6 的缺口）。
+**顺手记下一条会咬人的规则**（已写进 `authoring.md` §5.4）：hunk 头里的数是行数，往"新建文件"的 hunk 里加 5 行而忘了把 `+1,695` 改成 `+1,700`，
+`git apply` 照样 exit 0，而交付的 `sim_backup.rs` 在 `println!` 中间就断了（tail 树报 `unclosed delimiter`）——重建、`fmt`、`clippy` 三步是唯一会抓到它的门。
+重跑 `selftest` 4.19（76 s）与 4.24（27 s）→ `1/1 step(s) hold the contract`。
+
+**这一批没有重跑的东西**：整条 24 步的 learner lane（`verify lakelet` 需要一棵走完所有步骤的项目树；它连同 `--slow --json` 一起等引擎修好后的那次验收）。
+四步的 `selftest`（含慢门）与 tail 树的编译/装置是这一批的直接证据；受影响面用文本钉住：只有 4.19/4.21 的规格与 4.24 的装置提到这两个门。
