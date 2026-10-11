@@ -38,7 +38,7 @@
 | B5c | `course(lakelet/4.23-secret-rotation): two keys valid, one preferred, and the window is arithmetic` | 4.23 正文（deepen，16 用例 + `slow:sim@3`）+ `service/keys.rs`（环/令牌/`Refusal`/`Window`/`earliest_safe_retirement`）+ `ingest.rs` 的连接级鉴权（令牌是首载荷，拒绝计在 4.6 已经数拒绝的地方）+ `cli/rotate.rs`（`--add`/`--retire`/`--list`）+ 完整 `tests/sim_rotation.rs` + `docs/rotation.md`；sim 三个种子 `7867e017/a3de9fc0/f43918f3`（seed 1 重放）；演练：把窗口改成“接管即退休”→ 算术用例 `left Some(1700001000000) / right Some(1700004600000)` 红 + sim 红；回滚绿 |
 | B5d | `course(lakelet/4.24-runbook-drill): the procedure, and the instrument that runs it` | 4.24 正文（deepen，**`ops/runbook-drill@operate`**，14 用例）+ 完整装置 `tests/runbook_harness.rs`（2041 行：把页面读成 stages-as-data、五个义务、八个真检查、将页面命令当 `CARGO_BIN_EXE_*` 拿真店跑、缺口当 finding）+ 学习者的两页 `docs/runbook.md`（8 阶段）/`docs/slo.md`（11 行数字表 + 错误预算）；规格通过 `#[path = "runbook_harness.rs"] mod harness;` 拿装置当仪器；演练：删掉第 6 阶段的 `- signal:` → 用例与仪器双双点名；回滚绿。**T4 的 24 步至此全部写成** |
 
-| BP | `course(probes): …`（七个提交，`fe89ea6`…`1c27ff5`）+ `kiln: probe --check keeps what it builds, and a killed run says so`（`dd07d27`）+ `course(lakelet): the two sites the read-only door left behind`（`33e7d9f`） | T4 的 24 道探题（29 个槽位按 D-6 排除 5 个：`aware` 政策 + 四个机制不在单文件里的 design，理由在 [t4-lakelet.md](t4-lakelet.md) §6）：八批并行、逐批复核（与作者 scratch 副本逐字节 `diff`、`diff -u 题面 参考解` 的每个被删行都必须是桩那一行、参考解全绿 / 题面编译且全红、`rustfmt`）；框架侧修好「每次重编全部参考解、被杀时还会点错名」；写法写进 [authoring.md](authoring.md) §11 |
+| BP | `course(probes): …`（八个提交，`fe89ea6`…`d45391c`）+ `kiln: probe --check keeps what it builds, and a killed run says so`（`dd07d27`）+ `course(lakelet): the two sites the read-only door left behind`（`33e7d9f`） | T4 的 24 道探题（29 个槽位按 D-6 排除 5 个：`aware` 政策 + 四个机制不在单文件里的 design，理由在 [t4-lakelet.md](t4-lakelet.md) §6）：八批并行、逐批复核（与作者 scratch 副本逐字节 `diff`、`diff -u 题面 参考解` 的每个被删行都必须是桩那一行、参考解全绿 / 题面编译且全红、`rustfmt`）；框架侧修好「每次重编全部参考解、被杀时还会点错名」；写法写进 [authoring.md](authoring.md) §11。最后两道的第一任 worker 静默失败（段 34），重派后落地 |
 
 尚未落地：**收尾（BV）**——`cargo xtask ci` 的 exit 0、离线快路、`verify lakelet --slow --json`、`docs/t4-lakelet.md` 与本文 §0–§5 的收口。**plan §9 腿 6 的第二半仍欠：容器引擎坏着**（见 §5）。探题已全部落地（段 32/34），§5 里那笔只读 manifest 的修正也已落地（段 33）。
 
@@ -149,8 +149,9 @@ value }`，`series` = 指标名 + 标签集。
   ③ sim 抓到不确定性（4.6）；④ 未分类的截断帧（4.2）；⑤ 去掉索引剪枝 → `pruning_rate 95→50`（4.14）；
   ⑥ 弄坏 Dockerfile → `container-repro` 红（**欠，等引擎**）。
 - **探题（BP）**：全课程 **41 → 65 道**（T4 的 24 道；另有 5 个槽位按政策不出题，理由在 [t4-lakelet.md](t4-lakelet.md) §6）。
-  `kiln probe --check`：41 道冷跑 54.8 s → 63 道 54.3 s（复用编译目录之后）；每道题的交付判据是 §1 第 23 条
-  那两件事 `diff`。`rustfmt --check` 扫 126 份探题文件退 0；写法写进 [authoring.md](authoring.md) §11，池子级检查的修正在 §1 第 24 条。
+  **65 道整目录验收**：`kiln probe --check` → `65 exercise(s) · 65 reference(s) passed`（47.0 s，复用编译目录之后；
+  41 道时冷跑 54.8 s）；`rustfmt --check` 扫 **130 份**探题文件退 0。每道题的交付判据是 §1 第 23 条那两件事 `diff`。
+  写法写进 [authoring.md](authoring.md) §11，池子级检查的修正在 §1 第 24 条。
 - **只读 manifest（段 33）**：四个被碰的步骤 `selftest` 21 s / 92 s / 63 s / 28 s，各自 `1/1 step(s) hold the contract`（含慢门）；
   按规则 12 重建的 tail 树 `clippy --all-targets -- -D warnings` 干净、`tests/runbook_harness` 与 `tests/sim_backup` 各 1 passed；
   `kiln spec manifest --track lakelet` 重钉 `diff` exit 0。演练（我手跑）：只读源（`dr-xr-xr-x`，里面种着孤儿与半截清单）上

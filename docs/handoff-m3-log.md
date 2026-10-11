@@ -1822,3 +1822,30 @@ $ ls -1 copy → backup.manifest ingest.log segments segments.manifest ; copy/se
 
 **这一批没有重跑的东西**：整条 24 步的 learner lane（`verify lakelet` 需要一棵走完所有步骤的项目树；它连同 `--slow --json` 一起等引擎修好后的那次验收）。
 四步的 `selftest`（含慢门）与 tail 树的编译/装置是这一批的直接证据；受影响面用文本钉住：只有 4.19/4.21 的规格与 4.24 的装置提到这两个门。
+
+## 段 34：BP 的最后两道（第一任 worker 静默失败，重派后落地）+ 65 道的整目录验收
+
+**第一任 worker 掉了**：它的 scratch（`/private/tmp/bp-w8/`，里面还有自己写的 Python 生成脚本与 `templates/`）**90 分钟没动过**，
+十二棵 worktree 里都没有那两个文件，也没有汇报。按"worker 会静默失败"的纪律重派（作业书仍在磁盘上，重派只是一句"先读那份文件"），
+并要求接任者动手前先确认两个槽位是空的（实测：空）。**这是 M3 里唯一一次静默失败**——前七个 probe worker 与只读 manifest 那个都正常交付。
+
+**落地**（`d45391c`）：`sec/secrets-management.design`（1264/1361 行，10 用例，6 个 hunk）与
+`ops/runbook-drill.operate`（530/629 行，8 用例，2 个 hunk——`stages`/`gaps` 的函数体只隔 6 行，合成一个 hunk）。
+两处有意收窄都写进诚实段：4.23 的 token **没有 tag**（重抽的是环与窗口，不是 MAC；与 `sec/hmac-signing@apply` 同一处置），
+4.24 的缩小版把每个阶段的命令写成 `name: answer` 一行而不是围栏 `sh` 块（这一道读的是页面的**结构**，不是 shell）。
+
+**65 道的整目录验收**（BP 收尾的最后一次；本机负载已降下来）：
+
+```
+$ kiln --timeout 1800 probe --check
+probe --check · 65 exercise(s) · 65 reference(s) passed
+✓ every probe reference compiles and passes                       # real 47.0s（复用编译目录之后）
+$ rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --check <130 份 course/probes 文件>
+exit=0
+$ cargo test -q -p kiln → 327 passed + 21 + 1 · 0 failed          # 322 基线 + 5 条新用例（probe.rs 4 条、cmd/probe.rs 1 条）
+$ kiln links → 115 page(s) · 540 link(s) 全解 · kiln i18n status → 0 error · kiln lint-caps → no issues
+```
+
+**BV 还欠的三条都只等引擎**：`cargo xtask ci` 的 exit 0 与最后一行 `24/24 step(s) hold the contract`、
+`verify lakelet --slow --json` 的 `{passed: 24, failed: 0, clean: true}`、plan §9 腿 6 的第二半（弄坏 Dockerfile → `container-repro` 红）。
+可逆修法是 `podman machine stop && podman machine start`（镜像在 VM 盘上；会把另一个项目的 `auto-writer-pg-dev` 容器停几秒），**已向用户确认，等他点头**。
