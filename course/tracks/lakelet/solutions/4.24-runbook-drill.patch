@@ -218,9 +218,11 @@ index c9c2ce8..ce249cb 100644
 -- command:
 +Segments older than the tier's policy live in the object store rather than on this box
 +(`lakelet/4.21-cold-tiering`), and **no command of this deployment sweeps or hydrates them**: the
-+sweep is the store's own act, and the way back is `hydrate`, one copy per segment — a stopped store
-+whose segments are cold is not openable at all. So what an operator does in this stage is ask for
-+the span that left and see it answered; if it is not, the way back has not finished.
++sweep is the store's own act, and the way back is a hydrate of the store's directory — which the
++engine can run on a stopped store, because `hydrate` takes the directory and reads the manifest
++without opening it (`lakelet/4.19-backup-restore`'s read-only door). So what an operator does in
++this stage is ask for the span that left and see it answered; if it is not, the way back — that
++hydrate, and an open after it — has not finished.
  
  ```sh
 -[TODO](TODO)

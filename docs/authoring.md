@@ -197,6 +197,17 @@ track 骨架的规则与 patch 的规则一样）。
   学员编辑过的文件保留并提示。reset 之后 `kiln run <step>` 会把 scaffold 重新放回去。reset 不会删除
   任何不是 scaffold（或参考解）创建的文件。
 
+### 5.4 改一个 patch 的内容，也要改它的 hunk 头
+
+patch 是文本，`@@ -0,0 +1,695 @@` 里的 `695` 是**行数**。往一个“新建文件”的 hunk 里加行而忘了改这个数，
+不会报错：实测（M3 收尾）往 `scaffold/4.19-backup-restore.patch` 的 `tests/sim_backup.rs` 加了 5 行、
+头仍写 `+1,695`，`git apply` exit 0，而交付出去的 `sim_backup.rs` 在 `println!` 中间就断了（tail 树报
+`unclosed delimiter`）。所以手改 patch 之后要三步：① 数一遍这个 hunk 的新行数
+（`awk '/^diff --git a\/<path>/{i=1} i && /^\+/ && !/^\+\+\+/ {n++} END{print n}'`）；
+② 按新 patch 重建一棵树并应用它（`/private/tmp` 里的 `mkbaseNN.sh` 那种脚本）；
+③ 跑 `cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings`——被截断的文件必然编译不过，
+这是唯一会把它拉出来的门。
+
 ## 6. 规格测试规则
 
 1. 规格测试**只读**（`spec/`，哈希入清单），且不得包含 `#[ignore]`。

@@ -1275,7 +1275,7 @@ new file mode 100644
 index 0000000..6fc099d
 --- /dev/null
 +++ b/tests/sim_backup.rs
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,700 @@
 +//! The drill `lakelet/4.19-backup-restore` is judged by: a store, a machine death, a copy, and a
 +//! restore that has to agree with the store it came from.
 +//!
@@ -1466,12 +1466,17 @@ index 0000000..6fc099d
 +impl Taken {
 +    /// The files a copy of `source` takes, in order.
 +    fn of(source: &Path, proved: u64) -> Result<Vec<Self>, backup::Error> {
-+        let segments = Segments::open(source).map_err(|source| backup::Error::Source { source })?;
++        // The read-only door rather than an open (`lakelet/4.19-backup-restore`'s
++        // `compaction::Manifest::load`): what this models is what a copy *takes*, and an open
++        // deletes the files the manifest does not name — which is exactly the write the copy this
++        // harness stands in for must not make either.
++        let manifest = compaction::Manifest::load(source)
++            .map_err(|source| backup::Error::Source { source })?;
 +        let mut files = vec![Self {
 +            name: compaction::MANIFEST.to_owned(),
 +            bytes: length_of(&source.join(compaction::MANIFEST))?,
 +        }];
-+        for info in segments.manifest().segments() {
++        for info in manifest.segments() {
 +            let path = compaction::file_of(source, info.index);
 +            files.push(Self {
 +                name: relative(source, &path),
