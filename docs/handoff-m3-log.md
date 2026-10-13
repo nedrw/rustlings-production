@@ -1850,3 +1850,34 @@ $ kiln links → 115 page(s) · 540 link(s) 全解 · kiln i18n status → 0 err
 **BV 还欠的三条都只等引擎**：`cargo xtask ci` 的 exit 0 与最后一行 `24/24 step(s) hold the contract`、
 `verify lakelet --slow --json` 的 `{passed: 24, failed: 0, clean: true}`、plan §9 腿 6 的第二半（弄坏 Dockerfile → `container-repro` 红）。
 可逆修法是 `podman machine stop && podman machine start`（镜像在 VM 盘上；会把另一个项目的 `auto-writer-pg-dev` 容器停几秒），**已向用户确认，等他点头**。
+
+## 段 35：容器引擎坏局的精确读数（用户问「为什么一定要重启 machine」）
+
+**症状**：任何镜像的任何容器都起不来（四个声明镜像 + 两个本地构建的 `localhost/*` 全测过），`podman run` 一律 exit 126；
+而**不 mount 的操作全正常**：`podman images` 7 个、`podman create`（要写存储、但不 mount）exit 0、`rmi`/`prune` 都成功、
+VM 的盘 `9.4G/91G`、inode 用 1%、另一个项目的 `auto-writer-pg-dev` 已经 Up 5 天（这些探针一根手指都没碰它）。
+
+**原因（VM 内核自己说的，到读这一刻累计 53 次）**：
+
+```
+[1788592.076618] overlayfs: Cannot mount volatile when upperdir has an unseen error. Sync upperdir fs to clear state.
+```
+
+也就是：overlayfs 认为 upperdir 所在文件系统上有一个**没有被报告过**的写回错误，于是拒绝用 `volatile` 挂载。
+
+**按它自己指的路，三件更便宜的事都试过，都不管用**：
+
+```
+$ podman machine ssh 'sync; sync'                                  → 冒烟仍 exit 126
+$ podman machine ssh 'sudo sync -f <storage>; sudo sync -f /var'   → 冒烟仍 exit 126
+$ podman machine ssh 'sudo mount -o remount /var'                  → remount ok，冒烟仍 exit 126
+$ podman machine ssh '在同一个 xfs 上用全新目录做一次普通 overlay,volatile 挂载' → PLAIN OVERLAY MOUNT OK
+```
+
+最后一行是判别：**文件系统本身没坏**（普通 overlay 挂得上），坏的是 podman 存储树上的那个错误状态。
+
+**所以「重启 machine」不是唯一解，而是剩下最便宜且可逆的那一个**：它重挂文件系统、重建存储树的挂载命名空间，
+镜像与卷都在 VM 的盘上、重启不会抹掉（唯一代价是另一个项目的 `auto-writer-pg-dev` 停几秒）。
+被排除的更重选项：`podman system reset` 与 `podman machine rm`（**会抹掉全部镜像**，四个声明镜像得重新穿中国镜像源拉——
+明确不做）；在存储树里手工删 overlay 目录（每个镜像的层都在那儿，删错一个就是静默损坏一个镜像，而「新建的 upperdir 也失败」
+说明它不是某个陈旧目录）。**它修好后要补的三条验收**不变（`cargo xtask ci` exit 0、`verify lakelet --slow --json`、plan §9 腿 6 第二半）。
