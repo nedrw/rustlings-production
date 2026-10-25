@@ -75,26 +75,29 @@ query、perf、profile、soak、cardinality、dr-drill、capacity、rotation、b
 | 项 | 值 |
 | --- | --- |
 | 逐步 `selftest` | 4.1–4.24 全部 `1/1 step(s) hold the contract`（scaffold 红、参考解绿、must 门全绿）|
-| 全步判定（24 步尾巴树，`kiln verify lakelet`，快路）| **23/24 judged step(s) pass · 1 failed · 0 not prepared · 0 without content**（98 s）；唯一失败的是 4.22 的 `container-repro`——**本机容器引擎坏着**（`creating overlay mount … input/output error`），不是工程的问题 |
-| `kiln verify lakelet --slow --json` | **待收尾时跑**（`{passed:24, failed:0, …}` 需要先修好容器引擎）|
+| 全步判定（24 步尾巴树，`kiln verify lakelet`，快路）| 收尾跑：**24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without content**（**离线副本**上跑的：`CARGO_NET_OFFLINE=true` + 私有 `XDG_CACHE_HOME`，4.22 的 `container-repro` 11/11）；此前 lane24 是 23/24（98 s），差的正是坏引擎上的容器门 |
+| `kiln verify lakelet --slow --json` | 收尾跑（暖机器缓存）：**`{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}`**，exit 0，**625 s**；此前（lane24、坏引擎）824 s、`passed: 23`、`clean: false` |
 | 全量套件（尾巴树）| `cargo test -p lakelet`：各规格 + 装置全绿（4.24 那次：spec_runbook 15 passed · runbook_harness 1 passed；4.17 的 soak 目标 ~138 s）|
 | 慢门实测 | `fuzz@3` 4.2（≥20000 次 + 语料条数）；`sim@3` 4.4/4.6/4.8/4.13/4.19/4.23（各自的三个种子与摘要）；`soak@4000` 4.17/4.18（~146 s）；`mutants@80` 十二步：多数 6/6 或 5/6，4.12/4.14 10/12，4.17 6/8（阈值 `@70`），4.19 12/12，4.21 10/12；`bench-budget@10` 4.5/4.7/4.8/4.9/4.10/4.14/4.15/4.20 |
-| 课程自有检查 | `lint-caps` `no issues.`（97/136/119/97）；`links` **115 page(s) · 544 link(s) · 330 external target(s)**，全部解析；`i18n` 0 error；`probe --check` **65/65**（47 s）；`cargo test -q -p kiln` **327+21+1 passed**（题池扩到 65 道之前是 41/41 与 322+21+1 = 344）|
-| 4.22 的可复现构建 | `sh scripts/repro.sh`：`artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（手跑 34 s）|
-| `cargo xtask ci` | **待收尾时跑**（M2 的记录：30–39 分钟，最后一行是 `<n>/<n> step(s) hold the contract`）|
+| 课程自有检查 | `lint-caps` `no issues.`（97/136/119/97）；`links` **115 page(s) · 544 link(s) · 330 external target(s)**，全部解析；`i18n` 0 error；`probe --check` **65/65**（47 s）；`cargo test -q -p kiln` **335+21+1 passed**（题池扩到 65 道之前是 41/41 与 322+21+1 = 344；评审修复带来 327→335）|
+| 4.22 的可复现构建 | `sh scripts/repro.sh`：`artifacts_compared=4 identical=4 differing=0 verdict=reproducible`（手跑 34 s）；收尾跑的 `container-repro` 比对行：`weighs 11.8 MB of the 25 MB budget` + `--check-config answers the same 7 line(s)` |
+| `cargo xtask ci` | 收尾跑见 [handoff-m3.md](handoff-m3.md) §4（M2 的记录：30–39 分钟，最后一行是 `<n>/<n> step(s) hold the contract`）|
 
 ## 6. T4 范围内剩下的缺口
 
-- **容器引擎坏着，plan §9 腿 6 的第二半欠着**：本机 `podman run` 对任何镜像都报 overlay 挂载 I/O 错误，所以 4.22 的
-  `container-repro` 无法判；引擎恢复后要重跑（配方与暖 registry 的位置在 [handoff-m3.md](handoff-m3.md) §5）。
+- ~~**容器引擎坏着，plan §9 腿 6 的第二半欠着**~~ **已解决（引擎自愈，见 [handoff-m3.md](handoff-m3.md) §5/段 36）**：
+  腿 6 第二半已补（坏 `FROM ${RUNTIME}` → `the image is 939.3 MB, over the 25 MB this step allows` 红、
+  还原 → `weighs 11.8 MB of the 25 MB budget … --check-config answers the same 7 line(s)` 绿），4.22 的
+  `container-repro` 在快路与 `--slow` 里都判过。
 - **探题的 5 个槽位按政策不出题（其余 24 道已写成，见 `docs/authoring.md` §11 的写法）**：
   `store/wal-recovery@aware`（`aware` 深度不出题——loader 直接拒绍 `aware` 槽位的题）、
   `ci/pipeline@design` 与 `release/container-image@design`（机制是流水线与容器，单文件题会变成假证据，
   已由 `xtask ci` 与 `container-repro` 覆盖）、`repo/toolchain-pinning@design`（机制是文件与版本的关系）、
   `supply/deny-policy@design`（需要真实依赖图；本机没有 `cargo-deny`）。24 道题里多数是 6–10 条用例、
   约 500–1200 行（含给定的词汇），每道都写明了它**不是**那一步的什么机制。
-- **没有只读的 manifest 入口**（4.19、4.21、4.24 三处撞上）：`Segments::open` 会写，因此 `copy` 会改源、冷店打不开；
-  修法是一个只读的 `compaction::Manifest::load`，并让 4.19/4.21 改用它（是否放进 M3 收尾待定）。
+- ~~**没有只读的 manifest 入口**（4.19、4.21、4.24 三处撞上）~~ **已修（段 33）**：`compaction::Manifest::read`（只读）
+  与 `Manifest::load`（外加逐段长度核对）落 4.19 的 scaffold，`copy` 与 `hydrate` 都改用它们；规矩写进
+  [authoring.md](authoring.md) §5.4。
 - **tier 在 CLI 里没有入口**：`sweep`/`hydrate` 只有引擎侧，所以 4.24 的 runbook 阶段点不出 tier 命令。
 - **店的日志从不截断**：它占这台店字节的 **885‰**（4.20 的 TRACK 8）；容量模型把它计进去了，但「封段即截日志」的机制不存在。
 - **`query` 只看段，`inspect series` 看日志 + 活索引**：记录还在日志里时两者答案不同（4.24 有意用它，但操作员会跌进去）。

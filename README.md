@@ -67,17 +67,16 @@ locale fallback and translation-drift detection, so other languages can be added
 
 ## Status
 
-**M0, M1 and M2 are closed; M3 is in wrap-up.** The metadata layer, the capability lint, the gates
+**M0 through M3 are closed.** The metadata layer, the capability lint, the gates
 and the runner are in. M1 added the runtime half of the de-duplication mechanism (`kiln plan --fast`
 / `skip` / `probe` / `review --due`, one capability record per learner per capability) and authored
 T2 `relay` end to end; M2 authored T3 `jobq` and brought the slow gates (`mutants`, `coverage`,
-`bench-budget`, `semver`, `unsafe-budget`, `conformance`). M3 authored T4 `lakelet` end to end — 24
+`bench-budget`, `semver`, `unsafe-budget`, `conformance`); M3 authored T4 `lakelet` end to end — 24
 steps — added the `slow:sim`/`slow:soak`/`slow:fuzz` gates and the container and profiling
-infrastructure the track leans on, and filled the probe pool to 65 exercises behind the
-spaced-repetition loop. What M3 still owes is the wrap-up batch: the final `cargo xtask ci` pass on
-the finished tree, the offline fast path, `kiln verify lakelet --slow --json`, and plan §9 leg 6's
-second half, which is stuck on this machine's container engine. See
-[docs/handoff-m3.md](docs/handoff-m3.md) for the state of that list and
+infrastructure, and filled the probe pool to 65 exercises behind the spaced-repetition loop. M3's
+acceptance ran green on this tree: the offline fast path 24/24, `kiln verify lakelet --slow --json`
+`{passed: 24, failed: 0, clean: true}`, all six acceptance drills, and `cargo xtask ci` exit 0 —
+see [docs/handoff-m3.md](docs/handoff-m3.md) §4 for the numbers and
 [docs/t4-lakelet.md](docs/t4-lakelet.md) for what T4 delivers.
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
@@ -95,10 +94,13 @@ step's own `links` gate).
   `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 then; the current
   tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
   patch-engine fixes, not with a change to what is judged.)
-- On the current tree (M3, pre-wrap-up): `kiln lint-caps` — `97 capabilities · 136 slots · 119
+- On the current tree (M3, closed): `kiln lint-caps` — `97 capabilities · 136 slots · 119
   ledger positions · 97 authored steps`, no issues; `kiln links` — 115 pages, 544 links, 330
   external targets, 0 findings; `kiln probe --check` — 65/65 (47 s, measured for
-  [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests.
+  [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests;
+  the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
+  `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
+  `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s).
 - `kiln selftest --track relay` — **476 s**, `24/24 step(s) hold the contract`: every T2 step's spec
   fails on its scaffold, passes on the reference solution, and every must gate is green.
 - `kiln verify relay` — **155 s**, `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without
@@ -158,9 +160,6 @@ python3 tools/lint-caps-md.py   # 97 capabilities, 119 steps, 136 (capability, d
 ```
 
 What is not in yet: T5 `meskv` content (T1–T4 are authored — `docs/t1-mailer.md`, `docs/t2-relay.md`,
-`docs/t3-jobq.md`, `docs/t4-lakelet.md`); M3's wrap-up batch, which is the only thing between the
-tree and a closed M3: the final `cargo xtask ci` pass on the finished tree, the offline fast path,
-`kiln verify lakelet --slow --json`, and plan §9 leg 6's second half, stuck on this machine's
-container engine (see [docs/handoff-m3.md](docs/handoff-m3.md) §5); translations (the fallback chain
-and the drift detector are ready, no locale has translated bodies); the `new-track` generator; a
-documentation site. See [docs/plan.md](docs/plan.md) §11.
+`docs/t3-jobq.md`, `docs/t4-lakelet.md`); translations (the fallback chain and the drift detector
+are ready, no locale has translated bodies); the `new-track` generator; a documentation site. See
+[docs/plan.md](docs/plan.md) §11.

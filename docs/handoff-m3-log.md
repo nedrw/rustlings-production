@@ -1881,3 +1881,71 @@ $ podman machine ssh '在同一个 xfs 上用全新目录做一次普通 overlay
 被排除的更重选项：`podman system reset` 与 `podman machine rm`（**会抹掉全部镜像**，四个声明镜像得重新穿中国镜像源拉——
 明确不做）；在存储树里手工删 overlay 目录（每个镜像的层都在那儿，删错一个就是静默损坏一个镜像，而「新建的 upperdir 也失败」
 说明它不是某个陈旧目录）。**它修好后要补的三条验收**不变（`cargo xtask ci` exit 0、`verify lakelet --slow --json`、plan §9 腿 6 第二半）。
+
+## 段 36：BV 收尾——引擎自愈、六条腿补齐、以及一笔真正的课程修复（registry 漂移）
+
+**引擎自愈（未重启 machine）**：2026-10-26 实测 `podman run --rm alpine:3.20 true` → exit 0（只有一条
+amd64-on-arm64 平台警告），`podman ps` 里另一个项目的 `auto-writer-pg-dev` Up 8 天没动过——段 35 等的
+`podman machine stop && start` 一次也没执行，坏了两周的 overlay 状态自己清了。段 35 的诊断史保持原样。
+
+**补上的验收（原始行）**：
+
+```
+$ podman run --rm alpine:3.20 true; echo "podman exit=$?"
+WARNING: image platform (linux/amd64) does not match the expected platform (linux/arm64)
+podman exit=0
+$ 离线副本（rsync 配方 + 全新 XDG_CACHE_HOME，只预种 kiln/container-registry 144 MB）+ CARGO_NET_OFFLINE=true
+  24 步梯子：lakelet/4.1 … 4.24 逐行 run exit=1 solution exit=0（r=1 s=0 × 24，全部无网建成）
+$ kiln verify lakelet（快路，离线）
+  24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without content   （exit 0）
+  其中 4.22：spec ✓ · 11/11 must gates（container-repro 第一次真判过）
+$ kiln verify lakelet --slow --json（暖机器缓存）                            # real 10m25s
+  totals: {"blocked": 0, "clean": true, "failed": 0, "not_authored": 0, "passed": 24, "steps": 24}
+$ 腿 6 第二半：sed 把 FROM ${RUNTIME} AS runtime 改成 ${BUILDER} → kiln check lakelet/4.22
+  ✗ container-repro the image is 939.3 MB, over the 25 MB this step allows: a runtime stage that
+    is really the builder ships the toolchain and the sources      （10/11 must，尺寸检查先跑）
+  还原 Dockerfile → ✓ container-repro `kiln-lakelet-repro` builds from this tree, weighs 11.8 MB of
+  the 25 MB budget, and its --check-config answers the same 7 line(s) the binary on this host answers
+                                                                   （11/11 must；两次各 11 s，层缓存只重建变了的层）
+```
+
+**CI 第一轮（红，2923 s，私有缓存）**：全局阶段全绿（fmt、`rustfmt --check` 271 份课程文件、clippy
+`-D warnings`、`cargo test --workspace` 335+21+1、spec integrity、lint-caps、links、`probe --check` 65/65），
+selftest 逐 track：mailer **22/22** ✓、relay **24/24** ✓、jobq **27/27** ✓、lakelet **23/24**——4.22 在
+selftest 砂箱里两条红：参考解之后 `the_lockfile_pins_every_dependency_the_manifest_declares` 仍失败、
+`container-repro` 报 `the image did not build`。
+
+**根因：registry 漂移，不是工程的逻辑，也不是此前 state/patch 修复引起**。4.22 教「锁文件钉住测试过的版本」，
+但课程从不把锁当内容交付（`project.rs` 有意把 `Cargo.lock` 当构建产物跳过），学员树的锁是**当次解析**的结果。
+作者写课时 tokio 解析到 1.53.x；10 月中之后 registry 出了 `tokio 1.54.1` 与 `toml 0.9.12+spec-1.1.0`，
+于是：①规格的「版本前缀」断言（`starts_with("1.53")`）把兼容的新版本判成漂移；②砂箱树的新锁要拉策展
+`container-registry` 缓存里没有的 crate，容器内直连 crates.io 超时，镜像构建死。离线路（腿 1）反而全绿——
+离线解析只能用缓存里的 1.53.x，两头恰好一致；同一棵树在线重解析就翻。
+
+**两笔修复**：
+
+1. `spec/4.22/reproducible.rs`：断言从「锁版本前缀 == manifest 前两段」改成「锁版本满足 manifest 的要求」
+   （自实现 caret 语义：major>0 时下界是 major、major==0 时下界是 minor；构建元数据 `+spec-…` 按 cargo
+   的规则不参与比较）。断言保住的部分：丢依赖仍然 panic（那是 `--locked` 真会拒绝的）。与 4.11 键数断言
+   放宽同一先例（rule 10 的正解）。manifest 已重钉（`diff` 只动 4.22 一行）。
+2. `container_repro.rs` 的 `caches()`：builder 的 registry 挂载从策展的
+   `<cache>/kiln/container-registry` 改为**宿主自己的 `$CARGO_HOME/registry`**（无则回退策展副本）。
+   理由与 plan §10 同源：被构建的树是这台机器的 cargo 解析的，宿主 registry 就是「这台机器一定有、且恰好
+   覆盖锁文件所需版本」的那一份；策展副本从制作那天起就在慢慢失去这个性质。
+
+**被拒绝的候选**：①skeleton 里带 Cargo.lock——与 runner 的既有设计正面冲突（`project.rs:514` 把锁当
+构建产物跳过；正文教「锁是提交物」，改这一条是另一个量级的决定）；且 cargo 会把锁里多余的包剪掉、后续
+步骤新声明依赖时重新解析，钉不住中段加入的依赖。②manifest 全部写 `=x.y.z` 精确钉——与「manifest 写范围、
+锁写版本」的课程口径相反，4.22 的正文与 `deny.toml` 推导都建立在这个口径上。③保留前缀断言、靠任何形式的
+预置锁——见①，解析时机不在课程手里。
+
+**修后证据**：`kiln selftest --track lakelet 4.22-reproducible-build` → **1/1**（含 `container-repro`
+11/11，`weighs 11.8 MB … --check-config answers the same 7 line(s)`）；`kiln selftest --track mailer
+1.21-container`（同一个门）→ **1/1**；`cargo test -q -p kiln` 335+21+1、clippy、fmt 全绿。手工镜像
+复刻还记下两笔环境事实：容器网络对 crates.io/static.rust-lang.org 是**间歇性**的（同一命令一次
+`rustup` 拉频道清单超时、一次正常），宿主 registry 挂载消掉的是**确定性**的那类失败；间歇超时是机器
+网络本身的抖动，门的 `--pull=never` 与镜像预拉已经把能消的都消了。
+
+**同一批落地的还有**（评审修复，先于本段提交）：state 文件的原子写/按条目合并/读错误不再当零状态
+（单测 327→335），patch 引擎的部分失败回滚、solution 模式拒删不认识的文件、hunk 声明行号优先锚定；
+README/台账头注的数字刷新（97/136/119/97、65 探题、115 页 544 链）。
