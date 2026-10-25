@@ -106,6 +106,18 @@ pub fn run(cli: &Cli, session: &Session, requested: &[String], track: Option<&st
         track.id,
         scratch.path().display()
     );
+    // A track that builds on another track's project (plan §3 D6) needs that project in the
+    // sandbox too: the reference tree of the dependency is what the course can honestly lay —
+    // the sandbox judges the course's own steps, and the crates the `path` dependency names are
+    // compiled as part of this track's builds.
+    if let Some(required) = &track.requires_track {
+        let dependency = sandbox.course().track(required)?;
+        project::lay_reference_tree(sandbox.course(), dependency)?;
+        println!(
+            "  laid {}'s reference tree first ({} builds on it, plan §3 D6)",
+            dependency.id, track.id
+        );
+    }
 
     let mut reports = Vec::new();
     for step in &track.step {

@@ -113,6 +113,21 @@ pub enum KilnError {
         first: String,
     },
 
+    /// The project a track builds on through a `path` dependency (plan §3 D6) is not there.
+    #[error(
+        "{project} builds on {required}'s project ({required_project}), which does not exist yet — \
+         {required}'s steps are a prerequisite, not a scaffold: run them in order (`kiln run` \
+         starts at {required}'s first unfinished step)"
+    )]
+    MissingDependency {
+        /// This track's project directory (`app/meshkv`).
+        project: String,
+        /// The track whose project is required (`jobq`).
+        required: String,
+        /// The required track's project directory (`app/jobq`).
+        required_project: String,
+    },
+
     /// A step reference matched more than one step.
     #[error("ambiguous step `{requested}`: it matches {matches:?}")]
     AmbiguousStep {
@@ -212,6 +227,7 @@ impl KilnError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::NotAuthored { .. } | Self::MissingProject { .. } => EXIT_NOT_AUTHORED,
+            Self::MissingDependency { .. } => EXIT_NOT_AUTHORED,
             _ => EXIT_ERROR,
         }
     }

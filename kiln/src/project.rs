@@ -161,6 +161,33 @@ fn require_project(course: &Course, track: &Track, step: &Step, project: &Path) 
     })
 }
 
+/// The project a track builds on (plan §3 D6) must exist before any of its steps can be judged.
+///
+/// The learner's own tree in the required project is the input — that is the whole point of the
+/// dependency: meshkv's steps exercise *their* jobq engine, not the course's reference one. Only
+/// the existence is checked here; whether that tree compiles is what the steps' own specs say.
+/// `None` when there is nothing to require or the requirement is met.
+pub fn dependency_missing(course: &Course, track: &Track) -> Option<KilnError> {
+    let required = track.requires_track.as_ref()?;
+    let Ok(target) = course.track(required) else {
+        // `Course::load` already refuses such a course; this is the same answer for a caller
+        // that somehow got one anyway.
+        return Some(KilnError::Invalid(format!(
+            "{}.toml: requires_track `{required}` has no track metadata",
+            track.id
+        )));
+    };
+    let dir = target.project_dir(course.root());
+    if dir.is_dir() {
+        return None;
+    }
+    Some(KilnError::MissingDependency {
+        project: relative_to(course.root(), &track.project_dir(course.root())),
+        required: required.clone(),
+        required_project: relative_to(course.root(), &dir),
+    })
+}
+
 /// Where a step's scaffold comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scaffold {
@@ -257,6 +284,9 @@ pub fn missing_content(course: &Course, track: &Track, step: &Step) -> Vec<Strin
 pub fn prepare(course: &Course, track: &Track, step: &Step) -> Result<Outcome> {
     let project = track.project_dir(course.root());
     require_project(course, track, step, &project)?;
+    if let Some(missing) = dependency_missing(course, track) {
+        return Err(missing);
+    }
     let mut outcome = Outcome::default();
     for sync in spec::sync(course.root(), track, step, &project, false)? {
         let action = match sync.action {
@@ -462,6 +492,32 @@ pub fn apply_solution(course: &Course, track: &Track, step: &Step) -> Result<Out
         });
     }
     Ok(outcome)
+}
+
+/// Lay a track's whole reference tree: the skeleton, every step's scaffold, every step's
+/// solution — and nothing else. No specs are synced and no command runs, so this is not a
+/// judgement of anything; it is the state a sandbox needs when the track it is about to judge
+/// builds on this one through a `path` dependency (plan §3 D6); the crates that dependency names
+/// are compiled as part of the dependent's own build, which is why no build happens here either.
+///
+/// Steps the course has not authored yet stop the pass: a half-laid dependency is a tree the
+/// dependent's first `cargo` would fail on for reasons nothing names.
+pub fn lay_reference_tree(course: &Course, track: &Track) -> Result<()> {
+    for step in &track.step {
+        if !missing_content(course, track, step).is_empty() {
+            return Err(KilnError::Invalid(format!(
+                "cannot lay {}'s reference tree: {} is not authored yet — a track that builds on \
+                 it cannot be judged in this sandbox",
+                track.id,
+                step.qualified_id()
+            )));
+        }
+        apply_scaffold(course, track, step)?;
+        if step.solution.is_some() {
+            apply_solution(course, track, step)?;
+        }
+    }
+    Ok(())
 }
 
 /// Every file below a directory, as `(path relative to the directory, contents)`.
@@ -724,5 +780,110 @@ mod tests {
         temp.write("app/mailer/README.md", "# mailer\n");
         let error = apply_scaffold(&course, track, &step).unwrap_err();
         assert!(error.to_string().contains("README.md"), "{error}");
+    }
+
+    #[test]
+    fn a_track_that_builds_on_another_needs_its_project_present() {
+        use crate::test_support::{load_course, one_track, step_toml, track_toml_requiring};
+        let temp = TempDir::new("dependency");
+        let jobq_steps = [step_toml("jobq", "1.1-a", &["a/b@apply"])];
+        let meshkv_steps = [step_toml("meshkv", "5.1-x", &["c/d@apply"])];
+        let mailer_steps = [step_toml("mailer", "1.1-a", &["a/z@apply"])];
+        let tracks = vec![
+            (
+                "mailer",
+                1,
+                crate::test_support::track_toml("mailer", 1, &["a/z@apply"], &mailer_steps),
+            ),
+            (
+                "jobq",
+                3,
+                crate::test_support::track_toml("jobq", 3, &["a/b@apply"], &jobq_steps),
+            ),
+            (
+                "meshkv",
+                5,
+                track_toml_requiring("meshkv", 5, &["c/d@apply"], &meshkv_steps, "jobq"),
+            ),
+        ];
+        let _ = one_track(&[], &[]); // keep the import honest for readers; fixtures above are bespoke
+        let course = load_course(temp.path(), &tracks, &crate::test_support::ledger_toml(&[]));
+
+        let meshkv = course.track("meshkv").unwrap();
+        let missing = dependency_missing(&course, meshkv).expect("the dependency is not there");
+        assert!(
+            missing.to_string().contains("app/jobq"),
+            "the message names the missing prerequisite: {missing}"
+        );
+        assert_eq!(missing.exit_code(), crate::error::EXIT_NOT_AUTHORED);
+
+        std::fs::create_dir_all(temp.path().join("app/jobq")).unwrap();
+        assert!(
+            dependency_missing(&course, meshkv).is_none(),
+            "a present project satisfies the requirement — its contents are the learner's own"
+        );
+    }
+
+    #[test]
+    fn laying_a_reference_tree_ends_at_the_solutions() {
+        use crate::test_support::{TrackFixture, load_course, step_toml, track_toml};
+        let temp = TempDir::new("lay-reference");
+        // Step 1.1 starts from the skeleton; its solution grows the file. Step 1.2's scaffold
+        // inserts inside the marker block and its solution rewrites — the tree laid for a
+        // dependent track ends at the last solution, not halfway.
+        let mut first = step_toml("jobq", "1.1-a", &["a/b@apply"]);
+        first.push_str("scaffold = \"skeleton\"\nsolution = \"solutions/1.1.patch\"\n");
+        let mut second = step_toml("jobq", "1.2-b", &["a/c@apply"]);
+        second.push_str("scaffold = \"scaffold/1.2.patch\"\nsolution = \"solutions/1.2.patch\"\n");
+        let mailer_steps = [step_toml("mailer", "1.1-a", &["a/z@apply"])];
+        let tracks: Vec<TrackFixture> = vec![
+            (
+                "mailer",
+                1,
+                track_toml("mailer", 1, &["a/z@apply"], &mailer_steps),
+            ),
+            (
+                "jobq",
+                3,
+                track_toml("jobq", 3, &["a/b@apply"], &[first, second]),
+            ),
+        ];
+        let course = load_course(temp.path(), &tracks, &crate::test_support::ledger_toml(&[]));
+        let track = course.track("jobq").unwrap();
+
+        temp.write(
+            "course/tracks/jobq/skeleton/src/lib.rs",
+            "//! engine\n// kiln:scaffold:begin\n// kiln:scaffold:end\n",
+        );
+        temp.write("course/docs/steps/en/jobq/1.1-a.md", "body\n");
+        temp.write("course/docs/steps/en/jobq/1.2-b.md", "body\n");
+        temp.write("course/tracks/jobq/spec/1.1/spec.rs", "// spec\n");
+        temp.write("course/tracks/jobq/spec/1.2/spec.rs", "// spec\n");
+        temp.write(
+            "course/tracks/jobq/solutions/1.1.patch",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,4 @@\n //! engine\n // kiln:scaffold:begin\n+pub fn engine() -> u8 { 1 }\n // kiln:scaffold:end\n",
+        );
+        temp.write(
+            "course/tracks/jobq/scaffold/1.2.patch",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,4 +1,5 @@\n //! engine\n // kiln:scaffold:begin\n pub fn engine() -> u8 { 1 }\n+pub const EXTRA: u8 = 2;\n // kiln:scaffold:end\n",
+        );
+        temp.write(
+            "course/tracks/jobq/solutions/1.2.patch",
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2,4 +2,4 @@\n // kiln:scaffold:begin\n pub fn engine() -> u8 { 1 }\n-pub const EXTRA: u8 = 2;\n+pub const EXTRA: u8 = 3;\n // kiln:scaffold:end\n",
+        );
+
+        lay_reference_tree(&course, track).expect("the dependency lays");
+        let laid = std::fs::read_to_string(temp.path().join("app/jobq/src/lib.rs")).unwrap();
+        assert_eq!(
+            laid,
+            "//! engine\n// kiln:scaffold:begin\npub fn engine() -> u8 { 1 }\npub const EXTRA: u8 = 3;\n// kiln:scaffold:end\n",
+            "skeleton, both scaffolds and both solutions, in order"
+        );
+
+        // A dependency the course has not finished authoring is refused rather than half laid.
+        std::fs::remove_file(temp.path().join("course/tracks/jobq/solutions/1.2.patch")).unwrap();
+        std::fs::remove_dir_all(temp.path().join("app/jobq")).unwrap();
+        let error = lay_reference_tree(&course, track).unwrap_err();
+        assert!(error.to_string().contains("not authored yet"), "{error}");
     }
 }

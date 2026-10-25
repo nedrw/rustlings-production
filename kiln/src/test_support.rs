@@ -174,6 +174,21 @@ pub(crate) fn track_toml(id: &str, index: u32, exit: &[&str], steps: &[String]) 
     )
 }
 
+/// A `track.toml` that builds on another track's project (plan §3 D6), for the dependency tests.
+pub(crate) fn track_toml_requiring(
+    id: &str,
+    index: u32,
+    exit: &[&str],
+    steps: &[String],
+    requires: &str,
+) -> String {
+    format!(
+        "format_version = 1\nid = \"{id}\"\nindex = {index}\ntitle = \"{id}\"\nproject = \"app/{id}\"\nrequires_track = \"{requires}\"\nexit = [{}]\n{}",
+        quoted(exit),
+        steps.join("\n")
+    )
+}
+
 /// A `capabilities.toml` from `(capability, depth, position)` triples, grouped per capability.
 pub(crate) fn ledger_toml(slots: &[(&str, &str, &str)]) -> String {
     let mut grouped: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();

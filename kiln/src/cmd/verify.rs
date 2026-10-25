@@ -138,6 +138,14 @@ fn judge(session: &Session, track: &Track, step: &Step, run_slow: bool) -> Resul
         verdict.fix = Some(format!("kiln run {}", step.qualified_id()));
         return Ok(verdict);
     }
+    // A track that builds on another track's project (plan §3 D6) cannot be judged without it:
+    // every `cargo` the specs start would fail inside the dependency for reasons nothing names.
+    if let Some(missing) = project::dependency_missing(session.course(), track) {
+        verdict.status = "blocked";
+        verdict.detail = missing.to_string();
+        verdict.fix = Some("kiln run".to_owned());
+        return Ok(verdict);
+    }
 
     // Sync the specs into a project that exists, so a step the learner solved is judged against the
     // course's test rather than against a file that was never copied there.

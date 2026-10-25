@@ -244,6 +244,13 @@ pub struct Track {
     pub title: String,
     /// Learner workspace for this track, relative to the repository root (`app/mailer`).
     pub project: String,
+    /// The track whose project this one builds on, if any: its steps declare a `path` dependency
+    /// into that project (plan §3 D6 — T5 reusing T3's engine crate is the one cross-track
+    /// dependency the course allows). The runner treats the required project as a prerequisite:
+    /// `run`/`check` refuse with the reason when it is not there, and a sandbox lays its reference
+    /// tree before judging this track's steps.
+    #[serde(default)]
+    pub requires_track: Option<String>,
     /// Capabilities this track must have established by its last step (rule R6).
     #[serde(default)]
     pub exit: Vec<CapRequirement>,
@@ -432,6 +439,7 @@ impl Course {
                 manifest.default_track
             )));
         }
+        check_track_dependencies(&tracks)?;
         Ok(Self {
             root: root.to_path_buf(),
             manifest,
@@ -579,6 +587,45 @@ fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 /// Load every `course/tracks/*/track.toml`, ordered by path position.
+/// Every `requires_track` names a track that exists, is not the track itself, and is not part of
+/// a cycle — a dependency the runner cannot lay is a course that cannot start.
+fn check_track_dependencies(tracks: &[Track]) -> Result<()> {
+    for track in tracks {
+        let Some(required) = &track.requires_track else {
+            continue;
+        };
+        let Some(target) = tracks.iter().find(|other| &other.id == required) else {
+            return Err(KilnError::Invalid(format!(
+                "{}.toml: requires_track `{required}` has no track metadata",
+                track.id
+            )));
+        };
+        if target.id == track.id {
+            return Err(KilnError::Invalid(format!(
+                "{}.toml: requires_track names the track itself",
+                track.id
+            )));
+        }
+        // Follow the chain: with every link pointing at another existing track, the only way it
+        // does not terminate is a loop, and any loop passes through this track again.
+        let mut seen = std::iter::once(&track.id).collect::<std::collections::BTreeSet<_>>();
+        let mut hop = target;
+        while let Some(next_id) = &hop.requires_track {
+            if !seen.insert(next_id) {
+                return Err(KilnError::Invalid(format!(
+                    "{}.toml: requires_track forms a cycle through `{}`",
+                    track.id, next_id
+                )));
+            }
+            let Some(next) = tracks.iter().find(|other| &other.id == next_id) else {
+                break;
+            };
+            hop = next;
+        }
+    }
+    Ok(())
+}
+
 fn load_tracks(course_dir: &Path) -> Result<Vec<Track>> {
     let tracks_dir = course_dir.join(TRACKS_DIR);
     let entries = std::fs::read_dir(&tracks_dir).map_err(|source| KilnError::Read {
@@ -858,5 +905,76 @@ mod tests {
         }
         let error = course.step("mailer/9.9").unwrap_err();
         assert!(matches!(error, KilnError::UnknownStep { .. }), "{error}");
+    }
+    #[test]
+    fn a_track_may_build_on_another_and_only_another() {
+        use crate::test_support::{
+            MANIFEST_TOML, TempDir, ledger_toml, load_course, step_toml, track_toml,
+            track_toml_requiring, write,
+        };
+        let mailer = [step_toml("mailer", "1.1-a", &["a/b@apply"])];
+        let dependent = [step_toml("relay", "2.1-x", &["a/c@apply"])];
+        let fixture = |requires: &str| {
+            vec![
+                (
+                    "mailer",
+                    1,
+                    track_toml("mailer", 1, &["a/b@apply"], &mailer),
+                ),
+                (
+                    "relay",
+                    2,
+                    track_toml_requiring("relay", 2, &["a/c@apply"], &dependent, requires),
+                ),
+            ]
+        };
+
+        // A named, existing, different track: the link loads and is kept.
+        let temp = TempDir::new("requires-track");
+        let course = load_course(temp.path(), &fixture("mailer"), &ledger_toml(&[]));
+        assert_eq!(
+            course.track("relay").unwrap().requires_track.as_deref(),
+            Some("mailer")
+        );
+        drop(course);
+
+        // Anything else is refused at load, with the reason in the message.
+        for (label, requires, expected) in [
+            (
+                "a-ghost",
+                "ghost",
+                "requires_track `ghost` has no track metadata",
+            ),
+            ("itself", "relay", "names the track itself"),
+        ] {
+            let temp = TempDir::new(&format!("requires-{label}"));
+            write(temp.path(), "course/course.toml", MANIFEST_TOML);
+            write(temp.path(), "course/capabilities.toml", &ledger_toml(&[]));
+            for (id, _, body) in fixture(requires) {
+                write(
+                    temp.path(),
+                    &format!("course/tracks/{id}/track.toml"),
+                    &body,
+                );
+            }
+            let error = Course::load(temp.path()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+        }
+        // The two-track cycle: both links are fine alone, together they are a loop.
+        let temp = TempDir::new("requires-cycle");
+        write(temp.path(), "course/course.toml", MANIFEST_TOML);
+        write(temp.path(), "course/capabilities.toml", &ledger_toml(&[]));
+        write(
+            temp.path(),
+            "course/tracks/mailer/track.toml",
+            &track_toml_requiring("mailer", 1, &["a/b@apply"], &mailer, "relay"),
+        );
+        write(
+            temp.path(),
+            "course/tracks/relay/track.toml",
+            &track_toml_requiring("relay", 2, &["a/c@apply"], &dependent, "mailer"),
+        );
+        let error = Course::load(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 }
