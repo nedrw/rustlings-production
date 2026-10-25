@@ -1224,12 +1224,14 @@ fn the_lockfile_pins_every_dependency_the_manifest_declares() {
                      lockfile that lost a dependency is a build that does not start"
                 );
             };
-            let wanted_numbers: Vec<&str> = wanted.split('.').collect();
             assert!(
-                version.starts_with(&wanted_numbers[..wanted_numbers.len().min(2)].join(".")),
-                "`{MANIFEST}` asks for `{name}` at {wanted} and `{LOCKFILE}` pins {version}: the \
-                 lockfile is the versions this tree was tested with, and a lockfile that drifted \
-                 from the manifest is a build nobody reproduced"
+                satisfies(&wanted, version),
+                "`{MANIFEST}` asks for `{name}` at {wanted} and `{LOCKFILE}` pins {version}: \
+                 `--locked` builds the lockfile's versions or refuses, so a lockfile that does not \
+                 satisfy the manifest is a build that does not start — and a lockfile that \
+                 *skipped* a newer compatible release is normal cargo life, not drift (found the \
+                 hard way: a fresh resolve picked up a newly released tokio and this test's older \
+                 version-prefix rule called the tree unreproducible when it was merely current)"
             );
             checked += 1;
         }
@@ -1240,6 +1242,49 @@ fn the_lockfile_pins_every_dependency_the_manifest_declares() {
          project's dependencies are what its builds are reproducible *against*, and a case that \
          found almost none of them is a case that stopped reading"
     );
+}
+
+/// `true` when `version` satisfies the requirement `requirement` the way cargo resolves it.
+///
+/// Only the requirement forms this project's manifests write: a bare version (`"1.53.1"`,
+/// `"0.9"`) means caret — at least this version, below the next breaking boundary, which is the
+/// next major (or the next minor while the major is 0). Build metadata (the `+spec-1.1.0` the
+/// `toml` family carries) is ignored, the way cargo ignores it. What this deliberately is *not*
+/// is a version-prefix comparison: `^1.53.1` allows `1.54.0`, and a test that denied that was a
+/// test asserting the registry would never move.
+fn satisfies(requirement: &str, version: &str) -> bool {
+    // Build metadata does not participate in version ordering, so it cannot participate in the
+    // comparison either: `0.9.12+spec-1.1.0` is `0.9.12` as far as any requirement is concerned.
+    let requirement = requirement
+        .split_once('+')
+        .map_or(requirement, |(bare, _)| bare);
+    let version = version.split_once('+').map_or(version, |(bare, _)| bare);
+    let mut wanted = requirement.split('.');
+    let Some(major) = wanted.next().and_then(|n| n.parse::<u64>().ok()) else {
+        return false;
+    };
+    let minor = wanted.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    let patch = wanted
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut pinned = version.split('.');
+    let Some(pinned_major) = pinned.next().and_then(|n| n.parse::<u64>().ok()) else {
+        return false;
+    };
+    let pinned_minor = pinned.next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+    let pinned_patch = pinned
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if pinned_major != major {
+        return false;
+    }
+    // While the major is 0, cargo treats the minor as the breaking boundary.
+    if major == 0 {
+        return pinned_minor == minor && pinned_patch >= patch;
+    }
+    pinned_minor > minor || (pinned_minor == minor && pinned_patch >= patch)
 }
 
 #[test]

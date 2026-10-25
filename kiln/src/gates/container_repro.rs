@@ -242,18 +242,34 @@ const TARGET_MOUNT: &str = "/opt/kiln/target";
 
 /// Where a container build keeps its work, when this machine has a cache directory at all.
 ///
-/// The same two directories the step's own fixture mounts: a fixture and the gate that judges it
-/// share the cache, or every build pays for the one before it. A machine without a cache directory
-/// still builds — it just pays.
+/// The registry a container build reads crates from is the **host's own cargo registry** — the
+/// versions this machine has actually resolved, which is the one set of crate files a build inside
+/// the image can be sure to need: the tree being built was resolved by this machine's cargo, so
+/// its lockfile names versions this registry already holds. A curated copy, however fresh when it
+/// was made, silently loses that property the day the registry moves and a fresh resolve names a
+/// version nobody cached — found by `lakelet/4.22`, whose freshly resolved lockfile named a newly
+/// released tokio the curated cache had never seen. `$CARGO_HOME` wins when it has a registry; a
+/// machine without one falls back to the curated copy under the cache directory, and a machine
+/// with neither still builds — it just pays the network.
 fn caches() -> Vec<(PathBuf, &'static str)> {
     let mut caches = Vec::new();
     if let Some(target) = scratch::container_cache("container-target") {
         caches.push((target, TARGET_MOUNT));
     }
-    if let Some(registry) = scratch::container_cache("container-registry") {
+    let registry = cargo_home_registry().or_else(|| scratch::container_cache("container-registry"));
+    if let Some(registry) = registry {
         caches.push((registry, "/usr/local/cargo/registry"));
     }
     caches
+}
+
+/// The host's own cargo registry directory, when `cargo` on this machine has one.
+fn cargo_home_registry() -> Option<PathBuf> {
+    let home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    let registry = home.join("registry");
+    registry.is_dir().then_some(registry)
 }
 
 /// How many bytes the image weighs, as the engine reports it.
