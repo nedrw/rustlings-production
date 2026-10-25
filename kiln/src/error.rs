@@ -190,6 +190,17 @@ pub enum KilnError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Another kiln run held a file this command needed, and the wait ran out.
+    ///
+    /// The message names the file, the pid of the run that holds it and how long it has held it,
+    /// because those are what a person needs to decide between waiting and deleting a file whose
+    /// run is gone.
+    #[error("{message}")]
+    Busy {
+        /// The line naming the holder and the file it holds.
+        message: String,
+    },
 }
 
 impl KilnError {

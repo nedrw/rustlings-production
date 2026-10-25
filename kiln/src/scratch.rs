@@ -158,24 +158,26 @@ const CLAIM_STALE: Duration = Duration::from_secs(30 * 60);
 /// [`KilnError::Write`] when the machine gives a cache nowhere to live, or the lock file cannot be
 /// created for a reason that is not contention.
 pub fn claim(name: &str) -> Result<Option<Claim>> {
-    claim_within(&lock_file(name)?, CLAIM_WAIT)
+    claim_within(&lock_file(name)?, CLAIM_WAIT, CLAIM_STALE)
 }
 
-/// The claim, waiting up to `wait` for whoever holds it.
+/// The claim, waiting up to `wait` for whoever holds it, and taking a lock file older than `stale`
+/// over once the wait would otherwise be spent on a run that is gone.
 ///
-/// The wait is a parameter rather than [`CLAIM_WAIT`] itself so a test can watch a claim give up in
-/// milliseconds; [`claim`] is the only caller, and it is the one that decides how long a gate
-/// waits.
-fn claim_within(lock: &Path, wait: Duration) -> Result<Option<Claim>> {
+/// Both durations are parameters rather than the constants above so other callers can pick their
+/// own: [`claim`] waits out builds, and the progress file's save (state.rs) holds its lock for
+/// milliseconds and takes a dead owner's file over after a minute. [`claim`] is the only caller
+/// that decides how long a *gate* waits.
+pub(crate) fn claim_within(lock: &Path, wait: Duration, stale: Duration) -> Result<Option<Claim>> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(claim) = take(lock)? {
             return Ok(Some(claim));
         }
-        // The file is there. One written longer ago than [`CLAIM_STALE`] cannot belong to a running
+        // The file is there. One written longer ago than `stale` cannot belong to a running
         // process — its owner would have removed it — so it is taken over, once, and the attempt
         // that follows is immediate.
-        if modified_age(lock).is_some_and(|age| age > CLAIM_STALE)
+        if modified_age(lock).is_some_and(|age| age > stale)
             && std::fs::remove_file(lock).is_ok()
             && let Some(claim) = take(lock)?
         {
@@ -227,10 +229,8 @@ fn lock_file(name: &str) -> Result<PathBuf> {
     Ok(cache_root()?.join(format!("{name}.lock")))
 }
 
-/// One line about the run that holds a shared directory, for the gate that could not take it.
-///
-/// Names the lock file, the owner's pid and how long it has been held, because all three are what a
-/// person needs to decide between waiting and deleting a file whose run is gone.
+/// One line about the run that holds the shared directory `name`, for the gate that could not take
+/// it.
 #[must_use]
 pub fn contended(name: &str) -> String {
     lock_file(name).map_or_else(
@@ -239,8 +239,12 @@ pub fn contended(name: &str) -> String {
     )
 }
 
-/// The same line, read from a lock file the caller already knows.
-fn contention(lock: &Path) -> String {
+/// One line about the run that holds a lock, for the command that could not take it.
+///
+/// Names the lock file, the owner's pid and how long it has been held, because all three are what a
+/// person needs to decide between waiting and deleting a file whose run is gone.
+#[must_use]
+pub(crate) fn contention(lock: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(lock) else {
         return format!(
             "another kiln run held {} until this gate gave up",
@@ -385,12 +389,12 @@ mod tests {
         // cache, and the cache comes from the environment, which a test must not set.
         let temp = crate::test_support::TempDir::new("claim-held");
         let lock = temp.path().join("coverage-target.lock");
-        let first = claim_within(&lock, Duration::from_secs(5))
+        let first = claim_within(&lock, Duration::from_secs(5), CLAIM_STALE)
             .unwrap()
             .expect("nobody holds it yet");
 
         let started = Instant::now();
-        let second = claim_within(&lock, Duration::from_millis(100)).unwrap();
+        let second = claim_within(&lock, Duration::from_millis(100), CLAIM_STALE).unwrap();
         assert!(second.is_none(), "a held claim is not handed out twice");
         assert!(
             started.elapsed() >= Duration::from_millis(100),
@@ -402,7 +406,7 @@ mod tests {
         drop(first);
         assert!(!lock.exists(), "`Drop` removes the lock file");
         assert!(
-            claim_within(&lock, Duration::from_secs(5))
+            claim_within(&lock, Duration::from_secs(5), CLAIM_STALE)
                 .unwrap()
                 .is_some(),
             "and the file being gone is what lets the next run in"
@@ -424,7 +428,7 @@ mod tests {
             .set_modified(old)
             .unwrap();
 
-        let claim = claim_within(&lock, Duration::from_millis(50))
+        let claim = claim_within(&lock, Duration::from_millis(50), CLAIM_STALE)
             .unwrap()
             .expect("an abandoned lock is taken over");
         let rewritten = std::fs::read_to_string(&lock).unwrap();

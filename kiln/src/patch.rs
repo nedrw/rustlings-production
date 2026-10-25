@@ -13,7 +13,7 @@
 //! [`plan`] computes the resulting files, [`Plan::apply`] writes them. Planning first is what makes
 //! idempotence, conflict reporting and `kiln reset` fall out of one piece of logic.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{KilnError, Result};
 
@@ -491,7 +491,31 @@ impl Plan {
     }
 
     /// Write the planned files, checking that the tree still matches the plan.
+    ///
+    /// A write that fails part way is taken back before the error is reported: a file the plan
+    /// created is removed again, a file it modified or deleted gets its previous content back. One
+    /// failed edit therefore costs a retry, not a tree that is half the patch and has to be
+    /// repaired by hand before anything fits again.
     pub fn apply(&self, tree: &Path) -> Result<()> {
+        let mut applied: Vec<&Edit> = Vec::new();
+        if let Err(error) = self.write_edits(tree, &mut applied) {
+            return match undo_edits(tree, &applied) {
+                Ok(()) => Err(error),
+                Err((path, source)) => Err(KilnError::Patch {
+                    file: path.display().to_string(),
+                    reason: format!(
+                        "{error}; and putting the tree back failed too: {source}, so it may be \
+                         half patched"
+                    ),
+                }),
+            };
+        }
+        Ok(())
+    }
+
+    /// The writes themselves, in plan order; every finished one is recorded so a later failure can
+    /// undo it.
+    fn write_edits<'a>(&'a self, tree: &Path, applied: &mut Vec<&'a Edit>) -> Result<()> {
         for edit in &self.edits {
             let path = tree.join(&edit.path);
             if let Some(before) = &edit.before {
@@ -531,6 +555,7 @@ impl Plan {
                     })?;
                 }
             }
+            applied.push(edit);
         }
         Ok(())
     }
@@ -619,8 +644,18 @@ fn plan_section(tree: &Path, file: &FileDiff, mode: Mode, plan: &mut Plan) -> Re
                     before: Some(content),
                     after: None,
                 });
-            } else {
+            } else if mode.lenient() {
                 skip(plan, SkipReason::KeptYours);
+            } else {
+                // A solution that left the file alone would report success while leaving a tree
+                // that is not the reference solution's — the one thing `kiln solution` is for. It
+                // refuses instead, and the file keeps the learner's edits.
+                return Err(KilnError::Patch {
+                    file: file.path.clone(),
+                    reason: "the file is not the version the solution expects to delete — it has \
+                             been changed since the scaffold, and the solution will not destroy it"
+                        .to_owned(),
+                });
             }
         }
         (Section::Modify, None) => {
@@ -679,6 +714,31 @@ fn join_lines(lines: &[&str]) -> String {
     text
 }
 
+/// Take back the edits applied so far, last one first: a created file is removed again, a modified
+/// or deleted file gets its previous content back. The first failure stops the undo and is named,
+/// because a tree the undo could not finish is a tree a person has to look at.
+fn undo_edits(
+    tree: &Path,
+    applied: &[&Edit],
+) -> std::result::Result<(), (PathBuf, std::io::Error)> {
+    for edit in applied.iter().rev() {
+        let path = tree.join(&edit.path);
+        let undone = match &edit.before {
+            Some(previous) => std::fs::write(&path, previous),
+            // A file the plan created is simply gone again; failing to remove it costs nothing
+            // that the failure being undone has not already cost.
+            None => {
+                let _ = std::fs::remove_file(&path);
+                Ok(())
+            }
+        };
+        if let Err(source) = undone {
+            return Err((path, source));
+        }
+    }
+    Ok(())
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(Some(content)),
@@ -715,9 +775,18 @@ fn apply_hunks(path: &str, content: &str, file: &FileDiff, mode: Mode) -> Result
         if mode == Mode::Scaffold && additions_are_present(&lines, hunk) {
             continue;
         }
-        let found = match find(&lines, &old, cursor.max(expected)) {
-            Some(position) => Some((position, false)),
-            None => find(&lines, &new, cursor.min(expected)).map(|position| (position, true)),
+        // The hunk's own line number wins when the file still matches there: a solution whose
+        // earlier hunk inserted a copy of this hunk's context must not be pulled away from where it
+        // was written by the copy being nearer to the cursor. Only a declared position that no
+        // longer fits — the file grew above, a later step moved the block — falls through to the
+        // nearest-content search.
+        let found = if matches_at(&lines, &old, expected) {
+            Some((expected, false))
+        } else {
+            match find(&lines, &old, cursor.max(expected)) {
+                Some(position) => Some((position, false)),
+                None => find(&lines, &new, cursor.min(expected)).map(|position| (position, true)),
+            }
         };
         let Some((position, already)) = found else {
             return Err(KilnError::Patch {
@@ -1155,5 +1224,112 @@ mod tests {
         let patch = Patch::parse(text).expect("patch should parse");
         let error = plan(temp.path(), &patch, Mode::Scaffold).unwrap_err();
         assert!(error.to_string().contains("authoring.md §5"), "{error}");
+    }
+
+    #[test]
+    fn an_apply_that_fails_part_way_puts_the_earlier_files_back() {
+        // Two files are planned; the second is changed after planning, so the apply dies on it.
+        // The first file — already written by then — has to read its old content afterwards: a
+        // failed solution must not leave half of itself behind for the retry to trip over.
+        let temp = tree(
+            "patch-rollback",
+            &[("a.rs", "//! a\n"), ("b.rs", "//! b\n")],
+        );
+        let text = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-//! a\n+//! changed\n\
+                    --- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-//! b\n+//! changed\n";
+        let patch = Patch::parse(text).expect("patch should parse");
+        let plan = plan(temp.path(), &patch, Mode::Solution).expect("plan should succeed");
+        temp.write("b.rs", "//! mine\n");
+
+        let error = plan.apply(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("b.rs"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            "//! a\n",
+            "the edit that did land was taken back"
+        );
+
+        // And the tree is whole again, so fixing the named file is enough for a retry.
+        temp.write("b.rs", "//! b\n");
+        plan.apply(temp.path()).expect("the retry succeeds");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("a.rs")).unwrap(),
+            "//! changed\n"
+        );
+    }
+
+    #[test]
+    fn an_apply_that_fails_takes_a_created_file_back_out() {
+        let temp = tree("patch-rollback-create", &[("b.rs", "//! b\n")]);
+        let text = "--- /dev/null\n+++ b/a.rs\n@@ -0,0 +1 @@\n+//! created\n\
+                    --- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-//! b\n+//! changed\n";
+        let patch = Patch::parse(text).expect("patch should parse");
+        let plan = plan(temp.path(), &patch, Mode::Solution).expect("plan should succeed");
+        temp.write("b.rs", "//! mine\n");
+
+        plan.apply(temp.path()).unwrap_err();
+        assert!(
+            !temp.path().join("a.rs").exists(),
+            "the file the plan created is gone again"
+        );
+    }
+
+    #[test]
+    fn a_solution_refuses_to_delete_a_file_it_does_not_recognise() {
+        let text = "--- a/generated.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-//! generated\n";
+        let patch = Patch::parse(text).expect("patch should parse");
+
+        // The learner's version differs from what the scaffold wrote: a solution that skipped the
+        // deletion would report success while leaving a tree that is not the reference solution's.
+        let edited = tree("patch-solution-delete", &[("generated.rs", "//! mine\n")]);
+        let error = plan(edited.path(), &patch, Mode::Solution).unwrap_err();
+        assert!(error.to_string().contains("delete"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(edited.path().join("generated.rs")).unwrap(),
+            "//! mine\n",
+            "and the learner's file keeps its edits"
+        );
+
+        // The same mismatch under `kiln reset` — which applies the deletion backwards, as a
+        // creation — is the normal case: the revert keeps the learner's file.
+        let revert = plan(edited.path(), &patch.reversed(), Mode::Revert).expect("revert plan");
+        assert!(revert.is_empty(), "{revert:?}");
+        assert_eq!(
+            revert.skipped.first().unwrap().reason,
+            SkipReason::KeptYours
+        );
+
+        // And the version the scaffold wrote is deleted as the solution says.
+        let pristine = tree(
+            "patch-solution-delete-ok",
+            &[("generated.rs", "//! generated\n")],
+        );
+        plan(pristine.path(), &patch, Mode::Solution)
+            .expect("plan")
+            .apply(pristine.path())
+            .expect("apply");
+        assert!(!pristine.path().join("generated.rs").exists());
+    }
+
+    #[test]
+    fn a_hunk_is_anchored_to_its_declared_line_before_the_content_search() {
+        // The first hunk inserts a copy of the second hunk's context below it. The copy is nearer
+        // to the cursor the first hunk leaves behind, but the second hunk's own line number still
+        // fits, and that is where it belongs: a nearest-content search alone would edit the copy
+        // the patch itself just wrote.
+        let text = "--- a/lib.rs\n+++ b/lib.rs\n\
+                    @@ -3,1 +3,3 @@\n two\n+ctx\n+block\n\
+                    @@ -1,2 +1,2 @@\n ctx\n-block\n+BLOCK\n";
+        let temp = tree("patch-anchor", &[("lib.rs", "ctx\nblock\ntwo\n")]);
+        let patch = Patch::parse(text).expect("patch should parse");
+
+        plan(temp.path(), &patch, Mode::Solution)
+            .expect("plan")
+            .apply(temp.path())
+            .expect("apply");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("lib.rs")).unwrap(),
+            "ctx\nBLOCK\ntwo\nctx\nblock\n"
+        );
     }
 }
