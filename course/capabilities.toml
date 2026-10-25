@@ -4,8 +4,8 @@
 # value is the step that establishes that depth: "<track>/<phase>.<index>". A missing depth
 # means the course does not teach it at that depth; leaving it out is honest, not an omission.
 #
-# Transcribed from `docs/curriculum.md` §3: 97 capabilities, 134 (capability, depth) slots,
-# covering all 118 steps. `kiln lint-caps` cross-checks this file against the authored
+# Transcribed from `docs/curriculum.md` §3: 97 capabilities, 136 (capability, depth) slots,
+# covering all 119 planned steps. `kiln lint-caps` cross-checks this file against the authored
 # `tracks/*/track.toml` files (rule R0) and enforces R1-R6 on top of it.
 #
 # One slot = the step where that depth is *first established*. A step that re-establishes a

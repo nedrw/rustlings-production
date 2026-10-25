@@ -20,9 +20,10 @@ kiln review   # what you have proven per capability, and what is going stale (--
 ```
 
 Every step = a short brief (WHY / TASK / DONE WHEN / TRAP / FURTHER) + read-only spec tests + a set of
-production gates. The lint ladder that only ever tightens is in; the gates that need heavier
-machinery (`cargo-mutants` proving the specs are not vacuous, public-API baselines, perf budgets,
-dependency and `unsafe` budgets) arrive with the milestones that need them, see plan.md §11.
+production gates. The lint ladder that only ever tightens is in; the heavier gates arrived with the
+milestones that needed them — mutation testing proving the specs are not vacuous, coverage of error
+branches, perf budgets, API baselines, the `unsafe` budget, and the `sim`/`soak`/`fuzz` trio
+(plan.md §10, §11).
 
 **No repeated teaching across projects.** Every learnable thing is a *capability* with a depth
 (`aware → apply → design → operate`). A step declares what it teaches and at which depth; the runner
@@ -34,26 +35,30 @@ with stricter gates and fewer hints.
 | --- | --- | --- | --- |
 | T1 | `mailer` — subscription microservice (inspired by *Zero To Production in Rust*) **delivered** | intro → mid | 22 |
 | T2 | `relay` — webhook delivery service **delivered** | mid | 24 |
-| T3 | `jobq` — job queue engine (library + worker + CLI) | mid-high | 27 |
-| T4 | `lakelet` — telemetry ingest and query | high | 24 |
+| T3 | `jobq` — job queue engine (library + worker + CLI) **delivered** | mid-high | 27 |
+| T4 | `lakelet` — telemetry ingest and query **authored** | high | 24 |
 | T5 | `meskv` — distributed KV / scheduler (optional) | highest | 22 |
 
 ## Read next
 
 - **[docs/plan.md](docs/plan.md)** — mechanisms, decisions (and rejected alternatives), runner design,
   gate catalogue, environment constraints, milestones, risks.
-- **[docs/curriculum.md](docs/curriculum.md)** — capability ledger, track dependency graph, all 118
-  steps, and worked examples of one capability across tracks (what is new, what is deliberately not
-  repeated).
+- **[docs/curriculum.md](docs/curriculum.md)** — capability ledger, track dependency graph, all 119
+  planned steps, and worked examples of one capability across tracks (what is new, what is
+  deliberately not repeated).
 - **[docs/authoring.md](docs/authoring.md)** — step templates, metadata rules, i18n, scaffold patches,
   checklists.
 - **[docs/t1-mailer.md](docs/t1-mailer.md)** — T1 `mailer` as delivered: the 22 steps, the gate
   ladder, the project's final shape, the test fixtures, the patterns T2–T5 copy, and the measured
-  numbers.
+  numbers. [docs/t2-relay.md](docs/t2-relay.md), [docs/t3-jobq.md](docs/t3-jobq.md) and
+  [docs/t4-lakelet.md](docs/t4-lakelet.md) record T2–T4 in the same shape.
 - **[docs/handoff-m0.md](docs/handoff-m0.md)** — the compressed M0 brief: scope, acceptance, verified
   environment facts, conventions, and where everything else lives. Read this one first;
   [docs/handoff-m0-log.md](docs/handoff-m0-log.md) is the build log behind it (per-segment progress,
-  measured facts, traps).
+  measured facts, traps). [docs/handoff-m1.md](docs/handoff-m1.md),
+  [docs/handoff-m2.md](docs/handoff-m2.md) and [docs/handoff-m3.md](docs/handoff-m3.md) are the same
+  for M1 (the runtime half of de-duplication), M2 (the slow gates and T3) and M3 (T4 and the
+  `sim`/`soak`/`fuzz` gates), each with its own `-log.md`.
 - **[docs/drafts/](docs/drafts/)** — measured designs for steps whose decisions were expensive to
   re-derive.
 
@@ -62,29 +67,38 @@ locale fallback and translation-drift detection, so other languages can be added
 
 ## Status
 
-**M0 and M1 are closed.** The metadata layer, the capability lint, the gates and the
-runner are in, and T1 `mailer` is authored end to end: 22 steps, each with a brief, read-only spec
-tests, a scaffold, a reference solution and gate wiring. M1 adds the runtime half of the
-de-duplication mechanism (`kiln plan --fast` / `skip` / `probe` / `review --due`, one capability
-record per learner per capability) and authors T2 `relay` end to end: 24 steps, 18 teach + 1
-transfer + 5 deepen, `kiln verify relay` 24/24 on the final tree, and 19 probe exercises behind the
-spaced-repetition loop. See [docs/t2-relay.md](docs/t2-relay.md) for what T2 delivers and
-[docs/handoff-m1.md](docs/handoff-m1.md) for the mechanism, the acceptance lines and how to
-continue.
+**M0, M1 and M2 are closed; M3 is in wrap-up.** The metadata layer, the capability lint, the gates
+and the runner are in. M1 added the runtime half of the de-duplication mechanism (`kiln plan --fast`
+/ `skip` / `probe` / `review --due`, one capability record per learner per capability) and authored
+T2 `relay` end to end; M2 authored T3 `jobq` and brought the slow gates (`mutants`, `coverage`,
+`bench-budget`, `semver`, `unsafe-budget`, `conformance`). M3 authored T4 `lakelet` end to end — 24
+steps — added the `slow:sim`/`slow:soak`/`slow:fuzz` gates and the container and profiling
+infrastructure the track leans on, and filled the probe pool to 65 exercises behind the
+spaced-repetition loop. What M3 still owes is the wrap-up batch: the final `cargo xtask ci` pass on
+the finished tree, the offline fast path, `kiln verify lakelet --slow --json`, and plan §9 leg 6's
+second half, which is stuck on this machine's container engine. See
+[docs/handoff-m3.md](docs/handoff-m3.md) for the state of that list and
+[docs/t4-lakelet.md](docs/t4-lakelet.md) for what T4 delivers.
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
 (`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,
-re-verified at `dd47c11`) and say so. The link counts come from the repository-wide report, which
-counts the repository's own pages and names the directories it skipped (`app/<track>` is a learner's
-working copy, judged by its step's own `links` gate).
+re-verified at `dd47c11`) and say so; the current-tree numbers are from this README's own pass over
+the M3 tree. The link counts come from the repository-wide report, which counts the repository's own
+pages and names the directories it skipped (`app/<track>` is a learner's working copy, judged by its
+step's own `links` gate).
 
 - `cargo xtask ci` — **761 s** on the M1 tree: fmt, `rustfmt --check` on the course's own files,
   clippy `-D warnings`, 202 + 15 + 1 tests, spec integrity 46 pinned, `kiln lint-caps`
   `97 capabilities · 134 slots · 118 ledger positions · 46 authored steps`, `kiln links` offline,
   `kiln probe --check` 19/19, and `kiln selftest` — last lines `22/22 step(s) hold the contract` and
   `xtask ci: all checks passed`. (Measured with libtest serialized to dodge the fixture collision
-  `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 today — six arrived
-  with the report-wording fix, not with a change to what is judged.)
+  `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 then; the current
+  tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
+  patch-engine fixes, not with a change to what is judged.)
+- On the current tree (M3, pre-wrap-up): `kiln lint-caps` — `97 capabilities · 136 slots · 119
+  ledger positions · 97 authored steps`, no issues; `kiln links` — 115 pages, 544 links, 330
+  external targets, 0 findings; `kiln probe --check` — 65/65 (47 s, measured for
+  [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests.
 - `kiln selftest --track relay` — **476 s**, `24/24 step(s) hold the contract`: every T2 step's spec
   fails on its scaffold, passes on the reference solution, and every must gate is green.
 - `kiln verify relay` — **155 s**, `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without
@@ -96,7 +110,7 @@ working copy, judged by its step's own `links` gate).
   network, not 404s).
 - M0 tree, for reference: `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0`;
   `cargo xtask ci` — **579 s**.
-- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/46 step bodies, falling back through
+- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/97 step bodies, falling back through
   ja -> en`.
 - The three container steps (1.9 Postgres, 1.19 mailpit, 1.21 the image itself) run under local
   podman. `kiln images` says which images to pull first; `kiln doctor` warns when the machine needs
@@ -120,17 +134,19 @@ cargo run -p kiln -- review --due               # capabilities whose last proof 
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
 cargo run -p kiln -- links                      # the repository's own links, offline (learner projects aside)
 cargo run -p kiln -- spec restore               # put the course's spec files back
-cargo run -p kiln -- lint-caps                  # 97 capabilities, 134 slots, 118 planned, see below
+cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 planned, see below
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```
 
 Also in: the course metadata under `course/` (`course.toml`, `capabilities.toml`, the step tables in
-`tracks/<track>/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; eleven implemented
-gates — `spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` / `docs:public` / `exit-code` /
-`i18n` / `images` / `container-repro` / `links` — plus `timeout`, which is the runner's own deadline
-rather than a per-step gate (plan.md §6), and `conformance`, which the catalogue holds for T3;
-`list` / `caps` / `run` / `check` / `hint` / `reset` /
+`tracks/<track>/track.toml`); the capability rules R0–R6 as `kiln lint-caps`; twenty implemented
+gates — the eleven fast ones (`spec-integrity` / `caps` / `fmt` / `clippy@N` / `no-todo` /
+`docs:public` / `exit-code` / `i18n` / `images` / `container-repro` / `links`) and the nine that M2
+and M3 added (`mutants` / `coverage` / `bench-budget` / `semver` / `unsafe-budget` / `conformance` /
+`sim` / `soak` / `fuzz`) — plus `timeout`, which is the runner's own deadline rather than a per-step
+gate (plan.md §6), and `deny`, which the catalogue holds until `cargo-deny` joins the toolchain
+baseline; `list` / `caps` / `run` / `check` / `hint` / `reset` /
 `solution` / `spec restore` / `spec manifest` / `selftest` / `verify` / `watch` / `doctor` / `images` /
 `links` / `i18n status` / `plan` / `skip` / `probe` / `review`; and the locale fallback chain.
 `tools/lint-caps-md.py` is the prototype the
@@ -138,12 +154,13 @@ Rust lint was ported from; it still cross-checks the ledger against the curricul
 which is why it is kept:
 
 ```sh
-python3 tools/lint-caps-md.py   # 97 capabilities, 118 steps, 134 (capability, depth) slots, 0 issues
+python3 tools/lint-caps-md.py   # 97 capabilities, 119 steps, 136 (capability, depth) slots, 0 issues
 ```
 
-What is not in yet: T4–T5 content (T1, T2 and T3 are authored — `docs/t1-mailer.md`, `docs/t2-relay.md`,
-`docs/t3-jobq.md`); the rest of T2 (`relay` is being authored step by step, see
-[docs/handoff-m1.md](docs/handoff-m1.md)); the slow-path gates (`mutants`, `coverage`, `bench`,
-`loom`, `soak`, `sim`); translations (the fallback chain and the drift detector are ready, no locale
-has translated bodies); the `new-track` generator; a documentation site. See
-[docs/plan.md](docs/plan.md) §11.
+What is not in yet: T5 `meskv` content (T1–T4 are authored — `docs/t1-mailer.md`, `docs/t2-relay.md`,
+`docs/t3-jobq.md`, `docs/t4-lakelet.md`); M3's wrap-up batch, which is the only thing between the
+tree and a closed M3: the final `cargo xtask ci` pass on the finished tree, the offline fast path,
+`kiln verify lakelet --slow --json`, and plan §9 leg 6's second half, stuck on this machine's
+container engine (see [docs/handoff-m3.md](docs/handoff-m3.md) §5); translations (the fallback chain
+and the drift detector are ready, no locale has translated bodies); the `new-track` generator; a
+documentation site. See [docs/plan.md](docs/plan.md) §11.

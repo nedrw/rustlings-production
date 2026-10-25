@@ -4,3 +4,6 @@
 # `kiln` creates `app/<track>` from the track skeleton the first time a step is run.
 /.kiln
 /app
+
+# The desktop's own metadata, not this repository's content.
+.DS_Store
