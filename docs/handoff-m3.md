@@ -273,8 +273,10 @@ value }`，`series` = 指标名 + 标签集。
   4.22 在砂箱里被 **registry 漂移**打红（`tokio 1.54.1` 发布后，全新在线解析的锁被旧的前缀断言判为
   漂移；策展容器缓存也没有它要的 crate）。两笔修复（规格断言改 semver 兼容检查、container-repro 改挂
   宿主 registry）、被拒候选与全部原始行在 [handoff-m3-log.md](handoff-m3-log.md) 段 36；修后 4.22 与
-  mailer/1.21（同一个门）的 selftest 都是 `1/1 hold the contract`，修复后收尾提交上的 exit-0 复跑
-  记在段 36 末尾的补记。更早的 `/private/tmp/l4b3-wrapup` 一轮（538 s，`21/22`，引擎）已被上面这轮取代。
+  mailer/1.21（同一个门）的 selftest 都是 `1/1 hold the contract`。**修复后收尾提交 `c39eb58` 上的复跑：
+  exit 0 · 2444 s（40m44s）· `22/22 + 24/24 + 27/27 + 24/24 step(s) hold the contract` ·
+  `xtask ci: all checks passed`**（原始行在段 36 末尾的补记）。更早的 `/private/tmp/l4b3-wrapup` 一轮
+  （538 s，`21/22`，引擎）已被上面两轮取代。
 
 ## 5. 施工中记录、收尾时并入 §5 的缺口
 

@@ -1949,3 +1949,16 @@ selftest 砂箱里两条红：参考解之后 `the_lockfile_pins_every_dependenc
 **同一批落地的还有**（评审修复，先于本段提交）：state 文件的原子写/按条目合并/读错误不再当零状态
 （单测 327→335），patch 引擎的部分失败回滚、solution 模式拒删不认识的文件、hunk 声明行号优先锚定；
 README/台账头注的数字刷新（97/136/119/97、65 探题、115 页 544 链）。
+
+**段 36 补记（CI 复跑，修复后的收尾提交 `c39eb58` 上）**：
+
+```
+$ cargo xtask ci   # 私有缓存（land 配方），real 2444s = 40m44s
+  ✓ cargo fmt --all --check · ✓ rustfmt --check（271 份课程文件）· ✓ clippy -D warnings
+  ✓ cargo test --workspace（335+21+1）· ✓ spec integrity · ✓ lint-caps · ✓ links · ✓ probe --check 65/65
+  ✓ selftest --track mailer  → 22/22 step(s) hold the contract
+  ✓ selftest --track relay   → 24/24 step(s) hold the contract
+  ✓ selftest --track jobq    → 27/27 step(s) hold the contract
+  ✓ selftest --track lakelet → 24/24 step(s) hold the contract   （4.22 含 container-repro，修复后）
+  xtask ci: all checks passed                                     （exit 0）
+```
