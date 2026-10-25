@@ -1,0 +1,653 @@
+# T5 `meshkv` — distributed KV on a consensus log (22 steps, optional), see `docs/curriculum.md` §10.
+#
+# Same conventions as the other four tracks (`kiln lint-caps` enforces them). Two things are
+# different here, both decisions rather than accidents (docs/m4-plan.md):
+#
+# * `requires_track = "jobq"` — the one cross-track `path` dependency the course allows (plan §3
+#   D6): 5.20's acceptance is *jobq's engine crate reused with zero lines changed*, so this track
+#   builds on the learner's own T3 project. The dependency itself is held back until 5.20's
+#   scaffold declares it; the runner refuses to judge any step while `app/jobq` is missing.
+# * the ladder starts where T4 ended (clippy@4 and the persistent set), `unsafe-budget@0` runs the
+#   whole track, and 5.19 will raise the budget to the number its reference solution actually
+#   needs when that step is authored — the one deliberate loosening, argued on the step's page.
+
+format_version = 1
+id = "meshkv"
+index = 5
+title = "Meshkv — distributed KV / scheduler"
+
+requires_track = "jobq"
+
+# The learner's workspace for this track.
+project = "app/meshkv"
+
+# Exit capabilities (curriculum.md §10): whatever else happens, these are established here.
+exit = [
+    "dist/consensus@apply",
+    "test/deterministic-simulation@design",
+    "dist/partition-drill@operate",
+    "ops/cluster-drill@operate",
+    "api/library-reuse@design",
+    "dist/consistency-audit@operate",
+]
+
+[[step]]
+id = "5.1-multi-node-topology"
+title = "Five skeletons in: the node, its identity, and the cluster it answers to"
+kind = "milestone"
+origin = "transfer"
+entry = "docs/steps/en/meshkv/5.1-multi-node-topology.md"
+time_hint = "90m"
+concepts = ["node identity", "cluster topology", "in-process transport"]
+teaches = ["dist/topology@apply"]
+requires = []
+run = { cmd = "cargo test -p meshkv --test spec_multi_node_topology" }
+spec = ["spec/5.1/multi_node_topology.rs"]
+scaffold = "skeleton"
+solution = "solutions/5.1-multi-node-topology.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+
+[[step]]
+id = "5.2-replication-rules"
+title = "A write is a log entry, and a log entry is committed by a majority"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.2-replication-rules.md"
+time_hint = "90m"
+concepts = ["log replication", "commit rule", "failure catalogue"]
+teaches = ["dist/consensus@aware"]
+requires = ["dist/topology@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_replication_rules" }
+spec = ["spec/5.2/replication_rules.rs"]
+scaffold = "scaffold/5.2-replication-rules.patch"
+solution = "solutions/5.2-replication-rules.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+
+[[step]]
+id = "5.3-teaching-raft"
+title = "The term, the vote, and the heartbeat: a small Raft that three nodes agree on"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.3-teaching-raft.md"
+time_hint = "90m"
+concepts = ["leader election", "log matching", "heartbeats"]
+teaches = ["dist/consensus@apply"]
+requires = ["dist/consensus@aware"]
+run = { cmd = "cargo test -p meshkv --test spec_teaching_raft" }
+spec = ["spec/5.3/teaching_raft.rs"]
+scaffold = "scaffold/5.3-teaching-raft.patch"
+solution = "solutions/5.3-teaching-raft.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:mutants@80",
+    "slow:sim@3",
+    "links",
+]
+
+
+[[step]]
+id = "5.4-snapshots"
+title = "The log cannot grow forever: a snapshot is the state at an index"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.4-snapshots.md"
+time_hint = "90m"
+concepts = ["snapshot", "log compaction", "install"]
+teaches = ["dist/snapshot@design"]
+requires = ["dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_snapshots" }
+spec = ["spec/5.4/snapshots.rs"]
+scaffold = "scaffold/5.4-snapshots.patch"
+solution = "solutions/5.4-snapshots.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:bench-budget@10",
+    "links",
+]
+
+
+[[step]]
+id = "5.5-membership"
+title = "Nodes join, nodes leave, and no committed write falls out of the quorum"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.5-membership.md"
+time_hint = "90m"
+concepts = ["joint consensus", "quorum overlap", "membership change"]
+teaches = ["dist/membership@apply"]
+requires = ["dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_membership" }
+spec = ["spec/5.5/membership.rs"]
+scaffold = "scaffold/5.5-membership.patch"
+solution = "solutions/5.5-membership.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+    "slow:mutants@80",
+]
+
+
+[[step]]
+id = "5.6-lease-reads"
+title = "A read is a question about now: linearizable reads and the lease that makes them cheap"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.6-lease-reads.md"
+time_hint = "90m"
+concepts = ["linearizability", "read index", "lease clock"]
+teaches = ["dist/linearizable-read@design"]
+requires = ["dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_lease_reads" }
+spec = ["spec/5.6/lease_reads.rs"]
+scaffold = "scaffold/5.6-lease-reads.patch"
+solution = "solutions/5.6-lease-reads.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+
+[[step]]
+id = "5.7-client-routing"
+title = "Any node answers, one node decides: routing and redirection"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.7-client-routing.md"
+time_hint = "90m"
+concepts = ["redirect", "not-leader hint", "retry at the leader"]
+teaches = ["dist/client-routing@apply"]
+requires = ["dist/topology@apply", "dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_client_routing" }
+spec = ["spec/5.7/client_routing.rs"]
+scaffold = "scaffold/5.7-client-routing.patch"
+solution = "solutions/5.7-client-routing.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:mutants@80",
+]
+
+
+[[step]]
+id = "5.8-idempotent-sessions"
+title = "A retry is not a second write: sessions and idempotency keys"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.8-idempotent-sessions.md"
+time_hint = "90m"
+concepts = ["session", "idempotency key", "duplicate window"]
+teaches = ["api/idempotency-key@design"]
+requires = ["delivery/idempotency@apply", "dist/client-routing@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_idempotent_sessions" }
+spec = ["spec/5.8/idempotent_sessions.rs"]
+scaffold = "scaffold/5.8-idempotent-sessions.patch"
+solution = "solutions/5.8-idempotent-sessions.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+
+[[step]]
+id = "5.9-mtls"
+title = "The peer across the wire is the node it claims: mTLS and rotation"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.9-mtls.md"
+time_hint = "90m"
+concepts = ["mutual TLS", "certificate rotation", "unauthorized peer"]
+teaches = ["sec/mtls@apply"]
+requires = ["sec/token-lifetime@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_mtls" }
+spec = ["spec/5.9/mtls.rs"]
+scaffold = "scaffold/5.9-mtls.patch"
+solution = "solutions/5.9-mtls.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+    "links",
+]
+
+
+[[step]]
+id = "5.10-deterministic-apply"
+title = "The state machine is a pure function of the log, and the tests can prove it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.10-deterministic-apply.md"
+time_hint = "90m"
+concepts = ["apply loop", "determinism", "side-effect isolation"]
+teaches = ["dist/deterministic-state-machine@apply"]
+requires = ["dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_deterministic_apply" }
+spec = ["spec/5.10/deterministic_apply.rs"]
+scaffold = "scaffold/5.10-deterministic-apply.patch"
+solution = "solutions/5.10-deterministic-apply.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:mutants@80",
+    "slow:sim@3",
+]
+
+
+[[step]]
+id = "5.11-client-sdk"
+title = "The SDK is the product: one client, typed errors, and a contract of its own"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.11-client-sdk.md"
+time_hint = "90m"
+concepts = ["SDK contract", "typed errors", "backpressure to the caller"]
+teaches = ["api/client-sdk@apply"]
+requires = ["dist/client-routing@apply", "api/idempotency-key@design"]
+run = { cmd = "cargo test -p meshkv --test spec_client_sdk" }
+spec = ["spec/5.11/client_sdk.rs"]
+scaffold = "scaffold/5.11-client-sdk.patch"
+solution = "solutions/5.11-client-sdk.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:conformance@2",
+]
+
+
+[[step]]
+id = "5.12-consistency-levels"
+title = "Consistency is a dial: what each level promises and what it costs"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.12-consistency-levels.md"
+time_hint = "90m"
+concepts = ["read consistency", "staleness bound", "level matrix"]
+teaches = ["query/consistency-levels@apply"]
+requires = ["dist/linearizable-read@design"]
+run = { cmd = "cargo test -p meshkv --test spec_consistency_levels" }
+spec = ["spec/5.12/consistency_levels.rs"]
+scaffold = "scaffold/5.12-consistency-levels.patch"
+solution = "solutions/5.12-consistency-levels.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+]
+
+
+[[step]]
+id = "5.13-deterministic-network"
+title = "The network as data: turmoil topologies, seeds, and the digest of a run"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.13-deterministic-network.md"
+time_hint = "90m"
+concepts = ["deterministic simulation", "seeded topology", "digest replay"]
+teaches = ["test/deterministic-simulation@design"]
+requires = ["test/property-based@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_deterministic_network" }
+spec = ["spec/5.13/deterministic_network.rs"]
+scaffold = "scaffold/5.13-deterministic-network.patch"
+solution = "solutions/5.13-deterministic-network.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+    "links",
+]
+
+
+[[step]]
+id = "5.14-partition-drills"
+title = "A partition is an input: the minority stops committing and says why"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.14-partition-drills.md"
+time_hint = "90m"
+concepts = ["network partition", "quorum loss", "split brain"]
+teaches = ["dist/partition-drill@operate"]
+requires = ["test/deterministic-simulation@design"]
+run = { cmd = "cargo test -p meshkv --test spec_partition_drills" }
+spec = ["spec/5.14/partition_drills.rs"]
+scaffold = "scaffold/5.14-partition-drills.patch"
+solution = "solutions/5.14-partition-drills.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+    "links",
+]
+
+
+[[step]]
+id = "5.15-cluster-drills"
+title = "One node at a time: rolling restarts that never lose the majority"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.15-cluster-drills.md"
+time_hint = "90m"
+concepts = ["rolling restart", "availability during churn", "drill harness"]
+teaches = ["ops/cluster-drill@operate"]
+requires = ["dist/partition-drill@operate"]
+run = { cmd = "cargo test -p meshkv --test spec_cluster_drills" }
+spec = ["spec/5.15/cluster_drills.rs"]
+scaffold = "scaffold/5.15-cluster-drills.patch"
+solution = "solutions/5.15-cluster-drills.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "links",
+]
+
+
+[[step]]
+id = "5.16-chaos-matrix"
+title = "Everything that can break, on purpose, in a table the tests read"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.16-chaos-matrix.md"
+time_hint = "90m"
+concepts = ["fault injection", "expected behaviour table", "chaos matrix"]
+teaches = ["test/chaos-injection@design"]
+requires = ["test/deterministic-simulation@design"]
+run = { cmd = "cargo test -p meshkv --test spec_chaos_matrix" }
+spec = ["spec/5.16/chaos_matrix.rs"]
+scaffold = "scaffold/5.16-chaos-matrix.patch"
+solution = "solutions/5.16-chaos-matrix.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+]
+
+
+[[step]]
+id = "5.17-distributed-budgets"
+title = "Latency and throughput against node count: the budget with three axes"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.17-distributed-budgets.md"
+time_hint = "90m"
+concepts = ["quorum latency", "replication fan-out", "budget by topology"]
+teaches = ["perf/distributed-budget@design"]
+requires = ["perf/bench-budget@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_distributed_budgets" }
+spec = ["spec/5.17/distributed_budgets.rs"]
+scaffold = "scaffold/5.17-distributed-budgets.patch"
+solution = "solutions/5.17-distributed-budgets.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:bench-budget@10",
+    "links",
+]
+
+
+[[step]]
+id = "5.18-cluster-observability"
+title = "Who is behind, who is flapping: the SLO page of a cluster"
+kind = "milestone"
+origin = "deepen"
+entry = "docs/steps/en/meshkv/5.18-cluster-observability.md"
+time_hint = "90m"
+concepts = ["replication lag", "election counter", "cluster SLO"]
+teaches = ["obs/metrics-slo@operate"]
+requires = ["obs/metrics-slo@design", "dist/consensus@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_cluster_observability" }
+spec = ["spec/5.18/cluster_observability.rs"]
+scaffold = "scaffold/5.18-cluster-observability.patch"
+solution = "solutions/5.18-cluster-observability.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:bench-budget@10",
+    "links",
+]
+
+
+[[step]]
+id = "5.19-unsafe-deep-dive"
+title = "Where unsafe pays for itself: a hand-rolled structure under miri and loom"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.19-unsafe-deep-dive.md"
+time_hint = "90m"
+concepts = ["hand-rolled structure", "miri", "loom"]
+teaches = ["unsafe/hand-rolled@operate"]
+requires = ["unsafe/budget@apply", "test/model-based@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_unsafe_deep_dive" }
+spec = ["spec/5.19/unsafe_deep_dive.rs"]
+scaffold = "scaffold/5.19-unsafe-deep-dive.patch"
+solution = "solutions/5.19-unsafe-deep-dive.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "links",
+]
+
+
+[[step]]
+id = "5.20-reuse-jobq"
+title = "The graduation of the engine: jobq's crate, zero lines changed"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.20-reuse-jobq.md"
+time_hint = "90m"
+concepts = ["path dependency", "zero-diff reuse", "architecture seams"]
+teaches = ["api/library-reuse@design"]
+requires = ["api/library-design@apply", "dist/deterministic-state-machine@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_reuse_jobq" }
+spec = ["spec/5.20/reuse_jobq.rs"]
+scaffold = "scaffold/5.20-reuse-jobq.patch"
+solution = "solutions/5.20-reuse-jobq.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "links",
+]
+
+
+[[step]]
+id = "5.21-protocol-evolution"
+title = "New nodes, old nodes, one cluster: versioned protocol and rolling upgrade"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.21-protocol-evolution.md"
+time_hint = "90m"
+concepts = ["protocol versioning", "mixed-version cluster", "rolling upgrade"]
+teaches = ["dist/protocol-evolution@design", "ops/rolling-upgrade@design"]
+requires = ["dist/membership@apply", "sec/mtls@apply"]
+run = { cmd = "cargo test -p meshkv --test spec_protocol_evolution" }
+spec = ["spec/5.21/protocol_evolution.rs"]
+scaffold = "scaffold/5.21-protocol-evolution.patch"
+solution = "solutions/5.21-protocol-evolution.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "slow:sim@3",
+]
+
+
+[[step]]
+id = "5.22-consistency-audit"
+title = "The final drill: multi-node failures, then an audit that proves what survived"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/meshkv/5.22-consistency-audit.md"
+time_hint = "90m"
+concepts = ["audit script", "committed-prefix check", "post-mortem page"]
+teaches = ["dist/consistency-audit@operate"]
+requires = ["dist/partition-drill@operate", "ops/cluster-drill@operate"]
+run = { cmd = "cargo test -p meshkv --test spec_consistency_audit" }
+spec = ["spec/5.22/consistency_audit.rs"]
+scaffold = "scaffold/5.22-consistency-audit.patch"
+solution = "solutions/5.22-consistency-audit.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@4",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+    "links",
+]

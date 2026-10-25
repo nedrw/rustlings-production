@@ -1231,14 +1231,13 @@ mod tests {
         assert_eq!(report.capabilities, 97);
         assert_eq!(report.slots, 136);
         assert_eq!(report.ledger_positions, 119);
-        // Every track the ledger plans through T4 has metadata now (T1 22 + T2 24 + T3 27 + T4 24);
+        // Every track the ledger plans has metadata now (T1 22 + T2 24 + T3 27 + T4 24 + T5 22);
         // the bodies inside those steps arrive one at a time, which is what the R5 notice below
-        // reports. T5 is still ledger-only, so this number moves again when its metadata lands —
-        // that is the point of asserting it here.
+        // reports. That is the point of asserting it here.
         assert_eq!(
             report.authored_steps,
-            22 + 24 + 27 + 24,
-            "T1, T2, T3 and T4 metadata"
+            22 + 24 + 27 + 24 + 22,
+            "T1-T5 metadata; T5's bodies arrive batch by batch"
         );
         assert!(report.is_clean(), "{:?}", report.issues);
         assert!(report.reteaches.is_empty());

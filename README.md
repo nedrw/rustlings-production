@@ -95,7 +95,8 @@ step's own `links` gate).
   tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
   patch-engine fixes, not with a change to what is judged.)
 - On the current tree (M3, closed): `kiln lint-caps` — `97 capabilities · 136 slots · 119
-  ledger positions · 97 authored steps`, no issues; `kiln links` — 116 pages, 555 links, 330
+  ledger positions · 119 authored steps` (T1–T4 bodies + T5 metadata; T5's bodies arrive
+  batch by batch), no issues; `kiln links` — 116 pages, 555 links, 330
   external targets, 0 findings; `kiln probe --check` — 65/65 (47 s, measured for
   [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests;
   the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
@@ -136,7 +137,7 @@ cargo run -p kiln -- review --due               # capabilities whose last proof 
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
 cargo run -p kiln -- links                      # the repository's own links, offline (learner projects aside)
 cargo run -p kiln -- spec restore               # put the course's spec files back
-cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 planned, see below
+cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 steps (T5 bodies in progress)
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```

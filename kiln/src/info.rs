@@ -866,8 +866,8 @@ mod tests {
         assert_eq!(course.manifest().default_track, "mailer");
         assert_eq!(
             course.tracks().len(),
-            4,
-            "T1-T4 have metadata; T5 is ledger-only"
+            5,
+            "T1-T5 have metadata (T5's steps are authored batch by batch)"
         );
 
         let relay = course.track("relay").unwrap();
