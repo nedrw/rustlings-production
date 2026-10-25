@@ -263,7 +263,7 @@ value }`，`series` = 指标名 + 标签集。
   `kiln spec manifest --track lakelet` 重钉 `diff` exit 0。演练（我手跑）：只读源（`dr-xr-xr-x`，里面种着孤儿与半截清单）上
   `lakeletq backup` → `files=4 entries=4 bytes=569 records=8 log_bytes=261 log_records=2 interrupted=false epoch=2 floor=0` exit 0，
   而源一字未动、副本只含清单点名的文件。作者侧还留了新旧对照（同一只读源：新 exit=0 / 旧 exit=4）。
-- **课程自有检查**：`lint-caps` no issues（97/136/119/97）· `links` 115 页/544 链全解（收尾树的读数）·
+- **课程自有检查**：`lint-caps` no issues（97/136/119/97）· `links` 116 页/555 链全解（收尾树的读数）·
   `i18n` 0 error · `probe --check` 65/65 · `cargo test -q -p kiln` **335 + 21 + 1 passed**
   （BP 之前是 322+21+1 = 344；评审修复的八条新单测 327→335）。
 - **`cargo xtask ci`**：收尾第一轮（私有缓存，2923 s）全局阶段全绿——`cargo fmt --all --check`、

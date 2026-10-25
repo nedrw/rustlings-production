@@ -1224,6 +1224,14 @@ fn the_lockfile_pins_every_dependency_the_manifest_declares() {
                      lockfile that lost a dependency is a build that does not start"
                 );
             };
+            if !is_plain_version(&wanted) {
+                panic!(
+                    "`{MANIFEST}` asks for `{name}` at `{wanted}`, and this test only knows how to \
+                     read a bare version (`1.53.1`, `0.9`): a requirement with an operator or a \
+                     wildcard needs this case taught the shape before it can judge the lockfile — \
+                     answering `false` here would call a healthy tree unreproducible"
+                );
+            }
             assert!(
                 satisfies(&wanted, version),
                 "`{MANIFEST}` asks for `{name}` at {wanted} and `{LOCKFILE}` pins {version}: \
@@ -1285,6 +1293,21 @@ fn satisfies(requirement: &str, version: &str) -> bool {
         return pinned_minor == minor && pinned_patch >= patch;
     }
     pinned_minor > minor || (pinned_minor == minor && pinned_patch >= patch)
+}
+
+/// `true` when `requirement` is a bare version — `1.53.1`, `0.9` — the only shape [`satisfies`]
+/// reads. Anything else (`>=1.0`, `~1.2`, `1.*`, comma ranges) is a shape the test has not been
+/// taught, and judging it — either way — would be a verdict about a requirement it never read;
+/// the caller panics on it instead, so the first manifest that writes a new shape fails loudly at
+/// the step that has to learn it.
+fn is_plain_version(requirement: &str) -> bool {
+    let bare = requirement
+        .split_once('+')
+        .map_or(requirement, |(bare, _)| bare);
+    !bare.is_empty()
+        && bare
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[test]

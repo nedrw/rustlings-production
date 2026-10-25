@@ -513,8 +513,10 @@ impl Plan {
         Ok(())
     }
 
-    /// The writes themselves, in plan order; every finished one is recorded so a later failure can
-    /// undo it.
+    /// The writes themselves, in plan order; every edit is recorded as *about to be written*, so a
+    /// failure in the write itself is undone too — `fs::write` truncates before it writes, and an
+    /// edit that failed half way through its own write would otherwise leave a corrupted file the
+    /// rollback never knows it owns.
     fn write_edits<'a>(&'a self, tree: &Path, applied: &mut Vec<&'a Edit>) -> Result<()> {
         for edit in &self.edits {
             let path = tree.join(&edit.path);
@@ -535,6 +537,7 @@ impl Plan {
                     reason: "the file appeared while the patch was being planned".to_owned(),
                 });
             }
+            applied.push(edit);
             match &edit.after {
                 Some(content) => {
                     if let Some(parent) = path.parent() {
@@ -555,7 +558,6 @@ impl Plan {
                     })?;
                 }
             }
-            applied.push(edit);
         }
         Ok(())
     }
@@ -779,8 +781,11 @@ fn apply_hunks(path: &str, content: &str, file: &FileDiff, mode: Mode) -> Result
         // earlier hunk inserted a copy of this hunk's context must not be pulled away from where it
         // was written by the copy being nearer to the cursor. Only a declared position that no
         // longer fits — the file grew above, a later step moved the block — falls through to the
-        // nearest-content search.
-        let found = if matches_at(&lines, &old, expected) {
+        // nearest-content search. An *empty* old side (a pure insertion, `@@ -N,0 …`) matches
+        // everywhere, so it cannot be trusted to say the file is unchanged there — and the position
+        // it names was written against a file that earlier hunks in this same patch may already
+        // have grown or shrunk. Those keep the cursor-aware search the fallback always used.
+        let found = if !old.is_empty() && matches_at(&lines, &old, expected) {
             Some((expected, false))
         } else {
             match find(&lines, &old, cursor.max(expected)) {

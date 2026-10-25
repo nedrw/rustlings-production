@@ -254,9 +254,13 @@ impl State {
     ///   `record_*` methods mark them) are taken from memory, over whatever the file holds now. A
     ///   long-lived `kiln watch` and a command beside it can therefore each record their steps
     ///   without the second save erasing the first; entries this session never touched are written
-    ///   back as the file has them, not as this session's stale copy of them.
+    ///   back as the file has them, not as this session's stale copy of them. The merge is per
+    ///   entry, not per field: two sessions that both touched the *same* step are last-writer-wins
+    ///   on that entry, which is the price of not locking the file for a whole session.
     ///
     /// The merge and the rename happen under `.kiln/state.lock`, so two saves cannot interleave.
+    /// A crash mid-write can still strand the temporary file (nothing runs on the way down), so
+    /// each save, already holding the lock, sweeps any temporary files earlier crashes left.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
         if let Some(parent) = path.parent() {
@@ -271,6 +275,20 @@ impl State {
                 message: contention(&lock),
             });
         };
+        // The claim means no other save is in flight, so any temporary file still sitting here was
+        // stranded by a crash; nothing reads them, but a directory that fills with near-copies of
+        // the progress file is a directory a person has to puzzle out.
+        if let Ok(entries) = std::fs::read_dir(root.join(STATE_DIR)) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name
+                    .to_string_lossy()
+                    .starts_with(&format!("{STATE_FILE}.tmp-"))
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let mut merged = Self::load(root)?;
         for (id, entry) in &self.steps {
             if self.touched.steps.contains(id) {

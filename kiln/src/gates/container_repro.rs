@@ -248,9 +248,15 @@ const TARGET_MOUNT: &str = "/opt/kiln/target";
 /// its lockfile names versions this registry already holds. A curated copy, however fresh when it
 /// was made, silently loses that property the day the registry moves and a fresh resolve names a
 /// version nobody cached — found by `lakelet/4.22`, whose freshly resolved lockfile named a newly
-/// released tokio the curated cache had never seen. `$CARGO_HOME` wins when it has a registry; a
-/// machine without one falls back to the curated copy under the cache directory, and a machine
+/// released tokio the curated cache had never seen. `$CARGO_HOME` wins when it has a registry;
+/// a machine without one falls back to the curated copy under the cache directory, and a machine
 /// with neither still builds — it just pays the network.
+///
+/// Both mounts are **read-only**: a `--locked` build only reads a registry, and the host's copy is
+/// the user's own — a build writing into it (or interleaving with a concurrent host `cargo`, whose
+/// file lock does not reliably cross the container boundary) is corruption waiting to happen, so
+/// the mount refuses to allow it. A build that genuinely needs a crate the registry lacks then
+/// fails loudly instead of fetching, which is exactly the failure the gate wants to name.
 fn caches() -> Vec<(PathBuf, &'static str)> {
     let mut caches = Vec::new();
     if let Some(target) = scratch::container_cache("container-target") {
@@ -258,7 +264,7 @@ fn caches() -> Vec<(PathBuf, &'static str)> {
     }
     let registry = cargo_home_registry().or_else(|| scratch::container_cache("container-registry"));
     if let Some(registry) = registry {
-        caches.push((registry, "/usr/local/cargo/registry"));
+        caches.push((registry, "/usr/local/cargo/registry:ro"));
     }
     caches
 }
@@ -268,6 +274,11 @@ fn cargo_home_registry() -> Option<PathBuf> {
     let home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))?;
+    // An empty variable names nothing (a relative `registry` would silently depend on the working
+    // directory), and neither does a home that holds no registry.
+    if home.as_os_str().is_empty() {
+        return None;
+    }
     let registry = home.join("registry");
     registry.is_dir().then_some(registry)
 }

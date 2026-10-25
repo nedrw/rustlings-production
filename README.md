@@ -95,7 +95,7 @@ step's own `links` gate).
   tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
   patch-engine fixes, not with a change to what is judged.)
 - On the current tree (M3, closed): `kiln lint-caps` — `97 capabilities · 136 slots · 119
-  ledger positions · 97 authored steps`, no issues; `kiln links` — 115 pages, 544 links, 330
+  ledger positions · 97 authored steps`, no issues; `kiln links` — 116 pages, 555 links, 330
   external targets, 0 findings; `kiln probe --check` — 65/65 (47 s, measured for
   [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests;
   the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
