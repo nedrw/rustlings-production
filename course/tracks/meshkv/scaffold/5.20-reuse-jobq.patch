@@ -1,0 +1,109 @@
+--- /dev/null
++++ b/src/reuse.rs
+@@ -0,0 +1,30 @@
++//! The graduation: the engine of T3, reused with zero lines changed.
++//!
++//! `meshkv/5.20-reuse-jobq` is the step the whole course's `path`-dependency rule exists for (plan
++//! §3 D6): this project depends on the learner's own `jobq` crate — not a copy — and the acceptance
++//! is that `jobq` needed no change at all.
++//!
++//! The adapter is deliberately small: the engine's `JobId`, the identity `jobq/3.1` made a type so a
++//! queue can talk about a job without a string, becomes a key in this store, so a job's state can be
++//! replicated by the consensus log the previous steps built.
++
++#![allow(dead_code)] // the stub keeps the surface the implementation will fill; the reference
++// solution drops the allowance.
++
++pub use jobq::engine::JobId;
++
++use crate::kv::Command;
++
++/// The key a job's state lives under in this store.
++#[must_use]
++pub fn job_key(id: &JobId) -> String {
++    let _ = id;
++    todo!("meshkv/5.20-reuse-jobq: job_key")
++}
++
++/// The command that records a job's state under its key.
++#[must_use]
++pub fn record_job(id: &JobId, state: &[u8]) -> Vec<u8> {
++    let _ = (id, state);
++    todo!("meshkv/5.20-reuse-jobq: record_job")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,6 +30,7 @@
+ pub mod metrics;
+ pub mod raft;
+ pub mod restart;
++pub mod reuse;
+ pub mod ring;
+ pub mod sdk;
+ pub mod security;
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,6 +15,10 @@
+ 
+ [dependencies]
+ # kiln:scaffold:begin
++# `meshkv/5.20-reuse-jobq`: the learner's own T3 engine, as a library. This is the one
++# cross-track dependency the course allows (plan §3 D6) — the graduation of `jobq/3.1`'s
++# boundary, and the acceptance is that `jobq` is not modified to make it work.
++jobq = { path = "../jobq" }
+ thiserror = "2.0.21"
+ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+ # kiln:scaffold:end
+--- /dev/null
++++ b/docs/reuse.md
+@@ -0,0 +1,50 @@
++# Reuse: the engine, and the diff that is empty
++
++Every track before this one was forbidden to depend on another track's crate. The rule (plan §3 D6)
++has a reason: each track is a deliverable somebody can skip, and a `path` dependency on a sibling
++project turns "skip a track" into "the next one does not build".
++
++T5 is the one exception, and it is the reason the rule exists at all:
++
++> if the engine `jobq` built is really a library, then a *different* project can depend on it without
++> touching it.
++
++## The dependency
++
++```toml
++jobq = { path = "../jobq" }
++```
++
++A `path` dependency on the learner's own T3 project — the tree they wrote, not a copy of it. The
++course lays `jobq`'s reference tree as a prerequisite (`kiln` refuses to judge a meshkv step while
++`app/jobq` is missing), so the dependency is on a project that is *there*.
++
++## The acceptance is the diff
++
++"It compiles" is not the graduation. The graduate claim is that `jobq` needed **no change**: no `pub`
++widened, no `derive` added, no `cfg` flipped. A library that needed any of those was not one, and the
++step would have found out — which is the value of making the dependency the deliverable rather than a
++convenience.
++
++The step's page cannot check a diff by itself; the check is the one an operator runs:
++
++```sh
++git -C app/jobq diff --stat      # empty: nothing in T3 changed to make T5 work
++```
++
++The course's own version of the same check is that `meshkv`'s patches never touch `app/jobq/**`:
++every scaffold and solution in this track is written against `app/meshkv`, and `kiln` refuses a
++course whose patches name another track's project.
++
++## What meshkv does with it
++
++Deliberately little. The engine's `JobId` — the identity `jobq/3.1` made a type so a queue can talk
++about a job without a string — becomes a key in this store:
++
++```text
++job:<id>  →  the job's state, in whatever the engine's own serialisation is
++```
++
++That is the distributed scheduler the track's title promised: a job's state can be replicated by the
++consensus log the previous steps built, and the engine that owns the job's *behaviour* did not have to
++know. The adapter is one function; the boundary `jobq/3.1` drew is what makes it that small.

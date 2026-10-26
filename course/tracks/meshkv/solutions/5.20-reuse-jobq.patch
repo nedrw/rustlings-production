@@ -1,0 +1,64 @@
+--- a/src/reuse.rs
++++ b/src/reuse.rs
+@@ -1,30 +1,47 @@
+-//! The graduation: the engine of T3, reused with zero lines changed.
++//! The graduation: `jobq`'s engine, reused with zero lines changed.
+ //!
+-//! `meshkv/5.20-reuse-jobq` is the step the whole course's `path`-dependency rule exists for (plan
+-//! §3 D6): this project depends on the learner's own `jobq` crate — not a copy — and the acceptance
+-//! is that `jobq` needed no change at all.
++//! `meshkv/5.20-reuse-jobq` is the step the whole course's `path`-dependency rule exists for
++//! (plan §3 D6). Every other track was forbidden to depend on another track's crate, for a good
++//! reason — so that skipping a track is safe — and T5 is the one exception, because the question it
++//! answers cannot be answered any other way:
+ //!
+-//! The adapter is deliberately small: the engine's `JobId`, the identity `jobq/3.1` made a type so a
+-//! queue can talk about a job without a string, becomes a key in this store, so a job's state can be
+-//! replicated by the consensus log the previous steps built.
++//! > if the engine `jobq` built is really a library, then a *different* project can depend on it
++//! > without touching it.
++//!
++//! That sentence is the deliverable. The dependency is a `path` dependency on `../jobq` — the
++//! learner's own T3 project, laid by the course's prerequisites — and the acceptance is not "it
++//! compiles": it is **`jobq` is not modified**. A dependency that needed a `pub` added, a
++//! `#[derive]` widened or a `cfg` flipped would be a library that was not one, and this step would
++//! have found out.
++//!
++//! What meshkv does with it is deliberately small. The engine's `JobId` — the identity of a job, the
++//! thing `jobq/3.1` made a type so that a queue can talk about it — becomes a key in this store:
++//! the job's state can be replicated by the consensus log the previous nineteen steps built, which is
++//! exactly the "distributed scheduler" in the track's title. The adapter is a function and a type
++//! alias; nothing in `jobq` knows that meshkv exists.
+ 
+-#![allow(dead_code)] // the stub keeps the surface the implementation will fill; the reference
+-// solution drops the allowance.
+-
+ pub use jobq::engine::JobId;
+ 
+ use crate::kv::Command;
+ 
+ /// The key a job's state lives under in this store.
++///
++/// The prefix is this project's, not `jobq`'s: the store is a general key-value map, and namespacing
++/// another library's identifiers is the adapter's job, not the library's.
+ #[must_use]
+ pub fn job_key(id: &JobId) -> String {
+-    let _ = id;
+-    todo!("meshkv/5.20-reuse-jobq: job_key")
++    format!("job:{id}")
+ }
+ 
+ /// The command that records a job's state under its key.
++///
++/// This is the whole adapter: a `JobId` (from `jobq`) becomes a key (in `meshkv`), and the value is
++/// whatever the caller wants to store — the engine's own serialised job, in a real deployment.
+ #[must_use]
+ pub fn record_job(id: &JobId, state: &[u8]) -> Vec<u8> {
+-    let _ = (id, state);
+-    todo!("meshkv/5.20-reuse-jobq: record_job")
++    Command::Set {
++        key: job_key(id),
++        value: state.to_vec(),
++    }
++    .encode()
+ }
