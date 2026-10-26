@@ -20,9 +20,12 @@
 ## 1. 环境早验（2026-10-26 实测）
 
 - **turmoil 0.7.2 已在本地 registry 缓存**（`~/.cargo/registry/cache/*/turmoil-0.7.2.crate`）——离线路有它；
-  `madsim`、`loom`、`openraft` **未缓存**（首次构建需联网拉一次，之后进缓存）。
-- **miri 组件未安装**（`rustup component list --installed` 无 miri；llvm-tools 在）。5.19 需要它：
-  `rustup component add miri` 是加法、可逆、不影响钉住的 1.98.1 工具链其余部分——B0 做并写进 `doctor`。
+  `loom 0.7` **已预取入缓存**（B0）；`madsim`、`openraft` 未缓存（不用，见 §7 D-1/D-2）。
+- **miri 组件在钉住的工具链上不可用**（B0 实测）：`rustup component add miri` →
+  `component 'miri' for target 'aarch64-apple-darwin' is unavailable for download for channel
+  '1.98.1-aarch64-apple-darwin'`。所以 §7 D-4 走降级：5.19 的判据是 loom（已缓存）+ `unsafe-budget@N`
+  + 一个手工写下的安全论证，miri 只在正文与 FURTHER 里点名；`doctor` 把“miri 不可用”报出来而不是
+  在 5.19 上无理由变红（plan §10）。
 - **容器引擎健康**（M3 段 35/36：overlay 坏了两周后自愈，2026-10-26 起 `podman run` exit 0）；
   另一个项目的容器在跑，**任何时候不重启 podman machine**。
 - **registry 会漂**（段 36 的教训）：manifest 写范围、锁由解析生成，课程不预置锁；

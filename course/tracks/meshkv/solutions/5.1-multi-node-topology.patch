@@ -1,0 +1,431 @@
+--- a/src/cluster.rs
++++ b/src/cluster.rs
+@@ -15,7 +15,7 @@
+ 
+ use std::fmt;
+ 
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// The smallest thing a cluster agrees about: a node's name.
+ ///
+@@ -34,19 +34,34 @@
+     ///
+     /// [`Error::Invalid`] when the text is empty, or holds a byte outside the accepted alphabet.
+     pub fn parse(text: &str) -> Result<Self> {
+-        todo!("meshkv/5.1-multi-node-topology: NodeId::parse")
++        if text.is_empty() {
++            return Err(Error::invalid(
++                "a node name is at least one character — an anonymous node has no identity to vote with",
++            ));
++        }
++        if !text
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
++        {
++            return Err(Error::invalid(format!(
++                "`{text}` is not a node name: names use ASCII letters, digits, `-` and `_`"
++            )));
++        }
++        Ok(Self {
++            name: text.to_owned(),
++        })
+     }
+ 
+     /// The name, as it is compared and logged.
+     #[must_use]
+     pub fn as_str(&self) -> &str {
+-        todo!("meshkv/5.1-multi-node-topology: NodeId::as_str")
++        &self.name
+     }
+ }
+ 
+ impl fmt::Display for NodeId {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.write_str(todo!("meshkv/5.1-multi-node-topology: NodeId::fmt"))
++        f.write_str(&self.name)
+     }
+ }
+ 
+@@ -61,13 +76,13 @@
+     /// The node's name.
+     #[must_use]
+     pub fn id(&self) -> &NodeId {
+-        todo!("meshkv/5.1-multi-node-topology: Peer::id")
++        &self.id
+     }
+ 
+     /// Where the node answers, `host:port`.
+     #[must_use]
+     pub fn addr(&self) -> &str {
+-        todo!("meshkv/5.1-multi-node-topology: Peer::addr")
++        &self.addr
+     }
+ }
+ 
+@@ -89,26 +104,57 @@
+     /// an address is not valid, when an address is not `host:port`, or when two entries share a
+     /// name — each message names the entry it refused.
+     pub fn parse(spec: &str) -> Result<Self> {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::parse")
++        if spec.trim().is_empty() {
++            return Err(Error::invalid(
++                "the cluster specification is empty — a cluster of no nodes has no identity to hand out",
++            ));
++        }
++        let mut peers: Vec<Peer> = Vec::new();
++        for (index, entry) in spec.split(',').enumerate() {
++            let entry = entry.trim();
++            let Some((name, address)) = entry.split_once('=') else {
++                return Err(Error::invalid(format!(
++                    "entry {} (`{entry}`) is not `id=addr`",
++                    index + 1
++                )));
++            };
++            let id = NodeId::parse(name.trim())?;
++            let address = address.trim();
++            if address.is_empty() || !address.contains(':') {
++                return Err(Error::invalid(format!(
++                    "`{id}`'s address `{address}` is not `host:port` — a node at an address nobody can dial is a node nobody can reach"
++                )));
++            }
++            if peers.iter().any(|peer| peer.id == id) {
++                return Err(Error::invalid(format!(
++                    "`{id}` is named twice — two nodes answering to one identity is a cluster that can commit the same index twice"
++                )));
++            }
++            peers.push(Peer {
++                id,
++                addr: address.to_owned(),
++            });
++        }
++        Ok(Self { peers })
+     }
+ 
+     /// The peers, in specification order.
+     #[must_use]
+     pub fn peers(&self) -> &[Peer] {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::peers")
++        &self.peers
+     }
+ 
+     /// How many nodes the cluster has.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::len")
++        self.peers.len()
+     }
+ 
+     /// `true` when the topology is empty. Never true for a parsed one — an empty cluster is the
+     /// specification that cannot name a node, which [`Topology::parse`] refuses.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::is_empty")
++        self.peers.is_empty()
+     }
+ 
+     /// The peer that answers to `id`, or a refusal that names the identity nobody has.
+@@ -117,7 +163,23 @@
+     ///
+     /// [`Error::Invalid`] when no peer holds the name.
+     pub fn lookup(&self, id: &NodeId) -> Result<&Peer> {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::lookup")
++        let Some(peer) = self.peers.iter().find(|peer| &peer.id == id) else {
++            let names = self
++                .peers
++                .iter()
++                .map(|peer| peer.id.as_str())
++                .collect::<Vec<_>>()
++                .join(", ");
++            let names = if names.is_empty() {
++                "no nodes at all".to_owned()
++            } else {
++                names
++            };
++            return Err(Error::invalid(format!(
++                "`{id}` is not in this cluster: the topology names {names}"
++            )));
++        };
++        Ok(peer)
+     }
+ 
+     /// The canonical specification, `id=addr,id=addr`, in the order the peers were named.
+@@ -126,6 +188,13 @@
+     /// print the same string can only disagree about the cluster if somebody lied to one of them.
+     #[must_use]
+     pub fn render(&self) -> String {
+-        todo!("meshkv/5.1-multi-node-topology: Topology::render")
++        self.peers
++            .iter()
++            .map(|peer| {
++                let (id, addr) = (peer.id.as_str(), peer.addr.as_str());
++                format!("{id}={addr}")
++            })
++            .collect::<Vec<_>>()
++            .join(",")
+     }
+ }
+--- a/src/cli/mod.rs
++++ b/src/cli/mod.rs
+@@ -5,7 +5,7 @@
+ //! holds every step to it (`exit-code`) hands each binary an argument no program can mean and
+ //! checks that the answer names it — which is why [`Flags::from_args`] quotes what it refused.
+ 
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// What both binaries tell a user who asks how to run them.
+ pub const USAGE: &str = "\
+@@ -39,6 +39,30 @@
+     ///
+     /// [`Error::Invalid`] for an unknown argument, a flag with no value, or a positional argument.
+     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self> {
+-        todo!("meshkv/5.1-multi-node-topology: Flags::from_args")
++        let mut flags = Self::default();
++        let mut args = args.into_iter();
++        while let Some(argument) = args.next() {
++            match argument.as_str() {
++                "--help" | "-h" => flags.help = true,
++                "--version" | "-V" => flags.version = true,
++                "--cluster" => flags.cluster = Some(value(&mut args, "--cluster")?),
++                "--node" => flags.node = Some(value(&mut args, "--node")?),
++                "--listen" => flags.listen = Some(value(&mut args, "--listen")?),
++                unknown => {
++                    return Err(Error::invalid(format!(
++                        "unknown argument `{unknown}` — {USAGE}"
++                    )));
++                }
++            }
++        }
++        Ok(flags)
+     }
+ }
++
++/// The value of a flag that takes one.
++fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
++    let Some(value) = args.next() else {
++        return Err(Error::invalid(format!("`{flag}` takes a value — {USAGE}")));
++    };
++    Ok(value)
++}
+--- a/src/node.rs
++++ b/src/node.rs
+@@ -16,12 +16,14 @@
+ //! The connection stays open after the handshake: [`Session`] is the two ends of one authenticated
+ //! link, and the steps after this one put their messages through it instead of re-inventing framing.
+ 
++use std::io;
+ use std::net::SocketAddr;
+ 
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::{TcpListener, TcpStream};
+ 
+ use crate::cluster::{NodeId, Topology};
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// The protocol line every node opens with.
+ pub const HELLO_PREFIX: &str = "MESHKV/1 hello ";
+@@ -36,7 +38,7 @@
+ /// The line a node says to introduce itself.
+ #[must_use]
+ pub fn hello_line(id: &NodeId) -> String {
+-    todo!("meshkv/5.1-multi-node-topology: hello_line")
++    format!("{HELLO_PREFIX}{id}")
+ }
+ 
+ /// Read an identity out of a handshake line, or say what was wrong with it.
+@@ -50,7 +52,18 @@
+ /// [`Error::Protocol`] when the line is not this build's handshake, or its name is not a valid
+ /// [`NodeId`].
+ pub fn parse_hello(line: &str) -> Result<NodeId> {
+-    todo!("meshkv/5.1-multi-node-topology: parse_hello")
++    let line = line.trim_end_matches(['\r', '\n']);
++    let Some(rest) = line.strip_prefix(HELLO_PREFIX) else {
++        return Err(Error::protocol(format!(
++            "`{line}` is not a `{HELLO_PREFIX}<id>` greeting"
++        )));
++    };
++    if rest.is_empty() || rest.contains(' ') {
++        return Err(Error::protocol(format!(
++            "`{line}` does not carry exactly one node name"
++        )));
++    }
++    NodeId::parse(rest).map_err(|error| Error::protocol(format!("`{line}`: {error}")))
+ }
+ 
+ /// A node that has bound its listener and can be greeted.
+@@ -72,19 +85,27 @@
+     /// [`Error::Invalid`] when the name is not in the topology, and [`Error::Network`] when the
+     /// address cannot be parsed or bound.
+     pub async fn bind(id: NodeId, topology: Topology, listen: &str) -> Result<Self> {
+-        todo!("meshkv/5.1-multi-node-topology: Node::bind")
++        topology.lookup(&id)?;
++        let listener = TcpListener::bind(listen)
++            .await
++            .map_err(|source| Error::Network { source })?;
++        Ok(Self {
++            id,
++            topology,
++            listener,
++        })
+     }
+ 
+     /// This node's name.
+     #[must_use]
+     pub fn id(&self) -> &NodeId {
+-        todo!("meshkv/5.1-multi-node-topology: Node::id")
++        &self.id
+     }
+ 
+     /// The cluster this node was handed.
+     #[must_use]
+     pub fn topology(&self) -> &Topology {
+-        todo!("meshkv/5.1-multi-node-topology: Node::topology")
++        &self.topology
+     }
+ 
+     /// The address the kernel actually gave this node — the one a peer can reach.
+@@ -93,7 +114,9 @@
+     ///
+     /// [`Error::Network`] when the platform will not report it.
+     pub fn local_addr(&self) -> Result<SocketAddr> {
+-        todo!("meshkv/5.1-multi-node-topology: Node::local_addr")
++        self.listener
++            .local_addr()
++            .map_err(|source| Error::Network { source })
+     }
+ 
+     /// Wait for the next peer and complete the handshake.
+@@ -108,7 +131,12 @@
+     /// [`Error::Network`] when accepting fails; [`Error::Protocol`] when the peer's greeting is not
+     /// this build's, is not UTF-8, or names a node the topology does not have.
+     pub async fn accept(&self) -> Result<Session> {
+-        todo!("meshkv/5.1-multi-node-topology: Node::accept")
++        let (stream, _) = self
++            .listener
++            .accept()
++            .await
++            .map_err(|source| Error::Network { source })?;
++        handshake(stream, &self.id, &self.topology).await
+     }
+ }
+ 
+@@ -123,7 +151,7 @@
+     /// The name the other end proved with its handshake.
+     #[must_use]
+     pub fn peer(&self) -> &NodeId {
+-        todo!("meshkv/5.1-multi-node-topology: Session::peer")
++        &self.peer
+     }
+ 
+     /// Read one line, up to [`MAX_LINE`] bytes.
+@@ -133,7 +161,7 @@
+     /// [`Error::Protocol`] when the peer sent more than a line this build will hold;
+     /// [`Error::Network`] when the socket ends or fails.
+     pub async fn read_line(&mut self) -> Result<String> {
+-        todo!("meshkv/5.1-multi-node-topology: Session::read_line")
++        read_line(&mut self.stream).await
+     }
+ 
+     /// Write one line.
+@@ -142,7 +170,7 @@
+     ///
+     /// [`Error::Network`] when the socket refuses the write.
+     pub async fn write_line(&mut self, line: &str) -> Result<()> {
+-        todo!("meshkv/5.1-multi-node-topology: Session::write_line")
++        write_line(&mut self.stream, line).await
+     }
+ }
+ 
+@@ -163,5 +191,89 @@
+     expected: &NodeId,
+     topology: &Topology,
+ ) -> Result<NodeId> {
+-    todo!("meshkv/5.1-multi-node-topology: greet")
++    topology.lookup(me)?;
++    topology.lookup(expected)?;
++    let mut stream = TcpStream::connect(addr)
++        .await
++        .map_err(|source| Error::Network { source })?;
++    write_line(&mut stream, &hello_line(me)).await?;
++    let line = read_line(&mut stream).await?;
++    let answered = parse_hello(&line)?;
++    if &answered != expected {
++        return Err(Error::protocol(format!(
++            "expected `{expected}` at {addr}, but the peer there answered `{answered}`"
++        )));
++    }
++    Ok(answered)
+ }
++
++/// Complete the handshake on an accepted connection.
++///
++/// The greeting is read, its name is checked against the topology, and only then is our own greeting
++/// written: a peer that is not a member is refused before it has been told anything about us.
++async fn handshake(stream: TcpStream, me: &NodeId, topology: &Topology) -> Result<Session> {
++    let mut session = Session {
++        peer: me.clone(),
++        stream,
++    };
++    let line = read_line(&mut session.stream).await?;
++    let claimed = parse_hello(&line)?;
++    topology
++        .lookup(&claimed)
++        .map_err(|error| Error::protocol(format!("the peer greeted with `{line}`: {error}")))?;
++    if &claimed == me {
++        return Err(Error::protocol(format!(
++            "`{me}` connected to itself — a node is not its own peer"
++        )));
++    }
++    write_line(&mut session.stream, &hello_line(me)).await?;
++    session.peer = claimed;
++    Ok(session)
++}
++
++/// Read one line, bounded by [`MAX_LINE`].
++///
++/// The bound is checked as the bytes arrive rather than after: a peer that never sends a line ending
++/// must not be able to choose how much memory this process holds.
++async fn read_line(stream: &mut TcpStream) -> Result<String> {
++    let mut line = Vec::new();
++    let mut byte = [0u8; 1];
++    loop {
++        let read = stream
++            .read(&mut byte)
++            .await
++            .map_err(|source| Error::Network { source })?;
++        if read == 0 {
++            return Err(Error::Network {
++                source: io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "the peer went away before it finished a line",
++                ),
++            });
++        }
++        for value in byte {
++            if line.len() >= MAX_LINE {
++                return Err(Error::protocol(format!(
++                    "the peer sent more than {MAX_LINE} bytes without a line ending"
++                )));
++            }
++            line.push(value);
++            if value == b'\n' {
++                return String::from_utf8(line)
++                    .map_err(|_| Error::protocol("the line is not UTF-8"));
++            }
++        }
++    }
++}
++
++/// Write one line, adding the ending when the caller did not.
++async fn write_line(stream: &mut TcpStream, line: &str) -> Result<()> {
++    let mut bytes = line.as_bytes().to_vec();
++    if !bytes.ends_with(b"\n") {
++        bytes.push(b'\n');
++    }
++    stream
++        .write_all(&bytes)
++        .await
++        .map_err(|source| Error::Network { source })
++}

@@ -1,0 +1,10 @@
+# The compiler this project builds with, as a file rather than as a habit
+# (`repo/toolchain-pinning@apply — mailer/1.2`, kept for the reason a distributed system has more of
+# than a single-service one: two nodes comparing answers only compares anything if they were built
+# by the same compiler).
+#
+# `1.98.1` is the course's own pin and the version the repository's own CI runs.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

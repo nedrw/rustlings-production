@@ -1,0 +1,44 @@
+# The `meshkv` distributed key-value store, as it comes out of the box: the daemon, the operator
+# CLI, and the fixtures a step's spec drives them through.
+#
+# `meshkv/5.1-multi-node-topology` fills the modules in. Later scaffolds add dependencies, members
+# and lints *inside the marked blocks* — that rule is what keeps your own edits safe
+# (docs/authoring.md §5).
+
+[package]
+name = "meshkv"
+version = "0.1.0"
+edition = "2024"
+# The binary a bare `cargo run --package meshkv` means. This project has two (`meshkvd`, `meshkvc`),
+# so without this line cargo refuses to guess which one was meant.
+default-run = "meshkvd"
+
+[dependencies]
+# kiln:scaffold:begin
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# kiln:scaffold:end
+
+# The test side: a harness a step ships with brings its own crates, because a harness is not a
+# dependency of the store. Later scaffolds add them inside the marked block, the same rule as above,
+# which is why the block is here before there is anything to put in it: a scaffold cannot write
+# outside a region the skeleton declared (docs/authoring.md §5.3).
+[dev-dependencies]
+# kiln:scaffold:begin
+# kiln:scaffold:end
+
+# This crate's own lint policy. `unsafe_code = "deny"` is here from the first step rather than from
+# the step that first needs `unsafe` (that is `meshkv/5.19`, and it argues for its own budget): the
+# compiler holds the line while nothing needs to cross it, and `unsafe-budget@0` is one of this
+# track's persistent gates.
+[lints.rust]
+# kiln:scaffold:begin
+unsafe_code = "deny"
+# kiln:scaffold:end
+
+# This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
+[workspace]
+members = [
+    # kiln:scaffold:begin
+    # kiln:scaffold:end
+]
