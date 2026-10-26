@@ -98,7 +98,7 @@ step's own `links` gate).
 - On the current tree (M4, T5 authored end to end): `kiln lint-caps` — `97 capabilities · 136
   slots · 119 ledger positions · 119 authored steps` (all five tracks' bodies), no issues;
   `kiln links` — 139 pages, 557 links, 330 external targets, 0 findings; `kiln probe --check` —
-  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 338 + 21 + 1 tests;
+  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 340 + 21 + 1 tests;
   the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
   `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
   `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s).
