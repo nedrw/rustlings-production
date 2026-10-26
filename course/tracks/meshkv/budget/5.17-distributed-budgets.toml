@@ -1,0 +1,30 @@
+# The cost budget of `meshkv/5.17-distributed-budgets`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: the `bench-budget` gate reads *this* copy. The
+# command is the project's own harness (`tests/budget_distributed.rs`, which this step's scaffold
+# ships); every metric is a count of messages, acknowledgements or hops — never a time, which is why
+# this budget does not move when the machine is loaded (handoff M2 §1.1).
+#
+# The cluster is five nodes and the workload is one thousand writes. A metric is judged within ±10%
+# of its baseline; a name ending in `_max` is an upper bound instead.
+command = "cargo test -p meshkv --test budget_distributed -- --nocapture"
+
+[metric]
+# The cluster the budget is measured on.
+nodes = 5
+# The workload.
+writes = 1000
+# Messages the cluster carries: (n - 1) per write.
+messages = 4000
+# Acknowledgements the leader waits for: (quorum - 1) per write, where the quorum of five is three.
+acks = 2000
+# The leader sends every write message, so this equals `messages`.
+leader_messages = 4000
+# One follower sends one message per write; this does not grow with the cluster.
+follower_messages = 1000
+# Round trips a write takes before it is decided.
+hops = 1
+# The average messages per node, times a thousand: 4000 * 1000 / 5.
+per_node_milli = 800000
+# The leader's share of the messages, in permille: it sends all of them.
+leader_share_permille = 1000

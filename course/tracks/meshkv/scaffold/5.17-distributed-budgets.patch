@@ -1,0 +1,209 @@
+--- /dev/null
++++ b/src/budget.rs
+@@ -0,0 +1,101 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! What a cluster costs: a model you can read a budget off.
++//!
++//! `meshkv/5.17-distributed-budgets` is the step where "it depends on the cluster size" becomes a
++//! number. Every write in this project costs a round of messages — the leader sends, a majority
++//! acknowledges — and every read at the linearizable level costs a round too (`5.6`). Those are
++//! **counts**, and a count is a budget: the same number on a busy machine as on an idle one, which is
++//! why this step's gate (`bench-budget`) judges counts and never wall-clock time.
++//!
++//! The model has three parts, and each of them is arithmetic a reader can check:
++//!
++//! * **the quorum.** `⌊n/2⌋ + 1` acknowledgements, because that is what decides anything in this
++//!   project (`5.5`, `5.14`, `5.15` all use the same number).
++//! * **the fan-out.** The leader sends one message per peer, so a write costs `n − 1` messages and
++//!   has to hear from `quorum − 1` of them. The two numbers are different and both matter: the first
++//!   is what the network carries, the second is what the leader waits for.
++//! * **the per-node share.** The leader does the same work whatever `n` is; a follower does one
++//!   message per write. So the *average* per-node load falls as the cluster grows — and the leader's
++//!   does not. That is the shape every distributed system has, and stating it as a count is what
++//!   makes it a budget rather than a diagram.
++//!
++//! Latency is counted too, in **hops**: a write waits for one round trip to the quorum, so its
++//! latency is one hop whatever `n` is; a *read* at the linearizable level is a round too. Nothing
++//! here is milliseconds — the moment a budget is a time, it is a budget that fails on a loaded
++//! machine (handoff M2 §1.1).
++
++use crate::error::Result;
++
++/// What one cluster shape costs for one write and one linearizable read.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Cost {
++    /// How many nodes the cluster has.
++    pub nodes: usize,
++    /// How many acknowledgements decide anything.
++    pub quorum: usize,
++    /// How many messages the leader sends for one write.
++    pub messages: usize,
++    /// How many acknowledgements the leader waits for.
++    pub acks: usize,
++    /// How many round trips a write takes before it is decided.
++    pub write_hops: usize,
++    /// How many round trips a linearizable read takes.
++    pub read_hops: usize,
++}
++
++/// The cost of a cluster of `nodes` nodes.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the cluster has no nodes: there is no quorum to compute, and a budget for
++/// a cluster that does not exist is a number nobody can use.
++pub fn cost(nodes: usize) -> Result<Cost> {
++    let _ = nodes;
++    todo!("meshkv/5.17-distributed-budgets: cost")
++}
++
++/// The counts a workload of `writes` writes produces, for a cluster of `nodes` nodes.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the cluster has no nodes.
++pub fn workload(nodes: usize, writes: usize) -> Result<Counts> {
++    let _ = (nodes, writes);
++    todo!("meshkv/5.17-distributed-budgets: workload")
++}
++
++/// The counts of a workload: what the network carries, and what each kind of node does.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Counts {
++    /// How many nodes the cluster has.
++    pub nodes: usize,
++    /// How many writes the workload makes.
++    pub writes: usize,
++    /// Messages the cluster carries in total.
++    pub messages: usize,
++    /// Acknowledgements the leader waits for in total.
++    pub acks: usize,
++    /// Messages the leader sends in total (one per peer per write).
++    pub leader_messages: usize,
++    /// Messages one follower sends in total (one per write).
++    pub follower_messages: usize,
++    /// Round trips a write takes before it is decided.
++    pub hops: usize,
++}
++
++impl Counts {
++    /// The average messages per node: total messages over the members.
++    ///
++    /// This is the number that falls as the cluster grows — and the one that hides the leader's
++    /// constant share, which is why a budget needs both.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the cluster has no nodes.
++    pub fn per_node(&self) -> Result<f64> {
++        todo!("meshkv/5.17-distributed-budgets: Counts::per_node")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod budget;
+ pub mod chaos;
+ pub mod client;
+ pub mod consistency;
+--- /dev/null
++++ b/docs/budgets.md
+@@ -0,0 +1,46 @@
++# Distributed budgets: what a cluster costs, as counts
++
++"Does it scale?" is not a question with a yes. It is a question with a **budget**: how many messages a
++write costs, how many acknowledgements decide it, how much of that work each node does, and how many
++round trips a caller waits for. Every one of those is a count, and a count is the same number on a
++busy machine as on an idle one — which is why this project budgets in counts and not in milliseconds.
++
++## The three numbers
++
++| number | a cluster of `n` nodes |
++| --- | --- |
++| quorum | `⌊n/2⌋ + 1` — what decides anything, in every step of this track |
++| fan-out | `n − 1` — how many messages the leader sends per write |
++| acknowledgements | `quorum − 1` — how many the leader waits for (it counts itself) |
++
++The fan-out and the acknowledgements are different numbers, and both matter: the first is what the
++network carries, the second is what the write waits for. A budget that used one for the other would
++either overstate the network or overstate the latency.
++
++## The shape
++
++For one thousand writes:
++
++| cluster | messages | acks | leader messages | one follower | per-node average |
++| --- | --- | --- | --- | --- | --- |
++| 3 nodes | 2 000 | 1 000 | 2 000 | 1 000 | 667 |
++| 5 nodes | 4 000 | 2 000 | 4 000 | 1 000 | 800 |
++| 7 nodes | 6 000 | 2 000 | 6 000 | 1 000 | 857 |
++
++The **leader's** work per write is fixed at `n − 1` messages; a **follower's** is fixed at one. So as
++the cluster grows the total grows and the average per node grows — because the leader's share grows
++with the cluster and a follower's does not. That is the shape every replicated system has, and it is
++why "add a node" is not free: it buys redundancy and costs the leader a message per write.
++
++## Round trips
++
++A write is decided in one round trip (send, wait for the quorum), whatever `n` is; a linearizable read
++(`5.6`) is one round too. Those are the numbers a latency budget is made of, and they are counts of
++hops rather than milliseconds, so the budget does not move with the machine.
++
++## What the gate reads
++
++`bench-budget` reads the counts `tests/budget_distributed.rs` prints and compares them with
++`budget/5.17-distributed-budgets.toml`. The baseline is the model's own arithmetic at `n = 5`, one
++thousand writes — so a change that adds a message per write (a new hop, an extra message kind) shows
++up as a number that moved, and a change that only renames things does not.
+--- /dev/null
++++ b/tests/budget_distributed.rs
+@@ -0,0 +1,43 @@
++//! The instrument for `meshkv/5.17-distributed-budgets`: the counts of a workload.
++//!
++//! Course content, shipped by the step's scaffold. The `bench-budget` gate reads the
++//! `meshkv-budget <name>=<value>` lines this prints and compares them with the course's baseline
++//! (`budget/5.17-distributed-budgets.toml`). Every number is a count: messages, acknowledgements,
++//! round trips — never a time.
++
++use meshkv::budget::workload;
++
++/// The cluster and the workload the budget is measured on.
++const NODES: usize = 5;
++const WRITES: usize = 1_000;
++
++#[test]
++fn the_workload_costs_what_the_model_says() {
++    let counts = workload(NODES, WRITES).expect("a workload");
++
++    println!("meshkv-budget nodes={NODES}");
++    println!("meshkv-budget writes={WRITES}");
++    println!("meshkv-budget messages={}", counts.messages);
++    println!("meshkv-budget acks={}", counts.acks);
++    println!("meshkv-budget leader_messages={}", counts.leader_messages);
++    println!(
++        "meshkv-budget follower_messages={}",
++        counts.follower_messages
++    );
++    println!("meshkv-budget hops={}", counts.hops);
++    println!(
++        "meshkv-budget per_node_milli={}",
++        (counts.per_node().expect("a share") * 1000.0).round() as u64
++    );
++    println!(
++        "meshkv-budget leader_share_permille={}",
++        (counts.leader_messages as f64 / counts.messages as f64 * 1000.0).round() as u64
++    );
++
++    // A five-node cluster sends four messages per write and waits for two of them: the quorum is
++    // three, the leader is one of the three, and the other two are the acknowledgements.
++    assert_eq!(counts.messages, 4 * WRITES);
++    assert_eq!(counts.acks, 2 * WRITES);
++    assert_eq!(counts.leader_messages, counts.messages);
++    assert_eq!(counts.follower_messages, WRITES);
++}

@@ -1,0 +1,74 @@
+--- a/src/budget.rs
++++ b/src/budget.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! What a cluster costs: a model you can read a budget off.
+ //!
+ //! `meshkv/5.17-distributed-budgets` is the step where "it depends on the cluster size" becomes a
+@@ -27,7 +23,7 @@
+ //! here is milliseconds — the moment a budget is a time, it is a budget that fails on a loaded
+ //! machine (handoff M2 §1.1).
+ 
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// What one cluster shape costs for one write and one linearizable read.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -53,8 +49,20 @@
+ /// [`Error::Invalid`] when the cluster has no nodes: there is no quorum to compute, and a budget for
+ /// a cluster that does not exist is a number nobody can use.
+ pub fn cost(nodes: usize) -> Result<Cost> {
+-    let _ = nodes;
+-    todo!("meshkv/5.17-distributed-budgets: cost")
++    if nodes == 0 {
++        return Err(Error::invalid(
++            "a cluster of no nodes has no quorum to budget for",
++        ));
++    }
++    let quorum = nodes / 2 + 1;
++    Ok(Cost {
++        nodes,
++        quorum,
++        messages: nodes.saturating_sub(1),
++        acks: quorum.saturating_sub(1),
++        write_hops: 1,
++        read_hops: 1,
++    })
+ }
+ 
+ /// The counts a workload of `writes` writes produces, for a cluster of `nodes` nodes.
+@@ -63,8 +71,16 @@
+ ///
+ /// [`Error::Invalid`] when the cluster has no nodes.
+ pub fn workload(nodes: usize, writes: usize) -> Result<Counts> {
+-    let _ = (nodes, writes);
+-    todo!("meshkv/5.17-distributed-budgets: workload")
++    let cost = cost(nodes)?;
++    Ok(Counts {
++        nodes,
++        writes,
++        messages: cost.messages * writes,
++        acks: cost.acks * writes,
++        leader_messages: cost.messages * writes,
++        follower_messages: writes,
++        hops: cost.write_hops,
++    })
+ }
+ 
+ /// The counts of a workload: what the network carries, and what each kind of node does.
+@@ -96,6 +112,11 @@
+     ///
+     /// [`Error::Invalid`] when the cluster has no nodes.
+     pub fn per_node(&self) -> Result<f64> {
+-        todo!("meshkv/5.17-distributed-budgets: Counts::per_node")
++        if self.nodes == 0 {
++            return Err(Error::invalid(
++                "a cluster of no nodes has no per-node share",
++            ));
++        }
++        Ok(self.messages as f64 / self.nodes as f64)
+     }
+ }
