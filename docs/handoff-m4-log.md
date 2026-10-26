@@ -1,6 +1,6 @@
 # M4 施工日志（T5 `meshkv`）
 
-> 计划与决策在 [m4-plan.md](m4-plan.md)；交接简介在交付时写成 [t5-meshkv.md](t5-meshkv.md)。
+> 计划与决策在 [m4-plan.md](m4-plan.md)；交接简介（`t5-meshkv.md`）在收尾时写成。
 > 按批次追加；每条都留原始行。
 
 ## 段 1：B0 基建 + 5.1 第一个真步骤
