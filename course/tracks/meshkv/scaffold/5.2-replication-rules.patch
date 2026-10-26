@@ -1,0 +1,234 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod raft;
+ // kiln:scaffold:end
+ 
+ /// The crate's error type, at the root so a caller writes `meshkv::Error`.
+--- /dev/null
++++ b/src/raft/mod.rs
+@@ -0,0 +1,195 @@
++//! The rules of the log, as values: terms, entries, a majority, and when an entry may be called
++//! committed.
++//!
++//! `meshkv/5.2-replication-rules` is an *aware* step: its subject is the handful of rules every
++//! consensus protocol is built out of, and its deliverable is that they exist here as values with
++//! refusals — not as a paragraph the next reader is hoped to remember. The network that carries
++//! these values between nodes is `5.3`'s.
++
++use crate::error::Result;
++
++/// A position in the log: one-based, monotonic, never reused.
++pub type Index = u64;
++
++/// How many elections the cluster has been through.
++///
++/// A term moves in one direction only — up — and every message from `5.3` on carries the sender's
++/// term. A node that sees a higher term is behind, not ahead, and that is the whole reason terms
++/// exist: they order events that happened at nodes which cannot see each other.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
++pub struct Term(u64);
++
++impl Term {
++    /// The term a brand-new node starts in.
++    #[must_use]
++    pub fn zero() -> Self {
++        todo!("meshkv/5.2-replication-rules: Term::zero")
++    }
++
++    /// A term as it is written in a log or on the wire.
++    #[must_use]
++    pub fn new(number: u64) -> Self {
++        todo!("meshkv/5.2-replication-rules: Term::new")
++    }
++
++    /// The number, for logging and for a message.
++    #[must_use]
++    pub fn get(self) -> u64 {
++        todo!("meshkv/5.2-replication-rules: Term::get")
++    }
++
++    /// The next term: what a node moves to when it stands for election.
++    #[must_use]
++    pub fn next(self) -> Self {
++        todo!("meshkv/5.2-replication-rules: Term::next")
++    }
++}
++
++/// One write, as the log keeps it: the term that proposed it, and where it sits.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Entry {
++    /// The term of the leader that proposed it.
++    pub term: Term,
++    /// Its position, one-based.
++    pub index: Index,
++}
++
++impl Entry {
++    /// An entry proposed in `term` at `index`.
++    #[must_use]
++    pub fn new(term: Term, index: Index) -> Self {
++        todo!("meshkv/5.2-replication-rules: Entry::new")
++    }
++}
++
++/// How many nodes have to hold an entry before it counts as decided.
++///
++/// The size is the cluster's, not the acknowledgements': a quorum is a property of the cluster, so
++/// it is computed once and compared against however many acknowledgements arrived.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Quorum {
++    size: usize,
++}
++
++impl Quorum {
++    /// The quorum of a cluster of `size` nodes.
++    #[must_use]
++    pub fn of(size: usize) -> Self {
++        todo!("meshkv/5.2-replication-rules: Quorum::of")
++    }
++
++    /// How many nodes a majority is: `size / 2 + 1`.
++    ///
++    /// A cluster of no nodes has a majority of one, which nothing can ever reach — an empty cluster
++    /// commits nothing, which is the honest answer rather than a panic.
++    #[must_use]
++    pub fn majority(&self) -> usize {
++        todo!("meshkv/5.2-replication-rules: Quorum::majority")
++    }
++
++    /// `true` when `acknowledgements` nodes hold the entry.
++    #[must_use]
++    pub fn is_met(&self, acknowledgements: usize) -> bool {
++        todo!("meshkv/5.2-replication-rules: Quorum::is_met")
++    }
++}
++
++/// The append-only log every node keeps, as a value.
++///
++/// Two rules are enforced here rather than documented for later: an entry goes at the next index
++/// (no gaps — a gap is an entry this node never received and cannot pretend about), and terms never
++/// go backwards (the log on the disk is the memory of what this node has already seen).
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Log {
++    entries: Vec<Entry>,
++}
++
++impl Log {
++    /// An empty log.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("meshkv/5.2-replication-rules: Log::new")
++    }
++
++    /// How many entries it holds.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("meshkv/5.2-replication-rules: Log::len")
++    }
++
++    /// `true` when nothing has been appended.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("meshkv/5.2-replication-rules: Log::is_empty")
++    }
++
++    /// The last entry, if there is one.
++    #[must_use]
++    pub fn last(&self) -> Option<&Entry> {
++        todo!("meshkv/5.2-replication-rules: Log::last")
++    }
++
++    /// The entry at `index`, one-based.
++    #[must_use]
++    pub fn at(&self, index: Index) -> Option<&Entry> {
++        todo!("meshkv/5.2-replication-rules: Log::at")
++    }
++
++    /// Append an entry that belongs next, or refuse it and say why.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the entry's index is not `len() + 1` (a gap or a duplicate), or its
++    /// term is older than the log's last term.
++    pub fn append(&mut self, entry: Entry) -> Result<()> {
++        todo!("meshkv/5.2-replication-rules: Log::append")
++    }
++
++    /// Drop everything from `index` onwards, and answer how many entries went.
++    ///
++    /// This is what a follower does when a leader's log disagrees with its own: the suffix from the
++    /// first mismatch is replaced, never merged.
++    pub fn truncate_from(&mut self, index: Index) -> usize {
++        todo!("meshkv/5.2-replication-rules: Log::truncate_from")
++    }
++}
++
++/// Raft's commit rule, as one predicate at the end of this step.
++///
++/// Committed means: **an entry of the leader's current term** that a **majority** holds. Both
++/// clauses are load-bearing:
++///
++/// * the majority clause is what makes a decision survive the loss of any minority;
++/// * the term clause is what stops a leader from counting a replication of an entry it *inherited* —
++///   an old entry can be present on a majority and still be overwritten, because a majority is only
++///   a promise about entries from the term that asked for it.
++#[must_use]
++pub fn committable(
++    entry: &Entry,
++    current_term: Term,
++    acknowledgements: usize,
++    quorum: Quorum,
++) -> bool {
++    todo!("meshkv/5.2-replication-rules: committable")
++}
++
++/// The four rules the project's page has to name, in order.
++///
++/// The spec compares these strings against `docs/consensus.md`: a page that drifts from the rules
++/// the code relies on is the exact failure this step is about, in documentation form.
++pub const RULES: [&str; 4] = ["TODO", "TODO", "TODO", "TODO"];
++
++/// One failure the protocol has to be designed against, and what it must do instead.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Failure {
++    /// The failure, in the words the page's table uses.
++    pub scenario: &'static str,
++    /// What the system must do when it happens.
++    pub expected: &'static str,
++}
++
++/// The catalogue the page's table has to match, row for row.
++pub const FAILURES: [Failure; 5] = [Failure {
++    scenario: "TODO",
++    expected: "TODO",
++}; 5];
+--- /dev/null
++++ b/docs/consensus.md
+@@ -0,0 +1,23 @@
++# The rules of the log
++
++This page is the project's copy of the four rules the log is built on
++(`meshkv/5.2-replication-rules`). Fill it in where the markers are: the spec compares it against
++`src/raft/mod.rs`, and a page that drifts from the code is the exact failure this step is about.
++
++## The four rules
++
++<!-- TASK: number the four rules, in the order `raft::RULES` holds them. Each sentence is one line,
++     and it has to be the same sentence the code constant carries. -->
++
++## What this build does not have yet
++
++Terms, positions and majorities are values in `src/raft/mod.rs`; there is no election, no
++replication and no commit path yet. `5.3` adds them.
++
++## Failure catalogue
++
++<!-- TASK: one row per `raft::FAILURES` entry, with the same words in both cells. -->
++
++| scenario | what the system does |
++| --- | --- |
++| | |

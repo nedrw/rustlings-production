@@ -76,3 +76,37 @@ no issues.
    规格里用“坏连接 → accept 红 → 好连接照常”把这条钉住。
 4. **骨架的 import 只写桩用得着的东西**（否则 `kiln run` 时满屏 unused warning）；参考解把 `Error` 等补进 import，
    这是 patch 的第一批 hunk。
+
+## 段 2：B1 第一步——5.2 `dist/consensus@aware`（规则是值，页面是同一批规则的英文）
+
+**5.2 做了什么**：`src/raft/mod.rs`（`Term`/`Entry`/`Quorum`/`Log`/`committable` 五个契约，加上 `RULES`
+与 `FAILURES` 两组常量）、`scaffold/5.2-replication-rules.patch`（新建模块 + `lib.rs` 标记块里插入
+`pub mod raft;` + 新建 `docs/consensus.md` 的骨架）、`solutions/5.2-replication-rules.patch`（填函数体、
+写页面内容）、`spec/5.2/replication_rules.rs`（11 用例）、正文（teach，WHY/TASK/DONE WHEN/TRAP/FURTHER）。
+
+判据是 4.3 那种“代码里的值 ↔ 页面上的表”双向核对：`RULES` 的四句话必须原样出现在页面里，
+`FAILURES` 的五行必须与页面的 failure 表逐格相同。页面把规则写成**小写字面量**而不是大写加粗，
+理由就写在这一步的 TRAP 里：spec 比的是逐字相等，强调标记会让“同一句话”变成两句话。
+
+**原始结论行**：
+
+```
+$ kiln spec manifest --track meshkv
+2 spec file(s) pinned — commit the manifest with the specs it pins.
+
+$ kiln selftest --track meshkv 5.2-replication-rules
+✓ meshkv/5.1-multi-node-topology (setup)
+✓ meshkv/5.2-replication-rules (assert)
+    scaffold ✓ the spec fails as it must (exit code 101: test a_term_moves_only_forward ... FAILED)
+    solution ✓ reference patch applies
+    solution ✓ the spec passes
+    gates ✓ 9/9 must green
+
+1/1 step(s) hold the contract
+```
+
+**踩到并修掉的一处**（第一版脚手架）：`committable` 的签名跨行，桩生成脚本按“签名首行 + `{ todo!() }`”
+替换，产出的是 `pub fn committable( {`——**脚手架编译不过**。selftest 当时给了 `scaffold ✓`，
+但附了一句 `authoring.md §5.4` 的提醒（“it does not compile on the scaffold”）；这正是 §5.4 的判据
+（脚手架要能编译、规格在运行时失败）在起作用。修法：桩按**完整签名块 + 函数体**替换，重新生成两个 patch。
+教训（第 5 条）：**脚手架“失败”必须是运行时的失败**，selftest 的 `✓` 旁边那句 note 要读。
