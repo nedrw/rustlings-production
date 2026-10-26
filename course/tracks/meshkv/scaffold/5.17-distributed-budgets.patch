@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/budget.rs
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +#![allow(dead_code)]
 +// the stub keeps the values the implementation will read; the reference
 +// solution drops the allowance, because by then every one is used.
@@ -20,10 +20,11 @@
 +//! * **the fan-out.** The leader sends one message per peer, so a write costs `n − 1` messages and
 +//!   has to hear from `quorum − 1` of them. The two numbers are different and both matter: the first
 +//!   is what the network carries, the second is what the leader waits for.
-+//! * **the per-node share.** The leader does the same work whatever `n` is; a follower does one
-+//!   message per write. So the *average* per-node load falls as the cluster grows — and the leader's
-+//!   does not. That is the shape every distributed system has, and stating it as a count is what
-+//!   makes it a budget rather than a diagram.
++//! * **the per-node share.** The leader sends one message per peer, so its work per write grows with
++//!   the cluster; a follower sends one message per write whatever `n` is. The average is therefore
++//!   `(n − 1) / n` messages per node per write: it *rises* towards one as the cluster grows, and it
++//!   hides the leader's `n − 1`, which is the number that actually scales. Stating both is what
++//!   makes this a budget rather than a diagram.
 +//!
 +//! Latency is counted too, in **hops**: a write waits for one round trip to the quorum, so its
 +//! latency is one hop whatever `n` is; a *read* at the linearizable level is a round too. Nothing
@@ -92,8 +93,8 @@
 +impl Counts {
 +    /// The average messages per node: total messages over the members.
 +    ///
-+    /// This is the number that falls as the cluster grows — and the one that hides the leader's
-+    /// constant share, which is why a budget needs both.
++    /// This is the number that rises as the cluster grows — and the one that hides the leader's
++    /// share, which is `n − 1` messages per write whatever the average says. A budget needs both.
 +    ///
 +    /// # Errors
 +    ///
@@ -142,11 +143,11 @@
 +| --- | --- | --- | --- | --- | --- |
 +| 3 nodes | 2 000 | 1 000 | 2 000 | 1 000 | 667 |
 +| 5 nodes | 4 000 | 2 000 | 4 000 | 1 000 | 800 |
-+| 7 nodes | 6 000 | 2 000 | 6 000 | 1 000 | 857 |
++| 7 nodes | 6 000 | 3 000 | 6 000 | 1 000 | 857 |
 +
-+The **leader's** work per write is fixed at `n − 1` messages; a **follower's** is fixed at one. So as
-+the cluster grows the total grows and the average per node grows — because the leader's share grows
-+with the cluster and a follower's does not. That is the shape every replicated system has, and it is
++The **leader's** work per write is `n − 1` messages — one per peer; a **follower's** is one, whatever
++`n` is. So as the cluster grows the total grows, and the average per node grows with it — because the
++leader's share grows with the cluster and a follower's does not. That is the shape every replicated system has, and it is
 +why "add a node" is not free: it buys redundancy and costs the leader a message per write.
 +
 +## Round trips

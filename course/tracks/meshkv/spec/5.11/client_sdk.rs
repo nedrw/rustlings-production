@@ -135,6 +135,15 @@ fn errors_say_what_a_caller_can_do_about_them() {
         unavailable.is_retryable(),
         "a node that is down may come back"
     );
+    let exhausted = SdkError::RetriesExhausted {
+        attempts: 3,
+        last: "down".to_owned(),
+    };
+    assert!(
+        !exhausted.is_retryable(),
+        "the SDK has already made this decision: telling the caller to retry is the answer it \
+         just gave up on"
+    );
 }
 
 #[test]

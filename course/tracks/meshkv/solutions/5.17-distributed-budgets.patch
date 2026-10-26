@@ -8,7 +8,7 @@
  //! What a cluster costs: a model you can read a budget off.
  //!
  //! `meshkv/5.17-distributed-budgets` is the step where "it depends on the cluster size" becomes a
-@@ -27,7 +23,7 @@
+@@ -28,7 +24,7 @@
  //! here is milliseconds — the moment a budget is a time, it is a budget that fails on a loaded
  //! machine (handoff M2 §1.1).
  
@@ -17,7 +17,7 @@
  
  /// What one cluster shape costs for one write and one linearizable read.
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -53,8 +49,20 @@
+@@ -54,8 +50,20 @@
  /// [`Error::Invalid`] when the cluster has no nodes: there is no quorum to compute, and a budget for
  /// a cluster that does not exist is a number nobody can use.
  pub fn cost(nodes: usize) -> Result<Cost> {
@@ -40,7 +40,7 @@
  }
  
  /// The counts a workload of `writes` writes produces, for a cluster of `nodes` nodes.
-@@ -63,8 +71,16 @@
+@@ -64,8 +72,16 @@
  ///
  /// [`Error::Invalid`] when the cluster has no nodes.
  pub fn workload(nodes: usize, writes: usize) -> Result<Counts> {
@@ -59,7 +59,7 @@
  }
  
  /// The counts of a workload: what the network carries, and what each kind of node does.
-@@ -96,6 +112,11 @@
+@@ -97,6 +113,11 @@
      ///
      /// [`Error::Invalid`] when the cluster has no nodes.
      pub fn per_node(&self) -> Result<f64> {

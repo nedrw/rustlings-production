@@ -1,6 +1,6 @@
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -299,4 +299,6 @@
+@@ -314,4 +314,6 @@
  // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
  // (docs/authoring.md §5).
  // kiln:scaffold:begin
@@ -452,7 +452,7 @@
 +            }];
 +        }
 +        self.accept(&entries);
-+        let last = self.log.len() as Index;
++        let last = self.log.last_index();
 +        if commit > self.commit_index {
 +            self.commit_index = commit.min(last);
 +        }

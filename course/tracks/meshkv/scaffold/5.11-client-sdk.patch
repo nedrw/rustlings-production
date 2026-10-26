@@ -272,7 +272,7 @@
 +backends = ["scripted", "in-process"]
 --- /dev/null
 +++ b/docs/sdk.md
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,52 @@
 +# The SDK: what a caller sees
 +
 +The cluster's rules — the leader, the read index, the idempotency key, the retry window — are
@@ -291,7 +291,9 @@
 +| `RetriesExhausted { attempts }` | give up, and report the last refusal |
 +
 +An `Error::Io` with a message is a contract that says nothing; `is_retryable()` is the two-line
-+version of the table, and it is the SDK's job to be right about it.
++version of the table — `NotLeader` and `Unavailable`, nothing else. `Refused` and `RetriesExhausted`
++are the SDK's own verdicts, and telling a caller to retry an answer the SDK just gave up on is the
++one thing the method must not do.
 +
 +## The retries are the SDK's
 +

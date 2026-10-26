@@ -1,4 +1,4 @@
-# The schedules `meshkv/5.16-chaos-injection` is judged by.
+# The schedules `meshkv/5.16-chaos-matrix` is judged by.
 #
 # Course content, at the same trust level as `spec/`: the `sim` gate reads *this* copy. The command
 # is the project's own harness (`tests/sim_chaos.rs`, which this step's scaffold ships).

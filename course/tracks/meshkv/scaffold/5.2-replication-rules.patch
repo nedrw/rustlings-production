@@ -10,7 +10,7 @@
  /// The crate's error type, at the root so a caller writes `meshkv::Error`.
 --- /dev/null
 +++ b/src/raft/mod.rs
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,283 @@
 +#![allow(dead_code)]
 +// the stub keeps the state the implementation will read; the reference
 +// solution drops the allowance, because by then every field is read.
@@ -172,6 +172,21 @@
 +    #[must_use]
 +    pub fn last(&self) -> Option<&Entry> {
 +        todo!("meshkv/5.2-replication-rules: Log::last")
++    }
++
++    /// The index of the last entry this log holds, or the base when it holds none.
++    ///
++    /// This is *not* `len()`: after a compaction the log holds fewer entries than the cluster's
++    /// numbering has positions, and every position in the rest of this crate is a cluster index.
++    #[must_use]
++    pub fn last_index(&self) -> Index {
++        todo!("meshkv/5.2-replication-rules: Log::last_index")
++    }
++
++    /// The term of the last entry this log holds, or term zero when it holds none.
++    #[must_use]
++    pub fn last_term(&self) -> Term {
++        todo!("meshkv/5.2-replication-rules: Log::last_term")
 +    }
 +
 +    /// The entry at `index`, one-based.

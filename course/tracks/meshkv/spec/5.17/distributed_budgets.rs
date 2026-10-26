@@ -31,7 +31,7 @@ fn a_write_and_a_linearizable_read_each_take_one_round_trip() {
 }
 
 #[test]
-fn a_larger_cluster_costs_more_messages_and_less_per_node() {
+fn a_larger_cluster_costs_more_messages_and_more_per_node() {
     let small = workload(3, 1000).expect("a workload");
     let large = workload(5, 1000).expect("a workload");
     assert!(
@@ -44,8 +44,8 @@ fn a_larger_cluster_costs_more_messages_and_less_per_node() {
     let large_share = large.per_node().expect("a share");
     assert!(
         large_share > small_share,
-        "and the average per-node share *rises*, because the leader's messages are fixed per write \
-         while the nodes multiply: {large_share} vs {small_share}"
+        "and the average per-node share *rises*, because the leader sends one message per peer \
+         while the divisor only grows by one: {large_share} vs {small_share}"
     );
 }
 

@@ -88,6 +88,29 @@ fn the_log_reads_back_by_position() {
 }
 
 #[test]
+fn the_log_reports_its_own_end() {
+    let empty = Log::new();
+    assert_eq!(
+        empty.last_index(),
+        0,
+        "an empty log ends before its first entry"
+    );
+    assert_eq!(
+        empty.last_term(),
+        Term::zero(),
+        "and claims no term for an entry it does not hold"
+    );
+
+    let log = filled(3);
+    assert_eq!(
+        log.last_index(),
+        3,
+        "the position of the last entry — which from `5.4` on is not the number it holds"
+    );
+    assert_eq!(log.last_term(), Term::new(1));
+}
+
+#[test]
 fn a_conflicting_suffix_is_dropped_from_the_first_mismatch() {
     let mut log = filled(5);
     assert_eq!(log.truncate_from(3), 3, "3, 4 and 5 go");

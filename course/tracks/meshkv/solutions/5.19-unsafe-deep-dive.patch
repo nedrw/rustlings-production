@@ -92,12 +92,16 @@
      }
  
      /// How many slots the queue has.
-@@ -56,28 +85,70 @@
+@@ -56,28 +85,74 @@
      /// How many values it holds. A hint: the number is read from two atomics, so it is a snapshot.
      #[must_use]
      pub fn len(&self) -> usize {
 -        todo!("meshkv/5.19-unsafe-deep-dive: Ring::len")
-+        self.tail.load(Ordering::Relaxed) - self.head.load(Ordering::Relaxed)
++        // The two loads are a snapshot, not a moment: a concurrent pop can move `head` past the tail
++        // this call read, and the difference must not underflow.
++        self.tail
++            .load(Ordering::Relaxed)
++            .saturating_sub(self.head.load(Ordering::Relaxed))
      }
  
      /// `true` when it holds nothing, according to the same snapshot.

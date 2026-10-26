@@ -518,7 +518,7 @@
 +                self.role.as_str()
 +            )));
 +        }
-+        let index = self.log.len() as Index + 1;
++        let index = self.log.last_index() + 1;
 +        let entry = Entry::with_payload(self.term, index, payload);
 +        self.log.append(entry)?;
 +        self.match_index.insert(self.id.clone(), index);
@@ -543,7 +543,7 @@
 +                } else {
 +                    self.position_of(next - 1)
 +                };
-+                let entries = (next..=self.log.len() as Index)
++                let entries = (next..=self.log.last_index())
 +                    .filter_map(|index| self.log.at(index))
 +                    .cloned()
 +                    .collect();
@@ -640,14 +640,14 @@
 -        todo!("meshkv/5.3-teaching-raft: Raft::become_leader")
 +        self.role = Role::Leader;
 +        self.leader_hint = Some(self.id.clone());
-+        let next = self.log.len() as Index + 1;
++        let next = self.log.last_index() + 1;
 +        for peer in self.peers() {
 +            self.next_index.insert(peer.clone(), next);
 +            self.match_index.insert(peer, 0);
 +        }
 +        self.match_index
-+            .insert(self.id.clone(), self.log.len() as Index);
-+        let index = self.log.len() as Index + 1;
++            .insert(self.id.clone(), self.log.last_index());
++        let index = self.log.last_index() + 1;
 +        if self
 +            .log
 +            .append(Entry::with_payload(self.term, index, Vec::new()))
@@ -696,7 +696,7 @@
      fn advance_commit(&mut self) {
 -        todo!("meshkv/5.3-teaching-raft: Raft::advance_commit")
 +        let majority = self.quorum().majority();
-+        let mut index = self.log.len() as Index;
++        let mut index = self.log.last_index();
 +        while index > self.commit_index {
 +            let Some(entry) = self.log.at(index) else {
 +                return;

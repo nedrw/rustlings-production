@@ -55,7 +55,7 @@
 +                "a membership change is already in flight: finish it before starting another",
 +            ));
 +        }
-+        let index = self.log.len() as Index + 1;
++        let index = self.log.last_index() + 1;
 +        let payload = crate::raft::membership::encode(&target);
 +        self.log
 +            .append(Entry::with_payload(self.term, index, payload))?;
@@ -156,7 +156,7 @@
      /// The snapshot this node holds, if it holds one.
      #[must_use]
      pub fn snapshot(&self) -> Option<&crate::raft::snapshot::Snapshot> {
-@@ -539,7 +608,8 @@
+@@ -555,7 +624,8 @@
              return Vec::new();
          }
          self.votes.insert(from.clone());
@@ -166,9 +166,9 @@
              return self.become_leader();
          }
          Vec::new()
-@@ -575,7 +645,9 @@
+@@ -591,7 +661,9 @@
          self.accept(&entries);
-         let last = self.log.len() as Index;
+         let last = self.log.last_index();
          if commit > self.commit_index {
 +            let previous = self.commit_index;
              self.commit_index = commit.min(last);
@@ -176,15 +176,15 @@
          }
          vec![Outbound {
              to: from.clone(),
-@@ -677,7 +749,6 @@
+@@ -695,7 +767,6 @@
  
      /// The largest position a majority holds, of this term only.
      fn advance_commit(&mut self) {
 -        let majority = self.quorum().majority();
-         let mut index = self.log.len() as Index;
+         let mut index = self.log.last_index();
          while index > self.commit_index {
              let Some(entry) = self.log.at(index) else {
-@@ -685,14 +756,14 @@
+@@ -703,14 +774,14 @@
              };
              if entry.term == self.term {
                  // The leader's own position is in `match_index` too, so it is counted once — a

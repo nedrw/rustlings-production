@@ -8,19 +8,18 @@
  //! The SDK: what a caller sees, once the cluster's rules are somebody else's problem.
  //!
  //! `meshkv/5.11-client-sdk` is the step where the client stops being an example and becomes a
-@@ -70,7 +66,10 @@
+@@ -70,7 +66,9 @@
      /// `true` when retrying the same call might succeed.
      #[must_use]
      pub fn is_retryable(&self) -> bool {
 -        todo!("meshkv/5.11-client-sdk: SdkError::is_retryable")
-+        matches!(
-+            self,
-+            Self::NotLeader { .. } | Self::Unavailable { .. } | Self::RetriesExhausted { .. }
-+        )
++        // `RetriesExhausted` is the SDK's own verdict: the caller may start a *new* call, but telling
++        // it this one is worth retrying is the answer the SDK just decided against.
++        matches!(self, Self::NotLeader { .. } | Self::Unavailable { .. })
      }
  }
  
-@@ -135,13 +134,11 @@
+@@ -135,13 +133,11 @@
          key: &IdempotencyKey,
          command: &[u8],
      ) -> std::result::Result<Reply, SdkError> {
@@ -36,7 +35,7 @@
      }
  }
  
-@@ -157,20 +154,24 @@
+@@ -157,20 +153,24 @@
  impl<B: Backend> Sdk<B> {
      /// An SDK for `session`, starting at `node`.
      pub fn new(backend: B, session: Session, node: impl Into<String>) -> Self {
@@ -65,7 +64,7 @@
      }
  
      /// Write `command`, following redirects and retrying with the same idempotency key.
-@@ -180,8 +181,35 @@
+@@ -180,8 +180,35 @@
      /// [`SdkError::Refused`] when the store refuses the write (no retry), and
      /// [`SdkError::RetriesExhausted`] when the attempts run out first.
      pub fn write(&mut self, command: &[u8]) -> std::result::Result<Index, SdkError> {
@@ -103,7 +102,7 @@
      }
  
      /// Read `key`, following redirects.
-@@ -191,8 +219,32 @@
+@@ -191,8 +218,32 @@
      /// [`SdkError::RetriesExhausted`] when the attempts run out, and whatever the backend refuses
      /// without a retry.
      pub fn read(&mut self, key: &str) -> std::result::Result<Option<Vec<u8>>, SdkError> {
@@ -138,7 +137,7 @@
      }
  
      /// The ledger outcome for a write that may have been a duplicate, as the SDK sees it.
-@@ -202,13 +254,14 @@
+@@ -202,13 +253,14 @@
      /// to see the distinction, and `Outcome` is `5.8`'s.
      #[must_use]
      pub fn outcome_is_success(outcome: &Outcome) -> bool {
@@ -157,7 +156,7 @@
      }
  }
  
-@@ -218,22 +271,31 @@
+@@ -218,22 +270,31 @@
  /// operations, and the encoding is the store's business.
  #[must_use]
  pub fn command_set(key: &str, value: &[u8]) -> Vec<u8> {
@@ -195,7 +194,7 @@
  }
  
  /// A refusal from a node that is not the leader, as the SDK reads it.
-@@ -243,6 +305,12 @@
+@@ -243,6 +304,12 @@
  /// [`SdkError::NotLeader`] when the error carries a leader, and [`SdkError::Unavailable`] when it
  /// does not — a refusal that names nobody is not a redirect.
  pub fn classify(error: &Error) -> SdkError {

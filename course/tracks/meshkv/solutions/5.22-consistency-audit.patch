@@ -65,7 +65,7 @@
      }
  }
  
-@@ -89,6 +105,57 @@
+@@ -89,6 +105,59 @@
  /// [`Error::Invalid`] when nobody answered — an audit of no node is not an audit — or when the same
  /// node answered twice, which is a collector bug rather than a cluster one.
  pub fn audit(states: &[State]) -> Result<Report> {
@@ -86,38 +86,40 @@
 +    }
 +
 +    let common_prefix = states.iter().map(|state| state.applied).min().unwrap_or(0);
-+    // The nodes that reached the prefix, and the digest each reports there.
-+    let mut at_prefix: Vec<&State> = states
-+        .iter()
-+        .filter(|state| state.applied == common_prefix)
-+        .collect();
-+    // A node ahead of the prefix cannot be compared yet: it is not a finding, but it is also not
-+    // evidence, so the audit's majority is taken from the nodes that *are* at the prefix.
-+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
-+    for state in &at_prefix {
-+        *counts.entry(state.digest).or_default() += 1;
-+    }
-+    let majority_digest = counts
-+        .iter()
-+        .max_by_key(|(digest, count)| (**count, std::cmp::Reverse(**digest)))
-+        .map(|(digest, _)| *digest);
-+
-+    let diverged = match majority_digest {
-+        None => Vec::new(),
-+        Some(majority) => at_prefix
++    // Every position at which at least two nodes can be compared: a node ahead of another cannot be
++    // compared at the other's index, but two nodes that reached the same index can — and that is
++    // where a divergence lives.
++    let furthest = states.iter().map(|state| state.applied).max().unwrap_or(0);
++    let mut diverged: Vec<NodeId> = Vec::new();
++    for index in common_prefix..=furthest {
++        let at: Vec<&State> = states
 +            .iter()
-+            .filter(|state| state.digest != majority)
-+            .map(|state| state.node.clone())
-+            .collect(),
-+    };
++            .filter(|state| state.applied == index)
++            .collect();
++        if at.len() < 2 {
++            continue;
++        }
++        let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
++        for state in &at {
++            *counts.entry(state.digest).or_default() += 1;
++        }
++        let Some((majority, _)) = counts
++            .iter()
++            .max_by_key(|(digest, count)| (**count, std::cmp::Reverse(**digest)))
++        else {
++            continue;
++        };
++        for state in at {
++            if state.digest != *majority && !diverged.contains(&state.node) {
++                diverged.push(state.node.clone());
++            }
++        }
++    }
 +    let behind = states
 +        .iter()
-+        .filter(|state| state.applied < common_prefix)
++        .filter(|state| state.applied < furthest)
 +        .map(|state| state.node.clone())
 +        .collect();
-+
-+    // Keep the borrow checker honest: `at_prefix` is only needed above.
-+    at_prefix.clear();
 +    Ok(Report {
 +        common_prefix,
 +        behind,

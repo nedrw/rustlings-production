@@ -175,7 +175,7 @@
 +}
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -348,6 +348,7 @@
+@@ -363,6 +363,7 @@
  // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
  // (docs/authoring.md §5).
  // kiln:scaffold:begin

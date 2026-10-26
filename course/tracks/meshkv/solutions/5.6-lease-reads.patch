@@ -1,15 +1,16 @@
 --- a/src/raft/state.rs
 +++ b/src/raft/state.rs
-@@ -271,6 +271,8 @@
+@@ -271,6 +271,9 @@
      /// sending anything.
      pub fn campaign(&mut self) -> Vec<Outbound> {
          self.role = Role::Candidate;
 +        self.lease = None;
 +        self.read_index = None;
++        self.pending = None;
          self.term = self.term.next();
          self.voted_for = Some(self.id.clone());
          self.votes.clear();
-@@ -431,13 +433,25 @@
+@@ -431,14 +434,26 @@
      ///
      /// # Errors
      ///
@@ -30,14 +31,15 @@
      }
  
      /// Finish a read round: a majority in this node's own term grants the lease.
-+    ///
+     ///
 +    /// The acknowledgements are the voters that answered the heartbeat the round sent. A majority is
 +    /// what makes the read index safe: no other node could have been elected in this term without
 +    /// one of them knowing.
-     ///
++    ///
      /// # Errors
      ///
-@@ -447,15 +461,46 @@
+     /// [`Error::Invalid`] when this node is not the leader.
+@@ -447,15 +462,46 @@
          acknowledged: &[NodeId],
          now: u64,
      ) -> Result<crate::raft::read::ReadAnswer> {
@@ -88,16 +90,17 @@
      }
      // kiln:scaffold:end
  
-@@ -625,6 +670,8 @@
+@@ -641,6 +687,9 @@
      fn step_down(&mut self, term: Term) {
          self.term = term;
          self.role = Role::Follower;
 +        self.lease = None;
 +        self.read_index = None;
++        self.pending = None;
          self.voted_for = None;
          self.votes.clear();
          self.next_index.clear();
-@@ -681,6 +728,8 @@
+@@ -697,6 +746,8 @@
              self.role = Role::Follower;
              self.voted_for = None;
              self.votes.clear();

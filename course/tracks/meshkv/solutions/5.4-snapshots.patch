@@ -1,6 +1,6 @@
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -208,26 +208,53 @@
+@@ -223,26 +223,53 @@
      // edits safe (docs/authoring.md §5).
      // kiln:scaffold:begin
      /// The index of the last entry this log no longer holds, or zero when it holds everything.
@@ -83,7 +83,7 @@
                  let next = self.next_index.get(&to).copied().unwrap_or(1);
                  let prev = if next <= 1 {
                      LogPosition::empty()
-@@ -315,39 +329,91 @@
+@@ -315,39 +329,100 @@
  
      /// Take a snapshot of the state as of the last committed entry.
      ///
@@ -140,6 +140,15 @@
 +                snapshot.last_included_term.get()
 +            )));
 +        }
++        if snapshot.last_included_index == self.commit_index
++            && snapshot.last_included_term != self.term
++        {
++            return Err(Error::protocol(format!(
++                "a snapshot at the commit index must be of the entry this node committed, and the                  terms differ: {} against {}",
++                snapshot.last_included_term.get(),
++                self.term.get()
++            )));
++        }
 +        self.log.compact_to(snapshot.last_included_index)
      }
  
@@ -185,7 +194,7 @@
      }
  
      /// A snapshot from the leader: adopt it, and answer how far this node now reaches.
-@@ -358,8 +424,21 @@
+@@ -358,8 +433,21 @@
          leader: NodeId,
          snapshot: crate::raft::snapshot::Snapshot,
      ) -> Vec<Outbound> {
@@ -209,7 +218,23 @@
      }
      // kiln:scaffold:end
  
-@@ -545,9 +624,17 @@
+@@ -371,7 +459,14 @@
+                 term: entry.term,
+                 index: entry.index,
+             },
+-            None => LogPosition::empty(),
++            // A node whose log was replaced by a snapshot still has a position: the snapshot's.
++            None => match &self.snapshot {
++                Some(snapshot) => LogPosition {
++                    term: snapshot.last_included_term,
++                    index: snapshot.last_included_index,
++                },
++                None => LogPosition::empty(),
++            },
+         }
+     }
+ 
+@@ -545,9 +640,19 @@
          if prev.index == 0 {
              return true;
          }
@@ -219,11 +244,13 @@
 +        if let Some(entry) = self.log.at(prev.index) {
 +            return entry.term == prev.term;
 +        }
-+        // The entry may be inside the snapshot this node holds: the snapshot *is* the state at
-+        // that index, and its term is the term of the entry it replaced.
++        // The entry may be the last one the snapshot covers: the snapshot *is* the state at that
++        // index, and its term is the term of the entry it replaced. An index *below* it cannot be
++        // checked — the entries are gone — so the leader has to send the snapshot instead.
 +        match &self.snapshot {
 +            Some(snapshot) => {
-+                snapshot.covers(prev.index) && snapshot.last_included_term == prev.term
++                prev.index == snapshot.last_included_index
++                    && snapshot.last_included_term == prev.term
 +            }
 +            None => false,
 +        }

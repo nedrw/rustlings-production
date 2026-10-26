@@ -153,7 +153,7 @@
  }
  
  /// `true` when `node` is cut from every other member (or is crashed): it cannot reach a majority.
-@@ -120,8 +190,13 @@
+@@ -120,8 +190,19 @@
      cut: &BTreeSet<(NodeId, NodeId)>,
      crashed: &BTreeSet<NodeId>,
  ) -> bool {
@@ -162,14 +162,20 @@
 +    if crashed.contains(node) {
 +        return true;
 +    }
-+    members
++    // A node is isolated when it cannot *reach a majority*: itself plus every peer it can see. A node
++    // cut from one peer of five is still in the majority, and a drill that called that a split brain
++    // would fail on a healthy cluster.
++    let reachable = 1 + members
 +        .iter()
-+        .filter(|other| *other != node)
-+        .all(|other| cut.contains(&ordered(node, other)))
++        .filter(|other| {
++            *other != node && !crashed.contains(*other) && !cut.contains(&ordered(node, other))
++        })
++        .count();
++    reachable < members.len() / 2 + 1
  }
  
  /// The drill the course ships for `5.14`: `n2` is isolated, written to, healed, and written to
-@@ -131,5 +206,14 @@
+@@ -131,5 +212,14 @@
  ///
  /// [`Error::Invalid`] when the node names do not parse — a course bug.
  pub fn built_in() -> Result<Drill> {

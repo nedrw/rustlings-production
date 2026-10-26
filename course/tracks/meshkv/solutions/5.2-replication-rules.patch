@@ -139,8 +139,24 @@
 +        self.entries.last()
      }
  
+     /// The index of the last entry this log holds, or the base when it holds none.
+@@ -167,13 +166,13 @@
+     /// numbering has positions, and every position in the rest of this crate is a cluster index.
+     #[must_use]
+     pub fn last_index(&self) -> Index {
+-        todo!("meshkv/5.2-replication-rules: Log::last_index")
++        self.base + self.entries.len() as Index
+     }
+ 
+     /// The term of the last entry this log holds, or term zero when it holds none.
+     #[must_use]
+     pub fn last_term(&self) -> Term {
+-        todo!("meshkv/5.2-replication-rules: Log::last_term")
++        self.entries.last().map_or(Term::zero(), |entry| entry.term)
+     }
+ 
      /// The entry at `index`, one-based.
-@@ -167,8 +166,12 @@
+@@ -182,8 +181,12 @@
      /// like an index beyond its end.
      #[must_use]
      pub fn at(&self, index: Index) -> Option<&Entry> {
@@ -155,7 +171,7 @@
      }
  
      /// Append an entry that belongs next, or refuse it and say why.
-@@ -178,8 +181,26 @@
+@@ -193,8 +196,26 @@
      /// [`Error::Protocol`] when the entry's index is not `len() + 1` (a gap or a duplicate), or its
      /// term is older than the log's last term.
      pub fn append(&mut self, entry: Entry) -> Result<()> {
@@ -184,7 +200,7 @@
      }
  
      // The methods a later step adds are declared inside this block: a scaffold may only write
-@@ -193,8 +214,21 @@
+@@ -208,8 +229,21 @@
      /// This is what a follower does when a leader's log disagrees with its own: the suffix from the
      /// first mismatch is replaced, never merged.
      pub fn truncate_from(&mut self, index: Index) -> usize {

@@ -101,7 +101,7 @@
  }
 --- a/src/raft/state.rs
 +++ b/src/raft/state.rs
-@@ -349,11 +349,11 @@
+@@ -350,11 +350,11 @@
      /// the client has to be sent to the leader instead.
      pub fn propose(&mut self, payload: Vec<u8>) -> Result<Index> {
          if self.role != Role::Leader {
@@ -116,5 +116,5 @@
 +                leader: self.leader().map(|leader| leader.as_str().to_owned()),
 +            });
          }
-         let index = self.log.len() as Index + 1;
+         let index = self.log.last_index() + 1;
          let entry = Entry::with_payload(self.term, index, payload);

@@ -485,6 +485,7 @@ gates = [
     "exit-code",
     "unsafe-budget@0",
     "slow:sim@3",
+    "links",
 ]
 
 
@@ -627,6 +628,7 @@ gates = [
     "exit-code",
     "unsafe-budget@5",
     "slow:sim@3",
+    "links",
 ]
 
 

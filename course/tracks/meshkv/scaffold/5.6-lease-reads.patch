@@ -118,7 +118,7 @@
 +}
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -350,6 +350,7 @@
+@@ -365,6 +365,7 @@
  // kiln:scaffold:begin
  pub mod membership;
  pub mod message;

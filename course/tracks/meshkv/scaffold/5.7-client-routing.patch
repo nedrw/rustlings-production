@@ -116,7 +116,7 @@
 +}
 --- a/src/error.rs
 +++ b/src/error.rs
-@@ -36,6 +36,12 @@
+@@ -35,6 +35,12 @@
      // The variants a later step adds are declared inside this block: a scaffold may only write
      // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
      // kiln:scaffold:begin
