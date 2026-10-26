@@ -143,7 +143,15 @@ fn judge(session: &Session, track: &Track, step: &Step, run_slow: bool) -> Resul
     if let Some(missing) = project::dependency_missing(session.course(), track) {
         verdict.status = "blocked";
         verdict.detail = missing.to_string();
-        verdict.fix = Some("kiln run".to_owned());
+        // The fix has to name the *other* track's step: a bare `kiln run` starts the default track.
+        verdict.fix = track.requires_track.as_ref().and_then(|required| {
+            session
+                .course()
+                .track(required)
+                .ok()
+                .and_then(|track| track.step.first())
+                .map(|step| format!("kiln run {}", step.qualified_id()))
+        });
         return Ok(verdict);
     }
 

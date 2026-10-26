@@ -185,6 +185,10 @@ pub fn dependency_missing(course: &Course, track: &Track) -> Option<KilnError> {
         project: relative_to(course.root(), &track.project_dir(course.root())),
         required: required.clone(),
         required_project: relative_to(course.root(), &dir),
+        first: target
+            .step
+            .first()
+            .map_or_else(|| format!("{}/1", target.id), |step| step.qualified_id()),
     })
 }
 

@@ -116,8 +116,8 @@ pub enum KilnError {
     /// The project a track builds on through a `path` dependency (plan §3 D6) is not there.
     #[error(
         "{project} builds on {required}'s project ({required_project}), which does not exist yet — \
-         {required}'s steps are a prerequisite, not a scaffold: run them in order (`kiln run` \
-         starts at {required}'s first unfinished step)"
+         {required}'s steps are a prerequisite, not a scaffold: run them in order, starting at \
+         `{required}/{first}`"
     )]
     MissingDependency {
         /// This track's project directory (`app/meshkv`).
@@ -126,6 +126,8 @@ pub enum KilnError {
         required: String,
         /// The required track's project directory (`app/jobq`).
         required_project: String,
+        /// The required track's first step, which is where a learner starts.
+        first: String,
     },
 
     /// A step reference matched more than one step.
