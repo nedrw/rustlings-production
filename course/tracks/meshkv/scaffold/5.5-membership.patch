@@ -1,0 +1,486 @@
+--- /dev/null
++++ b/src/raft/membership.rs
+@@ -0,0 +1,172 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Who is allowed to vote, and what it takes to change that.
++//!
++//! `meshkv/5.5-membership` is the step where the cluster stops being a fixed list. A node joins, a
++//! node leaves, and the one thing that must not happen is a committed write falling out of the
++//! quorum while the change is in flight.
++//!
++//! The answer this step implements is Raft's **joint consensus**, and it is two configurations, not
++//! one:
++//!
++//! 1. the leader appends a configuration entry that names both the **old** voters and the **new**
++//!    ones. From that moment on a decision needs a majority of *both* sets — written
++//!    [`Membership::Joint`];
++//! 2. when that entry is committed, every node adopts the new configuration and forgets the old
++//!    one — [`Membership::Stable`].
++//!
++//! Why two phases rather than one: a single switch has a window in which the old voters and the new
++//! voters each think they are the cluster, and two majorities that do not overlap can decide two
++//! different things at the same index. Requiring both majorities while the change is in flight is
++//! what makes the window safe: any majority of the old set and any majority of the new set
++//! intersect, so there is exactly one quorum at every instant.
++//!
++//! A configuration is a list of names, written `n1,n2,n3` — the same alphabet `5.1` gave a node's
++//! identity, parsed by the same type. It is carried in a log entry like any other write, which is
++//! what makes the change ordered with respect to the writes it must not lose.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// The voters of one configuration.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Config {
++    voters: Vec<NodeId>,
++}
++
++impl Config {
++    /// A configuration of `voters`, in the order they were named.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the list is empty (a cluster of nobody can decide nothing), or when a
++    /// name appears twice (one node cannot be two voters).
++    pub fn new(voters: Vec<NodeId>) -> Result<Self> {
++        let _ = voters;
++        todo!("meshkv/5.5-membership: Config::new")
++    }
++
++    /// Parse `n1,n2,n3`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the text is empty, when an entry is not a node name, or when a name
++    /// appears twice.
++    pub fn parse(text: &str) -> Result<Self> {
++        let _ = text;
++        todo!("meshkv/5.5-membership: Config::parse")
++    }
++
++    /// The voters, in the order they were named.
++    #[must_use]
++    pub fn voters(&self) -> &[NodeId] {
++        todo!("meshkv/5.5-membership: Config::voters")
++    }
++
++    /// How many voters it has.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("meshkv/5.5-membership: Config::len")
++    }
++
++    /// `true` when it names no voter. Never true for a parsed one.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("meshkv/5.5-membership: Config::is_empty")
++    }
++
++    /// `true` when `id` is one of the voters.
++    #[must_use]
++    pub fn contains(&self, id: &NodeId) -> bool {
++        let _ = id;
++        todo!("meshkv/5.5-membership: Config::contains")
++    }
++
++    /// How many acknowledgements it takes to decide.
++    #[must_use]
++    pub fn majority(&self) -> usize {
++        todo!("meshkv/5.5-membership: Config::majority")
++    }
++
++    /// `true` when `acknowledgements` of these voters are enough.
++    #[must_use]
++    pub fn is_met(&self, acknowledgements: usize) -> bool {
++        let _ = acknowledgements;
++        todo!("meshkv/5.5-membership: Config::is_met")
++    }
++
++    /// The canonical text, `n1,n2,n3`.
++    #[must_use]
++    pub fn render(&self) -> String {
++        todo!("meshkv/5.5-membership: Config::render")
++    }
++}
++
++/// The voters of a cluster, and whether a change is in flight.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Membership {
++    /// One configuration decides everything.
++    Stable(Config),
++    /// A change is in flight: a decision needs a majority of `old` **and** of `new`.
++    Joint {
++        /// The configuration the cluster is leaving.
++        old: Config,
++        /// The one it is moving to.
++        new: Config,
++    },
++}
++
++impl Membership {
++    /// The configuration a stable membership is, or the new one a joint membership is moving to.
++    ///
++    /// This is the set a node that has just started should be handed: during a joint configuration
++    /// the *new* set is the one that will remain.
++    #[must_use]
++    pub fn targeted(&self) -> &Config {
++        todo!("meshkv/5.5-membership: Membership::targeted")
++    }
++
++    /// Every voter of either configuration, once each.
++    #[must_use]
++    pub fn voters(&self) -> Vec<&NodeId> {
++        todo!("meshkv/5.5-membership: Membership::voters")
++    }
++
++    /// `true` while a change is in flight.
++    #[must_use]
++    pub fn is_joint(&self) -> bool {
++        todo!("meshkv/5.5-membership: Membership::is_joint")
++    }
++
++    /// `true` when the acknowledgements decide: a majority of the stable configuration, or a
++    /// majority of **both** sets while a change is in flight.
++    #[must_use]
++    pub fn is_met(&self, acknowledged: &[&NodeId]) -> bool {
++        let _ = acknowledged;
++        todo!("meshkv/5.5-membership: Membership::is_met")
++    }
++}
++
++/// The marker a configuration entry carries, so the log can tell it from a write.
++///
++/// The payload of an entry is opaque to the consensus layer (`5.3` said so), and this is the one
++/// exception the layer itself has to read: a configuration entry is *about* the consensus layer. The
++/// marker is the smallest thing that makes that possible, and `5.10` inherits the same problem for
++/// the state machine's own commands.
++const CONFIG_MARKER: &[u8] = b"\x01cfg ";
++
++/// The payload of a configuration entry.
++#[must_use]
++pub fn encode(config: &Config) -> Vec<u8> {
++    let _ = config;
++    todo!("meshkv/5.5-membership: Membership::encode")
++}
++
++/// The configuration a payload carries, if it is a configuration entry.
++#[must_use]
++pub fn decode(payload: &[u8]) -> Option<Config> {
++    let _ = payload;
++    todo!("meshkv/5.5-membership: Membership::decode")
++}
+--- a/src/raft/mod.rs
++++ b/src/raft/mod.rs
+@@ -348,6 +348,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod membership;
+ pub mod message;
+ pub mod snapshot;
+ pub mod state;
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -321,6 +321,24 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// Who is allowed to vote, and whether a change is in flight.
++    #[must_use]
++    pub fn membership(&self) -> crate::raft::membership::Membership {
++        todo!("meshkv/5.5-membership: Raft::membership")
++    }
++
++    /// Begin a membership change: append the new configuration, and require both majorities until
++    /// it is committed.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this node is not the leader, when a change is already in flight, or
++    /// when the new configuration is empty.
++    pub fn begin_membership(&mut self, target: crate::raft::membership::Config) -> Result<Index> {
++        let _ = target;
++        todo!("meshkv/5.5-membership: Raft::begin_membership")
++    }
++
+     /// The snapshot this node holds, if it holds one.
+     #[must_use]
+     pub fn snapshot(&self) -> Option<&crate::raft::snapshot::Snapshot> {
+--- /dev/null
++++ b/tests/sim_membership.rs
+@@ -0,0 +1,271 @@
++//! The instrument for `meshkv/5.5-membership`: a cluster that changes its own membership.
++//!
++//! Course content, shipped by the step's scaffold. This harness drives the state machine as a
++//! *value-level* cluster — no sockets, no clock: a queue of messages, delivered in the order the
++//! seed chooses, and every node's state machine deciding from what arrives. That is enough here
++//! because `5.3` already put the rules in a pure type; what this step adds is a configuration, and
++//! a configuration is decided by messages like everything else.
++//!
++//! What the run does, in order:
++//!
++//! 1. every node stands for election, in the order the seed picks — so a different seed elects a
++//!    different leader, which is the "the seeds matter" half of the `sim` gate;
++//! 2. the leader commits one write with the three voters it starts with;
++//! 3. the leader begins a change to five voters. The configuration entry commits only once a
++//!    majority of **both** sets has it, and committing it ends the joint membership;
++//! 4. the leader commits a second write with the new five voters — including the two that joined,
++//!    which is the point of the step: the write is only decided if the new set really votes.
++//!
++//! The transcript is the `meshkv-sim <name>=<value>` lines below. Nothing in it is a wall clock or
++//! an address, so the same seed prints the same bytes.
++
++use std::collections::{BTreeMap, VecDeque};
++
++use meshkv::cluster::NodeId;
++use meshkv::raft::membership::Config;
++use meshkv::raft::message::Message;
++use meshkv::raft::state::{Outbound, Raft, Role};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The three nodes the cluster starts with.
++const OLD: [&str; 3] = ["n1", "n2", "n3"];
++
++/// The two that join.
++const JOINING: [&str; 2] = ["n4", "n5"];
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++fn id(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++/// A tiny seeded generator: the harness needs a spread of orders, not a good random number.
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++/// One message in flight, with both ends of it.
++struct InFlight {
++    from: NodeId,
++    to: NodeId,
++    message: Message,
++}
++
++/// A cluster of state machines, and the messages between them.
++struct Cluster {
++    nodes: BTreeMap<NodeId, Raft>,
++    queue: VecDeque<InFlight>,
++    rng: Rng,
++    transcript: Vec<String>,
++}
++
++impl Cluster {
++    fn new(seed: u64) -> Self {
++        let rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
++        let old: Vec<NodeId> = OLD.iter().map(|name| id(name)).collect();
++        let all: Vec<NodeId> = OLD
++            .iter()
++            .chain(JOINING.iter())
++            .map(|name| id(name))
++            .collect();
++        let nodes = OLD
++            .iter()
++            .map(|name| (id(name), Raft::new(id(name), old.clone())))
++            .chain(
++                JOINING
++                    .iter()
++                    .map(|name| (id(name), Raft::new(id(name), all.clone()))),
++            )
++            .collect();
++        Self {
++            nodes,
++            queue: VecDeque::new(),
++            rng,
++            transcript: Vec::new(),
++        }
++    }
++
++    /// Queue everything a node asked to send.
++    fn follow(&mut self, from: &NodeId, outbounds: Vec<Outbound>) {
++        for outbound in outbounds {
++            self.queue.push_back(InFlight {
++                from: from.clone(),
++                to: outbound.to,
++                message: outbound.message,
++            });
++        }
++    }
++
++    /// Deliver every queued message, in the order the seed picks, including the answers.
++    fn settle(&mut self) {
++        while !self.queue.is_empty() {
++            let at = self.rng.below(self.queue.len());
++            let Some(in_flight) = self.queue.remove(at) else {
++                break;
++            };
++            let InFlight { from, to, message } = in_flight;
++            if let Message::AppendAck {
++                success: true,
++                match_index,
++                ..
++            } = &message
++            {
++                self.transcript
++                    .push(format!("ack from={from} at={match_index}"));
++            }
++            let Some(node) = self.nodes.get_mut(&to) else {
++                continue;
++            };
++            let outbounds = node.on_message(&from, message);
++            self.follow(&to, outbounds);
++        }
++    }
++
++    /// The one node that is leading, if there is exactly one.
++    fn leader(&self) -> Option<NodeId> {
++        let leaders: Vec<&NodeId> = self
++            .nodes
++            .iter()
++            .filter(|(_, node)| node.role() == Role::Leader)
++            .map(|(name, _)| name)
++            .collect();
++        match leaders.as_slice() {
++            [only] => Some((*only).clone()),
++            _ => None,
++        }
++    }
++}
++
++#[test]
++fn a_cluster_grows_from_three_to_five_without_losing_a_write() {
++    let seed = seed();
++    let mut cluster = Cluster::new(seed);
++
++    // The seed decides whose election timeout fires first — the one thing a real cluster leaves to
++    // the clock, and the one thing this harness has to make reproducible. The other two answer its
++    // vote request; nobody else stands.
++    let mut names: Vec<&str> = OLD.to_vec();
++    let pick = cluster.rng.below(names.len());
++    names.swap(0, pick);
++    let candidate = id(names[0]);
++    let outbounds = cluster
++        .nodes
++        .get_mut(&candidate)
++        .expect("a node of the cluster")
++        .campaign();
++    cluster.follow(&candidate, outbounds);
++    cluster.settle();
++
++    let Some(leader) = cluster.leader() else {
++        println!("meshkv-sim elect leader=none");
++        panic!("the cluster did not agree on a leader: {names:?}");
++    };
++    println!("meshkv-sim elect leader={leader}");
++
++    // The first write, with the three voters the cluster starts with.
++    let first = {
++        let node = cluster.nodes.get_mut(&leader).expect("the leader");
++        let index = node.propose(b"first".to_vec()).expect("the leader writes");
++        let outbounds = node.append_entries();
++        (index, outbounds)
++    };
++    cluster.follow(&leader, first.1);
++    cluster.settle();
++    let committed = cluster
++        .nodes
++        .get(&leader)
++        .is_some_and(|node| node.commit_index() >= first.0);
++    println!(
++        "meshkv-sim write index={} committed={}",
++        first.0,
++        u8::from(committed)
++    );
++    assert!(committed, "a write to three voters has to commit");
++
++    // The change: three voters become five.
++    let (change, outbounds) = {
++        let node = cluster.nodes.get_mut(&leader).expect("the leader");
++        let index = node
++            .begin_membership(Config::parse("n1,n2,n3,n4,n5").expect("a configuration"))
++            .expect("the leader begins a change");
++        (index, node.append_entries())
++    };
++    let joint_before = cluster
++        .nodes
++        .get(&leader)
++        .is_some_and(|node| node.membership().is_joint());
++    cluster.follow(&leader, outbounds);
++    cluster.settle();
++    let after = cluster.nodes.get(&leader).expect("the leader").membership();
++    println!(
++        "meshkv-sim change voters={} joint_before={} joint_after={}",
++        after.voters().len(),
++        u8::from(joint_before),
++        u8::from(after.is_joint())
++    );
++    assert!(joint_before, "beginning a change puts it in flight at once");
++    assert!(
++        !after.is_joint(),
++        "the committed configuration entry ends the change"
++    );
++    assert_eq!(after.targeted().render(), "n1,n2,n3,n4,n5");
++    assert!(
++        cluster
++            .nodes
++            .get(&leader)
++            .is_some_and(|node| node.commit_index() >= change),
++        "the configuration entry itself commits"
++    );
++
++    // The second write: only the new five voters can decide it.
++    let (second, outbounds) = {
++        let node = cluster.nodes.get_mut(&leader).expect("the leader");
++        let index = node.propose(b"second".to_vec()).expect("the leader writes");
++        (index, node.append_entries())
++    };
++    cluster.follow(&leader, outbounds);
++    cluster.settle();
++    let committed = cluster
++        .nodes
++        .get(&leader)
++        .is_some_and(|node| node.commit_index() >= second);
++    let joined_have_it = JOINING.iter().all(|name| {
++        cluster
++            .nodes
++            .get(&id(name))
++            .is_some_and(|node| node.log().at(second).is_some())
++    });
++    println!(
++        "meshkv-sim write index={} committed={} joined={}",
++        second,
++        u8::from(committed),
++        u8::from(joined_have_it)
++    );
++    assert!(committed, "a write to five voters has to commit");
++    assert!(
++        joined_have_it,
++        "the nodes that joined hold the write they helped decide"
++    );
++
++    for line in &cluster.transcript {
++        println!("meshkv-sim {line}");
++    }
++}

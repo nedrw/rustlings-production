@@ -1,0 +1,25 @@
+# The schedules `meshkv/5.5-membership` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_membership.rs`, which
+# this step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set, and
+# every run has to be green — a membership change that holds under one schedule and breaks under
+# another is exactly the bug this gate is about.
+#
+# `seeds` is three schedules and the count is the judgement: `slow:sim@3` asks for at least three,
+# and the gate also demands that at least two of them produce *different* transcripts, so a harness
+# that ignored the seed would fail rather than pass three times. What the schedules decide here is
+# two things: **whose election timeout fires first** (the seed picks the candidate, and that is the
+# `elect leader=` line) and **the order the votes and acknowledgements arrive** (the `ack from=`
+# lines). The cluster has to reach the same answer — one write committed with three voters, the
+# change to five decided by a majority of both sets, one write committed with five — whichever
+# order it got there in.
+#
+# `replay = 1` is the seed that is run *twice*: the two transcripts have to be byte-identical. That
+# is the property the harness is written for — every line is a name, a count or a yes-or-a-no, never
+# a wall clock, a path or an address — and a scenario that fails it is a flaky test wearing a
+# simulation's name. Seed `1` is also the default the harness uses when nothing sets `KILN_SIM_SEED`,
+# so a learner running the file by hand sees the schedule this gate replays.
+command = "cargo test -p meshkv --test sim_membership -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1

@@ -198,3 +198,36 @@ $ cargo test -p kiln → 338 + 21 + 1
 5. **跨行签名会骗过桩生成器**（`pub fn new(\n  a: A,\n) -> Result<Self> {` 的首行不以 `{` 结尾）。
    第一版 `stubgen.py` 把整个 `Snapshot::new` 的实现留在了桩里，于是桩引用 `Error` 而 import 被剥掉，
    脚手架编译失败。修法：按 `fn 名字(` 识别函数起点，再往下收签名直到 `{`。
+
+## 段 5：5.5 成员变更（B1 收口）——联合共识
+
+**5.5 做了什么**：`src/raft/membership.rs`（`Config`、`Membership::{Stable, Joint}`、`encode`/`decode`）、
+`Raft::membership()` / `begin_membership()`、把三处"谁说了算"接到 membership 上（竞选、计票、提交），
+提交时采纳配置（leader 与 follower 都采纳）、`peers()` 在变更期是两套并集、`tests/sim_membership.rs`
+（纯值集群 + 种子决定超时与投递序）、`sim/5.5-membership.toml`。9 个规格用例。
+
+**原始结论行**：
+
+```
+$ KILN_SIM_SEED=1   → elect leader=n1   write index=2 committed=1   change voters=5 joint_before=1 joint_after=0   write index=4 committed=1 joined=1
+$ KILN_SIM_SEED=7   → elect leader=n3   （同三条不变）
+$ KILN_SIM_SEED=20260101 → elect leader=n2
+$ KILN_SIM_SEED=1 连跑两次 → transcript 逐字节相同（sha 前 16 位一致）
+
+$ kiln selftest --track meshkv
+5/5 step(s) hold the contract
+  ✓ 5.1 9/9 · 5.2 9/9 · 5.3 11/11 · 5.4 11/11 · 5.5 11/11
+```
+
+**这一段钉下来的四条**：
+
+1. **"只让一个节点超时"是确定性模拟里唯一诚实的选举起点**。第一版让三个节点同时 `campaign()`，
+   结果都投自己、无人过半（真实 Raft 靠各自的超时错开，而值层模型没有钟）。改成 **seed 决定谁的超时先到**：
+   一个候选、两个应答，胜者随 seed 变——这既复现了真实机制，又让 `sim` 门的"种子必须起作用"成立。
+2. **配置的采纳是"已提交日志"的性质，不是本地 `pending` 的性质**。第一版要求 `pending == 该配置` 才采纳，
+   于是"新加入的节点收到已提交的配置条目"什么都不会发生。改成：只要扫描到本段新提交的配置条目就采纳；
+   规格里用"未提交不变、提交即变"两条钉住。
+3. **`peers()` 在 joint 期必须是并集**，否则要离开的节点收不到它还没提交的那条配置，变成永远差一个人的死锁。
+4. **`-D clippy::expect_used` 会命中"不可能失败"的 `expect`**（`Config::new(self.members.clone()).expect(...)`）。
+   正解不是 allow，是给内部调用一个**免校验的构造器**（`pub(crate) fn from_voters`），并把"为什么这里不用检查"
+   写在它的文档里。

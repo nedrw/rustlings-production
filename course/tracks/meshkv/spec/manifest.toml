@@ -10,3 +10,4 @@ format_version = 1
 "spec/5.2/replication_rules.rs" = "sha256:af74365db7eeba1edf13ed0f8765f8c509839d5798d8371543ce37bd7504496a"
 "spec/5.3/teaching_raft.rs" = "sha256:8293e7cbc9614ae845e496a74f693aed71c5bd18ba74dd7ab308a95ddf887752"
 "spec/5.4/snapshots.rs" = "sha256:35354f1be6619787975e79d889e14bf9c05fc7d6006044e513a12c47248eff0d"
+"spec/5.5/membership.rs" = "sha256:067da241f0652b6c0669f7aac5ce777494286025ab0377e4dfc4fc5ed60e8c8a"

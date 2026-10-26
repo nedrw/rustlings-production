@@ -1,0 +1,408 @@
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -70,6 +70,8 @@
+     match_index: BTreeMap<NodeId, Index>,
+     commit_index: Index,
+     leader_hint: Option<NodeId>,
++    /// The configuration a joint membership is moving to, while the change is in flight.
++    pending: Option<crate::raft::membership::Config>,
+     // The fields a later step adds are declared inside this block: a scaffold may only write
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+     // kiln:scaffold:begin
+@@ -98,6 +100,7 @@
+             match_index: BTreeMap::new(),
+             commit_index: 0,
+             leader_hint: None,
++            pending: None,
+             // The fields a later step adds are set here, in the same marked region.
+             // kiln:scaffold:begin
+             snapshot: None,
+@@ -155,16 +158,99 @@
+         Quorum::of(self.members.len())
+     }
+ 
++    /// Who is allowed to vote, and whether a change is in flight.
++    #[must_use]
++    pub fn membership(&self) -> crate::raft::membership::Membership {
++        let config =
++            |voters: &[NodeId]| crate::raft::membership::Config::from_voters(voters.to_vec());
++        match &self.pending {
++            None => crate::raft::membership::Membership::Stable(config(&self.members)),
++            Some(new) => crate::raft::membership::Membership::Joint {
++                old: config(&self.members),
++                new: new.clone(),
++            },
++        }
++    }
++
++    /// Begin a membership change: append the new configuration, and require both majorities until
++    /// it is committed.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this node is not the leader, when a change is already in flight, or
++    /// when the new configuration is empty.
++    pub fn begin_membership(&mut self, target: crate::raft::membership::Config) -> Result<Index> {
++        if self.role != Role::Leader {
++            return Err(Error::invalid(format!(
++                "`{}` is a {}, not the leader — a membership change is proposed by the leader",
++                self.id,
++                self.role.as_str()
++            )));
++        }
++        if self.pending.is_some() {
++            return Err(Error::invalid(
++                "a membership change is already in flight: finish it before starting another",
++            ));
++        }
++        let index = self.log.len() as Index + 1;
++        let payload = crate::raft::membership::encode(&target);
++        self.log
++            .append(Entry::with_payload(self.term, index, payload))?;
++        self.pending = Some(target);
++        self.match_index.insert(self.id.clone(), index);
++        Ok(index)
++    }
++
+     /// The peers of this node, itself excluded.
++    ///
++    /// While a change is in flight that is the union of both configurations: the node that is
++    /// joining has to be told about the entries it will need, and the node that is leaving has to
++    /// keep receiving them until the new configuration commits.
+     #[must_use]
+     pub fn peers(&self) -> Vec<NodeId> {
+-        self.members
+-            .iter()
+-            .filter(|member| **member != self.id)
+-            .cloned()
++        let mut peers: Vec<NodeId> = Vec::new();
++        for voter in self.membership().voters() {
++            if voter != &self.id && !peers.contains(voter) {
++                peers.push(voter.clone());
++            }
++        }
++        peers
++    }
++
++    /// `true` when this cluster's voters have decided.
++    fn decided(&self, acknowledged: &[&NodeId]) -> bool {
++        self.membership().is_met(acknowledged)
++    }
++
++    /// The ids whose log reaches `index`, as the acknowledgements a decision is counted from.
++    fn holding(&self, index: Index) -> Vec<NodeId> {
++        self.match_index
++            .iter()
++            .filter(|(_, matched)| **matched >= index)
++            .map(|(id, _)| id.clone())
+             .collect()
+     }
+ 
++    /// Adopt a configuration entry that has just been committed.
++    ///
++    /// This is the second half of joint consensus: the entry that named both sets is committed, so
++    /// every node that applies it moves to the new configuration and stops asking the old one.
++    fn adopt_committed_membership(&mut self, from: Index, to: Index) {
++        for index in from + 1..=to {
++            let Some(entry) = self.log.at(index) else {
++                continue;
++            };
++            let Some(config) = crate::raft::membership::decode(entry.payload()) else {
++                continue;
++            };
++            // A committed configuration entry *is* the cluster's configuration from that index on:
++            // the leader adopts the set it was moving to, and a node that is joining adopts the set
++            // it is joining — neither needs a `pending` of its own to do it.
++            self.members = config.voters().to_vec();
++            self.pending = None;
++        }
++    }
++
+     /// The entries this node may apply: the committed prefix.
+     #[must_use]
+     pub fn committed(&self) -> Vec<&Entry> {
+@@ -185,7 +271,8 @@
+         self.votes.insert(self.id.clone());
+         self.next_index.clear();
+         self.match_index.clear();
+-        if self.votes.len() >= self.quorum().majority() {
++        let votes: Vec<&NodeId> = self.votes.iter().collect();
++        if self.decided(&votes) {
+             return self.become_leader();
+         }
+         let last = self.last_position();
+@@ -321,24 +408,6 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
+-    /// Who is allowed to vote, and whether a change is in flight.
+-    #[must_use]
+-    pub fn membership(&self) -> crate::raft::membership::Membership {
+-        todo!("meshkv/5.5-membership: Raft::membership")
+-    }
+-
+-    /// Begin a membership change: append the new configuration, and require both majorities until
+-    /// it is committed.
+-    ///
+-    /// # Errors
+-    ///
+-    /// [`Error::Invalid`] when this node is not the leader, when a change is already in flight, or
+-    /// when the new configuration is empty.
+-    pub fn begin_membership(&mut self, target: crate::raft::membership::Config) -> Result<Index> {
+-        let _ = target;
+-        todo!("meshkv/5.5-membership: Raft::begin_membership")
+-    }
+-
+     /// The snapshot this node holds, if it holds one.
+     #[must_use]
+     pub fn snapshot(&self) -> Option<&crate::raft::snapshot::Snapshot> {
+@@ -539,7 +608,8 @@
+             return Vec::new();
+         }
+         self.votes.insert(from.clone());
+-        if self.votes.len() >= self.quorum().majority() {
++        let votes: Vec<&NodeId> = self.votes.iter().collect();
++        if self.decided(&votes) {
+             return self.become_leader();
+         }
+         Vec::new()
+@@ -575,7 +645,9 @@
+         self.accept(&entries);
+         let last = self.log.len() as Index;
+         if commit > self.commit_index {
++            let previous = self.commit_index;
+             self.commit_index = commit.min(last);
++            self.adopt_committed_membership(previous, self.commit_index);
+         }
+         vec![Outbound {
+             to: from.clone(),
+@@ -677,7 +749,6 @@
+ 
+     /// The largest position a majority holds, of this term only.
+     fn advance_commit(&mut self) {
+-        let majority = self.quorum().majority();
+         let mut index = self.log.len() as Index;
+         while index > self.commit_index {
+             let Some(entry) = self.log.at(index) else {
+@@ -685,14 +756,14 @@
+             };
+             if entry.term == self.term {
+                 // The leader's own position is in `match_index` too, so it is counted once — a
+-                // leader that counted itself twice would commit with fewer than a majority.
+-                let holders = self
+-                    .match_index
+-                    .values()
+-                    .filter(|matched| **matched >= index)
+-                    .count();
+-                if holders >= majority {
++                // leader that counted itself twice would commit with fewer than a majority. While
++                // a change is in flight the same count has to satisfy both configurations.
++                let holders = self.holding(index);
++                let holders: Vec<&NodeId> = holders.iter().collect();
++                if self.decided(&holders) {
++                    let previous = self.commit_index;
+                     self.commit_index = index;
++                    self.adopt_committed_membership(previous, index);
+                     return;
+                 }
+             }
+--- a/src/raft/membership.rs
++++ b/src/raft/membership.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Who is allowed to vote, and what it takes to change that.
+ //!
+ //! `meshkv/5.5-membership` is the step where the cluster stops being a fixed list. A node joins, a
+@@ -28,7 +24,8 @@
+ //! what makes the change ordered with respect to the writes it must not lose.
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
++use crate::raft::Quorum;
+ 
+ /// The voters of one configuration.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -44,10 +41,32 @@
+     /// [`Error::Invalid`] when the list is empty (a cluster of nobody can decide nothing), or when a
+     /// name appears twice (one node cannot be two voters).
+     pub fn new(voters: Vec<NodeId>) -> Result<Self> {
+-        let _ = voters;
+-        todo!("meshkv/5.5-membership: Config::new")
++        if voters.is_empty() {
++            return Err(Error::invalid(
++                "a configuration names at least one voter — a cluster of nobody decides nothing",
++            ));
++        }
++        let mut seen: Vec<&NodeId> = Vec::new();
++        for voter in &voters {
++            if seen.contains(&voter) {
++                return Err(Error::invalid(format!(
++                    "`{voter}` is named twice in the configuration"
++                )));
++            }
++            seen.push(voter);
++        }
++        Ok(Self { voters })
+     }
+ 
++    /// The configuration of `voters`, for a caller whose invariant already says they are valid.
++    ///
++    /// Crate-internal: the public door is [`Config::new`], which checks. This one exists because
++    /// the state machine keeps its voters as a `Vec` it was built with, and re-validating a
++    /// configuration on every read would be a check whose failure mode is a panic.
++    pub(crate) fn from_voters(voters: Vec<NodeId>) -> Self {
++        Self { voters }
++    }
++
+     /// Parse `n1,n2,n3`.
+     ///
+     /// # Errors
+@@ -55,52 +74,62 @@
+     /// [`Error::Invalid`] when the text is empty, when an entry is not a node name, or when a name
+     /// appears twice.
+     pub fn parse(text: &str) -> Result<Self> {
+-        let _ = text;
+-        todo!("meshkv/5.5-membership: Config::parse")
++        if text.trim().is_empty() {
++            return Err(Error::invalid(
++                "a configuration names at least one voter, and the text names none",
++            ));
++        }
++        let mut voters = Vec::new();
++        for entry in text.split(',') {
++            voters.push(NodeId::parse(entry.trim())?);
++        }
++        Self::new(voters)
+     }
+ 
+     /// The voters, in the order they were named.
+     #[must_use]
+     pub fn voters(&self) -> &[NodeId] {
+-        todo!("meshkv/5.5-membership: Config::voters")
++        &self.voters
+     }
+ 
+     /// How many voters it has.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("meshkv/5.5-membership: Config::len")
++        self.voters.len()
+     }
+ 
+     /// `true` when it names no voter. Never true for a parsed one.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("meshkv/5.5-membership: Config::is_empty")
++        self.voters.is_empty()
+     }
+ 
+     /// `true` when `id` is one of the voters.
+     #[must_use]
+     pub fn contains(&self, id: &NodeId) -> bool {
+-        let _ = id;
+-        todo!("meshkv/5.5-membership: Config::contains")
++        self.voters.iter().any(|voter| voter == id)
+     }
+ 
+     /// How many acknowledgements it takes to decide.
+     #[must_use]
+     pub fn majority(&self) -> usize {
+-        todo!("meshkv/5.5-membership: Config::majority")
++        Quorum::of(self.len()).majority()
+     }
+ 
+     /// `true` when `acknowledgements` of these voters are enough.
+     #[must_use]
+     pub fn is_met(&self, acknowledgements: usize) -> bool {
+-        let _ = acknowledgements;
+-        todo!("meshkv/5.5-membership: Config::is_met")
++        Quorum::of(self.len()).is_met(acknowledgements)
+     }
+ 
+     /// The canonical text, `n1,n2,n3`.
+     #[must_use]
+     pub fn render(&self) -> String {
+-        todo!("meshkv/5.5-membership: Config::render")
++        self.voters
++            .iter()
++            .map(NodeId::as_str)
++            .collect::<Vec<_>>()
++            .join(",")
+     }
+ }
+ 
+@@ -125,27 +154,45 @@
+     /// the *new* set is the one that will remain.
+     #[must_use]
+     pub fn targeted(&self) -> &Config {
+-        todo!("meshkv/5.5-membership: Membership::targeted")
++        match self {
++            Self::Stable(config) => config,
++            Self::Joint { new, .. } => new,
++        }
+     }
+ 
+     /// Every voter of either configuration, once each.
+     #[must_use]
+     pub fn voters(&self) -> Vec<&NodeId> {
+-        todo!("meshkv/5.5-membership: Membership::voters")
++        let mut voters: Vec<&NodeId> = self.targeted().voters().iter().collect();
++        if let Self::Joint { old, .. } = self {
++            for voter in old.voters() {
++                if !voters.contains(&voter) {
++                    voters.push(voter);
++                }
++            }
++        }
++        voters
+     }
+ 
+     /// `true` while a change is in flight.
+     #[must_use]
+     pub fn is_joint(&self) -> bool {
+-        todo!("meshkv/5.5-membership: Membership::is_joint")
++        matches!(self, Self::Joint { .. })
+     }
+ 
+     /// `true` when the acknowledgements decide: a majority of the stable configuration, or a
+     /// majority of **both** sets while a change is in flight.
+     #[must_use]
+     pub fn is_met(&self, acknowledged: &[&NodeId]) -> bool {
+-        let _ = acknowledged;
+-        todo!("meshkv/5.5-membership: Membership::is_met")
++        match self {
++            Self::Stable(config) => {
++                config.is_met(acknowledged.iter().filter(|id| config.contains(id)).count())
++            }
++            Self::Joint { old, new } => {
++                old.is_met(acknowledged.iter().filter(|id| old.contains(id)).count())
++                    && new.is_met(acknowledged.iter().filter(|id| new.contains(id)).count())
++            }
++        }
+     }
+ }
+ 
+@@ -160,13 +207,15 @@
+ /// The payload of a configuration entry.
+ #[must_use]
+ pub fn encode(config: &Config) -> Vec<u8> {
+-    let _ = config;
+-    todo!("meshkv/5.5-membership: Membership::encode")
++    let mut payload = CONFIG_MARKER.to_vec();
++    payload.extend_from_slice(config.render().as_bytes());
++    payload
+ }
+ 
+ /// The configuration a payload carries, if it is a configuration entry.
+ #[must_use]
+ pub fn decode(payload: &[u8]) -> Option<Config> {
+-    let _ = payload;
+-    todo!("meshkv/5.5-membership: Membership::decode")
++    let text = payload.strip_prefix(CONFIG_MARKER)?;
++    let text = std::str::from_utf8(text).ok()?;
++    Config::parse(text).ok()
+ }
