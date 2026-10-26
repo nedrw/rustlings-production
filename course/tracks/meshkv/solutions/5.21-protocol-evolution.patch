@@ -1,0 +1,165 @@
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Versioned protocol: two builds of this cluster, talking to each other for as long as it takes.
+ //!
+ //! `meshkv/5.21-protocol-evolution` is the last shape of the "two truths at once" problem this track
+@@ -26,7 +22,7 @@
+ //! speak, the right answer is a refusal that names the version — not a frame that gets misread.
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// The version of the wire protocol one build speaks.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+@@ -41,8 +37,7 @@
+     /// A protocol version.
+     #[must_use]
+     pub fn new(major: u32, minor: u32) -> Self {
+-        let _ = (major, minor);
+-        todo!("meshkv/5.21-protocol-evolution: Protocol::new")
++        Self { major, minor }
+     }
+ 
+     /// Parse `major.minor`.
+@@ -51,8 +46,16 @@
+     ///
+     /// [`Error::Invalid`] when the text is not two numbers separated by a dot.
+     pub fn parse(text: &str) -> Result<Self> {
+-        let _ = text;
+-        todo!("meshkv/5.21-protocol-evolution: Protocol::parse")
++        let (major, minor) = text
++            .split_once('.')
++            .ok_or_else(|| Error::invalid(format!("`{text}` is not a `major.minor` version")))?;
++        let major = major
++            .parse::<u32>()
++            .map_err(|_| Error::invalid(format!("`{major}` is not a major version")))?;
++        let minor = minor
++            .parse::<u32>()
++            .map_err(|_| Error::invalid(format!("`{minor}` is not a minor version")))?;
++        Ok(Self { major, minor })
+     }
+ 
+     /// `true` when a build at `self` can *parse* what a build at `other` sends.
+@@ -63,14 +66,13 @@
+     /// has to hold back, because it is the one that could send something the older cannot parse.
+     #[must_use]
+     pub fn can_parse(&self, other: &Protocol) -> bool {
+-        let _ = other;
+-        todo!("meshkv/5.21-protocol-evolution: Protocol::can_parse")
++        self.major == other.major && other.minor <= self.minor
+     }
+ 
+     /// The version as it is written: `major.minor`.
+     #[must_use]
+     pub fn render(self) -> String {
+-        todo!("meshkv/5.21-protocol-evolution: Protocol::render")
++        format!("{}.{}", self.major, self.minor)
+     }
+ }
+ 
+@@ -87,8 +89,7 @@
+     /// A greeting from `node`, speaking `protocol`.
+     #[must_use]
+     pub fn new(node: NodeId, protocol: Protocol) -> Self {
+-        let _ = (node, protocol);
+-        todo!("meshkv/5.21-protocol-evolution: Greeting::new")
++        Self { node, protocol }
+     }
+ }
+ 
+@@ -100,8 +101,25 @@
+ /// reading it has to know which build is the odd one out — and when the peer speaks a newer minor
+ /// than this build understands.
+ pub fn accept(local: Protocol, greeting: &Greeting) -> Result<()> {
+-    let _ = (local, greeting);
+-    todo!("meshkv/5.21-protocol-evolution: Greeting::accept")
++    if greeting.protocol.major != local.major {
++        return Err(Error::invalid(format!(
++            "`{}` speaks protocol {} and this build speaks {}: a major version cannot be mixed in a \
++             running cluster",
++            greeting.node,
++            greeting.protocol.render(),
++            local.render()
++        )));
++    }
++    if !local.can_parse(&greeting.protocol) {
++        return Err(Error::invalid(format!(
++            "`{}` sends protocol {} and this build parses up to {}: the newer build has to hold back \
++             until this one is upgraded",
++            greeting.node,
++            greeting.protocol.render(),
++            local.render()
++        )));
++    }
++    Ok(())
+ }
+ 
+ /// A plan to upgrade a cluster one node at a time.
+@@ -121,14 +139,35 @@
+     /// when the majors differ — a major bump is not a rolling upgrade, and a plan that claimed to be
+     /// one would be a plan that stops the cluster.
+     pub fn new(order: &[NodeId], from: Protocol, to: Protocol) -> Result<Self> {
+-        let _ = (order, from, to);
+-        todo!("meshkv/5.21-protocol-evolution: Upgrade::new")
++        if order.is_empty() {
++            return Err(Error::invalid("an upgrade upgrades at least one node"));
++        }
++        if to <= from {
++            return Err(Error::invalid(format!(
++                "upgrading from {} to {} is not an upgrade",
++                from.render(),
++                to.render()
++            )));
++        }
++        if to.major != from.major {
++            return Err(Error::invalid(format!(
++                "upgrading {} to {} crosses a major version: that is a stop-the-world change, not a \
++                 rolling upgrade",
++                from.render(),
++                to.render()
++            )));
++        }
++        Ok(Self {
++            order: order.to_vec(),
++            from,
++            to,
++        })
+     }
+ 
+     /// The nodes it upgrades, in order.
+     #[must_use]
+     pub fn order(&self) -> &[NodeId] {
+-        todo!("meshkv/5.21-protocol-evolution: Upgrade::order")
++        &self.order
+     }
+ 
+     /// Walk the plan and answer the phase each node runs in, in the plan's order.
+@@ -142,7 +181,21 @@
+     /// [`Error::Invalid`] when a node in the order is not in the cluster (an empty plan is refused by
+     /// [`Upgrade::new`]), which would be a step that upgrades nobody.
+     pub fn phases(&self) -> Vec<Phase> {
+-        todo!("meshkv/5.21-protocol-evolution: Upgrade::phases")
++        let last = self.order.len().saturating_sub(1);
++        self.order
++            .iter()
++            .enumerate()
++            .map(|(index, _)| {
++                if index == last {
++                    Phase::Native { version: self.to }
++                } else {
++                    Phase::Compat {
++                        speaking: self.from,
++                        built: self.to,
++                    }
++                }
++            })
++            .collect()
+     }
+ }
+ 

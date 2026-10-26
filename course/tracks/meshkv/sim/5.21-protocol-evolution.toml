@@ -1,0 +1,14 @@
+# The schedules `meshkv/5.21-protocol-evolution` is judged by.
+#
+# Course content, at the same trust level as `spec/`: the `sim` gate reads *this* copy. The command
+# is the project's own harness (`tests/sim_protocol.rs`, which this step's scaffold ships).
+#
+# `seeds` is three orders: `slow:sim@3` asks for at least three, and the gate demands that at least
+# two produce different transcripts — the seed shuffles the upgrade order. What does not depend on the
+# order is the plan's shape: every node but the last runs in compatibility mode, and the last step is
+# where the cluster moves to the new minor.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical.
+command = "cargo test -p meshkv --test sim_protocol -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1

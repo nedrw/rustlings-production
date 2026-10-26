@@ -1,0 +1,127 @@
+--- a/src/audit.rs
++++ b/src/audit.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! The audit: what the cluster committed is what every node holds.
+ //!
+ //! `meshkv/5.22-consistency-audit` is the last step of the track, and it is the one that closes the
+@@ -30,8 +26,9 @@
+ //! runbook prints. The last property is the one that matters for a drill: the report has to be able to
+ //! say *why* it is unhappy in a sentence an operator can act on, not a table nobody reads.
+ 
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::Index;
++use std::collections::BTreeMap;
+ 
+ use crate::cluster::NodeId;
+ 
+@@ -50,8 +47,11 @@
+     /// A node's answer.
+     #[must_use]
+     pub fn new(node: NodeId, applied: Index, digest: u64) -> Self {
+-        let _ = (node, applied, digest);
+-        todo!("meshkv/5.22-consistency-audit: State::new")
++        Self {
++            node,
++            applied,
++            digest,
++        }
+     }
+ }
+ 
+@@ -72,13 +72,29 @@
+     /// `true` when no node diverged: the cluster's state is the one it committed.
+     #[must_use]
+     pub fn is_healthy(&self) -> bool {
+-        todo!("meshkv/5.22-consistency-audit: Report::is_healthy")
++        self.diverged.is_empty()
+     }
+ 
+     /// One sentence for a runbook.
+     #[must_use]
+     pub fn summary(&self) -> String {
+-        todo!("meshkv/5.22-consistency-audit: Report::summary")
++        if !self.is_healthy() {
++            let names = self
++                .diverged
++                .iter()
++                .map(NodeId::as_str)
++                .collect::<Vec<_>>()
++                .join(", ");
++            return format!(
++                "{} node(s) audited, and {names} disagrees about the state at index {} — the cluster \
++                 committed something a node does not hold",
++                self.audited, self.common_prefix
++            );
++        }
++        format!(
++            "{} node(s) audited, all agree at index {}",
++            self.audited, self.common_prefix
++        )
+     }
+ }
+ 
+@@ -89,6 +105,57 @@
+ /// [`Error::Invalid`] when nobody answered — an audit of no node is not an audit — or when the same
+ /// node answered twice, which is a collector bug rather than a cluster one.
+ pub fn audit(states: &[State]) -> Result<Report> {
+-    let _ = states;
+-    todo!("meshkv/5.22-consistency-audit: Report::audit")
++    if states.is_empty() {
++        return Err(Error::invalid("an audit needs at least one node to answer"));
++    }
++    let mut seen: Vec<&NodeId> = Vec::new();
++    for state in states {
++        if seen.contains(&&state.node) {
++            return Err(Error::invalid(format!(
++                "`{}` answered twice: two answers from one node is a collector bug",
++                state.node
++            )));
++        }
++        seen.push(&state.node);
++    }
++
++    let common_prefix = states.iter().map(|state| state.applied).min().unwrap_or(0);
++    // The nodes that reached the prefix, and the digest each reports there.
++    let mut at_prefix: Vec<&State> = states
++        .iter()
++        .filter(|state| state.applied == common_prefix)
++        .collect();
++    // A node ahead of the prefix cannot be compared yet: it is not a finding, but it is also not
++    // evidence, so the audit's majority is taken from the nodes that *are* at the prefix.
++    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
++    for state in &at_prefix {
++        *counts.entry(state.digest).or_default() += 1;
++    }
++    let majority_digest = counts
++        .iter()
++        .max_by_key(|(digest, count)| (**count, std::cmp::Reverse(**digest)))
++        .map(|(digest, _)| *digest);
++
++    let diverged = match majority_digest {
++        None => Vec::new(),
++        Some(majority) => at_prefix
++            .iter()
++            .filter(|state| state.digest != majority)
++            .map(|state| state.node.clone())
++            .collect(),
++    };
++    let behind = states
++        .iter()
++        .filter(|state| state.applied < common_prefix)
++        .map(|state| state.node.clone())
++        .collect();
++
++    // Keep the borrow checker honest: `at_prefix` is only needed above.
++    at_prefix.clear();
++    Ok(Report {
++        common_prefix,
++        behind,
++        diverged,
++        audited: states.len(),
++    })
+ }

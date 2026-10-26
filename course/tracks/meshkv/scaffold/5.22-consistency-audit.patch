@@ -1,0 +1,160 @@
+--- /dev/null
++++ b/src/audit.rs
+@@ -0,0 +1,94 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! The audit: what the cluster committed is what every node holds.
++//!
++//! `meshkv/5.22-consistency-audit` is the last step of the track, and it is the one that closes the
++//! loop the whole course opened: every step has argued that *a decision survives* — a vote, a commit,
++//! a snapshot, a membership change, a partition, a restart, an upgrade. The audit is how that is
++//! checked after the fact, from the outside, without trusting any single node's story.
++//!
++//! Each node is asked two things: **how far it has applied**, and **what its state is** at that
++//! position (a digest, `5.10`'s). From the answers the audit derives three facts:
++//!
++//! * **the common prefix.** The smallest applied index across the cluster is a position every node
++//!   has reached. Everything at or below it is what the cluster decided; the audit's job is to show
++//!   that every node agrees about it.
++//! * **who is behind.** A node whose applied index is above the common prefix is not wrong — it is
++//!   ahead, which is fine; a node *below* it defines the prefix. Being behind is not a finding; being
++//!   *stuck* is, and so is being behind after a heal, which is what a runbook watches.
++//! * **who diverged.** A node that reports the same applied index as another and a different digest
++//!   has a different state at the same position. That is the failure the whole track exists to
++//!   prevent, and it is the one fact that makes the audit say *unhealthy*.
++//!
++//! The digest comparison is done at the *common prefix* only: two nodes at different indices cannot
++//! be compared, and pretending they can would make every audit of a busy cluster fail. A node ahead of
++//! the prefix has nothing to disagree about yet — it will be compared when the others catch up.
++//!
++//! The audit is a value, not a script: `audit(states)` answers a `Report`, and the report is what a
++//! runbook prints. The last property is the one that matters for a drill: the report has to be able to
++//! say *why* it is unhappy in a sentence an operator can act on, not a table nobody reads.
++
++use crate::error::Result;
++use crate::raft::Index;
++
++use crate::cluster::NodeId;
++
++/// What one node answers when it is audited.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct State {
++    /// The node's name.
++    pub node: NodeId,
++    /// How far it has applied.
++    pub applied: Index,
++    /// The digest of its state at `applied` (`5.10`'s).
++    pub digest: u64,
++}
++
++impl State {
++    /// A node's answer.
++    #[must_use]
++    pub fn new(node: NodeId, applied: Index, digest: u64) -> Self {
++        let _ = (node, applied, digest);
++        todo!("meshkv/5.22-consistency-audit: State::new")
++    }
++}
++
++/// What the audit found.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Report {
++    /// The smallest applied index: the position every node has reached.
++    pub common_prefix: Index,
++    /// Nodes behind the common prefix — impossible by definition, kept for the empty case.
++    pub behind: Vec<NodeId>,
++    /// Nodes whose state at the common prefix disagrees with the majority of those that reached it.
++    pub diverged: Vec<NodeId>,
++    /// How many nodes answered.
++    pub audited: usize,
++}
++
++impl Report {
++    /// `true` when no node diverged: the cluster's state is the one it committed.
++    #[must_use]
++    pub fn is_healthy(&self) -> bool {
++        todo!("meshkv/5.22-consistency-audit: Report::is_healthy")
++    }
++
++    /// One sentence for a runbook.
++    #[must_use]
++    pub fn summary(&self) -> String {
++        todo!("meshkv/5.22-consistency-audit: Report::summary")
++    }
++}
++
++/// Audit a cluster's answers.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when nobody answered — an audit of no node is not an audit — or when the same
++/// node answered twice, which is a collector bug rather than a cluster one.
++pub fn audit(states: &[State]) -> Result<Report> {
++    let _ = states;
++    todo!("meshkv/5.22-consistency-audit: Report::audit")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod audit;
+ pub mod budget;
+ pub mod chaos;
+ pub mod client;
+--- /dev/null
++++ b/docs/audit.md
+@@ -0,0 +1,50 @@
++# The consistency audit
++
++Every step of this track has argued that a decision survives something: a vote survives a lost node, a
++commit survives a partition, a snapshot survives a restart, a membership change survives its window, an
++upgrade survives two builds. This page is the check that the argument held — from the outside, after
++the fact, without trusting any single node's story.
++
++## What a node is asked
++
++Two things:
++
++- **how far it has applied** (`5.10`'s index);
++- **what its state is** at that index — a digest, and one that is a function of the entries and
++  nothing else.
++
++## What the audit derives
++
++| fact | how |
++| --- | --- |
++| the common prefix | the smallest applied index across the answers |
++| who diverged | nodes *at* the prefix whose digest is not the majority's |
++| who is behind | nodes below the prefix — by definition none, since the prefix is the minimum; the field exists for a collector that answers a stale set |
++
++The comparison happens **at the common prefix only**. A node ahead of it cannot be compared yet — it
++has applied entries the others have not — and pretending it could would make every audit of a busy
++cluster fail. Being ahead is what a leader looks like; being *different at the same index* is the
++failure the whole track exists to prevent.
++
++## The report is a sentence
++
++```text
++3 node(s) audited, all agree at index 100
++2 node(s) audited, and n3 disagrees about the state at index 100 — the cluster committed something a
++node does not hold
++```
++
++The report names the node and the index, because that is what an operator acts on: which node, and
++where. A report that said "audit failed" would be a report nobody reads twice.
++
++## How it is used
++
++The audit closes the loop of every drill in this track:
++
++- after a partition (`5.14`), the majority and the minority converge to one state, and the audit says
++  so;
++- after a rolling restart (`5.15`), every node is back and holds what the cluster committed;
++- after an upgrade (`5.21`), two builds have one state, not two.
++
++It is also the step's own graduation exercise: a cluster the previous twenty-one steps built, audited
++by a function the last one wrote, and the answer is one sentence.

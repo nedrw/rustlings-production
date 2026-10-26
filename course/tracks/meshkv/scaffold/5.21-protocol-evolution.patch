@@ -1,0 +1,325 @@
+--- /dev/null
++++ b/src/protocol.rs
+@@ -0,0 +1,164 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Versioned protocol: two builds of this cluster, talking to each other for as long as it takes.
++//!
++//! `meshkv/5.21-protocol-evolution` is the last shape of the "two truths at once" problem this track
++//! has met three times: joint consensus (`5.5`) held two *memberships* at once, certificate rotation
++//! (`5.9`) held two *certificates*, and a rolling upgrade holds two **builds**.
++//!
++//! The rule is the same arithmetic in a different unit: during the upgrade, every node has to be able
++//! to understand every other node, or the cluster stops. Two numbers make that checkable:
++//!
++//! * the **major** version is the wire format. Two nodes with different majors cannot talk, so a
++//!   rolling upgrade may never have both in the cluster — which is what makes a major bump a
++//!   *stop-the-world* operation, stated rather than discovered;
++//! * the **minor** version is compatible within a major, and a node speaks every minor up to its own.
++//!   So a cluster may hold two minors during an upgrade, and the rule is that the *newer* peer must
++//!   not speak a minor the older one does not know.
++//!
++//! The upgrade is a plan, like `5.15`'s restart: an order over the nodes, and a check that every
++//! handshake along the way is possible. Upgrading every node at once is not a plan; upgrading one and
++//! then waiting is.
++//!
++//! The handshake carries the version for one reason: the moment a node sees a major it does not
++//! speak, the right answer is a refusal that names the version — not a frame that gets misread.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// The version of the wire protocol one build speaks.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Protocol {
++    /// The wire format. Two builds with different majors cannot talk at all.
++    pub major: u32,
++    /// The compatible revision inside a major: a node speaks every minor up to its own.
++    pub minor: u32,
++}
++
++impl Protocol {
++    /// A protocol version.
++    #[must_use]
++    pub fn new(major: u32, minor: u32) -> Self {
++        let _ = (major, minor);
++        todo!("meshkv/5.21-protocol-evolution: Protocol::new")
++    }
++
++    /// Parse `major.minor`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the text is not two numbers separated by a dot.
++    pub fn parse(text: &str) -> Result<Self> {
++        let _ = text;
++        todo!("meshkv/5.21-protocol-evolution: Protocol::parse")
++    }
++
++    /// `true` when a build at `self` can *parse* what a build at `other` sends.
++    ///
++    /// A build understands every minor up to its own, and no further: the format grows, and a reader
++    /// that was written before a frame existed cannot read it. The rule is therefore asymmetric, and
++    /// the asymmetry is the whole constraint of a rolling upgrade — the newer build is the one that
++    /// has to hold back, because it is the one that could send something the older cannot parse.
++    #[must_use]
++    pub fn can_parse(&self, other: &Protocol) -> bool {
++        let _ = other;
++        todo!("meshkv/5.21-protocol-evolution: Protocol::can_parse")
++    }
++
++    /// The version as it is written: `major.minor`.
++    #[must_use]
++    pub fn render(self) -> String {
++        todo!("meshkv/5.21-protocol-evolution: Protocol::render")
++    }
++}
++
++/// What a handshake says about the build that sent it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Greeting {
++    /// The node's name.
++    pub node: NodeId,
++    /// The protocol version the build speaks.
++    pub protocol: Protocol,
++}
++
++impl Greeting {
++    /// A greeting from `node`, speaking `protocol`.
++    #[must_use]
++    pub fn new(node: NodeId, protocol: Protocol) -> Self {
++        let _ = (node, protocol);
++        todo!("meshkv/5.21-protocol-evolution: Greeting::new")
++    }
++}
++
++/// Check a greeting against the version this build speaks, and answer what to do with it.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the major differs — the refusal names both versions, because an operator
++/// reading it has to know which build is the odd one out — and when the peer speaks a newer minor
++/// than this build understands.
++pub fn accept(local: Protocol, greeting: &Greeting) -> Result<()> {
++    let _ = (local, greeting);
++    todo!("meshkv/5.21-protocol-evolution: Greeting::accept")
++}
++
++/// A plan to upgrade a cluster one node at a time.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Upgrade {
++    order: Vec<NodeId>,
++    from: Protocol,
++    to: Protocol,
++}
++
++impl Upgrade {
++    /// An upgrade of `order` from `from` to `to`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the order is empty, when the target is not newer than the source, or
++    /// when the majors differ — a major bump is not a rolling upgrade, and a plan that claimed to be
++    /// one would be a plan that stops the cluster.
++    pub fn new(order: &[NodeId], from: Protocol, to: Protocol) -> Result<Self> {
++        let _ = (order, from, to);
++        todo!("meshkv/5.21-protocol-evolution: Upgrade::new")
++    }
++
++    /// The nodes it upgrades, in order.
++    #[must_use]
++    pub fn order(&self) -> &[NodeId] {
++        todo!("meshkv/5.21-protocol-evolution: Upgrade::order")
++    }
++
++    /// Walk the plan and answer the phase each node runs in, in the plan's order.
++    ///
++    /// An upgraded node speaks the *old* minor until the last node is upgraded — that is the hold-back
++    /// the asymmetry of [`Protocol::can_parse`] requires — and the last step is where the cluster
++    /// starts speaking the new one. The phases are what an operator reads off a deploy log.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when a node in the order is not in the cluster (an empty plan is refused by
++    /// [`Upgrade::new`]), which would be a step that upgrades nobody.
++    pub fn phases(&self) -> Vec<Phase> {
++        todo!("meshkv/5.21-protocol-evolution: Upgrade::phases")
++    }
++}
++
++/// What one node runs during an upgrade.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Phase {
++    /// A new build, held back to the old minor until the whole cluster is upgraded.
++    Compat {
++        /// The version it speaks on the wire.
++        speaking: Protocol,
++        /// The version it was built at.
++        built: Protocol,
++    },
++    /// The last node: the cluster now speaks the new minor.
++    Native {
++        /// The version the cluster speaks.
++        version: Protocol,
++    },
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,6 +28,7 @@
+ pub mod idempotency;
+ pub mod kv;
+ pub mod metrics;
++pub mod protocol;
+ pub mod raft;
+ pub mod restart;
+ pub mod reuse;
+--- /dev/null
++++ b/docs/protocol.md
+@@ -0,0 +1,43 @@
++# Protocol evolution: two builds, one cluster
++
++A rolling upgrade is the third time this project holds two truths at once: joint consensus (`5.5`) held
++two memberships, certificate rotation (`5.9`) held two certificates, and this holds two **builds**. The
++rule is the same arithmetic in a different unit — every node has to be able to understand every other
++node, at every instant of the change — and two numbers make it checkable.
++
++## The two numbers
++
++- **major** is the wire format. Two builds with different majors cannot talk at all, so a rolling
++  upgrade may never have both in a running cluster. A major bump is a *stop-the-world* change, and the
++  plan refuses to pretend otherwise.
++- **minor** is compatible inside a major, and the compatibility is **asymmetric**: a build parses every
++  minor up to its own and no further. The newer build is therefore the one that has to hold back,
++  because it is the one that could send a frame the older cannot read.
++
++That asymmetry is the whole constraint of a rolling upgrade. A node upgraded to `1.2` speaks `1.1` on
++the wire until the last node is upgraded; only then does the cluster start speaking `1.2`.
++
++## The plan
++
++```text
++order:   n1        n2        n3
++phase:   compat    compat    native
++speaks:  1.1       1.1       1.2
++```
++
++The plan is an order plus the phases it produces, and an operator reads the phases off a deploy log:
++"n1 and n2 are new builds running in compatibility mode, n3 is where the cluster moves". A plan that
++claimed to cross a major is refused, and so is one that upgrades nobody.
++
++## The handshake
++
++The handshake carries the version, for one reason: the moment a node sees a version it cannot parse,
++the right answer is a refusal that **names both versions** — an operator reading it has to know which
++build is the odd one out. A frame that gets misread is a cluster that behaves strangely for reasons
++nobody can see; a refusal with two version numbers in it is a five-minute fix.
++
++## What this buys
++
++The same thing every "two truths" step bought: a change that can be *planned* rather than hoped for.
++The version rule is a sentence ("the newer build holds back"), the plan is a value, and the check runs
++before the deploy.
+--- /dev/null
++++ b/tests/sim_protocol.rs
+@@ -0,0 +1,99 @@
++//! The instrument for `meshkv/5.21-protocol-evolution`: two builds, one cluster.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is a rolling upgrade: the plan is
++//! walked in the seed's order, and every step prints whether the upgraded node can still talk to the
++//! ones that are not upgraded yet — and whether the last step is where the cluster starts speaking
++//! the new minor.
++//!
++//! The seed decides the order; the verdicts do not, and that is the point: a plan that only worked in
++//! one order would be a plan that fails in production.
++
++use meshkv::cluster::NodeId;
++use meshkv::protocol::{Phase, Protocol, Upgrade};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++fn node(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++fn version(text: &str) -> Protocol {
++    Protocol::parse(text).expect("a version")
++}
++
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++#[test]
++fn a_rolling_upgrade_holds_the_new_minor_back_until_the_last_node() {
++    let seed = seed();
++    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
++    let mut order = vec![node("n1"), node("n2"), node("n3")];
++    for at in 0..order.len() {
++        let pick = rng.below(order.len() - at);
++        order.swap(at, at + pick);
++    }
++
++    let plan = Upgrade::new(&order, version("1.1"), version("1.2")).expect("a plan");
++    let phases = plan.phases();
++    println!("meshkv-sim seed={seed} nodes={}", order.len());
++    let mut compat = 0;
++    let mut native = 0;
++    for (index, phase) in phases.iter().enumerate() {
++        match phase {
++            Phase::Compat { speaking, built } => {
++                compat += 1;
++                println!(
++                    "meshkv-sim step={index} node={} phase=compat speaking={} built={}",
++                    order[index],
++                    speaking.render(),
++                    built.render()
++                );
++                assert_eq!(
++                    *speaking,
++                    version("1.1"),
++                    "a compat node speaks the old minor"
++                );
++            }
++            Phase::Native { version: spoken } => {
++                native += 1;
++                println!(
++                    "meshkv-sim step={index} node={} phase=native version={}",
++                    order[index],
++                    spoken.render()
++                );
++                assert_eq!(*spoken, version("1.2"));
++            }
++        }
++    }
++    println!("meshkv-sim compat={compat} native={native}");
++    assert_eq!(
++        compat,
++        order.len() - 1,
++        "every node but the last holds back"
++    );
++    assert_eq!(native, 1, "and the last step is where the cluster moves");
++
++    // A major bump is refused whatever the order.
++    assert!(Upgrade::new(&order, version("1.9"), version("2.0")).is_err());
++}

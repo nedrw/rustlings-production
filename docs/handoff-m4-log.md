@@ -377,3 +377,49 @@ $ kiln selftest --track meshkv → 11/11 step(s) hold the contract
    规则：**声明原样保留、定义才替换**；而且 `;` 行只输出一次。
 4. **`Box<dyn Trait>` 不会自动实现 trait**：SDK 要泛型于 port，就必须给 `Box<dyn Backend>` 一个转发实现，
    否则"运行时选实现"的调用方（正是 conformance 的用法）编译不过。
+
+## 段 11：B4 收尾与 B5 —— 5.16 到 5.22（七步，T5 的 22 步全部写成）
+
+**5.16 混沌矩阵**（`slow:sim@3`）：`src/chaos.rs` 的 `MATRIX`（四种故障 × "客户端看到什么" × "必须仍成立什么"）
+与 `docs/chaos.md` 的同一张表逐行核对；`check()` 拒绝重复行、空单元、两列同话。`tests/sim_chaos.rs` 为每行
+造一个剧本。
+
+**5.17 分布式预算**（`bench-budget@10` + `links`）：`src/budget.rs` 的 `cost`/`workload`——quorum `⌊n/2⌋+1`、
+fan-out `n−1`、acks `quorum−1`；预算文件以 n=5、1000 写为基线。
+
+**5.18 集群可观测**（`bench-budget@10` + `links`，deepen）：`src/metrics.rs` 的 `NodeMetrics`（lag/选举/拒绝/提交）
+与整数 `Slo::budget_left`；正文用 RECALL/DELTA（deepen 步不许有 WHY——R5 抓到了我第一版）。
+
+**5.19 unsafe 深潜**（`links`）：`src/ring.rs` 的 SPSC 环（`MaybeUninit` + 两个原子）、三个义务各带 `// SAFETY:`
+（门只在 3 行回看里认注释）、`loom` 两个模型；manifest 的 `unsafe_code = "deny"` 在这步摘掉，轨道元数据从 5.19
+起改为 `unsafe-budget@5`。
+
+**5.20 复用 jobq**（`links`，D6 的唯一例外）：`jobq = { path = "../jobq" }` + `src/reuse.rs` 的
+`pub use jobq::engine::JobId` / `job_key` / `record_job`；验收是"`jobq` 零改动"。
+
+**5.21 协议演进**（`slow:sim@3` + `links`）：`src/protocol.rs` 的 `Protocol`（major 不可混、minor 非对称兼容：
+老构建认不出更新的 minor）、`accept` 的拒绝同时点名两个版本、`Upgrade::phases()`（除最后一个节点外全部 `compat`）。
+
+**5.22 一致性审计**（`links`）：`src/audit.rs` 的 `audit(&[State]) -> Report`——共同前缀、谁发散（同前缀不同
+digest）、一句可执行的 `summary()`。
+
+**原始结论行**：
+
+```
+$ kiln selftest --track meshkv
+22/22 step(s) hold the contract      （22 步，每步 scaffold 红 / 解绿 / must 门全绿）
+$ kiln lint-caps
+97 capabilities · 136 slots · 119 ledger positions · 119 authored steps · no issues
+$ kiln links → every target resolves
+```
+
+**这一段钉下来的五条**：
+
+1. **deepen 步不许有 `## WHY`**（R5）：5.18 的第一版写了 WHY，被"origin = deepen must not re-explain with
+   `## WHY`"直接拦下；改成 RECALL/DELTA 才过。
+2. **`unsafe-budget` 的 `// SAFETY:` 只回看 3 行**：多行解释会被算作"没有注释"，把说明压到两行以内。
+3. **生产代码禁下标**（`clippy::indexing_slicing`）：`self.slots[i]` 换成 `.get(i)` 并处理 `None`。
+4. **路径依赖的相对路径相对 crate 根**：`jobq = { path = "../jobq" }` 在 `app/meshkv` 里指向 `app/jobq`；
+   scratch 树里要放一个同形状的 stand-in 才能本地编译。
+5. **`drop 1`/`partition` 的单链路不是隔离**（5.13/5.14 的教训在 5.16 的矩阵里也成立）：剧本要隔离一个节点得
+   切它和**每一个** peer 的链路。
