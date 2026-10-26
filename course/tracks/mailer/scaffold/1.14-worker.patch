@@ -1,9 +1,7 @@
 diff --git a/src/delivery.rs b/src/delivery.rs
-new file mode 100644
-index 0000000..0d3d2cc
 --- /dev/null
 +++ b/src/delivery.rs
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,164 @@
 +//! The delivery queue: one bounded queue, one worker, and what happens when either runs out
 +//! (step `mailer/1.14-worker`).
 +//!
@@ -108,7 +106,9 @@ index 0000000..0d3d2cc
 +    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting. The
 +    /// scaffold never reports it: nothing waits here, so there is nothing to refuse.
 +    pub fn reserve(&self) -> Result<Seat<'_>, Error> {
-+        Ok(Seat { sender: &self.sender })
++        Ok(Seat {
++            sender: &self.sender,
++        })
 +    }
 +
 +    /// Stop taking work, finish what is queued, and answer how many messages were delivered.

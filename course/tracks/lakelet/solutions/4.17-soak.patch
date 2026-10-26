@@ -1,5 +1,4 @@
 diff --git a/docs/soak.md b/docs/soak.md
-index 5259952..fbb4905 100644
 --- a/docs/soak.md
 +++ b/docs/soak.md
 @@ -1,35 +1,146 @@
@@ -171,10 +170,9 @@ index 5259952..fbb4905 100644
 +the whole reason this page separates the store from the disk a paragraph above: a counter that
 +counts the wrong thing turns a soak into an argument with the wrong file.
 diff --git a/src/engine/compaction/mod.rs b/src/engine/compaction/mod.rs
-index 2ec66ff..b279bc5 100644
 --- a/src/engine/compaction/mod.rs
 +++ b/src/engine/compaction/mod.rs
-@@ -130,6 +130,7 @@ use std::sync::Arc;
+@@ -137,6 +137,7 @@ use std::sync::Arc;
  use crate::engine::index::{self, Lookup, SegmentIndex};
  use crate::engine::retention::{self, ExpireReport};
  use crate::engine::segment;
@@ -182,7 +180,7 @@ index 2ec66ff..b279bc5 100644
  use crate::engine::wal::checksum;
  use crate::error::Error;
  use crate::protocol::batch::Record;
-@@ -915,7 +916,9 @@ impl Segments {
+@@ -922,7 +923,9 @@ impl Segments {
      /// half-written index.
      fn write_manifest(&self, manifest: Manifest) -> Result<(), Error> {
          let pending = self.directory.join(PENDING);
@@ -193,7 +191,7 @@ index 2ec66ff..b279bc5 100644
          flush(&pending)?;
          std::fs::rename(&pending, self.directory.join(MANIFEST)).map_err(store)?;
          flush(&self.directory)
-@@ -1125,7 +1128,10 @@ fn refused(detail: String) -> Error {
+@@ -1132,7 +1135,10 @@ fn refused(detail: String) -> Error {
  /// Wait for the device on `path`: `sync_all`, not `fsync`, for the reason
  /// `docs/adr/0001-write-path.md` measured.
  fn flush(path: &Path) -> Result<(), Error> {
@@ -205,7 +203,7 @@ index 2ec66ff..b279bc5 100644
          .map_err(store)?
          .sync_all()
          .map_err(store)
-@@ -1170,7 +1176,7 @@ fn length_of(path: &Path) -> Result<u64, Error> {
+@@ -1177,7 +1183,7 @@ fn length_of(path: &Path) -> Result<u64, Error> {
  /// answer: this returns an error, because guessing would be a store with a hole in it.
  fn read_manifest(directory: &Path) -> Result<Manifest, Error> {
      let path = directory.join(MANIFEST);
@@ -215,7 +213,6 @@ index 2ec66ff..b279bc5 100644
          Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Manifest::empty()),
          Err(error) => Err(store(error)),
 diff --git a/src/engine/index/mod.rs b/src/engine/index/mod.rs
-index efad0fa..cf12579 100644
 --- a/src/engine/index/mod.rs
 +++ b/src/engine/index/mod.rs
 @@ -83,6 +83,7 @@ pub mod zone;
@@ -261,7 +258,6 @@ index efad0fa..cf12579 100644
          .sync_all()
          .map_err(store)
 diff --git a/src/engine/segment/mod.rs b/src/engine/segment/mod.rs
-index 48007d3..9941467 100644
 --- a/src/engine/segment/mod.rs
 +++ b/src/engine/segment/mod.rs
 @@ -52,6 +52,7 @@ pub mod encode;
@@ -306,7 +302,6 @@ index 48007d3..9941467 100644
  }
  
 diff --git a/src/engine/soak.rs b/src/engine/soak.rs
-index 3d6dd58..23cff89 100644
 --- a/src/engine/soak.rs
 +++ b/src/engine/soak.rs
 @@ -6,43 +6,42 @@
@@ -548,7 +543,7 @@ index 3d6dd58..23cff89 100644
      }
  
      /// Tasks the service has spawned and not reaped.
-@@ -287,6 +317,10 @@ impl Live {
+@@ -287,12 +317,63 @@ impl Live {
  
  impl Spool {
      /// How many of this store's files the write path holds open right now.
@@ -559,11 +554,9 @@ index 3d6dd58..23cff89 100644
      #[must_use]
      pub fn open_handles(&self) -> u64 {
          Open::at(self.directory()).get()
-@@ -300,3 +334,50 @@ impl Segments {
-         Open::at(self.directory()).get()
      }
  }
-+
+ 
 +/// The counters of every store this process has a counter for.
 +fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Open>>> {
 +    static COUNTERS: OnceLock<Mutex<HashMap<PathBuf, Weak<Open>>>> = OnceLock::new();
@@ -610,8 +603,11 @@ index 3d6dd58..23cff89 100644
 +fn length_of(path: &Path) -> Option<u64> {
 +    std::fs::metadata(path).ok().map(|metadata| metadata.len())
 +}
++
+ impl Segments {
+     /// How many of this store's files the segment set holds open right now.
+     #[must_use]
 diff --git a/src/engine/spool.rs b/src/engine/spool.rs
-index bb6cc46..23b0424 100644
 --- a/src/engine/spool.rs
 +++ b/src/engine/spool.rs
 @@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
@@ -635,7 +631,6 @@ index bb6cc46..23b0424 100644
              Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
              Err(error) => return Err(store(error)),
 diff --git a/src/engine/spool/batch.rs b/src/engine/spool/batch.rs
-index d3fa0f1..74bf266 100644
 --- a/src/engine/spool/batch.rs
 +++ b/src/engine/spool/batch.rs
 @@ -27,6 +27,7 @@ use std::io::Write;
@@ -664,7 +659,6 @@ index d3fa0f1..74bf266 100644
          calls += 1;
          file.write_all(&bytes).map_err(store)?;
 diff --git a/src/engine/spool/durable.rs b/src/engine/spool/durable.rs
-index 0b56c1c..29b2bdc 100644
 --- a/src/engine/spool/durable.rs
 +++ b/src/engine/spool/durable.rs
 @@ -17,6 +17,7 @@ use std::path::PathBuf;
@@ -713,7 +707,6 @@ index 0b56c1c..29b2bdc 100644
          // first one waits for the device.
          file.sync_all().map_err(store)?;
 diff --git a/src/engine/wal/replay.rs b/src/engine/wal/replay.rs
-index 15ff4f3..50950a9 100644
 --- a/src/engine/wal/replay.rs
 +++ b/src/engine/wal/replay.rs
 @@ -35,6 +35,7 @@
@@ -757,7 +750,6 @@ index 15ff4f3..50950a9 100644
              source: Box::new(error),
          })
 diff --git a/src/service/backpressure.rs b/src/service/backpressure.rs
-index 6b6599c..ffd75a8 100644
 --- a/src/service/backpressure.rs
 +++ b/src/service/backpressure.rs
 @@ -283,6 +283,11 @@ pub struct Queue {
@@ -781,7 +773,6 @@ index 6b6599c..ffd75a8 100644
      }
  
 diff --git a/src/service/ingest.rs b/src/service/ingest.rs
-index 8284d2d..5743e7f 100644
 --- a/src/service/ingest.rs
 +++ b/src/service/ingest.rs
 @@ -123,7 +123,11 @@ pub async fn serve(
@@ -826,7 +817,6 @@ index 8284d2d..5743e7f 100644
          Ok(Err(error)) => Err(error),
          Err(error) => Err(Error::Store {
 diff --git a/src/service/soak.rs b/src/service/soak.rs
-index 3373b5f..a4814fe 100644
 --- a/src/service/soak.rs
 +++ b/src/service/soak.rs
 @@ -11,21 +11,12 @@

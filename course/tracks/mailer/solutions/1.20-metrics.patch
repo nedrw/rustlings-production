@@ -1,5 +1,4 @@
 diff --git a/src/delivery.rs b/src/delivery.rs
-index aa83a37..793fcce 100644
 --- a/src/delivery.rs
 +++ b/src/delivery.rs
 @@ -43,6 +43,7 @@ use tracing::{error, info, warn};
@@ -129,7 +128,6 @@ index aa83a37..793fcce 100644
          for _ in 0..super::QUEUE_CAPACITY {
              seats.push(queue.reserve().expect("the queue has room to fill"));
 diff --git a/src/http.rs b/src/http.rs
-index c8b74d3..8e41385 100644
 --- a/src/http.rs
 +++ b/src/http.rs
 @@ -39,9 +39,10 @@
@@ -270,7 +268,6 @@ index c8b74d3..8e41385 100644
  ///
  /// One name, in one place: the login that sets it, the logout that clears it, and the lookup that
 diff --git a/src/lib.rs b/src/lib.rs
-index 1b61a03..2206f24 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -24,6 +24,7 @@ pub mod error;
@@ -282,7 +279,6 @@ index 1b61a03..2206f24 100644
  pub mod session;
  pub mod signup;
 diff --git a/src/metrics.rs b/src/metrics.rs
-index 3e8b167..659c897 100644
 --- a/src/metrics.rs
 +++ b/src/metrics.rs
 @@ -25,15 +25,6 @@
@@ -301,7 +297,7 @@ index 3e8b167..659c897 100644
  //! What is deliberately *not* here: an SLO is a number somebody agrees to, and this file can only
  //! offer the ingredients. The step's prose (and `docs/slo.md` in a deployment) is where the agreement
  //! lives — this is the part of it a machine can check.
-@@ -165,18 +156,69 @@ impl Metrics {
+@@ -165,9 +156,8 @@ impl Metrics {
  
      /// The exposition: one sample per line, in the text format a scraper reads.
      ///
@@ -313,10 +309,9 @@ index 3e8b167..659c897 100644
      #[must_use]
      pub fn render(&self) -> String {
          let mut out = String::new();
--        out.push_str("# HELP http_requests_total Requests answered, by matched route and status.\n");
-+        out.push_str(
-+            "# HELP http_requests_total Requests answered, by matched route and status.\n",
-+        );
+@@ -175,10 +165,60 @@ impl Metrics {
+             "# HELP http_requests_total Requests answered, by matched route and status.\n",
+         );
          out.push_str("# TYPE http_requests_total counter\n");
 +        for ((route, status), count) in self
 +            .requests

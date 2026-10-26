@@ -208,6 +208,27 @@ patch 是文本，`@@ -0,0 +1,695 @@` 里的 `695` 是**行数**。往一个“�
 ③ 跑 `cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings`——被截断的文件必然编译不过，
 这是唯一会把它拉出来的门。
 
+### 5.5 不要手改 patch——修树，再由树重新生成（M4 评审后定稿）
+
+补丁是**派生物**：第 N 步的 scaffold 是「第 N−1 步 full 树 → 第 N 步 stub 树」的 diff，solution 是
+「stub 树 → full 树」的 diff，而树本身由补丁链铺出来。手改任何一份补丁都在和这条链作对——§5.4 的
+hunk 头只是它最浅的一种死法（M4 一个 session 里实测三起）。要改参考代码，用仓库里的工具：
+
+```sh
+# 验证：五条 track 的每份已提交补丁都等于它定义的树所产出的 diff（CI 也在跑这一条）
+python3 tools/rebuild-patches.py --track meshkv --check
+
+# 修改：写一个 fixes 模块（apply_fixes(tree, step, stub)），工具负责其余一切
+python3 tools/rebuild-patches.py --track meshkv --fixes /tmp/fixes.py
+```
+
+工具自己铺链（`kiln prepare` + `kiln solution`，全程不编译）、把修复应用到每棵树、**先 rustfmt 再
+diff**（交付未格式化的树第一道 fmt 门就红）、按**已提交补丁自己的段标签与段序**重生成
+（`--- /dev/null` 是 kiln 判"创建文件"的唯一依据）、拒绝会删行的 scaffold，并在比较时只比较语义
+（段序 + 每段增删行）——上下文宽度与 hunk 边界是差异器的自由度，不是内容。fixes 模块只能改补丁
+已携带的文件；新增文件要连段一起加。200 字节以内的参考代码改动才考虑手补丁，且改完必须跑
+`--check`。
+
 ## 6. 规格测试规则
 
 1. 规格测试**只读**（`spec/`，哈希入清单），且不得包含 `#[ignore]`。

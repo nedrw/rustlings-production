@@ -1,9 +1,7 @@
 diff --git a/src/metrics.rs b/src/metrics.rs
-new file mode 100644
-index 0000000..3e8b167
 --- /dev/null
 +++ b/src/metrics.rs
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,184 @@
 +//! What this service counts, and what a metric name promises (step `mailer/1.20-metrics`).
 +//!
 +//! Logs answer "what happened to this request"; metrics answer "how is this service doing", which is
@@ -177,7 +175,9 @@ index 0000000..3e8b167
 +    #[must_use]
 +    pub fn render(&self) -> String {
 +        let mut out = String::new();
-+        out.push_str("# HELP http_requests_total Requests answered, by matched route and status.\n");
++        out.push_str(
++            "# HELP http_requests_total Requests answered, by matched route and status.\n",
++        );
 +        out.push_str("# TYPE http_requests_total counter\n");
 +        out.push_str("# HELP http_request_duration_seconds Request duration, by matched route.\n");
 +        out.push_str("# TYPE http_request_duration_seconds histogram\n");

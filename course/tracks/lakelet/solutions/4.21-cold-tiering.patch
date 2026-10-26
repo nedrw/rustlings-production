@@ -1,5 +1,4 @@
 diff --git a/conformance.toml b/conformance.toml
-index 05813a1..ccbdf1c 100644
 --- a/conformance.toml
 +++ b/conformance.toml
 @@ -6,6 +6,9 @@
@@ -16,7 +15,6 @@ index 05813a1..ccbdf1c 100644
 +# real bucket instead and nothing else changes.
 +backends = ["local", "s3"]
 diff --git a/src/engine/tier/filesystem.rs b/src/engine/tier/filesystem.rs
-index 5ded632..949a384 100644
 --- a/src/engine/tier/filesystem.rs
 +++ b/src/engine/tier/filesystem.rs
 @@ -105,10 +105,21 @@ impl Directory {
@@ -45,7 +43,7 @@ index 5ded632..949a384 100644
      }
  
      /// Where `key`'s file is, for a caller that has to look.
-@@ -122,53 +133,127 @@ impl Directory {
+@@ -122,49 +133,127 @@ impl Directory {
  
      /// Every key below the root that starts with `prefix`, in key order.
      fn keys_under(&self, prefix: &str) -> Result<Vec<String>, Error> {
@@ -104,9 +102,7 @@ index 5ded632..949a384 100644
  
  impl Objects for Directory {
      fn prefix(&self) -> &str {
--        todo!(
--            "lakelet/4.21-cold-tiering: the prefix this port's store lives under"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the prefix this port's store lives under")
 +        &self.prefix
      }
  
@@ -156,9 +152,7 @@ index 5ded632..949a384 100644
  
      fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
 -        let _ = key;
--        todo!(
--            "lakelet/4.21-cold-tiering: the object's bytes, or `None` when there is no such file"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the object's bytes, or `None` when there is no such file")
 +        let path = self.path_of(key)?;
 +        match fs::read(&path) {
 +            Ok(bytes) => Ok(Some(bytes)),
@@ -201,16 +195,13 @@ index 5ded632..949a384 100644
      }
  }
 diff --git a/src/engine/tier/http.rs b/src/engine/tier/http.rs
-index 07adc98..416926c 100644
 --- a/src/engine/tier/http.rs
 +++ b/src/engine/tier/http.rs
-@@ -151,30 +151,41 @@ impl Request {
+@@ -151,28 +151,41 @@ impl Request {
      /// a copy.
      #[must_use]
      pub fn payload_hash(&self) -> String {
--        todo!(
--            "lakelet/4.21-cold-tiering: the sha256 of this request's own body, in hex"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the sha256 of this request's own body, in hex")
 +        hex_of(&sha256(&self.body))
      }
  
@@ -258,7 +249,7 @@ index 07adc98..416926c 100644
      }
  
      /// The string a signature is computed over: one value, from the request that is sent.
-@@ -189,18 +200,44 @@ impl Request {
+@@ -187,18 +200,44 @@ impl Request {
      /// after it was hashed changes the signature with it.
      #[must_use]
      pub fn canonical_request(&self, signed: &[&str]) -> String {
@@ -310,7 +301,7 @@ index 07adc98..416926c 100644
      }
  }
  
-@@ -248,9 +285,12 @@ impl Response {
+@@ -246,9 +285,12 @@ impl Response {
      /// What a caller has to *do* about this answer.
      #[must_use]
      pub fn class(&self) -> Class {
@@ -326,7 +317,7 @@ index 07adc98..416926c 100644
      }
  }
  
-@@ -308,10 +348,42 @@ impl Client {
+@@ -306,10 +348,42 @@ impl Client {
      /// [`Error::Invalid`] when the endpoint is not an authority this client can speak to, and
      /// [`Error::Transport`] when the runtime itself cannot be built.
      pub fn new(endpoint: &str) -> Result<Self, Error> {
@@ -373,7 +364,7 @@ index 07adc98..416926c 100644
      }
  
      /// The `host:port` this client connects to, which is also the `Host` header it sends.
-@@ -338,18 +410,39 @@ impl Client {
+@@ -336,16 +410,39 @@ impl Client {
      /// request, and a caller has to decide whether to try the whole pass again (a sweep does, an
      /// hour later, from a schedule it owns).
      pub fn send(&self, request: &Request) -> Result<Response, Error> {
@@ -404,9 +395,7 @@ index 07adc98..416926c 100644
      /// One attempt: connect, write, read the answer.
      fn attempt(&self, request: &Request) -> Result<Response, Error> {
 -        let _ = request;
--        todo!(
--            "lakelet/4.21-cold-tiering: one attempt: connect, write, read the answer"
--        )
+-        todo!("lakelet/4.21-cold-tiering: one attempt: connect, write, read the answer")
 +        let wire = request.wire(&self.authority);
 +        let authority = self.authority.clone();
 +        let ran = self.runtime.block_on(async move {
@@ -421,14 +410,12 @@ index 07adc98..416926c 100644
      }
  }
  
-@@ -360,35 +453,99 @@ impl Client {
+@@ -356,26 +453,98 @@ impl Client {
  /// measured that trap). An answer with no `content-length` is read to the close, which is HTTP/1.0's
  /// rule and the only other thing a body can mean.
  async fn read_answer(stream: &mut TcpStream) -> io::Result<Response> {
--        let _ = stream;
--        todo!(
--            "lakelet/4.21-cold-tiering: read a head, and then the body it promised"
--        )
+-    let _ = stream;
+-    todo!("lakelet/4.21-cold-tiering: read a head, and then the body it promised")
 +    let mut buffer: Vec<u8> = Vec::new();
 +    let mut chunk = vec![0u8; 8192];
 +    // Where the head ends, once a blank line has said so: the one fact the loop needs to know when
@@ -460,21 +447,19 @@ index 07adc98..416926c 100644
 +        if head.is_none() {
 +            head = find(&buffer, b"\r\n\r\n").map(|at| at + 4);
 +        }
-     }
++    }
 +    let Some(end) = head else {
 +        return Err(io::Error::other("the answer ended before its head did"));
 +    };
 +    let promised = promised_length(&buffer, end)?.unwrap_or(buffer.len() - end);
 +    let body = buffer.get(end..end + promised).unwrap_or_default().to_vec();
 +    parse(buffer.get(..end).unwrap_or_default(), body)
-+}
+ }
  
  /// How many bytes the head promises, or `None` when it promises none.
  fn promised_length(buffer: &[u8], end: usize) -> io::Result<Option<usize>> {
--        let _ = (buffer, end);
--        todo!(
--            "lakelet/4.21-cold-tiering: how many bytes an answer's head promises, if it promises any"
--        )
+-    let _ = (buffer, end);
+-    todo!("lakelet/4.21-cold-tiering: how many bytes an answer's head promises, if it promises any")
 +    let head = String::from_utf8_lossy(buffer.get(..end).unwrap_or_default()).into_owned();
 +    for line in head.lines().skip(1) {
 +        let Some((name, value)) = line.split_once(':') else {
@@ -488,17 +473,14 @@ index 07adc98..416926c 100644
 +                ))
 +            });
 +        }
-     }
++    }
 +    Ok(None)
-+}
+ }
  
  /// The status line and headers of `head`, with `body` as the answer's body.
  fn parse(head: &[u8], body: Vec<u8>) -> io::Result<Response> {
--        let _ = (head, body);
--        todo!(
--            "lakelet/4.21-cold-tiering: the status line and the headers of an answer"
--        )
--    }
+-    let _ = (head, body);
+-    todo!("lakelet/4.21-cold-tiering: the status line and the headers of an answer")
 +    let text = String::from_utf8_lossy(head).into_owned();
 +    let mut lines = text.lines();
 +    let Some(status_line) = lines.next() else {
@@ -521,31 +503,28 @@ index 07adc98..416926c 100644
 +        headers,
 +        body,
 +    })
-+}
+ }
  
  /// Where `needle` first stands in `haystack`.
  fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
--        let _ = (haystack, needle);
--        todo!(
--            "lakelet/4.21-cold-tiering: where a needle first stands in a haystack"
--        )
+-    let _ = (haystack, needle);
+-    todo!("lakelet/4.21-cold-tiering: where a needle first stands in a haystack")
 +    if needle.is_empty() || haystack.len() < needle.len() {
 +        return None;
-     }
++    }
 +    (0..=haystack.len() - needle.len())
 +        .find(|at| haystack.get(*at..at + needle.len()) == Some(needle))
-+}
+ }
  
  /// `text` with everything that is not unreserved percent-encoded, upper case, byte for byte.
- ///
-@@ -396,24 +553,26 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+@@ -384,20 +553,26 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
  /// query are encoded the same way for the signature and for the wire, so a key with a space or a
  /// `+` in it is one request rather than two.
  fn encoded(text: &str) -> String {
--        let _ = text;
--        todo!(
--            "lakelet/4.21-cold-tiering: everything that is not unreserved percent-encoded, upper case"
--        )
+-    let _ = text;
+-    todo!(
+-        "lakelet/4.21-cold-tiering: everything that is not unreserved percent-encoded, upper case"
+-    )
 +    let mut out = String::with_capacity(text.len());
 +    for byte in text.bytes() {
 +        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -553,34 +532,27 @@ index 07adc98..416926c 100644
 +        } else {
 +            out.push_str(&format!("%{byte:02X}"));
 +        }
-     }
++    }
 +    out
-+}
+ }
  
  /// The sha256 of `bytes`.
  fn sha256(bytes: &[u8]) -> [u8; 32] {
--        let _ = bytes;
--        todo!(
--            "lakelet/4.21-cold-tiering: the hash every signed request is made of"
--        )
--    }
+-    let _ = bytes;
+-    todo!("lakelet/4.21-cold-tiering: the hash every signed request is made of")
 +    use sha2::Digest as _;
 +    let mut hasher = sha2::Sha256::new();
 +    hasher.update(bytes);
 +    hasher.finalize().into()
-+}
+ }
  
  /// `bytes` as lower-case hex.
  pub(crate) fn hex_of(bytes: &[u8]) -> String {
--        let _ = bytes;
--        todo!(
--            "lakelet/4.21-cold-tiering: bytes as lower-case hex"
--        )
--    }
+-    let _ = bytes;
+-    todo!("lakelet/4.21-cold-tiering: bytes as lower-case hex")
 +    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-+}
+ }
 diff --git a/src/engine/tier/mod.rs b/src/engine/tier/mod.rs
-index 114f32a..1962250 100644
 --- a/src/engine/tier/mod.rs
 +++ b/src/engine/tier/mod.rs
 @@ -313,10 +313,10 @@ impl Policy {
@@ -598,32 +570,31 @@ index 114f32a..1962250 100644
      }
  }
  
-@@ -539,11 +539,13 @@ impl Listing {
+@@ -539,10 +539,12 @@ impl Listing {
  /// idempotency key (`lakelet/4.21`).
  #[must_use]
  pub fn object_key(prefix: &str, ordinal: u64) -> String {
--        let _ = (prefix, ordinal);
--        todo!(
--            "lakelet/4.21-cold-tiering: the key a segment's bytes live under — the file the store gives it, under the port's prefix"
--        )
+-    let _ = (prefix, ordinal);
+-    todo!(
+-        "lakelet/4.21-cold-tiering: the key a segment's bytes live under — the file the store gives it, under the port's prefix"
+-    )
 +    let name = compaction::file_of(Path::new(""), ordinal);
 +    let name = name.to_string_lossy();
 +    if prefix.is_empty() {
 +        return name.into_owned();
-     }
++    }
 +    format!("{}/{name}", prefix.trim_end_matches('/'))
-+}
+ }
  
  /// Every key a port holds under `prefix`, walking its pages.
- ///
-@@ -559,11 +561,28 @@ pub fn object_key(prefix: &str, ordinal: u64) -> String {
+@@ -559,10 +561,27 @@ pub fn object_key(prefix: &str, ordinal: u64) -> String {
  ///
  /// Everything [`Objects::list`] refuses, and [`Error::Transport`] when the cursor does not advance.
  pub fn listing(objects: &dyn Objects, prefix: &str) -> Result<Listing, Error> {
--        let _ = (objects, prefix);
--        todo!(
--            "lakelet/4.21-cold-tiering: walk the pages a port answers with, and refuse an endpoint that never advances"
--        )
+-    let _ = (objects, prefix);
+-    todo!(
+-        "lakelet/4.21-cold-tiering: walk the pages a port answers with, and refuse an endpoint that never advances"
+-    )
 +    let mut keys: Vec<String> = Vec::new();
 +    let mut pages = 0u64;
 +    let mut cursor: Option<Cursor> = None;
@@ -644,19 +615,18 @@ index 114f32a..1962250 100644
 +            });
 +        }
 +        cursor = Some(next);
-     }
-+}
++    }
+ }
  
  /// Move every cold segment out of the box and into the tier.
- ///
-@@ -592,11 +611,33 @@ pub fn sweep(
+@@ -592,10 +611,32 @@ pub fn sweep(
      policy: &Policy,
      now_millis: u64,
  ) -> Result<Report, Error> {
--        let _ = (store, objects, policy, now_millis);
--        todo!(
--            "lakelet/4.21-cold-tiering: the object first and the local file second, for every segment the policy calls cold"
--        )
+-    let _ = (store, objects, policy, now_millis);
+-    todo!(
+-        "lakelet/4.21-cold-tiering: the object first and the local file second, for every segment the policy calls cold"
+-    )
 +    let mut report = Report::default();
 +    for info in store.manifest().segments() {
 +        if !policy.is_cold(info, now_millis) {
@@ -681,20 +651,19 @@ index 114f32a..1962250 100644
 +        })?;
 +        report.moved += 1;
 +        report.bytes += info.bytes;
-     }
++    }
 +    Ok(report)
-+}
+ }
  
  /// Put back every segment of the store at `directory` whose local file is missing, or is not what
- /// the manifest says.
 @@ -633,8 +674,62 @@ pub fn sweep(
  /// [`Error::Damaged`] when what it holds is not the length the manifest states, [`Error::Local`]
  /// when a file cannot be written or looked at, and the port's own refusals.
  pub fn hydrate(directory: impl AsRef<Path>, objects: &dyn Objects) -> Result<Report, Error> {
--        let _ = (directory, objects);
--        todo!(
--            "lakelet/4.21-cold-tiering: fetch back every segment whose file is missing or is not the length the manifest states, checking that length before anything is written"
--        )
+-    let _ = (directory, objects);
+-    todo!(
+-        "lakelet/4.21-cold-tiering: fetch back every segment whose file is missing or is not the length the manifest states, checking that length before anything is written"
+-    )
 +    let directory: &Path = directory.as_ref();
 +    let manifest =
 +        compaction::Manifest::read(directory).map_err(|source| Error::Manifest { source })?;
@@ -715,7 +684,7 @@ index 114f32a..1962250 100644
 +                });
 +            }
 +        }
-     }
++    }
 +    if needed.is_empty() {
 +        return Ok(report);
 +    }
@@ -753,23 +722,20 @@ index 114f32a..1962250 100644
 +        report.bytes += info.bytes;
 +    }
 +    Ok(report)
-+}
+ }
 diff --git a/src/engine/tier/s3.rs b/src/engine/tier/s3.rs
-index c1cfedb..1f36f34 100644
 --- a/src/engine/tier/s3.rs
 +++ b/src/engine/tier/s3.rs
-@@ -82,9 +82,7 @@ pub struct Config {
+@@ -82,7 +82,7 @@ pub struct Config {
  impl Config {
      /// The date stamp the credential scope starts with: `20261008`.
      fn stamp(&self) -> String {
--        todo!(
--            "lakelet/4.21-cold-tiering: the date stamp the credential scope starts with"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the date stamp the credential scope starts with")
 +        self.date.get(..8).unwrap_or_default().to_owned()
      }
  
      /// The credential scope: `date/region/service/aws4_request`.
-@@ -94,8 +92,11 @@ impl Config {
+@@ -92,8 +92,11 @@ impl Config {
      /// else in another would sign a request nobody accepts.
      #[must_use]
      pub fn scope(&self) -> String {
@@ -783,14 +749,12 @@ index c1cfedb..1f36f34 100644
          )
      }
  
-@@ -203,10 +204,10 @@ impl Bucket {
+@@ -201,8 +204,10 @@ impl Bucket {
  
      /// The path one key of this bucket is addressed by: `/bucket/key`.
      fn path(&self, key: &str) -> String {
 -        let _ = key;
--        todo!(
--            "lakelet/4.21-cold-tiering: the path one key of this bucket is addressed by"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the path one key of this bucket is addressed by")
 +        if key.is_empty() {
 +            return format!("/{}", self.config.bucket);
 +        }
@@ -798,7 +762,7 @@ index c1cfedb..1f36f34 100644
      }
  
      /// The headers a signature covers: every header the request carries except the signature.
-@@ -217,10 +218,15 @@ impl Bucket {
+@@ -213,10 +218,15 @@ impl Bucket {
      /// refusal with no useful message. Sorted and lower-cased, which is the form SigV4 signs.
      #[must_use]
      pub fn signed_headers(&self, request: &Request) -> Vec<String> {
@@ -818,7 +782,7 @@ index c1cfedb..1f36f34 100644
      }
  
      /// The signing key: the secret, folded through the date, the region, the service and the
-@@ -232,9 +238,11 @@ impl Bucket {
+@@ -228,9 +238,11 @@ impl Bucket {
      /// immutable (which is why [`Config`]'s fields are values and not a lock), and a signature that
      /// depended on a cached key would be a signature that depended on which request came first.
      fn signing_key(&self) -> [u8; 32] {
@@ -833,7 +797,7 @@ index c1cfedb..1f36f34 100644
      }
  
      /// The `authorization` header for `request`: what makes it a signed request.
-@@ -244,9 +252,20 @@ impl Bucket {
+@@ -240,9 +252,20 @@ impl Bucket {
      /// caller built by hand, is the same string the operations below put on their own requests.
      #[must_use]
      pub fn authorization(&self, request: &Request) -> String {
@@ -857,7 +821,7 @@ index c1cfedb..1f36f34 100644
          )
      }
  
-@@ -259,18 +278,19 @@ impl Bucket {
+@@ -255,16 +278,19 @@ impl Bucket {
      /// of what a signature covers: a request signed before its query was written is a request that
      /// signs one URL and sends another, which is the failure this whole file is arranged around.
      fn signable(&self, method: &str, key: &str, body: Vec<u8>) -> Request {
@@ -877,15 +841,13 @@ index c1cfedb..1f36f34 100644
      /// The same request, signed: the one place `authorization` is added.
      fn signed(&self, request: Request) -> Request {
 -        let _ = request;
--        todo!(
--            "lakelet/4.21-cold-tiering: the same request, signed"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the same request, signed")
 +        let authorization = self.authorization(&request);
 +        request.with_header("authorization", &authorization)
      }
  
      /// Send a signed request, and answer what the endpoint said.
-@@ -285,72 +305,152 @@ impl Bucket {
+@@ -279,59 +305,151 @@ impl Bucket {
      /// which. The scope is quoted because a scope is what most mismatches are — a region, a service
      /// or a date that is not the endpoint's.
      fn refusal(&self, request: &Request, response: &Response) -> Error {
@@ -917,17 +879,13 @@ index c1cfedb..1f36f34 100644
  
  impl Objects for Bucket {
      fn prefix(&self) -> &str {
--        todo!(
--            "lakelet/4.21-cold-tiering: the prefix this port's store lives under"
--        )
+-        todo!("lakelet/4.21-cold-tiering: the prefix this port's store lives under")
 +        &self.prefix
      }
  
      fn put(&self, key: &str, bytes: &[u8]) -> Result<(), Error> {
 -        let _ = (key, bytes);
--        todo!(
--            "lakelet/4.21-cold-tiering: `PutObject`: a PUT of the object's own path"
--        )
+-        todo!("lakelet/4.21-cold-tiering: `PutObject`: a PUT of the object's own path")
 +        let request = self.signed(self.signable("PUT", key, bytes.to_vec()));
 +        let response = self.exchange(&request)?;
 +        match response.class() {
@@ -942,9 +900,7 @@ index c1cfedb..1f36f34 100644
  
      fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
 -        let _ = key;
--        todo!(
--            "lakelet/4.21-cold-tiering: `GetObject`: a 404 is `None` rather than a refusal"
--        )
+-        todo!("lakelet/4.21-cold-tiering: `GetObject`: a 404 is `None` rather than a refusal")
 +        let request = self.signed(self.signable("GET", key, Vec::new()));
 +        let response = self.exchange(&request)?;
 +        match response.class() {
@@ -1012,25 +968,20 @@ index c1cfedb..1f36f34 100644
  
  /// The text between the first `<name>` and the `</name>` after it.
  fn element(text: &str, name: &str) -> Option<String> {
--        let _ = (text, name);
--        todo!(
--            "lakelet/4.21-cold-tiering: the text between an element's tags"
--        )
--    }
+-    let _ = (text, name);
+-    todo!("lakelet/4.21-cold-tiering: the text between an element's tags")
 +    let opening = format!("<{name}>");
 +    let closing = format!("</{name}>");
 +    let start = text.find(&opening)? + opening.len();
 +    let rest = text.get(start..)?;
 +    let end = rest.find(&closing)?;
 +    rest.get(..end).map(str::to_owned)
-+}
+ }
  
  /// The text between every `<name>` and its `</name>`.
  fn elements(text: &str, name: &str) -> Vec<String> {
--        let _ = (text, name);
--        todo!(
--            "lakelet/4.21-cold-tiering: the text between every one of them"
--        )
+-    let _ = (text, name);
+-    todo!("lakelet/4.21-cold-tiering: the text between every one of them")
 +    let mut found: Vec<String> = Vec::new();
 +    let mut rest = text;
 +    while let Some(value) = element(rest, name) {
@@ -1043,16 +994,14 @@ index c1cfedb..1f36f34 100644
 +            Some(tail) if !tail.is_empty() => rest = tail,
 +            _ => break,
 +        }
-     }
++    }
 +    found
-+}
+ }
  
  /// `true` when `date` is the one shape a credential scope and an `x-amz-date` may have.
  fn check_date(date: &str) -> Result<(), Error> {
--        let _ = date;
--        todo!(
--            "lakelet/4.21-cold-tiering: whether a date is one a signature can be dated with"
--        )
+-    let _ = date;
+-    todo!("lakelet/4.21-cold-tiering: whether a date is one a signature can be dated with")
 +    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
 +    let good = date.len() == 16
 +        && date.get(8..9) == Some("T")
@@ -1061,7 +1010,7 @@ index c1cfedb..1f36f34 100644
 +        && date.get(9..15).is_some_and(digits);
 +    if good {
 +        return Ok(());
-     }
++    }
 +    Err(Error::Invalid {
 +        detail: format!(
 +            "`{date}` is not an instant a signature can be dated with: `x-amz-date` and the \
@@ -1070,18 +1019,17 @@ index c1cfedb..1f36f34 100644
 +             differently on two machines"
 +        ),
 +    })
-+}
+ }
  
  /// The HMAC-SHA256 of `data` under `key`.
- ///
-@@ -360,30 +460,36 @@ fn check_date(date: &str) -> Result<(), Error> {
+@@ -342,10 +460,19 @@ fn check_date(date: &str) -> Result<(), Error> {
  /// takes a key of any length and answers a `Result` for a length no byte string can have, and a
  /// signature is not a thing this build should be able to fail at.
  fn mac(key: &[u8], data: &[u8]) -> [u8; 32] {
--        let _ = (key, data);
--        todo!(
--            "lakelet/4.21-cold-tiering: HMAC-SHA256 of the data under the key, with HMAC's own rule for the key"
--        )
+-    let _ = (key, data);
+-    todo!(
+-        "lakelet/4.21-cold-tiering: HMAC-SHA256 of the data under the key, with HMAC's own rule for the key"
+-    )
 +    let mut block = [0u8; BLOCK];
 +    let derived: Vec<u8> = if key.len() > BLOCK {
 +        sha256(key).to_vec()
@@ -1091,37 +1039,30 @@ index c1cfedb..1f36f34 100644
 +    let take = derived.len().min(BLOCK);
 +    if let (Some(slot), Some(head)) = (block.get_mut(..take), derived.get(..take)) {
 +        slot.copy_from_slice(head);
-     }
++    }
 +    let mut mac = HmacSha256::new(&Key::<HmacSha256>::from(block));
 +    mac.update(data);
 +    mac.finalize().into_bytes().into()
-+}
+ }
  
  /// The typed name of the MAC this build signs with.
- type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+@@ -353,14 +480,15 @@ type HmacSha256 = hmac::Hmac<sha2::Sha256>;
  
  /// The sha256 of `bytes`.
  fn sha256(bytes: &[u8]) -> [u8; 32] {
--        let _ = bytes;
--        todo!(
--            "lakelet/4.21-cold-tiering: the hash every signed request is made of"
--        )
--    }
+-    let _ = bytes;
+-    todo!("lakelet/4.21-cold-tiering: the hash every signed request is made of")
 +    use sha2::Digest as _;
 +    let mut hasher = sha2::Sha256::new();
 +    hasher.update(bytes);
 +    hasher.finalize().into()
-+}
+ }
  
  /// `bytes` as lower-case hex.
  fn hex(bytes: &[u8]) -> String {
--        let _ = bytes;
--        todo!(
--            "lakelet/4.21-cold-tiering: bytes as lower-case hex"
--        )
--    }
+-    let _ = bytes;
+-    todo!("lakelet/4.21-cold-tiering: bytes as lower-case hex")
 +    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-+}
+ }
  
  impl fmt::Display for Config {
-     /// The endpoint, the bucket and the scope — and the access key, which is an identifier rather

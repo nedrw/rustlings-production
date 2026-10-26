@@ -101,6 +101,7 @@ fn ci() -> Result<(), String> {
     )?;
     run(&root, "cargo", &["test", "--workspace"])?;
     spec_integrity(&root)?;
+    patches_check(&root)?;
     lint_caps(&root)?;
     // `links` reads the tree and answers in under a second; `probe_check` starts a scratch crate.
     links(&root)?;
@@ -135,6 +136,62 @@ fn spec_integrity(root: &Path) -> Result<(), String> {
         "{} spec integrity problem(s)",
         audit.problems.len()
     ))
+}
+
+/// `tools/rebuild-patches.py --check` over every authored track: every committed scaffold and
+/// solution patch equals what the trees it defines produce.
+///
+/// The patches are derived artifacts — step N's scaffold is the diff between step N−1's full tree
+/// and its stub tree — and a hand-edited patch corrupts its hunks long before anything complains
+/// (three measured incidents, handoff-m4-log 段 12). This check makes the derivation a property CI
+/// holds, in both directions: a patch edited without its trees fails, and a fix applied to the
+/// trees without regenerating the patches fails too. The tool lays the chains with `kiln` itself
+/// and never compiles, so the whole pass costs seconds.
+fn patches_check(root: &Path) -> Result<(), String> {
+    println!("xtask ci: rebuild-patches --check (every patch is what its trees produce)");
+    let course = kiln::info::Course::load(root).map_err(|error| error.to_string())?;
+    let mut tracks: Vec<&kiln::info::Track> = course.tracks().iter().collect();
+    tracks.sort_by_key(|track| track.index);
+
+    // The tool lays the chains with kiln; point it at the binary `cargo test --workspace` built a
+    // step ago rather than paying a `cargo run` per chain command.
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let kiln = target.join("debug").join("kiln");
+    if !kiln.is_file() {
+        return Err(format!(
+            "no kiln binary at {} — build it first (`cargo build -p kiln`)",
+            kiln.display()
+        ));
+    }
+
+    for track in tracks {
+        let authored = track
+            .step
+            .iter()
+            .any(|step| kiln::project::missing_content(&course, track, step).is_empty());
+        if !authored {
+            continue;
+        }
+        let status = Command::new("python3")
+            .arg(root.join("tools/rebuild-patches.py"))
+            .arg("--track")
+            .arg(&track.id)
+            .arg("--check")
+            .env("KILN_BIN", &kiln)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|err| format!("cannot run rebuild-patches.py: {err}"))?;
+        if !status.success() {
+            return Err(format!(
+                "rebuild-patches --check failed for {} ({status}) — the committed patches no                  longer match the trees they define; regenerate them with the same tool",
+                track.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The course's own linter, called through the library the runner uses.

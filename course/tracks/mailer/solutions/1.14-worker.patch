@@ -1,5 +1,4 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index c48a4ad..89b60a6 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -39,7 +39,9 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
@@ -14,7 +13,6 @@ index c48a4ad..89b60a6 100644
  # kiln:scaffold:end
  
 diff --git a/src/delivery.rs b/src/delivery.rs
-index 0d3d2cc..d667d14 100644
 --- a/src/delivery.rs
 +++ b/src/delivery.rs
 @@ -14,40 +14,24 @@
@@ -86,7 +84,7 @@ index 0d3d2cc..d667d14 100644
  /// How long the worker is given to finish what it already has, once the process is asked to stop.
  pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
  
-@@ -81,64 +67,119 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+@@ -81,66 +67,119 @@ pub const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
  /// one that waits for it.
  #[derive(Debug, Clone)]
  pub struct Queue {
@@ -161,7 +159,9 @@ index 0d3d2cc..d667d14 100644
 -    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting. The
 -    /// scaffold never reports it: nothing waits here, so there is nothing to refuse.
 -    pub fn reserve(&self) -> Result<Seat<'_>, Error> {
--        Ok(Seat { sender: &self.sender })
+-        Ok(Seat {
+-            sender: &self.sender,
+-        })
 +    /// Reports [`Error::QueueFull`] when [`QUEUE_CAPACITY`] messages are already waiting.
 +    pub fn reserve(&self) -> Result<Permit<'_, Message>, Error> {
 +        self.jobs.try_reserve().map_err(|_| Error::QueueFull)
@@ -241,7 +241,7 @@ index 0d3d2cc..d667d14 100644
      }
  }
  
-@@ -147,16 +188,180 @@ impl Seat<'_> {
+@@ -149,16 +188,180 @@ impl Seat<'_> {
  /// *Full jitter*, in the shape of the AWS backoff article: a random delay in
  /// `[0, min(cap, base · 2^attempt))`, not a fixed one. The randomisation is the point — a fleet of
  /// workers retrying one broken mail server must not come back in step, and the failures they are
@@ -433,7 +433,6 @@ index 0d3d2cc..d667d14 100644
 +    }
  }
 diff --git a/src/error.rs b/src/error.rs
-index 955fe18..e113e7a 100644
 --- a/src/error.rs
 +++ b/src/error.rs
 @@ -166,6 +166,27 @@ pub enum Error {
@@ -484,7 +483,6 @@ index 955fe18..e113e7a 100644
              | Error::Migration { .. } => ExitCode::FAILURE,
          }
 diff --git a/src/http.rs b/src/http.rs
-index 24577b1..7aa6a7c 100644
 --- a/src/http.rs
 +++ b/src/http.rs
 @@ -21,6 +21,12 @@
@@ -705,7 +703,6 @@ index 24577b1..7aa6a7c 100644
          // A caller's failure ends the process with `2` and an HTTP caller with a 4xx, and a
          // deployment's with `1` and a 5xx: two spellings of one decision.
 diff --git a/src/lib.rs b/src/lib.rs
-index 06de042..2739a63 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -16,6 +16,7 @@ use std::path::PathBuf;
@@ -725,7 +722,6 @@ index 06de042..2739a63 100644
  pub use email::{EmailSender, Message, SendError};
  pub use error::{Error, SettingSource};
 diff --git a/src/main.rs b/src/main.rs
-index 717857b..c4c7e2a 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -11,8 +11,10 @@ use std::process::ExitCode;
@@ -804,7 +800,6 @@ index 717857b..c4c7e2a 100644
  ///
  /// The whole cause chain is printed (`{failure:#}`), because "cannot read `mailer.toml`" without
 diff --git a/src/signup.rs b/src/signup.rs
-index 7206fbf..b7b66e1 100644
 --- a/src/signup.rs
 +++ b/src/signup.rs
 @@ -14,16 +14,21 @@

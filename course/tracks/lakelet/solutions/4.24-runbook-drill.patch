@@ -1,5 +1,4 @@
 diff --git a/docs/runbook.md b/docs/runbook.md
-index c9c2ce8..ce249cb 100644
 --- a/docs/runbook.md
 +++ b/docs/runbook.md
 @@ -1,151 +1,249 @@
@@ -329,10 +328,7 @@ index c9c2ce8..ce249cb 100644
 +- `src/service/backpressure.rs` — the queue and its counters, and the command that prints them.
 +- `src/service/keys.rs` and `docs/rotation.md` — the ring, the window, and `--add`/`--list`/`--retire`.
 +- `src/engine/backup/` and [the DR page](dr-drill.md) — the copy, the restore, and the drill.
-+- `src/engine/tier/mod.rs` — the sweep and the way back, and the report this page's stage 7 watches.
-+- [The soak page](soak.md), [the cardinality page](cardinality.md) and [the capacity page](capacity.md) — the counters and the model this page's stages 5, 6 and 7 read.
 diff --git a/docs/slo.md b/docs/slo.md
-index 82815e9..3ac6027 100644
 --- a/docs/slo.md
 +++ b/docs/slo.md
 @@ -1,24 +1,84 @@

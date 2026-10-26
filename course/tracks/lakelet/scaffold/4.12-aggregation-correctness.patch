@@ -1,9 +1,7 @@
 diff --git a/src/engine/query/agg.rs b/src/engine/query/agg.rs
-new file mode 100644
-index 0000000..6ae20dd
 --- /dev/null
 +++ b/src/engine/query/agg.rs
-@@ -0,0 +1,412 @@
+@@ -0,0 +1,426 @@
 +//! The two numbers a query is wrong about while every other test passes: how a sum rounds, and
 +//! what a day is.
 +//!
@@ -145,8 +143,10 @@ index 0000000..6ae20dd
 +    /// overflow. `inf - inf` is not a number, and a sum that is perfectly well defined (`1 + inf`)
 +    /// must not be turned into one by an accumulator that meant well.
 +    pub fn add(&mut self, value: f64) {
-+        todo!("lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
-+               and the count")
++        todo!(
++            "lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
++               and the count"
++        )
 +    }
 +
 +    /// The sum, as well as this accumulator can state it: the total plus what the additions left
@@ -169,8 +169,10 @@ index 0000000..6ae20dd
 +    /// follows it and shows up as a missing point on a dashboard an hour later.
 +    #[must_use]
 +    pub fn mean(&self) -> Option<f64> {
-+        todo!("lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
-+               over the count")
++        todo!(
++            "lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
++               over the count"
++        )
 +    }
 +}
 +
@@ -200,8 +202,10 @@ index 0000000..6ae20dd
 +/// and [`agrees`] then agrees with nothing — the honest answer for a workload no bound applies to.
 +#[must_use]
 +pub fn error_bound(values: &[f64]) -> f64 {
-+    todo!("lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
-+           state them, times BOUND")
++    todo!(
++        "lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
++           state them, times BOUND"
++    )
 +}
 +
 +/// `true` when `left` and `right` are the same number, inside the absolute `bound`.
@@ -213,8 +217,10 @@ index 0000000..6ae20dd
 +/// has to refuse to certify it.
 +#[must_use]
 +pub fn agrees(left: f64, right: f64, bound: f64) -> bool {
-+    todo!("lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
-+           answers false by itself")
++    todo!(
++        "lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
++           answers false by itself"
++    )
 +}
 +
 +/// One step of a zone's table: from `from_millis` on, the zone is `offset_millis` from UTC.
@@ -350,8 +356,10 @@ index 0000000..6ae20dd
 +    /// is a byte offset into the *name* the caller wrote, since a zone is not part of a query
 +    /// text: byte `0` is the name itself, which is where a name nobody shipped is wrong.
 +    pub fn parse(name: &str) -> Result<Zone, Refusal> {
-+        todo!("lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
-+               name that is neither is refused with `Refusal::Syntax`")
++        todo!(
++            "lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
++               name that is neither is refused with `Refusal::Syntax`"
++        )
 +    }
 +
 +    /// What this zone is called: a shipped name, or the offset a caller wrote.
@@ -386,8 +394,10 @@ index 0000000..6ae20dd
 +    /// starts in 2024 covers neither.
 +    #[must_use]
 +    pub fn offset_at(&self, ts_millis: i64) -> Option<i64> {
-+        todo!("lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
-+               at or before the instant")
++        todo!(
++            "lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
++               at or before the instant"
++        )
 +    }
 +
 +    /// The half-open span of the *local* day `ts_millis` falls in, as milliseconds since the Unix
@@ -412,12 +422,13 @@ index 0000000..6ae20dd
 +    /// belongs to the first day this store can name rather than to no day at all.
 +    #[must_use]
 +    pub fn local_day(&self, ts_millis: i64) -> Option<(u64, u64)> {
-+        todo!("lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
-+               midnight, and the offset in force at that midnight")
++        todo!(
++            "lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
++               midnight, and the offset in force at that midnight"
++        )
 +    }
 +}
 diff --git a/src/engine/query/mod.rs b/src/engine/query/mod.rs
-index 9a33f81..f1ec004 100644
 --- a/src/engine/query/mod.rs
 +++ b/src/engine/query/mod.rs
 @@ -31,4 +31,7 @@ pub mod lex;

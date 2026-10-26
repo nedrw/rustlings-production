@@ -1,5 +1,4 @@
 diff --git a/migrations/0005_queues_and_usage.sql b/migrations/0005_queues_and_usage.sql
-index 3fa0feb..07f1047 100644
 --- a/migrations/0005_queues_and_usage.sql
 +++ b/migrations/0005_queues_and_usage.sql
 @@ -4,31 +4,76 @@
@@ -106,7 +105,6 @@ index 3fa0feb..07f1047 100644
 +
 +create index queue_audit_of_a_queue on queue_audit (queue, at desc);
 diff --git a/src/engine/authz.rs b/src/engine/authz.rs
-index 9b7b100..056648e 100644
 --- a/src/engine/authz.rs
 +++ b/src/engine/authz.rs
 @@ -56,7 +56,11 @@ impl QueueAction {
@@ -153,7 +151,6 @@ index 9b7b100..056648e 100644
  }
  
 diff --git a/src/engine/domain.rs b/src/engine/domain.rs
-index 1d8e226..736b0b2 100644
 --- a/src/engine/domain.rs
 +++ b/src/engine/domain.rs
 @@ -34,25 +34,7 @@ impl Queue {
@@ -221,7 +218,6 @@ index 1d8e226..736b0b2 100644
      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
          formatter.write_str(self.as_str())
 diff --git a/src/engine/error.rs b/src/engine/error.rs
-index cf7210f..8090463 100644
 --- a/src/engine/error.rs
 +++ b/src/engine/error.rs
 @@ -29,7 +29,7 @@
@@ -282,7 +278,6 @@ index cf7210f..8090463 100644
              Error::Config { .. } | Error::Io { .. } => 1,
          }
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
-index 7ef1ded..2109c1c 100644
 --- a/src/engine/mod.rs
 +++ b/src/engine/mod.rs
 @@ -18,6 +18,7 @@
@@ -315,7 +310,6 @@ index 7ef1ded..2109c1c 100644
  pub use timers::ReadySet;
 +pub use usage::{QueueUsage, Usage};
 diff --git a/src/engine/policy.rs b/src/engine/policy.rs
-index 5d7a2dd..94e372b 100644
 --- a/src/engine/policy.rs
 +++ b/src/engine/policy.rs
 @@ -31,6 +31,10 @@ pub struct Policy {
@@ -371,7 +365,6 @@ index 5d7a2dd..94e372b 100644
 +    }
  }
 diff --git a/src/engine/scheduler.rs b/src/engine/scheduler.rs
-index ceb8ce9..a89775d 100644
 --- a/src/engine/scheduler.rs
 +++ b/src/engine/scheduler.rs
 @@ -6,9 +6,12 @@
@@ -447,7 +440,6 @@ index ceb8ce9..a89775d 100644
      ///
      /// # Errors
 diff --git a/src/engine/store/memory.rs b/src/engine/store/memory.rs
-index 89452f3..292c7f0 100644
 --- a/src/engine/store/memory.rs
 +++ b/src/engine/store/memory.rs
 @@ -17,18 +17,25 @@
@@ -1027,7 +1019,6 @@ index 89452f3..292c7f0 100644
  
  /// Put one row back in its queue, and answer which attempt the line it gets will name.
 diff --git a/src/engine/store/mod.rs b/src/engine/store/mod.rs
-index a3b0868..556265e 100644
 --- a/src/engine/store/mod.rs
 +++ b/src/engine/store/mod.rs
 @@ -23,6 +23,15 @@
@@ -1186,7 +1177,6 @@ index a3b0868..556265e 100644
 +    fn audit<'a>(&'a self, limit: usize) -> BoxFuture<'a, Result<Vec<QueueAudit>, Error>>;
  }
 diff --git a/src/engine/store/postgres.rs b/src/engine/store/postgres.rs
-index 4a92e2f..2457bd2 100644
 --- a/src/engine/store/postgres.rs
 +++ b/src/engine/store/postgres.rs
 @@ -29,6 +29,14 @@
@@ -1396,7 +1386,7 @@ index 4a92e2f..2457bd2 100644
              // One statement, and the shape of it is the whole promise: the rows are chosen with
              // `for update skip locked` *inside* the update that stamps them, so a second claim
              // running at the same time either waits for nothing (the row is already taken and it
-@@ -305,6 +434,13 @@ impl Store for PostgresStore {
+@@ -314,6 +443,13 @@ impl Store for PostgresStore {
                                 select count(*) from jobs running \
                                 where running.queue = $1 and running.state = 'running' \
                             ) < $6) \
@@ -1410,7 +1400,21 @@ index 4a92e2f..2457bd2 100644
                           order by priority + case when $7 > 0 \
                                        then greatest(0, floor(extract(epoch from ($2 - run_at)) / $7)) \
                                        else 0 end desc, \
-@@ -314,6 +450,10 @@ impl Store for PostgresStore {
+@@ -322,11 +458,23 @@ impl Store for PostgresStore {
+                                               else greatest(0, $6 - ( \
+                                                   select count(*) from jobs running \
+                                                   where running.queue = $1 and running.state = 'running' \
+-                                              )) end) \
++                                              )) end, \
++                                      case when $8 = 0 then $3 \
++                                           else greatest(0, $8 - ( \
++                                               select count(*) from jobs holding \
++                                               where holding.state = 'running' and holding.queue in ( \
++                                                   select owner_of.queue from queues owner_of \
++                                                   where owner_of.owner = (select owner from queues where queue = $1) \
++                                               ) \
++                                           )) end) \
+                          for update skip locked \
                       ) \
                       returning id, queue, payload::text as payload, state, priority, run_at, \
                                 attempts, max_attempts, last_error, lease_owner, lease_expires_at \
@@ -1421,7 +1425,7 @@ index 4a92e2f..2457bd2 100644
                   ) \
                   select id, queue, payload::text as payload, state, priority, run_at, attempts, \
                          max_attempts, last_error, lease_owner, lease_expires_at \
-@@ -344,7 +484,17 @@ impl Store for PostgresStore {
+@@ -357,7 +505,17 @@ impl Store for PostgresStore {
                      .aging_after()
                      .map_or(0, |interval| i64::try_from(interval.as_secs()).unwrap_or(i64::MAX)),
              )
@@ -1440,7 +1444,7 @@ index 4a92e2f..2457bd2 100644
              .await
              .map_err(refused)?;
              rows.into_iter().map(JobRow::into_job).collect()
-@@ -373,9 +523,16 @@ impl Store for PostgresStore {
+@@ -386,9 +544,16 @@ impl Store for PostgresStore {
              let row: Option<JobRow> = sqlx::query_as(
                  "select id, queue, payload::text as payload, state, priority, run_at, attempts, \
                          max_attempts, last_error, lease_owner, lease_expires_at \
@@ -1458,7 +1462,7 @@ index 4a92e2f..2457bd2 100644
              .fetch_optional(&self.pool)
              .await
              .map_err(refused)?;
-@@ -392,6 +549,24 @@ impl Store for PostgresStore {
+@@ -405,6 +570,24 @@ impl Store for PostgresStore {
              // wins when two callers append the same line at the same instant, and `do nothing` is
              // what makes the loser's write a no-op rather than an error it would have to translate.
              let mut connection = self.pool.acquire().await.map_err(refused)?;
@@ -1483,7 +1487,7 @@ index 4a92e2f..2457bd2 100644
              append(&mut connection, event).await
          })
      }
-@@ -402,12 +577,18 @@ impl Store for PostgresStore {
+@@ -415,12 +598,18 @@ impl Store for PostgresStore {
              // still holds the row (and the instant moves) or it does not (and nothing happens).
              let renewed = sqlx::query(
                  "update jobs set lease_expires_at = $2 \
@@ -1503,7 +1507,7 @@ index 4a92e2f..2457bd2 100644
              .execute(&self.pool)
              .await
              .map_err(refused)?;
-@@ -427,6 +608,10 @@ impl Store for PostgresStore {
+@@ -440,6 +629,10 @@ impl Store for PostgresStore {
                  .bind(HANDED_BACK)
                  .bind(EventKind::Reclaimed.as_str())
                  .bind(self.clock.now())
@@ -1514,7 +1518,7 @@ index 4a92e2f..2457bd2 100644
                  .execute(&self.pool)
                  .await
                  .map_err(refused)?;
-@@ -441,6 +626,7 @@ impl Store for PostgresStore {
+@@ -454,6 +647,7 @@ impl Store for PostgresStore {
                  .bind(RECLAIM_BATCH)
                  .bind(ABANDONED)
                  .bind(EventKind::Reclaimed.as_str())
@@ -1522,7 +1526,7 @@ index 4a92e2f..2457bd2 100644
                  .execute(&self.pool)
                  .await
                  .map_err(refused)?;
-@@ -454,10 +640,18 @@ impl Store for PostgresStore {
+@@ -467,10 +661,18 @@ impl Store for PostgresStore {
              // order the table hands rows back in: `at` first, then the two columns that settle a
              // tie the same way the in-memory backend settles it.
              let rows: Vec<EventRow> = sqlx::query_as(
@@ -1542,7 +1546,7 @@ index 4a92e2f..2457bd2 100644
              .fetch_all(&self.pool)
              .await
              .map_err(refused)?;
-@@ -470,6 +664,15 @@ impl Store for PostgresStore {
+@@ -483,6 +685,15 @@ impl Store for PostgresStore {
          queue: &'a Queue,
      ) -> BoxFuture<'a, Result<Option<DateTime<Utc>>, Error>> {
          Box::pin(async move {
@@ -1558,7 +1562,7 @@ index 4a92e2f..2457bd2 100644
              // `min(run_at)` over the queue's queued rows: `jobs_claimable` is the partial index on
              // exactly that predicate (`migrations/0001_jobs.sql`), so this is the same index step the
              // claim's row selection takes, whatever the depth of the queue behind it. The instant is
-@@ -480,12 +683,197 @@ impl Store for PostgresStore {
+@@ -493,12 +704,197 @@ impl Store for PostgresStore {
                  "select min(run_at) from jobs where queue = $1 and state = 'queued'",
              )
              .bind(queue.as_str())
@@ -1757,7 +1761,7 @@ index 4a92e2f..2457bd2 100644
  }
  
  /// How many rows one run of the reclaimer may take back.
-@@ -510,6 +898,8 @@ const RECLAIM_BATCH: i64 = 128;
+@@ -523,6 +919,8 @@ const RECLAIM_BATCH: i64 = 128;
  const GIVE_BACK: &str = "with held as ( \
          select id, attempts, max_attempts from jobs \
          where state = 'running' and lease_owner = $1 \
@@ -1766,7 +1770,7 @@ index 4a92e2f..2457bd2 100644
          for update \
      ), put_back as ( \
          update jobs set \
-@@ -519,7 +909,11 @@ const GIVE_BACK: &str = "with held as ( \
+@@ -532,7 +930,11 @@ const GIVE_BACK: &str = "with held as ( \
              lease_expires_at = null \
          from held \
          where jobs.id = held.id \
@@ -1779,7 +1783,7 @@ index 4a92e2f..2457bd2 100644
      ) \
      insert into job_events (id, job_id, kind, attempt, detail, at) \
      select gen_random_uuid(), id, $3, attempt, $2, $4 from put_back \
-@@ -536,6 +930,8 @@ const GIVE_BACK: &str = "with held as ( \
+@@ -549,6 +951,8 @@ const GIVE_BACK: &str = "with held as ( \
  const RECLAIM: &str = "with expired as ( \
          select id, attempts, max_attempts from jobs \
          where state = 'running' and lease_expires_at <= $1 \
@@ -1788,7 +1792,7 @@ index 4a92e2f..2457bd2 100644
          order by lease_expires_at asc, id asc \
          limit $2 \
          for update skip locked \
-@@ -547,7 +943,11 @@ const RECLAIM: &str = "with expired as ( \
+@@ -560,7 +964,11 @@ const RECLAIM: &str = "with expired as ( \
              lease_expires_at = null \
          from expired \
          where jobs.id = expired.id \
@@ -1801,7 +1805,7 @@ index 4a92e2f..2457bd2 100644
      ) \
      insert into job_events (id, job_id, kind, attempt, detail, at) \
      select gen_random_uuid(), id, $4, attempt, $3, $1 from put_back \
-@@ -577,7 +977,9 @@ const SETTLE: &str = "begin isolation level repeatable read";
+@@ -590,7 +998,9 @@ const SETTLE: &str = "begin isolation level repeatable read";
  const COMPLETE: &str = "update jobs set state = 'succeeded', last_error = null, \
                                 lease_owner = null, lease_expires_at = null \
                         where id = $1 and state = 'running' and lease_owner = $2 \
@@ -1812,7 +1816,7 @@ index 4a92e2f..2457bd2 100644
  
  /// The statement that records a failure: the row's own budget decides where the job goes, in the
  /// same statement that writes the reason down — and the same lease guard.
-@@ -585,7 +987,9 @@ const FAIL: &str = "update jobs set last_error = $3, \
+@@ -598,7 +1008,9 @@ const FAIL: &str = "update jobs set last_error = $3, \
                             state = case when attempts < max_attempts then 'queued' else 'failed' end, \
                             lease_owner = null, lease_expires_at = null \
                      where id = $1 and state = 'running' and lease_owner = $2 \
@@ -1823,7 +1827,7 @@ index 4a92e2f..2457bd2 100644
  
  /// What a settle does to the row it touches.
  ///
-@@ -613,15 +1017,18 @@ impl Change<'_> {
+@@ -626,15 +1038,18 @@ impl Change<'_> {
          transaction: &mut Transaction<'_, Postgres>,
          worker: &WorkerId,
          id: &JobId,
@@ -1845,7 +1849,7 @@ index 4a92e2f..2457bd2 100644
          }
          .fetch_optional(&mut **transaction)
          .await
-@@ -637,6 +1044,11 @@ impl Change<'_> {
+@@ -650,6 +1065,11 @@ impl Change<'_> {
          }
      }
  
@@ -1857,7 +1861,7 @@ index 4a92e2f..2457bd2 100644
      /// What the line says, when there is something to say.
      fn detail(&self) -> Option<String> {
          match self {
-@@ -679,12 +1091,15 @@ impl PostgresStore {
+@@ -692,12 +1112,15 @@ impl PostgresStore {
          change: Change<'_>,
      ) -> Result<JobState, Error> {
          let mut transaction = self.pool.begin_with(SETTLE).await.map_err(refused)?;
@@ -1875,7 +1879,7 @@ index 4a92e2f..2457bd2 100644
                  None => Error::NotFound { id: *id },
                  Some((state, Some(owner))) if owner != worker.as_str() => Error::Invalid {
                      detail: format!(
-@@ -715,7 +1130,29 @@ impl PostgresStore {
+@@ -728,7 +1151,29 @@ impl PostgresStore {
              ),
          )
          .await?;
@@ -1906,7 +1910,7 @@ index 4a92e2f..2457bd2 100644
          transaction.commit().await.map_err(refused)?;
          decode_state(&state)
      }
-@@ -760,13 +1197,22 @@ async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool,
+@@ -773,13 +1218,22 @@ async fn append(connection: &mut PgConnection, event: &JobEvent) -> Result<bool,
  async fn state_and_holder(
      connection: &mut PgConnection,
      id: &JobId,
@@ -1935,7 +1939,7 @@ index 4a92e2f..2457bd2 100644
      Ok(row)
  }
  
-@@ -909,6 +1355,15 @@ fn count(value: i64, column: &'static str) -> Result<u32, Error> {
+@@ -922,6 +1376,15 @@ fn count(value: i64, column: &'static str) -> Result<u32, Error> {
      u32::try_from(value).map_err(|_| unreadable(column, format!("{value} is not a count")))
  }
  
@@ -1951,28 +1955,7 @@ index 4a92e2f..2457bd2 100644
  /// A driver failure, as the port wants it: whole, for the caller that wants the detail.
  ///
  /// One class is split off, and the split is the subject of `jobq/3.6-transaction-isolation`: a
-@@ -233,5 +233,13 @@ impl Store for PostgresStore {
--                         limit least($3, case when $6 = 0 then $3 \
--                                              else greatest(0, $6 - ( \
--                                                  select count(*) from jobs running \
--                                                  where running.queue = $1 and running.state = 'running' \
--                                              )) end) \
-+                         limit least($3, case when $6 = 0 then $3 \
-+                                              else greatest(0, $6 - ( \
-+                                                  select count(*) from jobs running \
-+                                                  where running.queue = $1 and running.state = 'running' \
-+                                              )) end, \
-+                                      case when $8 = 0 then $3 \
-+                                           else greatest(0, $8 - ( \
-+                                               select count(*) from jobs holding \
-+                                               where holding.state = 'running' and holding.queue in ( \
-+                                                   select owner_of.queue from queues owner_of \
-+                                                   where owner_of.owner = (select owner from queues where queue = $1) \
-+                                               ) \
-+                                           )) end) \
-                      ) \
 diff --git a/src/engine/tenant.rs b/src/engine/tenant.rs
-index ecd4a70..699d4b4 100644
 --- a/src/engine/tenant.rs
 +++ b/src/engine/tenant.rs
 @@ -21,7 +21,7 @@
@@ -2008,7 +1991,6 @@ index ecd4a70..699d4b4 100644
  }
  
 diff --git a/src/engine/usage.rs b/src/engine/usage.rs
-index 0ebadca..2be0353 100644
 --- a/src/engine/usage.rs
 +++ b/src/engine/usage.rs
 @@ -53,31 +53,31 @@ impl Usage {

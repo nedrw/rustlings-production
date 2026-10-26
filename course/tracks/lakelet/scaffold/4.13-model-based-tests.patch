@@ -1,5 +1,4 @@
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
-index c068e24..7844b76 100644
 --- a/src/engine/mod.rs
 +++ b/src/engine/mod.rs
 @@ -37,6 +37,9 @@ pub mod retention;
@@ -13,11 +12,9 @@ index c068e24..7844b76 100644
  
  /// The write path, at the engine's root: a caller writes `lakelet::engine::Spool`.
 diff --git a/src/engine/rng.rs b/src/engine/rng.rs
-new file mode 100644
-index 0000000..c6b4dc4
 --- /dev/null
 +++ b/src/engine/rng.rs
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,153 @@
 +//! The store's own seeded generator: one number in, one reproducible sequence out.
 +//!
 +//! Step `lakelet/4.13-model-based-tests`. A walk is only evidence if somebody else can run it
@@ -103,8 +100,10 @@ index 0000000..c6b4dc4
 +    /// what they are — each one folds a differently-scaled copy of the state into it — and the
 +    /// multiply at the end is the star.
 +    pub fn next_u64(&mut self) -> u64 {
-+        todo!("lakelet/4.13-model-based-tests: `MULTIPLIER` is the star, and the three shifts are \
-+               the whole of the state update")
++        todo!(
++            "lakelet/4.13-model-based-tests: `MULTIPLIER` is the star, and the three shifts are \
++               the whole of the state update"
++        )
 +    }
 +
 +    /// A number in `0..bound`, and `0` when there is nothing to draw from.
@@ -136,8 +135,10 @@ index 0000000..c6b4dc4
 +    /// range in it has no element to hand out, and the stream does not move — which is
 +    /// [`Rng::below`]'s rule about an empty alphabet one level up.
 +    pub fn between(&mut self, low: i64, high: i64) -> i64 {
-+        todo!("lakelet/4.13-model-based-tests: both ends included, and a span that names nothing \
-+               answers `low`")
++        todo!(
++            "lakelet/4.13-model-based-tests: both ends included, and a span that names nothing \
++               answers `low`"
++        )
 +    }
 +
 +    /// One of `items`, drawn uniformly.
@@ -161,13 +162,13 @@ index 0000000..c6b4dc4
 +    /// does not need them to read a manual.
 +    #[must_use]
 +    pub fn chance(&mut self, percent: u64) -> bool {
-+        todo!("lakelet/4.13-model-based-tests: `percent` times in a hundred, and 0 and 100 mean \
-+               what they say")
++        todo!(
++            "lakelet/4.13-model-based-tests: `percent` times in a hundred, and 0 and 100 mean \
++               what they say"
++        )
 +    }
 +}
 diff --git a/tests/sim_model.rs b/tests/sim_model.rs
-new file mode 100644
-index 0000000..a247eae
 --- /dev/null
 +++ b/tests/sim_model.rs
 @@ -0,0 +1,123 @@
@@ -295,7 +296,6 @@ index 0000000..a247eae
 +    );
 +}
 diff --git a/tests/support/mod.rs b/tests/support/mod.rs
-index 4b49203..b5f4f3d 100644
 --- a/tests/support/mod.rs
 +++ b/tests/support/mod.rs
 @@ -14,6 +14,11 @@ pub mod service;
@@ -311,8 +311,6 @@ index 4b49203..b5f4f3d 100644
  
  use std::path::{Path, PathBuf};
 diff --git a/tests/support/model.rs b/tests/support/model.rs
-new file mode 100644
-index 0000000..8a63745
 --- /dev/null
 +++ b/tests/support/model.rs
 @@ -0,0 +1,122 @@
@@ -439,8 +437,6 @@ index 0000000..8a63745
 +    u64::try_from(record.ts_millis).unwrap_or(0)
 +}
 diff --git a/tests/support/walk.rs b/tests/support/walk.rs
-new file mode 100644
-index 0000000..c179297
 --- /dev/null
 +++ b/tests/support/walk.rs
 @@ -0,0 +1,875 @@

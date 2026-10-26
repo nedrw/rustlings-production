@@ -1,6 +1,4 @@
 diff --git a/docs/migration.md b/docs/migration.md
-new file mode 100644
-index 0000000..952b257
 --- /dev/null
 +++ b/docs/migration.md
 @@ -0,0 +1,66 @@
@@ -71,11 +69,9 @@ index 0000000..952b257
 +<!-- TODO: the documentation for the statements above, and the step this one deepens. Link the
 +harness and the test that pins the counts: [the harness](TODO), [the step's test](TODO). -->
 diff --git a/src/engine/schema.rs b/src/engine/schema.rs
-new file mode 100644
-index 0000000..f452316
 --- /dev/null
 +++ b/src/engine/schema.rs
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,441 @@
 +//! Changing the queue's own schema while the queue keeps running.
 +//!
 +//! Step `jobq/3.23-online-schema`. `relay/2.23-online-schema` established what a schema change
@@ -188,7 +184,9 @@ index 0000000..f452316
 +    /// `queue`.
 +    #[must_use]
 +    pub fn new(table: &str, column: &str, computed: &str, queue: Queue) -> Self {
-+        todo!("jobq/3.23-online-schema: the change a column of a table is gaining, filled by jobs on a queue");
++        todo!(
++            "jobq/3.23-online-schema: the change a column of a table is gaining, filled by jobs on a queue"
++        );
 +    }
 +
 +    /// How many rows one batch fills.
@@ -242,13 +240,17 @@ index 0000000..f452316
 +    /// The constraint that says the column is never empty, as the database will name it.
 +    #[must_use]
 +    pub fn constraint(&self) -> String {
-+        todo!("jobq/3.23-online-schema: the constraint that says the column is never empty, named after the column");
++        todo!(
++            "jobq/3.23-online-schema: the constraint that says the column is never empty, named after the column"
++        );
 +    }
 +
 +    /// The partial index the backfill reads, as the database will name it.
 +    #[must_use]
 +    pub fn index(&self) -> String {
-+        todo!("jobq/3.23-online-schema: the partial index the backfill reads, named after the column");
++        todo!(
++            "jobq/3.23-online-schema: the partial index the backfill reads, named after the column"
++        );
 +    }
 +
 +    /// The read path's answer while the column is empty.
@@ -258,7 +260,9 @@ index 0000000..f452316
 +    /// that predates the change, which is what turns an expand phase into a breaking change.
 +    #[must_use]
 +    pub fn fallback(&self) -> String {
-+        todo!("jobq/3.23-online-schema: the read path's answer while the column is empty, built from `computed`");
++        todo!(
++            "jobq/3.23-online-schema: the read path's answer while the column is empty, built from `computed`"
++        );
 +    }
 +
 +    /// Phase one: add the column, the constraint and the index, without touching a row.
@@ -268,7 +272,9 @@ index 0000000..f452316
 +    /// second run rather than repeat itself.
 +    #[must_use]
 +    pub fn expand(&self, applied: &Applied) -> Action {
-+        todo!("jobq/3.23-online-schema: phase one: the statements that add the column, or nothing when it is already there");
++        todo!(
++            "jobq/3.23-online-schema: phase one: the statements that add the column, or nothing when it is already there"
++        );
 +    }
 +
 +    /// Phase two: the rows that predate the column, filled in batches by jobs on the queue.
@@ -278,7 +284,9 @@ index 0000000..f452316
 +    /// empty answer.
 +    #[must_use]
 +    pub fn backfill(&self, applied: &Applied, now: DateTime<Utc>) -> Action {
-+        todo!("jobq/3.23-online-schema: phase two: the plan of jobs for the rows that have no value, or why there is none");
++        todo!(
++            "jobq/3.23-online-schema: phase two: the plan of jobs for the rows that have no value, or why there is none"
++        );
 +    }
 +
 +    /// The middle phase's arithmetic: what filling `remaining` rows with jobs costs.
@@ -288,7 +296,9 @@ index 0000000..f452316
 +    /// budgeting the work rather than starting it (a change of no rows is a plan of no batches).
 +    #[must_use]
 +    pub fn plan(&self, remaining: u32, now: DateTime<Utc>) -> Plan {
-+        todo!("jobq/3.23-online-schema: the middle phase's arithmetic: what filling `remaining` rows costs");
++        todo!(
++            "jobq/3.23-online-schema: the middle phase's arithmetic: what filling `remaining` rows costs"
++        );
 +    }
 +
 +    /// Phase three: make the database check the rows it was told to skip, and take the index the
@@ -299,10 +309,10 @@ index 0000000..f452316
 +    /// it costs a deployment nothing.
 +    #[must_use]
 +    pub fn contract(&self, applied: &Applied) -> Action {
-+        todo!("jobq/3.23-online-schema: phase three: the statements that make the database check the rows, or why it may not yet");
++        todo!(
++            "jobq/3.23-online-schema: phase three: the statements that make the database check the rows, or why it may not yet"
++        );
 +    }
-+
-+
 +}
 +
 +/// What the database already answers about a change, so a phase knows whether it is a repeat.
@@ -356,7 +366,9 @@ index 0000000..f452316
 +    /// Whether the database has checked the rows that predate the constraint.
 +    #[must_use]
 +    pub fn validated(&self) -> bool {
-+        todo!("jobq/3.23-online-schema: whether the database has checked the rows that predate the constraint");
++        todo!(
++            "jobq/3.23-online-schema: whether the database has checked the rows that predate the constraint"
++        );
 +    }
 +}
 +
@@ -433,7 +445,9 @@ index 0000000..f452316
 +    /// queue's workers at once is a migration that stops the queue.
 +    #[must_use]
 +    pub fn burst(&self) -> u32 {
-+        todo!("jobq/3.23-online-schema: the most batches due in one interval: the rate this plan keeps");
++        todo!(
++            "jobq/3.23-online-schema: the most batches due in one interval: the rate this plan keeps"
++        );
 +    }
 +
 +    /// The one statement one batch runs, or `None` when the plan has no such batch.
@@ -469,7 +483,6 @@ index 0000000..f452316
 +}
 +
 +impl Batch {
-+
 +    /// How many rows this batch fills.
 +    #[must_use]
 +    pub fn rows(&self) -> u32 {
@@ -496,11 +509,11 @@ index 0000000..f452316
 +/// that reads these lines treats a missing metric as `blocked`, which is the honest answer.
 +#[must_use]
 +pub fn cost(change: &Change, rows: u32, left: u32, now: DateTime<Utc>) -> Vec<String> {
-+    todo!("jobq/3.23-online-schema: the lines a harness prints: the cost of the plan and the two guards over it");
++    todo!(
++        "jobq/3.23-online-schema: the lines a harness prints: the cost of the plan and the two guards over it"
++    );
 +}
 diff --git a/tests/backfill_budget.rs b/tests/backfill_budget.rs
-new file mode 100644
-index 0000000..456f250
 --- /dev/null
 +++ b/tests/backfill_budget.rs
 @@ -0,0 +1,60 @@

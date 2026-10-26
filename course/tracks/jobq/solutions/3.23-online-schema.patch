@@ -1,5 +1,4 @@
 diff --git a/docs/migration.md b/docs/migration.md
-index 952b257..88a236a 100644
 --- a/docs/migration.md
 +++ b/docs/migration.md
 @@ -1,66 +1,109 @@
@@ -149,7 +148,6 @@ index 952b257..88a236a 100644
 +(`BURST_LIMIT` and `RESUME_LIMIT`), and the three phases by name. A budget whose names live in a
 +page, a harness and a baseline is a budget that drifts, so the three are read against one list.
 diff --git a/src/engine/mod.rs b/src/engine/mod.rs
-index 75858b9..e8cc404 100644
 --- a/src/engine/mod.rs
 +++ b/src/engine/mod.rs
 @@ -38,6 +38,7 @@ pub(crate) mod mutation;
@@ -172,14 +170,15 @@ index 75858b9..e8cc404 100644
  #[cfg(feature = "postgres")]
  pub use store::PostgresStore;
 diff --git a/src/engine/schema.rs b/src/engine/schema.rs
-index f452316..ca010dc 100644
 --- a/src/engine/schema.rs
 +++ b/src/engine/schema.rs
-@@ -110,67 +110,78 @@ impl Change {
+@@ -110,73 +110,78 @@ impl Change {
      /// `queue`.
      #[must_use]
      pub fn new(table: &str, column: &str, computed: &str, queue: Queue) -> Self {
--        todo!("jobq/3.23-online-schema: the change a column of a table is gaining, filled by jobs on a queue");
+-        todo!(
+-            "jobq/3.23-online-schema: the change a column of a table is gaining, filled by jobs on a queue"
+-        );
 +        Self {
 +            table: table.to_owned(),
 +            column: column.to_owned(),
@@ -251,7 +250,9 @@ index f452316..ca010dc 100644
      /// The constraint that says the column is never empty, as the database will name it.
      #[must_use]
      pub fn constraint(&self) -> String {
--        todo!("jobq/3.23-online-schema: the constraint that says the column is never empty, named after the column");
+-        todo!(
+-            "jobq/3.23-online-schema: the constraint that says the column is never empty, named after the column"
+-        );
 +        let (table, column) = (self.table.as_str(), self.column.as_str());
 +        format!("{table}_{column}_known")
      }
@@ -259,27 +260,33 @@ index f452316..ca010dc 100644
      /// The partial index the backfill reads, as the database will name it.
      #[must_use]
      pub fn index(&self) -> String {
--        todo!("jobq/3.23-online-schema: the partial index the backfill reads, named after the column");
+-        todo!(
+-            "jobq/3.23-online-schema: the partial index the backfill reads, named after the column"
+-        );
 +        let (table, column) = (self.table.as_str(), self.column.as_str());
 +        format!("{table}_unfilled_{column}")
      }
  
      /// The read path's answer while the column is empty.
-@@ -180,7 +191,8 @@ impl Change {
+@@ -186,9 +191,8 @@ impl Change {
      /// that predates the change, which is what turns an expand phase into a breaking change.
      #[must_use]
      pub fn fallback(&self) -> String {
--        todo!("jobq/3.23-online-schema: the read path's answer while the column is empty, built from `computed`");
+-        todo!(
+-            "jobq/3.23-online-schema: the read path's answer while the column is empty, built from `computed`"
+-        );
 +        let (column, computed) = (self.column.as_str(), self.computed.as_str());
 +        format!("coalesce({column}, {computed})")
      }
  
      /// Phase one: add the column, the constraint and the index, without touching a row.
-@@ -190,7 +202,12 @@ impl Change {
+@@ -198,9 +202,12 @@ impl Change {
      /// second run rather than repeat itself.
      #[must_use]
      pub fn expand(&self, applied: &Applied) -> Action {
--        todo!("jobq/3.23-online-schema: phase one: the statements that add the column, or nothing when it is already there");
+-        todo!(
+-            "jobq/3.23-online-schema: phase one: the statements that add the column, or nothing when it is already there"
+-        );
 +        if applied.column() {
 +            return Action::Nothing(
 +                "the column is already there, so an expand that ran twice changes nothing",
@@ -289,11 +296,13 @@ index f452316..ca010dc 100644
      }
  
      /// Phase two: the rows that predate the column, filled in batches by jobs on the queue.
-@@ -200,7 +217,15 @@ impl Change {
+@@ -210,9 +217,15 @@ impl Change {
      /// empty answer.
      #[must_use]
      pub fn backfill(&self, applied: &Applied, now: DateTime<Utc>) -> Action {
--        todo!("jobq/3.23-online-schema: phase two: the plan of jobs for the rows that have no value, or why there is none");
+-        todo!(
+-            "jobq/3.23-online-schema: phase two: the plan of jobs for the rows that have no value, or why there is none"
+-        );
 +        if !applied.column() {
 +            return Action::Blocked(
 +                "the column is not there yet: the expand phase is what creates it",
@@ -306,11 +315,13 @@ index f452316..ca010dc 100644
      }
  
      /// The middle phase's arithmetic: what filling `remaining` rows with jobs costs.
-@@ -210,7 +235,21 @@ impl Change {
+@@ -222,9 +235,21 @@ impl Change {
      /// budgeting the work rather than starting it (a change of no rows is a plan of no batches).
      #[must_use]
      pub fn plan(&self, remaining: u32, now: DateTime<Utc>) -> Plan {
--        todo!("jobq/3.23-online-schema: the middle phase's arithmetic: what filling `remaining` rows costs");
+-        todo!(
+-            "jobq/3.23-online-schema: the middle phase's arithmetic: what filling `remaining` rows costs"
+-        );
 +        let width = self.batch.max(1);
 +        let seconds = self.interval.num_seconds();
 +        let mut batches = Vec::new();
@@ -329,11 +340,13 @@ index f452316..ca010dc 100644
      }
  
      /// Phase three: make the database check the rows it was told to skip, and take the index the
-@@ -221,10 +260,69 @@ impl Change {
+@@ -235,9 +260,68 @@ impl Change {
      /// it costs a deployment nothing.
      #[must_use]
      pub fn contract(&self, applied: &Applied) -> Action {
--        todo!("jobq/3.23-online-schema: phase three: the statements that make the database check the rows, or why it may not yet");
+-        todo!(
+-            "jobq/3.23-online-schema: phase three: the statements that make the database check the rows, or why it may not yet"
+-        );
 +        if !applied.column() {
 +            return Action::Blocked(
 +                "the column is not there yet: the expand phase is what creates it",
@@ -397,12 +410,9 @@ index f452316..ca010dc 100644
 +            format!("drop index if exists {}", self.index()),
 +        ]
      }
--
--
  }
  
- /// What the database already answers about a change, so a phase knows whether it is a repeat.
-@@ -247,38 +345,50 @@ impl Applied {
+@@ -261,40 +345,50 @@ impl Applied {
      /// What a database that has never seen this change answers.
      #[must_use]
      pub fn before() -> Self {
@@ -454,12 +464,14 @@ index f452316..ca010dc 100644
      /// Whether the database has checked the rows that predate the constraint.
      #[must_use]
      pub fn validated(&self) -> bool {
--        todo!("jobq/3.23-online-schema: whether the database has checked the rows that predate the constraint");
+-        todo!(
+-            "jobq/3.23-online-schema: whether the database has checked the rows that predate the constraint"
+-        );
 +        self.validated
      }
  }
  
-@@ -320,31 +430,31 @@ impl Plan {
+@@ -336,31 +430,31 @@ impl Plan {
      /// The change this plan runs.
      #[must_use]
      pub fn change(&self) -> &Change {
@@ -496,11 +508,13 @@ index f452316..ca010dc 100644
      }
  
      /// The most batches due in one interval: the rate this plan keeps.
-@@ -355,7 +465,28 @@ impl Plan {
+@@ -371,9 +465,28 @@ impl Plan {
      /// queue's workers at once is a migration that stops the queue.
      #[must_use]
      pub fn burst(&self) -> u32 {
--        todo!("jobq/3.23-online-schema: the most batches due in one interval: the rate this plan keeps");
+-        todo!(
+-            "jobq/3.23-online-schema: the most batches due in one interval: the rate this plan keeps"
+-        );
 +        let Some(first) = self.batches.first() else {
 +            return 0;
 +        };
@@ -526,7 +540,7 @@ index f452316..ca010dc 100644
      }
  
      /// The one statement one batch runs, or `None` when the plan has no such batch.
-@@ -365,7 +496,17 @@ impl Plan {
+@@ -383,7 +496,17 @@ impl Plan {
      /// interrupted finishable by anybody, and `limit` is what makes the batch atomic and small.
      #[must_use]
      pub fn statement(&self, index: usize) -> Option<String> {
@@ -545,7 +559,7 @@ index f452316..ca010dc 100644
      }
  
      /// The jobs to submit, in the order they run.
-@@ -376,7 +517,22 @@ impl Plan {
+@@ -394,7 +517,22 @@ impl Plan {
      /// claim will not hand out.
      #[must_use]
      pub fn requests(&self) -> Vec<SubmitRequest> {
@@ -569,7 +583,7 @@ index f452316..ca010dc 100644
      }
  }
  
-@@ -391,17 +547,21 @@ pub struct Batch {
+@@ -409,16 +547,21 @@ pub struct Batch {
  }
  
  impl Batch {
@@ -577,7 +591,7 @@ index f452316..ca010dc 100644
 +    fn new(rows: u32, due_at: DateTime<Utc>) -> Self {
 +        Self { rows, due_at }
 +    }
- 
++
      /// How many rows this batch fills.
      #[must_use]
      pub fn rows(&self) -> u32 {
@@ -593,11 +607,13 @@ index f452316..ca010dc 100644
      }
  }
  
-@@ -418,5 +578,15 @@ impl Batch {
+@@ -435,7 +578,15 @@ impl Batch {
  /// that reads these lines treats a missing metric as `blocked`, which is the honest answer.
  #[must_use]
  pub fn cost(change: &Change, rows: u32, left: u32, now: DateTime<Utc>) -> Vec<String> {
--    todo!("jobq/3.23-online-schema: the lines a harness prints: the cost of the plan and the two guards over it");
+-    todo!(
+-        "jobq/3.23-online-schema: the lines a harness prints: the cost of the plan and the two guards over it"
+-    );
 +    let whole = change.plan(rows, now);
 +    let resume = change.plan(left, now);
 +    let mut lines = vec![

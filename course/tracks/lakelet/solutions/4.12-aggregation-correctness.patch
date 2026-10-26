@@ -1,5 +1,4 @@
 diff --git a/src/cli/mod.rs b/src/cli/mod.rs
-index 1fe5e26..ccb913f 100644
 --- a/src/cli/mod.rs
 +++ b/src/cli/mod.rs
 @@ -44,6 +44,24 @@
@@ -167,7 +166,6 @@ index 1fe5e26..ccb913f 100644
              Err(refusal) => refused_by(&refusal),
          },
 diff --git a/src/engine/query/agg.rs b/src/engine/query/agg.rs
-index 6ae20dd..38a863a 100644
 --- a/src/engine/query/agg.rs
 +++ b/src/engine/query/agg.rs
 @@ -127,7 +127,11 @@ impl Sum {
@@ -183,12 +181,14 @@ index 6ae20dd..38a863a 100644
      }
  
      /// Add one value.
-@@ -139,21 +143,36 @@ impl Sum {
+@@ -139,23 +143,36 @@ impl Sum {
      /// overflow. `inf - inf` is not a number, and a sum that is perfectly well defined (`1 + inf`)
      /// must not be turned into one by an accumulator that meant well.
      pub fn add(&mut self, value: f64) {
--        todo!("lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
--               and the count")
+-        todo!(
+-            "lakelet/4.12-aggregation-correctness: the total, the part the addition dropped, \
+-               and the count"
+-        )
 +        // The addition itself, which is the one thing that cannot be avoided: `total` is what
 +        // `+=` would have left behind, and `lost` is what it threw away.
 +        let total = self.sum + value;
@@ -224,12 +224,14 @@ index 6ae20dd..38a863a 100644
      }
  
      /// What the values average to, or `None` when there are none.
-@@ -163,8 +182,10 @@ impl Sum {
+@@ -165,10 +182,10 @@ impl Sum {
      /// follows it and shows up as a missing point on a dashboard an hour later.
      #[must_use]
      pub fn mean(&self) -> Option<f64> {
--        todo!("lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
--               over the count")
+-        todo!(
+-            "lakelet/4.12-aggregation-correctness: no values is `None`, and otherwise the sum \
+-               over the count"
+-        )
 +        if self.count == 0 {
 +            return None;
 +        }
@@ -237,7 +239,7 @@ index 6ae20dd..38a863a 100644
      }
  }
  
-@@ -176,13 +197,21 @@ impl Sum {
+@@ -180,13 +197,21 @@ impl Sum {
  /// necessary is a claim *about this function* and cannot be made without running it.
  #[must_use]
  pub fn naive(values: &[f64]) -> f64 {
@@ -261,12 +263,14 @@ index 6ae20dd..38a863a 100644
  }
  
  /// The error [`running`] is allowed on `values`: [`BOUND`] times the sum of their magnitudes.
-@@ -194,8 +223,11 @@ pub fn running(values: &[f64]) -> f64 {
+@@ -198,10 +223,11 @@ pub fn running(values: &[f64]) -> f64 {
  /// and [`agrees`] then agrees with nothing — the honest answer for a workload no bound applies to.
  #[must_use]
  pub fn error_bound(values: &[f64]) -> f64 {
--    todo!("lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
--           state them, times BOUND")
+-    todo!(
+-        "lakelet/4.12-aggregation-correctness: magnitudes, through the accumulator that can \
+-           state them, times BOUND"
+-    )
 +    let mut magnitudes = Sum::new();
 +    for value in values {
 +        magnitudes.add(value.abs());
@@ -275,17 +279,19 @@ index 6ae20dd..38a863a 100644
  }
  
  /// `true` when `left` and `right` are the same number, inside the absolute `bound`.
-@@ -207,8 +239,7 @@ pub fn error_bound(values: &[f64]) -> f64 {
+@@ -213,10 +239,7 @@ pub fn error_bound(values: &[f64]) -> f64 {
  /// has to refuse to certify it.
  #[must_use]
  pub fn agrees(left: f64, right: f64, bound: f64) -> bool {
--    todo!("lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
--           answers false by itself")
+-    todo!(
+-        "lakelet/4.12-aggregation-correctness: `|left - right|` against the bound, and `NaN` \
+-           answers false by itself"
+-    )
 +    (left - right).abs() <= bound
  }
  
  /// One step of a zone's table: from `from_millis` on, the zone is `offset_millis` from UTC.
-@@ -265,6 +296,9 @@ pub struct Zone {
+@@ -273,6 +296,9 @@ pub struct Zone {
  /// The milliseconds in an hour, for reading the table below.
  const HOUR_MILLIS: i64 = 3_600_000;
  
@@ -295,12 +301,14 @@ index 6ae20dd..38a863a 100644
  /// The transitions `Europe/Berlin` had in the two years this build knows about.
  ///
  /// Five entries, in the order they happened, and each one is a real instant a reader can check the
-@@ -344,8 +378,18 @@ impl Zone {
+@@ -352,10 +378,18 @@ impl Zone {
      /// is a byte offset into the *name* the caller wrote, since a zone is not part of a query
      /// text: byte `0` is the name itself, which is where a name nobody shipped is wrong.
      pub fn parse(name: &str) -> Result<Zone, Refusal> {
--        todo!("lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
--               name that is neither is refused with `Refusal::Syntax`")
+-        todo!(
+-            "lakelet/4.12-aggregation-correctness: the shipped names first, then `±HH:MM`; a \
+-               name that is neither is refused with `Refusal::Syntax`"
+-        )
 +        if let Some(zone) = shipped(name) {
 +            return Ok(zone);
 +        }
@@ -316,7 +324,7 @@ index 6ae20dd..38a863a 100644
      }
  
      /// What this zone is called: a shipped name, or the offset a caller wrote.
-@@ -362,7 +406,7 @@ impl Zone {
+@@ -372,7 +406,7 @@ impl Zone {
      /// every instant, and a shipped table covers the span it ships.
      #[must_use]
      pub const fn covers(&self) -> (u64, u64) {
@@ -325,12 +333,14 @@ index 6ae20dd..38a863a 100644
      }
  
      /// How far `ts_millis` is from UTC in this zone, or `None` when the table does not cover that
-@@ -380,8 +424,21 @@ impl Zone {
+@@ -390,10 +424,21 @@ impl Zone {
      /// starts in 2024 covers neither.
      #[must_use]
      pub fn offset_at(&self, ts_millis: i64) -> Option<i64> {
--        todo!("lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
--               at or before the instant")
+-        todo!(
+-            "lakelet/4.12-aggregation-correctness: the covered span first, then the last change \
+-               at or before the instant"
+-        )
 +        let at = u64::try_from(ts_millis).unwrap_or(0);
 +        if at < self.from_millis || at >= self.to_millis {
 +            return None;
@@ -349,12 +359,14 @@ index 6ae20dd..38a863a 100644
      }
  
      /// The half-open span of the *local* day `ts_millis` falls in, as milliseconds since the Unix
-@@ -406,7 +463,147 @@ impl Zone {
+@@ -418,9 +463,147 @@ impl Zone {
      /// belongs to the first day this store can name rather than to no day at all.
      #[must_use]
      pub fn local_day(&self, ts_millis: i64) -> Option<(u64, u64)> {
--        todo!("lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
--               midnight, and the offset in force at that midnight")
+-        todo!(
+-            "lakelet/4.12-aggregation-correctness: the offset at the instant, the local \
+-               midnight, and the offset in force at that midnight"
+-        )
 +        let offset = self.offset_at(ts_millis)?;
 +        // The day is a property of the local calendar, so it is found in local time first: the
 +        // wall clock at this instant, rounded down to its own midnight.
@@ -500,7 +512,6 @@ index 6ae20dd..38a863a 100644
 +        .join(", ")
  }
 diff --git a/src/engine/query/downsample.rs b/src/engine/query/downsample.rs
-index eb7754c..ab18604 100644
 --- a/src/engine/query/downsample.rs
 +++ b/src/engine/query/downsample.rs
 @@ -67,10 +67,24 @@
@@ -721,7 +732,6 @@ index eb7754c..ab18604 100644
          }
      }
 diff --git a/src/engine/query/exec.rs b/src/engine/query/exec.rs
-index a2a889b..95a3858 100644
 --- a/src/engine/query/exec.rs
 +++ b/src/engine/query/exec.rs
 @@ -40,6 +40,7 @@
