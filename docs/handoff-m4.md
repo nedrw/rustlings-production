@@ -75,7 +75,7 @@ audit）、`src/bin/{meshkvd,meshkvc}.rs`、`src/cli/**`、`docs/**` 十三页�
 | 离线快路 | 两个 scratch 树都在 `CARGO_NET_OFFLINE=true` + 私有 `XDG_CACHE_HOME` 下建起并判定 |
 | 探题池 | `kiln probe --check` → `83 exercise(s) · 83 reference(s) passed` |
 | 课程自有检查 | `lint-caps` 97/136/119/119 `no issues.`；`links` 139 页 557 链接 0 findings；`cargo test -q -p kiln` 338+21+1 |
-| `cargo xtask ci` | （收尾跑）|
+| `cargo xtask ci` | **exit 0**（`xtask ci: all checks passed`）：五轨 `22/22 + 24/24 + 27/27 + 24/24 + 22/22`、83/83 探题、workspace 测试与全部门 |
 
 ## 5. 缺口
 
