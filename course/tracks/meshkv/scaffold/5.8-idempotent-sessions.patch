@@ -1,0 +1,200 @@
+--- /dev/null
++++ b/src/idempotency.rs
+@@ -0,0 +1,187 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one of used.
++
++//! A retry is not a second write: sessions and the keys that make one.
++//!
++//! `meshkv/5.8-idempotent-sessions` is the step where the *client* becomes part of the protocol.
++//! `5.7` taught a client to find the leader; this step teaches it that finding the leader is not
++//! the end of the conversation, because the answer may never arrive. A timeout is ambiguous: the
++//! write may have committed, or the request may never have reached the leader, and the client
++//! cannot tell the difference. Its only safe move is to ask again — and the second ask must not
++//! be a second write.
++//!
++//! The mechanism has two halves, and both are needed:
++//!
++//! * **the session.** A client that talks to a cluster needs an identity that survives a retry: a
++//!   session id, and the fact that the session is bound to *one* leader at a time. A retry that
++//! crosses a leadership change is a request that a different leader has to recognise.
++//! * **the idempotency key.** The client puts a key on the write it means to make once. The leader
++//! remembers the keys it has already applied, together with the answers it gave, and a request
++//! that carries a key it has seen is not applied again — it is *answered again*, with the same
++//!   answer.
++//!
++//! The second half is where the care goes. A duplicate request must return the *original* answer,
++//! not a fresh one, and it must return it while the key is still remembered. The window is
++//! therefore finite, and the size of that window is a decision, not a detail: a key remembered
++//! forever is a memory leak, and a key forgotten too early is a duplicate write.
++
++use std::collections::BTreeMap;
++use std::time::Duration;
++
++use crate::error::Result;
++
++/// A key that identifies one intended write.
++///
++/// It is an opaque string on purpose: the leader stores it, compares it, and never interprets it.
++/// The client generates it however it likes — a UUID, a counter plus a timestamp, a hash of the
++/// request — and the only thing that matters is that the *same* intended write always carries the
++/// *same* key.
++pub type IdempotencyKey = String;
++
++/// How long a leader remembers the keys it has applied.
++///
++/// The window has to cover the time a client is willing to retry, and a little more: a client that
++/// gave up after three attempts over a second needs the key to live longer than that. It also has
++/// to be bounded, because the memory this costs is one entry per write in the window.
++#[must_use]
++pub fn default_window() -> Duration {
++    todo!("meshkv/5.8-idempotent-sessions: default_window")
++}
++
++/// The answers a leader remembers, so that a retry is answered the same way.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Answers {
++    entries: BTreeMap<IdempotencyKey, (Vec<u8>, u64)>,
++    window: Duration,
++}
++
++impl Answers {
++    /// A leader that remembers nothing, for `window`.
++    #[must_use]
++    pub fn new(window: Duration) -> Self {
++        let _ = window;
++        todo!("meshkv/5.8-idempotent-sessions: Answers::new")
++    }
++
++    /// How many keys are remembered.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("meshkv/5.8-idempotent-sessions: Answers::len")
++    }
++
++    /// `true` when nothing is remembered.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("meshkv/5.8-idempotent-sessions: Answers::is_empty")
++    }
++
++    /// The answer this leader gave for `key`, if it still remembers it.
++    #[must_use]
++    pub fn get(&self, key: &IdempotencyKey) -> Option<&[u8]> {
++        let _ = key;
++        todo!("meshkv/5.8-idempotent-sessions: Answers::get")
++    }
++
++    /// Remember that `key` was answered with `answer` at `now`.
++    pub fn remember(&mut self, key: IdempotencyKey, answer: Vec<u8>, now: u64) {
++        let _ = (key, answer, now);
++        todo!("meshkv/5.8-idempotent-sessions: Answers::remember")
++    }
++
++    /// Forget the keys that are older than the window, and answer how many went.
++    ///
++    /// "Older" is measured from the moment the key was answered, so a key lives for the whole
++    /// window after it was used, not after it was created.
++    pub fn expire(&mut self, now: u64) -> usize {
++        let _ = now;
++        todo!("meshkv/5.8-idempotent-sessions: Answers::expire")
++    }
++}
++
++/// A client that means to make one write, however many times it asks.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Session {
++    id: String,
++}
++
++impl Session {
++    /// A session with the given id.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the id is empty — an anonymous session cannot be recognised on a
++    /// retry, which is the whole point of having one.
++    pub fn new(id: impl Into<String>) -> Result<Self> {
++        let _ = id;
++        todo!("meshkv/5.8-idempotent-sessions: Session::new")
++    }
++
++    /// The session's id.
++    #[must_use]
++    pub fn id(&self) -> &str {
++        todo!("meshkv/5.8-idempotent-sessions: Session::id")
++    }
++
++    /// The key one intended write carries.
++    ///
++    /// The key is derived from the session and the request, so the *same* request in the *same*
++    /// session always produces the *same* key — which is what makes a retry a retry rather than a
++    /// second write. A different request produces a different key, so it is a different write.
++    #[must_use]
++    pub fn key_for(&self, request: &[u8]) -> IdempotencyKey {
++        let _ = request;
++        todo!("meshkv/5.8-idempotent-sessions: Session::key_for")
++    }
++}
++
++/// What a leader does with a request that carries a key.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Outcome {
++    /// The write was applied now, and this is its answer.
++    Applied {
++        /// The position the write took, if the leader knows one.
++        index: Option<u64>,
++    },
++    /// The key was seen before: the write was *not* applied again, and this is the original answer.
++    Duplicate {
++        /// The answer the leader gave the first time.
++        answer: Vec<u8>,
++    },
++}
++
++/// The leader's answer to a request that carries an idempotency key.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Ledger {
++    answers: Answers,
++}
++
++impl Ledger {
++    /// A leader that remembers nothing.
++    #[must_use]
++    pub fn new(window: Duration) -> Self {
++        let _ = window;
++        todo!("meshkv/5.8-idempotent-sessions: Ledger::new")
++    }
++
++    /// The answers this leader remembers.
++    #[must_use]
++    pub fn answers(&self) -> &Answers {
++        todo!("meshkv/5.8-idempotent-sessions: Ledger::answers")
++    }
++    pub fn apply(
++        &mut self,
++        key: IdempotencyKey,
++        now: u64,
++        apply: impl FnOnce() -> Result<(Option<u64>, Vec<u8>)>,
++    ) -> Result<Outcome> {
++        let _ = (key, now, apply);
++        todo!("meshkv/5.8-idempotent-sessions: Ledger::apply")
++    }
++
++    /// Forget the keys that are older than the window.
++    pub fn expire(&mut self, now: u64) -> usize {
++        let _ = now;
++        todo!("meshkv/5.8-idempotent-sessions: Ledger::expire")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,6 +21,7 @@
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
+ pub mod client;
++pub mod idempotency;
+ pub mod raft;
+ // kiln:scaffold:end
+ 
