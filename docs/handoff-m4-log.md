@@ -489,3 +489,11 @@ bench-budget 3 步、links 12 步）；README 的 T5 状态与计数刷新。
 满/空的判定、`saturating_sub`、容量掩码——`UnsafeCell` 与别名那一半在步骤里，不在题里）。5.8 的题与已有的
 `delivery-idempotency.design` 明确分工：那道是去重**窗口**，这道是**会话**——键归 SDK、重启后能认出重试、重复答复
 带原来的下标。
+
+## 段 14：BV —— 毕业树能判什么，不能判什么
+
+尾巴树（22 步解全铺）上 `kiln verify meshkv` 只对 **5.19–5.22** 给出逐门判定：5.1–5.18 的 `unsafe-budget@0`
+数到了 5.19 才写下的 `src/ring.rs`。前缀树（只铺到 5.18）又反过来编译不了 5.19+ 的规格（`verify` 会把整条
+track 的规格都铺进 `tests/`）。结论写进 [t5-meshkv.md](t5-meshkv.md) §5/§6：逐门证据以 `selftest` 的 22/22 为准，
+`--slow` 的慢门（sim 9、bench-budget 3、conformance 1）在毕业树上全绿，`mutants` 四步被那条 must 门挡住。
+要一条命令全判绿，`unsafe-budget` 得按"本步补丁写下的文件"计数（mutants 已是这个口径）——留给 kiln，不是 M4 的欠账。
