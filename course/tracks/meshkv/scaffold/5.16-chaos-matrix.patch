@@ -1,0 +1,251 @@
+--- /dev/null
++++ b/src/chaos.rs
+@@ -0,0 +1,91 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! The chaos matrix: every fault, and the behaviour it must produce.
++//!
++//! `meshkv/5.16-chaos-injection` is the step that stops treating faults one at a time. `5.13` gave
++//! them a vocabulary, `5.14` and `5.15` asserted two of them in depth; this step asks the question a
++//! runbook asks — **for every fault, what is the expected behaviour?** — and writes the answer down
++//! as a **matrix**.
++//!
++//! The matrix is data, and it is checked from both sides. The code holds the cases; the project's
++//! page holds the same table; the spec compares them. That is `lakelet/4.3`'s trick (the decision is
++//! a value and a sentence, and the spec checks the two agree) applied to a fault catalogue — and it
++//! matters for the same reason: a page that drifts from the code is a page an operator trusts about
++//! behaviour nobody implements.
++//!
++//! Every row has three parts, because a fault is only understood when all three are answered:
++//!
++//! * **what is injected** — the fault, in `5.13`'s vocabulary;
++//! * **what a client sees** — the sentence the operator would say: writes are refused, reads are
++//!   served, and so on;
++//! * **what must still hold** — the invariant the cluster keeps whatever the fault does.
++
++use crate::error::Result;
++
++/// One row of the matrix.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Case {
++    /// The fault, as `5.13` names it.
++    pub fault: &'static str,
++    /// What a client sees while it is injected.
++    pub client_sees: &'static str,
++    /// What the cluster must still hold.
++    pub invariant: &'static str,
++}
++
++/// The matrix: one row per fault this project injects.
++///
++/// The order is the order of the page's table, and the spec compares the two row by row. A fault
++/// that is added here has to be added there, and a sentence that changes on one side has to change on
++/// the other — which is the whole point of keeping the matrix as data.
++pub const MATRIX: [Case; 4] = [
++    Case {
++        fault: "partition",
++        client_sees: "writes sent to the isolated side are refused; the majority side keeps committing",
++        invariant: "a committed write stays committed on every node once the link heals",
++    },
++    Case {
++        fault: "crash",
++        client_sees: "writes sent to the crashed node are refused until it restarts",
++        invariant: "the crashed node catches up from the log when it comes back",
++    },
++    Case {
++        fault: "drop",
++        client_sees: "the dropped messages are lost; the client retries with the same idempotency key",
++        invariant: "the retry is not a second write",
++    },
++    Case {
++        fault: "restart",
++        client_sees: "the node is unavailable for the length of the restart, then serves again",
++        invariant: "a rolling restart never leaves fewer than a majority up",
++    },
++];
++
++/// `true` when `fault` is one the matrix covers.
++#[must_use]
++pub fn covers(fault: &str) -> bool {
++    let _ = fault;
++    todo!("meshkv/5.16-chaos-matrix: covers")
++}
++
++/// The case for `fault`, if the matrix has one.
++#[must_use]
++pub fn case_for(fault: &str) -> Option<&'static Case> {
++    let _ = fault;
++    todo!("meshkv/5.16-chaos-matrix: case_for")
++}
++
++/// Check the matrix against itself, and answer why it is not a matrix if it is not.
++///
++/// A matrix with a duplicate row is a fault somebody forgot; a row with an empty sentence is a cell
++/// nobody filled in; a row whose invariant is a restatement of what the client sees is two columns
++/// for one fact.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] naming the row that failed.
++pub fn check() -> Result<()> {
++    todo!("meshkv/5.16-chaos-matrix: check")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod chaos;
+ pub mod client;
+ pub mod consistency;
+ pub mod drill;
+--- /dev/null
++++ b/docs/chaos.md
+@@ -0,0 +1,32 @@
++# The chaos matrix
++
++A fault is only understood when three questions are answered about it: what is injected, what a
++client sees, and what the cluster must still hold. This page is the project's answer for every fault
++it can inject — and the code holds the same table, so a row that changes here has to change there
++(the spec compares the two).
++
++## The matrix
++
++| fault | client sees | invariant |
++| --- | --- | --- |
++| partition | writes sent to the isolated side are refused; the majority side keeps committing | a committed write stays committed on every node once the link heals |
++| crash | writes sent to the crashed node are refused until it restarts | the crashed node catches up from the log when it comes back |
++| drop | the dropped messages are lost; the client retries with the same idempotency key | the retry is not a second write |
++| restart | the node is unavailable for the length of the restart, then serves again | a rolling restart never leaves fewer than a majority up |
++
++## How to read a row
++
++The **client sees** column is the sentence a caller can act on: refused means try the leader (or wait),
++served means the answer is real. The **invariant** column is the sentence a test asserts: it is what
++must be true of the cluster after the fault, whatever the schedule was.
++
++The two columns are deliberately different in kind. "Writes are refused while the node is down" is
++observable by a caller and useless as an assertion after the fact; "the node catches up when it comes
++back" is the thing a drill checks. A table that put the same sentence in both columns would be a table
++with one column.
++
++## Adding a fault
++
++A fault outside this matrix has no expected behaviour, which makes injecting it an experiment rather
++than a drill. Adding one means adding a row here **and** a case in `src/chaos.rs` — the spec refuses a
++matrix that is not the same on both sides, which is the only way this page stays true.
+--- /dev/null
++++ b/tests/sim_chaos.rs
+@@ -0,0 +1,109 @@
++//! The instrument for `meshkv/5.16-chaos-injection`: the matrix, one row at a time.
++//!
++//! Course content, shipped by the step's scaffold. Each row of the matrix (`src/chaos.rs`) names a
++//! fault; this harness builds a one-fault scenario for it, runs it under the seed, and prints what a
++//! client saw — which is the matrix's "client sees" column, made observable.
++//!
++//! The seed decides where the un-named writes go, so the transcript changes with it; what does not
++//! change is the verdict per row: a write sent to the isolated or crashed node is refused, and the
++//! writes that can reach a majority commit.
++
++use meshkv::chaos::{MATRIX, check};
++use meshkv::sim::{Playbook, run};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++/// The scenario for one fault, as text.
++fn scenario(fault: &str) -> &'static str {
++    match fault {
++        "partition" => {
++            "\
++partition n2 n1
++partition n2 n3
++write@n2 a 1
++heal n2 n1
++heal n2 n3
++write b 2
++write c 3
++write d 4
++"
++        }
++        "crash" => {
++            "\
++crash n2
++write@n2 a 1
++restart n2
++write b 2
++write c 3
++write d 4
++"
++        }
++        "drop" => {
++            "\
++drop 1
++write a 1
++write b 2
++write c 3
++write d 4
++"
++        }
++        "restart" => {
++            "\
++write@n1 a 1
++write b 2
++write c 3
++write d 4
++"
++        }
++        _ => "",
++    }
++}
++
++#[test]
++fn every_row_of_the_matrix_is_exercised_under_every_schedule() {
++    let seed = seed();
++    check().expect("the course's matrix is a matrix");
++    println!("meshkv-sim seed={seed}");
++    println!("meshkv-sim rows={}", MATRIX.len());
++
++    for case in MATRIX {
++        let text = scenario(case.fault);
++        assert!(
++            !text.is_empty(),
++            "the matrix names `{}` and this harness has no scenario for it",
++            case.fault
++        );
++        let playbook = Playbook::parse(text).expect("the scenario parses");
++        let transcript = run(seed, 3, &playbook).expect("the run");
++        let refused = transcript
++            .events()
++            .iter()
++            .filter(|event| event.contains("refused"))
++            .count();
++        let committed = transcript
++            .events()
++            .iter()
++            .filter(|event| event.contains("committed=") && !event.contains("committed=0"))
++            .count();
++        println!(
++            "meshkv-sim fault={} refused={refused} committed={committed} digest={}",
++            case.fault,
++            transcript.digest()
++        );
++        // Every row has an observable client verdict: something was refused or something committed.
++        assert!(
++            refused + committed > 0,
++            "`{}` produced no observable verdict: {:?}",
++            case.fault,
++            transcript.events()
++        );
++    }
++}

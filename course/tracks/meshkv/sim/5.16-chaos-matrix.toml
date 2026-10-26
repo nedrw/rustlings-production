@@ -1,0 +1,14 @@
+# The schedules `meshkv/5.16-chaos-injection` is judged by.
+#
+# Course content, at the same trust level as `spec/`: the `sim` gate reads *this* copy. The command
+# is the project's own harness (`tests/sim_chaos.rs`, which this step's scaffold ships).
+#
+# `seeds` is three schedules: the harness builds one scenario per row of the matrix and runs each
+# under the seed. What the seed decides is where the writes that name no node land, so a different
+# seed is a different transcript. What does not change is the per-row verdict: a write sent to the
+# isolated or crashed node is refused, and the writes that can reach a majority commit.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical.
+command = "cargo test -p meshkv --test sim_chaos -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
