@@ -231,3 +231,32 @@ $ kiln selftest --track meshkv
 4. **`-D clippy::expect_used` 会命中"不可能失败"的 `expect`**（`Config::new(self.members.clone()).expect(...)`）。
    正解不是 allow，是给内部调用一个**免校验的构造器**（`pub(crate) fn from_voters`），并把"为什么这里不用检查"
    写在它的文档里。
+
+## 段 6：5.6 线性一致读与租约读（B2 第一步）
+
+**5.6 做了什么**：`src/raft/read.rs`（`Lease`、`ReadAnswer::{Served, NotLeader, NeedsQuorum}`、
+`LEASE_MILLIS = 400`、`ELECTION_TIMEOUT_MILLIS = 1000`、`is_safe_lease`）、`Raft` 的读路径
+（`confirm_read` 记住 read index 并发心跳、`complete_read` 多数派确认后才授租约、`serve_read`
+按角色/租约作答）、以及"失去领导权就丢租约"（`campaign`/`step_down`/同 term 的 `on_append`
+三处）。9 个规格用例。
+
+**判据的核心不是代码，是时间的关系**：`is_safe_lease(lease, timeout)` 必须严格小于，
+课程自己的两个常量必须满足它——规格里有一条专门检查这件事。
+
+**原始结论行**：
+
+```
+$ kiln selftest --track meshkv
+6/6 step(s) hold the contract
+  ✓ 5.1 9/9 · 5.2 9/9 · 5.3 11/11 · 5.4 11/11 · 5.5 11/11 · 5.6 9/9
+$ kiln lint-caps → no issues      $ kiln links → every target resolves
+```
+
+**这一段钉下来的两条**：
+
+1. **"现在"必须是参数，不能是调用**。租约的每个函数都收 `now`（毫秒）：自己读钟的函数既没法测
+   （测试会和窗口赛跑），也没法被 `5.13` 的虚拟钟驱动。这条与 `time/clock-injection@apply — jobq/3.8`
+   是同一件事，但在分布式读路径上它是**正确性**问题而不是可测性问题。
+2. **元数据里的 `spec` 路径来自步骤名**（`5.6-lease-reads` → `spec/5.6/lease_reads.rs`，测试目标
+   `spec_lease_reads`）。我按 `read.rs` 命名文件，`missing_content` 判成"还没写正文"，
+   selftest 于是报 `0/0`——**`0/0 held` 这个输出本身就是"这一步还没被作者化"的信号**，要读它。

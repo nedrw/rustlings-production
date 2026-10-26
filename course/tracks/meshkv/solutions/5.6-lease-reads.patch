@@ -1,0 +1,108 @@
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -271,6 +271,8 @@
+     /// sending anything.
+     pub fn campaign(&mut self) -> Vec<Outbound> {
+         self.role = Role::Candidate;
++        self.lease = None;
++        self.read_index = None;
+         self.term = self.term.next();
+         self.voted_for = Some(self.id.clone());
+         self.votes.clear();
+@@ -431,13 +433,25 @@
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Invalid`] when this node is not the leader.
++    /// [`Error::Invalid`] when this node is not the leader — a follower has nothing to confirm.
+     pub fn confirm_read(&mut self, now: u64) -> Result<Vec<Outbound>> {
++        if self.role != Role::Leader {
++            return Err(Error::invalid(format!(
++                "`{}` is a {}, not the leader — a read round is started by the leader",
++                self.id,
++                self.role.as_str()
++            )));
++        }
+         let _ = now;
+-        todo!("meshkv/5.6-lease-reads: Raft::confirm_read")
++        self.read_index = Some(self.commit_index);
++        Ok(self.append_entries())
+     }
+ 
+     /// Finish a read round: a majority in this node's own term grants the lease.
++    ///
++    /// The acknowledgements are the voters that answered the heartbeat the round sent. A majority is
++    /// what makes the read index safe: no other node could have been elected in this term without
++    /// one of them knowing.
+     ///
+     /// # Errors
+     ///
+@@ -447,15 +461,46 @@
+         acknowledged: &[NodeId],
+         now: u64,
+     ) -> Result<crate::raft::read::ReadAnswer> {
+-        let _ = (acknowledged, now);
+-        todo!("meshkv/5.6-lease-reads: Raft::complete_read")
++        if self.role != Role::Leader {
++            return Err(Error::invalid(format!(
++                "`{}` is a {}, not the leader — a read round is finished by the leader",
++                self.id,
++                self.role.as_str()
++            )));
++        }
++        let Some(index) = self.read_index else {
++            return Ok(crate::raft::read::ReadAnswer::NeedsQuorum);
++        };
++        let ids: Vec<&NodeId> = acknowledged.iter().collect();
++        if self.decided(&ids) {
++            self.lease = Some(crate::raft::read::Lease::new(
++                now,
++                crate::raft::read::LEASE_MILLIS,
++                index,
++            ));
++            self.read_index = None;
++            return Ok(crate::raft::read::ReadAnswer::Served { index });
++        }
++        Ok(crate::raft::read::ReadAnswer::NeedsQuorum)
+     }
+ 
+     /// Answer a read from this node's own state, if it may.
++    ///
++    /// A follower is not allowed to answer at all: it has no idea how far behind it is. A leader
++    /// that is not inside a lease must confirm its leadership first.
+     #[must_use]
+     pub fn serve_read(&self, now: u64) -> crate::raft::read::ReadAnswer {
+-        let _ = now;
+-        todo!("meshkv/5.6-lease-reads: Raft::serve_read")
++        if self.role != Role::Leader {
++            return crate::raft::read::ReadAnswer::NotLeader {
++                leader: self.leader().cloned(),
++            };
++        }
++        match &self.lease {
++            Some(lease) if lease.is_valid(now) => crate::raft::read::ReadAnswer::Served {
++                index: lease.index(),
++            },
++            _ => crate::raft::read::ReadAnswer::NeedsQuorum,
++        }
+     }
+     // kiln:scaffold:end
+ 
+@@ -625,6 +670,8 @@
+     fn step_down(&mut self, term: Term) {
+         self.term = term;
+         self.role = Role::Follower;
++        self.lease = None;
++        self.read_index = None;
+         self.voted_for = None;
+         self.votes.clear();
+         self.next_index.clear();
+@@ -681,6 +728,8 @@
+             self.role = Role::Follower;
+             self.voted_for = None;
+             self.votes.clear();
++            self.lease = None;
++            self.read_index = None;
+         }
+         self.leader_hint = Some(leader.clone());
+         if !self.matches(&prev) {

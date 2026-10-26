@@ -1,0 +1,202 @@
+--- /dev/null
++++ b/src/raft/read.rs
+@@ -0,0 +1,115 @@
++//! Reading without writing: how a read is served, and why "now" is the hard part.
++//!
++//! A replicated log tells you what happened. It does not tell you what is happening, and the
++//! difference is what `meshkv/5.6-lease-reads` is about. A client that asks a node for a value is
++//! asking a question about *now*: if the node answers from a state that is a few entries behind, the
++//! answer may be a value the cluster has already replaced — a stale read, and in a system where a
++//! read is followed by a write it is a lost update waiting to happen.
++//!
++//! There are two ways out, and this step implements both:
++//!
++//! * **the read index.** A leader that wants to answer a read confirms it is *still* the leader by
++//!   getting a majority of the cluster to acknowledge a heartbeat in its own term. Then the value at
++//!   the commit index it saw before the round is safe to answer: nothing could have been committed
++//!   after that index without that majority knowing.
++//! * **the lease.** The confirmation above does not have to be repeated for every read. If the
++//!   leader's election timeout is `T`, and a majority acknowledged it at `t`, then no other node can
++//!   win an election before `t + T` — so until then the leader may answer locally. That window is
++//!   the lease, and it is worth having only because it is *strictly shorter* than the election
++//!   timeout: a lease that outlived the timeout would be a stale read with extra steps.
++//!
++//! Two things about the shape of this module matter more than the code:
++//!
++//! * **time is an argument, not a call.** Every function that needs to know when it is takes a
++//!   `now` in milliseconds (`time/clock-injection@apply — jobq/3.8`). A lease that read the clock
++//!   itself would be untestable and, worse, un-simulatable: `5.13` drives this code through a
++//!   virtual clock, and a function that calls `SystemTime::now()` cannot be driven by anything.
++//! * **a read is an answer about an index.** [`ReadAnswer::Served`] carries the index the answer is
++//!   correct at, so the state machine (`5.10`) is asked at exactly that position and a caller can
++//!   tell what it was told about.
++
++use crate::cluster::NodeId;
++use crate::raft::Index;
++
++/// How long a leader may answer reads locally after a majority acknowledged it.
++///
++/// The value the step uses is a fraction of the election timeout: a lease has to expire *before*
++/// another node could win the election, or the node that answers would be answering about a term
++/// that has already ended. `LEASE_MILLIS` is the course's constant because both the state machine
++/// and the harness need the same number; `5.13` is where the timeout becomes a value the simulator
++/// controls.
++pub const LEASE_MILLIS: u64 = 400;
++
++/// How long an election timeout is, for this step's arithmetic.
++pub const ELECTION_TIMEOUT_MILLIS: u64 = 1_000;
++
++/// A window, measured on the caller's clock, in which this node may answer reads locally.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Lease {
++    expires_at: u64,
++    index: Index,
++}
++
++impl Lease {
++    /// A lease that began at `now` and lasts `millis`, correct at `index`.
++    #[must_use]
++    pub fn new(now: u64, millis: u64, index: Index) -> Self {
++        Self {
++            expires_at: now.saturating_add(millis),
++            index,
++        }
++    }
++
++    /// The instant it expires, on the clock it was taken on.
++    #[must_use]
++    pub fn expires_at(&self) -> u64 {
++        self.expires_at
++    }
++
++    /// The position the reads it covers are correct at.
++    #[must_use]
++    pub fn index(&self) -> Index {
++        self.index
++    }
++
++    /// `true` while `now` is before the lease's expiry — a lease that expires *at* an instant is
++    /// already over at that instant, which is the safe side of the comparison.
++    #[must_use]
++    pub fn is_valid(&self, now: u64) -> bool {
++        now < self.expires_at
++    }
++}
++
++/// What a node answers a read with.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReadAnswer {
++    /// The value at this index is linearizable: nothing committed after it can exist yet.
++    Served {
++        /// The position the answer is correct at.
++        index: Index,
++    },
++    /// This node is not the leader, and this is who it believes is.
++    NotLeader {
++        /// The leader this node knows of, when it knows one.
++        leader: Option<NodeId>,
++    },
++    /// This node is the leader and has no valid lease: a read needs a confirmed round.
++    NeedsQuorum,
++}
++
++impl ReadAnswer {
++    /// `true` when the read was answered.
++    #[must_use]
++    pub fn is_served(&self) -> bool {
++        matches!(self, Self::Served { .. })
++    }
++}
++
++/// `true` when `millis` is short enough to be a lease against an election timeout of `timeout`.
++///
++/// A lease is safe only while it is strictly shorter than the timeout it is derived from; equal is
++/// already too long, because the election can start at the instant the lease would end.
++#[must_use]
++pub fn is_safe_lease(millis: u64, timeout: u64) -> bool {
++    millis < timeout
++}
+--- a/src/raft/mod.rs
++++ b/src/raft/mod.rs
+@@ -350,6 +350,7 @@
+ // kiln:scaffold:begin
+ pub mod membership;
+ pub mod message;
++pub mod read;
+ pub mod snapshot;
+ pub mod state;
+ // kiln:scaffold:end
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -75,6 +75,10 @@
+     // The fields a later step adds are declared inside this block: a scaffold may only write
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// The position a read round is confirming, while the round is in flight.
++    read_index: Option<Index>,
++    /// The window in which this node may answer reads locally.
++    lease: Option<crate::raft::read::Lease>,
+     /// The snapshot this node holds, if it holds one.
+     snapshot: Option<crate::raft::snapshot::Snapshot>,
+     // kiln:scaffold:end
+@@ -103,6 +107,8 @@
+             pending: None,
+             // The fields a later step adds are set here, in the same marked region.
+             // kiln:scaffold:begin
++            read_index: None,
++            lease: None,
+             snapshot: None,
+             // kiln:scaffold:end
+         }
+@@ -408,6 +414,51 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// The position a read round is confirming, if one is in flight.
++    #[must_use]
++    pub fn read_index(&self) -> Option<Index> {
++        self.read_index
++    }
++
++    /// The window in which this node may answer reads locally, if it has one.
++    #[must_use]
++    pub fn lease(&self) -> Option<crate::raft::read::Lease> {
++        self.lease
++    }
++
++    /// Begin a read round: remember the commit index, and send a heartbeat to prove this node is
++    /// still the leader in its own term.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this node is not the leader.
++    pub fn confirm_read(&mut self, now: u64) -> Result<Vec<Outbound>> {
++        let _ = now;
++        todo!("meshkv/5.6-lease-reads: Raft::confirm_read")
++    }
++
++    /// Finish a read round: a majority in this node's own term grants the lease.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this node is not the leader.
++    pub fn complete_read(
++        &mut self,
++        acknowledged: &[NodeId],
++        now: u64,
++    ) -> Result<crate::raft::read::ReadAnswer> {
++        let _ = (acknowledged, now);
++        todo!("meshkv/5.6-lease-reads: Raft::complete_read")
++    }
++
++    /// Answer a read from this node's own state, if it may.
++    #[must_use]
++    pub fn serve_read(&self, now: u64) -> crate::raft::read::ReadAnswer {
++        let _ = now;
++        todo!("meshkv/5.6-lease-reads: Raft::serve_read")
++    }
++    // kiln:scaffold:end
++
+     /// The snapshot this node holds, if it holds one.
+     #[must_use]
+     pub fn snapshot(&self) -> Option<&crate::raft::snapshot::Snapshot> {
