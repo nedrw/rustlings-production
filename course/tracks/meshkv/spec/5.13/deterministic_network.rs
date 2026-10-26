@@ -8,24 +8,27 @@ use meshkv::cluster::NodeId;
 use meshkv::sim::{Fault, Playbook, Step, run};
 
 const SCENARIO: &str = "\
-# one node isolated, then healed
+partition n2 n1
 partition n2 n3
-write a 1
+write@n2 a 1
+heal n2 n1
 heal n2 n3
-write b 2
+write@n2 b 2
+write c 3
+write d 4
 ";
 
 #[test]
 fn a_playbook_parses_faults_and_writes_and_ignores_comments() {
     let playbook = Playbook::parse(SCENARIO).expect("a scenario");
-    assert_eq!(playbook.steps().len(), 4);
-    assert_eq!(playbook.faults(), 2);
-    assert_eq!(playbook.writes(), 2);
+    assert_eq!(playbook.steps().len(), 8);
+    assert_eq!(playbook.faults(), 4);
+    assert_eq!(playbook.writes(), 4);
     assert!(matches!(
         playbook.steps()[0],
         Step::Fault(Fault::Partition { .. })
     ));
-    assert!(matches!(playbook.steps()[1], Step::Write { .. }));
+    assert!(matches!(playbook.steps()[2], Step::Write { .. }));
 
     for line in [
         "",
@@ -94,36 +97,38 @@ fn another_seed_is_another_run() {
         distinct.len() >= 2,
         "the seed has to matter: {digests:?} are all the same run"
     );
+    // The isolation part is not seed-dependent — a write sent to an isolated node is refused under
+    // every seed — and the two writes that name no node are what the seed moves around.
 }
 
 #[test]
-fn a_partitioned_node_refuses_writes_and_healing_brings_them_back() {
+fn an_isolated_node_refuses_writes_and_healing_brings_them_back() {
+    // A node cut from *both* peers cannot reach a majority, so a write sent to it is refused; the
+    // same write after the heals commits. A single cut link is a different scenario — the node still
+    // reaches a majority through the peer it can see — and that distinction is the drill's subject.
     let playbook = Playbook::parse(SCENARIO).expect("a scenario");
-    let mut committed_while_partitioned = 0;
-    let mut committed_after_heal = 0;
-    for seed in 1..=12 {
+    let mut refused_before = 0;
+    let mut committed_after = 0;
+    for seed in 1..=4 {
         let transcript = run(seed, 3, &playbook).expect("the run");
-        let events = transcript.events();
-        let heal = events
-            .iter()
-            .position(|event| event.starts_with("heal"))
-            .expect("the scenario heals");
-        for event in &events[..heal] {
-            if event.contains("refused") {
-                committed_while_partitioned += 0;
+        for event in transcript.events() {
+            if event.contains("node=n2") && event.contains("key=a") && event.contains("refused") {
+                refused_before += 1;
             }
-        }
-        for event in &events[heal..] {
-            if event.contains("committed=1") {
-                committed_after_heal += 1;
+            if event.contains("node=n2") && event.contains("key=b") && event.contains("committed=")
+            {
+                committed_after += 1;
             }
         }
     }
-    assert!(
-        committed_after_heal > 0,
-        "a healed link has to let the next write commit"
+    assert_eq!(
+        refused_before, 4,
+        "every seed refuses the write sent to the isolated node"
     );
-    let _ = committed_while_partitioned;
+    assert_eq!(
+        committed_after, 4,
+        "and every seed commits it after the heals"
+    );
 }
 
 #[test]

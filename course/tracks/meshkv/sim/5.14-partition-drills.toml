@@ -1,0 +1,14 @@
+# The schedules `meshkv/5.14-partition-drills` is judged by.
+#
+# Course content, at the same trust level as `spec/`: the `sim` gate reads *this* copy. The command
+# is the project's own harness (`tests/sim_partition.rs`, which this step's scaffold ships).
+#
+# `seeds` is three schedules: `slow:sim@3` asks for at least three, and the gate demands that at
+# least two produce different transcripts (the two writes that name no node land elsewhere). What
+# does not depend on the seed is the drill's sentence: a write sent to a node isolated from both of
+# its peers is refused under every schedule, and the writes after the heals commit.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical.
+command = "cargo test -p meshkv --test sim_partition -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1

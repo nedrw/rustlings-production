@@ -1,0 +1,187 @@
+--- a/src/drill.rs
++++ b/src/drill.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Reading a drill out of a transcript: what a partition did, asserted.
+ //!
+ //! `meshkv/5.14-partition-drills` is the step where `5.13`'s playbook stops being a tool and starts
+@@ -23,7 +19,7 @@
+ use std::collections::BTreeSet;
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::sim::Transcript;
+ 
+ /// One thing a drill checks about a transcript.
+@@ -62,14 +58,13 @@
+     /// A drill that has to satisfy `checks`.
+     #[must_use]
+     pub fn new(checks: Vec<Check>) -> Self {
+-        let _ = checks;
+-        todo!("meshkv/5.14-partition-drills: Drill::new")
++        Self { checks }
+     }
+ 
+     /// The checks it makes.
+     #[must_use]
+     pub fn checks(&self) -> &[Check] {
+-        todo!("meshkv/5.14-partition-drills: Drill::checks")
++        &self.checks
+     }
+ 
+     /// Judge a transcript.
+@@ -84,33 +79,108 @@
+     /// [`Error::Invalid`] with the first check that failed, phrased as the sentence the runbook
+     /// would say — a drill whose failure is "assertion failed" teaches nobody anything.
+     pub fn judge(&self, transcript: &Transcript) -> Result<()> {
+-        let _ = transcript;
+-        todo!("meshkv/5.14-partition-drills: Drill::judge")
++        let events = transcript.events();
++        let size = members_of(events)?;
++        let members: Vec<NodeId> = (1..=size)
++            .filter_map(|index| NodeId::parse(&format!("n{index}")).ok())
++            .collect();
++        let mut cut: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
++        let mut crashed: BTreeSet<NodeId> = BTreeSet::new();
++        let mut writes: Vec<(NodeId, bool, bool)> = Vec::new();
++        for event in events {
++            if let Some(rest) = event.strip_prefix("partition ") {
++                let (a, b) = pair(rest)?;
++                cut.insert(ordered(&a, &b));
++            } else if let Some(rest) = event.strip_prefix("heal ") {
++                let (a, b) = pair(rest)?;
++                cut.remove(&ordered(&a, &b));
++            } else if let Some(node) = event.strip_prefix("crash node=") {
++                crashed.insert(NodeId::parse(node)?);
++            } else if let Some(node) = event.strip_prefix("restart node=") {
++                crashed.remove(&NodeId::parse(node)?);
++            } else if let Some(rest) = event.strip_prefix("write ") {
++                let Some(node) = field(rest, "node=") else {
++                    continue;
++                };
++                let node = NodeId::parse(&node)?;
++                let committed = field(rest, "committed=").is_some_and(|value| value != "0");
++                let isolated = isolated(&node, &members, &cut, &crashed);
++                writes.push((node, isolated, committed));
++            }
++        }
++
++        for check in &self.checks {
++            match check {
++                Check::Attempted { count } => {
++                    if writes.len() < *count {
++                        return Err(Error::invalid(format!(
++                            "the scenario attempted {} write(s) and the drill requires {count}",
++                            writes.len()
++                        )));
++                    }
++                }
++                Check::RefusedWhileIsolated { node } => {
++                    let offending = writes
++                        .iter()
++                        .filter(|(at, isolated, committed)| at == node && *isolated && *committed)
++                        .count();
++                    if offending > 0 {
++                        return Err(Error::invalid(format!(
++                            "{offending} write(s) sent to `{node}` committed while it was isolated \
++                             from every peer — a minority must not commit"
++                        )));
++                    }
++                }
++                Check::CommittedWhileConnected { node, count } => {
++                    let committed = writes
++                        .iter()
++                        .filter(|(at, isolated, committed)| at == node && !*isolated && *committed)
++                        .count();
++                    if committed < *count {
++                        return Err(Error::invalid(format!(
++                            "{committed} write(s) committed at `{node}` while it could reach a \
++                             majority, and the drill requires {count} — the cluster has to keep \
++                             working"
++                        )));
++                    }
++                }
++            }
++        }
++        Ok(())
+     }
+ }
+ 
+ /// The member count a transcript starts with.
+ fn members_of(events: &[String]) -> Result<usize> {
+-    let _ = events;
+-    todo!("meshkv/5.14-partition-drills: Drill::members_of")
++    events
++        .iter()
++        .find_map(|event| event.strip_prefix("members="))
++        .and_then(|value| value.parse::<usize>().ok())
++        .ok_or_else(|| {
++            Error::invalid("the transcript does not say how many members the cluster has")
++        })
+ }
+ 
+ /// The `a=` and `b=` of a fault event.
+ fn pair(rest: &str) -> Result<(NodeId, NodeId)> {
+-    let _ = rest;
+-    todo!("meshkv/5.14-partition-drills: Drill::pair")
++    let a = field(rest, "a=").ok_or_else(|| Error::invalid("a fault names no `a=`"))?;
++    let b = field(rest, "b=").ok_or_else(|| Error::invalid("a fault names no `b=`"))?;
++    Ok((NodeId::parse(&a)?, NodeId::parse(&b)?))
+ }
+ 
+ /// One `name=value` field of an event.
+ fn field(text: &str, name: &str) -> Option<String> {
+-    let _ = (text, name);
+-    todo!("meshkv/5.14-partition-drills: Drill::field")
++    text.split_whitespace()
++        .find_map(|word| word.strip_prefix(name).map(str::to_owned))
+ }
+ 
+ /// Two names in a fixed order, so a cut and its reverse are one edge.
+ fn ordered(a: &NodeId, b: &NodeId) -> (NodeId, NodeId) {
+-    let _ = (a, b);
+-    todo!("meshkv/5.14-partition-drills: Drill::ordered")
++    if a <= b {
++        (a.clone(), b.clone())
++    } else {
++        (b.clone(), a.clone())
++    }
+ }
+ 
+ /// `true` when `node` is cut from every other member (or is crashed): it cannot reach a majority.
+@@ -120,8 +190,13 @@
+     cut: &BTreeSet<(NodeId, NodeId)>,
+     crashed: &BTreeSet<NodeId>,
+ ) -> bool {
+-    let _ = (node, members, cut, crashed);
+-    todo!("meshkv/5.14-partition-drills: Drill::isolated")
++    if crashed.contains(node) {
++        return true;
++    }
++    members
++        .iter()
++        .filter(|other| *other != node)
++        .all(|other| cut.contains(&ordered(node, other)))
+ }
+ 
+ /// The drill the course ships for `5.14`: `n2` is isolated, written to, healed, and written to
+@@ -131,5 +206,14 @@
+ ///
+ /// [`Error::Invalid`] when the node names do not parse — a course bug.
+ pub fn built_in() -> Result<Drill> {
+-    todo!("meshkv/5.14-partition-drills: Drill::built_in")
++    Ok(Drill::new(vec![
++        Check::Attempted { count: 2 },
++        Check::RefusedWhileIsolated {
++            node: NodeId::parse("n2")?,
++        },
++        Check::CommittedWhileConnected {
++            node: NodeId::parse("n2")?,
++            count: 1,
++        },
++    ]))
+ }

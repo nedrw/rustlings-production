@@ -73,7 +73,7 @@
      }
  }
  
-@@ -105,7 +145,7 @@
+@@ -107,7 +147,7 @@
      /// An empty playbook.
      #[must_use]
      pub fn new() -> Self {
@@ -82,7 +82,7 @@
      }
  
      /// Read a playbook from text: one step per line, `#` starts a comment.
-@@ -114,26 +154,51 @@
+@@ -116,26 +156,78 @@
      ///
      /// [`Error::Invalid`] for a line that is neither a fault nor a write.
      pub fn parse(text: &str) -> Result<Self> {
@@ -95,14 +95,41 @@
 +                continue;
 +            }
 +            if let Some(rest) = line.strip_prefix("write ") {
++                let (at, rest) = match rest.split_once('@') {
++                    Some(_) => {
++                        return Err(Error::invalid(format!(
++                            "`{line}` puts the node in the wrong place: expected `write@<node> <key> <value>`"
++                        )));
++                    }
++                    None => (None, rest),
++                };
 +                let Some((key, value)) = rest.split_once(' ') else {
 +                    return Err(Error::invalid(format!(
-+                        "`{line}` is not a write: expected `write <key> <value>`"
++                        "`{line}` is not a write: expected `write <key> <value>` or `write@<node> <key> <value>`"
 +                    )));
 +                };
 +                steps.push(Step::Write {
 +                    key: key.to_owned(),
 +                    value: value.as_bytes().to_vec(),
++                    at,
++                });
++                continue;
++            }
++            if let Some(rest) = line.strip_prefix("write@") {
++                let Some((node, rest)) = rest.split_once(' ') else {
++                    return Err(Error::invalid(format!(
++                        "`{line}` names no node: expected `write@<node> <key> <value>`"
++                    )));
++                };
++                let Some((key, value)) = rest.split_once(' ') else {
++                    return Err(Error::invalid(format!(
++                        "`{line}` is not a write: expected `write@<node> <key> <value>`"
++                    )));
++                };
++                steps.push(Step::Write {
++                    key: key.to_owned(),
++                    value: value.as_bytes().to_vec(),
++                    at: Some(NodeId::parse(node)?),
 +                });
 +                continue;
 +            }
@@ -139,7 +166,7 @@
      }
  
      /// What the combination of two faults adds up to, so a scenario can be checked for sense.
-@@ -145,14 +210,67 @@
+@@ -147,14 +239,67 @@
      /// crashing a node twice without a restart between. A playbook with a no-op in it is a playbook
      /// that says less than its author thinks.
      pub fn check(&self) -> Result<()> {
@@ -210,7 +237,7 @@
  }
  
  /// What one message in flight is.
-@@ -177,26 +295,29 @@
+@@ -179,26 +324,29 @@
      /// The events, in order.
      #[must_use]
      pub fn events(&self) -> &[String] {
@@ -246,7 +273,7 @@
      }
  }
  
-@@ -211,6 +332,82 @@
+@@ -213,6 +361,102 @@
  /// [`Error::Invalid`] when the playbook does not make sense ([`Playbook::check`]), or when the size
  /// is zero.
  pub fn run(seed: u64, size: usize, playbook: &Playbook) -> Result<Transcript> {
@@ -271,7 +298,7 @@
 +    }
 +    transcript.push(format!("members={size}"));
 +
-+    for (at, step) in playbook.steps().iter().enumerate() {
++    for (index, step) in playbook.steps().iter().enumerate() {
 +        match step {
 +            Step::Fault(Fault::Partition { a, b }) => {
 +                partitioned.insert(ordered(a, b));
@@ -293,24 +320,40 @@
 +                crashed.remove(node);
 +                transcript.push(format!("restart node={node}"));
 +            }
-+            Step::Write { key, value } => {
-+                // The write is attempted by the client at the node the seed picks; it commits only
-+                // if every node it has to reach is up and connected. The playbook's faults are what
-+                // decides that, and the transcript says which.
-+                let target = nodes.get((rng % size as u64) as usize).cloned();
++            Step::Write { key, value, at } => {
++                // The write is attempted at the node the scenario names, or at the one the seed
++                // picks when it names none. It commits only if the node it was sent to can reach a
++                // majority: the playbook's faults are what decides that, and the transcript says
++                // which node was asked.
++                let target = at
++                    .clone()
++                    .or_else(|| nodes.get((rng % size as u64) as usize).cloned());
 +                let Some(target) = target else {
 +                    continue;
 +                };
++                if !nodes.contains(&target) {
++                    transcript.push(format!("write key={key} step={index} unknown"));
++                    continue;
++                }
 +                rng ^= rng << 13;
 +                rng ^= rng >> 7;
 +                rng ^= rng << 17;
-+                let blocked = crashed.contains(&target)
-+                    || nodes.iter().any(|other| {
-+                        other != &target && partitioned.contains(&ordered(&target, other))
-+                    });
++                // A write commits only if the node it was sent to can reach a majority: itself,
++                // plus every peer it is neither cut from nor crashed. A node cut from one peer but
++                // not from the others still leads a majority — the arithmetic is what makes a
++                // two-of-three cluster survive a single link cut.
++                let reachable = 1 + nodes
++                    .iter()
++                    .filter(|other| {
++                        *other != &target
++                            && !crashed.contains(*other)
++                            && !partitioned.contains(&ordered(&target, other))
++                    })
++                    .count();
++                let blocked = crashed.contains(&target) || reachable < size / 2 + 1;
 +                if drop_budget > 0 && !blocked {
 +                    drop_budget -= 1;
-+                    transcript.push(format!("write key={key} at={at} lost"));
++                    transcript.push(format!("write key={key} node={target} step={index} lost"));
 +                    continue;
 +                }
 +                let command = Command::Set {
@@ -319,11 +362,15 @@
 +                }
 +                .encode();
 +                if blocked {
-+                    transcript.push(format!("write key={key} at={at} refused"));
++                    transcript.push(format!(
++                        "write key={key} node={target} step={index} refused"
++                    ));
 +                } else {
 +                    let _ = command;
 +                    committed += 1;
-+                    transcript.push(format!("write key={key} at={at} committed={committed}"));
++                    transcript.push(format!(
++                        "write key={key} node={target} step={index} committed={committed}"
++                    ));
 +                }
 +            }
 +        }

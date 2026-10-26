@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/sim.rs
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,218 @@
 +#![allow(dead_code)]
 +// the stub keeps the values the implementation will read; the reference
 +// solution drops the allowance, because by then every one is used.
@@ -101,6 +101,8 @@
 +        key: String,
 +        /// The value.
 +        value: Vec<u8>,
++        /// The node it is sent to, when the scenario names one.
++        at: Option<NodeId>,
 +    },
 +}
 +
@@ -293,7 +295,7 @@
 +vocabulary that hides bugs.
 --- /dev/null
 +++ b/tests/sim_playbook.rs
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +//! The instrument for `meshkv/5.13-deterministic-network`: a scenario from a file, run by a seed.
 +//!
 +//! Course content, shipped by the step's scaffold. The scenario is the one the step's page shows:
@@ -312,10 +314,12 @@
 +
 +/// The scenario: an isolation, two writes, a heal, two more writes.
 +const SCENARIO: &str = "\
++partition n2 n1
 +partition n2 n3
-+write a 1
-+write b 2
++write@n2 a 1
++heal n2 n1
 +heal n2 n3
++write@n2 b 2
 +write c 3
 +write d 4
 +";

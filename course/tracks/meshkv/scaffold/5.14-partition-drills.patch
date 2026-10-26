@@ -1,0 +1,278 @@
+--- /dev/null
++++ b/src/drill.rs
+@@ -0,0 +1,135 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Reading a drill out of a transcript: what a partition did, asserted.
++//!
++//! `meshkv/5.14-partition-drills` is the step where `5.13`'s playbook stops being a tool and starts
++//! being an **assertion**. A partition is only understood when a test can say what must happen, and
++//! the three sentences this module makes checkable are the ones a runbook is written in:
++//!
++//! * **an isolated node does not commit.** A node cut from every peer cannot reach a majority, so a
++//!   write sent to it is refused — and if the transcript shows one committed, that is a split brain.
++//! * **the majority keeps working.** A partition that stops *everything* is an outage, not a
++//!   partition; after the heals, writes commit again.
++//! * **the scenario is the scenario.** A drill over four writes is not a drill over two.
++//!
++//! The distinction the step exists to teach is the one a first draft gets wrong: **a single cut
++//! link is not an isolation**. In a three-node cluster, a node cut from one peer still reaches a
++//! majority through the other, so a write sent to it commits — correctly. Only a node cut from
++//! *every* peer is isolated. The drill reads the transcript to tell the two apart: it rebuilds the
++//! cut graph event by event, and it judges each write against the isolation state at that moment.
++
++use std::collections::BTreeSet;
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++use crate::sim::Transcript;
++
++/// One thing a drill checks about a transcript.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Check {
++    /// The run attempted at least `count` writes, committed or not.
++    Attempted {
++        /// How many.
++        count: usize,
++    },
++    /// Every write sent to `node` while it was cut from all of its peers was refused.
++    RefusedWhileIsolated {
++        /// The node the drill isolates.
++        node: NodeId,
++    },
++    /// At least `count` writes sent to `node` committed while it could reach a majority.
++    CommittedWhileConnected {
++        /// The node the drill writes to.
++        node: NodeId,
++        /// How many commits it requires.
++        count: usize,
++    },
++}
++
++/// What a drill is: the checks a transcript has to satisfy.
++///
++/// The playbook is not stored here: the drill reads what happened, and the transcript is the
++/// scenario's own record. (The page shows the playbook the course ships, and `built_in` is that
++/// scenario's checks.)
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Drill {
++    checks: Vec<Check>,
++}
++
++impl Drill {
++    /// A drill that has to satisfy `checks`.
++    #[must_use]
++    pub fn new(checks: Vec<Check>) -> Self {
++        let _ = checks;
++        todo!("meshkv/5.14-partition-drills: Drill::new")
++    }
++
++    /// The checks it makes.
++    #[must_use]
++    pub fn checks(&self) -> &[Check] {
++        todo!("meshkv/5.14-partition-drills: Drill::checks")
++    }
++
++    /// Judge a transcript.
++    ///
++    /// The transcript is walked once, carrying the cut graph and the crashed set; each write is
++    /// recorded together with whether its node was isolated *at that moment*. That is the whole
++    /// trick of reading a drill: the verdict depends on the state when the write happened, not on
++    /// the final state of the scenario.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] with the first check that failed, phrased as the sentence the runbook
++    /// would say — a drill whose failure is "assertion failed" teaches nobody anything.
++    pub fn judge(&self, transcript: &Transcript) -> Result<()> {
++        let _ = transcript;
++        todo!("meshkv/5.14-partition-drills: Drill::judge")
++    }
++}
++
++/// The member count a transcript starts with.
++fn members_of(events: &[String]) -> Result<usize> {
++    let _ = events;
++    todo!("meshkv/5.14-partition-drills: Drill::members_of")
++}
++
++/// The `a=` and `b=` of a fault event.
++fn pair(rest: &str) -> Result<(NodeId, NodeId)> {
++    let _ = rest;
++    todo!("meshkv/5.14-partition-drills: Drill::pair")
++}
++
++/// One `name=value` field of an event.
++fn field(text: &str, name: &str) -> Option<String> {
++    let _ = (text, name);
++    todo!("meshkv/5.14-partition-drills: Drill::field")
++}
++
++/// Two names in a fixed order, so a cut and its reverse are one edge.
++fn ordered(a: &NodeId, b: &NodeId) -> (NodeId, NodeId) {
++    let _ = (a, b);
++    todo!("meshkv/5.14-partition-drills: Drill::ordered")
++}
++
++/// `true` when `node` is cut from every other member (or is crashed): it cannot reach a majority.
++fn isolated(
++    node: &NodeId,
++    members: &[NodeId],
++    cut: &BTreeSet<(NodeId, NodeId)>,
++    crashed: &BTreeSet<NodeId>,
++) -> bool {
++    let _ = (node, members, cut, crashed);
++    todo!("meshkv/5.14-partition-drills: Drill::isolated")
++}
++
++/// The drill the course ships for `5.14`: `n2` is isolated, written to, healed, and written to
++/// again.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the node names do not parse — a course bug.
++pub fn built_in() -> Result<Drill> {
++    todo!("meshkv/5.14-partition-drills: Drill::built_in")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,6 +22,7 @@
+ // kiln:scaffold:begin
+ pub mod client;
+ pub mod consistency;
++pub mod drill;
+ pub mod idempotency;
+ pub mod kv;
+ pub mod raft;
+--- /dev/null
++++ b/docs/partitions.md
+@@ -0,0 +1,55 @@
++# Partition drills: the sentences a runbook is written in
++
++A partition is not a thing you describe; it is a thing you assert. This page is the project's
++vocabulary for that, and it exists because the first draft of every partition test gets one
++distinction wrong: **a single cut link is not an isolation.**
++
++## The distinction
++
++In a three-node cluster:
++
++| fault | what the node can still do |
++| --- | --- |
++| `n2` cut from `n3` | reach a majority through `n1` — a write sent to `n2` **commits** |
++| `n2` cut from `n1` **and** `n3` | reach nobody — a write sent to `n2` is **refused** |
++| `n2` crashed | reach nobody — the same sentence, a different fault |
++
++Only the second and third are a minority. A drill that treats the first as a split brain is wrong,
++and a test that asserts a single cut stops writes is a test that would pass on a broken cluster.
++
++## The three sentences
++
++A drill reads a transcript and checks:
++
++1. **an isolated node does not commit.** No write sent to a node that was cut from every peer (or
++   crashed) may appear as committed. If one does, the transcript shows a split brain.
++2. **the majority keeps working.** After the heals, writes commit again; a partition that stops
++   everything is an outage, not a partition.
++3. **the scenario is the scenario.** A drill over two writes does not hold on a transcript with one.
++
++## Why the verdict is a state walk
++
++The drill walks the transcript once, carrying the cut graph and the crashed set, and judges each
++write against the state *at that moment*. That is the whole trick: a transcript's final state says
++nothing about whether a particular write happened while the cluster was split, and a drill that
++judged from the end would pass scenarios it should fail.
++
++## The scenario the course ships
++
++```text
++partition n2 n1
++partition n2 n3
++write@n2 a 1
++heal n2 n1
++heal n2 n3
++write@n2 b 2
++write c 3
++write d 4
++```
++
++`write@n2` names the node the client asks, because a drill has to be able to isolate *that* node;
++the last two writes name none, so the seed decides where they go — which is what keeps the schedule
++interesting without changing the sentence.
++
++The same scenario runs under every `slow:sim` seed: the refusal holds under all of them, which is
++what makes it a rule rather than a lucky interleaving.
+--- /dev/null
++++ b/tests/sim_partition.rs
+@@ -0,0 +1,69 @@
++//! The instrument for `meshkv/5.14-partition-drills`: the drill, across schedules.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is the course's drill — `n2` is
++//! isolated from both peers, written to, healed, written to again — and the harness prints the
++//! verdicts the drill draws from each seed's transcript.
++//!
++//! What the seed changes is when the two writes that name no node land; what it does not change is
++//! the sentence: a write sent to an isolated node is refused under every schedule, and the same
++//! write after the heals commits. A drill that only held under one schedule would be a drill that
++//! held by luck.
++
++use meshkv::cluster::NodeId;
++use meshkv::drill::{Drill, built_in};
++use meshkv::sim::{Playbook, run};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The scenario: `n2` isolated, written to, healed, written to again, then two free writes.
++const SCENARIO: &str = "\
++partition n2 n1
++partition n2 n3
++write@n2 a 1
++heal n2 n1
++heal n2 n3
++write@n2 b 2
++write c 3
++write d 4
++";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++#[test]
++fn the_drill_holds_under_every_schedule() {
++    let seed = seed();
++    let playbook = Playbook::parse(SCENARIO).expect("the course's scenario is a playbook");
++    let drill: Drill = built_in().expect("the course's drill");
++    let transcript = run(seed, 3, &playbook).expect("the run");
++
++    println!("meshkv-sim seed={seed}");
++    println!("meshkv-sim checks={}", drill.checks().len());
++    let mut refused = 0;
++    let mut committed = 0;
++    for event in transcript.events() {
++        if event.starts_with("write ") {
++            println!("meshkv-sim {event}");
++            if event.contains("refused") {
++                refused += 1;
++            }
++            if event.contains("committed=") && !event.contains("committed=0") {
++                committed += 1;
++            }
++        }
++    }
++    println!("meshkv-sim refused={refused} committed={committed}");
++    println!("meshkv-sim digest={}", transcript.digest());
++
++    drill.judge(&transcript).expect("the drill holds");
++    assert_eq!(refused, 1, "the write sent to the isolated node is refused");
++    assert!(committed >= 1, "and the writes after the heals commit");
++
++    // The node the drill isolates is the one the scenario isolates.
++    assert_eq!(NodeId::parse("n2").expect("a name").as_str(), "n2");
++}
