@@ -326,6 +326,15 @@ fn a_frame_that_is_not_one_is_refused_and_counted_and_the_next_one_is_stored() {
         closed.contains("accepted=0"),
         "the connection that sent nothing but a refusal accepted nothing: {closed}"
     );
+    // The two frames travel on two connections, and the refusal's close line says nothing about the
+    // other one: the record this test asserts on exists once *its* connection has closed with it,
+    // so that is the line to wait for. (Measured: waiting only on the refusal raced the daemon's
+    // read of the second socket and read the store before the frame was in it.)
+    let stored_line = service.wait_for_line("accepted=1");
+    assert!(
+        stored_line.contains("rejected=0"),
+        "the second connection carried the good frame and refused nothing: {stored_line}"
+    );
     let spool = Spool::open(service.store().path()).expect("the store the daemon wrote");
     let stored = spool.records().expect("records the store can read back");
     assert_eq!(

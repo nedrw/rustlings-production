@@ -40,3 +40,12 @@ M5 后段，不与翻译并行开工。
 `kiln hint mailer/1.1-workspace --lang zh-Hans` → `body: course/docs/steps/zh-Hans/mailer/
 1.1-workspace.md (zh-Hans)`；`kiln links` 144 页 0 findings。术语表暂不做——前三步的词汇量
 （workspace、toolchain、CI）没有产生需要仲裁的译法，第一个真正的候选是 1.4 起的 config 分层。
+
+## 段 3：第三个 flake——`4.1` 的跨连接竞态
+
+CI 的 lakelet selftest 在 4.1 挂了一次（12 个测试并行时 3/4 复现）：`a_frame_that_is_not_one…` 等
+的是**垃圾连接**的拒绝日志，而它断言的记录在**另一个连接**的落盘里——两个事实互相独立，守护进程
+晚一点读第二个 socket，规格就在落盘前打开了 spool。修法是等自己那个事实：第二个连接自己的
+`accepted=1 rejected=0` 收线日志。规格改动重钉 manifest（24 份），修后五次并行全绿。三个 flake
+（1.21 容器、这个、以及 review 轮的容器门）的共同教训已经一致：**测试要等它断言的那个事实的发生
+信号，而不是另一个并发方的信号。**
