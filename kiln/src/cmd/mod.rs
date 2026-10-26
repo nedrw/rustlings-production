@@ -36,6 +36,7 @@ pub mod links;
 pub mod lint_caps;
 pub mod list;
 pub mod plan;
+pub mod prepare;
 pub mod probe;
 pub mod reset;
 pub mod review;
@@ -170,6 +171,14 @@ pub enum Command {
             default_missing_value = "45"
         )]
         due: Option<u64>,
+    },
+
+    /// Put a step's starting state in place, without judging anything (default: the first
+    /// unfinished step).
+    Prepare {
+        /// Step to prepare: `1.14`, `1.14-worker` or `mailer/1.14-worker`.
+        #[arg(value_name = "STEP")]
+        step: Option<String>,
     },
 
     /// Run a step's spec tests (the fast path; default: the first unfinished step).
@@ -380,6 +389,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
             *check,
         ),
         Some(Command::Review { due }) => review::run(&session, *due),
+        Some(Command::Prepare { step }) => prepare::run(&mut session, step.as_deref()),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
         Some(Command::Check { step, slow }) => check::run(&mut session, step.as_deref(), *slow),

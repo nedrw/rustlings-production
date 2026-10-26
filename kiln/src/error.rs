@@ -117,7 +117,7 @@ pub enum KilnError {
     #[error(
         "{project} builds on {required}'s project ({required_project}), which does not exist yet — \
          {required}'s steps are a prerequisite, not a scaffold: run them in order, starting at \
-         `{required}/{first}`"
+         `{first}`"
     )]
     MissingDependency {
         /// This track's project directory (`app/meshkv`).
