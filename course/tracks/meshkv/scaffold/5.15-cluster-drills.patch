@@ -1,0 +1,142 @@
+--- /dev/null
++++ b/src/restart.rs
+@@ -0,0 +1,90 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Rolling a cluster one node at a time, without ever losing the majority.
++//!
++//! `meshkv/5.15-cluster-drills` is the operator's half of `5.14`: a partition is something that
++//! *happens* to a cluster, and a rolling restart is something an operator *does* to one — deploy a
++//! new binary, rotate a certificate, replace a machine. The rule is the same arithmetic as every
++//! majority in this track, applied to a schedule instead of a fault:
++//!
++//! > at every instant of the restart, a majority of the cluster has to be up.
++//!
++//! A three-node cluster can lose one node; a five-node cluster can lose two. A plan that takes down
++//! the second node before the first is back is a plan that stops the cluster, and it is a plan that
++//! looks perfectly reasonable in a spreadsheet.
++//!
++//! So the plan is a **value**, and it is checked before it is run:
++//!
++//! * the order is the operator's (or the seed's), but the *quorum* check is arithmetic;
++//! * a node that is already down does not have to come back for the plan to continue — but it does
++//!   count as down, and the plan refuses the moment down nodes would be a majority;
++//! * a node that comes back is *back*: the plan tracks which nodes are up, so a plan that restarts
++//!   the same node twice without a failure in between is a no-op the check refuses.
++//!
++//! The last one is what makes the plan honest: a restart that does not change anything is a step
++//! somebody typed by mistake, and a plan that accepted it would report "restarted" for a cluster that
++//! never went down.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// A plan to restart a cluster one node at a time.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Plan {
++    members: Vec<NodeId>,
++    order: Vec<NodeId>,
++}
++
++impl Plan {
++    /// A plan that restarts `members` in `order`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the order is not a permutation of the members — a plan that misses a
++    /// node or names a stranger is a plan that does not describe the cluster it claims to.
++    pub fn new(members: &[NodeId], order: &[NodeId]) -> Result<Self> {
++        let _ = (members, order);
++        todo!("meshkv/5.15-cluster-drills: Plan::new")
++    }
++
++    /// The nodes it restarts, in order.
++    #[must_use]
++    pub fn order(&self) -> &[NodeId] {
++        todo!("meshkv/5.15-cluster-drills: Plan::order")
++    }
++
++    /// How many nodes have to be up for the cluster to decide: a majority of the members.
++    #[must_use]
++    pub fn majority(&self) -> usize {
++        todo!("meshkv/5.15-cluster-drills: Plan::majority")
++    }
++
++    /// Run the plan, restarting one node at a time, and answer the uptime timeline.
++    ///
++    /// `up` is the set of nodes that are up before the plan starts; a node in `up` is taken down and
++    /// brought back before the next one is touched. The answer is one entry per step: the node that
++    /// was restarted, and whether the cluster still had a majority while it was down.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the plan would take the cluster below its majority: the refusal names
++    /// the node and how many were up. This is the check that turns a spreadsheet into a rule.
++    pub fn run(&self, up: &[NodeId]) -> Result<Vec<Step>> {
++        let _ = up;
++        todo!("meshkv/5.15-cluster-drills: Plan::run")
++    }
++}
++
++/// One step of a plan: which node was restarted, and what the cluster looked like while it was down.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Step {
++    /// The node that was restarted.
++    pub node: NodeId,
++    /// `true` when it was up before the restart (a node that was already down is `false`).
++    pub was_up: bool,
++    /// `true` when the cluster still had a majority while it was down. A plan that returns a step
++    /// with `false` has already refused; the field is there so a timeline can be printed.
++    pub majority_kept: bool,
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,6 +26,7 @@
+ pub mod idempotency;
+ pub mod kv;
+ pub mod raft;
++pub mod restart;
+ pub mod sdk;
+ pub mod security;
+ pub mod sim;
+--- /dev/null
++++ b/docs/restarts.md
+@@ -0,0 +1,36 @@
++# Rolling restarts: one node at a time, and the arithmetic that says why
++
++A rolling restart is what an operator does to a cluster that has to keep serving: deploy a new
++binary, rotate a certificate, replace a machine. The rule fits in one sentence, and it is the same
++arithmetic every majority in this project has used:
++
++> **At every instant of the restart, a majority of the cluster has to be up.**
++
++A three-node cluster can lose one node. A five-node cluster can lose two. A plan that takes down the
++second node before the first is back is a plan that stops the cluster — and it is a plan that looks
++perfectly reasonable in a spreadsheet, which is why it is a value here and not a paragraph.
++
++## The plan
++
++A plan is an order over the cluster's members. It is checked before it runs:
++
++- **every member exactly once.** A plan that misses a node, names a stranger, or restarts one twice
++  does not describe the cluster it claims to;
++- **the majority at every step.** The plan walks its order, taking each node down and bringing it
++  back before the next, and refuses the step that would leave fewer than `⌊n/2⌋ + 1` nodes up;
++- **a node that is already down counts.** Its turn brings it back (the timeline says it was not up),
++  but it also counts as down for every later step's majority.
++
++## What the timeline is for
++
++The plan answers a timeline rather than a yes/no: one entry per step, naming the node, whether it
++was up before its turn, and whether the majority held. That is what a runbook prints, and what an
++operator reads at 3 a.m. — "n2, was up, majority held" is a sentence somebody can act on, where
++"restart ok" is not.
++
++## Why a schedule is worth a value
++
++Because the interesting failures are *plans*, not code. A cluster that stops during a deploy is
++almost never a bug in the restart — it is a plan that was one node too greedy, or one that assumed a
++node that was down was up. Making the plan a value means the check runs before the deploy, on the
++machine, with the same arithmetic the cluster uses to decide anything.

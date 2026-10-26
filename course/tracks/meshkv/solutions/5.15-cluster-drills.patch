@@ -1,0 +1,123 @@
+--- a/src/restart.rs
++++ b/src/restart.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Rolling a cluster one node at a time, without ever losing the majority.
+ //!
+ //! `meshkv/5.15-cluster-drills` is the operator's half of `5.14`: a partition is something that
+@@ -27,8 +23,10 @@
+ //! somebody typed by mistake, and a plan that accepted it would report "restarted" for a cluster that
+ //! never went down.
+ 
++use std::collections::BTreeSet;
++
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// A plan to restart a cluster one node at a time.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -45,20 +43,43 @@
+     /// [`Error::Invalid`] when the order is not a permutation of the members — a plan that misses a
+     /// node or names a stranger is a plan that does not describe the cluster it claims to.
+     pub fn new(members: &[NodeId], order: &[NodeId]) -> Result<Self> {
+-        let _ = (members, order);
+-        todo!("meshkv/5.15-cluster-drills: Plan::new")
++        if members.is_empty() {
++            return Err(Error::invalid("a plan restarts at least one node"));
++        }
++        if members.len() != order.len() {
++            return Err(Error::invalid(format!(
++                "the plan restarts {} node(s) and the cluster has {}",
++                order.len(),
++                members.len()
++            )));
++        }
++        let unique: BTreeSet<&NodeId> = order.iter().collect();
++        if unique.len() != order.len() {
++            return Err(Error::invalid("the plan restarts a node twice"));
++        }
++        for node in order {
++            if !members.contains(node) {
++                return Err(Error::invalid(format!(
++                    "`{node}` is not a member of this cluster"
++                )));
++            }
++        }
++        Ok(Self {
++            members: members.to_vec(),
++            order: order.to_vec(),
++        })
+     }
+ 
+     /// The nodes it restarts, in order.
+     #[must_use]
+     pub fn order(&self) -> &[NodeId] {
+-        todo!("meshkv/5.15-cluster-drills: Plan::order")
++        &self.order
+     }
+ 
+     /// How many nodes have to be up for the cluster to decide: a majority of the members.
+     #[must_use]
+     pub fn majority(&self) -> usize {
+-        todo!("meshkv/5.15-cluster-drills: Plan::majority")
++        self.members.len() / 2 + 1
+     }
+ 
+     /// Run the plan, restarting one node at a time, and answer the uptime timeline.
+@@ -72,8 +93,50 @@
+     /// [`Error::Invalid`] when the plan would take the cluster below its majority: the refusal names
+     /// the node and how many were up. This is the check that turns a spreadsheet into a rule.
+     pub fn run(&self, up: &[NodeId]) -> Result<Vec<Step>> {
+-        let _ = up;
+-        todo!("meshkv/5.15-cluster-drills: Plan::run")
++        let mut up: BTreeSet<NodeId> = up.iter().cloned().collect();
++        if up.len() < self.majority() {
++            return Err(Error::invalid(format!(
++                "the cluster starts below its majority: {} of {} nodes are up and {} are needed",
++                up.len(),
++                self.members.len(),
++                self.majority()
++            )));
++        }
++        let mut timeline = Vec::new();
++        for node in &self.order {
++            if !self.members.contains(node) {
++                return Err(Error::invalid(format!("`{node}` is not a member")));
++            }
++            if !up.contains(node) {
++                // A node that is already down is restarted where its turn comes; the timeline says
++                // so, and the majority check below still applies.
++                timeline.push(Step {
++                    node: node.clone(),
++                    was_up: false,
++                    majority_kept: up.len() >= self.majority(),
++                });
++                up.insert(node.clone());
++                continue;
++            }
++            up.remove(node);
++            let majority_kept = up.len() >= self.majority();
++            if !majority_kept {
++                return Err(Error::invalid(format!(
++                    "restarting `{node}` would leave {} of {} nodes up and the cluster needs {} — \
++                     restart one node at a time",
++                    up.len(),
++                    self.members.len(),
++                    self.majority()
++                )));
++            }
++            up.insert(node.clone());
++            timeline.push(Step {
++                node: node.clone(),
++                was_up: true,
++                majority_kept,
++            });
++        }
++        Ok(timeline)
+     }
+ }
+ 

@@ -12,6 +12,7 @@ format_version = 1
 "spec/5.12/consistency_levels.rs" = "sha256:749fc72ec9efd6fc904d3f6b44ae750174725ac5380bad073acd2c680495aaa5"
 "spec/5.13/deterministic_network.rs" = "sha256:81b4888b4d8b6fb5c9d22d76119855d705f69262872f0c73e015d63ad7514833"
 "spec/5.14/partition_drills.rs" = "sha256:37179ce7e67a11920c365b2136bbd4e20e09f4f049a701a13ac150a5801e4c90"
+"spec/5.15/cluster_drills.rs" = "sha256:bd50e39e10489c45d69631831cc3a04427d63463c1b0b87b88d186c033122061"
 "spec/5.2/replication_rules.rs" = "sha256:af74365db7eeba1edf13ed0f8765f8c509839d5798d8371543ce37bd7504496a"
 "spec/5.3/teaching_raft.rs" = "sha256:8293e7cbc9614ae845e496a74f693aed71c5bd18ba74dd7ab308a95ddf887752"
 "spec/5.4/snapshots.rs" = "sha256:35354f1be6619787975e79d889e14bf9c05fc7d6006044e513a12c47248eff0d"
