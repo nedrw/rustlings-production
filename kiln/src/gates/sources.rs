@@ -143,6 +143,38 @@ pub fn production_sources(track_dir: &Path, step: &Step) -> Result<Vec<String>> 
     Ok(touched(&solution))
 }
 
+/// The production sources a step's own patches **touch**: every `src/**/*.rs` file its scaffold or
+/// its reference solution writes.
+///
+/// This is what `unsafe-budget` counts. An `unsafe` block is a promise the *author of that block*
+/// makes, so a step's budget is a statement about the files the step writes — not about the tree it
+/// happens to be judged in. Measured on `meshkv`'s graduation tree: `5.19-unsafe-deep-dive` is the
+/// step that first writes `src/ring.rs`, and every earlier step's `unsafe-budget@0` counted that
+/// file, so `kiln verify meshkv` could only judge the last four steps. A file the step never touches
+/// belongs to the step that wrote it, which is the same rule `mutants` already applies to lines.
+///
+/// A **skeleton** scaffold contributes nothing here, for the reason [`introduced_sources`] gives:
+/// the skeleton is the material a track starts from, and it is not any one step's work.
+pub fn patched_sources(track_dir: &Path, step: &Step) -> Result<Vec<String>> {
+    let mut sources: Vec<String> = Vec::new();
+    if let Some(Scaffold::Patch(scaffold)) = project::load_scaffold(track_dir, step)? {
+        extend_unique(&mut sources, touched(&scaffold));
+    }
+    if let Some(solution) = project::load_solution(track_dir, step)? {
+        extend_unique(&mut sources, touched(&solution));
+    }
+    Ok(sources)
+}
+
+/// Append `more` to `sources`, keeping `sources` in first-seen order and free of repeats.
+fn extend_unique(sources: &mut Vec<String>, more: Vec<String>) {
+    for path in more {
+        if !sources.iter().any(|seen| seen == &path) {
+            sources.push(path);
+        }
+    }
+}
+
 /// The production sources a step **introduces**: the `src/**/*.rs` files its scaffold or its
 /// reference solution creates.
 ///
@@ -402,6 +434,32 @@ mod tests {
         " use std::fmt;\n",
         "+/// New.\n",
     );
+
+    #[test]
+    fn the_files_a_step_writes_are_what_its_budget_counts() {
+        let (temp, step) = fixture_parts(
+            "sources-patched",
+            Some("scaffold/3.22-bench-budget.patch"),
+            Some("solutions/3.22-bench-budget.patch"),
+        );
+        let track_dir = temp.path().join("course/tracks/mailer");
+        temp.write(
+            "course/tracks/mailer/scaffold/3.22-bench-budget.patch",
+            INTRODUCES,
+        );
+        temp.write(
+            "course/tracks/mailer/solutions/3.22-bench-budget.patch",
+            PATCH,
+        );
+
+        let sources = patched_sources(&track_dir, &step).expect("the module resolves");
+        assert_eq!(
+            sources,
+            ["src/engine/budget.rs", "src/store.rs", "src/bin/jobqc.rs"],
+            "the scaffold's module and the solution's files, in patch order: a spec, a migration \
+             and a manifest are not production sources, and a file both patches name is listed once"
+        );
+    }
 
     #[test]
     fn the_module_coverage_measures_is_what_the_step_introduces() {

@@ -55,6 +55,42 @@ pub fn copy_project(from: &Path, to: &Path) -> Result<()> {
     carry_pin(from, to)
 }
 
+/// Copy the project a gate judges, and the project of the track it builds on (plan §3 D6).
+///
+/// `meshkv` declares `requires_track = "jobq"` and builds with `jobq = { path = "../jobq" }`: a
+/// copy that holds only the project cannot resolve that path, and every command in the copy fails
+/// before a test runs. Measured on `meshkv`'s graduation tree: `mutants@80` in `5.3`/`5.5`/`5.7`/`5.10`
+/// blocked with "failed to load manifest for dependency `jobq`" (handoff-m4 段 16).
+///
+/// The dependency is copied beside the project, under the same directory name it has in `app/`, so
+/// the relative path inside the manifest means the same thing in the copy as it does in the tree.
+pub fn copy_project_and_dependencies(
+    course: &crate::info::Course,
+    track: &crate::info::Track,
+    project_dir: &Path,
+    to: &Path,
+) -> Result<()> {
+    copy_project(project_dir, to)?;
+    let Some(required) = track.requires_track.as_deref() else {
+        return Ok(());
+    };
+    let (Some(parent), Some(scratch)) = (project_dir.parent(), to.parent()) else {
+        return Ok(());
+    };
+    // `Track::project` is a path from the course root (`app/jobq`); the copy needs the directory
+    // name alone, because the dependency sits beside the project in `app/` and the manifest reaches
+    // it as `../jobq`.
+    let project = Path::new(&course.track(required)?.project);
+    let Some(dependency) = project.file_name() else {
+        return Ok(());
+    };
+    let from = parent.join(dependency);
+    if from.is_dir() {
+        copy_project(&from, &scratch.join(dependency))?;
+    }
+    Ok(())
+}
+
 /// Copy one directory of a project, recursively, without what a build regenerates.
 fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     let mut walked = std::collections::HashSet::new();

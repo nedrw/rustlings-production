@@ -234,7 +234,7 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 | `soak@N`（slow） | 长跑无泄漏、无堆积：循环数达到地板，且每个活计数在课程上界内 | `kiln/src/gates/soak.rs`：课程侧 `soak/<step-id>.toml` 给 `cycles_min` 与每个计数的上界；**墙钟只作证据、不当判据**（handoff M3 §4.2） | T4·4.17 |
 | `fuzz@N`（slow） | 种子搜索跑够次数，且课程侧文件要求的那几条回归输入都被重放过 | `kiln/src/gates/fuzz.rs`：课程侧 `fuzz/<step-id>.toml` 给种子、`iterations_min` 与语料条数（语料在哪、什么形状是那一步自己的事）；`cargo-fuzz` 是生产里的做法，不进闸门 | T4·4.2 |
 | `?deny`（**should**） | 许可/版本/来源策略 | `cargo-deny`；未装时 `blocked` + `cargo install cargo-deny --locked` | T2 末 |
-| `unsafe-budget@N` | 无未注明 unsafe | `kiln/src/gates/unsafe_budget.rs`：源码里的 `unsafe` 计数 + 每处 `// SAFETY:` + `unsafe_code = "deny"` | T3·3.24 |
+| `unsafe-budget@N` | 无未注明 unsafe | `kiln/src/gates/unsafe_budget.rs`：**本步补丁写下的**源码里的 `unsafe` 计数 + 每处 `// SAFETY:` + 项目无 unsafe 时要求 `unsafe_code = "deny"` | T3·3.24 |
 | `semver@baseline` | 公开 API 与基线兼容 | `kiln/src/gates/semver.rs`：用 `rustc` 编译课程基线见证文件（`cargo-semver-checks` 是生产里的做法，不进闸门） | T3·3.2 |
 | `container-repro` | 镜像跑的是同一面二进制、且体积在预算内 | `kiln/src/gates/container_repro.rs`（重新构建 + `--check-config` 对照） | T1 步 21 |
 | `links` | 文档链接有效（离线：相对目标 / 锚点 / 占位符） | 内置检查器（`kiln links`） | 每条 track 末 |

@@ -178,7 +178,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
     // itself: see the module docs and [`sandbox::copy_project`]. The copy is what every path below is
     // answered against — the report's numbers, and the files the export has to name.
     let measured = scratch.path().join("project");
-    sandbox::copy_project(project, &measured)?;
+    sandbox::copy_project_and_dependencies(ctx.course, ctx.track, project, &measured)?;
     let profiles = scratch.path().join("profiles");
     std::fs::create_dir_all(&profiles).map_err(|source| KilnError::Write {
         path: profiles.clone(),

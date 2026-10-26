@@ -231,7 +231,7 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 
     let scratch = scratch::directory("mutants")?;
     let copy = scratch.path().join("project");
-    sandbox::copy_project(project, &copy)?;
+    sandbox::copy_project_and_dependencies(ctx.course, ctx.track, project, &copy)?;
 
     // The copy's builds get a directory of their own, and this is a correctness rule rather than a
     // cache one: cargo keys a build slot by package name and version, not by the directory the

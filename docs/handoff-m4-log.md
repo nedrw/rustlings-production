@@ -497,3 +497,26 @@ bench-budget 3 步、links 12 步）；README 的 T5 状态与计数刷新。
 track 的规格都铺进 `tests/`）。结论写进 [t5-meshkv.md](t5-meshkv.md) §5/§6：逐门证据以 `selftest` 的 22/22 为准，
 `--slow` 的慢门（sim 9、bench-budget 3、conformance 1）在毕业树上全绿，`mutants` 四步被那条 must 门挡住。
 要一条命令全判绿，`unsafe-budget` 得按"本步补丁写下的文件"计数（mutants 已是这个口径）——留给 kiln，不是 M4 的欠账。
+
+## 段 15：把 `verify` 从"只判最后四步"救回来
+
+段 14 留下的缺口（`unsafe-budget` 按全项目计数，毕业树上 5.1–5.18 数到 5.19 的 `src/ring.rs`）按 mutants 的口径修掉：
+门只数**本步 scaffold/参考解写下的文件**（新增 `sources::patched_sources`，脚手架是 skeleton 时不贡献文件）；
+`unsafe_code = "deny"` 的要求只在**项目整体没有 unsafe** 时成立——后一步合法地放开了它，前一步不能被它判红。
+两条规则各配一个单测（`the_files_a_step_writes_are_what_its_budget_counts`、`the_deny_is_required_only_while_the_project_holds_no_unsafe`）。
+
+**第二个坑**：`mutants`（和 `coverage`）把项目复制进临时目录，但 `meshkv` 的 `jobq = { path = "../jobq" }` 在副本里
+指向一个不存在的目录，四个 mutants 步全 `blocked`（"failed to load manifest for dependency `jobq`"）。
+`sandbox::copy_project_and_dependencies` 现在把 `requires_track` 的项目复制到副本**旁边**（`Track::project` 是
+`app/jobq`，副本里要用目录名 `jobq`——第一次按整条路径拼出 `app/app/jobq` 才踩到）。两个调用点（mutants、coverage）都换了。
+
+**结果**：`kiln verify meshkv --slow --json` → `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 22, steps: 22}`，
+exit 0，42 s；慢门真跑：`mutants@80` 10/12、12/12、4/5、6/6，`sim@3` 九步各自的 transcripts，`bench-budget@10` 三步，
+`conformance@2` 两个后端。M4 的验收行「`kiln verify meshkv --slow` 在尾巴树上全绿」至此成立。
+
+## 段 16：1.21 的容器 flake
+
+`cargo xtask ci` 第一次跑挂在 `mailer/1.21-container`：四个用例并行，两个 `podman build` 撞在同一个层缓存与两个命名
+卷上，报的是 build 失败（不是超时），同一用例单独跑是绿的。修法是在 `tests/support/container.rs` 的 `build()` 里加一把
+进程内互斥锁（`static BUILDS: Mutex<()>`，中毒也取回），构建因此串行；有缓存时排队的那几个是秒级。这是课程内容
+（1.21 的 scaffold），补丁段用 `diff -u` 重新生成了一个新文件 hunk，`selftest mailer/1.21-container` 复验。

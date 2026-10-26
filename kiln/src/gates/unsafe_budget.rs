@@ -5,7 +5,11 @@
 //! check, so every block has to say in a `// SAFETY:` note what makes it sound. Three things are
 //! judged, and each one is a sentence the reader of a diff would otherwise have to write:
 //!
-//! * production sources (`src/**/*.rs`) hold at most `N` occurrences of the word `unsafe`;
+//! * the production sources **this step writes** — every `src/**/*.rs` file its scaffold or its
+//!   reference solution touches — hold at most `N` occurrences of the word `unsafe`. A file the step
+//!   never touches belongs to the step that wrote it: without that scope, the graduation tree's
+//!   `src/ring.rs` (`5.19`'s) would count against every earlier step's zero, and `verify` could not
+//!   judge a finished project's early steps at all (handoff-m4 段 14);
 //! * every occurrence has a `// SAFETY:` note within the three lines above it;
 //! * when `N` is `0`, the project's manifest denies `unsafe_code` — the compiler is then the one
 //!   holding the line, and an `unsafe` block cannot appear without an explicit `allow`.
@@ -29,6 +33,7 @@ use serde::Deserialize;
 use crate::error::{KilnError, Result};
 use crate::gates::lexer::{Class, classify, is_identifier_byte};
 use crate::gates::runner::GateContext;
+use crate::gates::sources;
 use crate::gates::{GateOutcome, GateSpec};
 
 /// How many lines above an `unsafe` its `// SAFETY:` note may sit.
@@ -65,10 +70,22 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         return Ok(GateOutcome::blocked(ctx.missing_project()));
     };
 
-    let files = production_sources(project)?;
+    let track_dir = ctx.track.dir(ctx.course.root());
+    let written = sources::patched_sources(&track_dir, ctx.step)?;
+    if written.is_empty() {
+        return Ok(GateOutcome::blocked(format!(
+            "{}'s scaffold and reference solution touch no `src/**/*.rs`, so there is no production \
+             code this step is answerable for",
+            ctx.step.qualified_id()
+        )));
+    }
+    let files: Vec<String> = written
+        .into_iter()
+        .filter(|path| project.join(path).is_file())
+        .collect();
     if files.is_empty() {
         return Ok(GateOutcome::blocked(format!(
-            "{} has no `src/**/*.rs`, so there is no production code to count `unsafe` in",
+            "none of the production files this step writes exists in {} yet",
             ctx.project_dir.display()
         )));
     }
@@ -84,7 +101,8 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 
     if found.len() > allowed {
         return Ok(GateOutcome::failed(format!(
-            "{} `unsafe` occurrence(s) in production code and this step allows {allowed}: {}",
+            "{} `unsafe` occurrence(s) in the production files this step writes, and this step allows \
+             {allowed}: {}",
             found.len(),
             found
                 .iter()
@@ -102,8 +120,20 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         )));
     }
 
+    // The deny holds while the project is free of `unsafe`. Once a later step legitimately writes
+    // some, the manifest cannot keep denying it, and this step cannot re-deny it: the promise this
+    // check enforces — "the next block is a compile error, not a review finding" — has nothing left
+    // to protect.
+    let project_total: usize = production_sources(project)?
+        .iter()
+        .map(|file| {
+            std::fs::read_to_string(project.join(file))
+                .map(|text| occurrences(file, &text).len())
+                .unwrap_or(0)
+        })
+        .sum();
     let denied = denies_unsafe_code(project);
-    if allowed == 0 && !denied {
+    if deny_required(allowed, denied, project_total) {
         return Ok(GateOutcome::failed(format!(
             "`unsafe-budget@0` asks for no `unsafe` at all, so the project has to deny it — add \
              `[lints.rust] unsafe_code = \"deny\"` to {} (the compiler then rejects the next block \
@@ -117,7 +147,17 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
         files.len(),
         allowed,
         &project.join("Cargo.toml"),
+        denied,
     )))
+}
+
+/// Whether this step's `@0` still needs the manifest to deny `unsafe_code`.
+///
+/// It does while the project holds no `unsafe` anywhere: the deny is what turns the learner's next
+/// block into a compile error. Once a later step writes `unsafe` on purpose, the deny cannot stand,
+/// and an earlier step judged in that tree must not be failed for a manifest it no longer controls.
+fn deny_required(allowed: usize, denied: bool, project_total: usize) -> bool {
+    allowed == 0 && !denied && project_total == 0
 }
 
 /// The pass line: the counts, the note clause only when there is an occurrence for it to describe, and
@@ -127,18 +167,31 @@ pub fn run(ctx: &GateContext<'_>, spec: &GateSpec) -> Result<GateOutcome> {
 /// nothing in it is false, and it still reads as if a note were expected from a step that has no
 /// `unsafe` at all (measured on `lakelet/4.7-columnar-segments`, whose line is read by every step from
 /// there on).
-fn passed_line(occurrences: usize, files: usize, allowed: usize, manifest: &Path) -> String {
+fn passed_line(
+    occurrences: usize,
+    files: usize,
+    allowed: usize,
+    manifest: &Path,
+    denied: bool,
+) -> String {
     let notes = if occurrences == 0 {
         String::new()
     } else {
         format!(", each with a `// {SAFETY}` note")
     };
     let policy = if allowed == 0 {
-        format!(", and `unsafe_code` is denied in {}", manifest.display())
+        if denied {
+            format!(", and `unsafe_code` is denied in {}", manifest.display())
+        } else {
+            " (a later step raised the budget, so the manifest no longer denies it)".to_owned()
+        }
     } else {
         format!(" (this step allows {allowed})")
     };
-    format!("{occurrences} `unsafe` occurrence(s) in {files} production file(s){notes}{policy}")
+    format!(
+        "{occurrences} `unsafe` occurrence(s) in the {files} production file(s) this step writes\
+         {notes}{policy}"
+    )
 }
 
 /// The `unsafe` occurrences of one file's production code.
@@ -621,21 +674,42 @@ mod tests {
     #[test]
     fn a_step_with_no_unsafe_does_not_claim_it_documented_any() {
         let manifest = Path::new("/tmp/project/Cargo.toml");
-        let clean = passed_line(0, 31, 0, manifest);
+        let clean = passed_line(0, 1, 0, manifest, true);
         assert!(
-            clean.contains("0 `unsafe` occurrence(s) in 31 production file(s)"),
+            clean.contains("0 `unsafe` occurrence(s) in the 1 production file(s) this step writes"),
             "{clean}"
         );
         assert!(!clean.contains("each with a"), "{clean}");
         assert!(clean.contains("unsafe_code` is denied"), "{clean}");
 
         // With occurrences, the note clause is the point, and a step that allows some says so.
-        let documented = passed_line(2, 5, 2, manifest);
+        let documented = passed_line(2, 5, 2, manifest, true);
         assert!(
             documented.contains("each with a `// SAFETY:` note"),
             "{documented}"
         );
         assert!(documented.contains("(this step allows 2)"), "{documented}");
+    }
+
+    #[test]
+    fn the_deny_is_required_only_while_the_project_holds_no_unsafe() {
+        assert!(
+            deny_required(0, false, 0),
+            "a project with no `unsafe` and no deny has lost the compile-time barrier"
+        );
+        assert!(
+            !deny_required(0, true, 0),
+            "a manifest that denies needs nothing from this rule"
+        );
+        assert!(
+            !deny_required(0, false, 5),
+            "a later step's documented `unsafe` lifts the deny, and an earlier step is not failed \
+             for it"
+        );
+        assert!(
+            !deny_required(5, false, 5),
+            "a step that allows some `unsafe` never needed the deny"
+        );
     }
 
     #[test]

@@ -83,16 +83,15 @@ slo、unsafe、reuse、protocol、audit、sdk）、`tests/spec_*.rs`（课程拷
 | 逐步 `selftest` | 5.1–5.22 全部把契约走通（scaffold 红、参考解绿、must 门全绿）：`22/22 step(s) hold the contract` |
 | `kiln probe --check` | **83/83** 参考解编译并全绿（T5 新增 18 道，池 65 → 83）|
 | 课程自有检查 | `kiln lint-caps`：`97 capabilities · 136 slots · 119 ledger positions · 119 authored steps`，`no issues.`；`kiln links` offline：139 页 · 557 链接 · 330 外部目标，0 findings；`cargo test -q -p kiln`：338 + 21 + 1 passed |
-| 全步判定（毕业树，快路） | `kiln verify meshkv`（22 步解全铺的毕业树）：**5.19–5.22 四步 4/4**（`spec ✓ · 10/10、10/10、10/11、10/10 must`）；5.1–5.18 判红，唯一原因是 `unsafe-budget@0` 撞上 5.19 起的 `src/ring.rs`——见 §6 第一条 |
-| 全步判定（`--slow`） | 同一棵毕业树：`{blocked: 0, clean: false, failed: 18, not_authored: 0, passed: 4, steps: 22}`，**慢门本身全绿**：`slow:sim@3` 9 步（5.3/5.5/5.9/5.10/5.12/5.13/5.14/5.16/5.21）、`slow:bench-budget@10` 3 步（5.4/5.17/5.18）、`slow:conformance@2`（5.11）全 passed；`slow:mutants@80` 4 步（5.3/5.5/5.7/5.10）blocked——被上面那条 must 门失败挡住，不是门本身的问题 |
+| 全步判定（毕业树，快路） | `kiln verify meshkv`（22 步解全铺的毕业树）：**22/22 judged step(s) pass** · 0 failed · 0 not prepared |
+| 全步判定（`--slow`） | `kiln verify meshkv --slow --json`，同一棵毕业树：**`{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 22, steps: 22}`**，exit 0，**42 s**。慢门真跑：`sim@3` 9 步（transcripts 与 seed 重放）、`mutants@80` 4 步（5.3 10/12、5.5 12/12、5.7 4/5、5.10 6/6）、`bench-budget@10` 3 步（5.4 5 计数、5.17 9、5.18 9）、`conformance@2`（scripted ✓ / in-process ✓）|
 | `cargo xtask ci` | （收尾跑：五轨 selftest + 全部门 + 探题池，结果见 §6/handoff）|
 
 ## 6. T5 范围内剩下的缺口
 
-- **`unsafe-budget` 是全项目门，而阶梯是按步收紧的**：毕业树上 5.1–5.18 的 `unsafe-budget@0` 会数到 5.19 才写下的
-  `src/ring.rs`，于是 `kiln verify` 只能对 5.19–5.22 给出逐门判定；前 18 步的逐门证据来自
-  `kiln selftest`（每步在自己的树上跑全部 must 门，22/22）。要一条命令把 22 步全判绿，门需要按"本步补丁写下的
-  文件"计 `unsafe`（mutants 已经是这个口径）——这是 kiln 侧的一项改动，不在 M4 的范围内。
+- **`unsafe-budget` 按步计**：门只数**本步 scaffold/参考解写下的**文件里的 `unsafe`（`deny` 的要求也只在项目整体
+  没有 unsafe 时成立）。这是收尾时改的：按全项目计数的话，毕业树上 5.1–5.18 会数到 5.19 才写下的 `src/ring.rs`，
+  `verify` 只能判最后四步（见 [handoff-m4-log.md](handoff-m4-log.md) 段 14）。
 - **探题的 5 个槽位按政策不出题**（其余 18 道已写成，写法见 [authoring.md](authoring.md) §11）：
   `dist/consensus@aware`（`aware` 深度不出题——loader 直接拒绝）；`dist/partition-drill@operate`、
   `ops/cluster-drill@operate`、`dist/consistency-audit@operate`（机制是剧本 + 装置 + 真实集群，单文件题会变成假证据，

@@ -70,8 +70,8 @@ audit）、`src/bin/{meshkvd,meshkvc}.rs`、`src/cli/**`、`docs/**` 十三页�
 | 项 | 值 |
 | --- | --- |
 | 全步 `selftest` | `22/22 step(s) hold the contract`（每步 scaffold 红、参考解绿、must 门全绿）|
-| 全步判定（毕业树） | `kiln verify meshkv`：5.19–5.22 **4/4**；5.1–5.18 判红，唯一原因是 `unsafe-budget@0` 撞上 5.19 的 `src/ring.rs` |
-| `kiln verify meshkv --slow --json` | 同上树：`{blocked: 0, clean: false, failed: 18, not_authored: 0, passed: 4, steps: 22}`；慢门全绿（sim 9/9、bench-budget 3/3、conformance 1/1），mutants 4 步被那条 must 门挡住 |
+| 全步判定（毕业树） | `kiln verify meshkv`：**22/22 judged step(s) pass** · 0 failed · 0 not prepared |
+| `kiln verify meshkv --slow --json` | 同一棵毕业树：**`{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 22, steps: 22}`**，exit 0，42 s；慢门全部真跑并通过（sim 9、mutants 4、bench-budget 3、conformance 1）|
 | 离线快路 | 两个 scratch 树都在 `CARGO_NET_OFFLINE=true` + 私有 `XDG_CACHE_HOME` 下建起并判定 |
 | 探题池 | `kiln probe --check` → `83 exercise(s) · 83 reference(s) passed` |
 | 课程自有检查 | `lint-caps` 97/136/119/119 `no issues.`；`links` 139 页 557 链接 0 findings；`cargo test -q -p kiln` 338+21+1 |
@@ -82,5 +82,7 @@ audit）、`src/bin/{meshkvd,meshkvc}.rs`、`src/cli/**`、`docs/**` 十三页�
 - T5 的 5 个槽位不出题（`dist/consensus@aware` 按政策，其余四个 mechanism 不在单文件里）：见
   [t5-meshkv.md](t5-meshkv.md) §6。
 - miri 不可用（同上，loom 只围一个并发面）。
+- `unsafe-budget` 收尾时改为按步计（只数本步补丁写下的文件，`deny` 只在项目整体没有 unsafe 时要求）——这是让
+  `verify meshkv` 一条命令判完 22 步的前提；`mutants` 的沙箱也学会把 `requires_track` 的项目复制到副本旁边。
 - 集群在进程内：没有真实 TCP/握手/容器编排；滚动升级是调度不是杀进程。
 - 5.18 的指标是计数流，不接 Prometheus；5.22 的审计覆盖每个节点上报的已应用位置，不覆盖并发中间态。

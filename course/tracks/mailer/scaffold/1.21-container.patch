@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..f6b5253
 --- /dev/null
 +++ b/tests/support/container.rs
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,553 @@
 +//! A container built from this project, for one test (step `mailer/1.21-container`).
 +//!
 +//! The other fixtures in this directory run a *service* (`service.rs`), a *database* (`postgres.rs`)
@@ -73,6 +73,7 @@ index 0000000..f6b5253
 +use std::net::{SocketAddr, TcpStream};
 +use std::path::Path;
 +use std::process::{Command, Stdio};
++use std::sync::Mutex;
 +use std::sync::atomic::{AtomicU64, Ordering};
 +use std::time::{Duration, Instant};
 +
@@ -251,6 +252,14 @@ index 0000000..f6b5253
 +/// [`CACHE_VOLUMES`] is what makes the second build of the same image cheap.
 +#[must_use]
 +pub fn build(tag: &str, context: &Path) -> Duration {
++    // One build at a time. Two `podman build`s at once share the engine's layer cache and the two
++    // named volumes below, and under the load of four tests starting together one of them fails as
++    // a build error rather than a timeout (measured in `cargo xtask ci`: two of this file's four
++    // tests failed, the same step passed alone). Builds are cached, so a queued build is seconds.
++    static BUILDS: Mutex<()> = Mutex::new(());
++    let _serialized = BUILDS
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner());
 +    let engine = engine();
 +    let context = context
 +        .to_str()
