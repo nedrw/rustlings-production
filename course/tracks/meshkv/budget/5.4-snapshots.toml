@@ -1,0 +1,27 @@
+# The compaction budget of `meshkv/5.4-snapshots`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the
+# `bench-budget` gate reads *this* copy. The command is the project's own harness
+# (`tests/budget_snapshot.rs`, which the step's scaffold ships); the metrics are the lines it
+# prints, and every one of them is a count rather than a time — a log counts its own entries, and a
+# count is the same number on a loaded machine as on an idle one, which is why this lane judges
+# counts at all (handoff M2 §1.1).
+#
+# A metric is judged within ±10% of its baseline here. A name ending in `_max` is an **upper bound**
+# instead: `entries_after_max` is "no worse than this", not "about this", so a log that compacts
+# better passes and one that compacts worse fails.
+command = "cargo test -p meshkv --test budget_snapshot -- --nocapture"
+
+[metric]
+# The log the harness built: a thousand entries of term 1.
+entries_before = 1000
+# How many of them the snapshot replaced — the entries at or below its index.
+entries_dropped = 600
+# What the log holds afterwards: the entries after the snapshot.
+entries_after = 400
+# The share of the log that survived, 400/1000. The number that says whether compaction did
+# anything at all: a log that keeps 99% of itself is not a compacted log.
+kept_ratio = 0.4
+# The size of the state the snapshot carries, in bytes. It is small here because the step's
+# payload is opaque; what matters is that the log is gone, not that the state is small.
+snapshot_bytes = 64

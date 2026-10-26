@@ -1,6 +1,14 @@
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -6,7 +6,7 @@
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the state the implementation will read; the reference
+-// solution drops the allowance, because by then every field is read.
+-
+ //! The rules of the log, as values: terms, entries, a majority, and when an entry may be called
+ //! committed.
+ //!
+@@ -10,7 +6,7 @@
  //! refusals — not as a paragraph the next reader is hoped to remember. The network that carries
  //! these values between nodes is `5.3`'s.
  
@@ -9,7 +17,7 @@
  
  /// A position in the log: one-based, monotonic, never reused.
  pub type Index = u64;
-@@ -23,26 +23,25 @@
+@@ -27,26 +23,25 @@
      /// The term a brand-new node starts in.
      #[must_use]
      pub fn zero() -> Self {
@@ -40,7 +48,7 @@
      }
  }
  
-@@ -62,8 +61,11 @@
+@@ -66,8 +61,11 @@
      /// An entry proposed in `term` at `index`, carrying nothing.
      #[must_use]
      pub fn new(term: Term, index: Index) -> Self {
@@ -54,7 +62,7 @@
      }
  
      /// An entry that carries `payload` — the write a client asked for.
-@@ -72,14 +74,17 @@
+@@ -76,14 +74,17 @@
      /// *which term* proposed it, never about what is inside it.
      #[must_use]
      pub fn with_payload(term: Term, index: Index, payload: Vec<u8>) -> Self {
@@ -75,7 +83,7 @@
      }
  }
  
-@@ -96,8 +101,7 @@
+@@ -100,8 +101,7 @@
      /// The quorum of a cluster of `size` nodes.
      #[must_use]
      pub fn of(size: usize) -> Self {
@@ -85,7 +93,7 @@
      }
  
      /// How many nodes a majority is: `size / 2 + 1`.
-@@ -106,14 +110,13 @@
+@@ -110,14 +110,13 @@
      /// commits nothing, which is the honest answer rather than a panic.
      #[must_use]
      pub fn majority(&self) -> usize {
@@ -102,7 +110,7 @@
      }
  }
  
-@@ -131,32 +134,33 @@
+@@ -140,25 +139,25 @@
      /// An empty log.
      #[must_use]
      pub fn new() -> Self {
@@ -132,23 +140,28 @@
      }
  
      /// The entry at `index`, one-based.
+@@ -167,8 +166,12 @@
+     /// like an index beyond its end.
      #[must_use]
      pub fn at(&self, index: Index) -> Option<&Entry> {
 -        let _ = index;
 -        todo!("meshkv/5.2-replication-rules: Log::at")
-+        let position = index.checked_sub(1)?;
++        if index <= self.base {
++            return None;
++        }
++        let position = index.checked_sub(self.base + 1)?;
 +        let position = usize::try_from(position).ok()?;
 +        self.entries.get(position)
      }
  
      /// Append an entry that belongs next, or refuse it and say why.
-@@ -166,8 +170,26 @@
+@@ -178,8 +181,26 @@
      /// [`Error::Protocol`] when the entry's index is not `len() + 1` (a gap or a duplicate), or its
      /// term is older than the log's last term.
      pub fn append(&mut self, entry: Entry) -> Result<()> {
 -        let _ = entry;
 -        todo!("meshkv/5.2-replication-rules: Log::append")
-+        let expected = self.entries.len() as Index + 1;
++        let expected = self.base + self.entries.len() as Index + 1;
 +        if entry.index != expected {
 +            return Err(Error::protocol(format!(
 +                "entry {} cannot follow a log of {}: the next position is {expected}",
@@ -170,14 +183,17 @@
 +        Ok(())
      }
  
-     /// Drop everything from `index` onwards, and answer how many entries went.
-@@ -175,8 +197,18 @@
+     // The methods a later step adds are declared inside this block: a scaffold may only write
+@@ -193,8 +214,21 @@
      /// This is what a follower does when a leader's log disagrees with its own: the suffix from the
      /// first mismatch is replaced, never merged.
      pub fn truncate_from(&mut self, index: Index) -> usize {
 -        let _ = index;
 -        todo!("meshkv/5.2-replication-rules: Log::truncate_from")
-+        let Some(position) = index.checked_sub(1) else {
++        if index <= self.base {
++            return 0;
++        }
++        let Some(position) = index.checked_sub(self.base + 1) else {
 +            return 0;
 +        };
 +        let Ok(position) = usize::try_from(position) else {

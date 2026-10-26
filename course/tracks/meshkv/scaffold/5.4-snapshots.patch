@@ -1,0 +1,408 @@
+--- a/src/raft/mod.rs
++++ b/src/raft/mod.rs
+@@ -207,6 +207,28 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// The index of the last entry this log no longer holds, or zero when it holds everything.
++    #[must_use]
++    pub fn base(&self) -> Index {
++        todo!("meshkv/5.4-snapshots: Log::base")
++    }
++
++    /// An empty log that starts after `index`.
++    #[must_use]
++    pub fn starting_at(index: Index) -> Self {
++        let _ = index;
++        todo!("meshkv/5.4-snapshots: Log::starting_at")
++    }
++
++    /// Drop every entry up to and including `index`, and answer how many went.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the log does not hold `index`.
++    pub fn compact_to(&mut self, index: Index) -> Result<usize> {
++        let _ = index;
++        todo!("meshkv/5.4-snapshots: Log::compact_to")
++    }
+     // kiln:scaffold:end
+ 
+     /// Drop everything from `index` onwards, and answer how many entries went.
+@@ -300,5 +322,6 @@
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
+ pub mod message;
++pub mod snapshot;
+ pub mod state;
+ // kiln:scaffold:end
+--- a/src/raft/message.rs
++++ b/src/raft/message.rs
+@@ -91,6 +91,15 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// A leader sends a snapshot to a follower that is too far behind to be caught up by entries.
++    InstallSnapshot {
++        /// The leader's term.
++        term: Term,
++        /// Who the leader is.
++        leader: NodeId,
++        /// The state, and the entry it came from.
++        snapshot: crate::raft::snapshot::Snapshot,
++    },
+     // kiln:scaffold:end
+     /// A follower answers an append.
+     AppendAck {
+@@ -115,6 +124,7 @@
+             // The arms a later step adds go here: a scaffold may only write inside a
+             // `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+             // kiln:scaffold:begin
++            Self::InstallSnapshot { term, .. } => *term,
+             // kiln:scaffold:end
+         }
+     }
+@@ -175,6 +185,18 @@
+             ),
+             // The arms a later step adds go here.
+             // kiln:scaffold:begin
++            Self::InstallSnapshot {
++                term,
++                leader,
++                snapshot,
++            } => format!(
++                "install {} {} {} {} {}",
++                term.get(),
++                leader,
++                snapshot.last_included_index,
++                snapshot.last_included_term.get(),
++                hex(&snapshot.data)
++            ),
+             // kiln:scaffold:end
+         }
+     }
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -73,6 +73,8 @@
+     // The fields a later step adds are declared inside this block: a scaffold may only write
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// The snapshot this node holds, if it holds one.
++    snapshot: Option<crate::raft::snapshot::Snapshot>,
+     // kiln:scaffold:end
+ }
+ 
+@@ -98,6 +100,7 @@
+             leader_hint: None,
+             // The fields a later step adds are set here, in the same marked region.
+             // kiln:scaffold:begin
++            snapshot: None,
+             // kiln:scaffold:end
+         }
+     }
+@@ -234,6 +237,11 @@
+             // The arms a later step adds go here: a scaffold may only write inside a
+             // `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+             // kiln:scaffold:begin
++            Message::InstallSnapshot {
++                term,
++                leader,
++                snapshot,
++            } => self.on_install_snapshot(from, term, leader, snapshot),
+             // kiln:scaffold:end
+         }
+     }
+@@ -299,6 +307,60 @@
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// The snapshot this node holds, if it holds one.
++    #[must_use]
++    pub fn snapshot(&self) -> Option<&crate::raft::snapshot::Snapshot> {
++        self.snapshot.as_ref()
++    }
++
++    /// Take a snapshot of the state as of the last committed entry.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when nothing is committed yet.
++    pub fn take_snapshot(&mut self, data: Vec<u8>) -> Result<crate::raft::snapshot::Snapshot> {
++        let _ = data;
++        todo!("meshkv/5.4-snapshots: Raft::take_snapshot")
++    }
++
++    /// Drop the log entries the snapshot covers.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the log does not hold the entry, or holds a different term.
++    pub fn compact(&mut self, snapshot: &crate::raft::snapshot::Snapshot) -> Result<usize> {
++        let _ = snapshot;
++        todo!("meshkv/5.4-snapshots: Raft::compact")
++    }
++
++    /// Adopt a snapshot: this node's log is replaced by the state the snapshot carries.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the snapshot is older than what this node has applied.
++    pub fn install_snapshot(&mut self, snapshot: &crate::raft::snapshot::Snapshot) -> Result<()> {
++        let _ = snapshot;
++        todo!("meshkv/5.4-snapshots: Raft::install_snapshot")
++    }
++
++    /// `true` when a peer is too far behind to be caught up by entries.
++    #[must_use]
++    pub fn needs_snapshot(&self, peer: &NodeId) -> bool {
++        let _ = (peer, &self.snapshot);
++        todo!("meshkv/5.4-snapshots: Raft::needs_snapshot")
++    }
++
++    /// A snapshot from the leader: adopt it, and answer how far this node now reaches.
++    fn on_install_snapshot(
++        &mut self,
++        from: &NodeId,
++        term: Term,
++        leader: NodeId,
++        snapshot: crate::raft::snapshot::Snapshot,
++    ) -> Vec<Outbound> {
++        let _ = (from, term, leader, snapshot);
++        todo!("meshkv/5.4-snapshots: Raft::on_install_snapshot")
++    }
+     // kiln:scaffold:end
+ 
+     /// The end of this node's log, as the position a vote request carries.
+@@ -329,6 +391,11 @@
+             Message::AppendAck { .. } => return Vec::new(),
+             // The arms a later step adds go here.
+             // kiln:scaffold:begin
++            Message::InstallSnapshot { .. } => Message::AppendAck {
++                term: self.term,
++                success: false,
++                match_index: 0,
++            },
+             // kiln:scaffold:end
+         };
+         vec![Outbound {
+--- /dev/null
++++ b/src/raft/snapshot.rs
+@@ -0,0 +1,72 @@
++#![allow(dead_code)]
++// the stub keeps the state the implementation will read; the reference
++// solution drops the allowance, because by then every field is read.
++
++//! The state at one index, kept so that the log before it can be thrown away.
++//!
++//! `meshkv/5.4-snapshots` is the step where the log stops being able to grow for ever. A node that
++//! has applied its state up to index 100 does not need entries 1..100 any more: it needs the *state*
++//! those entries produced. A snapshot is that state, plus the two numbers that say where it came
++//! from — the index and the term of the last entry it covers.
++//!
++//! Those two numbers are not decoration. A snapshot is only usable if the node that installs it can
++//! answer two questions about it: *which* entry it replaces (the index) and *which term* that entry
++//! belonged to (the term). The term is what makes the check possible: a follower that already has
++//! an entry at that index can compare the two, and if the terms differ the snapshot is from a
++//! different history and has to be refused. That is the same "log matching" idea `5.3` used for
++//! entries, applied to a whole prefix.
++//!
++//! The payload is opaque here, and deliberately so: what a snapshot *contains* is the state
++//! machine's business — `5.10` is the step that decides what a state is and that applying it is
++//! deterministic. This step is about *where* the snapshot is taken, *when* the log may be compacted
++//! and *how* a node that is too far behind catches up.
++
++use crate::error::Result;
++use crate::raft::{Entry, Index, Term};
++
++/// A state, and the entry it came from.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Snapshot {
++    /// The index of the last entry this snapshot covers.
++    pub last_included_index: Index,
++    /// The term of that entry.
++    pub last_included_term: Term,
++    /// The state itself — opaque bytes as far as this step is concerned.
++    pub data: Vec<u8>,
++}
++
++impl Snapshot {
++    /// A snapshot of `data` as of the entry at `index` and `term`.
++    ///
++    pub fn new(
++        last_included_index: Index,
++        last_included_term: Term,
++        data: Vec<u8>,
++    ) -> Result<Self> {
++        let _ = (last_included_index, last_included_term, data);
++        todo!("meshkv/5.4-snapshots: Snapshot::new")
++    }
++
++    /// The snapshot of the state an entry produced.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the entry is the one at index zero, which no snapshot can cover.
++    pub fn of(entry: &Entry, data: Vec<u8>) -> Result<Self> {
++        let _ = (entry, data);
++        todo!("meshkv/5.4-snapshots: Snapshot::of")
++    }
++
++    /// `true` when this snapshot covers `index` — that is, when the state at `index` is inside it.
++    #[must_use]
++    pub fn covers(&self, index: Index) -> bool {
++        let _ = index;
++        todo!("meshkv/5.4-snapshots: Snapshot::covers")
++    }
++
++    /// The size of the payload, in bytes.
++    #[must_use]
++    pub fn bytes(&self) -> usize {
++        todo!("meshkv/5.4-snapshots: Snapshot::bytes")
++    }
++}
+--- /dev/null
++++ b/docs/snapshot.md
+@@ -0,0 +1,62 @@
++# Snapshots: the state at an index
++
++A log that only grows is a log that eventually cannot be replicated, restored or shipped. This page
++is the project's answer, and it is the same answer every replicated log has found: **keep the state
++you have already applied, and throw away the entries that produced it.**
++
++## What a snapshot is
++
++A snapshot is three things:
++
++- the **state** itself — the bytes the state machine reached;
++- the **index** of the last entry it covers;
++- the **term** of that entry.
++
++The first is the payload and this step does not look inside it: what a state *is* is
++[the state machine's business](#what-the-state-is-not), and `5.10` is the step that decides what a
++state is and that applying it is deterministic.
++
++The other two are what make a snapshot usable. A node that installs a snapshot has to answer two
++questions about it: which entry does it replace, and which term did that entry belong to? The term
++is the interesting one, because it is what lets a node check the snapshot against what it already
++has: if the follower holds an entry at that index and the terms differ, the snapshot is from a
++different history and has to be refused. That is the same *log matching* idea the entries use,
++applied to a whole prefix.
++
++## When the log is compacted
++
++A snapshot is taken of the **committed** state and of nothing else — a snapshot of an entry that is
++not committed yet is a snapshot of a state that may still change. Once the snapshot exists, the
++entries at or below its index can go: the state already includes them, and keeping them would mean
++the node holds the same information twice.
++
++Compacting does not move the log. A compacted log remembers where it starts, so an index still
++means the same thing on every node: the index is a position in the *cluster's* log, not in this
++node's memory of it. The next entry after a snapshot at 600 belongs at 601, and position 600 is the
++last one this node remembers having applied.
++
++## What a node that is too far behind does
++
++A follower that is behind the leader's log is normally caught up by entries: the leader sends what
++is missing. But a follower that is behind the *snapshot* cannot be caught up that way — the entries
++it is missing are exactly the ones the snapshot replaced. So the leader sends it the snapshot
++instead, and the follower adopts it: its log is dropped, its commit index moves to the snapshot's,
++and the next entry belongs right after it.
++
++The leader knows when this is the case: if the position it would send the peer to is at or before
++the snapshot's index, the peer needs the snapshot. That is one comparison, and it is the only thing
++that has to be true for a cluster to survive a restart of one of its nodes.
++
++## What the state is not
++
++This step is about *where* the snapshot is taken and *when* the log may be compacted. What the
++bytes inside it mean — and the rule that applying them must be deterministic, so that two nodes
++that applied the same entries hold the same state — is `5.10`'s subject. A snapshot that carried
++an unordered map's iteration order would break that rule, and no amount of care in this step would
++save it.
++
++## Where it is used
++
++The cluster drill (`5.15`) restarts a node that has been away for a while, and the consistency
++audit (`5.22`) checks that what the cluster committed is what every node holds — snapshots
++included. Neither step exists yet; this page is the shape they will use.
+--- /dev/null
++++ b/tests/budget_snapshot.rs
+@@ -0,0 +1,78 @@
++//! The instrument for `meshkv/5.4-snapshots`: what a snapshot saves.
++//!
++//! Course content, shipped by the step's scaffold. The gate that reads it is `bench-budget`, and
++//! what it judges is not a time but a **count**: how many entries the log held before the snapshot
++//! and how many it holds after it. A count is the same number on a loaded machine as on an idle
++//! one, which is why this lane judges counts at all (handoff M2 §1.1).
++//!
++//! The scenario is the boring one on purpose: a log of a thousand entries, a snapshot at the
++//! halfway point, and the log compacted to it. The two numbers that matter are the entries the
++//! snapshot replaced and the entries the log still holds — and the *ratio* between them, which is
++//! what tells a reader whether compaction is doing anything at all.
++
++use meshkv::cluster::NodeId;
++use meshkv::raft::message::LogPosition;
++use meshkv::raft::snapshot::Snapshot;
++use meshkv::raft::state::Raft;
++use meshkv::raft::{Entry, Index, Term};
++
++/// How many entries the log holds before the snapshot.
++const ENTRIES: usize = 1_000;
++
++/// Where the snapshot is taken, in entries.
++const AT: usize = 600;
++
++/// A node whose log holds `ENTRIES` entries of term 1.
++fn node() -> Raft {
++    let mut node = Raft::new(
++        NodeId::parse("n1").expect("a valid name"),
++        vec![
++            NodeId::parse("n1").expect("a valid name"),
++            NodeId::parse("n2").expect("a valid name"),
++            NodeId::parse("n3").expect("a valid name"),
++        ],
++    );
++    for index in 1..=ENTRIES as Index {
++        let _ = node.on_message(
++            &NodeId::parse("n2").expect("a valid name"),
++            meshkv::raft::message::Message::Append {
++                term: Term::new(1),
++                leader: NodeId::parse("n2").expect("a valid name"),
++                prev: if index == 1 {
++                    LogPosition::empty()
++                } else {
++                    LogPosition {
++                        term: Term::new(1),
++                        index: index - 1,
++                    }
++                },
++                entries: vec![Entry::new(Term::new(1), index)],
++                commit: index,
++            },
++        );
++    }
++    node
++}
++
++#[test]
++fn a_snapshot_removes_the_entries_it_replaced() {
++    let mut node = node();
++    assert_eq!(node.log().len(), ENTRIES);
++
++    let snapshot = Snapshot::new(AT as Index, Term::new(1), vec![b's'; 64]).expect("a snapshot");
++    let dropped = node.compact(&snapshot).expect("the log holds that entry");
++
++    // The counts the gate reads.
++    println!("meshkv-budget entries_before={ENTRIES}");
++    println!("meshkv-budget entries_dropped={dropped}");
++    println!("meshkv-budget entries_after={}", node.log().len());
++    println!(
++        "meshkv-budget kept_ratio={:.4}",
++        node.log().len() as f64 / ENTRIES as f64
++    );
++    println!("meshkv-budget snapshot_bytes={}", snapshot.bytes());
++
++    assert_eq!(dropped, AT, "the snapshot replaced the entries before it");
++    assert_eq!(node.log().len(), ENTRIES - AT, "and the log holds the rest");
++    assert_eq!(node.log().base(), AT as Index, "at the snapshot's index");
++}

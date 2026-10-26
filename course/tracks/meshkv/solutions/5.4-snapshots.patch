@@ -1,0 +1,303 @@
+--- a/src/raft/mod.rs
++++ b/src/raft/mod.rs
+@@ -208,26 +208,53 @@
+     // edits safe (docs/authoring.md §5).
+     // kiln:scaffold:begin
+     /// The index of the last entry this log no longer holds, or zero when it holds everything.
++    ///
++    /// Zero means "nothing has been compacted", and it is also the index before the first entry, so
++    /// the log's first entry is always at `base + 1`.
+     #[must_use]
+     pub fn base(&self) -> Index {
+-        todo!("meshkv/5.4-snapshots: Log::base")
++        self.base
+     }
+ 
+     /// An empty log that starts after `index`.
++    ///
++    /// This is the log a node has after it installed a snapshot: it holds nothing, and the next
++    /// entry belongs at `index + 1`. The entries the snapshot covered are in the snapshot.
+     #[must_use]
+     pub fn starting_at(index: Index) -> Self {
+-        let _ = index;
+-        todo!("meshkv/5.4-snapshots: Log::starting_at")
++        Self {
++            base: index,
++            entries: Vec::new(),
++        }
+     }
+ 
+     /// Drop every entry up to and including `index`, and answer how many went.
+     ///
++    /// The log keeps its place: after compacting to 10, the next entry belongs at 11, and position
++    /// 10 is the last one this node remembers *having applied* — which is what a snapshot at 10
++    /// means.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::Protocol`] when the log does not hold `index`.
++    /// [`Error::Protocol`] when the log does not hold `index` — a node cannot compact past what it
++    /// never received.
+     pub fn compact_to(&mut self, index: Index) -> Result<usize> {
+-        let _ = index;
+-        todo!("meshkv/5.4-snapshots: Log::compact_to")
++        if index <= self.base {
++            return Ok(0);
++        }
++        if self.at(index).is_none() {
++            return Err(Error::protocol(format!(
++                "cannot compact to {index}: the log ends at {}",
++                self.base + self.entries.len() as Index
++            )));
++        }
++        // The entries with an index at or below the snapshot's are the ones it replaces: the first
++        // entry that stays is the one right after it.
++        let drop_count = usize::try_from(index - self.base).unwrap_or(0);
++        let dropped = drop_count.min(self.entries.len());
++        self.entries.drain(..dropped);
++        self.base = index;
++        Ok(dropped)
+     }
+     // kiln:scaffold:end
+ 
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -279,6 +279,20 @@
+         self.peers()
+             .into_iter()
+             .map(|to| {
++                // A peer that is behind the snapshot cannot be caught up by entries: the entries it
++                // is missing are the ones the snapshot replaced. It gets the snapshot instead.
++                if self.needs_snapshot(&to)
++                    && let Some(snapshot) = &self.snapshot
++                {
++                    return Outbound {
++                        to,
++                        message: Message::InstallSnapshot {
++                            term: self.term,
++                            leader: self.id.clone(),
++                            snapshot: snapshot.clone(),
++                        },
++                    };
++                }
+                 let next = self.next_index.get(&to).copied().unwrap_or(1);
+                 let prev = if next <= 1 {
+                     LogPosition::empty()
+@@ -315,39 +329,91 @@
+ 
+     /// Take a snapshot of the state as of the last committed entry.
+     ///
++    /// The snapshot is of the *committed* state and of nothing else: a snapshot of an entry that
++    /// is not committed yet is a snapshot of a state that may still change.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::Invalid`] when nothing is committed yet.
++    /// [`Error::Invalid`] when nothing is committed yet — there is no state to take — and
++    /// [`Error::Protocol`] when the log does not hold the entry at the commit index.
+     pub fn take_snapshot(&mut self, data: Vec<u8>) -> Result<crate::raft::snapshot::Snapshot> {
+-        let _ = data;
+-        todo!("meshkv/5.4-snapshots: Raft::take_snapshot")
++        if self.commit_index == 0 {
++            return Err(Error::invalid(
++                "nothing is committed yet, so there is no state to take a snapshot of",
++            ));
++        }
++        let Some(entry) = self.log.at(self.commit_index) else {
++            return Err(Error::protocol(format!(
++                "the commit index is {} but the log does not hold it",
++                self.commit_index
++            )));
++        };
++        let snapshot = crate::raft::snapshot::Snapshot::of(entry, data)?;
++        self.snapshot = Some(snapshot.clone());
++        Ok(snapshot)
+     }
+ 
+     /// Drop the log entries the snapshot covers.
+     ///
++    /// The snapshot and the log have to agree: the log has to *hold* the entry the snapshot claims
++    /// to cover, and that entry has to be of the term the snapshot names. A snapshot that does not
++    /// match the log is a snapshot of another history.
++    ///
+     /// # Errors
+     ///
+     /// [`Error::Protocol`] when the log does not hold the entry, or holds a different term.
+     pub fn compact(&mut self, snapshot: &crate::raft::snapshot::Snapshot) -> Result<usize> {
+-        let _ = snapshot;
+-        todo!("meshkv/5.4-snapshots: Raft::compact")
++        let Some(entry) = self.log.at(snapshot.last_included_index) else {
++            return Err(Error::protocol(format!(
++                "cannot compact to {}: the log does not hold that entry",
++                snapshot.last_included_index
++            )));
++        };
++        if entry.term != snapshot.last_included_term {
++            return Err(Error::protocol(format!(
++                "cannot compact to {}: the log holds term {} there and the snapshot says {}",
++                snapshot.last_included_index,
++                entry.term.get(),
++                snapshot.last_included_term.get()
++            )));
++        }
++        self.log.compact_to(snapshot.last_included_index)
+     }
+ 
+     /// Adopt a snapshot: this node's log is replaced by the state the snapshot carries.
+     ///
++    /// A follower that is too far behind to be caught up by entries installs the snapshot instead:
++    /// its log is dropped, its commit index moves to the snapshot's, and the next entry belongs
++    /// right after it.
++    ///
+     /// # Errors
+     ///
+-    /// [`Error::Protocol`] when the snapshot is older than what this node has applied.
++    /// [`Error::Protocol`] when the snapshot is older than what this node has already applied — a
++    /// snapshot that arrives late is refused rather than undoing a state that is already there.
+     pub fn install_snapshot(&mut self, snapshot: &crate::raft::snapshot::Snapshot) -> Result<()> {
+-        let _ = snapshot;
+-        todo!("meshkv/5.4-snapshots: Raft::install_snapshot")
++        if snapshot.last_included_index < self.commit_index {
++            return Err(Error::protocol(format!(
++                "cannot install a snapshot of index {}: this node has already committed {}",
++                snapshot.last_included_index, self.commit_index
++            )));
++        }
++        self.log = crate::raft::Log::starting_at(snapshot.last_included_index);
++        self.commit_index = snapshot.last_included_index;
++        self.snapshot = Some(snapshot.clone());
++        Ok(())
+     }
+ 
+     /// `true` when a peer is too far behind to be caught up by entries.
++    ///
++    /// A peer whose next position is at or before the snapshot's index cannot be sent the entries
++    /// that lead up to it: they are gone. It has to be sent the snapshot.
+     #[must_use]
+     pub fn needs_snapshot(&self, peer: &NodeId) -> bool {
+-        let _ = (peer, &self.snapshot);
+-        todo!("meshkv/5.4-snapshots: Raft::needs_snapshot")
++        let Some(snapshot) = &self.snapshot else {
++            return false;
++        };
++        let next = self.next_index.get(peer).copied().unwrap_or(1);
++        next <= snapshot.last_included_index
+     }
+ 
+     /// A snapshot from the leader: adopt it, and answer how far this node now reaches.
+@@ -358,8 +424,21 @@
+         leader: NodeId,
+         snapshot: crate::raft::snapshot::Snapshot,
+     ) -> Vec<Outbound> {
+-        let _ = (from, term, leader, snapshot);
+-        todo!("meshkv/5.4-snapshots: Raft::on_install_snapshot")
++        if self.role != Role::Follower {
++            self.role = Role::Follower;
++            self.voted_for = None;
++            self.votes.clear();
++        }
++        self.leader_hint = Some(leader);
++        let success = self.install_snapshot(&snapshot).is_ok();
++        vec![Outbound {
++            to: from.clone(),
++            message: Message::AppendAck {
++                term,
++                success,
++                match_index: self.commit_index,
++            },
++        }]
+     }
+     // kiln:scaffold:end
+ 
+@@ -545,9 +624,17 @@
+         if prev.index == 0 {
+             return true;
+         }
+-        self.log
+-            .at(prev.index)
+-            .is_some_and(|entry| entry.term == prev.term)
++        if let Some(entry) = self.log.at(prev.index) {
++            return entry.term == prev.term;
++        }
++        // The entry may be inside the snapshot this node holds: the snapshot *is* the state at
++        // that index, and its term is the term of the entry it replaced.
++        match &self.snapshot {
++            Some(snapshot) => {
++                snapshot.covers(prev.index) && snapshot.last_included_term == prev.term
++            }
++            None => false,
++        }
+     }
+ 
+     /// Take the leader's entries: the ones this node has are kept, the rest replace a suffix.
+--- a/src/raft/snapshot.rs
++++ b/src/raft/snapshot.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the state the implementation will read; the reference
+-// solution drops the allowance, because by then every field is read.
+-
+ //! The state at one index, kept so that the log before it can be thrown away.
+ //!
+ //! `meshkv/5.4-snapshots` is the step where the log stops being able to grow for ever. A node that
+@@ -21,7 +17,7 @@
+ //! deterministic. This step is about *where* the snapshot is taken, *when* the log may be compacted
+ //! and *how* a node that is too far behind catches up.
+ 
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::{Entry, Index, Term};
+ 
+ /// A state, and the entry it came from.
+@@ -38,13 +34,25 @@
+ impl Snapshot {
+     /// A snapshot of `data` as of the entry at `index` and `term`.
+     ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the index is zero — there is no entry zero to be the state of, and a
++    /// snapshot that covers nothing is a snapshot that says nothing.
+     pub fn new(
+         last_included_index: Index,
+         last_included_term: Term,
+         data: Vec<u8>,
+     ) -> Result<Self> {
+-        let _ = (last_included_index, last_included_term, data);
+-        todo!("meshkv/5.4-snapshots: Snapshot::new")
++        if last_included_index == 0 {
++            return Err(Error::protocol(
++                "a snapshot covers at least one entry: index 0 is before the log begins",
++            ));
++        }
++        Ok(Self {
++            last_included_index,
++            last_included_term,
++            data,
++        })
+     }
+ 
+     /// The snapshot of the state an entry produced.
+@@ -53,20 +61,18 @@
+     ///
+     /// [`Error::Protocol`] when the entry is the one at index zero, which no snapshot can cover.
+     pub fn of(entry: &Entry, data: Vec<u8>) -> Result<Self> {
+-        let _ = (entry, data);
+-        todo!("meshkv/5.4-snapshots: Snapshot::of")
++        Self::new(entry.index, entry.term, data)
+     }
+ 
+     /// `true` when this snapshot covers `index` — that is, when the state at `index` is inside it.
+     #[must_use]
+     pub fn covers(&self, index: Index) -> bool {
+-        let _ = index;
+-        todo!("meshkv/5.4-snapshots: Snapshot::covers")
++        index <= self.last_included_index
+     }
+ 
+     /// The size of the payload, in bytes.
+     #[must_use]
+     pub fn bytes(&self) -> usize {
+-        todo!("meshkv/5.4-snapshots: Snapshot::bytes")
++        self.data.len()
+     }
+ }

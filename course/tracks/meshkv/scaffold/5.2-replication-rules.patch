@@ -10,7 +10,11 @@
  /// The crate's error type, at the root so a caller writes `meshkv::Error`.
 --- /dev/null
 +++ b/src/raft/mod.rs
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,268 @@
++#![allow(dead_code)]
++// the stub keeps the state the implementation will read; the reference
++// solution drops the allowance, because by then every field is read.
++
 +//! The rules of the log, as values: terms, entries, a majority, and when an entry may be called
 +//! committed.
 +//!
@@ -137,6 +141,11 @@
 +/// go backwards (the log on the disk is the memory of what this node has already seen).
 +#[derive(Debug, Clone, Default, PartialEq, Eq)]
 +pub struct Log {
++    /// The index of the last entry this log no longer holds, or zero when it holds everything.
++    ///
++    /// Zero means "nothing has been compacted", and it is also the index before the first entry, so
++    /// the log's first entry is always at `base + 1`.
++    base: Index,
 +    entries: Vec<Entry>,
 +}
 +
@@ -166,6 +175,9 @@
 +    }
 +
 +    /// The entry at `index`, one-based.
++    ///
++    /// An index the log has compacted away is not an entry it holds: the answer is `None`, exactly
++    /// like an index beyond its end.
 +    #[must_use]
 +    pub fn at(&self, index: Index) -> Option<&Entry> {
 +        let _ = index;
@@ -182,6 +194,12 @@
 +        let _ = entry;
 +        todo!("meshkv/5.2-replication-rules: Log::append")
 +    }
++
++    // The methods a later step adds are declared inside this block: a scaffold may only write
++    // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
++    // edits safe (docs/authoring.md §5).
++    // kiln:scaffold:begin
++    // kiln:scaffold:end
 +
 +    /// Drop everything from `index` onwards, and answer how many entries went.
 +    ///

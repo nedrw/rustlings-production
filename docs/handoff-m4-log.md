@@ -158,3 +158,43 @@ $ kiln selftest --track meshkv
 6. **桩的生成器要跳过闭合大括号那一行**（少跳一行就会多出一个 `}`；`lstrip('mut ')` 是按**字符集**剥，
    会把 `term` 削成 `erm`）。本段把生成器写成 `stubgen.py`（在 `/private/tmp`），按签名取参数名、
    保留 `Type::method` 的标记形态、给每个桩函数补 `let _ = (...)`。
+
+## 段 4：5.4 快照与日志压缩（B1 收尾）
+
+**5.4 做了什么**：`src/raft/snapshot.rs`（`Snapshot`：index + term + 不透明载荷）、
+`Log` 学会基点（`base()`/`compact_to()`/`starting_at()`，并且 `at`/`append`/`truncate_from` 都按基点算）、
+`Raft` 学会取快照/压实/装入（`take_snapshot`/`compact`/`install_snapshot`/`needs_snapshot`）、
+`InstallSnapshot` 消息与四个臂、`docs/snapshot.md`、`tests/budget_snapshot.rs`（`bench-budget` 的仪器）。
+7 个规格用例 + 5 个预算计数。
+
+**原始结论行**：
+
+```
+$ kiln selftest --track meshkv
+4/4 step(s) hold the contract
+  ✓ 5.1  9/9 must green
+  ✓ 5.2  9/9 must green
+  ✓ 5.3 11/11 must green
+  ✓ 5.4 11/11 must green   （含 slow:bench-budget@10 与 links）
+
+$ kiln lint-caps → checked 101 of 119 step bodies · no issues
+$ kiln links      → every target resolves
+$ cargo test -p kiln → 338 + 21 + 1
+```
+
+**这一段钉下来的五条规矩（都很贵）**：
+
+1. **后一步要扩展前一步的文件，前一步就得留标记区**。5.4 要给 `Log` 加方法、给 `Raft` 加字段/方法/匹配臂、
+   给 `Message` 加变体——全是"插入"。所以 5.2/5.3 的**已发布文件**被改成带标记区的形态：`Log` 的 impl 内、
+   `Raft` 的字段与 impl 内、`Message` 的枚举内、`term()`/`encode()`/`on_message`/`refuse()` 的 match 内。
+   教训：**写一个"会被后人扩展"的类型时，先把挂载点留好**，否则只能回去改已发布的步骤（本段就这样做了，
+   并且 5.2/5.3 的补丁全部重新生成、重新 selftest）。
+2. **match 里的标记区不是空注释，是"臂的挂载点"**。空标记区让 match 在那一点"没有臂"，编译仍穷尽；
+   5.4 的脚手架往四个 match 各插一条臂，文件照样编译、规格照样红在 todo 上。
+3. **catch-all（`_ => ...`）解决不了这个问题**：它在"变体还没加"时是 unreachable（要 `#[allow]` 才不报警），
+   而且加了变体之后它把真臂吞掉。标记区才是正解。（本段先试了 catch-all，回滚。）
+4. **补丁生成必须在"格式化之后"**：先 `cargo fmt --all` 再 `diff -u`，否则交付的树第一道 `fmt` 门就红。
+   本段的 `build_b1.py` 因此有 `--patches-only` 模式：重建 → 格式化 → 只重生成补丁。
+5. **跨行签名会骗过桩生成器**（`pub fn new(\n  a: A,\n) -> Result<Self> {` 的首行不以 `{` 结尾）。
+   第一版 `stubgen.py` 把整个 `Snapshot::new` 的实现留在了桩里，于是桩引用 `Error` 而 import 被剥掉，
+   脚手架编译失败。修法：按 `fn 名字(` 识别函数起点，再往下收签名直到 `{`。

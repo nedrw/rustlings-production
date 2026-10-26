@@ -1,13 +1,14 @@
 --- a/src/raft/message.rs
 +++ b/src/raft/message.rs
-@@ -1,6 +1,3 @@
--#![allow(dead_code)] // the stub keeps the helpers the implementation will use; the reference
--                      // solution drops the allowance, because by then every one of them is used.
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the state the implementation will read; the reference
+-// solution drops the allowance, because by then every field is read.
 -
  //! What two nodes say to each other, and how a line of text carries it.
  //!
  //! `meshkv/5.3-teaching-raft` is the step where the log of `5.2` starts moving. The messages are
-@@ -22,7 +19,7 @@
+@@ -23,7 +19,7 @@
  //! where the entries are.
  
  use crate::cluster::NodeId;
@@ -16,7 +17,7 @@
  use crate::raft::{Entry, Index, Term};
  
  /// Where a node's log ends: the term of its last entry and that entry's position.
-@@ -41,7 +38,10 @@
+@@ -42,7 +38,10 @@
      /// The end of an empty log.
      #[must_use]
      pub fn empty() -> Self {
@@ -28,7 +29,7 @@
      }
  
      /// `true` when this position is at least as far along as `other` — the comparison a candidate
-@@ -51,8 +51,7 @@
+@@ -52,8 +51,7 @@
      /// fewer entries from a newer term, and that is the rule that keeps a committed entry safe.
      #[must_use]
      pub fn is_at_least(&self, other: &LogPosition) -> bool {
@@ -38,7 +39,7 @@
      }
  }
  
-@@ -103,13 +102,69 @@
+@@ -109,13 +107,76 @@
      /// The term this message belongs to.
      #[must_use]
      pub fn term(&self) -> Term {
@@ -48,6 +49,10 @@
 +            | Self::Vote { term, .. }
 +            | Self::Append { term, .. }
 +            | Self::AppendAck { term, .. } => *term,
++            // The arms a later step adds go here: a scaffold may only write inside a
++            // `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
++            // kiln:scaffold:begin
++            // kiln:scaffold:end
 +        }
      }
  
@@ -106,11 +111,14 @@
 +                u8::from(*success),
 +                match_index
 +            ),
++            // The arms a later step adds go here.
++            // kiln:scaffold:begin
++            // kiln:scaffold:end
 +        }
      }
  
      /// Read a message out of a line, or say what was wrong with it.
-@@ -120,49 +175,168 @@
+@@ -126,49 +187,168 @@
      /// number, or when a name is not a name — the refusal quotes the line, because a peer that
      /// speaks another protocol has to be able to tell *which* line it was.
      pub fn decode(line: &str) -> Result<Self> {
@@ -327,7 +335,7 @@
      }
  }
  
-@@ -80,38 +80,49 @@
+@@ -84,38 +84,52 @@
      /// of the same command answer differently.
      #[must_use]
      pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
@@ -345,6 +353,9 @@
 +            match_index: BTreeMap::new(),
 +            commit_index: 0,
 +            leader_hint: None,
++            // The fields a later step adds are set here, in the same marked region.
++            // kiln:scaffold:begin
++            // kiln:scaffold:end
 +        }
      }
  
@@ -384,7 +395,7 @@
      }
  
      /// The leader this node knows of, when it knows one.
-@@ -121,25 +132,35 @@
+@@ -125,25 +139,35 @@
      /// `5.7` is the step that turns it into a routing policy.
      #[must_use]
      pub fn leader(&self) -> Option<&NodeId> {
@@ -424,7 +435,7 @@
      }
  
      /// Stand for election: move to the next term, vote for oneself, and ask everyone.
-@@ -147,7 +168,28 @@
+@@ -151,7 +175,28 @@
      /// The returned messages are the vote requests; a cluster of one elects itself without
      /// sending anything.
      pub fn campaign(&mut self) -> Vec<Outbound> {
@@ -454,7 +465,7 @@
      }
  
      /// Handle a message from `from`, and answer whatever has to be answered.
-@@ -156,8 +198,33 @@
+@@ -160,8 +205,37 @@
      /// with this node's terms and nothing else, a message from an older term is refused, and only
      /// then is the content looked at.
      pub fn on_message(&mut self, from: &NodeId, message: Message) -> Vec<Outbound> {
@@ -486,11 +497,15 @@
 +                success,
 +                match_index,
 +            } => self.on_append_ack(from, term, success, match_index),
++            // The arms a later step adds go here: a scaffold may only write inside a
++            // `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
++            // kiln:scaffold:begin
++            // kiln:scaffold:end
 +        }
      }
  
      /// A leader appends a write to its own log and answers the position it took.
-@@ -167,8 +234,18 @@
+@@ -171,8 +245,18 @@
      /// [`Error::Invalid`] when this node is not the leader — a follower has no log to write to, and
      /// the client has to be sent to the leader instead.
      pub fn propose(&mut self, payload: Vec<u8>) -> Result<Index> {
@@ -511,7 +526,7 @@
      }
  
      /// The entries this leader still owes each peer, as the messages to send them.
-@@ -177,25 +254,78 @@
+@@ -181,7 +265,34 @@
      /// a leader tells a follower how far it has committed.
      #[must_use]
      pub fn append_entries(&self) -> Vec<Outbound> {
@@ -546,6 +561,8 @@
 +            .collect()
      }
  
+     // The methods a later step adds are declared inside this block: a scaffold may only write
+@@ -193,19 +304,48 @@
      /// The end of this node's log, as the position a vote request carries.
      #[must_use]
      pub fn last_position(&self) -> LogPosition {
@@ -575,6 +592,9 @@
 +                match_index: 0,
 +            },
 +            Message::AppendAck { .. } => return Vec::new(),
++            // The arms a later step adds go here.
++            // kiln:scaffold:begin
++            // kiln:scaffold:end
 +        };
 +        vec![Outbound {
 +            to: from.clone(),
@@ -596,7 +616,7 @@
      }
  
      /// A vote request: grant it when the candidate is caught up and nobody else has the vote.
-@@ -221,8 +351,14 @@
+@@ -231,8 +371,14 @@
  
      /// A vote answer: a majority makes this node the leader.
      fn on_vote(&mut self, from: &NodeId, _term: Term, granted: bool) -> Vec<Outbound> {
@@ -613,7 +633,7 @@
      }
  
      /// A leader's entries: accept them when the previous entry is the one the leader said it is.
-@@ -297,29 +433,89 @@
+@@ -307,29 +453,89 @@
      /// earlier term cannot commit them by itself — only an entry of its *own* term may commit — so
      /// it writes one, and commits the rest with it.
      fn become_leader(&mut self) -> Vec<Outbound> {

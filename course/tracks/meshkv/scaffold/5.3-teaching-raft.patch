@@ -1,6 +1,6 @@
 --- a/src/raft/mod.rs
 +++ b/src/raft/mod.rs
-@@ -279,4 +279,6 @@
+@@ -299,4 +299,6 @@
  // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
  // (docs/authoring.md §5).
  // kiln:scaffold:begin
@@ -9,10 +9,10 @@
  // kiln:scaffold:end
 --- /dev/null
 +++ b/src/raft/message.rs
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,174 @@
 +#![allow(dead_code)]
-+// the stub keeps the helpers the implementation will use; the reference
-+// solution drops the allowance, because by then every one of them is used.
++// the stub keeps the state the implementation will read; the reference
++// solution drops the allowance, because by then every field is read.
 +
 +//! What two nodes say to each other, and how a line of text carries it.
 +//!
@@ -101,6 +101,11 @@
 +        /// How far the leader has committed.
 +        commit: Index,
 +    },
++    // The variants a later step adds are declared inside this block: a scaffold may only write
++    // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
++    // edits safe (docs/authoring.md §5).
++    // kiln:scaffold:begin
++    // kiln:scaffold:end
 +    /// A follower answers an append.
 +    AppendAck {
 +        /// The follower's term.
@@ -181,7 +186,7 @@
 +}
 --- /dev/null
 +++ b/src/raft/state.rs
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,335 @@
 +#![allow(dead_code)]
 +// the stub keeps the state the implementation will read; the reference
 +// solution drops the allowance, because by then every field is read.
@@ -254,6 +259,10 @@
 +    match_index: BTreeMap<NodeId, Index>,
 +    commit_index: Index,
 +    leader_hint: Option<NodeId>,
++    // The fields a later step adds are declared inside this block: a scaffold may only write
++    // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
++    // kiln:scaffold:begin
++    // kiln:scaffold:end
 +}
 +
 +impl Raft {
@@ -363,6 +372,12 @@
 +    pub fn append_entries(&self) -> Vec<Outbound> {
 +        todo!("meshkv/5.3-teaching-raft: Raft::append_entries")
 +    }
++
++    // The methods a later step adds are declared inside this block: a scaffold may only write
++    // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own
++    // edits safe (docs/authoring.md §5).
++    // kiln:scaffold:begin
++    // kiln:scaffold:end
 +
 +    /// The end of this node's log, as the position a vote request carries.
 +    #[must_use]
