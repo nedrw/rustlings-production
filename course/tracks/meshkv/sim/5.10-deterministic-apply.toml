@@ -1,0 +1,17 @@
+# The schedules `meshkv/5.10-deterministic-apply` is judged by.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_kv.rs`, which this
+# step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set.
+#
+# `seeds` is three logs and the count is the judgement: `slow:sim@3` asks for at least three, and the
+# gate also demands that at least two of them produce *different* transcripts. What the seed decides
+# here is the log itself — which keys are written, in which order, with which compares — so a
+# different seed is a different state and a different digest. What does *not* depend on the seed is
+# the sentence the step is about: the live machine and the replaying machine reach the same digest.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical. Every line is a
+# count, a name or a digest, never a clock or a path.
+command = "cargo test -p meshkv --test sim_kv -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1

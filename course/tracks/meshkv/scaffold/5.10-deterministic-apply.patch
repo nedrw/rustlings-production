@@ -1,0 +1,333 @@
+--- /dev/null
++++ b/src/kv.rs
+@@ -0,0 +1,194 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! The state machine: a pure function from the log to the state.
++//!
++//! `meshkv/5.10-deterministic-state-machine` is where the log finally becomes a key-value store.
++//! Everything before this step moved entries around; nothing yet said what an entry *means*.
++//!
++//! The rule that makes a replicated store possible is one sentence: **the state is a function of the
++//! entries, and of nothing else.** Two nodes that applied the same entries in the same order hold
++//! the same state, byte for byte — and a snapshot (`5.4`) can carry that state because it is a fact,
++//! not an opinion. Every source of non-determinism breaks that sentence, and the usual suspects are
++//! boring and fatal:
++//!
++//! * **iteration order over a hash map.** Two nodes insert the same keys in the same order and
++//!   iterate them differently; if the state's *serialised* form depends on that order, the two
++//!   replicas disagree about their own digest while holding the same data.
++//! * **the clock.** A state machine that reads `now` for a TTL applies a different function on
++//!   every replay, and a follower that replays the log after a restart disagrees with the leader
++//!   about what happened.
++//! * **randomness** and **floating point** — the first has no place in a replicated function at all,
++//!   the second agrees with itself only on the same platform and the same instruction set.
++//!
++//! So the state is an *ordered* map, the digest walks it in key order, and the API has no time
++//! argument anywhere. That last one is a type-level statement, and it is the one a test cannot
++//! check — which is why the step's page says it in words and the code says it by having nowhere to
++//! put a clock.
++//!
++//! The state machine also refuses to be applied out of order. `apply` takes the entry's index and
++//! refuses anything that is not exactly the next one: a state machine that accepted a gap would be
++//! a state machine whose state depends on which entries happened to arrive, which is the one thing
++//! this step exists to rule out.
++
++use std::collections::BTreeMap;
++
++use crate::error::Result;
++use crate::raft::Index;
++
++/// One write, as the state machine understands it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Command {
++    /// Set a key.
++    Set {
++        /// The key.
++        key: String,
++        /// The value.
++        value: Vec<u8>,
++    },
++    /// Set a key only if it currently holds `expect`.
++    Cas {
++        /// The key.
++        key: String,
++        /// The value the key must hold.
++        expect: Vec<u8>,
++        /// The value to write.
++        value: Vec<u8>,
++    },
++    /// Remove a key.
++    Delete {
++        /// The key.
++        key: String,
++    },
++}
++
++impl Command {
++    /// Parse a command from an entry's payload: `set k v`, `cas k expect new`, `delete k`, with
++    /// values as hex.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the payload is not one of the three commands, when a key is empty,
++    /// or when a value is not hex.
++    pub fn parse(payload: &[u8]) -> Result<Self> {
++        let _ = payload;
++        todo!("meshkv/5.10-deterministic-apply: Command::parse")
++    }
++
++    /// The command as an entry payload.
++    #[must_use]
++    pub fn encode(&self) -> Vec<u8> {
++        todo!("meshkv/5.10-deterministic-apply: Command::encode")
++    }
++
++    /// The key it touches.
++    #[must_use]
++    pub fn key(&self) -> &str {
++        todo!("meshkv/5.10-deterministic-apply: Command::key")
++    }
++}
++
++/// What applying one command did.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Applied {
++    /// The key now holds a new value.
++    Written {
++        /// The value it holds.
++        value: Vec<u8>,
++    },
++    /// The key was removed.
++    Removed,
++    /// The key was not there to remove.
++    Absent,
++    /// A compare-and-set did not match: the state is unchanged, and this is what it holds.
++    Mismatch {
++        /// The value the key holds now.
++        holding: Option<Vec<u8>>,
++    },
++}
++
++/// The state: an ordered map from keys to values, plus the last index applied.
++///
++/// Ordered, not hashed: the digest below walks the keys in order, so two nodes holding the same
++/// data produce the same digest. A `HashMap` here would be a correctness bug that only shows up
++/// under a seed.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Kv {
++    map: BTreeMap<String, Vec<u8>>,
++    applied_index: Index,
++}
++
++impl Kv {
++    /// An empty state at index zero.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("meshkv/5.10-deterministic-apply: Kv::new")
++    }
++
++    /// The index of the last entry applied.
++    #[must_use]
++    pub fn applied_index(&self) -> Index {
++        todo!("meshkv/5.10-deterministic-apply: Kv::applied_index")
++    }
++
++    /// The value of `key`, if it holds one.
++    #[must_use]
++    pub fn get(&self, key: &str) -> Option<&[u8]> {
++        let _ = key;
++        todo!("meshkv/5.10-deterministic-apply: Kv::get")
++    }
++
++    /// How many keys it holds.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("meshkv/5.10-deterministic-apply: Kv::len")
++    }
++
++    /// `true` when it holds no key.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("meshkv/5.10-deterministic-apply: Kv::is_empty")
++    }
++
++    /// Apply the entry at `index`, and answer what it did.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when `index` is not the next one — a state machine only ever applies a
++    /// prefix of the log, so a gap, a duplicate or a step backwards is refused rather than
++    /// guessed at — and when the payload is not a command.
++    pub fn apply(&mut self, index: Index, payload: &[u8]) -> Result<Applied> {
++        let _ = (index, payload);
++        todo!("meshkv/5.10-deterministic-apply: Kv::apply")
++    }
++
++    /// A digest of the state: keys in order, then their values.
++    ///
++    /// The digest is what a test compares and what a snapshot of the state can be checked against.
++    /// It walks the map in key order because the order *is* part of the function: two nodes that
++    /// applied the same entries hold the same map, and the digest has to say so without depending
++    /// on how the map was built.
++    #[must_use]
++    pub fn digest(&self) -> u64 {
++        todo!("meshkv/5.10-deterministic-apply: Kv::digest")
++    }
++}
++
++/// A key, checked.
++fn checked_key(text: &str) -> Result<String> {
++    let _ = text;
++    todo!("meshkv/5.10-deterministic-apply: Kv::checked_key")
++}
++
++/// Bytes as hex.
++fn hex(bytes: &[u8]) -> String {
++    let _ = bytes;
++    todo!("meshkv/5.10-deterministic-apply: Kv::hex")
++}
++
++/// Hex as bytes.
++fn unhex(text: &str) -> Option<Vec<u8>> {
++    let _ = text;
++    todo!("meshkv/5.10-deterministic-apply: Kv::unhex")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,6 +22,7 @@
+ // kiln:scaffold:begin
+ pub mod client;
+ pub mod idempotency;
++pub mod kv;
+ pub mod raft;
+ pub mod security;
+ // kiln:scaffold:end
+--- /dev/null
++++ b/tests/sim_kv.rs
+@@ -0,0 +1,123 @@
++//! The instrument for `meshkv/5.10-deterministic-state-machine`: the same log, twice.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is the sentence the step is about,
++//! made executable: **two state machines fed the same entries produce the same digest.** The seed
++//! decides the entries — which keys, which values, which compares — and the transcript is the
++//! digest after each one.
++//!
++//! A digest that depends on anything but the entries fails here in the way it fails in production:
++//! the two machines diverge while both insist they are right, and the difference is the one the
++//! step exists to rule out (a hash map's iteration order, a clock, a random number). The two
++//! machines in this harness are deliberately built differently — one applies as it goes, the other
++//! replays the same log from the beginning — so an implementation that cached anything per-machine
++//! would show up as a mismatch.
++//!
++//! Every line is a count, a name or a digest, never a clock or a path: the same seed prints the
++//! same bytes.
++
++use meshkv::kv::{Command, Kv};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// How many entries the log has.
++const ENTRIES: usize = 24;
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++/// A tiny seeded generator: the harness needs a spread of logs, not a good random number.
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++/// The command the seed picks at this step.
++fn command(rng: &mut Rng, key: char) -> Vec<u8> {
++    let value = format!("v{}", rng.below(1000));
++    match rng.below(3) {
++        0 => Command::Set {
++            key: key.to_string(),
++            value: value.into_bytes(),
++        }
++        .encode(),
++        1 => Command::Cas {
++            key: key.to_string(),
++            expect: format!("v{}", rng.below(1000)).into_bytes(),
++            value: value.into_bytes(),
++        }
++        .encode(),
++        _ => Command::Delete {
++            key: key.to_string(),
++        }
++        .encode(),
++    }
++}
++
++#[test]
++fn the_same_entries_give_the_same_digest_on_a_fresh_machine() {
++    let seed = seed();
++    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
++
++    // The log the seed decides.
++    let keys = ['a', 'b', 'c', 'd'];
++    let mut log: Vec<Vec<u8>> = Vec::new();
++    for _ in 0..ENTRIES {
++        let key = keys[rng.below(keys.len())];
++        log.push(command(&mut rng, key));
++    }
++
++    // One machine applies the log as it goes and prints a digest per entry.
++    let mut live = Kv::new();
++    let mut transcripts: Vec<u64> = Vec::new();
++    for (offset, entry) in log.iter().enumerate() {
++        live.apply(offset as u64 + 1, entry)
++            .expect("the log applies");
++        transcripts.push(live.digest());
++    }
++
++    // The other replays it from nothing: same function, same answer.
++    let mut replayed = Kv::new();
++    for (offset, entry) in log.iter().enumerate() {
++        replayed
++            .apply(offset as u64 + 1, entry)
++            .expect("the log replays");
++    }
++
++    println!("meshkv-sim entries={}", log.len());
++    println!("meshkv-sim digest={}", live.digest());
++    println!("meshkv-sim replay={}", replayed.digest());
++    println!("meshkv-sim keys={}", live.len());
++    println!("meshkv-sim applied={}", live.applied_index());
++
++    assert_eq!(
++        live.digest(),
++        replayed.digest(),
++        "the state is a function of the entries and of nothing else"
++    );
++    assert_eq!(live, replayed, "and the maps agree, not only their digests");
++
++    // The transcript is a function of the seed too: a different seed is a different log.
++    let first = transcripts.first().copied().unwrap_or_default();
++    let last = transcripts.last().copied().unwrap_or_default();
++    println!("meshkv-sim transcript={first:016x}..{last:016x}");
++    assert_eq!(
++        live.applied_index() as usize,
++        ENTRIES,
++        "every entry was applied once"
++    );
++}
