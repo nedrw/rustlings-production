@@ -319,3 +319,30 @@ $ kiln selftest --track meshkv
    前后两次判断还能不同）。kiln 的 `missing_content` 因此报 `its spec file is missing`，而
    `selftest` 把它显示成 `0/0 held`。**`0/0` 的意思是"这一步还没被当成已作者化"**，先看 `verify`
    的那一行；本段的绕法是换一个规格文件名（元数据与 `run.cmd` 一起改）。
+
+## 段 9：5.9 mTLS（B2 收口）——身份是证书证明的，不是握手声称的
+
+**5.9 做了什么**：`src/security.rs`（`Certificate`（主题/签发者/半开窗口）、`TrustStore`、
+`verify`（三条规则、每种拒绝各说各的原因）、`authenticate`（证书主题必须等于声称的名字）、
+`Identity`（无公开构造器——`verify`/`authenticate` 是唯一的门）、`Rotation`（当前/下一张、
+`presented(now)`、`accepts`、`earliest_safe_retirement`））、`docs/mtls.md`、`tests/sim_mtls.rs`
+（轮换场景，seed 决定握手顺序）。10 个规格用例。
+
+**原始结论行**：
+
+```
+$ KILN_SIM_SEED=1 / 7 / 20260101 → 三个不同的握手顺序，同一组 verdict（overlap 全接受、退休后只接受新的）
+$ 同 seed 重放 → transcript 逐字节相同
+
+$ kiln selftest --track meshkv
+9/9 step(s) hold the contract
+  ✓ 5.9 11/11 must green（含 slow:sim@3 与 links）
+```
+
+**这一段钉下来的两条**：
+
+1. **"已证明的身份"要是一个类型**。`Identity` 没有公开构造器，所以"这个 peer 认证过"是类型事实而不是
+   约定——`domain/parse-dont-validate@apply` 用在安全决策上。规格里有一条用例把这个形状写出来
+   （拒绝时 `Result` 里根本没有 `Identity`）。
+2. **轮换的算术要作为函数暴露**（`earliest_safe_retirement(overlap)`），而不是写成页面上的一句话：
+   "新证书生效时刻 + 分发耗时"是能判的东西，而"记得留够时间"不是。

@@ -1,0 +1,457 @@
+--- /dev/null
++++ b/src/security.rs
+@@ -0,0 +1,248 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Who the peer is, proved rather than claimed.
++//!
++//! `meshkv/5.1-multi-node-topology` let a node *say* its name in one line of text. That is enough to
++//! route a message and nothing else: any process that can open a socket can claim to be `n2`.
++//! `meshkv/5.9-mtls` is the step where the claim becomes a proof — a certificate that a peer
++//! presents, a trust store that decides whether to believe it, and a clock that decides whether it
++//! is still valid.
++//!
++//! Three rules, and each one is a way a cluster is compromised:
++//!
++//! * **the issuer has to be trusted.** A certificate is a statement by somebody; the store is the
++//!   list of somebodies this node believes. A certificate from a stranger is a stranger.
++//! * **the window has to contain now.** Certificates expire — that is the mechanism by which a
++//!   compromised key stops being useful — and a node that ignores the window has a certificate
++//!   store that only grows.
++//! * **the name in the certificate has to be the name that was claimed.** A valid certificate for
++//!   `n2` proves the peer is `n2`; it does not prove the peer is `n3`, and a handshake that checks
++//!   the certificate but not the name has authenticated *somebody* rather than *this peer*.
++//!
++//! The result of verification is an [`Identity`], and that type is the point: it cannot be built by
++//! hand, so any code that takes an `Identity` has a proof in hand rather than a string somebody
++//! typed. This is `domain/parse-dont-validate@apply` in a security setting — the difference between
++//! a check and a guarantee is whether the unchecked value can still reach the code that cares.
++//!
++//! Time is injected, for the reason `5.6` gave: a validity window read from the wall clock cannot be
++//! tested at its boundaries, and the boundaries are the whole subject.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// A peer's claim, made in a form only an issuer can sign.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Certificate {
++    subject: NodeId,
++    issuer: String,
++    not_before: u64,
++    not_after: u64,
++}
++
++impl Certificate {
++    /// A certificate for `subject`, issued by `issuer`, valid from `not_before` until `not_after`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the window is empty (`not_after` is not after `not_before`) — a
++    /// certificate that is never valid is a certificate that can never be used, and one whose
++    /// window is backwards is a mistake that would otherwise wait until the first handshake.
++    pub fn new(
++        subject: NodeId,
++        issuer: impl Into<String>,
++        not_before: u64,
++        not_after: u64,
++    ) -> Result<Self> {
++        let _ = (subject, issuer, not_before, not_after);
++        todo!("meshkv/5.9-mtls: Certificate::new")
++    }
++
++    /// The name the certificate is for.
++    #[must_use]
++    pub fn subject(&self) -> &NodeId {
++        todo!("meshkv/5.9-mtls: Certificate::subject")
++    }
++
++    /// Who issued it.
++    #[must_use]
++    pub fn issuer(&self) -> &str {
++        todo!("meshkv/5.9-mtls: Certificate::issuer")
++    }
++
++    /// When it becomes valid.
++    #[must_use]
++    pub fn not_before(&self) -> u64 {
++        todo!("meshkv/5.9-mtls: Certificate::not_before")
++    }
++
++    /// When it stops being valid.
++    #[must_use]
++    pub fn not_after(&self) -> u64 {
++        todo!("meshkv/5.9-mtls: Certificate::not_after")
++    }
++
++    /// `true` while `now` is inside the window — the window is half-open, so a certificate is
++    /// already invalid at the instant it expires.
++    #[must_use]
++    pub fn covers(&self, now: u64) -> bool {
++        let _ = now;
++        todo!("meshkv/5.9-mtls: Certificate::covers")
++    }
++}
++
++/// The issuers a node believes.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct TrustStore {
++    roots: Vec<String>,
++}
++
++impl TrustStore {
++    /// A store that believes nobody.
++    #[must_use]
++    pub fn empty() -> Self {
++        todo!("meshkv/5.9-mtls: TrustStore::empty")
++    }
++
++    /// A store that believes `roots`.
++    #[must_use]
++    pub fn of(roots: impl IntoIterator<Item = impl Into<String>>) -> Self {
++        let _ = roots;
++        todo!("meshkv/5.9-mtls: TrustStore::of")
++    }
++
++    /// The issuers it believes.
++    #[must_use]
++    pub fn roots(&self) -> &[String] {
++        todo!("meshkv/5.9-mtls: TrustStore::roots")
++    }
++
++    /// `true` when `issuer` is one of the roots.
++    #[must_use]
++    pub fn trusts(&self, issuer: &str) -> bool {
++        let _ = issuer;
++        todo!("meshkv/5.9-mtls: TrustStore::trusts")
++    }
++}
++
++/// A peer whose certificate was verified: the only type the rest of the system accepts as "who is
++/// calling".
++///
++/// There is no public constructor. An `Identity` comes out of [`verify`] and nowhere else, which is
++/// what makes "the peer is authenticated" a fact about the type rather than a convention.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Identity {
++    subject: NodeId,
++}
++
++impl Identity {
++    /// The name the certificate proved.
++    #[must_use]
++    pub fn subject(&self) -> &NodeId {
++        todo!("meshkv/5.9-mtls: Identity::subject")
++    }
++}
++
++/// Verify `certificate` against `store` at `now`, and answer who the peer is.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the issuer is not trusted, when the certificate is not yet valid, or
++/// when it has expired — each refusal names which of the three it was, because the three have
++/// different fixes (a wrong issuer is a configuration problem, an expired certificate is an
++/// operations problem).
++pub fn verify(certificate: &Certificate, store: &TrustStore, now: u64) -> Result<Identity> {
++    let _ = (certificate, store, now);
++    todo!("meshkv/5.9-mtls: Identity::verify")
++}
++
++/// Verify a certificate *and* that it belongs to the peer that claimed the name.
++///
++/// A handshake has two facts — the name in the greeting and the certificate that arrived with it —
++/// and the only safe rule is that they are the same. A certificate that verifies but belongs to
++/// somebody else proves the cluster is talking to an authenticated stranger.
++///
++/// # Errors
++///
++/// Whatever [`verify`] refuses, and [`Error::Invalid`] when the certificate's subject is not the
++/// claimed name.
++pub fn authenticate(
++    claimed: &NodeId,
++    certificate: &Certificate,
++    store: &TrustStore,
++    now: u64,
++) -> Result<Identity> {
++    let _ = (claimed, certificate, store, now);
++    todo!("meshkv/5.9-mtls: Identity::authenticate")
++}
++
++/// A node's current and next certificate, so that rotation does not have a gap.
++///
++/// Rotation is the one operation where the cluster holds two truths at once: peers still present
++/// the old certificate while the new one is being distributed, and a node that only accepts one of
++/// them will refuse half the cluster for as long as the distribution takes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Rotation {
++    current: Certificate,
++    next: Certificate,
++}
++
++impl Rotation {
++    /// A node's certificates: the one in use, and the one it is moving to.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the two certificates are for different names — a node cannot rotate
++    /// into somebody else's identity.
++    pub fn new(current: Certificate, next: Certificate) -> Result<Self> {
++        let _ = (current, next);
++        todo!("meshkv/5.9-mtls: Rotation::new")
++    }
++
++    /// The certificate in use before the rotation.
++    #[must_use]
++    pub fn current(&self) -> &Certificate {
++        todo!("meshkv/5.9-mtls: Rotation::current")
++    }
++
++    /// The certificate the rotation is moving to.
++    #[must_use]
++    pub fn next(&self) -> &Certificate {
++        todo!("meshkv/5.9-mtls: Rotation::next")
++    }
++
++    /// The certificate this node presents to its peers.
++    ///
++    /// The new one as soon as it is valid; the old one until then. A node presents exactly one, and
++    /// it is the one that verifies *now* — presenting the new one early is a handshake that fails
++    /// against every peer that has not been updated yet.
++    #[must_use]
++    pub fn presented(&self, now: u64) -> &Certificate {
++        let _ = now;
++        todo!("meshkv/5.9-mtls: Rotation::presented")
++    }
++
++    /// `true` when this node accepts a peer's certificate: either of its own two names' issuers, or
++    /// any certificate that verifies against the store.
++    ///
++    /// The acceptance question is about the *peer's* certificate, so what matters is the store, not
++    /// this node's own rotation: a node accepts every peer whose certificate verifies, including
++    /// one still on the old certificate. What the rotation bounds is how long that is true.
++    #[must_use]
++    pub fn accepts(&self, certificate: &Certificate, store: &TrustStore, now: u64) -> bool {
++        let _ = (certificate, store, now);
++        todo!("meshkv/5.9-mtls: Rotation::accepts")
++    }
++
++    /// The instant after which the old certificate may be retired safely, given the overlap.
++    ///
++    /// The caller passes the overlap it chose — how long a distribution takes — and the answer is
++    /// the moment the new certificate is valid plus that overlap. Retiring before it is how a
++    /// rotation becomes an outage.
++    #[must_use]
++    pub fn earliest_safe_retirement(&self, overlap: u64) -> u64 {
++        let _ = overlap;
++        todo!("meshkv/5.9-mtls: Rotation::earliest_safe_retirement")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,6 +23,7 @@
+ pub mod client;
+ pub mod idempotency;
+ pub mod raft;
++pub mod security;
+ // kiln:scaffold:end
+ 
+ /// The crate's error type, at the root so a caller writes `meshkv::Error`.
+--- /dev/null
++++ b/docs/mtls.md
+@@ -0,0 +1,49 @@
++# Peer identity: what a certificate proves
++
++A cluster is only as trustworthy as its answer to one question: **who is on the other end of this
++socket?** The handshake `5.1` wrote lets a peer *say* a name; this page is about the step that makes
++the saying a proof.
++
++## Three rules
++
++1. **The issuer has to be trusted.** A certificate is a statement by somebody. A node keeps the
++   list of somebodies it believes — its trust store — and a certificate from anybody else is a
++   certificate from a stranger, however well-formed it is.
++2. **The window has to contain now.** Certificates expire; that is how a compromised key stops
++   being useful. A node that verifies a certificate without its window has a trust store that only
++   grows, and a rotation that only moves forward.
++3. **The name in the certificate has to be the name that was claimed.** A valid certificate for `n2`
++   proves the peer is `n2`. It says nothing about a peer claiming `n3`, and a handshake that checks
++   only the certificate has authenticated *somebody* rather than *this peer*.
++
++Rule 3 is the one that is easy to skip and the one that matters in a cluster: the certificate is an
++input to the identity check, not a replacement for it.
++
++## The verified identity is a type
++
++The result of verification is an `Identity`, and nothing outside this module can construct one. That
++is deliberate: as long as the unchecked value (a name in a message) can reach code that believes it
++is authenticated, a check is a convention. Making the checked value a type turns the convention into
++a compile error — the same move `domain/parse-dont-validate@apply` made for a parsed field, applied
++to a peer.
++
++## Rotation without a gap
++
++Rotating a certificate is the one operation where the cluster holds two truths at once:
++
++- a node may not present a certificate its peers do not accept yet, so it presents the **new** one
++  only from the instant that one is valid;
++- a node may not refuse a certificate its peers are still presenting, so it accepts **both** until
++  the distribution has finished.
++
++That window — both valid, both accepted — is the overlap, and it has a hard lower bound: the moment
++the new certificate becomes valid plus the time the distribution takes. Retiring the old one before
++that is how a rotation becomes an outage, which is why `earliest_safe_retirement` is a function that
++takes the distribution time rather than a constant.
++
++## What this page does not cover
++
++The bytes of the TLS handshake itself: this step's subject is the *rules* a handshake enforces
++(issuer, window, name, overlap), and the rules are what a cluster gets wrong. The wire format is
++Rustls's, and [the mTLS chapter of the Rustls book](https://docs.rs/rustls/latest/rustls/) is where to
++read it.
+--- /dev/null
++++ b/tests/sim_mtls.rs
+@@ -0,0 +1,141 @@
++//! The instrument for `meshkv/5.9-mtls`: handshakes across a rotation.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is the one operation that makes
++//! certificates hard: **rotating them while the cluster is running**. A node may not present a
++//! certificate its peers do not accept yet, and may not refuse one its peers are still presenting —
++//! so for as long as the distribution takes, both are valid, and the moment the overlap ends the old
++//! one must stop working.
++//!
++//! The seed decides the order the handshakes happen in, which is the only thing that varies here:
++//! the verdicts do not, and that is the point — a rotation that only works in one order is a
++//! rotation that will fail in production.
++//!
++//! The transcript is the `meshkv-sim <name>=<value>` lines below. Nothing in it is a wall clock or a
++//! path: the times are the ones the scenario passes in, so the same seed prints the same bytes.
++
++use meshkv::cluster::NodeId;
++use meshkv::security::{Certificate, Rotation, TrustStore, authenticate};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The cluster's issuer.
++const ISSUER: &str = "cluster-ca";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++fn id(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++fn cert(subject: &str, not_before: u64, not_after: u64) -> Certificate {
++    Certificate::new(id(subject), ISSUER, not_before, not_after).expect("a certificate")
++}
++
++/// A tiny seeded generator: the harness needs an order, not a good random number.
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++#[test]
++fn a_rotation_has_no_gap_and_a_retired_certificate_stops_working() {
++    let seed = seed();
++    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
++    let store = TrustStore::of([ISSUER]);
++
++    // n1 rotates: its old certificate is valid until 500, the new one from 200 until 900. The
++    // overlap is 200..500, and the distribution has to finish inside it.
++    let rotation = Rotation::new(cert("n1", 0, 500), cert("n1", 200, 900)).expect("a rotation");
++    println!(
++        "meshkv-sim rotation overlap_start={} overlap_end={}",
++        rotation.next().not_before(),
++        rotation.current().not_after()
++    );
++
++    // The peers to hand-shake with, in the order the seed picks.
++    let mut peers: Vec<&str> = vec!["n2", "n3", "n4"];
++    for at in 0..peers.len() {
++        let pick = rng.below(peers.len() - at);
++        peers.swap(at, at + pick);
++    }
++
++    // Inside the overlap every peer is accepted, whichever certificate it presents.
++    let mut accepted = 0usize;
++    for (age, peer) in peers.iter().enumerate() {
++        // Half the peers are still on the old certificate, half have the new one.
++        let certificate = if age % 2 == 0 {
++            cert(peer, 0, 500)
++        } else {
++            cert(peer, 200, 900)
++        };
++        let verdict = authenticate(&id(peer), &certificate, &store, 300);
++        let ok = verdict.is_ok();
++        accepted += usize::from(ok);
++        println!(
++            "meshkv-sim handshake peer={peer} phase=overlap verdict={}",
++            if ok { "accepted" } else { "refused" }
++        );
++    }
++    println!("meshkv-sim overlap_accepted={accepted}");
++    assert_eq!(
++        accepted,
++        peers.len(),
++        "every peer is accepted during the overlap"
++    );
++
++    // After the old certificate expires, only the new one is.
++    let mut accepted = 0usize;
++    for peer in &peers {
++        let old = authenticate(&id(peer), &cert(peer, 0, 500), &store, 600);
++        let new = authenticate(&id(peer), &cert(peer, 200, 900), &store, 600);
++        accepted += usize::from(old.is_ok()) + usize::from(new.is_ok());
++        println!(
++            "meshkv-sim handshake peer={peer} phase=retired old={} new={}",
++            if old.is_ok() { "accepted" } else { "refused" },
++            if new.is_ok() { "accepted" } else { "refused" }
++        );
++    }
++    println!("meshkv-sim after_retirement_accepted={accepted}");
++    assert_eq!(
++        accepted,
++        peers.len(),
++        "only the new certificate works after the retirement"
++    );
++
++    // The node presents exactly one certificate at each moment, and it is the valid one.
++    println!(
++        "meshkv-sim presented overlap={} retired={}",
++        rotation.presented(300).not_before(),
++        rotation.presented(600).not_before()
++    );
++    assert_eq!(
++        rotation.presented(300).not_before(),
++        200,
++        "inside the overlap the new one"
++    );
++    assert_eq!(rotation.presented(600).not_before(), 200, "and after it");
++
++    // The retirement has to wait for the distribution, and the arithmetic says so.
++    let safe = rotation.earliest_safe_retirement(100);
++    println!("meshkv-sim safe_retirement={safe}");
++    assert!(
++        safe > 200,
++        "retiring the old certificate before the new one is distributed is an outage"
++    );
++}

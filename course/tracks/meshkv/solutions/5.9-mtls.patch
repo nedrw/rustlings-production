@@ -1,0 +1,237 @@
+--- a/src/security.rs
++++ b/src/security.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Who the peer is, proved rather than claimed.
+ //!
+ //! `meshkv/5.1-multi-node-topology` let a node *say* its name in one line of text. That is enough to
+@@ -30,7 +26,7 @@
+ //! tested at its boundaries, and the boundaries are the whole subject.
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// A peer's claim, made in a form only an issuer can sign.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -55,40 +51,52 @@
+         not_before: u64,
+         not_after: u64,
+     ) -> Result<Self> {
+-        let _ = (subject, issuer, not_before, not_after);
+-        todo!("meshkv/5.9-mtls: Certificate::new")
++        let issuer = issuer.into();
++        if issuer.trim().is_empty() {
++            return Err(Error::invalid("a certificate names its issuer"));
++        }
++        if not_after <= not_before {
++            return Err(Error::invalid(format!(
++                "a certificate's window is empty: it would be valid from {not_before} to {not_after}"
++            )));
++        }
++        Ok(Self {
++            subject,
++            issuer,
++            not_before,
++            not_after,
++        })
+     }
+ 
+     /// The name the certificate is for.
+     #[must_use]
+     pub fn subject(&self) -> &NodeId {
+-        todo!("meshkv/5.9-mtls: Certificate::subject")
++        &self.subject
+     }
+ 
+     /// Who issued it.
+     #[must_use]
+     pub fn issuer(&self) -> &str {
+-        todo!("meshkv/5.9-mtls: Certificate::issuer")
++        &self.issuer
+     }
+ 
+     /// When it becomes valid.
+     #[must_use]
+     pub fn not_before(&self) -> u64 {
+-        todo!("meshkv/5.9-mtls: Certificate::not_before")
++        self.not_before
+     }
+ 
+     /// When it stops being valid.
+     #[must_use]
+     pub fn not_after(&self) -> u64 {
+-        todo!("meshkv/5.9-mtls: Certificate::not_after")
++        self.not_after
+     }
+ 
+     /// `true` while `now` is inside the window — the window is half-open, so a certificate is
+     /// already invalid at the instant it expires.
+     #[must_use]
+     pub fn covers(&self, now: u64) -> bool {
+-        let _ = now;
+-        todo!("meshkv/5.9-mtls: Certificate::covers")
++        self.not_before <= now && now < self.not_after
+     }
+ }
+ 
+@@ -102,27 +110,27 @@
+     /// A store that believes nobody.
+     #[must_use]
+     pub fn empty() -> Self {
+-        todo!("meshkv/5.9-mtls: TrustStore::empty")
++        Self::default()
+     }
+ 
+     /// A store that believes `roots`.
+     #[must_use]
+     pub fn of(roots: impl IntoIterator<Item = impl Into<String>>) -> Self {
+-        let _ = roots;
+-        todo!("meshkv/5.9-mtls: TrustStore::of")
++        Self {
++            roots: roots.into_iter().map(Into::into).collect(),
++        }
+     }
+ 
+     /// The issuers it believes.
+     #[must_use]
+     pub fn roots(&self) -> &[String] {
+-        todo!("meshkv/5.9-mtls: TrustStore::roots")
++        &self.roots
+     }
+ 
+     /// `true` when `issuer` is one of the roots.
+     #[must_use]
+     pub fn trusts(&self, issuer: &str) -> bool {
+-        let _ = issuer;
+-        todo!("meshkv/5.9-mtls: TrustStore::trusts")
++        self.roots.iter().any(|root| root == issuer)
+     }
+ }
+ 
+@@ -140,7 +148,7 @@
+     /// The name the certificate proved.
+     #[must_use]
+     pub fn subject(&self) -> &NodeId {
+-        todo!("meshkv/5.9-mtls: Identity::subject")
++        &self.subject
+     }
+ }
+ 
+@@ -153,8 +161,30 @@
+ /// different fixes (a wrong issuer is a configuration problem, an expired certificate is an
+ /// operations problem).
+ pub fn verify(certificate: &Certificate, store: &TrustStore, now: u64) -> Result<Identity> {
+-    let _ = (certificate, store, now);
+-    todo!("meshkv/5.9-mtls: Identity::verify")
++    if !store.trusts(certificate.issuer()) {
++        return Err(Error::invalid(format!(
++            "the certificate of `{}` was issued by `{}`, which this node does not trust",
++            certificate.subject(),
++            certificate.issuer()
++        )));
++    }
++    if now < certificate.not_before() {
++        return Err(Error::invalid(format!(
++            "the certificate of `{}` is not valid until {} (it is {now})",
++            certificate.subject(),
++            certificate.not_before()
++        )));
++    }
++    if now >= certificate.not_after() {
++        return Err(Error::invalid(format!(
++            "the certificate of `{}` expired at {} (it is {now})",
++            certificate.subject(),
++            certificate.not_after()
++        )));
++    }
++    Ok(Identity {
++        subject: certificate.subject().clone(),
++    })
+ }
+ 
+ /// Verify a certificate *and* that it belongs to the peer that claimed the name.
+@@ -173,8 +203,14 @@
+     store: &TrustStore,
+     now: u64,
+ ) -> Result<Identity> {
+-    let _ = (claimed, certificate, store, now);
+-    todo!("meshkv/5.9-mtls: Identity::authenticate")
++    let identity = verify(certificate, store, now)?;
++    if identity.subject() != claimed {
++        return Err(Error::invalid(format!(
++            "the peer claimed `{claimed}` and presented a certificate for `{}`",
++            identity.subject()
++        )));
++    }
++    Ok(identity)
+ }
+ 
+ /// A node's current and next certificate, so that rotation does not have a gap.
+@@ -196,20 +232,26 @@
+     /// [`Error::Invalid`] when the two certificates are for different names — a node cannot rotate
+     /// into somebody else's identity.
+     pub fn new(current: Certificate, next: Certificate) -> Result<Self> {
+-        let _ = (current, next);
+-        todo!("meshkv/5.9-mtls: Rotation::new")
++        if current.subject() != next.subject() {
++            return Err(Error::invalid(format!(
++                "the rotation of `{}` cannot move to a certificate for `{}`",
++                current.subject(),
++                next.subject()
++            )));
++        }
++        Ok(Self { current, next })
+     }
+ 
+     /// The certificate in use before the rotation.
+     #[must_use]
+     pub fn current(&self) -> &Certificate {
+-        todo!("meshkv/5.9-mtls: Rotation::current")
++        &self.current
+     }
+ 
+     /// The certificate the rotation is moving to.
+     #[must_use]
+     pub fn next(&self) -> &Certificate {
+-        todo!("meshkv/5.9-mtls: Rotation::next")
++        &self.next
+     }
+ 
+     /// The certificate this node presents to its peers.
+@@ -219,8 +261,11 @@
+     /// against every peer that has not been updated yet.
+     #[must_use]
+     pub fn presented(&self, now: u64) -> &Certificate {
+-        let _ = now;
+-        todo!("meshkv/5.9-mtls: Rotation::presented")
++        if self.next.covers(now) {
++            &self.next
++        } else {
++            &self.current
++        }
+     }
+ 
+     /// `true` when this node accepts a peer's certificate: either of its own two names' issuers, or
+@@ -231,8 +276,7 @@
+     /// one still on the old certificate. What the rotation bounds is how long that is true.
+     #[must_use]
+     pub fn accepts(&self, certificate: &Certificate, store: &TrustStore, now: u64) -> bool {
+-        let _ = (certificate, store, now);
+-        todo!("meshkv/5.9-mtls: Rotation::accepts")
++        verify(certificate, store, now).is_ok()
+     }
+ 
+     /// The instant after which the old certificate may be retired safely, given the overlap.
+@@ -242,7 +286,6 @@
+     /// rotation becomes an outage.
+     #[must_use]
+     pub fn earliest_safe_retirement(&self, overlap: u64) -> u64 {
+-        let _ = overlap;
+-        todo!("meshkv/5.9-mtls: Rotation::earliest_safe_retirement")
++        self.next.not_before().saturating_add(overlap)
+     }
+ }

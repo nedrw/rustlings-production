@@ -14,3 +14,4 @@ format_version = 1
 "spec/5.6/lease_reads.rs" = "sha256:98ceaee65bd44b3f96c677217c25b1463308ebabbe55f04e4382eebb269721bb"
 "spec/5.7/client_routing.rs" = "sha256:53c38622fd6b7cbca1427fa152938edb3391923528664baa9d62baf45b461d3b"
 "spec/5.8/duplicates.rs" = "sha256:0b2fa8d2be9ff41ddfffa5accb259360bf26e75e2976682179c1798d547cc077"
+"spec/5.9/mtls.rs" = "sha256:a9869210770cb72b2caf1870fe49bcbe2c73ad136575d7ed305c8352fb87af11"

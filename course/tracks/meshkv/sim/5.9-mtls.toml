@@ -1,0 +1,18 @@
+# The schedules `meshkv/5.9-mtls` is judged by, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: readable, useless to edit, because the `sim`
+# gate reads *this* copy. The command is the project's own harness (`tests/sim_mtls.rs`, which this
+# step's scaffold ships); the gate runs it once per seed below with `KILN_SIM_SEED` set.
+#
+# `seeds` is three schedules and the count is the judgement: `slow:sim@3` asks for at least three,
+# and the gate also demands that at least two of them produce *different* transcripts. What the
+# seed decides here is the **order the handshakes happen in** — which peer is asked about first,
+# and which of them is still on the old certificate. The verdicts do not depend on it, and that is
+# the point of the scenario: a rotation that only works in one order is a rotation that will fail
+# in production.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical. Every line is a
+# name, a count or a verdict, never a wall clock or a path.
+command = "cargo test -p meshkv --test sim_mtls -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
