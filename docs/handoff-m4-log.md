@@ -346,3 +346,34 @@ $ kiln selftest --track meshkv
    （拒绝时 `Result` 里根本没有 `Identity`）。
 2. **轮换的算术要作为函数暴露**（`earliest_safe_retirement(overlap)`），而不是写成页面上的一句话：
    "新证书生效时刻 + 分发耗时"是能判的东西，而"记得留够时间"不是。
+
+## 段 10：5.10 确定性状态机 + 5.11 客户端 SDK（B3 前两步）
+
+**5.10**：`src/kv.rs`（`Command` set/cas/delete 严格解析、`Kv`（`BTreeMap` + applied index）、
+`Applied`、`digest`（FNV-1a 按键序）），`tests/sim_kv.rs`（两台机器同日志同 digest）。10 个用例。
+**关键补丁**：leader 赢得选举时写的**空条目**必须能被状态机应用（no-op、推进 index）——否则
+"应用整个已提交前缀"在第一次选举后就卡住。这条是 5.11 的 in-process 后端逼出来的。
+
+**5.11**：`src/sdk.rs`（`SdkError` 四类 + `is_retryable`、`Reply`、`Backend` port、`Sdk` 重试策略
+（键只算一次、跟随重定向、`MAX_ATTEMPTS`、拒绝不重试））、`conformance.toml`
+（`backends = ["scripted", "in-process"]`）、`tests/support/mod.rs`（两个实现）、`docs/sdk.md`。8 个用例 × 两个后端。
+
+**原始结论行**：
+
+```
+$ KILN_BACKEND=scripted   cargo test -p meshkv --test spec_client_sdk → 8 passed
+$ KILN_BACKEND=in-process cargo test -p meshkv --test spec_client_sdk → 8 passed
+$ kiln selftest --track meshkv → 11/11 step(s) hold the contract
+```
+
+**这一段钉下来的四条**：
+
+1. **`conformance@2` 真的会抓到东西**：scripted 后端第一次就全绿，in-process 后端暴露了三个真缺口——
+   没应用 leader 的空条目、没应用"整个已提交前缀"、CAS 不匹配被当成功。**同一套规格在两个实现上跑**
+   是这一步最有价值的部分。
+2. **CAS 在提案前拒绝**（leader 能看见的失败不要写进日志），否则状态机会永远回答 `Mismatch` 而调用方
+   分不清"被拒绝"和"写得慢"。
+3. **桩生成器第三次被同一类问题咬**：多行 **trait 声明**（`fn write(...);`）既没有函数体也不能丢参数。
+   规则：**声明原样保留、定义才替换**；而且 `;` 行只输出一次。
+4. **`Box<dyn Trait>` 不会自动实现 trait**：SDK 要泛型于 port，就必须给 `Box<dyn Backend>` 一个转发实现，
+   否则"运行时选实现"的调用方（正是 conformance 的用法）编译不过。

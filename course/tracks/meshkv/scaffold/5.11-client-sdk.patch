@@ -1,0 +1,564 @@
+--- /dev/null
++++ b/src/sdk.rs
+@@ -0,0 +1,248 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! The SDK: what a caller sees, once the cluster's rules are somebody else's problem.
++//!
++//! `meshkv/5.11-client-sdk` is the step where the client stops being an example and becomes a
++//! product. The rules are all established by now — the leader (`5.7`), the idempotency key
++//! (`5.8`), the session (`5.8`), the state machine's digest (`5.10`) — and the SDK is where they
++//! are assembled into an API that a caller can use without knowing any of them.
++//!
++//! Three things make an SDK more than a thin wrapper, and each is a decision:
++//!
++//! * **the error type is the contract.** A caller has to be able to tell "not the leader, ask
++//!   `n2`" from "the cluster is unreachable" from "the write was refused", because the three have
++//!   different remedies: retry elsewhere, retry later, or do not retry at all. An `Error::Io` with
++//!   a string is a contract that says nothing.
++//! * **the retries are the SDK's, not the caller's.** Following a redirect, retrying a timeout with
++//!   the same idempotency key, and stopping after a bound are one policy — and a policy in the SDK
++//!   is a policy every caller gets. The alternative is every caller inventing its own, and one of
++//!   them forgetting the key.
++//! * **a write that was applied is a success, however many times it was asked.** The SDK is where
++//!   `5.8`'s duplicate answer becomes an ordinary "ok": the caller asked for a write, the write
++//!   exists, and whether it took one attempt or three is not part of the answer.
++//!
++//! The backend is a trait, because the SDK's subject is the *policy* — retries, keys, errors — not
++//! the transport. `conformance@2` holds the SDK to two implementations of it: a scripted one that
++//! answers from a table, and an in-process one that runs the real state machine. A policy that
++//! works against one and breaks against the other is a policy that has not been tested.
++
++use crate::error::Error;
++use crate::idempotency::{IdempotencyKey, Outcome, Session};
++use crate::raft::Index;
++
++/// How many attempts a call may take before the SDK gives up.
++pub const MAX_ATTEMPTS: usize = 4;
++
++/// What a caller has to be able to tell apart.
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum SdkError {
++    /// The node that answered is not the leader; the caller may retry, and the SDK will.
++    #[error("not the leader: {}", leader.as_deref().unwrap_or("nobody named"))]
++    NotLeader {
++        /// The leader the node named, when it named one.
++        leader: Option<String>,
++    },
++    /// The cluster is unreachable, or answered something the SDK cannot classify.
++    #[error("the cluster is unavailable: {detail}")]
++    Unavailable {
++        /// What went wrong, phrased for a caller who cannot fix it.
++        detail: String,
++    },
++    /// The write was refused: retrying will not help.
++    #[error("the write was refused: {reason}")]
++    Refused {
++        /// Why the store refused it.
++        reason: String,
++    },
++    /// The SDK gave up after [`MAX_ATTEMPTS`] attempts.
++    #[error("gave up after {attempts} attempt(s): {last}")]
++    RetriesExhausted {
++        /// How many attempts were made.
++        attempts: usize,
++        /// The last refusal.
++        last: String,
++    },
++}
++
++impl SdkError {
++    /// `true` when retrying the same call might succeed.
++    #[must_use]
++    pub fn is_retryable(&self) -> bool {
++        todo!("meshkv/5.11-client-sdk: SdkError::is_retryable")
++    }
++}
++
++/// What one call to a backend answers.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Reply {
++    /// The write was applied at this index (or was already, with this answer).
++    Applied {
++        /// Where it sits in the log.
++        index: Index,
++        /// The value the write produced, if it produced one.
++        value: Option<Vec<u8>>,
++    },
++    /// The node is not the leader; the SDK will try the one it names.
++    Redirect {
++        /// The leader the node knows of.
++        leader: String,
++    },
++    /// The node knows no leader: an election is probably running.
++    NoLeader,
++    /// The write was refused, and retrying will not change that.
++    Refused {
++        /// Why.
++        reason: String,
++    },
++}
++
++/// One implementation of "talk to the cluster".
++///
++/// The trait is the seam `conformance@2` uses: the same SDK suite runs against every implementation
++/// of it, and an SDK that passes against one and breaks against another has a policy the second
++/// implementation can see through.
++pub trait Backend {
++    /// Send one write to `node`, with its idempotency key.
++    ///
++    /// # Errors
++    ///
++    /// [`SdkError::Unavailable`] when the node cannot be reached at all — a node that is down is a
++    /// different thing from a node that is not the leader, and the SDK retries them differently.
++    fn write(
++        &mut self,
++        node: &str,
++        key: &IdempotencyKey,
++        command: &[u8],
++    ) -> std::result::Result<Reply, SdkError>;
++
++    /// Send one read to `node`.
++    ///
++    /// # Errors
++    ///
++    /// [`SdkError::Unavailable`] when the node cannot be reached.
++    fn read(&mut self, node: &str, key: &str) -> std::result::Result<Reply, SdkError>;
++}
++
++/// A boxed backend is a backend: the SDK is generic over the trait, and a caller that picks the
++/// implementation at run time (a suite that runs once per backend, say) should not have to write
++/// this by hand.
++impl Backend for Box<dyn Backend> {
++    fn write(
++        &mut self,
++        node: &str,
++        key: &IdempotencyKey,
++        command: &[u8],
++    ) -> std::result::Result<Reply, SdkError> {
++        let _ = (node, key, command);
++        todo!("meshkv/5.11-client-sdk: Backend::write")
++    }
++
++    fn read(&mut self, node: &str, key: &str) -> std::result::Result<Reply, SdkError> {
++        let _ = (node, key);
++        todo!("meshkv/5.11-client-sdk: Backend::read")
++    }
++}
++
++/// A client of the cluster, with the retry policy that makes it usable.
++#[derive(Debug, Clone)]
++pub struct Sdk<B> {
++    backend: B,
++    session: Session,
++    node: String,
++    attempts: usize,
++}
++
++impl<B: Backend> Sdk<B> {
++    /// An SDK for `session`, starting at `node`.
++    pub fn new(backend: B, session: Session, node: impl Into<String>) -> Self {
++        let _ = (backend, session, node);
++        todo!("meshkv/5.11-client-sdk: Backend::new")
++    }
++
++    /// The node the SDK will try first.
++    #[must_use]
++    pub fn node(&self) -> &str {
++        todo!("meshkv/5.11-client-sdk: Backend::node")
++    }
++
++    /// How many attempts the last call took.
++    #[must_use]
++    pub fn attempts(&self) -> usize {
++        todo!("meshkv/5.11-client-sdk: Backend::attempts")
++    }
++
++    /// Write `command`, following redirects and retrying with the same idempotency key.
++    ///
++    /// # Errors
++    ///
++    /// [`SdkError::Refused`] when the store refuses the write (no retry), and
++    /// [`SdkError::RetriesExhausted`] when the attempts run out first.
++    pub fn write(&mut self, command: &[u8]) -> std::result::Result<Index, SdkError> {
++        let _ = command;
++        todo!("meshkv/5.11-client-sdk: Backend::write")
++    }
++
++    /// Read `key`, following redirects.
++    ///
++    /// # Errors
++    ///
++    /// [`SdkError::RetriesExhausted`] when the attempts run out, and whatever the backend refuses
++    /// without a retry.
++    pub fn read(&mut self, key: &str) -> std::result::Result<Option<Vec<u8>>, SdkError> {
++        let _ = key;
++        todo!("meshkv/5.11-client-sdk: Backend::read")
++    }
++
++    /// The ledger outcome for a write that may have been a duplicate, as the SDK sees it.
++    ///
++    /// The SDK does not tell "applied now" from "applied before" apart, because the caller asked
++    /// for a write and the write exists either way. This function exists for the *test* that wants
++    /// to see the distinction, and `Outcome` is `5.8`'s.
++    #[must_use]
++    pub fn outcome_is_success(outcome: &Outcome) -> bool {
++        let _ = outcome;
++        todo!("meshkv/5.11-client-sdk: Backend::outcome_is_success")
++    }
++
++    fn exhausted(&self, last: &str) -> SdkError {
++        let _ = last;
++        todo!("meshkv/5.11-client-sdk: Backend::exhausted")
++    }
++}
++
++/// A write the SDK sends: the state machine's command bytes.
++///
++/// Kept as a function so a caller does not have to import `kv`; the SDK's surface is the four
++/// operations, and the encoding is the store's business.
++#[must_use]
++pub fn command_set(key: &str, value: &[u8]) -> Vec<u8> {
++    let _ = (key, value);
++    todo!("meshkv/5.11-client-sdk: Backend::command_set")
++}
++
++/// A delete, as the SDK sends it.
++#[must_use]
++pub fn command_delete(key: &str) -> Vec<u8> {
++    let _ = key;
++    todo!("meshkv/5.11-client-sdk: Backend::command_delete")
++}
++
++/// A compare-and-set, as the SDK sends it.
++#[must_use]
++pub fn command_cas(key: &str, expect: &[u8], value: &[u8]) -> Vec<u8> {
++    let _ = (key, expect, value);
++    todo!("meshkv/5.11-client-sdk: Backend::command_cas")
++}
++
++/// A refusal from a node that is not the leader, as the SDK reads it.
++///
++/// # Errors
++///
++/// [`SdkError::NotLeader`] when the error carries a leader, and [`SdkError::Unavailable`] when it
++/// does not — a refusal that names nobody is not a redirect.
++pub fn classify(error: &Error) -> SdkError {
++    let _ = error;
++    todo!("meshkv/5.11-client-sdk: Backend::classify")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@
+ pub mod idempotency;
+ pub mod kv;
+ pub mod raft;
++pub mod sdk;
+ pub mod security;
+ // kiln:scaffold:end
+ 
+--- /dev/null
++++ b/conformance.toml
+@@ -0,0 +1,8 @@
++# The implementations of the SDK's backend port, in the order the gate runs them.
++#
++# `conformance@2` runs the step's own suite once per name below, with `KILN_BACKEND` set to it, and
++# `tests/support/mod.rs` turns the name into an implementation. The two are deliberately different
++# in kind: a scripted table (the smallest thing that satisfies the port) and the in-process cluster
++# (the real Raft, state machine and ledger). A suite that passes on one and fails on the other is
++# the bug the gate exists to find.
++backends = ["scripted", "in-process"]
+--- /dev/null
++++ b/docs/sdk.md
+@@ -0,0 +1,50 @@
++# The SDK: what a caller sees
++
++The cluster's rules — the leader, the read index, the idempotency key, the retry window — are
++somebody else's problem. This page is the last step of that sentence: the API a caller uses, and the
++three decisions that make it an SDK rather than a thin wrapper over the wire.
++
++## The error type is the contract
++
++A caller has to be able to tell these apart, because the remedies are different:
++
++| error | what the caller does |
++| --- | --- |
++| `NotLeader { leader }` | retry — the SDK will, at the node it names |
++| `Unavailable { detail }` | retry later: the cluster may come back |
++| `Refused { reason }` | do not retry: the store has decided |
++| `RetriesExhausted { attempts }` | give up, and report the last refusal |
++
++An `Error::Io` with a message is a contract that says nothing; `is_retryable()` is the two-line
++version of the table, and it is the SDK's job to be right about it.
++
++## The retries are the SDK's
++
++Following a redirect (`5.7`), retrying with the same idempotency key (`5.8`), and stopping after a
++bound are *one* policy. In the SDK it is a policy every caller gets; in the caller it is a policy
++every caller invents, and one of them forgets the key.
++
++The bound is `MAX_ATTEMPTS`, and it is a number rather than a hope: a cluster that never names a
++leader must produce `RetriesExhausted`, not a client that spins.
++
++## A write that was applied is a success
++
++The SDK does not tell "applied now" from "applied before" at the API level. The caller asked for a
++write; the write exists; whether it took one attempt or three is an implementation detail of the
++retry policy. `5.8`'s `Outcome` keeps the distinction for the tests that want it, and the SDK folds
++both into "ok".
++
++## Two implementations, one suite
++
++`conformance@2` runs the same suite against two implementations of the backend port: a **scripted**
++one (a table and a ledger — the smallest thing that satisfies the port) and an **in-process** one
++(the real `Raft`, the real state machine, the real ledger). A policy that passes against one and
++fails against the other is a policy that depends on an accident of the implementation, which is
++exactly what the gate is for.
++
++Running the suite by hand:
++
++```sh
++KILN_BACKEND=scripted   cargo test -p meshkv --test spec_client_sdk
++KILN_BACKEND=in-process cargo test -p meshkv --test spec_client_sdk
++```
+--- /dev/null
++++ b/tests/support/mod.rs
+@@ -0,0 +1,236 @@
++//! The two implementations of the SDK's backend, and the one the spec is told to use.
++//!
++//! Course content, shipped by `meshkv/5.11-client-sdk`. `conformance@2` runs the step's own spec
++//! once per name in `conformance.toml`, with `KILN_BACKEND` set; this file is where that name
++//! becomes a value. The two implementations are deliberately different in kind:
++//!
++//! * **scripted** answers from a table: a fixed leader, a follower that redirects to it, and a
++//!   ledger that remembers the keys it has applied. It is the smallest thing that can satisfy the
++//!   port, which is what makes it a good check on the SDK's policy — there is nothing else for the
++//!   policy to lean on.
++//! * **in-process** runs the real cluster: an elected `Raft`, `5.10`'s state machine, and `5.8`'s
++//!   ledger. It is the implementation a user of the SDK would actually get.
++//!
++//! A suite that passes against one and fails against the other has found a policy that depends on
++//! an accident of the implementation, which is the bug `conformance@2` exists to find.
++
++use std::collections::BTreeMap;
++
++use meshkv::cluster::NodeId;
++use meshkv::idempotency::{IdempotencyKey, Ledger, Outcome};
++use meshkv::kv::Kv;
++use meshkv::raft::Term;
++use meshkv::raft::message::Message;
++use meshkv::raft::state::Raft;
++use meshkv::sdk::{Backend, Reply, SdkError};
++
++/// The variable the conformance gate sets to pick an implementation.
++const BACKEND: &str = "KILN_BACKEND";
++
++/// The backend the spec asked for, by name.
++pub fn backend() -> Box<dyn Backend> {
++    match std::env::var(BACKEND).as_deref() {
++        Ok("scripted") => Box::new(Scripted::new()),
++        // The default is the in-process cluster: a suite run by hand should exercise the real one.
++        _ => Box::new(InProcess::new()),
++    }
++}
++
++/// A backend that answers from a table, with a ledger for the keys it has seen.
++struct Scripted {
++    leader: String,
++    applied: BTreeMap<IdempotencyKey, meshkv::raft::Index>,
++    values: BTreeMap<String, Vec<u8>>,
++}
++
++impl Scripted {
++    fn new() -> Self {
++        Self {
++            leader: "n1".to_owned(),
++            applied: BTreeMap::new(),
++            values: BTreeMap::new(),
++        }
++    }
++}
++
++impl Backend for Scripted {
++    fn write(
++        &mut self,
++        node: &str,
++        key: &IdempotencyKey,
++        command: &[u8],
++    ) -> Result<Reply, SdkError> {
++        if node != self.leader {
++            return Ok(Reply::Redirect {
++                leader: self.leader.clone(),
++            });
++        }
++        if let Some(index) = self.applied.get(key) {
++            // The same write, again: the same answer, and no second application.
++            return Ok(Reply::Applied {
++                index: *index,
++                value: None,
++            });
++        }
++        let parsed = meshkv::kv::Command::parse(command).map_err(|error| SdkError::Refused {
++            reason: error.to_string(),
++        })?;
++        match parsed {
++            meshkv::kv::Command::Set { key, value } => {
++                self.values.insert(key, value);
++            }
++            meshkv::kv::Command::Cas { key, expect, value } => {
++                if self.values.get(&key) != Some(&expect) {
++                    return Err(SdkError::Refused {
++                        reason: format!("`{key}` does not hold what the compare-and-set expects"),
++                    });
++                }
++                self.values.insert(key, value);
++            }
++            meshkv::kv::Command::Delete { key } => {
++                self.values.remove(&key);
++            }
++        }
++        let index = self.applied.len() as meshkv::raft::Index + 1;
++        self.applied.insert(key.clone(), index);
++        Ok(Reply::Applied { index, value: None })
++    }
++
++    fn read(&mut self, node: &str, key: &str) -> Result<Reply, SdkError> {
++        if node != self.leader {
++            return Ok(Reply::Redirect {
++                leader: self.leader.clone(),
++            });
++        }
++        Ok(Reply::Applied {
++            index: 0,
++            value: self.values.get(key).cloned(),
++        })
++    }
++}
++
++/// A backend that runs the real cluster: an elected `Raft`, the state machine, and the ledger.
++struct InProcess {
++    raft: Raft,
++    kv: Kv,
++    ledger: Ledger,
++}
++
++impl InProcess {
++    fn new() -> Self {
++        let members = vec![id("n1"), id("n2"), id("n3")];
++        let mut raft = Raft::new(id("n1"), members);
++        let _ = raft.campaign();
++        let _ = raft.on_message(
++            &id("n2"),
++            Message::Vote {
++                term: Term::new(1),
++                granted: true,
++            },
++        );
++        Self {
++            raft,
++            kv: Kv::new(),
++            ledger: Ledger::new(meshkv::idempotency::default_window()),
++        }
++    }
++}
++
++fn id(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++impl Backend for InProcess {
++    fn write(
++        &mut self,
++        node: &str,
++        key: &IdempotencyKey,
++        command: &[u8],
++    ) -> Result<Reply, SdkError> {
++        // `n1` is the leader in this fixture: any other node answers with a redirect, which is the
++        // part of the SDK's policy the suite exercises from the first case.
++        if node != "n1" {
++            return Ok(Reply::Redirect {
++                leader: "n1".to_owned(),
++            });
++        }
++        // A compare-and-set the leader can already see will not match is refused before it costs a
++        // log entry: the state machine would answer `Mismatch` for ever, so there is nothing to
++        // gain from writing it down.
++        if let Ok(meshkv::kv::Command::Cas { key, expect, .. }) =
++            meshkv::kv::Command::parse(command)
++            && self.kv.get(&key) != Some(expect.as_slice())
++        {
++            return Ok(Reply::Refused {
++                reason: format!("`{key}` does not hold what the compare-and-set expects"),
++            });
++        }
++        let mut applied = None;
++        let outcome = self
++            .ledger
++            .apply(key.clone(), 0, || {
++                let index = self
++                    .raft
++                    .propose(command.to_vec())
++                    .map_err(|error| meshkv::error::Error::invalid(error.to_string()))?;
++                // A write commits once a majority holds it; the fixture's follower is the second
++                // node of three, which is a majority with the leader.
++                let _ = self.raft.on_message(
++                    &id("n2"),
++                    Message::AppendAck {
++                        term: Term::new(1),
++                        success: true,
++                        match_index: index,
++                    },
++                );
++                if self.raft.commit_index() >= index {
++                    // Apply the whole committed prefix, not just this entry: the leader's own entry
++                    // from `5.3` sits at index 1 and has to be applied first — a state machine
++                    // applies the log in order, which is the rule `5.10` enforces.
++                    let from = self.kv.applied_index() + 1;
++                    for position in from..=index {
++                        let payload = self
++                            .raft
++                            .log()
++                            .at(position)
++                            .map(|entry| entry.payload().to_vec())
++                            .unwrap_or_default();
++                        self.kv
++                            .apply(position, &payload)
++                            .map_err(|error| meshkv::error::Error::invalid(error.to_string()))?;
++                    }
++                    applied = Some(index);
++                }
++                Ok((Some(index), index.to_be_bytes().to_vec()))
++            })
++            .map_err(|error| SdkError::Refused {
++                reason: error.to_string(),
++            })?;
++        match outcome {
++            Outcome::Applied { index } => Ok(Reply::Applied {
++                index: index.unwrap_or_default(),
++                value: None,
++            }),
++            Outcome::Duplicate { answer } => {
++                let mut bytes = [0u8; 8];
++                bytes.copy_from_slice(&answer[..8]);
++                Ok(Reply::Applied {
++                    index: u64::from_be_bytes(bytes),
++                    value: None,
++                })
++            }
++        }
++    }
++
++    fn read(&mut self, node: &str, key: &str) -> Result<Reply, SdkError> {
++        if node != "n1" {
++            return Ok(Reply::Redirect {
++                leader: "n1".to_owned(),
++            });
++        }
++        Ok(Reply::Applied {
++            index: self.kv.applied_index(),
++            value: self.kv.get(key).map(<[u8]>::to_vec),
++        })
++    }
++}

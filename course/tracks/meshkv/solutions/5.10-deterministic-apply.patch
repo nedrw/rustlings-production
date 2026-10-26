@@ -126,7 +126,7 @@
      }
  
      /// Apply the entry at `index`, and answer what it did.
-@@ -159,8 +200,37 @@
+@@ -159,8 +200,44 @@
      /// prefix of the log, so a gap, a duplicate or a step backwards is refused rather than
      /// guessed at — and when the payload is not a command.
      pub fn apply(&mut self, index: Index, payload: &[u8]) -> Result<Applied> {
@@ -137,6 +137,13 @@
 +                "entry {index} cannot be applied after {}: a state machine applies the log in order",
 +                self.applied_index
 +            )));
++        }
++        // The leader writes one empty entry when it wins (`5.3`), and that entry is committed and
++        // applied like any other. It carries no command, so applying it is a no-op that moves the
++        // index — a state machine that refused it would stop at the first election.
++        if payload.is_empty() {
++            self.applied_index = index;
++            return Ok(Applied::Written { value: Vec::new() });
 +        }
 +        let command = Command::parse(payload)?;
 +        let applied = match command {
@@ -166,7 +173,7 @@
      }
  
      /// A digest of the state: keys in order, then their values.
-@@ -171,24 +241,48 @@
+@@ -171,24 +248,48 @@
      /// on how the map was built.
      #[must_use]
      pub fn digest(&self) -> u64 {

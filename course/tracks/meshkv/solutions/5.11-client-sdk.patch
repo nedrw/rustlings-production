@@ -1,0 +1,212 @@
+--- a/src/sdk.rs
++++ b/src/sdk.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! The SDK: what a caller sees, once the cluster's rules are somebody else's problem.
+ //!
+ //! `meshkv/5.11-client-sdk` is the step where the client stops being an example and becomes a
+@@ -70,7 +66,10 @@
+     /// `true` when retrying the same call might succeed.
+     #[must_use]
+     pub fn is_retryable(&self) -> bool {
+-        todo!("meshkv/5.11-client-sdk: SdkError::is_retryable")
++        matches!(
++            self,
++            Self::NotLeader { .. } | Self::Unavailable { .. } | Self::RetriesExhausted { .. }
++        )
+     }
+ }
+ 
+@@ -135,13 +134,11 @@
+         key: &IdempotencyKey,
+         command: &[u8],
+     ) -> std::result::Result<Reply, SdkError> {
+-        let _ = (node, key, command);
+-        todo!("meshkv/5.11-client-sdk: Backend::write")
++        (**self).write(node, key, command)
+     }
+ 
+     fn read(&mut self, node: &str, key: &str) -> std::result::Result<Reply, SdkError> {
+-        let _ = (node, key);
+-        todo!("meshkv/5.11-client-sdk: Backend::read")
++        (**self).read(node, key)
+     }
+ }
+ 
+@@ -157,20 +154,24 @@
+ impl<B: Backend> Sdk<B> {
+     /// An SDK for `session`, starting at `node`.
+     pub fn new(backend: B, session: Session, node: impl Into<String>) -> Self {
+-        let _ = (backend, session, node);
+-        todo!("meshkv/5.11-client-sdk: Backend::new")
++        Self {
++            backend,
++            session,
++            node: node.into(),
++            attempts: 0,
++        }
+     }
+ 
+     /// The node the SDK will try first.
+     #[must_use]
+     pub fn node(&self) -> &str {
+-        todo!("meshkv/5.11-client-sdk: Backend::node")
++        &self.node
+     }
+ 
+     /// How many attempts the last call took.
+     #[must_use]
+     pub fn attempts(&self) -> usize {
+-        todo!("meshkv/5.11-client-sdk: Backend::attempts")
++        self.attempts
+     }
+ 
+     /// Write `command`, following redirects and retrying with the same idempotency key.
+@@ -180,8 +181,35 @@
+     /// [`SdkError::Refused`] when the store refuses the write (no retry), and
+     /// [`SdkError::RetriesExhausted`] when the attempts run out first.
+     pub fn write(&mut self, command: &[u8]) -> std::result::Result<Index, SdkError> {
+-        let _ = command;
+-        todo!("meshkv/5.11-client-sdk: Backend::write")
++        // The key is computed once: every attempt is the *same* write, which is what makes a retry
++        // safe. A key per attempt would turn the retry into a second write.
++        let key = self.session.key_for(command);
++        self.attempts = 0;
++        loop {
++            self.attempts += 1;
++            let node = self.node.clone();
++            match self.backend.write(&node, &key, command) {
++                Ok(Reply::Applied { index, .. }) => return Ok(index),
++                Ok(Reply::Redirect { leader }) => {
++                    self.node = leader;
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted("the redirects did not reach a leader"));
++                    }
++                }
++                Ok(Reply::NoLeader) => {
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted("no node knew who the leader was"));
++                    }
++                }
++                Ok(Reply::Refused { reason }) => return Err(SdkError::Refused { reason }),
++                Err(SdkError::Unavailable { detail }) => {
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted(&detail));
++                    }
++                }
++                Err(error) => return Err(error),
++            }
++        }
+     }
+ 
+     /// Read `key`, following redirects.
+@@ -191,8 +219,32 @@
+     /// [`SdkError::RetriesExhausted`] when the attempts run out, and whatever the backend refuses
+     /// without a retry.
+     pub fn read(&mut self, key: &str) -> std::result::Result<Option<Vec<u8>>, SdkError> {
+-        let _ = key;
+-        todo!("meshkv/5.11-client-sdk: Backend::read")
++        self.attempts = 0;
++        loop {
++            self.attempts += 1;
++            let node = self.node.clone();
++            match self.backend.read(&node, key) {
++                Ok(Reply::Applied { value, .. }) => return Ok(value),
++                Ok(Reply::Redirect { leader }) => {
++                    self.node = leader;
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted("the redirects did not reach a leader"));
++                    }
++                }
++                Ok(Reply::NoLeader) => {
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted("no node knew who the leader was"));
++                    }
++                }
++                Ok(Reply::Refused { reason }) => return Err(SdkError::Refused { reason }),
++                Err(SdkError::Unavailable { detail }) => {
++                    if self.attempts >= MAX_ATTEMPTS {
++                        return Err(self.exhausted(&detail));
++                    }
++                }
++                Err(error) => return Err(error),
++            }
++        }
+     }
+ 
+     /// The ledger outcome for a write that may have been a duplicate, as the SDK sees it.
+@@ -202,13 +254,14 @@
+     /// to see the distinction, and `Outcome` is `5.8`'s.
+     #[must_use]
+     pub fn outcome_is_success(outcome: &Outcome) -> bool {
+-        let _ = outcome;
+-        todo!("meshkv/5.11-client-sdk: Backend::outcome_is_success")
++        matches!(outcome, Outcome::Applied { .. } | Outcome::Duplicate { .. })
+     }
+ 
+     fn exhausted(&self, last: &str) -> SdkError {
+-        let _ = last;
+-        todo!("meshkv/5.11-client-sdk: Backend::exhausted")
++        SdkError::RetriesExhausted {
++            attempts: self.attempts,
++            last: last.to_owned(),
++        }
+     }
+ }
+ 
+@@ -218,22 +271,31 @@
+ /// operations, and the encoding is the store's business.
+ #[must_use]
+ pub fn command_set(key: &str, value: &[u8]) -> Vec<u8> {
+-    let _ = (key, value);
+-    todo!("meshkv/5.11-client-sdk: Backend::command_set")
++    crate::kv::Command::Set {
++        key: key.to_owned(),
++        value: value.to_vec(),
++    }
++    .encode()
+ }
+ 
+ /// A delete, as the SDK sends it.
+ #[must_use]
+ pub fn command_delete(key: &str) -> Vec<u8> {
+-    let _ = key;
+-    todo!("meshkv/5.11-client-sdk: Backend::command_delete")
++    crate::kv::Command::Delete {
++        key: key.to_owned(),
++    }
++    .encode()
+ }
+ 
+ /// A compare-and-set, as the SDK sends it.
+ #[must_use]
+ pub fn command_cas(key: &str, expect: &[u8], value: &[u8]) -> Vec<u8> {
+-    let _ = (key, expect, value);
+-    todo!("meshkv/5.11-client-sdk: Backend::command_cas")
++    crate::kv::Command::Cas {
++        key: key.to_owned(),
++        expect: expect.to_vec(),
++        value: value.to_vec(),
++    }
++    .encode()
+ }
+ 
+ /// A refusal from a node that is not the leader, as the SDK reads it.
+@@ -243,6 +305,12 @@
+ /// [`SdkError::NotLeader`] when the error carries a leader, and [`SdkError::Unavailable`] when it
+ /// does not — a refusal that names nobody is not a redirect.
+ pub fn classify(error: &Error) -> SdkError {
+-    let _ = error;
+-    todo!("meshkv/5.11-client-sdk: Backend::classify")
++    match error {
++        Error::NotLeader { leader } => SdkError::NotLeader {
++            leader: leader.clone(),
++        },
++        other => SdkError::Unavailable {
++            detail: other.to_string(),
++        },
++    }
+ }

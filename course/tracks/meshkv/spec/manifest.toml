@@ -8,6 +8,7 @@ format_version = 1
 [spec]
 "spec/5.1/multi_node_topology.rs" = "sha256:be860601aeab769ea9264536a533cb3809062850fa7fda64af934d5e46b2943c"
 "spec/5.10/deterministic_apply.rs" = "sha256:d433c8a46348a6dc676071366876b6b81ef478d712c81333fe4aa738f9cca495"
+"spec/5.11/client_sdk.rs" = "sha256:90e0a48e0099dbcff8aff9c167887ae1080f47f70ae57b58f6a2bf9a0d317f10"
 "spec/5.2/replication_rules.rs" = "sha256:af74365db7eeba1edf13ed0f8765f8c509839d5798d8371543ce37bd7504496a"
 "spec/5.3/teaching_raft.rs" = "sha256:8293e7cbc9614ae845e496a74f693aed71c5bd18ba74dd7ab308a95ddf887752"
 "spec/5.4/snapshots.rs" = "sha256:35354f1be6619787975e79d889e14bf9c05fc7d6006044e513a12c47248eff0d"
