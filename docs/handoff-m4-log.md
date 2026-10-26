@@ -291,3 +291,31 @@ $ kiln selftest --track meshkv
 5. **脚手架"只能写进标记区"这条规则会在你违反它时立刻抓住你**——本段第一次撞上它是在给 5.7 插
    `use crate::cluster::NodeId;` 时，报错原话就是"outside a `kiln:scaffold:begin`/`kiln:scaffold:end`
    block: scaffolds may only write inside marked regions (authoring.md §5)"。
+
+## 段 8：5.8 幂等会话（B2 第三步）
+
+**5.8 做了什么**：`src/idempotency.rs`（`Session` + `key_for`、`Answers`（键 → 答案 + 时刻）+ `expire`、
+`Ledger::apply`（见过的键不再应用、闭包不调用、原答案返回）、`default_window`）。8 个规格用例。
+
+**原始结论行**：
+
+```
+$ kiln selftest --track meshkv
+8/8 step(s) hold the contract
+  ✓ 5.8 9/9 must green（scaffold 红在 "a retry is answered with the original answer and is not applied again"）
+```
+
+**这一段钉下来的四条（三条是工具链的，都很隐蔽）**：
+
+1. **`diff` 在"有差异"时退出码是 1**——用 `&&` 串「生成三个补丁」的命令会在第一个 diff 处断掉，
+   于是补丁只写了一半（lib.rs 的段没了），而**文件看起来是生成了的**。分隔符必须是 `;`。
+2. **补丁必须在真实补丁链上验证**：单独对"上一棵树"能应用不代表对"轨道累积出来的树"能应用。
+   做法（本段起成为规矩）：建一个 scratch 目录，从骨架开始按 5.1→5.x 逐笔 `git apply` 骨架与解，
+   再 `git apply --check` 新的一对。"文件在规划后被改过"这类错误只有这条链能提前抓到。
+3. **桩生成器的两个真 bug**（`out[:-len(signature)]` 会吃掉紧邻的文档行；参数切分用了行里**最后一个**
+   `)` 而不是与左括号配对的那个）。症状分别是：桩丢了 `# Errors` 段（`docs:public` 门红）、
+   参数变成 `(key, ) -> Result<()>`。**生成器要先在一个 9 行的最小例子上验证再跑全量。**
+4. **文件系统会对特定路径偶发 `NotFound`**（`readdir` 列得出来、`stat` 却说不存在，同一进程里
+   前后两次判断还能不同）。kiln 的 `missing_content` 因此报 `its spec file is missing`，而
+   `selftest` 把它显示成 `0/0 held`。**`0/0` 的意思是"这一步还没被当成已作者化"**，先看 `verify`
+   的那一行；本段的绕法是换一个规格文件名（元数据与 `run.cmd` 一起改）。

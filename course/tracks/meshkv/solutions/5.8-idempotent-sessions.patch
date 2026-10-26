@@ -3,7 +3,7 @@
 @@ -1,7 +1,3 @@
 -#![allow(dead_code)]
 -// the stub keeps the values the implementation will read; the reference
--// solution drops the allowance, because by then every one of used.
+-// solution drops the allowance, because by then every one is used.
 -
  //! A retry is not a second write: sessions and the keys that make one.
  //!
@@ -119,7 +119,7 @@
      }
  }
  
-@@ -160,28 +167,39 @@
+@@ -160,14 +167,15 @@
      /// A leader that remembers nothing.
      #[must_use]
      pub fn new(window: Duration) -> Self {
@@ -136,14 +136,9 @@
 -        todo!("meshkv/5.8-idempotent-sessions: Ledger::answers")
 +        &self.answers
      }
-+
-+    /// Apply a request that carries `key`, or recognise it as a duplicate.
-+    ///
-+    /// The `apply` closure is what the leader would do with a *new* write; it is not called for a
-+    /// duplicate, which is the whole point.
-     pub fn apply(
-         &mut self,
-         key: IdempotencyKey,
+ 
+     /// Apply a request that carries `key`, or recognise it as a duplicate.
+@@ -185,13 +193,18 @@
          now: u64,
          apply: impl FnOnce() -> Result<(Option<u64>, Vec<u8>)>,
      ) -> Result<Outcome> {

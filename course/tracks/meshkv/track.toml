@@ -243,8 +243,8 @@ time_hint = "90m"
 concepts = ["session", "idempotency key", "duplicate window"]
 teaches = ["api/idempotency-key@design"]
 requires = ["delivery/idempotency@apply", "dist/client-routing@apply"]
-run = { cmd = "cargo test -p meshkv --test spec_idempotent_sessions" }
-spec = ["spec/5.8/idempotent_sessions.rs"]
+run = { cmd = "cargo test -p meshkv --test spec_duplicates" }
+spec = ["spec/5.8/duplicates.rs"]
 scaffold = "scaffold/5.8-idempotent-sessions.patch"
 solution = "solutions/5.8-idempotent-sessions.patch"
 gates = [

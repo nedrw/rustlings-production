@@ -1,9 +1,9 @@
 --- /dev/null
 +++ b/src/idempotency.rs
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,197 @@
 +#![allow(dead_code)]
 +// the stub keeps the values the implementation will read; the reference
-+// solution drops the allowance, because by then every one of used.
++// solution drops the allowance, because by then every one is used.
 +
 +//! A retry is not a second write: sessions and the keys that make one.
 +//!
@@ -18,10 +18,10 @@
 +//!
 +//! * **the session.** A client that talks to a cluster needs an identity that survives a retry: a
 +//!   session id, and the fact that the session is bound to *one* leader at a time. A retry that
-+//! crosses a leadership change is a request that a different leader has to recognise.
++//!   crosses a leadership change is a request that a different leader has to recognise.
 +//! * **the idempotency key.** The client puts a key on the write it means to make once. The leader
-+//! remembers the keys it has already applied, together with the answers it gave, and a request
-+//! that carries a key it has seen is not applied again — it is *answered again*, with the same
++//!   remembers the keys it has already applied, together with the answers it gave, and a request
++//!   that carries a key it has seen is not applied again — it is *answered again*, with the same
 +//!   answer.
 +//!
 +//! The second half is where the care goes. A duplicate request must return the *original* answer,
@@ -172,6 +172,16 @@
 +    pub fn answers(&self) -> &Answers {
 +        todo!("meshkv/5.8-idempotent-sessions: Ledger::answers")
 +    }
++
++    /// Apply a request that carries `key`, or recognise it as a duplicate.
++    ///
++    /// The `apply` closure is what the leader would do with a *new* write; it is not called for a
++    /// duplicate, which is the whole point.
++    ///
++    /// # Errors
++    ///
++    /// Whatever the closure answers when the write itself is refused. A refused write is not
++    /// remembered: there is no answer to replay, so the key stays free.
 +    pub fn apply(
 +        &mut self,
 +        key: IdempotencyKey,
