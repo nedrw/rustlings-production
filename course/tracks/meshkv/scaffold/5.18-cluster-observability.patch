@@ -1,0 +1,249 @@
+--- /dev/null
++++ b/src/metrics.rs
+@@ -0,0 +1,141 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! What a cluster can be asked about itself: the counters an SLO is computed from.
++//!
++//! `meshkv/5.18-cluster-observability` is the `operate` depth of `obs/metrics-slo`: T1 counted
++//! requests, T2 counted a service's outcomes, T3 designed the alerts; this step asks the question
++//! only a cluster can be asked — **who is behind, and who is flapping?** — and answers it with
++//! counters an operator can read off a node.
++//!
++//! The counters are deliberately the ones a *cluster* has and a service does not:
++//!
++//! * **lag per peer.** How far behind the leader's commit each follower is, in entries. A follower
++//!   that is behind by a growing number is the node that will be the last to notice a leader change,
++//!   and the first to be a problem when one happens.
++//! * **elections.** How many times the node has stood, and how many it won. A node that stands every
++//!   few seconds while another keeps winning is a node whose clock or network is the problem.
++//! * **refusals.** How many writes the node refused because it could not reach a majority. A refusal
++//!   count that moves on one node and not the others is a partition that healed before anybody
++//!   looked.
++//! * **commit index.** How far the node has applied. The difference between nodes' indexes *is* the
++//!   lag, seen from each end.
++//!
++//! And then the SLO: an objective is a promise about a ratio, and the **error budget** is how much of
++//! it the cluster has spent. `Slo::evaluate` answers the remaining budget as counts, because a budget
++//! that needs a clock is a budget that moves when the machine does.
++
++use std::collections::BTreeMap;
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++use crate::raft::Index;
++
++/// The counters one node keeps about itself.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct NodeMetrics {
++    /// How far each peer's log reaches, as this node last heard.
++    pub peer_index: BTreeMap<NodeId, Index>,
++    /// How many elections this node has stood in.
++    pub elections_stood: u64,
++    /// How many it won.
++    pub elections_won: u64,
++    /// How many writes it refused because no majority was reachable.
++    pub refusals: u64,
++    /// How many writes it committed.
++    pub commits: u64,
++    /// How far it has applied.
++    pub applied: Index,
++}
++
++impl NodeMetrics {
++    /// A node with no counters.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::new")
++    }
++
++    /// Record that `peer`'s log reaches `index`.
++    pub fn record_peer(&mut self, peer: NodeId, index: Index) {
++        let _ = (peer, index);
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::record_peer")
++    }
++
++    /// How far behind this node's own commit the named peer is, when both are known.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when `commit` is behind this node's applied index in a way that cannot be
++    /// true (a commit index below the applied one), or when the peer is not recorded — a lag for a
++    /// peer nobody has heard from is not zero, it is unknown.
++    pub fn lag(&self, peer: &NodeId, commit: Index) -> Result<Index> {
++        let _ = (peer, commit);
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::lag")
++    }
++
++    /// The peer that is furthest behind, when any peer is behind at all.
++    #[must_use]
++    pub fn most_behind(&self, commit: Index) -> Option<(&NodeId, Index)> {
++        let _ = commit;
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::most_behind")
++    }
++
++    /// How many times this node stood but lost: a node that is flapping without winning.
++    #[must_use]
++    pub fn lost_elections(&self) -> u64 {
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::lost_elections")
++    }
++
++    /// `true` when this node's counters suggest it is the one to look at: it lost more elections than
++    /// it won, or it refused writes while committing none.
++    #[must_use]
++    pub fn is_suspect(&self) -> bool {
++        todo!("meshkv/5.18-cluster-observability: NodeMetrics::is_suspect")
++    }
++}
++
++/// A promise about a ratio, and the evidence its budget is spent from.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Slo {
++    /// The objective, in parts per million: 999_000 is "99.9% of writes commit".
++    pub objective_ppm: u64,
++}
++
++impl Slo {
++    /// An SLO with the given objective.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the objective is not in `1..=1_000_000` parts per million — an
++    /// objective of zero is a promise to fail, and one above a million is a promise about nothing.
++    pub fn new(objective_ppm: u64) -> Result<Self> {
++        let _ = objective_ppm;
++        todo!("meshkv/5.18-cluster-observability: Slo::new")
++    }
++
++    /// The budget left after `commits` successes out of `attempts`: the number of further failures
++    /// the promise still allows.
++    ///
++    /// This is `attempts × (1 − objective) − failures`, floored at zero, in integers so that the
++    /// answer is the same on every machine.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when there were more successes than attempts — a counter that says so is a
++    /// counter that is wrong.
++    pub fn budget_left(&self, commits: u64, attempts: u64) -> Result<u64> {
++        let _ = (commits, attempts);
++        todo!("meshkv/5.18-cluster-observability: Slo::budget_left")
++    }
++
++    /// `true` when the budget is spent: the promise is broken for this window.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the ratio is impossible (see [`Slo::budget_left`]).
++    pub fn is_broken(&self, commits: u64, attempts: u64) -> Result<bool> {
++        let _ = (commits, attempts);
++        todo!("meshkv/5.18-cluster-observability: Slo::is_broken")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,7 @@
+ pub mod drill;
+ pub mod idempotency;
+ pub mod kv;
++pub mod metrics;
+ pub mod raft;
+ pub mod restart;
+ pub mod sdk;
+--- /dev/null
++++ b/docs/slo.md
+@@ -0,0 +1,42 @@
++# The cluster's SLO: who is behind, who is flapping, and what it costs
++
++A service's SLO is about latency and errors. A cluster's SLO is about *agreement*: how many writes the
++cluster promised to commit, and how many it actually did. This page is the project's version, and the
++counters it is computed from are the ones only a cluster has.
++
++## The counters
++
++| counter | what it answers |
++| --- | --- |
++| lag per peer | how far behind the leader's commit each follower is |
++| elections stood / won | who is flapping, and who keeps winning |
++| refusals | writes this node refused because no majority was reachable |
++| commits | writes this node saw committed |
++| applied | how far this node's state machine has got |
++
++The first and last are two views of the same fact: the difference between nodes' applied indexes *is*
++the lag, seen from each end. A node whose lag grows is the node that will be last to notice a leader
++change, and the first to be a problem when one happens. A node that stands for election over and over
++while another keeps winning is a node whose clock or network is the problem — and a node that refuses
++writes while committing none is the one that was on the wrong side of a partition.
++
++## The SLO, in counts
++
++An objective is a promise about a ratio, and the **error budget** is how much of it the cluster has
++spent:
++
++```text
++budget_left = attempts × (1 − objective) − failures
++```
++
++Everything is an integer and everything is a count, because a budget that needs a clock is a budget
++that moves when the machine does. A 99.9% objective over a thousand attempts allows exactly one
++failure; over ten thousand it allows ten. That is the arithmetic a release decision is made of: "we
++have five failures of budget left this window" is a sentence somebody can act on.
++
++## What it does not say
++
++The counters are per node, and they are deliberately not a global truth: a node's view of a peer's lag
++is as fresh as the last message it received. The audit (`5.22`) is the step that compares the nodes'
++views *against each other*; this page is what each node says about itself, which is what an operator
++reads first.
+--- /dev/null
++++ b/tests/budget_slo.rs
+@@ -0,0 +1,47 @@
++//! The instrument for `meshkv/5.18-cluster-observability`: the counters an SLO is computed from.
++//!
++//! Course content, shipped by the step's scaffold. The `bench-budget` gate reads the
++//! `meshkv-budget <name>=<value>` lines this prints: the lag counters, the flapping counters, and the
++//! error budget for a fixed window. Every number is a count.
++
++use meshkv::cluster::NodeId;
++use meshkv::metrics::{NodeMetrics, Slo};
++
++fn node(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++#[test]
++fn the_counters_and_the_budget_are_the_numbers_the_page_states() {
++    let mut metrics = NodeMetrics::new();
++    metrics.record_peer(node("n2"), 990);
++    metrics.record_peer(node("n3"), 950);
++    metrics.elections_stood = 4;
++    metrics.elections_won = 4;
++    metrics.commits = 9_998;
++    metrics.refusals = 2;
++    metrics.applied = 1_000;
++
++    let lag_two = metrics.lag(&node("n2"), 1_000).expect("a lag");
++    let lag_three = metrics.lag(&node("n3"), 1_000).expect("a lag");
++    let slo = Slo::new(999_000).expect("an objective");
++    let budget = slo.budget_left(9_998, 10_000).expect("a budget");
++
++    println!("meshkv-budget lag_n2={lag_two}");
++    println!("meshkv-budget lag_n3={lag_three}");
++    println!("meshkv-budget worst_lag_max={}", lag_three.max(lag_two));
++    println!("meshkv-budget lost_elections={}", metrics.lost_elections());
++    println!("meshkv-budget suspect={}", u8::from(metrics.is_suspect()));
++    println!("meshkv-budget commits={}", metrics.commits);
++    println!("meshkv-budget refusals={}", metrics.refusals);
++    println!("meshkv-budget budget_left={budget}");
++    println!(
++        "meshkv-budget budget_broken={}",
++        u8::from(slo.is_broken(9_998, 10_000).expect("a verdict"))
++    );
++
++    assert_eq!(lag_two, 10);
++    assert_eq!(lag_three, 50);
++    assert_eq!(budget, 8, "ten allowed failures minus two");
++    assert!(!metrics.is_suspect());
++}

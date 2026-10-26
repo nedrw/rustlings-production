@@ -15,6 +15,7 @@ format_version = 1
 "spec/5.15/cluster_drills.rs" = "sha256:bd50e39e10489c45d69631831cc3a04427d63463c1b0b87b88d186c033122061"
 "spec/5.16/chaos_matrix.rs" = "sha256:6329c34190bc705e195e9a2d5a1ce3894b5db414c8e0b701dbd1a68db25b7252"
 "spec/5.17/distributed_budgets.rs" = "sha256:b30cbac02606e5474686804dc5b205446df2d450956b86984e55b7290925dfc0"
+"spec/5.18/cluster_observability.rs" = "sha256:4b9318a80c7785c499140bc31d1756a7f5399f6f75216fe754cf9231f208f278"
 "spec/5.2/replication_rules.rs" = "sha256:af74365db7eeba1edf13ed0f8765f8c509839d5798d8371543ce37bd7504496a"
 "spec/5.3/teaching_raft.rs" = "sha256:8293e7cbc9614ae845e496a74f693aed71c5bd18ba74dd7ab308a95ddf887752"
 "spec/5.4/snapshots.rs" = "sha256:35354f1be6619787975e79d889e14bf9c05fc7d6006044e513a12c47248eff0d"

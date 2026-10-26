@@ -1,0 +1,24 @@
+# The observability budget of `meshkv/5.18-cluster-observability`, measured on the reference solution.
+#
+# Course content, at the same trust level as `spec/`: the `bench-budget` gate reads *this* copy. The
+# command is the project's own harness (`tests/budget_slo.rs`, which this step's scaffold ships); the
+# metrics are counts of entries, elections and failures — never a time.
+command = "cargo test -p meshkv --test budget_slo -- --nocapture"
+
+[metric]
+# How far behind the leader's commit each follower is, in entries.
+lag_n2 = 10
+lag_n3 = 50
+# The worst of them: the number an operator looks at first.
+worst_lag_max = 50
+# Elections this node stood and lost.
+lost_elections = 0
+# Whether the counters make this node the one to look at.
+suspect = 0
+# Writes the node saw committed, and writes it refused.
+commits = 9998
+refusals = 2
+# The remaining error budget for 99.9% over ten thousand writes: ten allowed, two spent.
+budget_left = 8
+# Whether the promise is already broken: it is not.
+budget_broken = 0

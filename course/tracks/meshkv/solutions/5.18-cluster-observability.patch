@@ -1,0 +1,121 @@
+--- a/src/metrics.rs
++++ b/src/metrics.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! What a cluster can be asked about itself: the counters an SLO is computed from.
+ //!
+ //! `meshkv/5.18-cluster-observability` is the `operate` depth of `obs/metrics-slo`: T1 counted
+@@ -29,7 +25,7 @@
+ use std::collections::BTreeMap;
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::Index;
+ 
+ /// The counters one node keeps about itself.
+@@ -53,13 +49,12 @@
+     /// A node with no counters.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::new")
++        Self::default()
+     }
+ 
+     /// Record that `peer`'s log reaches `index`.
+     pub fn record_peer(&mut self, peer: NodeId, index: Index) {
+-        let _ = (peer, index);
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::record_peer")
++        self.peer_index.insert(peer, index);
+     }
+ 
+     /// How far behind this node's own commit the named peer is, when both are known.
+@@ -70,28 +65,38 @@
+     /// true (a commit index below the applied one), or when the peer is not recorded — a lag for a
+     /// peer nobody has heard from is not zero, it is unknown.
+     pub fn lag(&self, peer: &NodeId, commit: Index) -> Result<Index> {
+-        let _ = (peer, commit);
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::lag")
++        let Some(reached) = self.peer_index.get(peer) else {
++            return Err(Error::invalid(format!(
++                "no index has been recorded for `{peer}`, so its lag is unknown, not zero"
++            )));
++        };
++        if *reached > commit {
++            return Ok(0);
++        }
++        Ok(commit - reached)
+     }
+ 
+     /// The peer that is furthest behind, when any peer is behind at all.
+     #[must_use]
+     pub fn most_behind(&self, commit: Index) -> Option<(&NodeId, Index)> {
+-        let _ = commit;
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::most_behind")
++        self.peer_index
++            .iter()
++            .map(|(peer, reached)| (peer, commit.saturating_sub(*reached)))
++            .max_by_key(|(_, lag)| *lag)
++            .filter(|(_, lag)| *lag > 0)
+     }
+ 
+     /// How many times this node stood but lost: a node that is flapping without winning.
+     #[must_use]
+     pub fn lost_elections(&self) -> u64 {
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::lost_elections")
++        self.elections_stood.saturating_sub(self.elections_won)
+     }
+ 
+     /// `true` when this node's counters suggest it is the one to look at: it lost more elections than
+     /// it won, or it refused writes while committing none.
+     #[must_use]
+     pub fn is_suspect(&self) -> bool {
+-        todo!("meshkv/5.18-cluster-observability: NodeMetrics::is_suspect")
++        self.lost_elections() > self.elections_won || (self.refusals > 0 && self.commits == 0)
+     }
+ }
+ 
+@@ -110,8 +115,12 @@
+     /// [`Error::Invalid`] when the objective is not in `1..=1_000_000` parts per million — an
+     /// objective of zero is a promise to fail, and one above a million is a promise about nothing.
+     pub fn new(objective_ppm: u64) -> Result<Self> {
+-        let _ = objective_ppm;
+-        todo!("meshkv/5.18-cluster-observability: Slo::new")
++        if objective_ppm == 0 || objective_ppm > 1_000_000 {
++            return Err(Error::invalid(format!(
++                "{objective_ppm} parts per million is not an objective"
++            )));
++        }
++        Ok(Self { objective_ppm })
+     }
+ 
+     /// The budget left after `commits` successes out of `attempts`: the number of further failures
+@@ -125,8 +134,14 @@
+     /// [`Error::Invalid`] when there were more successes than attempts — a counter that says so is a
+     /// counter that is wrong.
+     pub fn budget_left(&self, commits: u64, attempts: u64) -> Result<u64> {
+-        let _ = (commits, attempts);
+-        todo!("meshkv/5.18-cluster-observability: Slo::budget_left")
++        if commits > attempts {
++            return Err(Error::invalid(format!(
++                "{commits} commits out of {attempts} attempts is not a ratio"
++            )));
++        }
++        let allowed = attempts.saturating_mul(1_000_000 - self.objective_ppm) / 1_000_000;
++        let failures = attempts - commits;
++        Ok(allowed.saturating_sub(failures))
+     }
+ 
+     /// `true` when the budget is spent: the promise is broken for this window.
+@@ -135,7 +150,6 @@
+     ///
+     /// [`Error::Invalid`] when the ratio is impossible (see [`Slo::budget_left`]).
+     pub fn is_broken(&self, commits: u64, attempts: u64) -> Result<bool> {
+-        let _ = (commits, attempts);
+-        todo!("meshkv/5.18-cluster-observability: Slo::is_broken")
++        Ok(self.budget_left(commits, attempts)? == 0)
+     }
+ }
