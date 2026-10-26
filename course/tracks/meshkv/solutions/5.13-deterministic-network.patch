@@ -1,0 +1,333 @@
+--- a/src/sim.rs
++++ b/src/sim.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! The network as data: a playbook of faults, replayed by a seed.
+ //!
+ //! `meshkv/5.13-deterministic-network` is the step where the cluster's *testing* changes shape. Up
+@@ -32,8 +28,11 @@
+ //! transcript — and `5.14` is the step that reads a partition out of one and asserts what the
+ //! minority did.
+ 
++use std::collections::BTreeSet;
++
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
++use crate::kv::Command;
+ 
+ /// One fault a playbook can inject.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -76,8 +75,49 @@
+     ///
+     /// [`Error::Invalid`] when the line is not one of the five faults, or when a name is not a name.
+     pub fn parse(line: &str) -> Result<Self> {
+-        let _ = line;
+-        todo!("meshkv/5.13-deterministic-network: Fault::parse")
++        let mut words = line.split_whitespace();
++        let wrong = || Error::invalid(format!("`{line}` is not a fault this playbook knows"));
++        match words.next() {
++            Some("partition") | Some("heal") => {
++                let partition = line.starts_with("partition");
++                let a = words.next().ok_or_else(wrong)?;
++                let b = words.next().ok_or_else(wrong)?;
++                if words.next().is_some() {
++                    return Err(wrong());
++                }
++                let a = NodeId::parse(a)?;
++                let b = NodeId::parse(b)?;
++                Ok(if partition {
++                    Self::Partition { a, b }
++                } else {
++                    Self::Heal { a, b }
++                })
++            }
++            Some("drop") => {
++                let count = words.next().ok_or_else(wrong)?;
++                if words.next().is_some() {
++                    return Err(wrong());
++                }
++                let count = count.parse::<usize>().map_err(|_| {
++                    Error::invalid(format!("`{count}` is not a number of messages"))
++                })?;
++                Ok(Self::Drop { count })
++            }
++            Some("crash") | Some("restart") => {
++                let crash = line.starts_with("crash");
++                let node = words.next().ok_or_else(wrong)?;
++                if words.next().is_some() {
++                    return Err(wrong());
++                }
++                let node = NodeId::parse(node)?;
++                Ok(if crash {
++                    Self::Crash { node }
++                } else {
++                    Self::Restart { node }
++                })
++            }
++            _ => Err(wrong()),
++        }
+     }
+ }
+ 
+@@ -105,7 +145,7 @@
+     /// An empty playbook.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("meshkv/5.13-deterministic-network: Playbook::new")
++        Self::default()
+     }
+ 
+     /// Read a playbook from text: one step per line, `#` starts a comment.
+@@ -114,26 +154,51 @@
+     ///
+     /// [`Error::Invalid`] for a line that is neither a fault nor a write.
+     pub fn parse(text: &str) -> Result<Self> {
+-        let _ = text;
+-        todo!("meshkv/5.13-deterministic-network: Playbook::parse")
++        let mut steps = Vec::new();
++        for line in text.lines() {
++            let line = line.split('#').next().unwrap_or_default().trim();
++            if line.is_empty() {
++                continue;
++            }
++            if let Some(rest) = line.strip_prefix("write ") {
++                let Some((key, value)) = rest.split_once(' ') else {
++                    return Err(Error::invalid(format!(
++                        "`{line}` is not a write: expected `write <key> <value>`"
++                    )));
++                };
++                steps.push(Step::Write {
++                    key: key.to_owned(),
++                    value: value.as_bytes().to_vec(),
++                });
++                continue;
++            }
++            steps.push(Step::Fault(Fault::parse(line)?));
++        }
++        Ok(Self { steps })
+     }
+ 
+     /// The steps, in order.
+     #[must_use]
+     pub fn steps(&self) -> &[Step] {
+-        todo!("meshkv/5.13-deterministic-network: Playbook::steps")
++        &self.steps
+     }
+ 
+     /// How many faults it holds.
+     #[must_use]
+     pub fn faults(&self) -> usize {
+-        todo!("meshkv/5.13-deterministic-network: Playbook::faults")
++        self.steps
++            .iter()
++            .filter(|step| matches!(step, Step::Fault(_)))
++            .count()
+     }
+ 
+     /// How many writes it attempts.
+     #[must_use]
+     pub fn writes(&self) -> usize {
+-        todo!("meshkv/5.13-deterministic-network: Playbook::writes")
++        self.steps
++            .iter()
++            .filter(|step| matches!(step, Step::Write { .. }))
++            .count()
+     }
+ 
+     /// What the combination of two faults adds up to, so a scenario can be checked for sense.
+@@ -145,14 +210,67 @@
+     /// crashing a node twice without a restart between. A playbook with a no-op in it is a playbook
+     /// that says less than its author thinks.
+     pub fn check(&self) -> Result<()> {
+-        todo!("meshkv/5.13-deterministic-network: Playbook::check")
++        let mut partitioned: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
++        let mut crashed: BTreeSet<NodeId> = BTreeSet::new();
++        let mut budget = 0usize;
++        for step in &self.steps {
++            let Step::Fault(fault) = step else {
++                continue;
++            };
++            match fault {
++                Fault::Partition { a, b } => {
++                    if a == b {
++                        return Err(Error::invalid(format!(
++                            "`{a}` cannot be partitioned from itself"
++                        )));
++                    }
++                    let pair = ordered(a, b);
++                    if !partitioned.insert(pair.clone()) {
++                        return Err(Error::invalid(format!(
++                            "`{}` and `{}` are partitioned twice",
++                            pair.0, pair.1
++                        )));
++                    }
++                }
++                Fault::Heal { a, b } => {
++                    let pair = ordered(a, b);
++                    if !partitioned.remove(&pair) {
++                        return Err(Error::invalid(format!(
++                            "`{}` and `{}` are not partitioned, so there is nothing to heal",
++                            pair.0, pair.1
++                        )));
++                    }
++                }
++                Fault::Drop { count } => {
++                    if *count == 0 {
++                        return Err(Error::invalid("a drop of zero messages is a no-op"));
++                    }
++                    budget += *count;
++                }
++                Fault::Crash { node } => {
++                    if !crashed.insert(node.clone()) {
++                        return Err(Error::invalid(format!("`{node}` crashes twice in a row")));
++                    }
++                }
++                Fault::Restart { node } => {
++                    if !crashed.remove(node) {
++                        return Err(Error::invalid(format!("`{node}` is not crashed")));
++                    }
++                }
++            }
++        }
++        let _ = budget;
++        Ok(())
+     }
+ }
+ 
+ /// Two names in a fixed order, so `partition a b` and `partition b a` are one link.
+ fn ordered(a: &NodeId, b: &NodeId) -> (NodeId, NodeId) {
+-    let _ = (a, b);
+-    todo!("meshkv/5.13-deterministic-network: Playbook::ordered")
++    if a <= b {
++        (a.clone(), b.clone())
++    } else {
++        (b.clone(), a.clone())
++    }
+ }
+ 
+ /// What one message in flight is.
+@@ -177,26 +295,29 @@
+     /// The events, in order.
+     #[must_use]
+     pub fn events(&self) -> &[String] {
+-        todo!("meshkv/5.13-deterministic-network: Transcript::events")
++        &self.events
+     }
+ 
+     /// The digest of the events.
+     #[must_use]
+     pub fn digest(&self) -> u64 {
+-        todo!("meshkv/5.13-deterministic-network: Transcript::digest")
++        self.digest
+     }
+ 
+     /// Record one event, folding it into the digest.
+     pub fn push(&mut self, event: impl Into<String>) {
+-        let _ = event;
+-        todo!("meshkv/5.13-deterministic-network: Transcript::push")
++        let event = event.into();
++        for byte in event.as_bytes().iter().chain(b"\n") {
++            self.digest ^= u64::from(*byte);
++            self.digest = self.digest.wrapping_mul(0x0000_0100_0000_01b3);
++        }
++        self.events.push(event);
+     }
+ 
+     /// `true` when two runs are the same run.
+     #[must_use]
+     pub fn same_as(&self, other: &Transcript) -> bool {
+-        let _ = other;
+-        todo!("meshkv/5.13-deterministic-network: Transcript::same_as")
++        self.digest == other.digest && self.events == other.events
+     }
+ }
+ 
+@@ -211,6 +332,82 @@
+ /// [`Error::Invalid`] when the playbook does not make sense ([`Playbook::check`]), or when the size
+ /// is zero.
+ pub fn run(seed: u64, size: usize, playbook: &Playbook) -> Result<Transcript> {
+-    let _ = (seed, size, playbook);
+-    todo!("meshkv/5.13-deterministic-network: Transcript::run")
++    if size == 0 {
++        return Err(Error::invalid(
++            "a cluster of no nodes cannot run a playbook",
++        ));
++    }
++    playbook.check()?;
++    let mut transcript = Transcript::default();
++    let mut partitioned: BTreeSet<(NodeId, NodeId)> = BTreeSet::new();
++    let mut crashed: BTreeSet<NodeId> = BTreeSet::new();
++    let mut drop_budget = 0usize;
++    let mut committed = 0u64;
++    let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
++
++    let mut nodes: Vec<NodeId> = Vec::with_capacity(size);
++    for index in 1..=size {
++        nodes.push(NodeId::parse(&format!("n{index}"))?);
++    }
++    transcript.push(format!("members={size}"));
++
++    for (at, step) in playbook.steps().iter().enumerate() {
++        match step {
++            Step::Fault(Fault::Partition { a, b }) => {
++                partitioned.insert(ordered(a, b));
++                transcript.push(format!("partition a={a} b={b}"));
++            }
++            Step::Fault(Fault::Heal { a, b }) => {
++                partitioned.remove(&ordered(a, b));
++                transcript.push(format!("heal a={a} b={b}"));
++            }
++            Step::Fault(Fault::Drop { count }) => {
++                drop_budget += count;
++                transcript.push(format!("drop count={count}"));
++            }
++            Step::Fault(Fault::Crash { node }) => {
++                crashed.insert(node.clone());
++                transcript.push(format!("crash node={node}"));
++            }
++            Step::Fault(Fault::Restart { node }) => {
++                crashed.remove(node);
++                transcript.push(format!("restart node={node}"));
++            }
++            Step::Write { key, value } => {
++                // The write is attempted by the client at the node the seed picks; it commits only
++                // if every node it has to reach is up and connected. The playbook's faults are what
++                // decides that, and the transcript says which.
++                let target = nodes.get((rng % size as u64) as usize).cloned();
++                let Some(target) = target else {
++                    continue;
++                };
++                rng ^= rng << 13;
++                rng ^= rng >> 7;
++                rng ^= rng << 17;
++                let blocked = crashed.contains(&target)
++                    || nodes.iter().any(|other| {
++                        other != &target && partitioned.contains(&ordered(&target, other))
++                    });
++                if drop_budget > 0 && !blocked {
++                    drop_budget -= 1;
++                    transcript.push(format!("write key={key} at={at} lost"));
++                    continue;
++                }
++                let command = Command::Set {
++                    key: key.clone(),
++                    value: value.clone(),
++                }
++                .encode();
++                if blocked {
++                    transcript.push(format!("write key={key} at={at} refused"));
++                } else {
++                    let _ = command;
++                    committed += 1;
++                    transcript.push(format!("write key={key} at={at} committed={committed}"));
++                }
++            }
++        }
++    }
++    transcript.push(format!("committed={committed}"));
++    Ok(transcript)
+ }

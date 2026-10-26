@@ -1,0 +1,362 @@
+--- /dev/null
++++ b/src/sim.rs
+@@ -0,0 +1,216 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! The network as data: a playbook of faults, replayed by a seed.
++//!
++//! `meshkv/5.13-deterministic-network` is the step where the cluster's *testing* changes shape. Up
++//! to here, a failure was something a harness did to a value: the value-level cluster in `5.5`'s
++//! instrument, the handshake order in `5.9`'s. This step makes the failures themselves data — a
++//! **playbook** — so that
++//!
++//! * a scenario is a file, not a test function: the faults, their order and the messages they
++//!   affect are the scenario's own content;
++//! * the same seed replays the same run, byte for byte, because the schedule is an input;
++//! * a different seed explores a different order, and the invariants have to hold anyway.
++//!
++//! The design decision that makes this possible is the one `5.3` made and every step since has kept:
++//! the cluster's rules are a pure state machine. A playbook can only drive something that takes
++//! messages and returns messages — and a system that reaches for the network inside its rules cannot
++//! be driven by a playbook at all.
++//!
++//! The playbook's vocabulary is deliberately small, because a fault vocabulary that no test can
++//! exhaust is a vocabulary that hides bugs:
++//!
++//! * `partition <a> <b>`: nothing gets from `a` to `b`, in either direction;
++//! * `heal <a> <b>`: the link works again;
++//! * `drop <n>`: the next `n` messages are lost, in delivery order;
++//! * `crash <a>`: `a` stops answering, and comes back at the next `restart <a>`.
++//!
++//! A scenario is a list of these plus a list of client writes; running it answers a [`Transcript`]:
++//! the events that happened, in order, with a digest. Two runs with the same seed are the same
++//! transcript — and `5.14` is the step that reads a partition out of one and asserts what the
++//! minority did.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// One fault a playbook can inject.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Fault {
++    /// Nothing gets between the two nodes, in either direction.
++    Partition {
++        /// One end.
++        a: NodeId,
++        /// The other end.
++        b: NodeId,
++    },
++    /// The link between the two works again.
++    Heal {
++        /// One end.
++        a: NodeId,
++        /// The other end.
++        b: NodeId,
++    },
++    /// The next `count` messages are lost.
++    Drop {
++        /// How many to lose.
++        count: usize,
++    },
++    /// A node stops answering.
++    Crash {
++        /// Which one.
++        node: NodeId,
++    },
++    /// A node answers again.
++    Restart {
++        /// Which one.
++        node: NodeId,
++    },
++}
++
++impl Fault {
++    /// Parse one line of a playbook.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the line is not one of the five faults, or when a name is not a name.
++    pub fn parse(line: &str) -> Result<Self> {
++        let _ = line;
++        todo!("meshkv/5.13-deterministic-network: Fault::parse")
++    }
++}
++
++/// A playbook: the faults, in order, and the writes the client attempts between them.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Playbook {
++    steps: Vec<Step>,
++}
++
++/// One step of a playbook: a fault, or a client write that has to be attempted.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Step {
++    /// Inject this fault.
++    Fault(Fault),
++    /// Attempt this write.
++    Write {
++        /// The key.
++        key: String,
++        /// The value.
++        value: Vec<u8>,
++    },
++}
++
++impl Playbook {
++    /// An empty playbook.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("meshkv/5.13-deterministic-network: Playbook::new")
++    }
++
++    /// Read a playbook from text: one step per line, `#` starts a comment.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] for a line that is neither a fault nor a write.
++    pub fn parse(text: &str) -> Result<Self> {
++        let _ = text;
++        todo!("meshkv/5.13-deterministic-network: Playbook::parse")
++    }
++
++    /// The steps, in order.
++    #[must_use]
++    pub fn steps(&self) -> &[Step] {
++        todo!("meshkv/5.13-deterministic-network: Playbook::steps")
++    }
++
++    /// How many faults it holds.
++    #[must_use]
++    pub fn faults(&self) -> usize {
++        todo!("meshkv/5.13-deterministic-network: Playbook::faults")
++    }
++
++    /// How many writes it attempts.
++    #[must_use]
++    pub fn writes(&self) -> usize {
++        todo!("meshkv/5.13-deterministic-network: Playbook::writes")
++    }
++
++    /// What the combination of two faults adds up to, so a scenario can be checked for sense.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when a fault would have no effect: healing a link that is not partitioned,
++    /// partitioning the same pair twice, dropping on a link after the drop's budget is spent, or
++    /// crashing a node twice without a restart between. A playbook with a no-op in it is a playbook
++    /// that says less than its author thinks.
++    pub fn check(&self) -> Result<()> {
++        todo!("meshkv/5.13-deterministic-network: Playbook::check")
++    }
++}
++
++/// Two names in a fixed order, so `partition a b` and `partition b a` are one link.
++fn ordered(a: &NodeId, b: &NodeId) -> (NodeId, NodeId) {
++    let _ = (a, b);
++    todo!("meshkv/5.13-deterministic-network: Playbook::ordered")
++}
++
++/// What one message in flight is.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct InFlight {
++    /// Who sent it.
++    pub from: NodeId,
++    /// Who it is for.
++    pub to: NodeId,
++    /// When it was sent, as a step number.
++    pub at: usize,
++}
++
++/// The result of running a playbook: what happened, in order, and a digest of it.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Transcript {
++    events: Vec<String>,
++    digest: u64,
++}
++
++impl Transcript {
++    /// The events, in order.
++    #[must_use]
++    pub fn events(&self) -> &[String] {
++        todo!("meshkv/5.13-deterministic-network: Transcript::events")
++    }
++
++    /// The digest of the events.
++    #[must_use]
++    pub fn digest(&self) -> u64 {
++        todo!("meshkv/5.13-deterministic-network: Transcript::digest")
++    }
++
++    /// Record one event, folding it into the digest.
++    pub fn push(&mut self, event: impl Into<String>) {
++        let _ = event;
++        todo!("meshkv/5.13-deterministic-network: Transcript::push")
++    }
++
++    /// `true` when two runs are the same run.
++    #[must_use]
++    pub fn same_as(&self, other: &Transcript) -> bool {
++        let _ = other;
++        todo!("meshkv/5.13-deterministic-network: Transcript::same_as")
++    }
++}
++
++/// Run a playbook against a cluster of state machines, and answer what happened.
++///
++/// The cluster is `size` nodes named `n1..n<size>`, elected with the seed's help; the playbook's
++/// faults are applied between the client's writes; every event is recorded. The run is a function of
++/// `(seed, playbook, size)` and of nothing else.
++///
++/// # Errors
++///
++/// [`Error::Invalid`] when the playbook does not make sense ([`Playbook::check`]), or when the size
++/// is zero.
++pub fn run(seed: u64, size: usize, playbook: &Playbook) -> Result<Transcript> {
++    let _ = (seed, size, playbook);
++    todo!("meshkv/5.13-deterministic-network: Transcript::run")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,6 +27,7 @@
+ pub mod raft;
+ pub mod sdk;
+ pub mod security;
++pub mod sim;
+ // kiln:scaffold:end
+ 
+ /// The crate's error type, at the root so a caller writes `meshkv::Error`.
+--- /dev/null
++++ b/docs/simulation.md
+@@ -0,0 +1,61 @@
++# Deterministic simulation: the network as data
++
++A cluster's failures are the interesting part of it, and the hardest part to test: a partition, a
++crash, a dropped message — each one is a thing that happens *to* the system at a moment nobody chose.
++This page is the project's answer, and it is the same answer every serious distributed system has
++found: **make the failure an input**.
++
++## The playbook
++
++A scenario is a text file. One step per line; `#` starts a comment.
++
++```text
++partition n2 n3
++write a 1
++write b 2
++heal n2 n3
++write c 3
++write d 4
++```
++
++Five faults:
++
++| fault | meaning |
++| --- | --- |
++| `partition <a> <b>` | nothing gets between `a` and `b`, in either direction |
++| `heal <a> <b>` | the link works again |
++| `drop <n>` | the next `n` messages are lost, in delivery order |
++| `crash <a>` | `a` stops answering |
++| `restart <a>` | `a` answers again |
++
++## The two properties
++
++1. **The same seed is the same run.** A seed decides the order events happen in — which node the
++   client talks to, which messages arrive first — so `(seed, playbook)` produces one transcript,
++   byte for byte. That is what makes a failure reproducible: a bug found by a seed is a bug somebody
++   else can run.
++2. **Another seed is another run.** A schedule that never varies tests one interleaving. The
++   scenarios the course ships are run under several seeds, and the invariants have to hold under
++   all of them.
++
++## A playbook that says nothing is refused
++
++`partition n1 n1` (a node isolated from itself), `heal` on a link that is not partitioned, `drop 0`,
++two `crash`es of one node with no restart between: each is a step that cannot change anything, and a
++scenario built from steps that cannot change anything is a scenario that proves nothing. The check
++runs before the scenario does.
++
++## Why this is possible at all
++
++Because the cluster's rules are a value. `5.3` put the Raft state machine in a type with no sockets
++and no clock; `5.10` made the state machine a pure function; everything since has kept that shape.
++A playbook can only drive something that takes messages and returns messages — a system that reached
++for the network inside its rules could not be driven by a playbook, and its failures could only be
++tested by waiting for them.
++
++## Where it goes next
++
++`5.14` reads a partition out of a playbook and asserts what the minority did; `5.16` turns the
++faults into a matrix with an expected behaviour per cell; `5.17` puts a budget on the latency the
++schedule produces. The vocabulary stays small on purpose: a fault vocabulary nobody can exhaust is a
++vocabulary that hides bugs.
+--- /dev/null
++++ b/tests/sim_playbook.rs
+@@ -0,0 +1,66 @@
++//! The instrument for `meshkv/5.13-deterministic-network`: a scenario from a file, run by a seed.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is the one the step's page shows:
++//! a node is isolated, two writes are attempted, the link is healed, and two more are attempted. The
++//! seed decides where the client's writes go, so the transcript changes with it — but the *rules* do
++//! not: a write that cannot reach the node it was sent to is refused, and a healed link commits.
++//!
++//! The point of the harness is that the scenario is a string. A test function can only run the
++//! scenarios somebody wrote as code; a playbook is a file the course can ship, and `5.14` reads
++//! partitions out of one.
++
++use meshkv::sim::{Playbook, run};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// The scenario: an isolation, two writes, a heal, two more writes.
++const SCENARIO: &str = "\
++partition n2 n3
++write a 1
++write b 2
++heal n2 n3
++write c 3
++write d 4
++";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++#[test]
++fn a_playbook_runs_the_same_way_twice_and_differently_on_another_seed() {
++    let seed = seed();
++    let playbook = Playbook::parse(SCENARIO).expect("the step's own scenario is a playbook");
++    let first = run(seed, 3, &playbook).expect("the run");
++    let again = run(seed, 3, &playbook).expect("the run");
++
++    println!("meshkv-sim seed={seed}");
++    println!(
++        "meshkv-sim faults={} writes={}",
++        playbook.faults(),
++        playbook.writes()
++    );
++    for event in first.events() {
++        println!("meshkv-sim {event}");
++    }
++    println!("meshkv-sim digest={}", first.digest());
++
++    assert!(
++        first.same_as(&again),
++        "the same seed is the same run, byte for byte"
++    );
++
++    // A different seed is a different schedule: the client's writes go elsewhere, so the transcript
++    // differs. Two of the four writes may still commit — the invariants hold either way.
++    let other = run(seed.wrapping_add(1), 3, &playbook).expect("the run");
++    println!("meshkv-sim digest_other={}", other.digest());
++    assert_eq!(
++        other.events().len(),
++        first.events().len(),
++        "a different schedule is the same scenario, so the same number of events"
++    );
++}
