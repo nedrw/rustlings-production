@@ -37,7 +37,7 @@ with stricter gates and fewer hints.
 | T2 | `relay` — webhook delivery service **delivered** | mid | 24 |
 | T3 | `jobq` — job queue engine (library + worker + CLI) **delivered** | mid-high | 27 |
 | T4 | `lakelet` — telemetry ingest and query **authored** | high | 24 |
-| T5 | `meskv` — distributed KV / scheduler (optional) | highest | 22 |
+| T5 | `meshkv` — distributed KV / scheduler (optional) **authored** | highest | 22 |
 
 ## Read next
 
@@ -160,7 +160,7 @@ which is why it is kept:
 python3 tools/lint-caps-md.py   # 97 capabilities, 119 steps, 136 (capability, depth) slots, 0 issues
 ```
 
-What is not in yet: T5 `meskv` content (T1–T4 are authored — `docs/t1-mailer.md`, `docs/t2-relay.md`,
-`docs/t3-jobq.md`, `docs/t4-lakelet.md`); translations (the fallback chain and the drift detector
-are ready, no locale has translated bodies); the `new-track` generator; a documentation site. See
-[docs/plan.md](docs/plan.md) §11.
+What is not in yet: M4's wrap-up (T5's probe pool and the acceptance runs — T1–T5's steps are all
+authored, `docs/t1-mailer.md` … `docs/t4-lakelet.md` record the first four tracks); translations (the
+fallback chain and the drift detector are ready, no locale has translated bodies); the `new-track`
+generator; a documentation site. See [docs/plan.md](docs/plan.md) §11.

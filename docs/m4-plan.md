@@ -1,5 +1,8 @@
 # M4 计划：T5 `meshkv`（22 步）+ 确定性分布式基建
 
+> **状态：T5 的 22 步已全部写成**（`kiln selftest --track meshkv` → 22/22 hold the contract）。
+> 剩余：探题（BP）与收尾（BV）。计划与施工记录见 [handoff-m4-log.md](handoff-m4-log.md) 段 1–11。
+>
 > 对着 [plan.md](plan.md) §11 的 M4 行写。结构沿用 [m3-plan.md](m3-plan.md)（§0–§10 同构）。
 > 决策点 §7 全部给出推荐与理由；按 M3 的先例，未在开工前被否决的推荐视为拍板。
 > 入口上下文：plan §3 D6（T5 是唯一允许跨 track `path` 依赖的例外）、curriculum.md §10（22 步）、
