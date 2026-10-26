@@ -260,3 +260,34 @@ $ kiln lint-caps → no issues      $ kiln links → every target resolves
 2. **元数据里的 `spec` 路径来自步骤名**（`5.6-lease-reads` → `spec/5.6/lease_reads.rs`，测试目标
    `spec_lease_reads`）。我按 `read.rs` 命名文件，`missing_content` 判成"还没写正文"，
    selftest 于是报 `0/0`——**`0/0 held` 这个输出本身就是"这一步还没被作者化"的信号**，要读它。
+
+## 段 7：5.7 客户端路由与重定向（B2 第二步）
+
+**5.7 做了什么**：`src/client.rs`（`Answer::{Served, Redirect, NoLeader}`、`Transport` trait、
+`Client`（跟随重定向、环路检测、跳数上限 `MAX_HOPS`、记住 leader）、`leader()`/`hops()`）、
+`Error::NotLeader { leader: Option<String> }`（跟随者拒绝写入时点名 leader）、`propose` 改为返回该错误。
+8 个规格用例。
+
+**原始结论行**：
+
+```
+$ kiln selftest --track meshkv
+7/7 step(s) hold the contract
+  ✓ 5.1 9/9 · 5.2 9/9 · 5.3 11/11 · 5.4 11/11 · 5.5 11/11 · 5.6 9/9 · 5.7 10/10
+```
+
+**这一段钉下来的五条**：
+
+1. **错误枚举里的 `use` 不能放在变体区**（`use` 是 item，不是变体）——脚手架一插就被编译器骂。
+   而"脚手架只能写进标记区"又意味着**不能**在文件头插 `use`。所以变体里带的是 `Option<String>`
+   （错误消息要的是名字，不是类型）；类型化的重定向在 `client.rs` 的 `Answer` 里。
+2. **改骨架就是改所有后续步骤的交付物**：给 `error.rs` 加标记区之后，5.1–5.6 的树都带着它，
+   `fmt` 门先红（我加的空行不符合 rustfmt）。**改骨架之后要把所有树同步并重跑整条轨道的 selftest**，
+   不能只看新步骤。
+3. **桩生成器会被字符串里的花括号骗**：`format!("{current}")` 里的 `{` 让朴素的括号计数失衡，
+   生成器把整个文件后半段吞进了桩里（第一版把 `Client` 结构体也吃掉了）。
+4. **桩生成器会跨过 trait 的方法声明**：`fn call(...);` 以 `;` 结尾、没有函数体，生成器继续往下找 `{`，
+   于是把下一个 item（一个结构体）当成了它的函数体。修法：签名以 `;` 结尾就跳过。
+5. **脚手架"只能写进标记区"这条规则会在你违反它时立刻抓住你**——本段第一次撞上它是在给 5.7 插
+   `use crate::cluster::NodeId;` 时，报错原话就是"outside a `kiln:scaffold:begin`/`kiln:scaffold:end`
+   block: scaffolds may only write inside marked regions (authoring.md §5)"。

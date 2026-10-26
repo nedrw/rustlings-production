@@ -1,0 +1,141 @@
+--- /dev/null
++++ b/src/client.rs
+@@ -0,0 +1,113 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Where a request goes, and how the answer gets back.
++//!
++//! `meshkv/5.7-client-routing` is the step where the cluster's *clients* meet the cluster's
++//! *rules*. A client does not know who the leader is, cannot be told, and often does not care —
++//! it knows an address. The question this step answers is what happens in between: the client asks
++//! the node it knows, the node says "I am not the leader, ask there", and the client goes there.
++//!
++//! Four things make that more than a `while let Some(leader)` loop, and each of them is a way a
++//! client in production goes wrong:
++//!
++//! * **the redirect has to name somebody.** "I am not the leader" without a name is a dead end; the
++//!   node that answers a redirect it does not know the answer to says *no leader* instead, and the
++//!   client stops — which is the honest answer while an election is running.
++//! * **a redirect cycle must not spin.** Two nodes that point at each other — which happens when
++//!   both believe the other is the leader — would send a client round for ever. The client
++//!   remembers where it has been.
++//! * **the number of hops has to be bounded.** Even without a cycle, a chain of redirects must end;
++//!   the bound is a number the client can state and a test can check.
++//! * **the leader the client found is worth remembering.** A client that just learned where the
++//!   leader is should ask there first next time, which is one line and the difference between one
++//!   round trip and two.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++
++/// How many redirects a client follows before it gives up.
++pub const MAX_HOPS: usize = 4;
++
++/// What a node answers a client's request with.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Answer {
++    /// The request was served; this is the value it produced.
++    Served {
++        /// The value the node answered with.
++        value: Vec<u8>,
++    },
++    /// This node is not the leader: ask that one.
++    Redirect {
++        /// The leader this node knows of.
++        leader: NodeId,
++    },
++    /// This node does not know who the leader is — an election is probably running.
++    NoLeader,
++}
++
++impl Answer {
++    /// `true` when the request was served.
++    #[must_use]
++    pub fn is_served(&self) -> bool {
++        todo!("meshkv/5.7-client-routing: Answer::is_served")
++    }
++}
++
++/// How a client reaches a node.
++///
++/// The trait is the seam: the harness drives it with a table of answers, and the daemon will
++/// implement it with a socket. A routing rule that cannot be tested without a network is a routing
++/// rule nobody tests.
++pub trait Transport {
++    /// Ask `node` to serve `request`, and answer what it said.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Network`] when the node could not be reached at all — a node that is *down* is a
++    /// different thing from a node that is *not the leader*, and the client has to tell them apart:
++    /// one is worth retrying, the other is worth redirecting.
++    fn call(&mut self, node: &NodeId, request: &[u8]) -> Result<Answer>;
++}
++
++/// A client that finds the leader by asking.
++#[derive(Debug, Clone, Default)]
++pub struct Client {
++    leader: Option<NodeId>,
++    hops: usize,
++}
++
++impl Client {
++    /// A client that does not know anything yet.
++    #[must_use]
++    pub fn new() -> Self {
++        todo!("meshkv/5.7-client-routing: Client::new")
++    }
++
++    /// The leader this client last saw, if it has seen one.
++    #[must_use]
++    pub fn leader(&self) -> Option<&NodeId> {
++        todo!("meshkv/5.7-client-routing: Client::leader")
++    }
++
++    /// How many redirects this client has followed.
++    #[must_use]
++    pub fn hops(&self) -> usize {
++        todo!("meshkv/5.7-client-routing: Client::hops")
++    }
++
++    /// Ask `node` to serve `request`, following redirects.
++    ///
++    /// The client asks the leader it remembers first, and only then the node it was given — a
++    /// client that has just learned where the leader is should not pay for the redirect again.
++    pub fn serve(
++        &mut self,
++        node: &NodeId,
++        request: &[u8],
++        transport: &mut impl Transport,
++    ) -> Result<Vec<u8>> {
++        let _ = (node, request, transport);
++        todo!("meshkv/5.7-client-routing: Client::serve")
++    }
++}
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -36,6 +36,12 @@
+     // The variants a later step adds are declared inside this block: a scaffold may only write
+     // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+     // kiln:scaffold:begin
++    /// This node is not the leader, and the client should ask that one instead.
++    #[error("not the leader: {}", leader.as_deref().unwrap_or("nobody knows"))]
++    NotLeader {
++        /// The name of the leader this node knows of, when it knows one.
++        leader: Option<String>,
++    },
+     // kiln:scaffold:end
+ }
+ 
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,7 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod client;
+ pub mod raft;
+ // kiln:scaffold:end
+ 

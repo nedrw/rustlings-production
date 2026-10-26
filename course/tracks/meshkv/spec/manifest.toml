@@ -12,3 +12,4 @@ format_version = 1
 "spec/5.4/snapshots.rs" = "sha256:35354f1be6619787975e79d889e14bf9c05fc7d6006044e513a12c47248eff0d"
 "spec/5.5/membership.rs" = "sha256:067da241f0652b6c0669f7aac5ce777494286025ab0377e4dfc4fc5ed60e8c8a"
 "spec/5.6/lease_reads.rs" = "sha256:98ceaee65bd44b3f96c677217c25b1463308ebabbe55f04e4382eebb269721bb"
+"spec/5.7/client_routing.rs" = "sha256:53c38622fd6b7cbca1427fa152938edb3391923528664baa9d62baf45b461d3b"

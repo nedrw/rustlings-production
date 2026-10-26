@@ -1,0 +1,120 @@
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Where a request goes, and how the answer gets back.
+ //!
+ //! `meshkv/5.7-client-routing` is the step where the cluster's *clients* meet the cluster's
+@@ -24,8 +20,10 @@
+ //!   leader is should ask there first next time, which is one line and the difference between one
+ //!   round trip and two.
+ 
++use std::collections::BTreeSet;
++
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ 
+ /// How many redirects a client follows before it gives up.
+ pub const MAX_HOPS: usize = 4;
+@@ -51,7 +49,7 @@
+     /// `true` when the request was served.
+     #[must_use]
+     pub fn is_served(&self) -> bool {
+-        todo!("meshkv/5.7-client-routing: Answer::is_served")
++        matches!(self, Self::Served { .. })
+     }
+ }
+ 
+@@ -82,32 +80,64 @@
+     /// A client that does not know anything yet.
+     #[must_use]
+     pub fn new() -> Self {
+-        todo!("meshkv/5.7-client-routing: Client::new")
++        Self::default()
+     }
+ 
+     /// The leader this client last saw, if it has seen one.
+     #[must_use]
+     pub fn leader(&self) -> Option<&NodeId> {
+-        todo!("meshkv/5.7-client-routing: Client::leader")
++        self.leader.as_ref()
+     }
+ 
+     /// How many redirects this client has followed.
+     #[must_use]
+     pub fn hops(&self) -> usize {
+-        todo!("meshkv/5.7-client-routing: Client::hops")
++        self.hops
+     }
+ 
+     /// Ask `node` to serve `request`, following redirects.
+     ///
+     /// The client asks the leader it remembers first, and only then the node it was given — a
+     /// client that has just learned where the leader is should not pay for the redirect again.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the redirects do not lead anywhere: a cycle, or more hops than
++    /// [`MAX_HOPS`]. A client that cannot reach a leader is told so rather than told to try again.
+     pub fn serve(
+         &mut self,
+         node: &NodeId,
+         request: &[u8],
+         transport: &mut impl Transport,
+     ) -> Result<Vec<u8>> {
+-        let _ = (node, request, transport);
+-        todo!("meshkv/5.7-client-routing: Client::serve")
++        let mut visited: BTreeSet<NodeId> = BTreeSet::new();
++        let mut current = self.leader.clone().unwrap_or_else(|| node.clone());
++        self.hops = 0;
++        loop {
++            if !visited.insert(current.clone()) {
++                return Err(Error::invalid(format!(
++                    "the redirects came back to `{current}`: the cluster is pointing at itself"
++                )));
++            }
++            let answer = transport.call(&current, request)?;
++            match answer {
++                Answer::Served { value } => return Ok(value),
++                Answer::Redirect { leader } => {
++                    self.hops += 1;
++                    if self.hops > MAX_HOPS {
++                        return Err(Error::invalid(format!(
++                            "more than {MAX_HOPS} redirects before the request was served"
++                        )));
++                    }
++                    self.leader = Some(leader.clone());
++                    current = leader;
++                }
++                Answer::NoLeader => {
++                    return Err(Error::invalid(
++                        "the node does not know who the leader is — an election is probably running",
++                    ));
++                }
++            }
++        }
+     }
+ }
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -349,11 +349,11 @@
+     /// the client has to be sent to the leader instead.
+     pub fn propose(&mut self, payload: Vec<u8>) -> Result<Index> {
+         if self.role != Role::Leader {
+-            return Err(Error::invalid(format!(
+-                "`{}` is a {}, not the leader — a write goes to the leader",
+-                self.id,
+-                self.role.as_str()
+-            )));
++            // The refusal names the leader, so a client that asked this node can be sent straight
++            // there instead of trying another node at random.
++            return Err(Error::NotLeader {
++                leader: self.leader().map(|leader| leader.as_str().to_owned()),
++            });
+         }
+         let index = self.log.len() as Index + 1;
+         let entry = Entry::with_payload(self.term, index, payload);

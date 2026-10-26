@@ -32,6 +32,10 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    // The variants a later step adds are declared inside this block: a scaffold may only write
+    // inside a `kiln:scaffold:begin`/`kiln:scaffold:end` region (docs/authoring.md §5).
+    // kiln:scaffold:begin
+    // kiln:scaffold:end
 }
 
 /// The crate's result type: everything answers with [`Error`].
