@@ -1,0 +1,265 @@
+--- /dev/null
++++ b/src/ring.rs
+@@ -0,0 +1,83 @@
++//! A hand-rolled ring buffer: `unsafe` where it pays, and the argument for every block.
++//!
++//! `meshkv/5.19-unsafe-deep-dive` is the one step of this track that is allowed to use `unsafe`. Up
++//! to here the crate denied it (`unsafe_code = "deny"` in the scaffold), and that was the right
++//! default: none of the previous steps needed it. This step needs it for one reason: a **bounded
++//! queue whose head and tail are read by a producer and a consumer on different threads** is the case
++//! where the safe version costs the thing a queue exists to save.
++//!
++//! The structure is a single-producer, single-consumer ring of `MaybeUninit<T>`, and it has exactly
++//! three unsafe obligations — initialisation, exclusive access, and dropping each value exactly once.
++//! Each is named where it is discharged, and each block says which one it rests on with a
++//! `// SAFETY:` note. The page (`docs/unsafe.md`) is the whole argument; this file is where it is
++//! carried out.
++//!
++//! The orderings are the part that is easy to get wrong and hard to see: the producer publishes a
++//! written slot with `Release`, the consumer observes it with `Acquire`, and the indices are
++//! `Relaxed` only where the value they order is not read. `loom` (the step's harness) is what turns
++//! that argument into a check. `miri` is not available on this course's pinned toolchain, and the
++//! page says so.
++
++#![allow(dead_code)] // the stub keeps the structure the implementation will fill; the reference
++// solution drops the allowance.
++
++use std::cell::UnsafeCell;
++use std::mem::MaybeUninit;
++use std::sync::atomic::AtomicUsize;
++
++/// A bounded single-producer, single-consumer queue.
++///
++/// The capacity is the number of slots and is fixed at construction. One producer and one consumer
++/// may use it concurrently; more than that is a misuse the type does not detect, and the page says
++/// so.
++pub struct Ring<T> {
++    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
++    head: AtomicUsize,
++    tail: AtomicUsize,
++}
++
++impl<T> Ring<T> {
++    /// A queue of `capacity` slots.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the capacity is zero: a queue with no slot can never hold anything.
++    pub fn new(capacity: usize) -> crate::error::Result<Self> {
++        let _ = capacity;
++        todo!("meshkv/5.19-unsafe-deep-dive: Ring::new")
++    }
++
++    /// How many slots the queue has.
++    #[must_use]
++    pub fn capacity(&self) -> usize {
++        self.slots.len()
++    }
++
++    /// How many values it holds. A hint: the number is read from two atomics, so it is a snapshot.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        todo!("meshkv/5.19-unsafe-deep-dive: Ring::len")
++    }
++
++    /// `true` when it holds nothing, according to the same snapshot.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        todo!("meshkv/5.19-unsafe-deep-dive: Ring::is_empty")
++    }
++
++    /// Push `value`, or refuse it when the queue is full.
++    ///
++    /// # Errors
++    ///
++    /// The value itself, handed back, when every slot is taken: a queue that dropped it would have
++    /// decided something the caller did not.
++    pub fn push(&self, value: T) -> std::result::Result<(), T> {
++        let _ = value;
++        todo!("meshkv/5.19-unsafe-deep-dive: Ring::push")
++    }
++
++    /// Pop the oldest value, if there is one.
++    pub fn pop(&self) -> Option<T> {
++        todo!("meshkv/5.19-unsafe-deep-dive: Ring::pop")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,6 +30,7 @@
+ pub mod metrics;
+ pub mod raft;
+ pub mod restart;
++pub mod ring;
+ pub mod sdk;
+ pub mod security;
+ pub mod sim;
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,6 +28,10 @@
+ # The simulator the step's own harness runs on: a virtual clock and a virtual network, so a
+ # schedule is a seed and not a race.
+ turmoil = "0.7.2"
++# The model checker `meshkv/5.19-unsafe-deep-dive` runs its orderings under: it explores every
++# interleaving of a small program, which is the only way to check a Release/Acquire pair without
++# waiting for a bug to happen on a real machine.
++loom = "0.7"
+ # kiln:scaffold:end
+ 
+ # This crate's own lint policy. `unsafe_code = "deny"` is here from the first step rather than from
+--- /dev/null
++++ b/docs/unsafe.md
+@@ -0,0 +1,46 @@
++# A hand-rolled structure, and the three obligations of `unsafe`
++
++Every step before this one denied `unsafe` — `unsafe_code = "deny"` stood in the manifest from `5.1`,
++and none of them needed it. This step needs it for one structure, and the point of the step is that a
++structure which needs it can **argue** for it: three obligations, each one named, each one checked.
++
++## The structure
++
++A bounded, single-producer single-consumer ring of `MaybeUninit<T>`. It exists because a queue's whole
++job is to avoid the cost of a lock on the path between two threads, and a safe version either locks or
++allocates per message. The ring does neither: two atomics and a slot array.
++
++## The three obligations
++
++1. **Initialisation.** A slot is uninitialised until a `push` writes it. Reading a slot nobody wrote is
++   the bug `MaybeUninit` exists to prevent, and the queue's invariant is what makes every read sound:
++   the producer writes at `tail % capacity`, the consumer reads at `head % capacity`, and
++   `head <= tail` says the slot was written before it is read.
++2. **Exclusive access.** The producer's write and the consumer's read touch different slots *by the
++   index arithmetic*, and the indices are atomics with the right orderings: `Release` when an index is
++   published, `Acquire` when it is observed. That ordering pair is the entire synchronisation — there
++   is no lock, which is the point, and there is no fence, which is luck: the pair is what the argument
++   uses.
++3. **Drop exactly once.** A value in the ring when it is dropped has to be dropped once: the `Drop`
++   impl drops the slots between `head` and `tail`, and nothing else. Dropping twice is worse than
++   leaking, and dropping nothing is a leak nobody sees until the queue is busy.
++
++Each block carries a `// SAFETY:` note saying which obligation it rests on — the gate
++(`unsafe-budget@5`) counts the blocks and requires the notes, which is why the number in the metadata
++is the number of blocks here.
++
++## What checks it
++
++- **`loom`** runs every interleaving of the index protocol, in two models: a value published with
++  `Release` is seen once with `Acquire`, and a slot is not reused before the consumer has moved `head`
++  past it. That is the part of the argument a test can hold.
++- **`miri` is not available** on this course's pinned toolchain (`1.98.1-aarch64` has no `miri`
++  component — handoff M4 §1). The step says so rather than pretending: loom plus the written argument
++  is the evidence it has, and the page names what is missing.
++
++## What the gate counts
++
++`unsafe-budget@5` allows five occurrences of the word `unsafe` in production code, requires a
++`// SAFETY:` note within three lines above each, and — because the budget is no longer zero — does not
++require the manifest to deny `unsafe_code`. The step's own manifest drops the deny, and the comment
++where it stood says which step argued for that and why.
+--- /dev/null
++++ b/tests/loom_ring.rs
+@@ -0,0 +1,104 @@
++//! The instrument for `meshkv/5.19-unsafe-deep-dive`: the orderings, checked exhaustively.
++//!
++//! Course content, shipped by the step's scaffold. `loom` runs every interleaving of a small program
++//! under a model scheduler, which is the only way to check a `Release`/`Acquire` pair without waiting
++//! for a bug to happen on a real machine.
++//!
++//! The model here is the ring's *algorithm* — two atomics and a slot published between them — written
++//! against loom's atomics, because that is what a loom check needs: the std atomics the crate uses
++//! cannot be told what to explore. The page says so; the property checked is the one the ring's
++//! argument claims: a value pushed before a pop is never lost, and a value is never seen twice.
++
++use loom::sync::Arc;
++use loom::sync::atomic::{AtomicUsize, Ordering};
++
++/// The ring's index protocol, with one slot: a producer writes a slot then publishes `tail`; a
++/// consumer reads `tail`, takes the slot, then moves `head`.
++struct Slot {
++    value: AtomicUsize,
++    head: AtomicUsize,
++    tail: AtomicUsize,
++}
++
++#[test]
++fn a_value_published_with_release_is_seen_once_with_acquire() {
++    loom::model(|| {
++        let slot = Arc::new(Slot {
++            value: AtomicUsize::new(0),
++            head: AtomicUsize::new(0),
++            tail: AtomicUsize::new(0),
++        });
++
++        let producer = {
++            let slot = Arc::clone(&slot);
++            loom::thread::spawn(move || {
++                slot.value.store(42, Ordering::Relaxed);
++                // Publishing the index is what makes the value visible.
++                slot.tail.store(1, Ordering::Release);
++            })
++        };
++        let consumer = {
++            let slot = Arc::clone(&slot);
++            loom::thread::spawn(move || {
++                if slot.tail.load(Ordering::Acquire) == 1 {
++                    // The value must be the published one: a missing Release here would let loom
++                    // find the interleaving where this reads zero.
++                    assert_eq!(slot.value.load(Ordering::Relaxed), 42);
++                    slot.head.store(1, Ordering::Release);
++                }
++            })
++        };
++
++        producer.join().expect("the producer ran");
++        consumer.join().expect("the consumer ran");
++    });
++}
++
++#[test]
++fn a_slot_is_not_reused_before_the_consumer_is_done_with_it() {
++    // The ring's other obligation: the producer may reuse a slot only after the consumer has moved
++    // `head` past it. The model runs the two phases and checks that the sequence is the one the
++    // indices allow — no reuse while `head` still points at the slot.
++    loom::model(|| {
++        let slot = Arc::new(Slot {
++            value: AtomicUsize::new(0),
++            head: AtomicUsize::new(0),
++            tail: AtomicUsize::new(0),
++        });
++
++        let producer = {
++            let slot = Arc::clone(&slot);
++            loom::thread::spawn(move || {
++                slot.value.store(1, Ordering::Relaxed);
++                slot.tail.store(1, Ordering::Release);
++                // Wait for the consumer to release the slot before reusing it.
++                while slot.head.load(Ordering::Acquire) == 0 {
++                    loom::hint::spin_loop();
++                }
++                slot.value.store(2, Ordering::Relaxed);
++                slot.tail.store(2, Ordering::Release);
++            })
++        };
++        let consumer = {
++            let slot = Arc::clone(&slot);
++            loom::thread::spawn(move || {
++                while slot.tail.load(Ordering::Acquire) == 0 {
++                    loom::hint::spin_loop();
++                }
++                assert_eq!(slot.value.load(Ordering::Relaxed), 1, "the first value");
++                slot.head.store(1, Ordering::Release);
++                while slot.tail.load(Ordering::Acquire) < 2 {
++                    loom::hint::spin_loop();
++                }
++                assert_eq!(
++                    slot.value.load(Ordering::Relaxed),
++                    2,
++                    "and the reuse is visible"
++                );
++            })
++        };
++
++        producer.join().expect("the producer ran");
++        consumer.join().expect("the consumer ran");
++    });
++}

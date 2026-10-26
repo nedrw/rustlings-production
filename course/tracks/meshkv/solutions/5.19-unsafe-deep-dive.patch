@@ -1,0 +1,192 @@
+--- a/src/ring.rs
++++ b/src/ring.rs
+@@ -2,28 +2,37 @@
+ //!
+ //! `meshkv/5.19-unsafe-deep-dive` is the one step of this track that is allowed to use `unsafe`. Up
+ //! to here the crate denied it (`unsafe_code = "deny"` in the scaffold), and that was the right
+-//! default: none of the previous steps needed it. This step needs it for one reason: a **bounded
+-//! queue whose head and tail are read by a producer and a consumer on different threads** is the case
+-//! where the safe version costs the thing a queue exists to save.
++//! default: none of the previous steps needed it. This step needs it for one reason, and the page
++//! argues it: a **bounded queue whose head and tail are read by a producer and a consumer on
++//! different threads** is the case where the safe version costs the thing a queue exists to save.
+ //!
+-//! The structure is a single-producer, single-consumer ring of `MaybeUninit<T>`, and it has exactly
+-//! three unsafe obligations — initialisation, exclusive access, and dropping each value exactly once.
+-//! Each is named where it is discharged, and each block says which one it rests on with a
+-//! `// SAFETY:` note. The page (`docs/unsafe.md`) is the whole argument; this file is where it is
+-//! carried out.
++//! The structure here is a single-producer, single-consumer ring of `MaybeUninit<T>`, and it is the
++//! classic exercise for a reason: it has exactly three unsafe obligations, and a learner who can
++//! name them has understood what `unsafe` is for.
+ //!
++//! 1. **Initialisation.** A slot is `MaybeUninit` until it is written. Reading a slot that was never
++//!    written is the bug the type exists to prevent; the invariant of the queue — the producer only
++//!    writes at `tail % capacity`, the consumer only reads at `head % capacity`, and `head <= tail` —
++//!    is what makes every read of a written slot sound.
++//! 2. **Exclusive access.** The producer's write and the consumer's read touch different slots *by
++//!    the index arithmetic*, and the indices are `AtomicUsize` with the right orderings. That is the
++//!    whole synchronisation; there is no lock, which is the point.
++//! 3. **Drop.** A value that is in the ring when it is dropped has to be dropped exactly once: the
++//!    `Drop` impl drops the slots between `head` and `tail` and nothing else. Dropping twice is worse
++//!    than leaking, and dropping nothing is a leak nobody sees until the queue is busy.
++//!
+ //! The orderings are the part that is easy to get wrong and hard to see: the producer publishes a
+ //! written slot with `Release`, the consumer observes it with `Acquire`, and the indices are
+-//! `Relaxed` only where the value they order is not read. `loom` (the step's harness) is what turns
+-//! that argument into a check. `miri` is not available on this course's pinned toolchain, and the
+-//! page says so.
++//! `Relaxed` only where the value they order is not read (the `len` hint, which is allowed to be
++//! stale). The loom test in the step's harness is what turns that argument into a check.
++//!
++//! `miri` is not available on this course's pinned toolchain (handoff M4 §1), so the step's evidence
++//! is loom plus this argument. The page says so; the tool's absence is recorded rather than papered
++//! over, and the check that *can* run is the one the step leans on.
+ 
+-#![allow(dead_code)] // the stub keeps the structure the implementation will fill; the reference
+-// solution drops the allowance.
+-
+ use std::cell::UnsafeCell;
+ use std::mem::MaybeUninit;
+-use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ /// A bounded single-producer, single-consumer queue.
+ ///
+@@ -36,15 +45,35 @@
+     tail: AtomicUsize,
+ }
+ 
++// SAFETY: values cross threads through `push`/`pop` only, and `T: Send` is the bound that makes
++// that sound; the queue owns every slot until it hands one out.
++unsafe impl<T: Send> Send for Ring<T> {}
++// SAFETY: the two threads never alias a written slot — the index arithmetic partitions the slots
++// between them, and the `Accept`/`Release` pair orders the handover.
++unsafe impl<T: Send> Sync for Ring<T> {}
++
+ impl<T> Ring<T> {
+     /// A queue of `capacity` slots.
+     ///
+     /// # Errors
+     ///
+-    /// [`Error::Invalid`] when the capacity is zero: a queue with no slot can never hold anything.
++    /// [`Error::Invalid`] when the capacity is zero: a queue with no slot can never hold anything,
++    /// and every push would be a refusal the caller could have been told about once.
+     pub fn new(capacity: usize) -> crate::error::Result<Self> {
+-        let _ = capacity;
+-        todo!("meshkv/5.19-unsafe-deep-dive: Ring::new")
++        if capacity == 0 {
++            return Err(crate::error::Error::invalid(
++                "a ring with no slots can never hold anything",
++            ));
++        }
++        let mut slots = Vec::with_capacity(capacity);
++        for _ in 0..capacity {
++            slots.push(UnsafeCell::new(MaybeUninit::uninit()));
++        }
++        Ok(Self {
++            slots: slots.into_boxed_slice(),
++            head: AtomicUsize::new(0),
++            tail: AtomicUsize::new(0),
++        })
+     }
+ 
+     /// How many slots the queue has.
+@@ -56,28 +85,70 @@
+     /// How many values it holds. A hint: the number is read from two atomics, so it is a snapshot.
+     #[must_use]
+     pub fn len(&self) -> usize {
+-        todo!("meshkv/5.19-unsafe-deep-dive: Ring::len")
++        self.tail.load(Ordering::Relaxed) - self.head.load(Ordering::Relaxed)
+     }
+ 
+     /// `true` when it holds nothing, according to the same snapshot.
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        todo!("meshkv/5.19-unsafe-deep-dive: Ring::is_empty")
++        self.len() == 0
+     }
+ 
+     /// Push `value`, or refuse it when the queue is full.
+     ///
+     /// # Errors
+     ///
+-    /// The value itself, handed back, when every slot is taken: a queue that dropped it would have
+-    /// decided something the caller did not.
++    /// [`Error::Full`] when every slot is taken. The refusal carries the value back, because a queue
++    /// that drops it has decided something the caller did not.
+     pub fn push(&self, value: T) -> std::result::Result<(), T> {
+-        let _ = value;
+-        todo!("meshkv/5.19-unsafe-deep-dive: Ring::push")
++        let tail = self.tail.load(Ordering::Relaxed);
++        let head = self.head.load(Ordering::Acquire);
++        if tail - head == self.capacity() {
++            return Err(value);
++        }
++        let Some(slot) = self.slots.get(tail % self.capacity()) else {
++            return Err(value);
++        };
++        // SAFETY: the producer is the only writer of `tail`; the slot was left uninitialised and the
++        // consumer has not reached it (`tail - head < capacity`).
++        unsafe {
++            (*slot.get()).write(value);
++        }
++        // The consumer may now see the value: everything above must happen before this store.
++        self.tail.store(tail + 1, Ordering::Release);
++        Ok(())
+     }
+ 
+     /// Pop the oldest value, if there is one.
+     pub fn pop(&self) -> Option<T> {
+-        todo!("meshkv/5.19-unsafe-deep-dive: Ring::pop")
++        let head = self.head.load(Ordering::Relaxed);
++        let tail = self.tail.load(Ordering::Acquire);
++        if head == tail {
++            return None;
++        }
++        let slot = self.slots.get(head % self.capacity())?;
++        // SAFETY: the consumer is the only reader of `head`; `head < tail` says the slot was written
++        // before `tail` was published, and no other reader exists.
++        let value = unsafe { (*slot.get()).assume_init_read() };
++        // The producer may reuse the slot: the read above must happen before this store.
++        self.head.store(head + 1, Ordering::Release);
++        Some(value)
+     }
+ }
++
++impl<T> Drop for Ring<T> {
++    fn drop(&mut self) {
++        let head = *self.head.get_mut();
++        let tail = *self.tail.get_mut();
++        for index in head..tail {
++            let Some(slot) = self.slots.get(index % self.slots.len()) else {
++                continue;
++            };
++            // SAFETY: the slots between `head` and `tail` are exactly the initialised ones, each
++            // dropped once here and nowhere else.
++            unsafe {
++                (*slot.get()).assume_init_drop();
++            }
++        }
++    }
++}
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,13 +34,12 @@
+ loom = "0.7"
+ # kiln:scaffold:end
+ 
+-# This crate's own lint policy. `unsafe_code = "deny"` is here from the first step rather than from
+-# the step that first needs `unsafe` (that is `meshkv/5.19`, and it argues for its own budget): the
+-# compiler holds the line while nothing needs to cross it, and `unsafe-budget@0` is one of this
+-# track's persistent gates.
++# This crate's own lint policy. `unsafe_code = "deny"` held from the first step until
++# `meshkv/5.19-unsafe-deep-dive`, which is the one step that argues for a budget instead: the ring
++# buffer's three `unsafe` obligations are the argument, and `unsafe-budget@5` is the gate that keeps
++# the count honest from there on.
+ [lints.rust]
+ # kiln:scaffold:begin
+-unsafe_code = "deny"
+ # kiln:scaffold:end
+ 
+ # This project is its own workspace, so it never picks up the course's settings (docs/plan.md §3 D6).
