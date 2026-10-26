@@ -9,7 +9,7 @@
  
  /// A position in the log: one-based, monotonic, never reused.
  pub type Index = u64;
-@@ -23,25 +23,25 @@
+@@ -23,26 +23,25 @@
      /// The term a brand-new node starts in.
      #[must_use]
      pub fn zero() -> Self {
@@ -20,6 +20,7 @@
      /// A term as it is written in a log or on the wire.
      #[must_use]
      pub fn new(number: u64) -> Self {
+-        let _ = number;
 -        todo!("meshkv/5.2-replication-rules: Term::new")
 +        Self(number)
      }
@@ -39,25 +40,52 @@
      }
  }
  
-@@ -58,7 +58,7 @@
-     /// An entry proposed in `term` at `index`.
+@@ -62,8 +61,11 @@
+     /// An entry proposed in `term` at `index`, carrying nothing.
      #[must_use]
      pub fn new(term: Term, index: Index) -> Self {
+-        let _ = (term, index);
 -        todo!("meshkv/5.2-replication-rules: Entry::new")
-+        Self { term, index }
++        Self {
++            term,
++            index,
++            payload: Vec::new(),
++        }
+     }
+ 
+     /// An entry that carries `payload` — the write a client asked for.
+@@ -72,14 +74,17 @@
+     /// *which term* proposed it, never about what is inside it.
+     #[must_use]
+     pub fn with_payload(term: Term, index: Index, payload: Vec<u8>) -> Self {
+-        let _ = (term, index, payload);
+-        todo!("meshkv/5.2-replication-rules: Entry::with_payload")
++        Self {
++            term,
++            index,
++            payload,
++        }
+     }
+ 
+     /// What the entry carries.
+     #[must_use]
+     pub fn payload(&self) -> &[u8] {
+-        todo!("meshkv/5.2-replication-rules: Entry::payload")
++        &self.payload
      }
  }
  
-@@ -75,7 +75,7 @@
+@@ -96,8 +101,7 @@
      /// The quorum of a cluster of `size` nodes.
      #[must_use]
      pub fn of(size: usize) -> Self {
+-        let _ = size;
 -        todo!("meshkv/5.2-replication-rules: Quorum::of")
 +        Self { size }
      }
  
      /// How many nodes a majority is: `size / 2 + 1`.
-@@ -84,13 +84,13 @@
+@@ -106,14 +110,13 @@
      /// commits nothing, which is the honest answer rather than a panic.
      #[must_use]
      pub fn majority(&self) -> usize {
@@ -68,12 +96,13 @@
      /// `true` when `acknowledgements` nodes hold the entry.
      #[must_use]
      pub fn is_met(&self, acknowledgements: usize) -> bool {
+-        let _ = acknowledgements;
 -        todo!("meshkv/5.2-replication-rules: Quorum::is_met")
 +        acknowledgements >= self.majority()
      }
  }
  
-@@ -108,31 +108,33 @@
+@@ -131,32 +134,33 @@
      /// An empty log.
      #[must_use]
      pub fn new() -> Self {
@@ -105,6 +134,7 @@
      /// The entry at `index`, one-based.
      #[must_use]
      pub fn at(&self, index: Index) -> Option<&Entry> {
+-        let _ = index;
 -        todo!("meshkv/5.2-replication-rules: Log::at")
 +        let position = index.checked_sub(1)?;
 +        let position = usize::try_from(position).ok()?;
@@ -112,10 +142,11 @@
      }
  
      /// Append an entry that belongs next, or refuse it and say why.
-@@ -142,7 +144,26 @@
+@@ -166,8 +170,26 @@
      /// [`Error::Protocol`] when the entry's index is not `len() + 1` (a gap or a duplicate), or its
      /// term is older than the log's last term.
      pub fn append(&mut self, entry: Entry) -> Result<()> {
+-        let _ = entry;
 -        todo!("meshkv/5.2-replication-rules: Log::append")
 +        let expected = self.entries.len() as Index + 1;
 +        if entry.index != expected {
@@ -140,10 +171,11 @@
      }
  
      /// Drop everything from `index` onwards, and answer how many entries went.
-@@ -150,7 +171,18 @@
+@@ -175,8 +197,18 @@
      /// This is what a follower does when a leader's log disagrees with its own: the suffix from the
      /// first mismatch is replaced, never merged.
      pub fn truncate_from(&mut self, index: Index) -> usize {
+-        let _ = index;
 -        todo!("meshkv/5.2-replication-rules: Log::truncate_from")
 +        let Some(position) = index.checked_sub(1) else {
 +            return 0;
@@ -160,58 +192,6 @@
      }
  }
  
-@@ -170,14 +202,19 @@
-     acknowledgements: usize,
-     quorum: Quorum,
- ) -> bool {
--    todo!("meshkv/5.2-replication-rules: committable")
-+    entry.term == current_term && quorum.is_met(acknowledgements)
- }
- 
- /// The four rules the project's page has to name, in order.
- ///
- /// The spec compares these strings against `docs/consensus.md`: a page that drifts from the rules
- /// the code relies on is the exact failure this step is about, in documentation form.
--pub const RULES: [&str; 4] = ["TODO", "TODO", "TODO", "TODO"];
-+pub const RULES: [&str; 4] = [
-+    "a write is an entry: a term and a position",
-+    "a log is a prefix: no gaps, and no term going backwards",
-+    "a majority decides: more than half of the nodes hold it",
-+    "only an entry of the current term commits",
-+];
- 
- /// One failure the protocol has to be designed against, and what it must do instead.
- #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -189,7 +226,25 @@
- }
- 
- /// The catalogue the page's table has to match, row for row.
--pub const FAILURES: [Failure; 5] = [Failure {
--    scenario: "TODO",
--    expected: "TODO",
--}; 5];
-+pub const FAILURES: [Failure; 5] = [
-+    Failure {
-+        scenario: "the leader dies mid-append",
-+        expected: "the next leader wins with a higher term, and the entry is either on a majority and commits, or is not and is dropped",
-+    },
-+    Failure {
-+        scenario: "two nodes claim one term",
-+        expected: "each needs a majority, majorities intersect, so one sees the other's higher term and steps down",
-+    },
-+    Failure {
-+        scenario: "a follower's log diverges",
-+        expected: "the leader overwrites the suffix from the first mismatching index; a committed entry never mismatches",
-+    },
-+    Failure {
-+        scenario: "a message arrives late, from an old term",
-+        expected: "it is refused by its term before its content is read",
-+    },
-+    Failure {
-+        scenario: "a majority is unreachable",
-+        expected: "nothing commits: the cluster stops rather than half-writing",
-+    },
-+];
 --- a/docs/consensus.md
 +++ b/docs/consensus.md
 @@ -1,23 +1,40 @@

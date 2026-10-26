@@ -10,7 +10,7 @@
  /// The crate's error type, at the root so a caller writes `meshkv::Error`.
 --- /dev/null
 +++ b/src/raft/mod.rs
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,250 @@
 +//! The rules of the log, as values: terms, entries, a majority, and when an entry may be called
 +//! committed.
 +//!
@@ -42,6 +42,7 @@
 +    /// A term as it is written in a log or on the wire.
 +    #[must_use]
 +    pub fn new(number: u64) -> Self {
++        let _ = number;
 +        todo!("meshkv/5.2-replication-rules: Term::new")
 +    }
 +
@@ -58,20 +59,40 @@
 +    }
 +}
 +
-+/// One write, as the log keeps it: the term that proposed it, and where it sits.
++/// One write, as the log keeps it: the term that proposed it, where it sits, and what it carries.
 +#[derive(Debug, Clone, PartialEq, Eq)]
 +pub struct Entry {
 +    /// The term of the leader that proposed it.
 +    pub term: Term,
 +    /// Its position, one-based.
 +    pub index: Index,
++    /// What the write itself is. Empty in this step: the rules of the log say nothing about what
++    /// an entry carries, and `5.3` is where a replicated write finally has a payload.
++    payload: Vec<u8>,
 +}
 +
 +impl Entry {
-+    /// An entry proposed in `term` at `index`.
++    /// An entry proposed in `term` at `index`, carrying nothing.
 +    #[must_use]
 +    pub fn new(term: Term, index: Index) -> Self {
++        let _ = (term, index);
 +        todo!("meshkv/5.2-replication-rules: Entry::new")
++    }
++
++    /// An entry that carries `payload` — the write a client asked for.
++    ///
++    /// The payload is opaque here on purpose: the log's rules are about *where* an entry sits and
++    /// *which term* proposed it, never about what is inside it.
++    #[must_use]
++    pub fn with_payload(term: Term, index: Index, payload: Vec<u8>) -> Self {
++        let _ = (term, index, payload);
++        todo!("meshkv/5.2-replication-rules: Entry::with_payload")
++    }
++
++    /// What the entry carries.
++    #[must_use]
++    pub fn payload(&self) -> &[u8] {
++        todo!("meshkv/5.2-replication-rules: Entry::payload")
 +    }
 +}
 +
@@ -88,6 +109,7 @@
 +    /// The quorum of a cluster of `size` nodes.
 +    #[must_use]
 +    pub fn of(size: usize) -> Self {
++        let _ = size;
 +        todo!("meshkv/5.2-replication-rules: Quorum::of")
 +    }
 +
@@ -103,6 +125,7 @@
 +    /// `true` when `acknowledgements` nodes hold the entry.
 +    #[must_use]
 +    pub fn is_met(&self, acknowledgements: usize) -> bool {
++        let _ = acknowledgements;
 +        todo!("meshkv/5.2-replication-rules: Quorum::is_met")
 +    }
 +}
@@ -145,6 +168,7 @@
 +    /// The entry at `index`, one-based.
 +    #[must_use]
 +    pub fn at(&self, index: Index) -> Option<&Entry> {
++        let _ = index;
 +        todo!("meshkv/5.2-replication-rules: Log::at")
 +    }
 +
@@ -155,6 +179,7 @@
 +    /// [`Error::Protocol`] when the entry's index is not `len() + 1` (a gap or a duplicate), or its
 +    /// term is older than the log's last term.
 +    pub fn append(&mut self, entry: Entry) -> Result<()> {
++        let _ = entry;
 +        todo!("meshkv/5.2-replication-rules: Log::append")
 +    }
 +
@@ -163,6 +188,7 @@
 +    /// This is what a follower does when a leader's log disagrees with its own: the suffix from the
 +    /// first mismatch is replaced, never merged.
 +    pub fn truncate_from(&mut self, index: Index) -> usize {
++        let _ = index;
 +        todo!("meshkv/5.2-replication-rules: Log::truncate_from")
 +    }
 +}
@@ -183,14 +209,19 @@
 +    acknowledgements: usize,
 +    quorum: Quorum,
 +) -> bool {
-+    todo!("meshkv/5.2-replication-rules: committable")
++    entry.term == current_term && quorum.is_met(acknowledgements)
 +}
 +
 +/// The four rules the project's page has to name, in order.
 +///
 +/// The spec compares these strings against `docs/consensus.md`: a page that drifts from the rules
 +/// the code relies on is the exact failure this step is about, in documentation form.
-+pub const RULES: [&str; 4] = ["TODO", "TODO", "TODO", "TODO"];
++pub const RULES: [&str; 4] = [
++    "a write is an entry: a term and a position",
++    "a log is a prefix: no gaps, and no term going backwards",
++    "a majority decides: more than half of the nodes hold it",
++    "only an entry of the current term commits",
++];
 +
 +/// One failure the protocol has to be designed against, and what it must do instead.
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,10 +233,34 @@
 +}
 +
 +/// The catalogue the page's table has to match, row for row.
-+pub const FAILURES: [Failure; 5] = [Failure {
-+    scenario: "TODO",
-+    expected: "TODO",
-+}; 5];
++pub const FAILURES: [Failure; 5] = [
++    Failure {
++        scenario: "the leader dies mid-append",
++        expected: "the next leader wins with a higher term, and the entry is either on a majority and commits, or is not and is dropped",
++    },
++    Failure {
++        scenario: "two nodes claim one term",
++        expected: "each needs a majority, majorities intersect, so one sees the other's higher term and steps down",
++    },
++    Failure {
++        scenario: "a follower's log diverges",
++        expected: "the leader overwrites the suffix from the first mismatching index; a committed entry never mismatches",
++    },
++    Failure {
++        scenario: "a message arrives late, from an old term",
++        expected: "it is refused by its term before its content is read",
++    },
++    Failure {
++        scenario: "a majority is unreachable",
++        expected: "nothing commits: the cluster stops rather than half-writing",
++    },
++];
++
++// The modules a later step adds are declared inside this block: a scaffold may only write inside a
++// `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
++// (docs/authoring.md §5).
++// kiln:scaffold:begin
++// kiln:scaffold:end
 --- /dev/null
 +++ b/docs/consensus.md
 @@ -0,0 +1,23 @@

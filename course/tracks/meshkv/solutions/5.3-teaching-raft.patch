@@ -1,0 +1,713 @@
+--- a/src/raft/message.rs
++++ b/src/raft/message.rs
+@@ -1,6 +1,3 @@
+-#![allow(dead_code)] // the stub keeps the helpers the implementation will use; the reference
+-                      // solution drops the allowance, because by then every one of them is used.
+-
+ //! What two nodes say to each other, and how a line of text carries it.
+ //!
+ //! `meshkv/5.3-teaching-raft` is the step where the log of `5.2` starts moving. The messages are
+@@ -22,7 +19,7 @@
+ //! where the entries are.
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::{Entry, Index, Term};
+ 
+ /// Where a node's log ends: the term of its last entry and that entry's position.
+@@ -41,7 +38,10 @@
+     /// The end of an empty log.
+     #[must_use]
+     pub fn empty() -> Self {
+-        todo!("meshkv/5.3-teaching-raft: LogPosition::empty")
++        Self {
++            term: Term::zero(),
++            index: 0,
++        }
+     }
+ 
+     /// `true` when this position is at least as far along as `other` — the comparison a candidate
+@@ -51,8 +51,7 @@
+     /// fewer entries from a newer term, and that is the rule that keeps a committed entry safe.
+     #[must_use]
+     pub fn is_at_least(&self, other: &LogPosition) -> bool {
+-        let _ = other;
+-        todo!("meshkv/5.3-teaching-raft: LogPosition::is_at_least")
++        (self.term, self.index) >= (other.term, other.index)
+     }
+ }
+ 
+@@ -103,13 +102,69 @@
+     /// The term this message belongs to.
+     #[must_use]
+     pub fn term(&self) -> Term {
+-        todo!("meshkv/5.3-teaching-raft: Message::term")
++        match self {
++            Self::RequestVote { term, .. }
++            | Self::Vote { term, .. }
++            | Self::Append { term, .. }
++            | Self::AppendAck { term, .. } => *term,
++        }
+     }
+ 
+     /// The message as one line of text, without the line ending.
+     #[must_use]
+     pub fn encode(&self) -> String {
+-        todo!("meshkv/5.3-teaching-raft: Message::encode")
++        match self {
++            Self::RequestVote {
++                term,
++                candidate,
++                last,
++            } => format!(
++                "vote {} {} {} {}",
++                term.get(),
++                candidate,
++                last.term.get(),
++                last.index
++            ),
++            Self::Vote { term, granted } => {
++                format!("vote-reply {} {}", term.get(), u8::from(*granted))
++            }
++            Self::Append {
++                term,
++                leader,
++                prev,
++                entries,
++                commit,
++            } => {
++                let mut line = format!(
++                    "append {} {} {} {} {} {}",
++                    term.get(),
++                    leader,
++                    prev.term.get(),
++                    prev.index,
++                    commit,
++                    entries.len()
++                );
++                for entry in entries {
++                    line.push_str(&format!(
++                        " {}:{}:{}",
++                        entry.term.get(),
++                        entry.index,
++                        hex(entry.payload())
++                    ));
++                }
++                line
++            }
++            Self::AppendAck {
++                term,
++                success,
++                match_index,
++            } => format!(
++                "append-ack {} {} {}",
++                term.get(),
++                u8::from(*success),
++                match_index
++            ),
++        }
+     }
+ 
+     /// Read a message out of a line, or say what was wrong with it.
+@@ -120,49 +175,168 @@
+     /// number, or when a name is not a name — the refusal quotes the line, because a peer that
+     /// speaks another protocol has to be able to tell *which* line it was.
+     pub fn decode(line: &str) -> Result<Self> {
+-        let _ = line;
+-        todo!("meshkv/5.3-teaching-raft: Message::decode")
++        let line = line.trim();
++        let wrong = |what: &str| {
++            Error::protocol(format!(
++                "`{line}` is not a message this build speaks: {what}"
++            ))
++        };
++        // Every refusal quotes the line: a peer that speaks another protocol has to be able to
++        // tell *which* line it was, and a message that ends early is as wrong as one that is
++        // malformed.
++        let quoted = |reason: Error| -> Error {
++            Error::protocol(format!(
++                "`{line}` is not a message this build speaks: {reason}"
++            ))
++        };
++        let mut words = line.split(' ');
++        let Some(kind) = words.next() else {
++            return Err(wrong("it is empty"));
++        };
++        match kind {
++            "vote" => {
++                let term = term_of(words.next()).map_err(quoted)?;
++                let candidate =
++                    node_of(words.next()).map_err(|_| wrong("its candidate is not a name"))?;
++                let last_term = term_of(words.next()).map_err(quoted)?;
++                let last_index = index_of(words.next()).map_err(quoted)?;
++                if words.next().is_some() {
++                    return Err(wrong("it has trailing words"));
++                }
++                Ok(Self::RequestVote {
++                    term,
++                    candidate,
++                    last: LogPosition {
++                        term: last_term,
++                        index: last_index,
++                    },
++                })
++            }
++            "vote-reply" => {
++                let term = term_of(words.next()).map_err(quoted)?;
++                let granted = flag_of(words.next()).map_err(quoted)?;
++                if words.next().is_some() {
++                    return Err(wrong("it has trailing words"));
++                }
++                Ok(Self::Vote { term, granted })
++            }
++            "append" => {
++                let term = term_of(words.next()).map_err(quoted)?;
++                let leader =
++                    node_of(words.next()).map_err(|_| wrong("its leader is not a name"))?;
++                let prev_term = term_of(words.next()).map_err(quoted)?;
++                let prev_index = index_of(words.next()).map_err(quoted)?;
++                let commit = index_of(words.next()).map_err(quoted)?;
++                let count = index_of(words.next()).map_err(quoted)?;
++                let mut entries = Vec::new();
++                for _ in 0..count {
++                    let Some(raw) = words.next() else {
++                        return Err(wrong("it says it carries more entries than it does"));
++                    };
++                    entries
++                        .push(entry_of(raw).map_err(|_| wrong("one of its entries is malformed"))?);
++                }
++                if words.next().is_some() {
++                    return Err(wrong("it has trailing words"));
++                }
++                Ok(Self::Append {
++                    term,
++                    leader,
++                    prev: LogPosition {
++                        term: prev_term,
++                        index: prev_index,
++                    },
++                    entries,
++                    commit,
++                })
++            }
++            "append-ack" => {
++                let term = term_of(words.next()).map_err(quoted)?;
++                let success = flag_of(words.next()).map_err(quoted)?;
++                let match_index = index_of(words.next()).map_err(quoted)?;
++                if words.next().is_some() {
++                    return Err(wrong("it has trailing words"));
++                }
++                Ok(Self::AppendAck {
++                    term,
++                    success,
++                    match_index,
++                })
++            }
++            _ => Err(wrong(
++                "it is not one of vote, vote-reply, append, append-ack",
++            )),
++        }
+     }
+ }
+ 
+ /// A term as it is written on the wire.
+ fn term_of(word: Option<&str>) -> Result<Term> {
+-    let _ = word;
+-    todo!("meshkv/5.3-teaching-raft: Message::term_of")
++    let word = word.ok_or_else(|| Error::protocol("the message ends early"))?;
++    let number = word
++        .parse::<u64>()
++        .map_err(|_| Error::protocol(format!("`{word}` is not a term")))?;
++    Ok(Term::new(number))
+ }
+ 
+ /// A position as it is written on the wire.
+ fn index_of(word: Option<&str>) -> Result<Index> {
+-    let _ = word;
+-    todo!("meshkv/5.3-teaching-raft: Message::index_of")
++    let word = word.ok_or_else(|| Error::protocol("the message ends early"))?;
++    word.parse::<Index>()
++        .map_err(|_| Error::protocol(format!("`{word}` is not a position")))
+ }
+ 
+ /// A node's name as it is written on the wire.
+ fn node_of(word: Option<&str>) -> Result<NodeId> {
+-    let _ = word;
+-    todo!("meshkv/5.3-teaching-raft: Message::node_of")
++    let word = word.ok_or_else(|| Error::protocol("the message ends early"))?;
++    NodeId::parse(word)
+ }
+ 
+ /// A yes/no as it is written on the wire.
+ fn flag_of(word: Option<&str>) -> Result<bool> {
+-    let _ = word;
+-    todo!("meshkv/5.3-teaching-raft: Message::flag_of")
++    match word {
++        Some("0") => Ok(false),
++        Some("1") => Ok(true),
++        Some(other) => Err(Error::protocol(format!("`{other}` is not a yes or a no"))),
++        None => Err(Error::protocol("the message ends early")),
++    }
+ }
+ 
+ /// One entry as it is written on the wire: `term:index:hex`.
+ fn entry_of(raw: &str) -> Result<Entry> {
+-    let _ = raw;
+-    todo!("meshkv/5.3-teaching-raft: Message::entry_of")
++    let mut parts = raw.split(':');
++    let term = term_of(parts.next())?;
++    let index = index_of(parts.next())?;
++    let payload = parts.next().unwrap_or_default();
++    if parts.next().is_some() {
++        return Err(Error::protocol(format!("`{raw}` is not an entry")));
++    }
++    let bytes = unhex(payload)
++        .ok_or_else(|| Error::protocol(format!("`{raw}` does not carry a hex payload")))?;
++    Ok(Entry::with_payload(term, index, bytes))
+ }
+ 
+ /// The payload of an entry, as hex.
+ fn hex(bytes: &[u8]) -> String {
+-    let _ = bytes;
+-    todo!("meshkv/5.3-teaching-raft: Message::hex")
++    let mut out = String::with_capacity(bytes.len() * 2);
++    for byte in bytes {
++        out.push_str(&format!("{byte:02x}"));
++    }
++    out
+ }
+ 
+ /// The hex of a payload, as the bytes it stands for.
+ fn unhex(text: &str) -> Option<Vec<u8>> {
+-    let _ = text;
+-    todo!("meshkv/5.3-teaching-raft: Message::unhex")
++    if !text.len().is_multiple_of(2) {
++        return None;
++    }
++    let mut bytes = Vec::with_capacity(text.len() / 2);
++    let raw = text.as_bytes();
++    for pair in raw.chunks(2) {
++        let mut digits = pair.iter().map(|byte| (*byte as char).to_digit(16));
++        let high = digits.next()??;
++        let low = digits.next()??;
++        bytes.push((high * 16 + low) as u8);
++    }
++    Some(bytes)
+ }
+--- a/src/raft/state.rs
++++ b/src/raft/state.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the state the implementation will read; the reference
+-// solution drops the allowance, because by then every field is read.
+-
+ //! The state machine of one node: what it believes, and what it answers.
+ //!
+ //! Everything in this module is a **value**. There is no socket here, no clock, no randomness:
+@@ -24,7 +20,7 @@
+ use std::collections::{BTreeMap, BTreeSet};
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::message::{LogPosition, Message};
+ use crate::raft::{Entry, Index, Log, Quorum, Term};
+ 
+@@ -43,7 +39,11 @@
+     /// The name as the page and the logs spell it.
+     #[must_use]
+     pub fn as_str(self) -> &'static str {
+-        todo!("meshkv/5.3-teaching-raft: Role::as_str")
++        match self {
++            Self::Follower => "follower",
++            Self::Candidate => "candidate",
++            Self::Leader => "leader",
++        }
+     }
+ }
+ 
+@@ -80,38 +80,49 @@
+     /// of the same command answer differently.
+     #[must_use]
+     pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
+-        let _ = (id, members);
+-        todo!("meshkv/5.3-teaching-raft: Raft::new")
++        Self {
++            id,
++            members,
++            role: Role::Follower,
++            term: Term::zero(),
++            voted_for: None,
++            log: Log::new(),
++            votes: BTreeSet::new(),
++            next_index: BTreeMap::new(),
++            match_index: BTreeMap::new(),
++            commit_index: 0,
++            leader_hint: None,
++        }
+     }
+ 
+     /// This node's name.
+     #[must_use]
+     pub fn id(&self) -> &NodeId {
+-        todo!("meshkv/5.3-teaching-raft: Raft::id")
++        &self.id
+     }
+ 
+     /// What this node currently is.
+     #[must_use]
+     pub fn role(&self) -> Role {
+-        todo!("meshkv/5.3-teaching-raft: Raft::role")
++        self.role
+     }
+ 
+     /// The term this node is in.
+     #[must_use]
+     pub fn term(&self) -> Term {
+-        todo!("meshkv/5.3-teaching-raft: Raft::term")
++        self.term
+     }
+ 
+     /// The log this node keeps.
+     #[must_use]
+     pub fn log(&self) -> &Log {
+-        todo!("meshkv/5.3-teaching-raft: Raft::log")
++        &self.log
+     }
+ 
+     /// How far this node's log is committed.
+     #[must_use]
+     pub fn commit_index(&self) -> Index {
+-        todo!("meshkv/5.3-teaching-raft: Raft::commit_index")
++        self.commit_index
+     }
+ 
+     /// The leader this node knows of, when it knows one.
+@@ -121,25 +132,35 @@
+     /// `5.7` is the step that turns it into a routing policy.
+     #[must_use]
+     pub fn leader(&self) -> Option<&NodeId> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::leader")
++        match self.role {
++            Role::Leader => Some(&self.id),
++            Role::Follower => self.leader_hint.as_ref(),
++            Role::Candidate => None,
++        }
+     }
+ 
+     /// The quorum of this cluster.
+     #[must_use]
+     pub fn quorum(&self) -> Quorum {
+-        todo!("meshkv/5.3-teaching-raft: Raft::quorum")
++        Quorum::of(self.members.len())
+     }
+ 
+     /// The peers of this node, itself excluded.
+     #[must_use]
+     pub fn peers(&self) -> Vec<NodeId> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::peers")
++        self.members
++            .iter()
++            .filter(|member| **member != self.id)
++            .cloned()
++            .collect()
+     }
+ 
+     /// The entries this node may apply: the committed prefix.
+     #[must_use]
+     pub fn committed(&self) -> Vec<&Entry> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::committed")
++        (1..=self.commit_index)
++            .filter_map(|index| self.log.at(index))
++            .collect()
+     }
+ 
+     /// Stand for election: move to the next term, vote for oneself, and ask everyone.
+@@ -147,7 +168,28 @@
+     /// The returned messages are the vote requests; a cluster of one elects itself without
+     /// sending anything.
+     pub fn campaign(&mut self) -> Vec<Outbound> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::campaign")
++        self.role = Role::Candidate;
++        self.term = self.term.next();
++        self.voted_for = Some(self.id.clone());
++        self.votes.clear();
++        self.votes.insert(self.id.clone());
++        self.next_index.clear();
++        self.match_index.clear();
++        if self.votes.len() >= self.quorum().majority() {
++            return self.become_leader();
++        }
++        let last = self.last_position();
++        self.peers()
++            .into_iter()
++            .map(|to| Outbound {
++                to,
++                message: Message::RequestVote {
++                    term: self.term,
++                    candidate: self.id.clone(),
++                    last,
++                },
++            })
++            .collect()
+     }
+ 
+     /// Handle a message from `from`, and answer whatever has to be answered.
+@@ -156,8 +198,33 @@
+     /// with this node's terms and nothing else, a message from an older term is refused, and only
+     /// then is the content looked at.
+     pub fn on_message(&mut self, from: &NodeId, message: Message) -> Vec<Outbound> {
+-        let _ = (from, message);
+-        todo!("meshkv/5.3-teaching-raft: Raft::on_message")
++        let term = message.term();
++        if term > self.term {
++            self.step_down(term);
++        }
++        if term < self.term {
++            return self.refuse(from, message);
++        }
++        match message {
++            Message::RequestVote {
++                term,
++                candidate,
++                last,
++            } => self.on_request_vote(from, term, candidate, last),
++            Message::Vote { term, granted } => self.on_vote(from, term, granted),
++            Message::Append {
++                term,
++                leader,
++                prev,
++                entries,
++                commit,
++            } => self.on_append(from, term, leader, prev, entries, commit),
++            Message::AppendAck {
++                term,
++                success,
++                match_index,
++            } => self.on_append_ack(from, term, success, match_index),
++        }
+     }
+ 
+     /// A leader appends a write to its own log and answers the position it took.
+@@ -167,8 +234,18 @@
+     /// [`Error::Invalid`] when this node is not the leader — a follower has no log to write to, and
+     /// the client has to be sent to the leader instead.
+     pub fn propose(&mut self, payload: Vec<u8>) -> Result<Index> {
+-        let _ = payload;
+-        todo!("meshkv/5.3-teaching-raft: Raft::propose")
++        if self.role != Role::Leader {
++            return Err(Error::invalid(format!(
++                "`{}` is a {}, not the leader — a write goes to the leader",
++                self.id,
++                self.role.as_str()
++            )));
++        }
++        let index = self.log.len() as Index + 1;
++        let entry = Entry::with_payload(self.term, index, payload);
++        self.log.append(entry)?;
++        self.match_index.insert(self.id.clone(), index);
++        Ok(index)
+     }
+ 
+     /// The entries this leader still owes each peer, as the messages to send them.
+@@ -177,25 +254,78 @@
+     /// a leader tells a follower how far it has committed.
+     #[must_use]
+     pub fn append_entries(&self) -> Vec<Outbound> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::append_entries")
++        if self.role != Role::Leader {
++            return Vec::new();
++        }
++        self.peers()
++            .into_iter()
++            .map(|to| {
++                let next = self.next_index.get(&to).copied().unwrap_or(1);
++                let prev = if next <= 1 {
++                    LogPosition::empty()
++                } else {
++                    self.position_of(next - 1)
++                };
++                let entries = (next..=self.log.len() as Index)
++                    .filter_map(|index| self.log.at(index))
++                    .cloned()
++                    .collect();
++                Outbound {
++                    to,
++                    message: Message::Append {
++                        term: self.term,
++                        leader: self.id.clone(),
++                        prev,
++                        entries,
++                        commit: self.commit_index,
++                    },
++                }
++            })
++            .collect()
+     }
+ 
+     /// The end of this node's log, as the position a vote request carries.
+     #[must_use]
+     pub fn last_position(&self) -> LogPosition {
+-        todo!("meshkv/5.3-teaching-raft: Raft::last_position")
++        match self.log.last() {
++            Some(entry) => LogPosition {
++                term: entry.term,
++                index: entry.index,
++            },
++            None => LogPosition::empty(),
++        }
+     }
+ 
+     /// A refusal for a message from an older term: this node's term, and nothing else.
+     fn refuse(&self, from: &NodeId, message: Message) -> Vec<Outbound> {
+-        let _ = (from, message);
+-        todo!("meshkv/5.3-teaching-raft: Raft::refuse")
++        let reply = match message {
++            Message::RequestVote { .. } => Message::Vote {
++                term: self.term,
++                granted: false,
++            },
++            Message::Vote { .. } => return Vec::new(),
++            Message::Append { .. } => Message::AppendAck {
++                term: self.term,
++                success: false,
++                match_index: 0,
++            },
++            Message::AppendAck { .. } => return Vec::new(),
++        };
++        vec![Outbound {
++            to: from.clone(),
++            message: reply,
++        }]
+     }
+ 
+     /// Move to a newer term as a follower: the vote is forgotten, the role is forgotten.
+     fn step_down(&mut self, term: Term) {
+-        let _ = term;
+-        todo!("meshkv/5.3-teaching-raft: Raft::step_down")
++        self.term = term;
++        self.role = Role::Follower;
++        self.voted_for = None;
++        self.votes.clear();
++        self.next_index.clear();
++        self.match_index.clear();
++        self.leader_hint = None;
+     }
+ 
+     /// A vote request: grant it when the candidate is caught up and nobody else has the vote.
+@@ -221,8 +351,14 @@
+ 
+     /// A vote answer: a majority makes this node the leader.
+     fn on_vote(&mut self, from: &NodeId, _term: Term, granted: bool) -> Vec<Outbound> {
+-        let _ = (from, _term, granted);
+-        todo!("meshkv/5.3-teaching-raft: Raft::on_vote")
++        if self.role != Role::Candidate || !granted {
++            return Vec::new();
++        }
++        self.votes.insert(from.clone());
++        if self.votes.len() >= self.quorum().majority() {
++            return self.become_leader();
++        }
++        Vec::new()
+     }
+ 
+     /// A leader's entries: accept them when the previous entry is the one the leader said it is.
+@@ -297,29 +433,89 @@
+     /// earlier term cannot commit them by itself — only an entry of its *own* term may commit — so
+     /// it writes one, and commits the rest with it.
+     fn become_leader(&mut self) -> Vec<Outbound> {
+-        todo!("meshkv/5.3-teaching-raft: Raft::become_leader")
++        self.role = Role::Leader;
++        self.leader_hint = Some(self.id.clone());
++        let next = self.log.len() as Index + 1;
++        for peer in self.peers() {
++            self.next_index.insert(peer.clone(), next);
++            self.match_index.insert(peer, 0);
++        }
++        self.match_index
++            .insert(self.id.clone(), self.log.len() as Index);
++        let index = self.log.len() as Index + 1;
++        if self
++            .log
++            .append(Entry::with_payload(self.term, index, Vec::new()))
++            .is_ok()
++        {
++            self.match_index.insert(self.id.clone(), index);
++        }
++        self.append_entries()
+     }
+ 
+     /// `true` when this node's log holds the entry the leader said it would.
+     fn matches(&self, prev: &LogPosition) -> bool {
+-        let _ = prev;
+-        todo!("meshkv/5.3-teaching-raft: Raft::matches")
++        if prev.index == 0 {
++            return true;
++        }
++        self.log
++            .at(prev.index)
++            .is_some_and(|entry| entry.term == prev.term)
+     }
+ 
+     /// Take the leader's entries: the ones this node has are kept, the rest replace a suffix.
+     fn accept(&mut self, entries: &[Entry]) {
+-        let _ = entries;
+-        todo!("meshkv/5.3-teaching-raft: Raft::accept")
++        for entry in entries {
++            match self.log.at(entry.index) {
++                Some(existing) if existing.term == entry.term => {}
++                Some(_) => {
++                    self.log.truncate_from(entry.index);
++                    if self.log.append(entry.clone()).is_err() {
++                        return;
++                    }
++                }
++                None => {
++                    if self.log.append(entry.clone()).is_err() {
++                        return;
++                    }
++                }
++            }
++        }
+     }
+ 
+     /// The largest position a majority holds, of this term only.
+     fn advance_commit(&mut self) {
+-        todo!("meshkv/5.3-teaching-raft: Raft::advance_commit")
++        let majority = self.quorum().majority();
++        let mut index = self.log.len() as Index;
++        while index > self.commit_index {
++            let Some(entry) = self.log.at(index) else {
++                return;
++            };
++            if entry.term == self.term {
++                // The leader's own position is in `match_index` too, so it is counted once — a
++                // leader that counted itself twice would commit with fewer than a majority.
++                let holders = self
++                    .match_index
++                    .values()
++                    .filter(|matched| **matched >= index)
++                    .count();
++                if holders >= majority {
++                    self.commit_index = index;
++                    return;
++                }
++            }
++            index -= 1;
++        }
+     }
+ 
+     /// The position of the entry at `index`.
+     fn position_of(&self, index: Index) -> LogPosition {
+-        let _ = index;
+-        todo!("meshkv/5.3-teaching-raft: Raft::position_of")
++        match self.log.at(index) {
++            Some(entry) => LogPosition {
++                term: entry.term,
++                index: entry.index,
++            },
++            None => LogPosition::empty(),
++        }
+     }
+ }

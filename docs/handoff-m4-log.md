@@ -110,3 +110,51 @@ $ kiln selftest --track meshkv 5.2-replication-rules
 但附了一句 `authoring.md §5.4` 的提醒（“it does not compile on the scaffold”）；这正是 §5.4 的判据
 （脚手架要能编译、规格在运行时失败）在起作用。修法：桩按**完整签名块 + 函数体**替换，重新生成两个 patch。
 教训（第 5 条）：**脚手架“失败”必须是运行时的失败**，selftest 的 `✓` 旁边那句 note 要读。
+
+## 段 3：B1 的三步 —— 5.1 拓扑、5.2 规则、5.3 教学版 Raft
+
+**三步的关系**：5.1 给出"集群是什么"（身份、拓扑、一行握手），5.2 给出"日志的规则"（四个值 + 一页必须与代码逐字一致的说明），5.3 让规则动起来（选举、复制、提交）——而且 5.3 的判据里第一次有了**确定性模拟**。
+
+**5.3 的形状**（`dist/consensus@apply`）：
+
+- `src/raft/message.rs`：四种消息 + 严格文本编码（解码失败必须引用原行；条目载荷走 hex，写里带换行也不会破行）。
+- `src/raft/state.rs`：**纯值状态机**——没有 socket、没有钟、没有随机。状态只因"收到消息"或"有人提案"而变。
+- `tests/sim_raft.rs`：**课程内容**（脚手架交付的仪器）。turmoil 跑三台主机，虚拟钟 + 虚拟网络，
+  seed 决定消息投递顺序；选举超时由 seed 抽；客户端说自己的话（`client propose …`，不是 Raft 消息）。
+- `sim/5.3-teaching-raft.toml`：三个 seed（1 / 7 / 20260101），`replay = 1`。
+
+**原始结论行**：
+
+```
+$ KILN_SIM_SEED=1 cargo test -p meshkv --test sim_raft -- --nocapture
+meshkv-sim leader=n3
+meshkv-sim committed=1
+meshkv-sim entries=2
+$ KILN_SIM_SEED=7 …        → leader=n2        （种子换了，胜者就换：门要的就是这个）
+$ KILN_SIM_SEED=1 （连跑三次）→ 三次逐字节相同   （replay 的那一半）
+
+$ kiln selftest --track meshkv
+3/3 step(s) hold the contract
+  ✓ meshkv/5.1-multi-node-topology   9/9 must green
+  ✓ meshkv/5.2-replication-rules      9/9 must green
+  ✓ meshkv/5.3-teaching-raft         11/11 must green   （含 slow:sim@3 与 slow:mutants@80）
+```
+
+**这一段钉下来的六条**：
+
+1. **`turmoil` 的地址是 `192.168.0.0/16`，只许绑 `0.0.0.0`/`::`/localhost，连接按名字走**
+   （`TcpStream::connect((name, port))`）；主机用 `sim.host(name, …)` 注册，DNS 自动分配 IP。
+   第一次写 `1.1.1.1` 会得到 `AddrNotAvailable: 1.1.1.1:1234 is not supported`。
+2. **`turmoil` 的 host 闭包是 `Fn`（可重启）**，所以它捕获的东西只能在闭包**里面**克隆——直接 `move` 一个
+   `Vec`/`Arc` 进去会得到 `cannot move out of ... a captured variable in an Fn closure`。
+3. **`tokio::join!` 不是 future**（它在宏里 await）；两个 await 的握手要把 listener 那一半
+   `tokio::spawn` 成任务，调用的一半留在测试里。
+4. **桩必须用掉自己的参数**（`let _ = (term, index);`），否则学员第一次构建就看到一堆他改不掉的
+   warning，而 `clippy@4` 会因 `unused_variables` 变红；桩里未被用到的私有助手加
+   `#![allow(dead_code)]`（课程自己的做法：4.21/4.24 的脚手架都这么写），参考解里去掉。
+5. **改 patch 的内容必须同步改 hunk 头**（authoring.md §5.4）：本段第一次踩到——往"新建文件"的 hunk 里
+   加行而忘了改 `+1,195` 这个数，`git apply` 居然 exit 0，而交付出去的文件在中间就断了。
+   正解不是手改计数，是**重建两棵树再 `diff -u` 重生成**（规则 12）。
+6. **桩的生成器要跳过闭合大括号那一行**（少跳一行就会多出一个 `}`；`lstrip('mut ')` 是按**字符集**剥，
+   会把 `term` 削成 `erm`）。本段把生成器写成 `stubgen.py`（在 `/private/tmp`），按签名取参数名、
+   保留 `Type::method` 的标记形态、给每个桩函数补 `let _ = (...)`。

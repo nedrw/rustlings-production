@@ -1,0 +1,998 @@
+--- a/src/raft/mod.rs
++++ b/src/raft/mod.rs
+@@ -279,4 +279,6 @@
+ // `kiln:scaffold:begin`/`kiln:scaffold:end` region, which is what keeps your own edits safe
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
++pub mod message;
++pub mod state;
+ // kiln:scaffold:end
+--- /dev/null
++++ b/src/raft/message.rs
+@@ -0,0 +1,169 @@
++#![allow(dead_code)]
++// the stub keeps the helpers the implementation will use; the reference
++// solution drops the allowance, because by then every one of them is used.
++
++//! What two nodes say to each other, and how a line of text carries it.
++//!
++//! `meshkv/5.3-teaching-raft` is the step where the log of `5.2` starts moving. The messages are
++//! the only things that move it, and there are four of them:
++//!
++//! | message | who sends it | what it asks |
++//! | --- | --- | --- |
++//! | [`Message::RequestVote`] | a candidate | "may I have your vote for this term?" |
++//! | [`Message::Vote`] | a peer | "yes" or "no", for that term |
++//! | [`Message::Append`] | a leader | "these entries, and this is how far I have committed" |
++//! | [`Message::AppendAck`] | a follower | "I have them" (and how far), or "no" |
++//!
++//! Two things are deliberate here. First, **the encoding is text and the parsing is strict**: a
++//! line that is not one of these four is a refusal, not a shrug — the same rule 5.1 wrote down for
++//! the handshake, and the same reason (`4.1`'s framing: after bytes that are not a message,
++//! nothing that follows can be trusted to start at a boundary). Second, **the payload of an entry
++//! is carried as hex**, so an entry never breaks the line it rides in: the log's rules are about
++//! positions and terms, and a write that contained a newline would make the encoding lie about
++//! where the entries are.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++use crate::raft::{Entry, Index, Term};
++
++/// Where a node's log ends: the term of its last entry and that entry's position.
++///
++/// The empty log ends at term 0, position 0 — the same numbers a log's first entry would have to
++/// follow, which is what makes "my log is at least as long as yours" a comparison of two pairs.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct LogPosition {
++    /// The term of the last entry.
++    pub term: Term,
++    /// Its position, one-based; zero for an empty log.
++    pub index: Index,
++}
++
++impl LogPosition {
++    /// The end of an empty log.
++    #[must_use]
++    pub fn empty() -> Self {
++        todo!("meshkv/5.3-teaching-raft: LogPosition::empty")
++    }
++
++    /// `true` when this position is at least as far along as `other` — the comparison a candidate
++    /// has to win to get a vote from a node whose log is longer.
++    ///
++    /// The term comes first: a log with more entries from an older term is *behind* one with
++    /// fewer entries from a newer term, and that is the rule that keeps a committed entry safe.
++    #[must_use]
++    pub fn is_at_least(&self, other: &LogPosition) -> bool {
++        let _ = other;
++        todo!("meshkv/5.3-teaching-raft: LogPosition::is_at_least")
++    }
++}
++
++/// One message between two nodes.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Message {
++    /// A candidate asks a peer for its vote.
++    RequestVote {
++        /// The term the candidate is standing in.
++        term: Term,
++        /// Who is standing.
++        candidate: NodeId,
++        /// Where the candidate's log ends, so the peer can judge whether it is caught up.
++        last: LogPosition,
++    },
++    /// A peer answers a vote request.
++    Vote {
++        /// The term the answer is about; a peer that has moved on answers with its newer term.
++        term: Term,
++        /// Whether the vote was given.
++        granted: bool,
++    },
++    /// A leader sends entries, or a heartbeat when it carries none.
++    Append {
++        /// The leader's term.
++        term: Term,
++        /// Who the leader is.
++        leader: NodeId,
++        /// The entry that must already be on the follower for these to follow it.
++        prev: LogPosition,
++        /// The entries themselves, in order.
++        entries: Vec<Entry>,
++        /// How far the leader has committed.
++        commit: Index,
++    },
++    /// A follower answers an append.
++    AppendAck {
++        /// The follower's term.
++        term: Term,
++        /// Whether the entries were accepted.
++        success: bool,
++        /// How far the follower's log reaches, whatever the answer was.
++        match_index: Index,
++    },
++}
++
++impl Message {
++    /// The term this message belongs to.
++    #[must_use]
++    pub fn term(&self) -> Term {
++        todo!("meshkv/5.3-teaching-raft: Message::term")
++    }
++
++    /// The message as one line of text, without the line ending.
++    #[must_use]
++    pub fn encode(&self) -> String {
++        todo!("meshkv/5.3-teaching-raft: Message::encode")
++    }
++
++    /// Read a message out of a line, or say what was wrong with it.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Protocol`] when the line is not one of the four messages, when a number is not a
++    /// number, or when a name is not a name — the refusal quotes the line, because a peer that
++    /// speaks another protocol has to be able to tell *which* line it was.
++    pub fn decode(line: &str) -> Result<Self> {
++        let _ = line;
++        todo!("meshkv/5.3-teaching-raft: Message::decode")
++    }
++}
++
++/// A term as it is written on the wire.
++fn term_of(word: Option<&str>) -> Result<Term> {
++    let _ = word;
++    todo!("meshkv/5.3-teaching-raft: Message::term_of")
++}
++
++/// A position as it is written on the wire.
++fn index_of(word: Option<&str>) -> Result<Index> {
++    let _ = word;
++    todo!("meshkv/5.3-teaching-raft: Message::index_of")
++}
++
++/// A node's name as it is written on the wire.
++fn node_of(word: Option<&str>) -> Result<NodeId> {
++    let _ = word;
++    todo!("meshkv/5.3-teaching-raft: Message::node_of")
++}
++
++/// A yes/no as it is written on the wire.
++fn flag_of(word: Option<&str>) -> Result<bool> {
++    let _ = word;
++    todo!("meshkv/5.3-teaching-raft: Message::flag_of")
++}
++
++/// One entry as it is written on the wire: `term:index:hex`.
++fn entry_of(raw: &str) -> Result<Entry> {
++    let _ = raw;
++    todo!("meshkv/5.3-teaching-raft: Message::entry_of")
++}
++
++/// The payload of an entry, as hex.
++fn hex(bytes: &[u8]) -> String {
++    let _ = bytes;
++    todo!("meshkv/5.3-teaching-raft: Message::hex")
++}
++
++/// The hex of a payload, as the bytes it stands for.
++fn unhex(text: &str) -> Option<Vec<u8>> {
++    let _ = text;
++    todo!("meshkv/5.3-teaching-raft: Message::unhex")
++}
+--- /dev/null
++++ b/src/raft/state.rs
+@@ -0,0 +1,325 @@
++#![allow(dead_code)]
++// the stub keeps the state the implementation will read; the reference
++// solution drops the allowance, because by then every field is read.
++
++//! The state machine of one node: what it believes, and what it answers.
++//!
++//! Everything in this module is a **value**. There is no socket here, no clock, no randomness:
++//! a node's state changes because a message arrived, because somebody proposed a write, or because
++//! somebody timed out — and the last of those is the *caller's* decision, not this module's. That
++//! split is the whole reason the next steps can drive a whole cluster through a simulated network:
++//! the part that has to be right (the rules) is a function of its inputs, and the part that has to
++//! be fast (the plumbing) is not in here at all.
++//!
++//! The rules themselves are `5.2`'s, now in motion:
++//!
++//! * a node that has not heard from a leader becomes a **candidate** and asks for votes
++//!   ([`Raft::campaign`]);
++//! * a candidate that wins a **majority** becomes the **leader**;
++//! * a leader **appends** its writes to its own log and sends them ([`Raft::append_entries`]);
++//! * a follower that accepts them answers how far its log now reaches;
++//! * a leader that has the entry on a majority **commits** it — and only an entry of the leader's
++//!   *current* term commits, which is the rule `5.2` wrote down and this step makes bite.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++use crate::raft::message::{LogPosition, Message};
++use crate::raft::{Entry, Index, Log, Quorum, Term};
++
++/// What a node currently is.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Role {
++    /// It waits for a leader and answers vote requests.
++    Follower,
++    /// It is standing for election and collecting votes.
++    Candidate,
++    /// It leads: it appends writes and replicates them.
++    Leader,
++}
++
++impl Role {
++    /// The name as the page and the logs spell it.
++    #[must_use]
++    pub fn as_str(self) -> &'static str {
++        todo!("meshkv/5.3-teaching-raft: Role::as_str")
++    }
++}
++
++/// A message this node wants to send, and who it is for.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Outbound {
++    /// The peer to send it to.
++    pub to: NodeId,
++    /// What to send.
++    pub message: Message,
++}
++
++/// One node's state: what it believes about the cluster, term by term.
++#[derive(Debug, Clone)]
++pub struct Raft {
++    id: NodeId,
++    members: Vec<NodeId>,
++    role: Role,
++    term: Term,
++    voted_for: Option<NodeId>,
++    log: Log,
++    votes: BTreeSet<NodeId>,
++    next_index: BTreeMap<NodeId, Index>,
++    match_index: BTreeMap<NodeId, Index>,
++    commit_index: Index,
++    leader_hint: Option<NodeId>,
++}
++
++impl Raft {
++    /// A fresh node: a follower in term 0, with an empty log and no vote given.
++    ///
++    /// `members` is the whole cluster, this node included. The order is kept, because a test and a
++    /// human read the same cluster description and a set that reordered itself would make two runs
++    /// of the same command answer differently.
++    #[must_use]
++    pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
++        let _ = (id, members);
++        todo!("meshkv/5.3-teaching-raft: Raft::new")
++    }
++
++    /// This node's name.
++    #[must_use]
++    pub fn id(&self) -> &NodeId {
++        todo!("meshkv/5.3-teaching-raft: Raft::id")
++    }
++
++    /// What this node currently is.
++    #[must_use]
++    pub fn role(&self) -> Role {
++        todo!("meshkv/5.3-teaching-raft: Raft::role")
++    }
++
++    /// The term this node is in.
++    #[must_use]
++    pub fn term(&self) -> Term {
++        todo!("meshkv/5.3-teaching-raft: Raft::term")
++    }
++
++    /// The log this node keeps.
++    #[must_use]
++    pub fn log(&self) -> &Log {
++        todo!("meshkv/5.3-teaching-raft: Raft::log")
++    }
++
++    /// How far this node's log is committed.
++    #[must_use]
++    pub fn commit_index(&self) -> Index {
++        todo!("meshkv/5.3-teaching-raft: Raft::commit_index")
++    }
++
++    /// The leader this node knows of, when it knows one.
++    ///
++    /// A leader knows itself; a follower knows the leader it last heard from; a candidate knows
++    /// none until it wins. This is the hint a client is sent to when it asked the wrong node —
++    /// `5.7` is the step that turns it into a routing policy.
++    #[must_use]
++    pub fn leader(&self) -> Option<&NodeId> {
++        todo!("meshkv/5.3-teaching-raft: Raft::leader")
++    }
++
++    /// The quorum of this cluster.
++    #[must_use]
++    pub fn quorum(&self) -> Quorum {
++        todo!("meshkv/5.3-teaching-raft: Raft::quorum")
++    }
++
++    /// The peers of this node, itself excluded.
++    #[must_use]
++    pub fn peers(&self) -> Vec<NodeId> {
++        todo!("meshkv/5.3-teaching-raft: Raft::peers")
++    }
++
++    /// The entries this node may apply: the committed prefix.
++    #[must_use]
++    pub fn committed(&self) -> Vec<&Entry> {
++        todo!("meshkv/5.3-teaching-raft: Raft::committed")
++    }
++
++    /// Stand for election: move to the next term, vote for oneself, and ask everyone.
++    ///
++    /// The returned messages are the vote requests; a cluster of one elects itself without
++    /// sending anything.
++    pub fn campaign(&mut self) -> Vec<Outbound> {
++        todo!("meshkv/5.3-teaching-raft: Raft::campaign")
++    }
++
++    /// Handle a message from `from`, and answer whatever has to be answered.
++    ///
++    /// The order of the checks is the protocol's order: a message from a newer term is answered
++    /// with this node's terms and nothing else, a message from an older term is refused, and only
++    /// then is the content looked at.
++    pub fn on_message(&mut self, from: &NodeId, message: Message) -> Vec<Outbound> {
++        let _ = (from, message);
++        todo!("meshkv/5.3-teaching-raft: Raft::on_message")
++    }
++
++    /// A leader appends a write to its own log and answers the position it took.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when this node is not the leader — a follower has no log to write to, and
++    /// the client has to be sent to the leader instead.
++    pub fn propose(&mut self, payload: Vec<u8>) -> Result<Index> {
++        let _ = payload;
++        todo!("meshkv/5.3-teaching-raft: Raft::propose")
++    }
++
++    /// The entries this leader still owes each peer, as the messages to send them.
++    ///
++    /// A peer that has everything gets an empty append — that is the heartbeat, and it is also how
++    /// a leader tells a follower how far it has committed.
++    #[must_use]
++    pub fn append_entries(&self) -> Vec<Outbound> {
++        todo!("meshkv/5.3-teaching-raft: Raft::append_entries")
++    }
++
++    /// The end of this node's log, as the position a vote request carries.
++    #[must_use]
++    pub fn last_position(&self) -> LogPosition {
++        todo!("meshkv/5.3-teaching-raft: Raft::last_position")
++    }
++
++    /// A refusal for a message from an older term: this node's term, and nothing else.
++    fn refuse(&self, from: &NodeId, message: Message) -> Vec<Outbound> {
++        let _ = (from, message);
++        todo!("meshkv/5.3-teaching-raft: Raft::refuse")
++    }
++
++    /// Move to a newer term as a follower: the vote is forgotten, the role is forgotten.
++    fn step_down(&mut self, term: Term) {
++        let _ = term;
++        todo!("meshkv/5.3-teaching-raft: Raft::step_down")
++    }
++
++    /// A vote request: grant it when the candidate is caught up and nobody else has the vote.
++    fn on_request_vote(
++        &mut self,
++        from: &NodeId,
++        term: Term,
++        candidate: NodeId,
++        last: LogPosition,
++    ) -> Vec<Outbound> {
++        let mine = self.last_position();
++        let free = self.voted_for.is_none() || self.voted_for.as_ref() == Some(&candidate);
++        let caught_up = last.is_at_least(&mine);
++        let granted = free && caught_up && self.role != Role::Leader;
++        if granted {
++            self.voted_for = Some(candidate);
++        }
++        vec![Outbound {
++            to: from.clone(),
++            message: Message::Vote { term, granted },
++        }]
++    }
++
++    /// A vote answer: a majority makes this node the leader.
++    fn on_vote(&mut self, from: &NodeId, _term: Term, granted: bool) -> Vec<Outbound> {
++        let _ = (from, _term, granted);
++        todo!("meshkv/5.3-teaching-raft: Raft::on_vote")
++    }
++
++    /// A leader's entries: accept them when the previous entry is the one the leader said it is.
++    fn on_append(
++        &mut self,
++        from: &NodeId,
++        term: Term,
++        leader: NodeId,
++        prev: LogPosition,
++        entries: Vec<Entry>,
++        commit: Index,
++    ) -> Vec<Outbound> {
++        // Two leaders in one term: the one that hears about the other steps down.
++        if self.role != Role::Follower {
++            self.role = Role::Follower;
++            self.voted_for = None;
++            self.votes.clear();
++        }
++        self.leader_hint = Some(leader.clone());
++        if !self.matches(&prev) {
++            return vec![Outbound {
++                to: from.clone(),
++                message: Message::AppendAck {
++                    term,
++                    success: false,
++                    match_index: 0,
++                },
++            }];
++        }
++        self.accept(&entries);
++        let last = self.log.len() as Index;
++        if commit > self.commit_index {
++            self.commit_index = commit.min(last);
++        }
++        vec![Outbound {
++            to: from.clone(),
++            message: Message::AppendAck {
++                term,
++                success: true,
++                match_index: last,
++            },
++        }]
++    }
++
++    /// A follower's answer: on success the entry may commit; on failure the leader retries earlier.
++    fn on_append_ack(
++        &mut self,
++        from: &NodeId,
++        term: Term,
++        success: bool,
++        match_index: Index,
++    ) -> Vec<Outbound> {
++        if self.role != Role::Leader {
++            return Vec::new();
++        }
++        let _ = term;
++        if success {
++            self.match_index.insert(from.clone(), match_index);
++            self.next_index.insert(from.clone(), match_index + 1);
++            self.advance_commit();
++        } else {
++            let next = self.next_index.get(from).copied().unwrap_or(1);
++            self.next_index
++                .insert(from.clone(), next.saturating_sub(1).max(1));
++        }
++        Vec::new()
++    }
++
++    /// Become the leader: the next positions for every peer, and an empty entry of this term.
++    ///
++    /// The empty entry is the classic Raft subtlety: a leader that inherited entries from an
++    /// earlier term cannot commit them by itself — only an entry of its *own* term may commit — so
++    /// it writes one, and commits the rest with it.
++    fn become_leader(&mut self) -> Vec<Outbound> {
++        todo!("meshkv/5.3-teaching-raft: Raft::become_leader")
++    }
++
++    /// `true` when this node's log holds the entry the leader said it would.
++    fn matches(&self, prev: &LogPosition) -> bool {
++        let _ = prev;
++        todo!("meshkv/5.3-teaching-raft: Raft::matches")
++    }
++
++    /// Take the leader's entries: the ones this node has are kept, the rest replace a suffix.
++    fn accept(&mut self, entries: &[Entry]) {
++        let _ = entries;
++        todo!("meshkv/5.3-teaching-raft: Raft::accept")
++    }
++
++    /// The largest position a majority holds, of this term only.
++    fn advance_commit(&mut self) {
++        todo!("meshkv/5.3-teaching-raft: Raft::advance_commit")
++    }
++
++    /// The position of the entry at `index`.
++    fn position_of(&self, index: Index) -> LogPosition {
++        let _ = index;
++        todo!("meshkv/5.3-teaching-raft: Raft::position_of")
++    }
++}
+--- /dev/null
++++ b/tests/sim_raft.rs
+@@ -0,0 +1,474 @@
++//! The instrument for `meshkv/5.3-teaching-raft`: three nodes in a simulated network.
++//!
++//! This file is **course content**, shipped by the step's scaffold: it is the thing that drives
++//! the learner's state machine, not the thing the learner writes. What it does is deliberately
++//! dull — it opens sockets, it moves timers, it prints a transcript — so that everything the
++//! learner has to get right is left in `src/raft/`.
++//!
++//! Three things about it are worth knowing, because they are the three things the step is about:
++//!
++//! * **the network is simulated, so the schedule is a seed.** `turmoil` runs every host on one
++//!   thread with a virtual clock; the seed decides the order the messages are delivered in. The
++//!   harness reads `KILN_SIM_SEED` and hands it to both the simulator and its own timeout picker,
++//!   so a seed *is* the schedule, and the same seed is the same schedule.
++//! * **the plumbing is here, the rules are not.** The election timeout, the heartbeat and the
++//!   sockets are this file's; the term, the vote, the log and the commit rule are the learner's.
++//!   That split is what makes a protocol testable at all: the part that can be wrong in an
++//!   interesting way is a value, and the part that cannot is plumbing.
++//! * **the client speaks its own protocol.** `client propose …` is not a Raft message; the client
++//!   is not a member of the cluster and never appears in the log. A client protocol that a
++//!   consensus protocol knows nothing about is the shape production systems have, and the step
++//!   that teaches client routing (`5.7`) is the step that moves it.
++//!
++//! What the harness prints is the transcript the `sim` gate judges: one `meshkv-sim <name>=<value>`
++//! line per fact, never a wall clock, never an address, never a path — a transcript that changed
++//! between two runs of the same seed would be a flaky test wearing a simulation's name.
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::time::Duration;
++
++use meshkv::cluster::NodeId;
++use meshkv::raft::message::Message;
++use meshkv::raft::state::{Outbound, Raft, Role};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::sync::mpsc;
++use turmoil::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
++use turmoil::net::{TcpListener, TcpStream};
++
++/// The port every node listens on, in the simulation and in production.
++const PORT: u16 = 7000;
++
++/// The cluster: three nodes.
++const NAMES: [&str; 3] = ["n1", "n2", "n3"];
++
++/// How often the loop wakes up, in simulated milliseconds.
++const TICK: Duration = Duration::from_millis(10);
++
++/// How often a leader says "I am still here".
++const HEARTBEAT: Duration = Duration::from_millis(100);
++
++/// The window an election timeout is drawn from, in simulated milliseconds.
++const ELECTION_WINDOW: (u64, u64) = (300, 700);
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++/// What the seed is, or 1 when nothing set it.
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++/// Something a node has to deal with.
++enum Incoming {
++    /// A message from another member of the cluster.
++    Raft { from: NodeId, message: Message },
++    /// A request from a client, and the connection to answer it on.
++    Client {
++        request: String,
++        writer: Option<OwnedWriteHalf>,
++    },
++}
++
++/// The node's own view of its peers, and the sockets to them.
++struct Node {
++    name: String,
++    raft: Raft,
++    out: BTreeMap<NodeId, TcpStream>,
++    election_deadline: tokio::time::Instant,
++    next_heartbeat: tokio::time::Instant,
++    rng: u64,
++}
++
++impl Node {
++    /// A node with an election timeout drawn from the seed.
++    fn new(id: NodeId, members: Vec<NodeId>, seed: u64) -> Self {
++        let rng = mix(seed);
++        let timeout = ELECTION_WINDOW.0 + (rng % span());
++        let now = tokio::time::Instant::now();
++        Self {
++            name: id.as_str().to_owned(),
++            raft: Raft::new(id, members),
++            out: BTreeMap::new(),
++            election_deadline: now + Duration::from_millis(timeout),
++            next_heartbeat: now,
++            rng,
++        }
++    }
++
++    /// Draw the next election timeout from this node's own generator.
++    fn next_timeout(&mut self) -> Duration {
++        self.rng = mix(self.rng);
++        Duration::from_millis(ELECTION_WINDOW.0 + (self.rng % span()))
++    }
++
++    /// Send one message to a peer, connecting first if it has to.
++    async fn send(&mut self, to: &NodeId, message: &Message) {
++        if !self.out.contains_key(to) {
++            let Ok(stream) = TcpStream::connect((to.as_str(), PORT)).await else {
++                return;
++            };
++            self.out.insert(to.clone(), stream);
++        }
++        let Some(stream) = self.out.get_mut(to) else {
++            return;
++        };
++        // The envelope is the harness's, not the protocol's: every line names its sender, so the
++        // receiver knows who a message came from without the protocol having to say so. (The
++        // production transport learns the same thing from the handshake `5.1` wrote down.)
++        let line = format!("{} {}\n", self.name, message.encode());
++        if stream.write_all(line.as_bytes()).await.is_err() {
++            self.out.remove(to);
++        }
++    }
++
++    /// Send everything the state machine asked for.
++    async fn flush(&mut self, outbounds: Vec<Outbound>) {
++        for outbound in outbounds {
++            self.send(&outbound.to, &outbound.message).await;
++        }
++    }
++}
++
++/// The width of the election-timeout window.
++fn span() -> u64 {
++    (ELECTION_WINDOW.1 - ELECTION_WINDOW.0).max(1)
++}
++
++/// A tiny mixing function: the harness needs a spread of timeouts, not a good random number.
++fn mix(seed: u64) -> u64 {
++    let mut value = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
++    value ^= value << 13;
++    value ^= value >> 7;
++    value ^= value << 17;
++    value
++}
++
++/// Read the lines of one connection and hand them to the node.
++async fn read_connection(
++    mut reader: BufReader<OwnedReadHalf>,
++    inbox: mpsc::UnboundedSender<Incoming>,
++    writer: Option<OwnedWriteHalf>,
++) {
++    let mut writer = writer;
++    let mut line = String::new();
++    loop {
++        line.clear();
++        match reader.read_line(&mut line).await {
++            Ok(0) | Err(_) => return,
++            Ok(_) => {}
++        }
++        let text = line.trim().to_owned();
++        if text.is_empty() {
++            continue;
++        }
++        let Some((sender, rest)) = text.split_once(' ') else {
++            continue;
++        };
++        if sender == "client" {
++            if inbox
++                .send(Incoming::Client {
++                    request: rest.to_owned(),
++                    writer: writer.take(),
++                })
++                .is_err()
++            {
++                return;
++            }
++            // One client request per connection: the answer goes back on this one, and the
++            // client opens a new connection for the next request.
++            return;
++        }
++        let Ok(from) = NodeId::parse(sender) else {
++            continue;
++        };
++        let Ok(message) = Message::decode(rest) else {
++            continue;
++        };
++        if inbox.send(Incoming::Raft { from, message }).is_err() {
++            return;
++        }
++    }
++}
++
++/// Answer a client request with one line.
++async fn answer(writer: &mut OwnedWriteHalf, line: &str) {
++    let _ = writer.write_all(format!("{line}\n").as_bytes()).await;
++}
++
++/// How long the client waits for a cluster to have a leader, in simulated milliseconds.
++const CLIENT_PATIENCE: Duration = Duration::from_secs(8);
++
++/// The client: find a leader, propose a write, and wait until it is committed.
++///
++/// The client starts with the cluster, not after it: a node that has not bound its listener yet
++/// refuses the connection, and a client that gave up at the first refusal would report "no leader"
++/// for a cluster that is about to have one. So the client waits — on the *simulated* clock, which
++/// is why this loop costs nothing in real time.
++async fn client(done: Arc<AtomicBool>, committed: Arc<AtomicBool>) {
++    let deadline = tokio::time::Instant::now() + CLIENT_PATIENCE;
++    let mut found = None;
++    while tokio::time::Instant::now() < deadline && found.is_none() {
++        for name in NAMES {
++            if let Some((leader, index)) = propose_to(name, b"write-1").await {
++                found = Some((leader, index));
++                break;
++            }
++        }
++        if found.is_none() {
++            tokio::time::sleep(Duration::from_millis(50)).await;
++        }
++    }
++    let Some((leader, index)) = found else {
++        println!("meshkv-sim leader=none");
++        println!("meshkv-sim committed=0");
++        done.store(true, Ordering::SeqCst);
++        return;
++    };
++    let was_committed = wait_committed(&leader, index).await;
++    committed.store(was_committed, Ordering::SeqCst);
++    println!("meshkv-sim leader={leader}");
++    println!("meshkv-sim committed={}", u8::from(was_committed));
++    println!("meshkv-sim entries={index}");
++    done.store(true, Ordering::SeqCst);
++}
++
++/// Propose one write to a node, following a redirect to the leader.
++async fn propose_to(name: &str, payload: &[u8]) -> Option<(String, u64)> {
++    let mut current = name.to_owned();
++    for _ in 0..4 {
++        let Ok(mut stream) = TcpStream::connect((current.as_str(), PORT)).await else {
++            return None;
++        };
++        let request = format!("client propose {}\n", hex(payload));
++        if stream.write_all(request.as_bytes()).await.is_err() {
++            return None;
++        }
++        let mut answer = String::new();
++        let mut reader = BufReader::new(stream);
++        if reader.read_line(&mut answer).await.is_err() {
++            return None;
++        }
++        let answer = answer.trim().to_owned();
++        if let Some(rest) = answer.strip_prefix("client redirect ") {
++            let leader = rest.trim();
++            if leader == "unknown" {
++                // No leader yet: the client tries again rather than dialing a host that does not
++                // exist.
++                return None;
++            }
++            current = leader.to_owned();
++            continue;
++        }
++        if let Some(rest) = answer.strip_prefix("client ok ") {
++            return rest
++                .trim()
++                .parse::<u64>()
++                .ok()
++                .map(|index| (current, index));
++        }
++        return None;
++    }
++    None
++}
++
++/// Ask a node whether an entry is committed, until it says yes or the sim gives up.
++async fn wait_committed(leader: &str, index: u64) -> bool {
++    for _ in 0..200 {
++        let Ok(mut stream) = TcpStream::connect((leader, PORT)).await else {
++            return false;
++        };
++        let request = format!("client committed {index}\n");
++        if stream.write_all(request.as_bytes()).await.is_err() {
++            return false;
++        }
++        let mut answer = String::new();
++        let mut reader = BufReader::new(stream);
++        if reader.read_line(&mut answer).await.is_err() {
++            return false;
++        }
++        if answer.trim() == "client committed yes" {
++            return true;
++        }
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    false
++}
++
++/// The payload of a write, as hex.
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++/// The payload of a write, as bytes.
++fn unhex(text: &str) -> Option<Vec<u8>> {
++    if !text.len().is_multiple_of(2) {
++        return None;
++    }
++    let raw = text.as_bytes();
++    let mut bytes = Vec::with_capacity(raw.len() / 2);
++    for pair in raw.chunks(2) {
++        let high = (pair[0] as char).to_digit(16)?;
++        let low = (pair[1] as char).to_digit(16)?;
++        bytes.push((high * 16 + low) as u8);
++    }
++    Some(bytes)
++}
++
++/// What a client request asks of the node, and what the node does about it.
++enum Request {
++    /// Propose a write.
++    Propose(Vec<u8>),
++    /// Ask whether an entry is committed.
++    Committed(u64),
++}
++
++/// Read a client request.
++fn parse_request(request: &str) -> Option<Request> {
++    let mut words = request.split(' ');
++    match words.next() {
++        Some("propose") => Some(Request::Propose(unhex(words.next().unwrap_or_default())?)),
++        Some("committed") => Some(Request::Committed(words.next()?.parse::<u64>().ok()?)),
++        _ => None,
++    }
++}
++
++/// Run one node of the cluster.
++async fn run_node(id: NodeId, members: Vec<NodeId>, seed: u64, done: Arc<AtomicBool>) {
++    let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<Incoming>();
++    let Ok(listener) = TcpListener::bind(("0.0.0.0", PORT)).await else {
++        return;
++    };
++    let acceptor = tokio::spawn(async move {
++        loop {
++            let Ok((stream, _)) = listener.accept().await else {
++                return;
++            };
++            let (read, write) = stream.into_split();
++            let sender = inbox_tx.clone();
++            tokio::spawn(async move {
++                read_connection(BufReader::new(read), sender, Some(write)).await;
++            });
++        }
++    });
++
++    let mut node = Node::new(id, members, seed);
++    loop {
++        if done.load(Ordering::SeqCst) {
++            break;
++        }
++        tokio::select! {
++            Some(incoming) = inbox_rx.recv() => match incoming {
++                Incoming::Raft { from, message } => {
++                    let term = message.term();
++                    let outbounds = node.raft.on_message(&from, message);
++                    if term >= node.raft.term() {
++                        node.election_deadline = tokio::time::Instant::now() + node.next_timeout();
++                    }
++                    node.flush(outbounds).await;
++                }
++                Incoming::Client { request, writer } => {
++                    let (line, outbounds) = serve(&mut node, &request);
++                    node.flush(outbounds).await;
++                    if let Some(mut writer) = writer {
++                        answer(&mut writer, &line).await;
++                    }
++                }
++            },
++            _ = tokio::time::sleep(TICK) => {
++                let now = tokio::time::Instant::now();
++                if node.raft.role() == Role::Leader {
++                    if now >= node.next_heartbeat {
++                        let outbounds = node.raft.append_entries();
++                        node.flush(outbounds).await;
++                        node.next_heartbeat = now + HEARTBEAT;
++                    }
++                } else if now >= node.election_deadline {
++                    let outbounds = node.raft.campaign();
++                    node.flush(outbounds).await;
++                    node.election_deadline = now + node.next_timeout();
++                    node.next_heartbeat = now + HEARTBEAT;
++                }
++            }
++        }
++    }
++    acceptor.abort();
++}
++
++/// Answer a client request: the line to send back, and the messages the answer caused.
++fn serve(node: &mut Node, request: &str) -> (String, Vec<Outbound>) {
++    match parse_request(request) {
++        Some(Request::Propose(payload)) => match node.raft.propose(payload) {
++            Ok(index) => {
++                let outbounds = node.raft.append_entries();
++                (format!("client ok {index}"), outbounds)
++            }
++            Err(_) => {
++                let leader = node
++                    .raft
++                    .leader()
++                    .map(|leader| leader.as_str().to_owned())
++                    .unwrap_or_else(|| "unknown".to_owned());
++                (format!("client redirect {leader}"), Vec::new())
++            }
++        },
++        Some(Request::Committed(index)) => {
++            let committed = node.raft.commit_index() >= index;
++            (
++                format!("client committed {}", if committed { "yes" } else { "no" }),
++                Vec::new(),
++            )
++        }
++        None => ("client unknown".to_owned(), Vec::new()),
++    }
++}
++
++#[test]
++fn three_nodes_elect_a_leader_and_commit_a_write() {
++    let seed = seed();
++    let mut sim = turmoil::Builder::new().rng_seed(seed).build();
++    let done = Arc::new(AtomicBool::new(false));
++    let committed = Arc::new(AtomicBool::new(false));
++    let members: Arc<Vec<NodeId>> = Arc::new(
++        NAMES
++            .iter()
++            .map(|name| NodeId::parse(name).expect("a valid name"))
++            .collect(),
++    );
++    for name in NAMES {
++        let members = Arc::clone(&members);
++        let done = Arc::clone(&done);
++        // The host closure is called again whenever a host is restarted, so it may only borrow
++        // what it captures — everything it needs is cloned inside.
++        sim.host(name, move || {
++            let members = Arc::clone(&members);
++            let done = Arc::clone(&done);
++            async move {
++                let id = NodeId::parse(name).expect("a valid name");
++                run_node(id, members.as_ref().clone(), seed, done).await;
++                Ok(())
++            }
++        });
++    }
++    let client_done = Arc::clone(&done);
++    let client_committed = Arc::clone(&committed);
++    sim.client("client", async move {
++        client(client_done, client_committed).await;
++        Ok(())
++    });
++    sim.run().expect("the simulation runs");
++    assert!(
++        done.load(Ordering::SeqCst),
++        "the client finished: a scenario that never finishes is a scenario with no answer"
++    );
++    assert!(
++        committed.load(Ordering::SeqCst),
++        "the cluster elected a leader and committed the write: a run that elects nobody, or a write \
++         nobody commits, is a run with no answer — and the gate reads the answer off the \
++         transcript"
++    );
++}
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,6 +25,9 @@
+ # outside a region the skeleton declared (docs/authoring.md §5.3).
+ [dev-dependencies]
+ # kiln:scaffold:begin
++# The simulator the step's own harness runs on: a virtual clock and a virtual network, so a
++# schedule is a seed and not a race.
++turmoil = "0.7.2"
+ # kiln:scaffold:end
+ 
+ # This crate's own lint policy. `unsafe_code = "deny"` is here from the first step rather than from
