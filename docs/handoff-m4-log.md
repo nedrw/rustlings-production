@@ -423,3 +423,69 @@ $ kiln links → every target resolves
    scratch 树里要放一个同形状的 stand-in 才能本地编译。
 5. **`drop 1`/`partition` 的单链路不是隔离**（5.13/5.14 的教训在 5.16 的矩阵里也成立）：剧本要隔离一个节点得
    切它和**每一个** peer 的链路。
+
+## 段 12：第二轮评审与修复（参考代码、内容、框架三线）
+
+**评审怎么做的**：两个子 agent 分别读参考解与课程内容，逐条对着正文/规格/补丁找"说了但没做"和"做了但会错"。
+结论分三线：
+
+**框架（kiln）**：`MissingDependency` 只说"缺前置 track"，不说从哪一步开始跑——补 `first` 字段（取前置 track 的
+第一步）并把 `kiln verify` 的 blocked verdict 的 `fix` 指到 `kiln run <first>`；`state` 的读只把 NotFound 当默认
+（权限/损坏不再静默重置）、写改为临时文件 + `sync_all` + rename、并发合并走 `.kiln/state.lock`；补丁器在
+`Solution` 模式下拒绝删除一个被改过的文件，锚定改为"旧行非空才要求上下文匹配"；`Plan::apply` 出错回滚已写文件。
+
+**参考代码（21 个 step 树）**：九处真 bug，全部是"能跑但语义错"：
+
+1. `Log::len()` 被当成集群下标——压缩之后 `len()` 比最后下标小；新增 `Log::last_index()/last_term()`，所有位置
+   计算改走它们；
+2. `last_position()` 在日志被快照替换后返回 `LogPosition::empty()`——回退到快照的位置；
+3. `pending` 成员配置跨任期存活——`campaign`/`step_down` 清掉；
+4. `compact` 接受"提交下标处但任期不同"的快照——拒绝；
+5. `matches()` 接受快照覆盖范围内的任意下标——只认快照自己那个位置（更低的下标查不了，要让 leader 发快照）；
+6. `Ring::len()` 两个原子读不是同一时刻——`saturating_sub`；
+7. drill 的 `isolated()` 用"切断了与每个 peer 的链路"——改成"够不到多数派"，否则健康集群也会被判成脑裂；
+8. audit 只比 `min(applied)` 那一个下标——比每个至少两个节点到达的下标；
+9. `is_retryable()` 把 `RetriesExhausted` 也算可重试——SDK 刚做出的决定，不该让调用方再问一遍。
+
+**怎么落的**：手改 5.2 的补丁把 hunk 头改坏了（`git checkout` 回滚）；"重放补丁链再修"在 5.5 处因 5.4 的上下文
+变化失败；最终做法是**先修树、最后生成补丁**：把修复应用到 `s52…s522` 的 stub 与 full 树，再 `diff -u` 生成
+scaffold（上一步 full → 本步 stub）与 solution（本步 stub → 本步 full）。两条规则是这次踩出来的：
+
+- **补丁段的标签与顺序以已提交补丁为模版**：`--- /dev/null` 是 kiln 判"创建文件"的唯一依据，`--- a/path` 会被当成
+  "修改一个已有文件"，于是"the file does not exist"；段序与标签从 `git show HEAD:…patch` 读出来，重新生成后
+  逐字节可比。
+- **scaffold 只能加不能删**：5.4 的 stub 里 `last_position` 还是 5.3 的形状，把快照回退的修复加进 stub 会让
+  scaffold 删一行（被 `authoring.md` §5 拒绝）——所以那处修复属于 5.4 的**参考解**，stub 保持原样；同理 5.2 的
+  stub 里 `last_index/last_term` 是洞，5.3 起的 stub 才是实现（否则会把上一步的工作回退成洞）。
+
+**内容**：5.6/5.8/5.10 的 DONE WHEN 里的测试目标名（`spec_read`/`spec_idempotency`/`spec_kv`）与实际规格文件名
+（`spec_lease_reads`/`spec_duplicates`/`spec_deterministic_apply`）对齐；5.16 的 sim 头写错步骤名（`chaos-injection`
+→ `chaos-matrix`）；5.16/5.21 正文承诺"`links` judges it"却没挂门，补上；5.17 的页面 7 节点 ack 数 2000 → 3000、
+"per-node average falls" 改成 "rises"（模型是 `(n−1)/n`），模块文档与规格测试名一起改；5.11 的页面与规格把
+`RetriesExhausted` 不可重试写成明文；m4-plan §2/§6 的门阶梯与 track.toml 对齐（mutants 4 步、sim 9 步、
+bench-budget 3 步、links 12 步）；README 的 T5 状态与计数刷新。
+
+**规格两次补钉**：5.2 增加 `the_log_reports_its_own_end`（`last_index/last_term` 是交付物——5.3 的 scaffold 会调用它们，
+不写进规格，学员的树在下一步就编译不过）；5.11 增加"`RetriesExhausted` 不可重试"的断言。`kiln spec manifest` 重钉 22 份。
+
+**第三次踩到同一条**：手插的 `isolated()` 修复没走 rustfmt，5.14 的 `fmt` 门红了一次
+（`*other != node && ...` 被拆成三行）。修复应用到树之后必须 `rustfmt` 再 `diff -u`——这正是 §1 第 6 条的由来，
+这次是它第三次抓到同一类疏忽。
+
+## 段 13：BP —— T5 的 18 道探题（池 65 → 83）
+
+按 D-6 排除 5 个槽位（`aware` 政策、四个机制不在单文件里的 design/operate，理由见 [t5-meshkv.md](t5-meshkv.md) §6），
+其余 18 个槽位各一道，四批并行：
+
+| 批 | 槽位 |
+| --- | --- |
+| A | `dist/topology@apply`、`dist/consensus@apply`、`dist/snapshot@design`、`dist/membership@apply` |
+| B | `dist/linearizable-read@design`、`dist/client-routing@apply`、`api/idempotency-key@design`、`sec/mtls@apply` |
+| C | `dist/deterministic-state-machine@apply`、`api/client-sdk@apply`、`query/consistency-levels@apply`、`test/deterministic-simulation@design` |
+| D | `test/chaos-injection@design`、`perf/distributed-budget@design`、`obs/metrics-slo@operate`、`unsafe/hand-rolled@operate`、`dist/protocol-evolution@design`、`ops/rolling-upgrade@design` |
+
+**实测**：`kiln probe --check` → `83 exercise(s) · 83 reference(s) passed`；每对文件 7–10 条用例、`diff -u` 的 hunk
+2–6 个（每个 hunk 只删桩行）、`rustfmt --check` 全过、**没有 `unsafe` 关键字**（5.19 的题用安全代码重抽"下标协议"：
+满/空的判定、`saturating_sub`、容量掩码——`UnsafeCell` 与别名那一半在步骤里，不在题里）。5.8 的题与已有的
+`delivery-idempotency.design` 明确分工：那道是去重**窗口**，这道是**会话**——键归 SDK、重启后能认出重试、重复答复
+带原来的下标。

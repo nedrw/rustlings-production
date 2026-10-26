@@ -56,14 +56,14 @@
 | 5.12 | 一致性级别与受限查询 | `query/consistency-levels@apply` | teach | `slow:sim@3` |
 | 5.13 | 确定性网络模拟（turmoil） | `test/deterministic-simulation@design` | teach | `slow:sim@3`（seed 重放） |
 | 5.14 | 分区与脑裂演练 | `dist/partition-drill@operate` | teach | `slow:sim@3` |
-| 5.15 | 集群故障转移与滚动重启 | `ops/cluster-drill@operate` | teach | 装置形态照 4.24 的 runbook 仪器 |
-| 5.16 | 混沌注入深化 | `test/chaos-injection@design` | teach | `slow:sim@3` |
+| 5.15 | 集群故障转移与滚动重启 | `ops/cluster-drill@operate` | teach | `links`；装置形态照 4.24 的 runbook 仪器 |
+| 5.16 | 混沌注入深化 | `test/chaos-injection@design` | teach | `slow:sim@3`、`links` |
 | 5.17 | 分布式性能预算 | `perf/distributed-budget@design` | teach | `slow:bench-budget@10`（节点数扫描） |
 | 5.18 | 集群可观测性 | `obs/metrics-slo@operate` | **deepen**（mailer@aware → relay/jobq@… → 这里 operate） | `slow:bench-budget@10` |
-| 5.19 | unsafe 深潜：自研结构 + miri + loom | `unsafe/hand-rolled@operate` | teach | `unsafe-budget@N>0` 首次放开 + miri 装置 |
-| 5.20 | 复用 `jobq` 引擎 | `api/library-reuse@design` | teach | 装置 diff `app/jobq` 全程零改动 |
-| 5.21 | 协议与升级演进 | `dist/protocol-evolution@design`、`ops/rolling-upgrade@design` | teach | `slow:sim@3`（新旧混跑） |
-| 5.22 | 毕业演练：多节点故障 + 一致性审计 | `dist/consistency-audit@operate` | teach | 照 4.24 仪器 + 审计脚本 |
+| 5.19 | unsafe 深潜：自研结构 + miri + loom | `unsafe/hand-rolled@operate` | teach | `unsafe-budget@5` 首次放开、`links` + miri 装置 |
+| 5.20 | 复用 `jobq` 引擎 | `api/library-reuse@design` | teach | `links`；装置 diff `app/jobq` 全程零改动 |
+| 5.21 | 协议与升级演进 | `dist/protocol-evolution@design`、`ops/rolling-upgrade@design` | teach | `slow:sim@3`（新旧混跑）、`links` |
+| 5.22 | 毕业演练：多节点故障 + 一致性审计 | `dist/consistency-audit@operate` | teach | `links`；照 4.24 仪器 + 审计脚本 |
 
 ## 3. 项目形状、数据模型与依赖决定
 
@@ -107,12 +107,15 @@
 ## 6. T5 的门阶梯（起点 = T4 的终点）
 
 - **持久基线（5.1 起全程）**：`spec-integrity`、`caps`、`i18n`、`fmt`、`clippy@4`、`no-todo`、`docs:public`、
-  `exit-code`、`unsafe-budget@0`（继承自 4.7 的持久属性；5.19 按预算放开后**不再收回**——阶梯只收紧）。
+  `exit-code`、`unsafe-budget@0`（继承自 4.7 的持久属性；5.19 放开到 `unsafe-budget@5` 后**不再收回**——阶梯只收紧）。
 - **不继承 `semver`**：T5 没有 `api/library-design` 槽位；5.20 的复用判据是「零改动 diff」，比基线更强。
-- **`links` 步骤作用域**：只写在真交页面的步骤（预计 5.3、5.4、5.9、5.13、5.14、5.15、5.17、5.18、5.19、5.20、5.22）。
-- **`slow:mutants@80` 只在 5 个步骤**（5.3、5.5、5.7、5.10、5.21）：共识与状态机是正确性关键中的关键；
-  演练/运维步（5.14/5.15/5.22）由 sim 与仪器判，不凑变异比。
-- **`slow:sim@3` 是 M4 的主力门**（10 个步骤）：确定性是 M4 的验收主词，turmoil 剧本 + digest 重放。
+- **`links` 步骤作用域**：只写在真交页面的步骤，实际 12 个（5.4、5.9、5.13、5.14、5.15、5.16、5.17、
+  5.18、5.19、5.20、5.21、5.22）；5.2 的 `docs/consensus.md` 由 spec 逐字比对，比链接更严，不再叠门。
+- **`slow:mutants@80` 只在 4 个步骤**（5.3、5.5、5.7、5.10）：共识与状态机是正确性关键中的关键；
+  演练/运维步（5.14/5.15/5.21/5.22）由 sim 与仪器判，不凑变异比。
+- **`slow:sim@3` 是 M4 的主力门**（9 个步骤：5.3、5.5、5.9、5.10、5.12、5.13、5.14、5.16、5.21）：
+  确定性是 M4 的验收主词，turmoil 剧本 + digest 重放。
+- **`slow:bench-budget@10` 在 3 个步骤**（5.4、5.17、5.18）：计数预算只在真有可计数的模型处出现。
 - **镜像/容器**：meshkv 本身不出镜像（分布式步的容器编排不在判据里）；`images`/`container-repro` 不进阶梯。
 
 ## 7. 决策点（按推荐执行，除非否决）
@@ -124,7 +127,7 @@
 | **D-3** | 跨 track 依赖的机制 | (a) track.toml `requires_track` + 砂箱铺 jobq 参考树（上面 C1）；(b) vendor 冻结副本进 meshkv 骨架 | **(a)**：5.20 的判据是「引擎零改动被接入」，vendor 恰好把判据变成空话；(b) 还让 jobq 的后续修复无法到达 T5 |
 | **D-4** | miri 进不进 CI | (a) 只做步骤作用域装置（5.19 跑、`doctor` 报告、缺组件标 skipped）；(b) 全局 CI 跑 | **(a)**：miri 慢一个数量级，且只服务 5.19 的一小段自研结构；plan §10「缺工具不改判」 |
 | **D-5** | 5.1 的 origin | (a) transfer；(b) teach | **(a)**：第五遍骨架，RECALL/DELTA 比 WHY 更诚实 |
-| **D-6** | T5 探题 | (a) 23 槽位里按政策排除后全出（预计排除 `aware`（5.2）与机制不在单文件里的 design（5.20 复用、5.14/5.15/5.22 演练），约 **17–18 道**）；(b) 分半两批 | **(a)**：M2/M3 同一先例（缺题的槽位只能 `--force`）；排在对应步骤之后出题 |
+| **D-6** | T5 探题 | (a) 23 槽位里按政策排除后全出（排除 `aware`（5.2）与机制不在单文件里的 design（5.20 复用、5.14/5.15/5.22 演练），**18 道**）；(b) 分半两批 | **(a)**：M2/M3 同一先例（缺题的槽位只能 `--force`）；排在对应步骤之后出题，池 65 → 83 |
 | **D-7** | obs/metrics-slo@operate 的 deepen 写法 | (a) 集群维度的 SLO 页 + 仪器（谁落后、谁抖动），复用 4.24 的仪器形态；(b) 再教一遍指标 | **(a)**：deepen 的定义是「同一能力在更难的失败模式下」，不重教 |
 
 ## 8. 批次与顺序
@@ -139,7 +142,7 @@
 | **B3** | 5.10–5.13（状态机、SDK、一致性级别、turmoil 接入——M4 的主词在这里立起来） | 同上 |
 | **B4** | 5.14–5.17（分区演练、滚动重启、混沌、分布式预算） | 同上 |
 | **B5** | 5.18–5.22（可观测 deepen、unsafe 深潜、jobq 复用、协议演进、毕业审计） | 同上 |
-| **BP** | ~17–18 道探题 + 不出题理由表 | 分批派子 agent |
+| **BP** | 18 道探题 + 不出题理由表（池 65 → 83） | 分批派子 agent |
 | **BV 验收** | §9 的腿 + `docs/t5-meshkv.md` + `handoff-m4.md` + 日志 + 收尾 | 我自己做 |
 
 每批收尾跑该段的 `kiln verify meshkv --slow` 并复核原始行；B3 结束给中间检查点

@@ -50,8 +50,9 @@ with stricter gates and fewer hints.
   checklists.
 - **[docs/t1-mailer.md](docs/t1-mailer.md)** — T1 `mailer` as delivered: the 22 steps, the gate
   ladder, the project's final shape, the test fixtures, the patterns T2–T5 copy, and the measured
-  numbers. [docs/t2-relay.md](docs/t2-relay.md), [docs/t3-jobq.md](docs/t3-jobq.md) and
-  [docs/t4-lakelet.md](docs/t4-lakelet.md) record T2–T4 in the same shape.
+  numbers. [docs/t2-relay.md](docs/t2-relay.md), [docs/t3-jobq.md](docs/t3-jobq.md),
+  [docs/t4-lakelet.md](docs/t4-lakelet.md) and [docs/t5-meshkv.md](docs/t5-meshkv.md) record T2–T5 in
+  the same shape.
 - **[docs/handoff-m0.md](docs/handoff-m0.md)** — the compressed M0 brief: scope, acceptance, verified
   environment facts, conventions, and where everything else lives. Read this one first;
   [docs/handoff-m0-log.md](docs/handoff-m0-log.md) is the build log behind it (per-segment progress,
@@ -94,11 +95,10 @@ step's own `links` gate).
   `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 then; the current
   tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
   patch-engine fixes, not with a change to what is judged.)
-- On the current tree (M3, closed): `kiln lint-caps` — `97 capabilities · 136 slots · 119
-  ledger positions · 119 authored steps` (T1–T4 bodies + T5 metadata; T5's bodies arrive
-  batch by batch), no issues; `kiln links` — 116 pages, 555 links, 330
-  external targets, 0 findings; `kiln probe --check` — 65/65 (47 s, measured for
-  [docs/t4-lakelet.md](docs/t4-lakelet.md)); `cargo test -p kiln` — 335 + 21 + 1 tests;
+- On the current tree (M4, T5 authored end to end): `kiln lint-caps` — `97 capabilities · 136
+  slots · 119 ledger positions · 119 authored steps` (all five tracks' bodies), no issues;
+  `kiln links` — 139 pages, 557 links, 330 external targets, 0 findings; `kiln probe --check` —
+  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 338 + 21 + 1 tests;
   the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
   `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
   `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s).
@@ -137,7 +137,7 @@ cargo run -p kiln -- review --due               # capabilities whose last proof 
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
 cargo run -p kiln -- links                      # the repository's own links, offline (learner projects aside)
 cargo run -p kiln -- spec restore               # put the course's spec files back
-cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 steps (T5 bodies in progress)
+cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 steps, all authored
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```
