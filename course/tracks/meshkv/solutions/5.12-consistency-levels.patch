@@ -1,0 +1,119 @@
+--- a/src/consistency.rs
++++ b/src/consistency.rs
+@@ -1,7 +1,3 @@
+-#![allow(dead_code)]
+-// the stub keeps the values the implementation will read; the reference
+-// solution drops the allowance, because by then every one is used.
+-
+ //! Consistency is a dial: what each level promises, and what it costs.
+ //!
+ //! `meshkv/5.6-lease-reads` gave one answer: a leader with a lease may serve a read, and it is
+@@ -33,7 +29,7 @@
+ //! module here is.
+ 
+ use crate::cluster::NodeId;
+-use crate::error::Result;
++use crate::error::{Error, Result};
+ use crate::raft::Index;
+ 
+ /// How fresh a read has to be.
+@@ -57,20 +53,38 @@
+     ///
+     /// [`Error::Invalid`] when the text is not one of the three, or when a bound is not a number.
+     pub fn parse(text: &str) -> Result<Self> {
+-        let _ = text;
+-        todo!("meshkv/5.12-consistency-levels: Level::parse")
++        match text {
++            "linearizable" => Ok(Self::Linearizable),
++            "local" => Ok(Self::Local),
++            other => {
++                let Some(bound) = other.strip_prefix("bounded-stale:") else {
++                    return Err(Error::invalid(format!(
++                        "`{text}` is not a consistency level: `linearizable`, `bounded-stale:<n>` or \
++                         `local`"
++                    )));
++                };
++                let max_lag = bound
++                    .parse::<Index>()
++                    .map_err(|_| Error::invalid(format!("`{bound}` is not a number of entries")))?;
++                Ok(Self::BoundedStale { max_lag })
++            }
++        }
+     }
+ 
+     /// The level as it is written.
+     #[must_use]
+     pub fn render(self) -> String {
+-        todo!("meshkv/5.12-consistency-levels: Level::render")
++        match self {
++            Self::Linearizable => "linearizable".to_owned(),
++            Self::BoundedStale { max_lag } => format!("bounded-stale:{max_lag}"),
++            Self::Local => "local".to_owned(),
++        }
+     }
+ 
+     /// `true` when the level is the strongest one.
+     #[must_use]
+     pub fn is_linearizable(self) -> bool {
+-        todo!("meshkv/5.12-consistency-levels: Level::is_linearizable")
++        matches!(self, Self::Linearizable)
+     }
+ }
+ 
+@@ -93,7 +107,7 @@
+     /// `true` when the read was answered.
+     #[must_use]
+     pub fn is_served(&self) -> bool {
+-        todo!("meshkv/5.12-consistency-levels: Answer::is_served")
++        matches!(self, Self::Served { .. })
+     }
+ }
+ 
+@@ -116,6 +130,45 @@
+     commit: Option<Index>,
+     leader: Option<&NodeId>,
+ ) -> Answer {
+-    let _ = (level, is_leader, lease_index, applied, commit, leader);
+-    todo!("meshkv/5.12-consistency-levels: Answer::answer")
++    match level {
++        Level::Linearizable => match (is_leader, lease_index) {
++            (true, Some(index)) => Answer::Served { index },
++            (true, None) => Answer::Refused {
++                reason: "this node leads but has no lease: a linearizable read needs a confirmed \
++                         round (5.6)"
++                    .to_owned(),
++            },
++            (false, _) => Answer::Refused {
++                reason: match leader {
++                    Some(leader) => format!(
++                        "this node is a follower: a linearizable read has to be served by `{leader}`"
++                    ),
++                    None => "this node is a follower and knows no leader yet".to_owned(),
++                },
++            },
++        },
++        Level::BoundedStale { max_lag } => match commit {
++            None => Answer::Refused {
++                reason: "this node has heard of no leader, so it cannot show how far behind it is"
++                    .to_owned(),
++            },
++            Some(commit) => {
++                if commit <= applied {
++                    // This node is at or ahead of the commit it knows about: nothing to bound.
++                    return Answer::Served { index: applied };
++                }
++                let lag = commit - applied;
++                if lag <= max_lag {
++                    Answer::Served { index: applied }
++                } else {
++                    Answer::Refused {
++                        reason: format!(
++                            "this node is {lag} entries behind and the level allows {max_lag}"
++                        ),
++                    }
++                }
++            }
++        },
++        Level::Local => Answer::Served { index: applied },
++    }
+ }

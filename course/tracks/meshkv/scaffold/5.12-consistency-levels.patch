@@ -1,0 +1,277 @@
+--- /dev/null
++++ b/src/consistency.rs
+@@ -0,0 +1,121 @@
++#![allow(dead_code)]
++// the stub keeps the values the implementation will read; the reference
++// solution drops the allowance, because by then every one is used.
++
++//! Consistency is a dial: what each level promises, and what it costs.
++//!
++//! `meshkv/5.6-lease-reads` gave one answer: a leader with a lease may serve a read, and it is
++//! linearizable. That is the strongest promise and the most expensive one — every read needs the
++//! leader, and the leader is one node out of three.
++//!
++//! Most reads do not need that. A dashboard that refreshes every ten seconds does not care whether
++//! it sees the write that landed one millisecond ago; a cache warmer does not care about a second
++//! of staleness; a debugging tool wants *some* answer quickly and will say so. The dial is how a
++//! caller says what it needs, and the three levels here are the ones every replicated store offers:
++//!
++//! * [`Level::Linearizable`]: the answer is correct as of a moment after the read began. It needs
++//!   the leader (`5.6`), and it is the only level that can be served by one node.
++//! * [`Level::BoundedStale`]: the answer is at most `max_lag` entries behind the cluster's commit.
++//!   Any node that can show it is within the bound may answer — a follower with a fresh enough
++//!   state, which spreads the read load off the leader.
++//! * [`Level::Local`]: the answer is whatever this node has applied. No bound at all; useful when
++//!   the caller is asking about *this node* (an operator's view, a test, a cache fill).
++//!
++//! The interesting part is not the enum. It is that **each level has to be refused when it cannot be
++//! honoured**: a follower asked for linearizable reads has to say so rather than answer from its
++//! own state, and a node asked for bounded-stale has to be able to *show* its lag rather than assume
++//! it. A level that is silently downgraded is worse than a level that is refused, because the caller
++//! never learns which promise it got.
++//!
++//! The lag is an argument, not a measurement the module makes itself: a node knows its applied index
++//! and learns the leader's commit index from the leader's messages (`5.3`), and the caller passes
++//! both. That keeps the module free of time and of the network, for the same reason every other
++//! module here is.
++
++use crate::cluster::NodeId;
++use crate::error::Result;
++use crate::raft::Index;
++
++/// How fresh a read has to be.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Level {
++    /// Correct as of a moment after the read began: the leader's lease (`5.6`).
++    Linearizable,
++    /// At most `max_lag` entries behind the cluster's commit.
++    BoundedStale {
++        /// The largest lag, in entries, this read may accept.
++        max_lag: Index,
++    },
++    /// Whatever this node has applied. No promise about staleness at all.
++    Local,
++}
++
++impl Level {
++    /// Parse `linearizable`, `bounded-stale:<entries>` or `local`.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::Invalid`] when the text is not one of the three, or when a bound is not a number.
++    pub fn parse(text: &str) -> Result<Self> {
++        let _ = text;
++        todo!("meshkv/5.12-consistency-levels: Level::parse")
++    }
++
++    /// The level as it is written.
++    #[must_use]
++    pub fn render(self) -> String {
++        todo!("meshkv/5.12-consistency-levels: Level::render")
++    }
++
++    /// `true` when the level is the strongest one.
++    #[must_use]
++    pub fn is_linearizable(self) -> bool {
++        todo!("meshkv/5.12-consistency-levels: Level::is_linearizable")
++    }
++}
++
++/// What a node answers a read at a level with.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Answer {
++    /// The answer is correct at this index (the promise is the level that was asked for).
++    Served {
++        /// The position the answer is correct at.
++        index: Index,
++    },
++    /// The level cannot be honoured here, and this is why.
++    Refused {
++        /// What would have to change for this node to answer.
++        reason: String,
++    },
++}
++
++impl Answer {
++    /// `true` when the read was answered.
++    #[must_use]
++    pub fn is_served(&self) -> bool {
++        todo!("meshkv/5.12-consistency-levels: Answer::is_served")
++    }
++}
++
++/// Answer a read at `level`, from one node's view.
++///
++/// * `is_leader`: whether this node is the leader.
++/// * `lease_index`: the index the leader's lease was granted at (`5.6`), if it has one.
++/// * `applied`: how far this node has applied.
++/// * `commit`: the leader's commit index, as this node last heard it — `None` when it has heard of
++///   no leader, which is exactly when a bounded-stale read cannot be shown to be within its bound.
++///
++/// The function is pure: every fact it needs is an argument, including the lag, so a caller can test
++/// the boundary of a level without a cluster.
++#[must_use]
++pub fn answer(
++    level: Level,
++    is_leader: bool,
++    lease_index: Option<Index>,
++    applied: Index,
++    commit: Option<Index>,
++    leader: Option<&NodeId>,
++) -> Answer {
++    let _ = (level, is_leader, lease_index, applied, commit, leader);
++    todo!("meshkv/5.12-consistency-levels: Answer::answer")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,6 +21,7 @@
+ // (docs/authoring.md §5).
+ // kiln:scaffold:begin
+ pub mod client;
++pub mod consistency;
+ pub mod idempotency;
+ pub mod kv;
+ pub mod raft;
+--- /dev/null
++++ b/tests/sim_consistency.rs
+@@ -0,0 +1,140 @@
++//! The instrument for `meshkv/5.12-consistency-levels`: the same three nodes, read three ways.
++//!
++//! Course content, shipped by the step's scaffold. The scenario is the dial: a cluster whose nodes
++//! are at different applied indices, and one read per node per level. What the seed decides is the
++//! order the reads happen in — and, because the nodes' indices are drawn from it too, which node is
++//! furthest behind. What it does not decide is the *verdict* for a level at a given lag, because
++//! that is the contract.
++//!
++//! The transcript is the `meshkv-sim <name>=<value>` lines below: names, counts and verdicts, never
++//! a clock or a path.
++
++use meshkv::cluster::NodeId;
++use meshkv::consistency::{Answer, Level, answer};
++
++/// The variable the `sim` gate sets the seed with.
++const SEED: &str = "KILN_SIM_SEED";
++
++fn seed() -> u64 {
++    std::env::var(SEED)
++        .ok()
++        .and_then(|text| text.trim().parse::<u64>().ok())
++        .unwrap_or(1)
++}
++
++fn id(text: &str) -> NodeId {
++    NodeId::parse(text).expect("a valid name")
++}
++
++struct Rng(u64);
++
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 ^= self.0 << 13;
++        self.0 ^= self.0 >> 7;
++        self.0 ^= self.0 << 17;
++        self.0
++    }
++
++    fn below(&mut self, bound: usize) -> usize {
++        (self.next() % bound as u64) as usize
++    }
++}
++
++#[test]
++fn each_level_answers_what_it_promises_and_refuses_what_it_cannot() {
++    let seed = seed();
++    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
++    let commit = 40u64;
++    let leader = id("n1");
++
++    // Three nodes, at applied indices the seed picks below the commit.
++    let mut nodes: Vec<(&str, u64)> = vec![
++        ("n1", commit - rng.below(5) as u64),
++        ("n2", commit - rng.below(20) as u64),
++        ("n3", commit - rng.below(20) as u64),
++    ]
++    .into_iter()
++    .collect::<Vec<_>>();
++    nodes.sort_by_key(|(_, applied)| *applied);
++    println!(
++        "meshkv-sim applied behind={}",
++        commit - nodes.first().map(|(_, applied)| *applied).unwrap_or(commit)
++    );
++
++    // Linearizable: only the leader, and only with a lease.
++    let served = answer(
++        Level::Linearizable,
++        true,
++        Some(commit),
++        commit,
++        Some(commit),
++        None,
++    );
++    println!(
++        "meshkv-sim linearizable_leader served={}",
++        u8::from(served.is_served())
++    );
++    let follower = answer(
++        Level::Linearizable,
++        false,
++        None,
++        commit,
++        Some(commit),
++        Some(&leader),
++    );
++    println!(
++        "meshkv-sim linearizable_follower served={}",
++        u8::from(follower.is_served())
++    );
++    assert!(served.is_served(), "the leader with a lease serves it");
++    assert!(!follower.is_served(), "a follower refuses it");
++
++    // Bounded-stale over every node: served exactly when the lag fits.
++    for (name, applied) in &nodes {
++        let lag = commit - applied;
++        let within = answer(
++            Level::BoundedStale { max_lag: 5 },
++            false,
++            None,
++            *applied,
++            Some(commit),
++            Some(&leader),
++        );
++        println!(
++            "meshkv-sim bounded peer={name} lag={lag} served={}",
++            u8::from(within.is_served())
++        );
++        assert_eq!(
++            within.is_served(),
++            lag <= 5,
++            "the bound is the verdict: {name} is {lag} behind"
++        );
++        if let Answer::Served { index } = within {
++            assert_eq!(
++                index, *applied,
++                "an answered read names the position it is correct at"
++            );
++        }
++    }
++
++    // Local: every node answers, whatever its lag.
++    for (name, applied) in &nodes {
++        let local = answer(
++            Level::Local,
++            false,
++            None,
++            *applied,
++            Some(commit),
++            Some(&leader),
++        );
++        println!(
++            "meshkv-sim local peer={name} index={}",
++            match local {
++                Answer::Served { index } => index,
++                Answer::Refused { .. } => 0,
++            }
++        );
++        assert!(local.is_served(), "a local read promises only this node");
++    }
++}

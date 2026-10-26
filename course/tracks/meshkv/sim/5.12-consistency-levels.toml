@@ -1,0 +1,15 @@
+# The schedules `meshkv/5.12-consistency-levels` is judged by.
+#
+# Course content, at the same trust level as `spec/`: the `sim` gate reads *this* copy. The command
+# is the project's own harness (`tests/sim_consistency.rs`, which this step's scaffold ships).
+#
+# `seeds` is three schedules: `slow:sim@3` asks for at least three, and the gate demands that at
+# least two produce different transcripts. What the seed decides here is how far behind each node is
+# and the order the reads happen in — so a different seed is a different set of lags. What does not
+# depend on the seed is the verdict: a bound of five serves a lag of five and refuses a lag of six,
+# every time.
+#
+# `replay = 1` is the seed run twice; the transcripts have to be byte-identical.
+command = "cargo test -p meshkv --test sim_consistency -- --nocapture"
+seeds = [1, 7, 20260101]
+replay = 1
