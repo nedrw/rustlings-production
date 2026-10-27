@@ -38,6 +38,12 @@ pub struct Glossary {
 pub struct Term {
     /// The wording per locale (`zh-Hans` → `配置`).
     pub renderings: BTreeMap<String, String>,
+    /// Other wordings this locale accepts for the same English word.
+    ///
+    /// `subscriber` is the newsletter's person (订阅者) and tracing's sink (订阅器), and both are
+    /// right where they appear: the table cannot tell which sense a sentence means, and refusing
+    /// one of them would make the check argue with correct translations.
+    pub also: BTreeMap<String, Vec<String>>,
     /// Phrases in which this term means something else, and the table does not apply.
     pub except: Vec<String>,
     /// A note for the translator; never checked.
@@ -59,6 +65,8 @@ struct RawTerm {
     zh_hans: Option<String>,
     #[serde(default)]
     except: Vec<String>,
+    #[serde(rename = "zh-Hans-also", default)]
+    zh_hans_also: Vec<String>,
     note: Option<String>,
 }
 
@@ -96,10 +104,15 @@ pub fn read(course_dir: &Path) -> Result<Option<Glossary>> {
         if let Some(zh) = term.zh_hans {
             renderings.insert("zh-Hans".to_owned(), zh);
         }
+        let mut also = BTreeMap::new();
+        if !term.zh_hans_also.is_empty() {
+            also.insert("zh-Hans".to_owned(), term.zh_hans_also);
+        }
         glossary.terms.insert(
             english,
             Term {
                 renderings,
+                also,
                 except: term.except,
                 note: term.note,
             },
@@ -233,20 +246,82 @@ fn says(text: &str, word: &str) -> bool {
         .contains(word)
 }
 
-/// `true` when the source uses the term in a sense the table does not cover.
+/// `true` when the source uses the term **only** in senses the table does not cover.
 ///
 /// A term can mean two things in the same course: `probe` is the course's own exercise and the
 /// Kubernetes sense of the word, and a translation that writes 存活探针 for the second is right.
-/// The table says so in the term's `except` list, and the check then leaves that use alone.
+/// The table lists those phrases in the term's `except` list, and this function decides.
+///
+/// The rule is per *occurrence*, not per step: every place the word appears has to be inside an
+/// excepted phrase for the step to be left alone. A step-wide exemption was the first version, and
+/// it was silently wrong — replacing every 探针 with 探题 in a step that mentions both senses was
+/// not reported, which is the check switched off for that step rather than a judgement about one
+/// use of the word.
 fn excluded(source: &str, english: &str, glossary: &Glossary) -> bool {
     let Some(term) = glossary.terms.get(english) else {
         return false;
     };
     let prose = prose_only(source).to_lowercase();
-    term.except.iter().any(|phrase| {
-        let phrase = phrase.to_lowercase();
-        prose.contains(&phrase)
-    })
+    let excepted: Vec<String> = term
+        .except
+        .iter()
+        .map(|phrase| phrase.to_lowercase())
+        .collect();
+    let mut remaining = prose.as_str();
+    let mut seen = false;
+    while let Some(found) = find_word(remaining, english) {
+        seen = true;
+        let at = found;
+        // The occurrence is covered when one of the excepted phrases covers the same stretch.
+        let mut covered = false;
+        for phrase in &excepted {
+            let window_start = at.saturating_sub(phrase.len());
+            let window_end = (at + english.len() + phrase.len()).min(prose.len());
+            if let Some(slice) = prose.get(window_start..window_end)
+                && slice.contains(phrase.as_str())
+                && !slice.is_empty()
+            {
+                // The phrase has to contain the term, not just sit near it.
+                if let Some(offset) = slice.find(phrase.as_str()) {
+                    let phrase_start = window_start + offset;
+                    let phrase_end = phrase_start + phrase.len();
+                    if phrase_start <= at && at + english.len() <= phrase_end {
+                        covered = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !covered {
+            return false;
+        }
+        remaining = &remaining[found + english.len()..];
+    }
+    // Every occurrence was inside an excepted phrase (or there was none).
+    let _ = seen;
+    true
+}
+
+/// Byte offset of `word` in `body` as a whole word, if it is there.
+fn find_word(body: &str, word: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = body[from..].find(word) {
+        let start = from + found;
+        let end = start + word.len();
+        let before_ok = body[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let after_ok = body[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = start + 1;
+    }
+    None
 }
 
 /// A step's translation does not use the wording the table agreed on.
@@ -279,7 +354,16 @@ pub fn mismatches(
         let Some(agreed) = rendering(glossary, &english, locale) else {
             continue;
         };
-        if !says(translation, agreed) {
+        let accepted = std::iter::once(agreed).chain(
+            glossary
+                .terms
+                .get(&english)
+                .and_then(|term| term.also.get(locale))
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        );
+        if !accepted.into_iter().any(|word| says(translation, word)) {
             found.push(Mismatch {
                 step: step.to_owned(),
                 english,
@@ -300,6 +384,7 @@ mod tests {
             "setting".to_owned(),
             Term {
                 renderings: BTreeMap::from([("zh-Hans".to_owned(), "设置项".to_owned())]),
+                also: BTreeMap::new(),
                 except: Vec::new(),
                 note: None,
             },
@@ -308,6 +393,7 @@ mod tests {
             "route".to_owned(),
             Term {
                 renderings: BTreeMap::from([("zh-Hans".to_owned(), "路由".to_owned())]),
+                also: BTreeMap::new(),
                 except: Vec::new(),
                 note: None,
             },
@@ -372,6 +458,35 @@ mod tests {
         assert!(
             says("一条 lint 默\n认是什么级别", "默认"),
             "a Chinese word split by the wrap is the word"
+        );
+    }
+
+    #[test]
+    fn a_second_accepted_wording_is_the_word_too() {
+        let mut glossary = glossary();
+        if let Some(term) = glossary.terms.get_mut("setting") {
+            term.also
+                .insert("zh-Hans".to_owned(), vec!["项".to_owned()]);
+        }
+        let found = mismatches(
+            "mailer/1.4-config",
+            "each setting has a default",
+            "每一项都有默认值",
+            &glossary,
+            "zh-Hans",
+        );
+        assert!(found.is_empty(), "{found:?}");
+        let found = mismatches(
+            "mailer/1.4-config",
+            "each setting has a default",
+            "每个都有默认值",
+            &glossary,
+            "zh-Hans",
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "neither wording is a licence to leave the word out: {found:?}"
         );
     }
 

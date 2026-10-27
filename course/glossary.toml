@@ -49,7 +49,8 @@ note = "「这一步」「第 N 步」都算；作为名词时也可以写「步
 
 [terms."probe"]
 zh-Hans = "探题"
-except = ["liveness probe"]
+zh-Hans-also = ["探针"]
+except = ["liveness probe", "readiness probe"]
 note = "a small exercise that re-checks one capability; `course/probes/`. The Kubernetes sense of the word is a different term — see `liveness probe`"
 
 [terms."drill"]
@@ -143,9 +144,12 @@ zh-Hans = "关联 id"
 [terms."log level"]
 zh-Hans = "日志级别"
 
+
 [terms."subscriber"]
-zh-Hans = "订阅器"
-note = "tracing's sink; the thing that decides where a log line goes"
+zh-Hans = "订阅者"
+zh-Hans-also = ["订阅器"]
+except = []
+note = "the newsletter's person is 订阅者 (a row in `subscribers`); tracing's sink is 订阅器. Both are right where they appear, so both are accepted"
 
 [terms."router"]
 zh-Hans = "路由"
