@@ -380,3 +380,37 @@ zh-Hans = "熔断器"
 
 [terms."backpressure"]
 zh-Hans = "背压"
+
+[terms."drain"]
+zh-Hans = "排干"
+zh-Hans-also = ["排空"]
+note = "finishing the work already accepted before stopping; `mailer/1.14`'s word, used from T2 on"
+
+[terms."lane"]
+zh-Hans = "车道"
+note = "one ordering lane (the traffic metaphor, `relay/2.9`); not 泳道, which is a diagram's swimlane"
+
+[terms."seat"]
+zh-Hans = "座位"
+note = "a reserved place in a bounded queue (`mailer/1.14`)"
+
+[terms."token bucket"]
+zh-Hans = "令牌桶"
+
+[terms."constant time"]
+zh-Hans = "恒定时间"
+
+[terms."runbook"]
+zh-Hans = "runbook"
+note = "kept in Latin: it is the word the page's own title uses"
+
+[terms."deadline"]
+zh-Hans = "截止时间"
+zh-Hans-also = ["死线", "期限"]
+
+[terms."credential"]
+zh-Hans = "凭据"
+zh-Hans-also = ["凭证"]
+
+[terms."fault"]
+zh-Hans = "故障"
