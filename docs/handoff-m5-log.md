@@ -139,3 +139,20 @@ M5 接下来该做的（按 plan §11 的次序）：中文翻译续做（下一
 **译文的覆盖面**：zh-Hans 从 3 步到 **10 步**（mailer 1.1–1.8 + 之前的三步复核），结构 0 error、漂移 0 warning。
 两个翻译 agent 各自独立指出词表缺词与冲突（`probe` 与存活探针、`app factory`、缺 catch-all/fallback/extractor），
 这些都补进了表里。
+
+## 段 8：一个死了的 owner 能把 CI 搁置半小时
+
+CI 这次挂在 `kiln` 自己的一个集成测试上（`coverage_measures_the_step_module_or_names_the_component_to_install`），
+原因不是课程而是**锁**：`coverage` 门在共享缓存里建一个有锁的构建目录，锁文件记下 owner 的 pid 与时刻，
+但**没人检查那个 pid 还活着没有**。我为了并行工作杀掉的 CI 留下的锁，让下一个运行等满 `CLAIM_STALE`
+（三十分钟）——而那个 pid 早就死了。
+
+修法：`claim_within` 在拿不到锁时读 pid，用 `ps -p <pid>` 问一句；问不到就立刻接管（与"文件比 `stale`
+更老"的旧规则并存，那条仍是兜底）。`ps` 是这个仓库已经在用的 POSIX 工具（进程夹具的 `SIGTERM` 就是
+它），`std` 里没有等价的问法。pid 会被复用，所以这个答案只是"大概不在了"——代价有界（锁被接管、两个
+运行写同一个构建目录），所以只在紧接着又一次 `take` 时才动手，旧的时间规则照旧兜底。两个单测钉住
+两侧：owner 死了要接管，owner 活着要等。
+
+**同一段里的一句自省**：这次的失败是**我自己并行跑工作**撞出来的（CI 在跑 `cargo test` 时我在同一个
+`XDG_CACHE_HOME` 下跑别的 kiln 命令）。这条也记在 [m4-t5-progress] 的记忆里：门之间共享的目录与锁，
+是为了让并发的运行互相绊住——所以**验证 CI 时不要在同一份缓存上并行做别的 kiln 工作**。

@@ -174,6 +174,17 @@ pub(crate) fn claim_within(lock: &Path, wait: Duration, stale: Duration) -> Resu
         if let Some(claim) = take(lock)? {
             return Ok(Some(claim));
         }
+        // A lock whose owner is gone is not a lock. The file records the owner's pid, and a run
+        // that was killed (or a machine that rebooted) never removes it — without this check the
+        // next run waits out `stale`, which is half an hour, on a file nobody holds. Measured: a
+        // CI run of this repository failed a gate because a killed run's pid in
+        // `coverage-target.lock` had been dead for two minutes.
+        if owner_is_gone(lock)
+            && std::fs::remove_file(lock).is_ok()
+            && let Some(claim) = take(lock)?
+        {
+            return Ok(Some(claim));
+        }
         // The file is there. One written longer ago than `stale` cannot belong to a running
         // process — its owner would have removed it — so it is taken over, once, and the attempt
         // that follows is immediate.
@@ -222,6 +233,36 @@ fn take(lock: &Path) -> Result<Option<Claim>> {
     Ok(Some(Claim {
         lock: lock.to_path_buf(),
     }))
+}
+
+/// `true` when the process that wrote `lock` is no longer running.
+///
+/// `ps -p <pid>` is the question the standard library cannot ask (there is no `kill(0)` in `std`,
+/// and `/proc` does not exist on every platform this course runs on). It is the same tool the
+/// project's own process fixture uses for `SIGTERM`, and the same caveat applies: a pid can be
+/// reused, so this answers "probably gone". The consequence of a wrong answer is bounded — the
+/// lock is taken over and the previous owner's build directory is written by two runs, which is
+/// what the claim exists to prevent — so it is only acted on together with a fresh `take`, and the
+/// age rule above remains the fallback for a lock whose pid never belonged to anything.
+fn owner_is_gone(lock: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(lock) else {
+        return false;
+    };
+    let Some(pid) = owner_in(&text).pid else {
+        return false;
+    };
+    if pid == std::process::id() {
+        // Our own pid: this process created the file a moment ago (or a previous incarnation with
+        // the same number did). Let the age rule decide.
+        return false;
+    }
+    let status = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .status();
+    matches!(status, Ok(status) if !status.success())
 }
 
 /// The lock file of a shared build directory `name`.
@@ -347,6 +388,49 @@ fn cache_base(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lock whose owner is dead is taken over instead of waited out.
+    #[test]
+    fn a_lock_whose_owner_is_gone_is_taken_over() {
+        let temp = crate::test_support::TempDir::new("claim-dead-owner");
+        let lock = temp.path().join("build.lock");
+        // A pid that cannot be running: the parent of every process is above this one's, and a
+        // pid of 0 is not a process `ps -p` reports.
+        std::fs::write(&lock, owner_of(0, SystemTime::now())).expect("the lock is written");
+        assert!(
+            owner_is_gone(&lock),
+            "pid 0 is not a running process, so the lock is nobody's"
+        );
+
+        let claim = claim_within(&lock, Duration::from_millis(50), CLAIM_STALE)
+            .expect("claiming works")
+            .expect("a dead owner's lock is taken over");
+        assert_eq!(
+            owner_in(&std::fs::read_to_string(&lock).expect("the new lock")).pid,
+            Some(std::process::id()),
+            "the lock now names this process"
+        );
+        drop(claim);
+        assert!(!lock.exists(), "the claim is released with the value");
+    }
+
+    /// A lock whose owner is alive is respected.
+    #[test]
+    fn a_lock_whose_owner_is_running_is_respected() {
+        let temp = crate::test_support::TempDir::new("claim-live-owner");
+        let lock = temp.path().join("build.lock");
+        std::fs::write(&lock, owner_of(std::process::id(), SystemTime::now())).expect("written");
+        assert!(
+            !owner_is_gone(&lock),
+            "this process is the owner, and it is running"
+        );
+        assert!(
+            claim_within(&lock, Duration::from_millis(30), CLAIM_STALE)
+                .expect("claiming works")
+                .is_none(),
+            "the claim is refused, not taken"
+        );
+    }
 
     #[test]
     fn a_cache_directory_comes_from_the_variable_that_says_so() {
