@@ -98,3 +98,10 @@ CI 的第二轮在 `mailer/1.6` 与 `1.7` 报 "BROKEN STEP: the spec passes on t
 **运行器的判决也改了**：脚手架通过时，它现在把两种可能都说出来（这一步真的分不开两个状态 / 这次跑的
 二进制不是这棵树的），并指出"单独跑这一步能分辨"。一个只说第一种可能的判决，会让下一次调查从错误的
 方向开始。
+
+**顺带的一条**：CI 那一轮还撞上一次 crates.io 索引停顿（"failed to transfer more than 10 bytes in
+30s"），一步因此被判红。cargo 的默认是"三十秒内不到十字节就放弃、重试三次"——那是为笔记本上的咖啡馆
+wifi 调的，不是为一台同时被一百个构建索取的机器。运行器现在给 cargo 三个更耐心的默认值
+（`CARGO_NET_RETRY=10`、`CARGO_HTTP_TIMEOUT=120`、`CARGO_HTTP_LOW_SPEED_LIMIT=1`），而且**调用方自己
+写的值优先**（学员想用 cargo 自己的行为、或 `CARGO_NET_OFFLINE=true`，都还是他的）。一个单测把这三个
+默认值钉住。

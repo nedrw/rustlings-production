@@ -245,6 +245,26 @@ fn prepared(program: &str, args: &[&str], dir: &Path, env: &[(String, String)]) 
     {
         command.env("CARGO_TARGET_DIR", target_dir);
     }
+    if program == "cargo" {
+        // A slow network must not decide a step. Cargo's defaults give up on a transfer that
+        // manages ten bytes in thirty seconds, three times over — a rule tuned for a laptop on
+        // a café wifi, not for a machine whose index update stalls while a hundred builds ask
+        // for it at once. Measured: a CI run failed at `mailer/1.4-config` with "spurious
+        // network error … failed to transfer more than 10 bytes in 30s", and the step was
+        // reported as failing when the course had nothing to do with it.
+        //
+        // The knobs are only *defaults*: a caller that names its own wins, so a learner who
+        // wants cargo's own behaviour (or `CARGO_NET_OFFLINE=true`) still gets it.
+        for (name, value) in [
+            ("CARGO_NET_RETRY", "10"),
+            ("CARGO_HTTP_TIMEOUT", "120"),
+            ("CARGO_HTTP_LOW_SPEED_LIMIT", "1"),
+        ] {
+            if !env.iter().any(|(given, _)| given == name) && std::env::var_os(name).is_none() {
+                command.env(name, value);
+            }
+        }
+    }
     command
 }
 
@@ -503,6 +523,36 @@ fn drain(mut reader: impl Read) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The network knobs a judged cargo command gets.
+    #[test]
+    fn cargo_is_told_to_be_patient_with_a_slow_network() {
+        let command = prepared("cargo", &["test"], Path::new("."), &[]);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for (name, value) in [
+            ("CARGO_NET_RETRY", "10"),
+            ("CARGO_HTTP_TIMEOUT", "120"),
+            ("CARGO_HTTP_LOW_SPEED_LIMIT", "1"),
+        ] {
+            let given = envs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone());
+            assert_eq!(
+                given.flatten().as_deref(),
+                Some(value),
+                "{name} is the runner's default"
+            );
+        }
+    }
+
     use super::*;
     use crate::test_support::TempDir;
 
