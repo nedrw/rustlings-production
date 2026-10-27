@@ -414,3 +414,8 @@ zh-Hans-also = ["凭证"]
 
 [terms."fault"]
 zh-Hans = "故障"
+
+[terms."job"]
+zh-Hans = "作业"
+zh-Hans-also = ["任务"]
+note = "jobq's unit of work, as the course's own Chinese record has it (作业状态机, 作业数). mailer's delivery queue calls its unit 投递任务 — the same English word for a different object, and both are accepted"
