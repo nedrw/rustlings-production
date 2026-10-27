@@ -79,11 +79,21 @@ pub fn run(cli: &Cli, session: &Session, requested: &[String], track: Option<&st
         }
     };
     // One build directory for every command this run starts, so the dependencies of the project are
-    // compiled once per machine rather than once per step: nineteen throwaway copies of one project
+    // compiled once per *run* rather than once per step: nineteen throwaway copies of one project
     // would otherwise pay for the same crates nineteen times.
-    if let Some(target_dir) = crate::scratch::shared_target_dir() {
-        crate::process::share_cargo_target_dir(target_dir);
-    }
+    //
+    // It is this run's own directory and not the machine's shared one, and that is a correctness
+    // rule rather than a tidiness one. Cargo uplifts a built binary to `<target>/debug/<name>` — one
+    // path per package name — and a spec that starts a service does so through
+    // `CARGO_BIN_EXE_<name>`, which is that path. A shared directory therefore lets a build of
+    // *another* tree replace the binary a running spec is about to start: measured, a `kiln
+    // selftest` whose target directory was shared with a build left over from a killed run saw the
+    // *reference solution's* binary answer the scaffold's spec, and the step was reported as
+    // "BROKEN STEP: the spec passes on the scaffold" — a verdict about the course that was really a
+    // verdict about a stale binary. Per-run, the swap cannot happen: a build of another tree writes
+    // to another directory, and this run's own commands write to this one.
+    let target_dir = scratch.path().join("target");
+    crate::process::share_cargo_target_dir(target_dir);
     project::copy_tree(&session.course().dir(), &scratch.path().join(COURSE_DIR))?;
     // The repository's own toolchain and style settings reach `app/<track>` through the directory
     // it lives in, so the sandbox needs them too; otherwise the sandbox would compile with whatever
@@ -253,7 +263,8 @@ fn grade_spec(session: &Session, step: &Step, before_solution: bool, report: &mu
         (true, true) => {
             report.lines.push(
                 "BROKEN STEP: the spec passes on the scaffold, so it cannot tell the two states \
-                 apart"
+                 apart — or the run judged a binary that is not this tree's (a shared build \
+                 directory can swap it; running the step on its own tells the two apart)"
                     .to_owned(),
             );
             report.lines.push(indent(&clip(&ran)));
