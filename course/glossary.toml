@@ -151,8 +151,14 @@ zh-Hans-also = ["订阅器"]
 except = []
 note = "the newsletter's person is 订阅者 (a row in `subscribers`); tracing's sink is 订阅器. Both are right where they appear, so both are accepted"
 
-[terms."router"]
+[terms."route"]
 zh-Hans = "路由"
+note = "one path the service answers"
+
+[terms."router"]
+zh-Hans = "路由器"
+zh-Hans-also = ["路由"]
+note = "the thing that dispatches; distinct from the routes it holds, which the table calls 路由"
 
 [terms."handler"]
 zh-Hans = "处理函数"
@@ -358,3 +364,19 @@ zh-Hans = "schema 迁移"
 
 [terms."upstream"]
 zh-Hans = "上游"
+
+[terms."fan-out"]
+zh-Hans = "扇出"
+
+[terms."state machine"]
+zh-Hans = "状态机"
+
+[terms."tick"]
+zh-Hans = "tick"
+note = "a clock's step; kept in Latin, as the retry-budget prose uses it as a noun of art"
+
+[terms."breaker"]
+zh-Hans = "熔断器"
+
+[terms."backpressure"]
+zh-Hans = "背压"
