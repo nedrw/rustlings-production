@@ -262,3 +262,99 @@ zh-Hans = "燃烧率"
 
 [terms."error budget"]
 zh-Hans = "错误预算"
+
+# --- T2 relay vocabulary ---------------------------------------------------------------------
+
+[terms."tenant"]
+zh-Hans = "租户"
+
+[terms."delivery"]
+zh-Hans = "投递"
+note = "the act of one webhook reaching one subscriber; a row in `deliveries`"
+
+[terms."event"]
+zh-Hans = "事件"
+note = "what a publisher posts, and what a delivery carries"
+
+[terms."claim"]
+zh-Hans = "认领"
+zh-Hans-also = ["主张", "断言"]
+note = "two senses: taking a row for one worker (认领), and an assertion a spec or a paragraph makes (主张/断言)"
+
+[terms."lease"]
+zh-Hans = "租约"
+
+[terms."poison pill"]
+zh-Hans = "毒丸"
+note = "a message that fails every attempt, however often it is retried"
+
+[terms."dead letter"]
+zh-Hans = "死信"
+
+[terms."retry"]
+zh-Hans = "重试"
+
+[terms."jitter"]
+zh-Hans = "抖动"
+
+[terms."backoff"]
+zh-Hans = "退避"
+
+[terms."circuit breaker"]
+zh-Hans = "熔断器"
+
+[terms."rate limit"]
+zh-Hans = "限流"
+zh-Hans-also = ["速率限制"]
+
+[terms."backlog"]
+zh-Hans = "积压"
+
+[terms."queue"]
+zh-Hans = "队列"
+
+[terms."concurrency"]
+zh-Hans = "并发"
+
+[terms."payload"]
+zh-Hans = "载荷"
+
+[terms."header"]
+zh-Hans = "头部"
+zh-Hans-also = ["头"]
+note = "「`Allow` 头」是中文里的自然说法；正式的说法是头部"
+
+[terms."pagination"]
+zh-Hans = "分页"
+
+[terms."cursor"]
+zh-Hans = "游标"
+
+[terms."audit trail"]
+zh-Hans = "审计轨迹"
+
+[terms."supply chain"]
+zh-Hans = "供应链"
+
+[terms."capacity"]
+zh-Hans = "容量"
+
+[terms."tracing"]
+zh-Hans = "追踪"
+
+[terms."trace"]
+zh-Hans = "trace"
+note = "a single request's span tree; the word is kept because `traceparent` and the W3C header are Latin"
+
+[terms."span"]
+zh-Hans = "span"
+note = "tracing's unit of work; kept in Latin as `5.x`'s T5 text does"
+
+[terms."SSRF"]
+zh-Hans = "SSRF"
+
+[terms."schema migration"]
+zh-Hans = "schema 迁移"
+
+[terms."upstream"]
+zh-Hans = "上游"
