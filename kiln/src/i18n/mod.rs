@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KilnError, Result};
 use crate::info::Origin;
 
+pub mod glossary;
 pub mod status;
 pub mod ui;
 
@@ -487,6 +488,34 @@ pub fn check_body(
         if declared != &actual {
             check.drift.push(format!(
                 "the translation was made from {declared}; the {source} source is now {actual}"
+            ));
+        }
+    }
+
+    // The term table: where the source uses a word the table has an agreed wording for, the
+    // translation has to use that wording. A warning and not a problem — the English text is the
+    // truth, and the table is an agreement the translator and the author keep.
+    if let Some(glossary) = glossary::read(course_dir)? {
+        let source_text = format!(
+            "{}\n{}",
+            english.front_matter.title.as_deref().unwrap_or_default(),
+            english.text
+        );
+        let translation_text = format!(
+            "{}\n{}",
+            body.front_matter.title.as_deref().unwrap_or_default(),
+            body.text
+        );
+        for mismatch in glossary::mismatches(
+            entry,
+            &source_text,
+            &translation_text,
+            &glossary,
+            locale.as_str(),
+        ) {
+            check.drift.push(format!(
+                "the source says `{}`, the term table agreed `{}`",
+                mismatch.english, mismatch.agreed
             ));
         }
     }

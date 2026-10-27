@@ -1,0 +1,257 @@
+# The course's term table.
+#
+# A translation is not free prose: the same word must mean the same thing in every step of every
+# track, or a learner reading a Chinese brief and an English spec sees two vocabularies. This file
+# is that agreement, in the only form a machine can check: an English term and, per locale, the
+# word the translation uses for it.
+#
+# **When a translation needs a word this file does not have, add it here first** (authoring.md §8
+# rule 5), then translate. A term belongs here when it is (a) part of the course's own vocabulary —
+# the names of mechanisms, artifacts and judgments — rather than ordinary English, and (b) likely to
+# appear in more than one step. "Raft" and "idempotency key" are terms; "server" is not.
+#
+# `kiln i18n status` checks the table against the translations: where an English body uses a term
+# and the translated body does not use the word agreed here, it says so (as a drift warning — the
+# translator acts on it, CI does not fail on it). The `note` is for the translator and is not
+# checked.
+
+format_version = 1
+
+# --- The course's own artifacts and mechanisms -----------------------------------------------
+
+[terms."spec"]
+zh-Hans = "规格"
+note = "a step's read-only test file; `spec/` holds the course's copies"
+
+[terms."scaffold"]
+zh-Hans = "脚手架"
+note = "the starting state a step lays down for the learner"
+
+[terms."reference solution"]
+zh-Hans = "参考解"
+note = "the course's own implementation of a step, applied by `kiln solution`"
+
+[terms."gate"]
+zh-Hans = "闸门"
+note = "one check a step must pass; `must` gates decide the step"
+
+[terms."capability"]
+zh-Hans = "能力"
+note = "one thing the course teaches, at a depth; the ledger's unit"
+
+[terms."track"]
+zh-Hans = "track"
+note = "one of the five projects; the word is left in English because it names the course's own structure"
+
+[terms."step"]
+zh-Hans = "步"
+note = "「这一步」「第 N 步」都算；作为名词时也可以写「步骤」"
+
+[terms."probe"]
+zh-Hans = "探题"
+except = ["liveness probe"]
+note = "a small exercise that re-checks one capability; `course/probes/`. The Kubernetes sense of the word is a different term — see `liveness probe`"
+
+[terms."drill"]
+zh-Hans = "演练"
+note = "a scenario the course runs on purpose, with assertions about the outcome"
+
+[terms."budget"]
+zh-Hans = "预算"
+note = "a counted allowance, never a duration"
+
+[terms."ledger"]
+zh-Hans = "台账"
+
+[terms."fixture"]
+zh-Hans = "夹具"
+note = "the support code a test drives the project through"
+
+[terms."harness"]
+zh-Hans = "装置"
+note = "a fixture that runs a scenario rather than a function"
+
+# --- Rust and the toolchain ------------------------------------------------------------------
+
+[terms."toolchain"]
+zh-Hans = "工具链"
+
+[terms."crate"]
+zh-Hans = "crate"
+
+[terms."workspace"]
+zh-Hans = "workspace"
+note = "Cargo 自己的词，译文里保持原样（`[workspace.lints]` 更是逐字节不动）"
+
+[terms."binary"]
+zh-Hans = "二进制"
+
+[terms."lint"]
+zh-Hans = "lint"
+
+[terms."MSRV"]
+zh-Hans = "MSRV"
+note = "the minimum supported Rust version"
+
+# --- Configuration, errors, logging (T1) -----------------------------------------------------
+
+[terms."configuration"]
+zh-Hans = "配置"
+
+[terms."setting"]
+zh-Hans = "设置项"
+
+[terms."default"]
+zh-Hans = "默认"
+note = "「默认值」是它的名词形式；形容词的位置写「默认」"
+
+[terms."environment variable"]
+zh-Hans = "环境变量"
+
+[terms."command-line flag"]
+zh-Hans = "命令行旗标"
+
+[terms."override order"]
+zh-Hans = "覆盖顺序"
+note = "which source wins when two of them set the same setting"
+
+[terms."secret"]
+zh-Hans = "密钥"
+
+[terms."redacted"]
+zh-Hans = "已打码"
+
+[terms."error type"]
+zh-Hans = "错误类型"
+
+[terms."failure"]
+zh-Hans = "失败"
+
+[terms."refuse"]
+zh-Hans = "拒绝"
+note = "the course's word for saying no to a value, a key or a request"
+
+[terms."exit code"]
+zh-Hans = "退出码"
+
+[terms."structured log"]
+zh-Hans = "结构化日志"
+
+[terms."correlation id"]
+zh-Hans = "关联 id"
+
+[terms."log level"]
+zh-Hans = "日志级别"
+
+[terms."subscriber"]
+zh-Hans = "订阅器"
+note = "tracing's sink; the thing that decides where a log line goes"
+
+[terms."router"]
+zh-Hans = "路由"
+
+[terms."handler"]
+zh-Hans = "处理函数"
+
+[terms."middleware"]
+zh-Hans = "中间件"
+
+[terms."endpoint"]
+zh-Hans = "端点"
+
+[terms."test harness"]
+zh-Hans = "测试装置"
+
+[terms."assertion"]
+zh-Hans = "断言"
+
+[terms."idempotency key"]
+zh-Hans = "幂等键"
+
+[terms."session"]
+zh-Hans = "会话"
+
+[terms."idempotent"]
+zh-Hans = "幂等"
+
+[terms."liveness probe"]
+zh-Hans = "存活探针"
+note = "the Kubernetes sense of `probe`; a different word from the course's `probe`"
+
+[terms."readiness probe"]
+zh-Hans = "就绪探针"
+
+[terms."catch-all"]
+zh-Hans = "兜底"
+
+[terms."fallback"]
+zh-Hans = "回退处理"
+
+[terms."extractor"]
+zh-Hans = "提取器"
+
+[terms."app factory"]
+zh-Hans = "app 工厂"
+note = "the in-process fixture that starts the service for a test; 与 docs/t1-mailer.md §4 的「进程内 app 工厂」一致"
+
+[terms."bind"]
+zh-Hans = "绑定"
+note = "what a server does with an address"
+
+# --- T4 and T5 vocabulary (added as those translations land) ----------------------------------
+
+[terms."snapshot"]
+zh-Hans = "快照"
+
+[terms."compaction"]
+zh-Hans = "合并"
+note = "T4 rewrites segments into one; T5's Raft sense is 截断"
+
+[terms."quorum"]
+zh-Hans = "多数派"
+
+[terms."majority"]
+zh-Hans = "多数派"
+
+[terms."minority"]
+zh-Hans = "少数派"
+
+[terms."partition"]
+zh-Hans = "分区"
+
+[terms."term"]
+zh-Hans = "任期"
+note = "Raft's election term"
+
+[terms."leader"]
+zh-Hans = "leader"
+
+[terms."follower"]
+zh-Hans = "follower"
+
+[terms."candidate"]
+zh-Hans = "candidate"
+
+[terms."commit"]
+zh-Hans = "提交"
+
+[terms."deterministic"]
+zh-Hans = "确定性"
+
+[terms."replay"]
+zh-Hans = "重放"
+
+[terms."seed"]
+zh-Hans = "种子"
+
+[terms."chaos"]
+zh-Hans = "混沌"
+
+[terms."SLO"]
+zh-Hans = "SLO"
+
+[terms."burn rate"]
+zh-Hans = "燃烧率"
+
+[terms."error budget"]
+zh-Hans = "错误预算"

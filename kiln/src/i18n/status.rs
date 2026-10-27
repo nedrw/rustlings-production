@@ -58,6 +58,8 @@ pub struct Report {
     pub steps_total: usize,
     /// One report per locale, source included.
     pub locales: Vec<LocaleReport>,
+    /// The course's term table, when it has one.
+    pub glossary: Option<super::glossary::Glossary>,
 }
 
 impl Report {
@@ -127,6 +129,8 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
         }
     }
     locales.sort();
+
+    let glossary = super::glossary::read(&course.dir())?;
 
     let mut reports = Vec::with_capacity(locales.len());
     for locale in locales {
@@ -219,6 +223,38 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
                     ));
                 }
             }
+
+            // The term table: where the English source uses a word the table has an agreed wording
+            // for, the translation has to use that wording. A warning and not an error — the English
+            // is the truth, and the table is an agreement between the translator and the author.
+            if let Some(glossary) = &glossary
+                && let Ok(english) = read_step_body(&source_path)
+            {
+                // The title counts: it is the one line of the translation that a reader sees first,
+                // and it is prose the translator wrote (the English title is the source's own).
+                let source_text = format!(
+                    "{}\n{}",
+                    english.front_matter.title.as_deref().unwrap_or_default(),
+                    english.text
+                );
+                let translation_text = format!(
+                    "{}\n{}",
+                    body.front_matter.title.as_deref().unwrap_or_default(),
+                    body.text
+                );
+                for mismatch in super::glossary::mismatches(
+                    &id,
+                    &source_text,
+                    &translation_text,
+                    glossary,
+                    locale.as_str(),
+                ) {
+                    report.drift.push(format!(
+                        "{id}: the source says `{}`, the term table agreed `{}`",
+                        mismatch.english, mismatch.agreed
+                    ));
+                }
+            }
         }
 
         reports.push(report);
@@ -230,6 +266,7 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
         source,
         requested: requested.clone(),
         locales: reports,
+        glossary,
     })
 }
 
@@ -253,6 +290,43 @@ mod tests {
             ),
             &ledger_toml(&[("repo/workspace-layout", "apply", "mailer/1.1")]),
         )
+    }
+
+    /// The term table is read, and a translation that ignores it is reported.
+    #[test]
+    fn a_translation_that_ignores_the_term_table_is_reported() {
+        let temp = TempDir::new("i18n-glossary");
+        let course = one_step_course(temp.path());
+        let source = temp
+            .path()
+            .join("course/docs/steps/en/mailer/1.1-workspace.md");
+        temp.write(
+            "course/docs/steps/en/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"A setting\"\nlocale = \"en\"\n+++\n\n             # A setting\n\n## WHY\n\nThe setting has a default.\n",
+        );
+        temp.write(
+            "course/glossary.toml",
+            "format_version = 1\n\n[terms.\"setting\"]\nzh-Hans = \"设置项\"\n",
+        );
+        temp.write(
+            "course/docs/steps/zh-Hans/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"一项\"\nlocale = \"zh-Hans\"\n\
+             source_hash = \"sha256:0000\"\ntranslator = \"t\"\n+++\n\n# A setting\n\n## WHY\n\n             那一项有一个默认。\n",
+        );
+
+        let report =
+            report(&course, &Locale::parse("zh-Hans").expect("a locale")).expect("a report");
+        let locale = report
+            .for_locale(&Locale::parse("zh-Hans").expect("a locale"))
+            .expect("zh");
+        let drift: Vec<&String> = locale
+            .drift
+            .iter()
+            .filter(|line| line.contains("term table"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", locale.drift);
+        assert!(drift[0].contains("设置项"), "{drift:?}");
+        let _ = source;
     }
 
     #[test]
