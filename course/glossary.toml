@@ -420,3 +420,71 @@ zh-Hans = "故障"
 zh-Hans = "作业"
 zh-Hans-also = ["任务"]
 note = "jobq's unit of work, as the course's own Chinese record has it (作业状态机, 作业数). mailer's delivery queue calls its unit 投递任务 — the same English word for a different object, and both are accepted"
+
+# --- Words the translations needed and the table did not have --------------------------------
+
+[terms."protocol"]
+zh-Hans = "协议"
+
+[terms."daemon"]
+zh-Hans = "守护进程"
+zh-Hans-also = ["守护", "daemon"]
+
+[terms."engine"]
+zh-Hans = "引擎"
+
+[terms."backend"]
+zh-Hans = "后端"
+
+[terms."port"]
+zh-Hans = "端口"
+
+[terms."segment"]
+zh-Hans = "段"
+
+[terms."manifest"]
+zh-Hans = "清单"
+zh-Hans-also = ["manifest"]
+
+[terms."retention"]
+zh-Hans = "保留期"
+zh-Hans-also = ["保留"]
+
+[terms."downsampling"]
+zh-Hans = "降采样"
+
+[terms."write amplification"]
+zh-Hans = "写放大"
+
+[terms."cardinality"]
+zh-Hans = "基数"
+
+[terms."bloom filter"]
+zh-Hans = "布隆过滤器"
+
+[terms."soak"]
+zh-Hans = "浸泡"
+
+[terms."invariant"]
+zh-Hans = "不变式"
+zh-Hans-also = ["不变", "invariant"]
+
+[terms."mutation"]
+zh-Hans = "变异"
+zh-Hans-also = ["mutation"]
+
+[terms."coverage"]
+zh-Hans = "覆盖率"
+zh-Hans-also = ["coverage"]
+
+[terms."threshold"]
+zh-Hans = "阈值"
+
+[terms."timer"]
+zh-Hans = "定时器"
+
+[terms."scheduler"]
+zh-Hans = "调度器"
+
+[terms."quota"]
+zh-Hans = "配额"
