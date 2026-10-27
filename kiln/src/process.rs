@@ -255,9 +255,15 @@ fn prepared(program: &str, args: &[&str], dir: &Path, env: &[(String, String)]) 
         //
         // The knobs are only *defaults*: a caller that names its own wins, so a learner who
         // wants cargo's own behaviour (or `CARGO_NET_OFFLINE=true`) still gets it.
+        // The numbers are bounded by a step's own deadline, because patience that outlasts the step
+        // is not patience: a first version used ten retries of two minutes, and a machine with no
+        // route to the registry spent the whole 300-second deadline per attempt and reported
+        // "timed out" instead of "the network is down" (measured in this repository's CI).
+        // Thirty seconds is long enough for a slow transfer, and three of them fail well inside a
+        // step's deadline.
         for (name, value) in [
-            ("CARGO_NET_RETRY", "10"),
-            ("CARGO_HTTP_TIMEOUT", "120"),
+            ("CARGO_NET_RETRY", "3"),
+            ("CARGO_HTTP_TIMEOUT", "30"),
             ("CARGO_HTTP_LOW_SPEED_LIMIT", "1"),
         ] {
             if !env.iter().any(|(given, _)| given == name) && std::env::var_os(name).is_none() {
@@ -410,6 +416,27 @@ pub fn run_line_with_env(
     run_with_env(program, &args, dir, timeout, env)
 }
 
+/// `true` when a command's output says it could not reach the crate registry.
+///
+/// This is the one failure a step must never be blamed for. The strings are cargo's own: a
+/// connection that never opened, a transfer that stalled, and the resolution error that follows
+/// them. A verdict that says "the spec failed" when the registry is unreachable sends the reader to
+/// the wrong file — the step is fine, the machine has no route to `index.crates.io`.
+#[must_use]
+pub fn network_trouble(ran: &Ran) -> bool {
+    let said = format!("{}\n{}", ran.stdout, ran.stderr);
+    [
+        "spurious network error",
+        "failed to get `",
+        "failed to download",
+        "unable to update registry",
+        "Connection timed out",
+        "Couldn't connect to server",
+    ]
+    .iter()
+    .any(|marker| said.contains(marker))
+}
+
 /// Split a whitespace-separated command line into program and arguments, without a shell.
 pub fn split_command(line: &str) -> Result<(&str, Vec<&str>)> {
     let mut parts = line.split_whitespace();
@@ -523,6 +550,27 @@ fn drain(mut reader: impl Read) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_registry_failure_is_recognised_as_the_network() {
+        let said = |text: &str| Ran {
+            code: Some(101),
+            stdout: String::new(),
+            stderr: text.to_owned(),
+            timed_out: false,
+            elapsed: Duration::from_secs(1),
+        };
+        assert!(network_trouble(&said(
+            "warning: spurious network error (3 tries remaining): [28] Timeout was reached"
+        )));
+        assert!(network_trouble(&said(
+            "error: failed to get `serde` as a dependency of package `mailer v0.1.0`"
+        )));
+        assert!(
+            !network_trouble(&said("test result: FAILED. 3 passed; 1 failed; 0 ignored")),
+            "a failing test is not a network problem"
+        );
+    }
+
     /// The network knobs a judged cargo command gets.
     #[test]
     fn cargo_is_told_to_be_patient_with_a_slow_network() {
@@ -537,8 +585,8 @@ mod tests {
             })
             .collect();
         for (name, value) in [
-            ("CARGO_NET_RETRY", "10"),
-            ("CARGO_HTTP_TIMEOUT", "120"),
+            ("CARGO_NET_RETRY", "3"),
+            ("CARGO_HTTP_TIMEOUT", "30"),
             ("CARGO_HTTP_LOW_SPEED_LIMIT", "1"),
         ] {
             let given = envs

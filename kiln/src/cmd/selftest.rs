@@ -247,6 +247,15 @@ fn grade_spec(session: &Session, step: &Step, before_solution: bool, report: &mu
         }
     };
     match (before_solution, ran.success()) {
+        (true, false) if crate::process::network_trouble(&ran) => {
+            report.lines.push(
+                "scaffold ✗ the spec could not run: the crate registry was unreachable — this is \
+                 the network, not the step, and it proves nothing about the scaffold"
+                    .to_owned(),
+            );
+            report.lines.push(indent(&clip(&ran)));
+            report.passed = false;
+        }
         (true, false) => {
             let structural = if complaint(&ran).contains("could not compile") {
                 " — note: it does not compile on the scaffold, so the scaffold is missing a signature \
@@ -271,10 +280,18 @@ fn grade_spec(session: &Session, step: &Step, before_solution: bool, report: &mu
             report.passed = false;
         }
         (false, false) => {
-            report.lines.push(format!(
-                "solution ✗ the spec still fails: {}",
-                summary(&ran)
-            ));
+            if crate::process::network_trouble(&ran) {
+                report.lines.push(
+                    "solution ✗ the spec could not run: the crate registry was unreachable — this \
+                     is the network, not the step"
+                        .to_owned(),
+                );
+            } else {
+                report.lines.push(format!(
+                    "solution ✗ the spec still fails: {}",
+                    summary(&ran)
+                ));
+            }
             report.lines.push(indent(&clip(&ran)));
             report.passed = false;
         }
