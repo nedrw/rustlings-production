@@ -226,3 +226,23 @@ CI 这次挂在 `kiln` 自己的一个集成测试上（`coverage_measures_the_s
 
 **顺带一个自己踩的坑**：标题批量替换的脚本没有跳过代码块，把 1.9 里一行 shell 注释 `# ... then, in
 another shell:` 替换成了标题；`i18n status` 的代码块检查当场报出来（"a code block differs"），已修。
+
+## 段 13：mailer 全 22 步译完
+
+`course/docs/steps/zh-Hans/mailer/` 现在 22 个文件，与英文一一对应。`i18n status`：结构 0 error、漂移
+0 warning；`links` 与 `lint-caps` 干净；`cargo test -p kiln` 354 + 21 + 1。
+
+**这一批用的方法**（后面几条 track 照做）：
+1. 读英文全篇，先弄清这一步在讲哪几个决定（每步正文自己列了 2–4 个）；
+2. 按中文语序重写，不逐句对译——术语查 `course/glossary.toml`，代码、命令、错误字符串、链接原样；
+3. 标题翻成中文，段数/层级/顺序与英文一致（`i18n status` 判形状）；
+4. 跑 `i18n status`，漂移告警逐条裁决：要么改译文，要么往词表加 `zh-Hans-also`（一个词两种意思）或
+   `except`（某个说法里是另一个词）；
+5. 提交前再通读一遍——检查器绿只说明没坏。
+
+**词表在这一批里长了三处**：`bind` 收「绑/绑定」两种说法，`candidate` 收「候选/candidate」，`subscriber`
+收「订阅者/订阅器」（通讯的订阅者 vs tracing 的 sink）。这些都是机器报出来的：英文正文用了词、译文没用约定
+说法，就报一条——然后由人裁决"改译文"还是"改词表"。
+
+**下一批**：T2 `relay` 的 24 步。它是 T1 之后的第一条独立 track，比 mailer 长，术语也更集中（webhook、
+delivery、retry、dead-letter），值得先扫一遍英文正文，把词表缺的词一次补上再开始翻。
