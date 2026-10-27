@@ -190,3 +190,16 @@ CI 这次挂在 `kiln` 自己的一个集成测试上（`coverage_measures_the_s
 **顺带把上一段的"两档 CI"问题记在这里**：内容改动（译文）跑全量 CI 是三十分钟换十秒该做的事；仓库目前
 没有"这次改了什么"的概念。可行的形状是内容档（links / i18n / lint-caps / 文档计数）与全量档（只有改动落在
 `kiln/`、`xtask/`、`course/tracks/`、`course/probes/` 时才跑）。没有做，因为这一轮先把边界本身立住。
+
+## 段 11：内容改动不再跑全量 CI（用户指示）
+
+用户明确要求：**不要跑全量 CI**。这条把段 7 里那个"两档门"的问题按最省的方式定了下来——内容改动
+（译文、术语表、文档）的判据是**内容档**：`kiln i18n status --lang zh-Hans`（结构 + 漂移 + 运行器输出
+误译）、`kiln links`、`kiln lint-caps`；改到 `kiln/` 或 `xtask/` 的提交才跑 `cargo test -p kiln` 与
+`cargo clippy`。全量 `cargo xtask ci`（五轨 selftest，约 35 分钟）留给改动落在 `course/tracks/`、
+`course/probes/` 的提交，以及发布前的验收。
+
+**诚实地说清楚代价**：这意味着这些内容提交的推送背后没有一次"五轨全绿"的记录。它们改动的是
+`course/docs/steps/zh-Hans/**`、`course/glossary.toml` 与文档，不参与任何一步的规格或闸门；`selftest`
+读的是英文正文与规格，而 i18n 门读的正是内容档跑的同一套检查。所以"没跑全量"在这里是一个有依据的取舍，
+不是一个遗漏——**但它被记下来**，将来若有一步红，读到这里的人知道从哪查起。
