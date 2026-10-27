@@ -29,6 +29,14 @@ pub fn run(session: &mut Session, reference: Option<&str>) -> Result<u8> {
         step.qualified_id(),
         step.qualified_id()
     );
+    // Preparing is not verifying: the steps before this one are assumed to be done, and only the
+    // step's own spec can say otherwise. Saying so keeps the promise honest — "set up" is a
+    // statement about this step's files, not a claim that the project is at the right point in the
+    // track.
+    println!(
+        "note: this lays this step's own files; the steps before it are assumed to be done (a \
+         later `kiln run` is what says so if they are not)"
+    );
     Ok(EXIT_OK)
 }
 

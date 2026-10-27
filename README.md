@@ -47,7 +47,10 @@ with stricter gates and fewer hints.
   planned steps, and worked examples of one capability across tracks (what is new, what is
   deliberately not repeated).
 - **[docs/authoring.md](docs/authoring.md)** — step templates, metadata rules, i18n, scaffold patches,
-  checklists.
+  checklists. `tools/rebuild-patches.py` is the mechanical half of it: a track's scaffold and
+  solution patches are *derived* from the trees they define, and this tool lays the chain, formats
+  the trees and regenerates the patches (or, with `--check`, proves that the committed patches are
+  what the trees produce — which is a step of `cargo xtask ci`).
 - **[docs/t1-mailer.md](docs/t1-mailer.md)** — T1 `mailer` as delivered: the 22 steps, the gate
   ladder, the project's final shape, the test fixtures, the patterns T2–T5 copy, and the measured
   numbers. [docs/t2-relay.md](docs/t2-relay.md), [docs/t3-jobq.md](docs/t3-jobq.md),

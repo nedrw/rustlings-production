@@ -186,7 +186,9 @@ fn patches_check(root: &Path) -> Result<(), String> {
             .map_err(|err| format!("cannot run rebuild-patches.py: {err}"))?;
         if !status.success() {
             return Err(format!(
-                "rebuild-patches --check failed for {} ({status}) — the committed patches no                  longer match the trees they define; regenerate them with the same tool",
+                "rebuild-patches --check failed for {} ({status}) — the committed patches no \
+                 longer match the trees they define; the tool's own output above says which, and \
+                 regenerating them with the same tool is the fix",
                 track.id
             ));
         }

@@ -7,3 +7,7 @@
 
 # The desktop's own metadata, not this repository's content.
 .DS_Store
+
+# Python bytecode: a tool run leaves it behind, and it is not content.
+__pycache__/
+*.pyc
