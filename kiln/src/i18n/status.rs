@@ -224,6 +224,16 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
                 }
             }
 
+            // The boundary: the runner's own sentences stay English (plan §3 D5). A translation
+            // that writes one out as prose has translated something the program prints, and the two
+            // will disagree the next time the message changes.
+            for marker in super::glossary::translated_output(&body.text) {
+                report.drift.push(format!(
+                    "{id}: the translation carries `{marker}`, which is the runner's own output and \
+                     stays in English"
+                ));
+            }
+
             // The term table: where the English source uses a word the table has an agreed wording
             // for, the translation has to use that wording. A warning and not an error — the English
             // is the truth, and the table is an agreement between the translator and the author.

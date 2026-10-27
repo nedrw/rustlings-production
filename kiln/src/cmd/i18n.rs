@@ -41,9 +41,13 @@ pub fn status(session: &Session) -> Result<u8> {
             locale.covered(),
             locale.total()
         );
-        match &locale.catalog {
-            Some(path) => println!("  cli catalogue: {}", path.display()),
-            None => println!("  cli catalogue: none (built-in English is used)"),
+        // Only a catalogue that exists is reported. The course translates its *content*; the
+        // runner's own sentences (errors, hints, gate names, the failure text of a spec) stay in
+        // English by policy — they quote code, paths and identifiers, and a learner reading Rust
+        // compiler output all day is not served by a translated `error[E0308]`. A line that says
+        // "cli catalogue: none" reads as a gap to be filled, which is the opposite of the policy.
+        if let Some(path) = &locale.catalog {
+            println!("  cli catalogue: {}", path.display());
         }
         if !locale.missing.is_empty() && locale.is_source {
             println!(

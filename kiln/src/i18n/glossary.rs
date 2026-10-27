@@ -374,6 +374,35 @@ pub fn mismatches(
     found
 }
 
+/// `true` when a translated body says an English string that must stay English.
+///
+/// The boundary the course draws (plan §3 D5): a translation covers the *content* — the prose of a
+/// step — and nothing the runner prints, because those sentences quote code, paths and compiler
+/// output. The practical failure is a translator translating a quoted message, a gate name or a
+/// command: it reads fine and it no longer matches what the program says. The check is a warning,
+/// not an error: a Chinese sentence may legitimately contain "错误" as a word.
+///
+/// The markers are the ones the runner and the specs actually print: a backticked identifier is
+/// already protected (prose only is compared), so what is looked for is the *shape* of a quoted
+/// failure — `error[E0308]`, `assertion ... failed`, a `must` gate name — outside code spans.
+pub fn translated_output(translation: &str) -> Vec<String> {
+    let prose = prose_only(translation);
+    let markers = [
+        "error[E",
+        "panicked at",
+        "assertion `left == right` failed",
+        "test result:",
+        "spec tests pass",
+        "spec tests failed",
+        "must gate",
+    ];
+    markers
+        .iter()
+        .filter(|marker| prose.contains(**marker))
+        .map(|marker| (*marker).to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +516,26 @@ mod tests {
             found.len(),
             1,
             "neither wording is a licence to leave the word out: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_translated_failure_message_is_reported() {
+        // Bare, not in a code span: this is the violation — the translation writes the marker as
+        // its own prose.
+        let found = translated_output("这一步以 error[E0308] 失败，而 test result: FAILED 是真的");
+        assert_eq!(
+            found,
+            vec!["error[E".to_owned(), "test result:".to_owned()],
+            "both markers are found"
+        );
+        assert!(
+            translated_output("这一步的规格通过，闸门是绿的").is_empty(),
+            "ordinary prose is not a quoted failure"
+        );
+        assert!(
+            translated_output("一个 `error[E0308]` 在代码里").is_empty(),
+            "a marker inside a code span is a quotation, which is allowed"
         );
     }
 

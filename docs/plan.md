@@ -121,7 +121,11 @@ rustlings 的 runner 假设「把一个 `.rs` 拷进临时 crate 跑 `cargo test
 - `docs/steps/en/<track>/<step>.md` 是唯一真源，其它语言是 `docs/steps/<locale>/<track>/<step>.md`。
 - 翻译文件带 front-matter：`locale` / `source_hash`（翻译时英文源的哈希）/ `translator`。
 - 回退链 `zh-Hans → zh → en`，回退时在终端明确提示「本步尚无中文版，回退到英文」，不报错、不阻塞。
-- `kiln` 自己的提示语也在 `locales/<locale>/ui.toml`，所以**切换接口同时覆盖课程正文与 CLI**。
+- **翻译的边界是课程正文，不是整个程序**（M5 定下）：`docs/steps/<locale>/` 里的步骤正文，加上课程自己的
+  两句招呼语（welcome / final message）可以放在 `locales/<locale>/ui.toml`。**运行器的其余输出保持英文**——
+  错误消息、提示、闸门名、规格失败文本都不翻：它们引用代码、路径、标识符与编译器输出（`error[E0308]`、
+  `assertion left == right failed`），翻了既不能复制粘贴，也要为每一次消息改动多维护一份译文；而读这门课的人
+  每天都在读英文编译错误。一个"某语言覆盖了 CLI"的说法会把这条边界变成待办的缺口。
 - `kiln i18n status`：覆盖率、漂移（`source_hash` 与当前英文源不符 = 需要重翻）、结构缺失（标题段不全）。CI 对**结构**报错、对**漂移**告警。
 - 验收标准（写进 M0）：`kiln --lang ja` 在没有任何 `ja` 文件时必须优雅回退、正常走完全流程。加一门语言 = 新建目录 + front-matter，**不改代码**。
 
