@@ -101,7 +101,7 @@ step's own `links` gate).
 - On the current tree (M4, T5 authored end to end): `kiln lint-caps` — `97 capabilities · 136
   slots · 119 ledger positions · 119 authored steps` (all five tracks' bodies), no issues;
   `kiln links` — 139 pages, 557 links, 330 external targets, 0 findings; `kiln probe --check` —
-  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 342 + 21 + 1 tests;
+  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 351 + 21 + 1 tests;
   the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
   `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
   `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s).
@@ -163,7 +163,7 @@ which is why it is kept:
 python3 tools/lint-caps-md.py   # 97 capabilities, 119 steps, 136 (capability, depth) slots, 0 issues
 ```
 
-What is not in yet: the rest of M5 (translations are started — `course/docs/steps/zh-Hans/` carries
-the first three mailer steps and `kiln i18n status` audits them; the `new-track` guide and a
-documentation site follow). See [docs/plan.md](docs/plan.md) §11 and
+What is not in yet: the rest of M5 (translations are under way — `course/docs/steps/zh-Hans/`
+carries the first ten mailer steps, checked against the term table in `course/glossary.toml`; the
+`new-track` guide and a documentation site follow). See [docs/plan.md](docs/plan.md) §11 and
 [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
