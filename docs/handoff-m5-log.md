@@ -105,3 +105,12 @@ wifi 调的，不是为一台同时被一百个构建索取的机器。运行器
 （`CARGO_NET_RETRY=10`、`CARGO_HTTP_TIMEOUT=120`、`CARGO_HTTP_LOW_SPEED_LIMIT=1`），而且**调用方自己
 写的值优先**（学员想用 cargo 自己的行为、或 `CARGO_NET_OFFLINE=true`，都还是他的）。一个单测把这三个
 默认值钉住。
+
+## 段 6：M5 第一段的收尾状态
+
+`cargo xtask ci` **exit 0**（`xtask ci: all checks passed`）：五轨 selftest `22/22 + 24/24 + 27/27 +
+24/24 + 22/22`；探题 83/83；五轨的 `rebuild-patches --check` 全绿（工具自测也在 CI 里）；`cargo test -p kiln`
+342 + 21 + 1。已推送。
+
+M5 接下来该做的（按 plan §11 的次序）：中文翻译续做（下一步是 mailer 1.4 起的 config 分层——那里开始
+出现真正需要仲裁的译名，是做术语表的时机）、`new-track` 指南、文档站。

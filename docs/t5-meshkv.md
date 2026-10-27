@@ -82,7 +82,7 @@ slo、unsafe、reuse、protocol、audit、sdk）、`tests/spec_*.rs`（课程拷
 | --- | --- |
 | 逐步 `selftest` | 5.1–5.22 全部把契约走通（scaffold 红、参考解绿、must 门全绿）：`22/22 step(s) hold the contract` |
 | `kiln probe --check` | **83/83** 参考解编译并全绿（T5 新增 18 道，池 65 → 83）|
-| 课程自有检查 | `kiln lint-caps`：`97 capabilities · 136 slots · 119 ledger positions · 119 authored steps`，`no issues.`；`kiln links` offline：139 页 · 557 链接 · 330 外部目标，0 findings；`cargo test -q -p kiln`：341 + 21 + 1 passed |
+| 课程自有检查 | `kiln lint-caps`：`97 capabilities · 136 slots · 119 ledger positions · 119 authored steps`，`no issues.`；`kiln links` offline：139 页 · 557 链接 · 330 外部目标，0 findings；`cargo test -q -p kiln`：342 + 21 + 1 passed |
 | 全步判定（毕业树，快路） | `kiln verify meshkv`（22 步解全铺的毕业树）：**22/22 judged step(s) pass** · 0 failed · 0 not prepared |
 | 全步判定（`--slow`） | `kiln verify meshkv --slow --json`，同一棵毕业树：**`{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 22, steps: 22}`**，exit 0，**42 s**。慢门真跑：`sim@3` 9 步（transcripts 与 seed 重放）、`mutants@80` 4 步（5.3 10/12、5.5 12/12、5.7 4/5、5.10 6/6）、`bench-budget@10` 3 步（5.4 5 计数、5.17 9、5.18 9）、`conformance@2`（scripted ✓ / in-process ✓）|
 | `cargo xtask ci` | **exit 0 · `xtask ci: all checks passed`**（私有缓存）：五轨 selftest `22/22 + 24/24 + 27/27 + 24/24 + 22/22`、83/83 探题、全部门与 `cargo test --workspace` |
