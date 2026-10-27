@@ -366,6 +366,22 @@ pub fn required_sections(origin: Origin) -> &'static [&'static str] {
 
 /// Section names a body actually has, normalised for comparison (`## Task` counts as `TASK`).
 #[must_use]
+/// The level of each heading (`#` → 1), which is what a translation has to keep.
+///
+/// The *text* of a heading is prose, and prose is what a translation is for: a Chinese reader is
+/// better served by `## 为什么` than by `## WHY`. What cannot change is the shape — how many
+/// sections there are, at which level, in which order — because that is what tells a learner (and
+/// this checker) that a section was not dropped, merged or invented. Code fences stay byte-equal
+/// for the opposite reason: code is not prose.
+pub fn heading_shape(headings: &[String]) -> Vec<usize> {
+    headings
+        .iter()
+        .map(|heading| heading.chars().take_while(|c| *c == '#').count())
+        .collect()
+}
+
+/// The section names a body declares, upper-cased and without their `#` marks.
+#[must_use]
 pub fn sections(headings: &[String]) -> Vec<String> {
     headings
         .iter()
@@ -425,26 +441,29 @@ pub fn check_body(
     check.fell_back = locale != *requested;
 
     let body = read_step_body(&path)?;
-    let present = sections(&body.headings);
-    let missing: Vec<&str> = required_sections(origin)
-        .iter()
-        .copied()
-        .filter(|section| !present.iter().any(|found| found == section))
-        .collect();
-    if !missing.is_empty() {
-        check.problems.push(format!(
-            "origin = {origin}: the body has no `## {}` section",
-            missing.join("`, `## ")
-        ));
-    }
-    if origin != Origin::Teach && present.iter().any(|section| section == "WHY") {
-        check.problems.push(format!(
-            "origin = {origin} must not re-explain with `## WHY` — deepen/transfer steps use \
-             RECALL/DELTA"
-        ));
-    }
-
+    // The template rules are about the *source* body: its headings are the course's own words, and
+    // that is what `required_sections` names. A translation is held to the source's *shape* below
+    // (same sections, same levels, same order), which is the same guarantee without dictating the
+    // words — `## 为什么` and `## WHY` are the same section.
     if &locale == source {
+        let present = sections(&body.headings);
+        let missing: Vec<&str> = required_sections(origin)
+            .iter()
+            .copied()
+            .filter(|section| !present.iter().any(|found| found == section))
+            .collect();
+        if !missing.is_empty() {
+            check.problems.push(format!(
+                "origin = {origin}: the body has no `## {}` section",
+                missing.join("`, `## ")
+            ));
+        }
+        if origin != Origin::Teach && present.iter().any(|section| section == "WHY") {
+            check.problems.push(format!(
+                "origin = {origin} must not re-explain with `## WHY` — deepen/transfer steps use \
+                 RECALL/DELTA"
+            ));
+        }
         return Ok(check);
     }
 
@@ -471,11 +490,13 @@ pub fn check_body(
 
     let source_path = course_dir.join(entry_for_locale(entry, source)?);
     let english = read_step_body(&source_path)?;
-    if english.headings != body.headings {
+    let source_shape = heading_shape(&english.headings);
+    let translation_shape = heading_shape(&body.headings);
+    if source_shape != translation_shape {
         check.problems.push(format!(
-            "headings differ from the {source} source ({} versus {})",
-            body.headings.len(),
-            english.headings.len()
+            "the headings do not have the {source} source's shape (levels {:?} versus {:?}) — a \
+             translation says the same sections in the same order, in its own words",
+            translation_shape, source_shape
         ));
     }
     if english.fences != body.fences {
@@ -529,6 +550,69 @@ mod tests {
 
     fn locale(text: &str) -> Locale {
         Locale::parse(text).unwrap()
+    }
+
+    /// A translation keeps the source's section shape and says it in its own words.
+    #[test]
+    fn a_translation_may_translate_its_headings() {
+        let temp = crate::test_support::TempDir::new("i18n-shape");
+        let course = crate::test_support::load_course(
+            temp.path(),
+            &crate::test_support::one_track(
+                &[crate::test_support::step_toml(
+                    "mailer",
+                    "1.1-workspace",
+                    &["repo/workspace-layout@apply"],
+                )],
+                &["repo/workspace-layout@apply"],
+            ),
+            &crate::test_support::ledger_toml(&[("repo/workspace-layout", "apply", "mailer/1.1")]),
+        );
+        temp.write(
+            "course/docs/steps/en/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"A step\"\nlocale = \"en\"\n+++\n\n\
+             # A step\n\n## WHY\n\nBecause.\n\n## TASK\n\nWork.\n\n### A part\n\nMore.\n",
+        );
+        temp.write(
+            "course/docs/steps/zh-Hans/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"一步\"\nlocale = \"zh-Hans\"\n\
+             source_hash = \"sha256:00\"\ntranslator = \"t\"\n+++\n\n\
+             # 一步一步\n\n## 为什么\n\n因为。\n\n## 任务\n\n干活。\n\n### 一部分\n\n更多。\n",
+        );
+        let check = check_body(
+            &course.dir(),
+            "docs/steps/en/mailer/1.1-workspace.md",
+            Origin::Teach,
+            &locale("zh-Hans"),
+            &locale("en"),
+        )
+        .expect("the check runs");
+        assert!(
+            check.problems.is_empty(),
+            "translated headings are prose: {:?}",
+            check.problems
+        );
+
+        // A section that was dropped, or one whose level changed, is still a structure problem.
+        temp.write(
+            "course/docs/steps/zh-Hans/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"一步\"\nlocale = \"zh-Hans\"\n\
+             source_hash = \"sha256:00\"\ntranslator = \"t\"\n+++\n\n\
+             # 一步一步\n\n## 为什么\n\n因为。\n\n## 任务\n\n干活。\n",
+        );
+        let check = check_body(
+            &course.dir(),
+            "docs/steps/en/mailer/1.1-workspace.md",
+            Origin::Teach,
+            &locale("zh-Hans"),
+            &locale("en"),
+        )
+        .expect("the check runs");
+        assert!(
+            check.problems.iter().any(|p| p.contains("shape")),
+            "a dropped section is a shape problem: {:?}",
+            check.problems
+        );
     }
 
     #[test]

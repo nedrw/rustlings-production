@@ -197,11 +197,12 @@ pub fn report(course: &Course, requested: &Locale) -> Result<Report> {
 
             match read_step_body(&source_path) {
                 Ok(english) => {
-                    if english.headings != body.headings {
+                    let source_shape = super::heading_shape(&english.headings);
+                    let translation_shape = super::heading_shape(&body.headings);
+                    if source_shape != translation_shape {
                         report.structure.push(format!(
-                            "{id}: headings differ from the {source} source ({} versus {})",
-                            body.headings.len(),
-                            english.headings.len()
+                            "{id}: the headings do not have the {source} source's shape \
+                             (levels {translation_shape:?} versus {source_shape:?})"
                         ));
                     }
                     if english.fences != body.fences {
