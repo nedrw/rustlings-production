@@ -148,6 +148,18 @@ fn spec_integrity(root: &Path) -> Result<(), String> {
 /// trees without regenerating the patches fails too. The tool lays the chains with `kiln` itself
 /// and never compiles, so the whole pass costs seconds.
 fn patches_check(root: &Path) -> Result<(), String> {
+    println!("xtask ci: rebuild-patches --self-test (the tool's own checks)");
+    let self_test = Command::new("python3")
+        .arg(root.join("tools/rebuild-patches.py"))
+        .arg("--self-test")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|err| format!("cannot run rebuild-patches.py --self-test: {err}"))?;
+    if !self_test.success() {
+        return Err(format!("rebuild-patches --self-test failed ({self_test})"));
+    }
+
     println!("xtask ci: rebuild-patches --check (every patch is what its trees produce)");
     let course = kiln::info::Course::load(root).map_err(|error| error.to_string())?;
     let mut tracks: Vec<&kiln::info::Track> = course.tracks().iter().collect();
