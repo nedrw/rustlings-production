@@ -408,9 +408,10 @@ mod tests {
         let zh = report.for_locale(&Locale::parse("zh").unwrap()).unwrap();
         assert_eq!(zh.covered(), 1);
         assert_eq!(zh.drift.len(), 1, "{zh:?}");
-        // Headings are compared as text, so a translated heading is a structure error.
-        assert_eq!(zh.structure.len(), 1, "{zh:?}");
-        assert_eq!(report.structure_errors(), 1);
+        // A translated heading is prose and therefore fine: the structure is the *shape*, and one
+        // heading at one level has the same shape as one heading at one level.
+        assert!(zh.structure.is_empty(), "{zh:?}");
+        assert_eq!(report.structure_errors(), 0);
         assert_eq!(report.drift_warnings(), 1);
     }
 
