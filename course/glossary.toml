@@ -199,8 +199,9 @@ zh-Hans = "app 工厂"
 note = "the in-process fixture that starts the service for a test; 与 docs/t1-mailer.md §4 的「进程内 app 工厂」一致"
 
 [terms."bind"]
-zh-Hans = "绑定"
-note = "what a server does with an address"
+zh-Hans = "绑"
+zh-Hans-also = ["绑定"]
+note = "what a server does with an address (绑定端口) and what a query does with its parameters (绑定参数); 绑 covers both"
 
 # --- T4 and T5 vocabulary (added as those translations land) ----------------------------------
 
@@ -234,7 +235,9 @@ zh-Hans = "leader"
 zh-Hans = "follower"
 
 [terms."candidate"]
-zh-Hans = "candidate"
+zh-Hans = "候选"
+zh-Hans-also = ["candidate"]
+note = "a value being tried (候选值) and Raft's role, which stays 候选人 in T5"
 
 [terms."commit"]
 zh-Hans = "提交"
