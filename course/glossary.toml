@@ -232,7 +232,8 @@ zh-Hans = "分区"
 
 [terms."term"]
 zh-Hans = "任期"
-note = "Raft's election term"
+zh-Hans-also = ["项", "词项"]
+note = "three senses: Raft's election term (任期), an arithmetic term (项, lakelet 4.12/4.20), and a bloom filter's term (词项, 4.14)"
 
 [terms."leader"]
 zh-Hans = "leader"
