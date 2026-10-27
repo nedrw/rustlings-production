@@ -246,3 +246,22 @@ another shell:` 替换成了标题；`i18n status` 的代码块检查当场报�
 
 **下一批**：T2 `relay` 的 24 步。它是 T1 之后的第一条独立 track，比 mailer 长，术语也更集中（webhook、
 delivery、retry、dead-letter），值得先扫一遍英文正文，把词表缺的词一次补上再开始翻。
+
+## 段 14：全课程 119 步的中文版完成
+
+`course/docs/steps/zh-Hans/` 现在 119 个文件，与英文一一对应（mailer 22、relay 24、jobq 27、lakelet 24、
+meshkv 22）。`kiln i18n status --lang zh-Hans`：**zh-Hans 119/119，结构 0 error，漂移 0 warning**；
+`links` 与 `lint-caps` 干净；`cargo test -p kiln` 354 + 21 + 1。
+
+**怎么做的**：我译了 mailer 全部 22 步（逐段重写过一遍，那一轮就是"信达雅"的基准），其余四条 track 由
+并行子 agent 分批翻，每批 4–6 步，每批都跑 `i18n status` 才交回。**词表在这一轮从 70 条长到 133 条**——
+每一条都是被 real 文本逼出来的。
+
+**子 agent 交回时最有价值的三类信息**（都比"翻完了"有用）：
+1. **同一个英文词在不同 track 是不同东西**：`term` 在 meshkv 是 Raft 的「任期」，在 lakelet 是算术的「项」、
+   布隆过滤器的「词项」；`job` 在 jobq 是「作业」（课程自己的 t3-jobq.md 就这么写），在 mailer 是「投递任务」。
+   词表现在用 `zh-Hans-also` 同时收下，并在 note 里写明各自的语境。
+2. **译者们用了不同说法**：`drain` 有人写排干有人写排空，`lane` 有人写车道有人写泳道。这类不一致机器不报
+   （词表里还没有这个词），是我把某一批的词表补上之后才照出来的——**先补词表、再统一文本**，顺序不能反。
+3. **短语不是术语**：一开始把 `at least once`/`exactly once` 也放进了表，中文的「恰好」常落在句子的另
+   一个位置，于是每条都误报。删掉这两条——词表收词，不收句子。
