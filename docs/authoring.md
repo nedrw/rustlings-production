@@ -376,6 +376,12 @@ except = ["liveness probe"]   # 这个词在这里是另一个意思，表不管
 - [ ] front-matter 补 `locale` / `source_hash` / `translator`
 - [ ] `kiln i18n status` 无结构错误（漂移由作者处理，不静默修哈希）
 
+## 10.5 加一条新 track
+
+见 [new-track.md](new-track.md)：`kiln new-track` 写机械的一半（目录、元数据、骨架、路径、门的
+阶梯起点、规格清单），另一半——台账槽位、退出能力、探题、规格与参考解的内容、正文——是课程的决定，
+生成器只把它们列成清单，不替你决定。
+
 ## 11. 探题（probe）的写法
 
 一个 `(能力, 深度)` 槽位两道文件：题面 `course/probes/<domain>-<name>.<level>.rs` 与参考解
