@@ -29,7 +29,7 @@
 | 阶段 | 内容 | 验收 | 估时 |
 | --- | --- | --- | --- |
 | **M6.0** | 补齐 24 个 apply 槽位的探题（六批，每批 4 道） | `kiln probe --check` 107/107；每个 apply 槽位都有题 | **已完成 2026-10-28**：107/107、79/79，缺一道即失败 |
-| **M6.1** | 缓存与热点：新 track **T6 `cache`**（8 步） | `selftest --track cache` 全绿；台账/退出能力/探题齐 | 25–35 h |
+| **M6.1** | 缓存与热点：新 track **T6 `cache`** | `selftest --track cache` 全绿；台账/退出能力/探题齐 | **前四步已交付 2026-10-28**（4/4、83/83 探题）；6.5–6.8 待写 |
 | **M7** | 消息中间件语义：新 track **T7 `broker`**（9 步） | 同上；分区/消费组/rebalance/lag 各一步 | 30–40 h |
 | **M8** | gRPC 与流式：新 track **T8 `rpc`**（7 步） | 同上；契约、deadline、流式背压、协议演进 | 25–35 h |
 | **M9** | 编排与身份：新 track **T9 `platform`**（8 步） | 同上；K8s 清单/探针/rollout、外部 secrets、OIDC | 30–40 h |
@@ -62,21 +62,24 @@
 2. **每道题都要有失败面**：至少三条测试在 `todo!()` 上失败，且其中一条测的是"错误路径不留下部分结果"。
 3. **参考解与练习只差函数体**：其余字节相同，这样 `kiln probe --check` 编的是学员要写的那份文件。
 
-## 4. M6.1：T6 `cache` 的步表（草稿，第一步落地后冻结）
+## 4. M6.1：T6 `cache` 的步表（前四步已交付，后四步待写）
 
-| 步 | 教什么（能力/深度） | 一句话 |
-| --- | --- | --- |
-| 6.1 | `cache/async-read-through@apply` | 一个读穿缓存的端口：miss 时填充，命中时不碰后端 |
-| 6.2 | `cache/invalidation@apply` | 写路径的失效：先写库再删缓存，以及为什么不能反过来 |
-| 6.3 | `cache/versioned-keys@apply` | 键里带版本：不删除也能让旧值失效 |
-| 6.4 | `cache/stampede@apply` | 单飞：一个键在过期时只允许一个填充者 |
-| 6.5 | `cache/hot-key@apply` | 热点与本地/共享两层：一致性预算写下来 |
-| 6.6 | `cache/ttl-and-jitter@apply` | TTL 抖动与雪崩：过期时间不是常数 |
-| 6.7 | `obs/cache-effectiveness@operate` | 命中率、穿透率、回源延迟：缓存也要有 SLO |
-| 6.8 | `ops/cache-failure@operate` | 缓存挂了：降级到直连的预算与熔断 |
+| 步 | 能力 | 一句话 | 状态 |
+| --- | --- | --- | --- |
+| 6.1 | `cache/read-through@apply` | 读穿缓存与存活时间 | **已交付** |
+| 6.2 | `cache/invalidation@apply` | 写路径先写存储再删缓存 | **已交付** |
+| 6.3 | `cache/single-flight@apply` | 一个键一个填充者 | **已交付** |
+| 6.4 | `cache/expiry-jitter@apply` | 过期是一个区间，按键确定 | **已交付** |
+| 6.5 | `cache/versioned-keys@apply` | 键里带版本：不删除也能让旧值失效 | 待写 |
+| 6.6 | `cache/hot-key@apply` | 热点与本地/共享两层：一致性预算写下来 | 待写 |
+| 6.7 | `obs/cache-effectiveness@operate` | 命中率、穿透率、回源延迟：缓存也要有 SLO | 待写 |
+| 6.8 | `ops/cache-failure@operate` | 缓存挂了：降级到直连的预算与熔断 | 待写 |
 
-项目形状：一个把 `mailer` 的订阅者查询放到缓存后面的小服务，故意用同一个进程内的
-`BTreeMap + Mutex` 当"共享缓存"，端口后面才是"数据库"——这样每条失败模式都能在测试里确定性复现。
+项目形状（实际落地的，与草稿不同）：`app/cache` 是一个**库 + 薄二进制**，`Store` 是计数的
+`BTreeMap`（"慢存储"），`Cache` 是带截止时间的条目表，**时钟是每个 API 的参数**。原草稿里
+`Mutex` + "共享缓存"的模型被放弃了：这一步的判定全是单线程语义，加一个 `Mutex` 只会让测试变慢、
+让失败变成调度；并发的那一半（单飞）用"进行中标记"的状态机表达，恰好是我们想让人重新写一遍的
+东西。
 
 ## 5. 每个新 track 的验收清单（与 `new-track.md` 一致）
 

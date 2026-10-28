@@ -40,6 +40,7 @@ with stricter gates and fewer hints.
 | T3 | `jobq` — job queue engine (library + worker + CLI) **delivered** | mid-high | 27 |
 | T4 | `lakelet` — telemetry ingest and query **authored** | high | 24 |
 | T5 | `meshkv` — distributed KV / scheduler (optional) **authored** | highest | 22 |
+| T6 | `cache` — a read cache in front of a slow store **delivered (first four steps)** | mid | 4 |
 
 ## Read next
 
@@ -95,10 +96,13 @@ the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
 
 **M6 has started** (2026-10-28), on the gap analysis in
 [docs/m6-plan.md](docs/m6-plan.md): the course is complete on its vertical axis and thin on a few
-horizontal ones. **M6.0 is done**: the 24 `apply` slots that had no probe now have one — `kiln probe --check` reads
-`107/107` references and `79/79` apply slots, and a slot without an exercise is a failure instead of
-a number (`kiln/tests/probes_cover_apply.rs` states the same rule for `cargo test`). The cache,
-broker, RPC, platform and capstone milestones follow in that order.
+horizontal ones. M6.0 is done: the 24 `apply` slots that had no probe now have one —
+`kiln probe --check` reads `111/111` references and `83/83` apply slots, and a slot without an
+exercise is a failure instead of a number (`kiln/tests/probes_cover_apply.rs` states the same rule
+for `cargo test`). M6.1 added **T6 `cache`**, a four-step read-cache track (read-through,
+invalidation, single flight, expiry jitter): `kiln selftest --track cache` is `4/4`, both languages
+are written, and each `apply` slot has its probe. Broker, RPC, platform and capstone follow in that
+order ([docs/m6-plan.md](docs/m6-plan.md)).
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
 (`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,

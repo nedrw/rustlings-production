@@ -143,3 +143,48 @@ db/transactions@apply` 并失败；移回来 79/79 绿。同时新增 `kiln/test
 
 **下一步（M6.1）**：缓存 track T6 的 8 步（计划 §4 有步表草稿）。它要动台账、curriculum、规格、
 树与补丁、正文与译文、每步一道探题——按 `new-track.md` 的流程走，不是加一批文件那么简单。
+
+## 段 6：T6 `cache` 前四步交付（2026-10-28）
+
+按 `new-track.md` 的流程起了一条新 track，落地即完整（台账、curriculum、规格、树与补丁、双语正文、
+每步探题、门阶梯），`kiln selftest --track cache` → **4/4 step(s) hold the contract**。
+
+**四步**：6.1 读穿缓存与存活时间（`cache/read-through@apply`）；6.2 写路径先写存储再删缓存
+（`cache/invalidation@apply`）；6.3 一个键一个填充者（`cache/single-flight@apply`）；6.4 过期是
+一个区间、按键确定（`cache/expiry-jitter@apply`）。
+
+**项目形状与草稿的差别**（写进 m6-plan §4）：草稿是一个 `BTreeMap + Mutex` 的"共享缓存"，实际做成
+**时钟是参数**的同步库。理由：这门课每一步的判定都是单线程语义，`Mutex` 只会让测试变慢、把失败
+变成调度；并发那一半（单飞）用"进行中标记"的状态机表达，正好是希望学员重写一遍的东西。`Store`
+计数读次数，于是"缓存真的服务了这次"是断言而不是感觉。
+
+**结构决定**：每一步的新 API 都落在**新文件**里（`invalidation.rs` / `single_flight.rs` /
+`expiry.rs`），脚手架只做两件事——在 `lib.rs` 的标记区里插一行 `pub mod …;`、创建那个文件里的桩。
+这正是 authoring.md §5 教的形状：插入的行是"以后谁都不会想改"的一行，桩本身在新文件里，参考解
+就地改桩不会让 scaffold 认不出自己。
+
+**这一步踩到的坑（都在过程中修掉了）**：
+
+1. **`[localized_titles]` 又放错位置**：写在 `project`/`exit` 之前，TOML 把后面两个键吞进表里，
+   `track.toml` 直接解析失败。规则很硬：所有顶层键之后、第一个 `[[step]]` 之前。
+2. **规格文件不过 rustfmt**：`fmt` 门在每一步都红（`cargo fmt --all --check` 看整个项目）。
+   跑 `cargo fmt --all` 之后重钉 manifest。
+3. **词表贪心**：给 `stale` 加了词条，结果 lakelet/meshkv 的既有译文里用的是别的说法，一次冒出十几条
+   漂移警告。按词表自己的规则撤掉了——`stale` 是普通形容词，不是课程术语；保留 `cache`、`invalidation`、
+   `TTL`、`thundering herd` 四条。
+4. **术语被强调拆开**：`**确定**性` 里夹了 `**`，词表匹配不到；改成纯文本。
+5. **闭包借用**：探题的计数器用 `let mut calls = 0` 被闭包可变借用，`assert_eq!(calls, 1)` 在两次
+   调用之间读不了；换成 `Cell<u32>`（共享借用）。
+6. **一个白送的测试**：`releasing_a_key_nobody_holds_is_false` 只调用给定的 `release`，在练习文件上
+   会通过；按探题约定改成同时断言 `begin` 仍然可以填。
+
+**同步的计数**：curriculum §3/§11 加了 4 个能力与 4 步（97→101 能力、136→140 槽位、119→123 步），
+`ledger_matches_curriculum` 与两个仓库级测试（`caps::lint::tests::the_repository_course_is_clean`、
+`info::tests::the_repository_course_loads`）跟着改；`probe --check` 覆盖 83/83。
+
+**验收（本机实测）**：`selftest --track cache` 4/4；`probe --check` 111/111、覆盖 83/83；
+`lint-caps` `101 capabilities · 140 slots · 123 ledger positions · 123 authored steps`，no issues；
+`i18n status` 123/123、结构 0 error、漂移 0；`links` 干净；`site --check` 261 页；
+`rebuild-patches.py --track cache --check` 全部 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1。
+
+**未完**：6.5–6.8（版本化键、热点两层、命中率 SLO、缓存故障降级）按计划表待写。
