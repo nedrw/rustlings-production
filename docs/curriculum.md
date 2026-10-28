@@ -229,6 +229,16 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `broker/schema-compat` | — | T7·7.8 | — | — |
 | `ops/lag-alert` | — | — | — | T7·7.9 |
 
+### 3.10 RPC
+
+| 能力 | aware | apply | design | operate |
+| --- | --- | --- | --- | --- |
+| `rpc/field-numbers` | — | T8·8.1 | — | — |
+| `rpc/deadline` | — | T8·8.2 | — | — |
+| `rpc/status-codes` | — | T8·8.3 | — | — |
+| `rpc/server-streaming` | — | T8·8.4 | — | — |
+| `rpc/multiplexing` | — | — | T8·8.5 | — |
+
 **这张表就是「不重复」的证明**：一个能力在四个深度上各只出现一次，跨 track 只是换项目、换难度、换失败模式。
 
 ## 4. 去重实例：同一能力的四次出现
@@ -285,7 +295,8 @@ flowchart TD
     T3 --> T4["T4 lakelet 遥测存储与查询（24 步，高）"]
     T4 --> T5["T5 meshkv 分布式 KV/调度（22 步，最高，可选）"]
     T5 --> T6["T6 cache 读缓存层（8 步，中）"]
-    T6 --> T7["T7 broker 分区消息日志（4 步，中）"]
+    T6 --> T7["T7 broker 分区消息日志（9 步，中）"]
+    T7 --> T8["T8 rpc 契约先行的 RPC 层（5 步，中）"]
     P["probe + drill 库（间隔重复）"] -.-> T1
     P -.-> T3
     P -.-> T4
@@ -303,6 +314,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 编写时由 `lint-caps` 统计 |
 | T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断 | 8 teach |
 | T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 | 9 teach |
+| T8 `rpc` | T1 的 HTTP 契约 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用 | 5 teach |
 
 ## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
@@ -541,7 +553,20 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 7.8 | 加法兼容，减法破坏 | `broker/schema-compat@apply` | 删字段、改类型、加必填都是破坏；加可选不是 |
 | 7.9 | 用"落后"的连续段告警 | `ops/lag-alert@operate` | 严格高于阈值、连续 N 次；一次低谷重置 |
 
-## 13. probe 与 drill 库
+## 13. T8 `rpc`：契约先行的 RPC 层（5 步，进行中）
+
+题材：一层 gRPC 形状的 RPC。没有网络、没有代码生成：契约是数据，deadline 是一个数字，流是一个窗口
+——而判断是每个 gRPC 服务在每次调用上都要做的那些。
+
+| # | 步骤 | teaches | 过关条件（要点） |
+| --- | --- | --- | --- |
+| 8.1 | 线路是字段号，不是名字 | `rpc/field-numbers@apply` | 改名兼容；删号、复用号破坏 |
+| 8.2 | deadline 是绝对的，每一跳从它里面付 | `rpc/deadline@apply` | 差额传播；装不下的跳在跑之前失败 |
+| 8.3 | 状态码是 API 的一部分 | `rpc/status-codes@apply` | 规范映射；可重试只含瞬时错误 |
+| 8.4 | 流是一个窗口，不是一个缓冲 | `rpc/server-streaming@apply` | 在途到达窗口即停；确认后继续 |
+| 8.5 | 一条连接，多条流，没有队头阻塞 | `rpc/multiplexing@design` | 每轮每流一项；阻塞的流不拖住别人 |
+
+## 14. probe 与 drill 库
 
 - **probe**（3–10 分钟）：每个 (能力, 深度) 格位一个抽查题，用于 `kiln review --due` 的间隔重复，也用于 `kiln plan --fast` 的免修证明。
   台账现在有 97 个能力、136 个格位，全覆盖等于 136 个 probe——这是笔真实成本，所以**只对 `apply` 级以上、
@@ -549,7 +574,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 - **drill**：纯机制训练（取消安全、`Pin`、`Buf`/`Bytes`、`dyn` 兼容性、迭代器适配器），按需插在 track 里；
   每个 drill 独立、可在 15 分钟内完成，不进任何项目。
 
-## 14. 课程如何组装（给未来的作者/翻译者）
+## 15. 课程如何组装（给未来的作者/翻译者）
 
 1. 新 track 的起点是**能力缺口**：先看台账缺什么深度，再设计项目，而不是先想项目
    （T1 是已交付的参考实现：[t1-mailer.md](t1-mailer.md) §5 列了可以照抄的模式）。

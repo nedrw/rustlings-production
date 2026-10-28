@@ -453,7 +453,7 @@ except = ["liveness probe"]   # 这个词在这里是另一个意思，表不管
    带一句消息），`const fn` 里用单字面量的 `panic!("…")`（`todo!()` 在 const 上下文是 E0015）。落地前
    `diff -u 题面 参考解` 数 hunk：**每个 hunk 必须正好是那些桩行**（实测：一道题的 hunk 2–6 个）。
 3. **零依赖、只有 `std`、离线、秒级。** 需要真东西的能力（真哈希、真 HTTP、真数据库、真采样器）在文件里手写
-   一个形状，并在正文里说明这个形状仍诚实抽到了那个习惯；**宁可不写题，也不写假证据**（`curriculum.md §13`
+   一个形状，并在正文里说明这个形状仍诚实抽到了那个习惯；**宁可不写题，也不写假证据**（`curriculum.md §14`
    的 `aware` 政策与 handoff-m1-log 的两条先例）。
 4. **一份文件被编译两次，角色不同**：它既是学习者的 `src/lib.rs`，也是 `probe --check` 里的一个测试目标
    （`tests/<slug 的 . 换成 _>.rs`）。所以：单 crate root、`#[cfg(test)] mod tests` 在文件末尾、没有 `fn main`、

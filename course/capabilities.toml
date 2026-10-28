@@ -397,3 +397,19 @@ apply = "broker/7.8"
 
 [capability."ops/lag-alert"]
 operate = "broker/7.9"
+
+# T8 `rpc` (docs/curriculum.md §13). A contract-first RPC layer; no network, no codegen.
+[capability."rpc/field-numbers"]
+apply = "rpc/8.1"
+
+[capability."rpc/deadline"]
+apply = "rpc/8.2"
+
+[capability."rpc/status-codes"]
+apply = "rpc/8.3"
+
+[capability."rpc/server-streaming"]
+apply = "rpc/8.4"
+
+[capability."rpc/multiplexing"]
+design = "rpc/8.5"
