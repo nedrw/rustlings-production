@@ -256,17 +256,13 @@ fn check_course(session: &Session) -> Result<u8> {
             apply_slots
         );
         if !uncovered.is_empty() {
-            let shown: Vec<&str> = uncovered.iter().take(6).map(String::as_str).collect();
-            let more = uncovered.len().saturating_sub(shown.len());
-            println!(
-                "  without one: {}{} — docs/m6-plan.md says which batch writes them",
-                shown.join(", "),
-                if more > 0 {
-                    format!(" … +{more}")
-                } else {
-                    String::new()
-                }
-            );
+            // M6.0 closed the gap (docs/m6-plan.md): every apply slot has an exercise, so a slot
+            // without one is a course defect now, not a work in progress.
+            problems.push(format!(
+                "{} apply slot(s) have no probe: {}",
+                uncovered.len(),
+                uncovered.join(", ")
+            ));
         }
     }
     for problem in &problems {
