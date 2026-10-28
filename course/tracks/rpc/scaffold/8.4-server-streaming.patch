@@ -1,0 +1,63 @@
+--- /dev/null
++++ b/src/stream.rs
+@@ -0,0 +1,50 @@
++//! A server stream has a window, not a buffer.
++//!
++//! Server streaming looks like "produce the items" and is really "produce as many items as the
++//! client has room for". The room is the window: items sent and not yet acknowledged are in flight,
++//! and a producer that keeps sending past the window is buffering the consumer's memory on the
++//! producer's terms — the unbounded queue of step 2.14, one layer down.
++//!
++//! ## What you write
++//!
++//! [`Stream::send`] — the next item when fewer than `window` are in flight, `None` when the window
++//! is full. A full window is backpressure, not the end of the stream: the caller acknowledges and
++//! sends again.
++
++/// One server stream.
++#[derive(Debug)]
++pub struct Stream {
++    items: Vec<String>,
++    window: usize,
++    sent: usize,
++    acked: usize,
++}
++
++impl Stream {
++    /// A stream over `items` with a window of `window`.
++    #[must_use]
++    pub fn new(items: &[&str], window: usize) -> Self {
++        Self {
++            items: items.iter().map(|item| (*item).to_owned()).collect(),
++            window,
++            sent: 0,
++            acked: 0,
++        }
++    }
++
++    /// Items sent and not yet acknowledged.
++    #[must_use]
++    pub fn in_flight(&self) -> usize {
++        self.sent - self.acked
++    }
++
++    /// Acknowledge `n` items the client consumed (clamped to what was sent).
++    pub fn ack(&mut self, n: usize) {
++        self.acked = (self.acked + n).min(self.sent);
++    }
++
++    /// The next item if the window allows it.
++    pub fn send(&mut self) -> Option<String> {
++        todo!("the next item while the window has room; None when it is full")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // kiln:scaffold:begin
+ pub mod deadline;
+ pub mod status;
++pub mod stream;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;

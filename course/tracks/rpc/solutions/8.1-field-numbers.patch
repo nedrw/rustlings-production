@@ -1,0 +1,26 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -44,7 +44,22 @@
+ /// Every breaking difference between two messages, sorted by number.
+ #[must_use]
+ pub fn wire(old: &[Field], new: &[Field]) -> Vec<Breaking> {
+-    todo!("by number: removed, or the same number with another type")
++    let mut breaking = Vec::new();
++    let new_by_number: BTreeMap<u32, &Field> =
++        new.iter().map(|field| (field.number, field)).collect();
++    for field in old {
++        match new_by_number.get(&field.number) {
++            None => breaking.push(Breaking::NumberRemoved(field.number)),
++            // The number kept its place and lost its meaning: the old client's bytes now parse as
++            // something else, which is the failure `reserved` exists to prevent.
++            Some(replacement) if replacement.kind != field.kind => {
++                breaking.push(Breaking::NumberReused(field.number));
++            }
++            Some(_) => {}
++        }
++    }
++    breaking.sort();
++    breaking
+ }
+ 
+ /// The version of the service.

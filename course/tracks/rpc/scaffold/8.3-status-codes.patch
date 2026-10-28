@@ -1,0 +1,78 @@
+--- /dev/null
++++ b/src/status.rs
+@@ -0,0 +1,65 @@
++//! Canonical status codes: what went wrong, and whether trying again can help.
++//!
++//! A gRPC status is a small closed set, and a client branches on it: `UNAVAILABLE` is retried by
++//! every sane backoff, `INVALID_ARGUMENT` is never retried because the argument will not change,
++//! and `INTERNAL` is the server's bug — retrying it delays the page. Mapping an internal failure
++//! onto the wrong code is what makes a retry storm of a validation error.
++//!
++//! ## What you write
++//!
++//! * [`code_for`] — the canonical code for an internal failure: a bad request is
++//!   `INVALID_ARGUMENT`, a missing row `NOT_FOUND`, a duplicate `ALREADY_EXISTS`, an overloaded
++//!   server `RESOURCE_EXHAUSTED`, a bug `INTERNAL`, and a failing dependency `UNAVAILABLE`;
++//! * [`retryable`] — `true` for the codes a client may retry: `UNAVAILABLE`, `RESOURCE_EXHAUSTED`
++//!   and `DEADLINE_EXCEEDED`; never for `OK`, `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS` or
++//!   `INTERNAL`.
++
++/// How a call failed, in the service's own words.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Failure {
++    /// The caller sent something unusable.
++    BadRequest,
++    /// A row that is not there.
++    MissingRow,
++    /// A row that is already there.
++    Duplicate,
++    /// The server has no room right now.
++    Overloaded,
++    /// A bug in the server.
++    Bug,
++    /// A dependency is down.
++    Downstream,
++}
++
++/// The canonical status code.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Code {
++    /// The call succeeded.
++    Ok,
++    /// The caller's input is unusable.
++    InvalidArgument,
++    /// What was asked for does not exist.
++    NotFound,
++    /// What was created already exists.
++    AlreadyExists,
++    /// The server is out of room.
++    ResourceExhausted,
++    /// A dependency is unavailable.
++    Unavailable,
++    /// The server failed.
++    Internal,
++    /// The deadline passed.
++    DeadlineExceeded,
++}
++
++/// The canonical code for `failure`.
++#[must_use]
++pub fn code_for(failure: Failure) -> Code {
++    todo!("the canonical code for each internal failure")
++}
++
++/// Whether a client may retry this code.
++#[must_use]
++pub fn retryable(code: Code) -> bool {
++    todo!("retry the transient codes, never the caller's mistakes or the server's bug")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,6 +7,7 @@
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
+ pub mod deadline;
++pub mod status;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;

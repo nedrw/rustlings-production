@@ -1,0 +1,60 @@
+--- /dev/null
++++ b/src/deadline.rs
+@@ -0,0 +1,47 @@
++//! Deadlines are absolute and they travel with the call.
++//!
++//! A timeout is a duration decided by whoever set it; a deadline is a **point in time**, and that
++//! is what makes it work across hops: the client computes `now + budget`, every server reads the
++//! same instant, and each hop subtracts what it spent. A server that received a duration instead
++//! would start its own clock and the chain would be as long as the number of hops.
++//!
++//! The boundary is the lesson: a hop may consume exactly what is left (the call then has zero
++//! budget and is done), and a hop that needs more fails **before** it runs — a server that starts
++//! work it cannot finish is spending the next hop's budget on a result nobody will read.
++//!
++//! ## What you write
++//!
++//! [`call`] — walk `hops`, each entry the ticks it costs, from `now` against an absolute
++//! `deadline`; answer the leftover budget, or [`Status::DeadlineExceeded`] at the first hop that
++//! does not fit.
++
++/// How a call ended.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Status {
++    /// The call finished with budget to spare.
++    Ok,
++    /// The deadline passed before the work could finish.
++    DeadlineExceeded,
++}
++
++/// What is left of an absolute deadline at `now`.
++///
++/// # Errors
++///
++/// [`Status::DeadlineExceeded`] when `now` is at or past the deadline.
++pub fn remaining(deadline: u64, now: u64) -> Result<u64, Status> {
++    if now >= deadline {
++        return Err(Status::DeadlineExceeded);
++    }
++    Ok(deadline - now)
++}
++
++/// Walk the chain: the leftover budget, or the hop that did not fit.
++///
++/// # Errors
++///
++/// [`Status::DeadlineExceeded`] when `now` is at or past `deadline`, or when a hop needs more than
++/// what is left.
++pub fn call(deadline: u64, now: u64, hops: &[u64]) -> Result<u64, Status> {
++    todo!("subtract each hop from what is left; a hop that does not fit fails before it runs")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,6 +6,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod deadline;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;

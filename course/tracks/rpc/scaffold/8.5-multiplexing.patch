@@ -1,0 +1,54 @@
+--- /dev/null
++++ b/src/multiplex.rs
+@@ -0,0 +1,41 @@
++//! Many streams on one connection: per-stream windows, one shared pump.
++//!
++//! One HTTP/2 connection carries every call, and each stream has its own flow-control window. The
++//! design decision is that they are **independent**: a slow consumer on one stream must not stop
++//! the others, which is what a single connection-wide queue would do — the head-of-line blocking
++//! that multiplexing exists to avoid.
++//!
++//! ## What you write
++//!
++//! [`pump`] — one round-robin pass over the streams, repeated until nobody can send:
++//!
++//! * each round asks every stream, in order, for one item; a blocked stream (`None`) does not stop
++//!   the round;
++//! * the answer is the `(index, item)` pairs in the order sent;
++//! * when a full round sends nothing, the pump stops.
++
++use crate::stream::Stream;
++
++/// A connection's streams.
++#[derive(Debug)]
++pub struct Connection {
++    streams: Vec<Stream>,
++}
++
++impl Connection {
++    /// A connection over `streams`.
++    #[must_use]
++    pub fn new(streams: Vec<Stream>) -> Self {
++        Self { streams }
++    }
++
++    /// The streams, for the callers that acknowledge.
++    pub fn streams_mut(&mut self) -> &mut [Stream] {
++        &mut self.streams
++    }
++}
++
++/// Send as much as the windows allow, one item per stream per round.
++pub fn pump(connection: &mut Connection) -> Vec<(usize, String)> {
++    todo!("one item per stream per round, until a full round sends nothing")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,6 +7,7 @@
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
+ pub mod deadline;
++pub mod multiplex;
+ pub mod status;
+ pub mod stream;
+ // kiln:scaffold:end

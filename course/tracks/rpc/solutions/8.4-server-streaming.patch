@@ -1,0 +1,15 @@
+--- a/src/stream.rs
++++ b/src/stream.rs
+@@ -45,6 +45,11 @@
+ 
+     /// The next item if the window allows it.
+     pub fn send(&mut self) -> Option<String> {
+-        todo!("the next item while the window has room; None when it is full")
++        if self.in_flight() >= self.window {
++            return None;
++        }
++        let item = self.items.get(self.sent)?.clone();
++        self.sent += 1;
++        Some(item)
+     }
+ }

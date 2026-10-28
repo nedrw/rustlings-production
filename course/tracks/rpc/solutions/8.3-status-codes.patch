@@ -1,0 +1,26 @@
+--- a/src/status.rs
++++ b/src/status.rs
+@@ -55,11 +55,21 @@
+ /// The canonical code for `failure`.
+ #[must_use]
+ pub fn code_for(failure: Failure) -> Code {
+-    todo!("the canonical code for each internal failure")
++    match failure {
++        Failure::BadRequest => Code::InvalidArgument,
++        Failure::MissingRow => Code::NotFound,
++        Failure::Duplicate => Code::AlreadyExists,
++        Failure::Overloaded => Code::ResourceExhausted,
++        Failure::Bug => Code::Internal,
++        Failure::Downstream => Code::Unavailable,
++    }
+ }
+ 
+ /// Whether a client may retry this code.
+ #[must_use]
+ pub fn retryable(code: Code) -> bool {
+-    todo!("retry the transient codes, never the caller's mistakes or the server's bug")
++    matches!(
++        code,
++        Code::Unavailable | Code::ResourceExhausted | Code::DeadlineExceeded
++    )
+ }
