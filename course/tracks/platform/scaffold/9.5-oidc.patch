@@ -1,0 +1,68 @@
+--- /dev/null
++++ b/src/oidc.rs
+@@ -0,0 +1,55 @@
++//! OIDC tokens: four checks, and the one everybody forgets.
++//!
++//! A token is a bearer credential; validating it is not "parse the claims", it is comparing them
++//! against what this service accepts. Three checks are famous — issuer, expiry, not-before — and the
++//! fourth is the one that turns a token minted for *any* client of the provider into a token for
++//! this one: **the audience**. A service that skips it accepts its neighbours' tokens, which is one
++//! shared identity provider away from a cross-tenant hole.
++//!
++//! ## What you write
++//!
++//! [`validate`] — the subject when every check passes, else the first failing one, in this order:
++//! issuer, audience, not-before, expiry. The order is the contract; a token that is both expired
++//! and for another audience is the wrong audience.
++
++/// The claims this service reads.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Claims {
++    /// Who minted the token.
++    pub issuer: String,
++    /// Who the token is for.
++    pub audience: String,
++    /// Who it identifies.
++    pub subject: String,
++    /// The first second at which it is invalid.
++    pub expires_at: u64,
++    /// The first second at which it is valid.
++    pub not_before: u64,
++}
++
++/// Why a token was refused.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ClaimError {
++    /// Another provider minted it.
++    WrongIssuer,
++    /// It is for another audience.
++    WrongAudience,
++    /// It is not valid yet.
++    NotYetValid,
++    /// It has expired.
++    Expired,
++}
++
++/// The subject of a valid token, or the first check it failed.
++///
++/// # Errors
++///
++/// See [`ClaimError`]; the checks run issuer, audience, not-before, expiry.
++pub fn validate<'a>(
++    claims: &'a Claims,
++    issuer: &str,
++    audience: &str,
++    now: u64,
++) -> Result<&'a str, ClaimError> {
++    todo!("issuer, audience, not-before, expiry — in that order")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,6 +7,7 @@
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
+ pub mod budget;
++pub mod oidc;
+ pub mod rollout;
+ pub mod secrets;
+ // kiln:scaffold:end

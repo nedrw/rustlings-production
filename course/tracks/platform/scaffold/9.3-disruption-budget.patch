@@ -1,0 +1,40 @@
+--- /dev/null
++++ b/src/budget.rs
+@@ -0,0 +1,27 @@
++//! Disruption budgets: how many pods a drain may take, and the one that takes none.
++//!
++//! A PodDisruptionBudget is the promise a cluster keeps to a workload during *voluntary* work —
++//! node drains, upgrades. `minAvailable` and `maxUnavailable` are two spellings of the same number,
++//! and the interesting cases are the edges: a budget of zero allowed evictions is a workload that
++//! blocks every drain (an alert, not a safety feature), and a budget larger than the workload
++//! cannot create pods that are not there.
++//!
++//! ## What you write
++//!
++//! [`allowed`] — how many pods may be evicted at once: `replicas - minAvailable` for the first
++//! spelling, `maxUnavailable` for the second, both capped at `replicas` and never below zero.
++
++/// One of the two spellings of a disruption budget.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Budget {
++    /// At least this many pods stay up.
++    MinAvailable(u32),
++    /// At most this many pods go down.
++    MaxUnavailable(u32),
++}
++
++/// How many pods may be evicted at once.
++#[must_use]
++pub fn allowed(replicas: u32, budget: Budget) -> u32 {
++    todo!("both spellings, capped at the replicas, never below zero")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,6 +6,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod budget;
+ pub mod rollout;
+ // kiln:scaffold:end
+ 

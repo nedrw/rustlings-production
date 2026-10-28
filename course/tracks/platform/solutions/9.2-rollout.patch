@@ -1,0 +1,11 @@
+--- a/src/rollout.rs
++++ b/src/rollout.rs
+@@ -26,5 +26,7 @@
+ /// Whether one more old pod may be terminated.
+ #[must_use]
+ pub fn may_terminate(replicas: u32, max_unavailable: u32, ready: u32, total: u32) -> bool {
+-    todo!("one more old pod may go only while the floor stays ready")
++    // The pod that leaves takes its readiness with it: after the move there must still be at least
++    // the floor ready, and it must have existed to be removed.
++    total > 0 && ready.saturating_sub(1) >= available_floor(replicas, max_unavailable)
+ }

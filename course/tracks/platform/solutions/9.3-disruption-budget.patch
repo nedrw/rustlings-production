@@ -1,0 +1,13 @@
+--- a/src/budget.rs
++++ b/src/budget.rs
+@@ -23,5 +23,9 @@
+ /// How many pods may be evicted at once.
+ #[must_use]
+ pub fn allowed(replicas: u32, budget: Budget) -> u32 {
+-    todo!("both spellings, capped at the replicas, never below zero")
++    let allowed = match budget {
++        Budget::MinAvailable(available) => replicas.saturating_sub(available),
++        Budget::MaxUnavailable(unavailable) => unavailable,
++    };
++    allowed.min(replicas)
+ }

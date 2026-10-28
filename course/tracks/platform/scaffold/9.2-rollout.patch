@@ -1,0 +1,43 @@
+--- /dev/null
++++ b/src/rollout.rs
+@@ -0,0 +1,30 @@
++//! Rolling updates: two budgets, and the smaller one decides each step.
++//!
++//! A Deployment's strategy is two numbers. `maxSurge` is how many extra pods may exist, and
++//! `maxUnavailable` is how many fewer than the desired count may be ready. A rollout may create a
++//! pod while total < desired + surge, and may terminate an old pod only while ready - 1 >= desired -
++//! unavailable. `maxUnavailable: 0` therefore needs a surge: without an extra pod there is nothing
++//! to make ready before the first old one leaves, and the rollout stalls at full capacity.
++//!
++//! ## What you write
++//!
++//! [`may_terminate`] — whether one more old pod may go now, given how many pods are ready and how
++//! many exist in total. [`may_create`] is given.
++
++/// The number of pods that may be ready at worst.
++#[must_use]
++pub fn available_floor(replicas: u32, max_unavailable: u32) -> u32 {
++    replicas.saturating_sub(max_unavailable)
++}
++
++/// Whether a new pod may be created, given how many exist.
++#[must_use]
++pub fn may_create(replicas: u32, max_surge: u32, total: u32) -> bool {
++    total < replicas.saturating_add(max_surge)
++}
++
++/// Whether one more old pod may be terminated.
++#[must_use]
++pub fn may_terminate(replicas: u32, max_unavailable: u32, ready: u32, total: u32) -> bool {
++    todo!("one more old pod may go only while the floor stays ready")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,6 +6,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod rollout;
+ // kiln:scaffold:end
+ 
+ /// What a manifest's probes are wired to.

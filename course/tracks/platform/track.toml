@@ -1,0 +1,149 @@
+# T9 `platform` — the layer a service ships on (5 steps, first landing), see curriculum.md §14.
+#
+# Conventions: see the header of `mailer/track.toml`; they are the same for every track.
+#
+# No cluster: a manifest is data, a rollout is arithmetic, a token is a struct — so each judgement is
+# reproducible in one call.
+
+format_version = 1
+id = "platform"
+index = 9
+title = "Platform — the layer a service ships on"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/platform"
+
+# Exit capabilities (curriculum.md §5): whatever else happens, these are established here.
+exit = [
+    "k8s/probe-wiring@apply",
+    "k8s/rollout@apply",
+]
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Platform —— 服务上线所依赖的那一层"
+
+[[step]]
+id = "9.1-probes"
+title = "Liveness is about the process, readiness is about serving"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.1-probes.md"
+time_hint = "60m"
+concepts = ["liveness probe", "readiness probe", "dependency"]
+teaches = ["k8s/probe-wiring@apply"]
+requires = []
+run = { cmd = "cargo test -p platform --test spec_probes" }
+spec = ["spec/9.1/probes.rs"]
+scaffold = "skeleton"
+solution = "solutions/9.1-probes.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+]
+
+[[step]]
+id = "9.2-rollout"
+title = "Two budgets decide every step of a rollout"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.2-rollout.md"
+time_hint = "60m"
+concepts = ["maxSurge", "maxUnavailable", "rolling update"]
+teaches = ["k8s/rollout@apply"]
+requires = ["k8s/probe-wiring@apply"]
+run = { cmd = "cargo test -p platform --test spec_rollout" }
+spec = ["spec/9.2/rollout.rs"]
+scaffold = "scaffold/9.2-rollout.patch"
+solution = "solutions/9.2-rollout.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+
+[[step]]
+id = "9.3-disruption-budget"
+title = "A budget of zero is an alert, not a safety feature"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.3-disruption-budget.md"
+time_hint = "45m"
+concepts = ["PodDisruptionBudget", "minAvailable", "maxUnavailable"]
+teaches = ["k8s/disruption-budget@apply"]
+requires = ["k8s/rollout@apply"]
+run = { cmd = "cargo test -p platform --test spec_budget" }
+spec = ["spec/9.3/budget.rs"]
+scaffold = "scaffold/9.3-disruption-budget.patch"
+solution = "solutions/9.3-disruption-budget.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "9.4-external-secrets"
+title = "A secret is a reference, never an artifact"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.4-external-secrets.md"
+time_hint = "60m"
+concepts = ["secret reference", "missing key", "manifest leak"]
+teaches = ["sec/external-secrets@operate"]
+requires = ["sec/secrets-management@apply"]
+run = { cmd = "cargo test -p platform --test spec_secrets" }
+spec = ["spec/9.4/secrets.rs"]
+scaffold = "scaffold/9.4-external-secrets.patch"
+solution = "solutions/9.4-external-secrets.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "9.5-oidc"
+title = "A token is somebody else's claim, checked here"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.5-oidc.md"
+time_hint = "60m"
+concepts = ["issuer", "audience", "expiry"]
+teaches = ["sec/oidc@apply"]
+requires = ["sec/authn-session@apply"]
+run = { cmd = "cargo test -p platform --test spec_oidc" }
+spec = ["spec/9.5/oidc.rs"]
+scaffold = "scaffold/9.5-oidc.patch"
+solution = "solutions/9.5-oidc.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]

@@ -1,0 +1,25 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -33,7 +33,21 @@
+ /// Every problem with `probes`, sorted.
+ #[must_use]
+ pub fn audit(probes: Probes) -> Vec<Finding> {
+-    todo!("liveness must be about the process; readiness must be about serving")
++    let mut findings = Vec::new();
++    // A liveness probe that reads a dependency restarts a healthy process every time the dependency
++    // blinks: it must answer "is this process alive", nothing else.
++    if probes.liveness_checks_dependencies {
++        findings.push(Finding::LivenessChecksDependency);
++    }
++    if !probes.has_readiness {
++        findings.push(Finding::NoReadinessProbe);
++    } else if !probes.readiness_checks_something {
++        // A readiness probe that always passes is a probe that says nothing; the traffic it lets
++        // through is exactly the traffic nobody checked.
++        findings.push(Finding::ReadinessAlwaysPasses);
++    }
++    findings.sort();
++    findings
+ }
+ 
+ /// The version of the service.

@@ -1,0 +1,23 @@
+--- a/src/oidc.rs
++++ b/src/oidc.rs
+@@ -51,5 +51,19 @@
+     audience: &str,
+     now: u64,
+ ) -> Result<&'a str, ClaimError> {
+-    todo!("issuer, audience, not-before, expiry — in that order")
++    if claims.issuer != issuer {
++        return Err(ClaimError::WrongIssuer);
++    }
++    // Without this check the service accepts every token its neighbours were issued.
++    if claims.audience != audience {
++        return Err(ClaimError::WrongAudience);
++    }
++    if now < claims.not_before {
++        return Err(ClaimError::NotYetValid);
++    }
++    // The expiry is exclusive, like every deadline in this course.
++    if now >= claims.expires_at {
++        return Err(ClaimError::Expired);
++    }
++    Ok(&claims.subject)
+ }
