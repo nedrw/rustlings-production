@@ -92,3 +92,26 @@ C 批的题型是"把一条约定写成一个可判定的判断"：
 **下一批（D）**：`test/fake-external`（1.13）· `sec/authn-session`（1.16）· `test/integration-layering`
 （1.19）· `release/container-image`（1.21）——偏"替身与发布"：端口后面的假实现、会话的有效期与撤销、
 测试之间的资源隔离、镜像的基线钉版与非 root。
+
+## 段 4：第四批四道（替身与发布，2026-10-28）
+
+1. **`test/fake-external@apply`（1.13）**——端口、假实现与用例三分：`Mailer` trait 是端口，
+   `FakeMailer` 记录被要求发送的消息、可以被设定成失败（**失败不记账**），`send_confirmation`
+   收 `&mut dyn Mailer` 而不是假实现本身。最后一条测试用第二个实现（计数器）走同一个用例，
+   这就是"用例不认识假实现"的编译期证明。
+2. **`sec/authn-session@apply`（1.16）**——`authenticate` 的三种拒绝与顺序：未知 → 已撤销 →
+   已过期（撤销是人的决定，过期是时间流逝，两者同时成立时报前者）。截止时刻是**开区间**：
+   `now == expires_at` 已经过期。
+3. **`test/integration-layering@apply`（1.19）**——审一个测试清单：任意两个测试共用一个资源
+   （`real:` 开头的算真实依赖，其余是夹具）都要报，`Unit` 测试用真实依赖另报一条。假实现被两个
+   测试共用也是冲突——"只是个假实现"正是上一个测试的收件箱变成下一个测试初始状态的方式。
+4. **`release/container-image@apply`（1.21）**——读 Dockerfile：每个 `FROM` 必须钉版（非
+   `latest` 的 tag，或 digest；`scratch` 天然钉死），**最后一个** stage 必须选非 root 的 `USER`
+   （builder 的 `USER` 不算）。
+
+**验收**：`kiln probe --check` **99/99**、覆盖 **71/79**；四道练习在 `todo!()` 上全挂（6/7/7/8）。
+D1 写的时候差点留下一条"只测给定代码"的测试（`FakeMailer::new().sent()` 本来就是空），按 probe
+的约定换成了走用例的 token 原样插入测试。
+
+**下一批（E）**：`ops/runbook-drill`（1.22）· `http/middleware-layering`（2.1）·
+`api/idempotency-key`（2.2）· `api/contract-testing`（2.3）——偏"接口与演练"。
