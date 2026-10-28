@@ -210,6 +210,10 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `cache/invalidation` | — | T6·6.2 | — | — |
 | `cache/single-flight` | — | T6·6.3 | — | — |
 | `cache/expiry-jitter` | — | T6·6.4 | — | — |
+| `cache/versioned-keys` | — | T6·6.5 | — | — |
+| `cache/two-level` | — | T6·6.6 | — | — |
+| `obs/cache-effectiveness` | — | — | — | T6·6.7 |
+| `ops/cache-failure` | — | — | — | T6·6.8 |
 
 **这张表就是「不重复」的证明**：一个能力在四个深度上各只出现一次，跨 track 只是换项目、换难度、换失败模式。
 
@@ -486,7 +490,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 5.21 | 协议与升级演进 | `dist/protocol-evolution@design`、`ops/rolling-upgrade@design` | 新旧节点混跑 |
 | 5.22 | 毕业演练：多节点故障 + 一致性审计 | `dist/consistency-audit@operate` | 审计脚本 + 复盘 |
 
-## 11. T6 `cache`：读缓存层（4 步，进行中）
+## 11. T6 `cache`：读缓存层（8 步）
 
 题材：一个挡在慢存储前面的读缓存。它不引异步运行时也不引 HTTP：时钟是参数，存储是一个计数的
 `BTreeMap`，于是每一条失效语义都能在测试里确定性复现。这条 track 是 M6 的第一块（见
@@ -498,6 +502,10 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 6.2 | 写路径的失效 | `cache/invalidation@apply` | 先写存储再删缓存；写后第一次读能看到新值 |
 | 6.3 | 单飞：一个键一个填充者 | `cache/single-flight@apply` | 进行中第二次请求是等待，不是第二个填充者 |
 | 6.4 | 过期时间不是常数 | `cache/expiry-jitter@apply` | 同一基准下不同键的 TTL 不同，且落在带宽内 |
+| 6.5 | 移动前缀来让命名空间失效 | `cache/versioned-keys@apply` | 一次 bump 让整片条目不可达，不扫缓存 |
+| 6.6 | 两层缓存与陈旧预算 | `cache/two-level@apply` | 本地命中不碰共享层；预算写下来 |
+| 6.7 | 缓存的有效性要成为 SLO | `obs/cache-effectiveness@operate` | 命中率与回源次数，边界算健康 |
+| 6.8 | 缓存挂了：停止询问它 | `ops/cache-failure@operate` | 熔断打开走直连，冷却后单探针 |
 
 ## 12. probe 与 drill 库
 

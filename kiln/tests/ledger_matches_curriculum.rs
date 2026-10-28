@@ -160,8 +160,8 @@ fn the_ledger_is_the_transcription_of_the_curriculum() {
     );
 
     // The counts the prototype reports, now pinned against the metadata.
-    assert_eq!(ledger.capability_count(), 101);
-    assert_eq!(ledger.slot_count(), 140);
+    assert_eq!(ledger.capability_count(), 105);
+    assert_eq!(ledger.slot_count(), 144);
 
     // Every slot points at a step the curriculum actually lists, and every listed step has one.
     let document_positions = positions_from_document();
@@ -172,8 +172,8 @@ fn the_ledger_is_the_transcription_of_the_curriculum() {
         .collect();
     assert_eq!(
         document_positions.len(),
-        123,
-        "the curriculum has 123 steps"
+        127,
+        "the curriculum has 127 steps"
     );
     assert_eq!(
         ledger_positions, document_positions,

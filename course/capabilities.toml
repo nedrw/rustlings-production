@@ -357,3 +357,15 @@ apply = "cache/6.3"
 
 [capability."cache/expiry-jitter"]
 apply = "cache/6.4"
+
+[capability."cache/versioned-keys"]
+apply = "cache/6.5"
+
+[capability."cache/two-level"]
+apply = "cache/6.6"
+
+[capability."obs/cache-effectiveness"]
+operate = "cache/6.7"
+
+[capability."ops/cache-failure"]
+operate = "cache/6.8"
