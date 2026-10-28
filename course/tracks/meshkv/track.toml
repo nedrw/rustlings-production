@@ -38,7 +38,7 @@ zh-Hans = "Meshkv —— 分布式 KV / 调度器"
 
 [[step]]
 id = "5.1-multi-node-topology"
-title = "Five skeletons in: the node, its identity, and the cluster it answers to"
+title = "A cluster is a list of names: node identity, the topology, and the line two nodes greet with"
 kind = "milestone"
 origin = "transfer"
 entry = "docs/steps/en/meshkv/5.1-multi-node-topology.md"
@@ -240,7 +240,7 @@ gates = [
 
 [[step]]
 id = "5.8-idempotent-sessions"
-title = "A retry is not a second write: sessions and idempotency keys"
+title = "A retry is not a second write: sessions and the keys that make one"
 kind = "milestone"
 origin = "teach"
 entry = "docs/steps/en/meshkv/5.8-idempotent-sessions.md"
@@ -267,7 +267,7 @@ gates = [
 
 [[step]]
 id = "5.9-mtls"
-title = "The peer across the wire is the node it claims: mTLS and rotation"
+title = "The peer across the wire is the node it claims: mTLS and the rotation window"
 kind = "milestone"
 origin = "teach"
 entry = "docs/steps/en/meshkv/5.9-mtls.md"

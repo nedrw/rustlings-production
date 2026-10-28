@@ -95,27 +95,14 @@ pub fn first_unfinished<'a>(track: &'a Track, state: &State) -> Option<&'a Step>
         .find(|step| state.status(&step.qualified_id()).is_unfinished())
 }
 
-/// The title a reader of this locale sees: the body's own front-matter title when a translation is
-/// there, the metadata title otherwise.
-///
-/// `track.toml` carries the English source title (authoring.md §3) — the translated one lives in
-/// the body that a `--lang` switch resolves to, which is exactly the file `kiln hint` would open.
+/// The title a reader of this locale sees — the body's, or the metadata's when no body resolves.
 fn step_title(session: &Session, step: &Step) -> String {
-    if session.locale() == session.source() {
-        return step.title.clone();
-    }
-    let Ok(crate::i18n::StepDoc::Found { path, .. }) = crate::i18n::resolve_step_doc(
+    crate::i18n::step_title(
         &session.course().dir(),
-        &step.entry,
+        step,
         session.locale(),
         session.source(),
-    ) else {
-        return step.title.clone();
-    };
-    crate::i18n::read_step_body(&path)
-        .ok()
-        .and_then(|body| body.front_matter.title)
-        .unwrap_or_else(|| step.title.clone())
+    )
 }
 
 /// Print one track and return `(steps done, steps total)`.

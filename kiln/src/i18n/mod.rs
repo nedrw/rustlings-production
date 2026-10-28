@@ -194,6 +194,31 @@ pub fn resolve_step_doc(
     })
 }
 
+/// The title a reader of `requested` sees for a step.
+///
+/// The body is where a step's name lives (authoring.md §2): `track.toml` repeats it as metadata,
+/// and the body may be a translation. Every learner-facing line — `kiln list`, the header `kiln
+/// hint` prints, `kiln plan`, `kiln site` — goes through here, so a step cannot have one name in
+/// one command and another somewhere else. Machine output (`kiln verify --json`, the spec listing)
+/// keeps the metadata title: it must not change with the reader's locale.
+#[must_use]
+pub fn step_title(
+    course_dir: &Path,
+    step: &crate::info::Step,
+    requested: &Locale,
+    source: &Locale,
+) -> String {
+    let Ok(StepDoc::Found { path, .. }) =
+        resolve_step_doc(course_dir, &step.entry, requested, source)
+    else {
+        return step.title.clone();
+    };
+    read_step_body(&path)
+        .ok()
+        .and_then(|body| body.front_matter.title)
+        .unwrap_or_else(|| step.title.clone())
+}
+
 /// The learner-facing notice for a fallback, or `None` when the requested locale was found.
 #[must_use]
 pub fn fallback_notice(

@@ -230,7 +230,12 @@ pub fn print_plan(session: &Session, track: &Track, probes: &[Probe], fast: bool
                 "  · {:<24} {:<34} {}",
                 step.qualified_id(),
                 teaches,
-                step.title
+                crate::i18n::step_title(
+                    &session.course().dir(),
+                    step,
+                    session.locale(),
+                    session.source()
+                )
             ));
         }
     }

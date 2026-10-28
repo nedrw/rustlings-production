@@ -137,7 +137,16 @@ pub fn print_preparation(prepared: &project::Outcome) {
 
 /// Print the step header, including where its body is (and whether it is translated).
 pub fn print_step_header(session: &Session, step: &Step) -> Result<()> {
-    println!("{} — {}", step.qualified_id(), step.title);
+    println!(
+        "{} — {}",
+        step.qualified_id(),
+        crate::i18n::step_title(
+            &session.course().dir(),
+            step,
+            session.locale(),
+            session.source()
+        )
+    );
     println!(
         "  kind: {} · origin: {} · {}",
         step.kind, step.origin, step.time_hint

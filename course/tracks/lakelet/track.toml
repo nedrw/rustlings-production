@@ -154,7 +154,7 @@ hint = "The decision is a value in the code (`Policy`) and a sentence in `docs/a
 
 [[step]]
 id = "4.4-wal-recovery"
-title = "Recovery replays a prefix: checksums, torn writes, and the records that were acknowledged"
+title = "A log is a prefix: checksummed records, torn writes, and the boundary that was acknowledged"
 kind = "milestone"
 origin = "deepen"
 entry = "docs/steps/en/lakelet/4.4-wal-recovery.md"

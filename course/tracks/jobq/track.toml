@@ -55,7 +55,7 @@ zh-Hans = "Jobq —— 作业队列引擎（库、worker、CLI）"
 
 [[step]]
 id = "3.1-engine-boundary"
-title = "Draw the engine boundary: a library the service depends on, never the other way"
+title = "Draw the engine boundary: a library the daemon depends on, never the other way"
 kind = "milestone"
 origin = "transfer"
 entry = "docs/steps/en/jobq/3.1-engine-boundary.md"
@@ -268,7 +268,7 @@ hint = "The delta over `relay/2.15` is that the lease outlives the process: rene
 
 [[step]]
 id = "3.8-clock-injection"
-title = "Time is a dependency: inject the clock, ban reading the system one"
+title = "Time is a dependency: inject the clock and let the compiler refuse the rest"
 kind = "milestone"
 origin = "teach"
 entry = "docs/steps/en/jobq/3.8-clock-injection.md"
@@ -295,7 +295,7 @@ hint = "`clippy.toml` is the other half of the lesson: once business code may no
 
 [[step]]
 id = "3.9-priority-fairness"
-title = "Priority without starvation: a scheduler the noisy tenant cannot capture"
+title = "Priority without starvation: a policy you can defend"
 kind = "milestone"
 origin = "deepen"
 entry = "docs/steps/en/jobq/3.9-priority-fairness.md"
