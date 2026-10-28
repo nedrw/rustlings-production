@@ -250,3 +250,28 @@ FnMut + '_` 说不清借的是谁；把字面量改成 `String` 传进去（只�
 `fmt`/`clippy` 干净。
 
 **未完**：7.5–7.9（重放、跨分区顺序、恰好一次、事件模式演进、lag 告警）在计划 §5 的表里。
+
+## 段 9：T7 后五步，九步齐（2026-10-28）
+
+7.5 重放（`broker/replay@apply`）、7.6 排序分组（`broker/ordering@design`）、7.7 恰好一次
+（`broker/exactly-once@design`）、7.8 事件模式演进（`broker/schema-compat@apply`）、7.9 lag 告警
+（`ops/lag-alert@operate`）。`kiln selftest --track broker` → **9/9 step(s) hold the contract**。
+
+**五步各自的那条判断**：重放是"读区间不移动任何提交"（`new` 把 `to` 夹到日志，`next_record` 只走到
+`end`）；排序分组是"排序约束的连通分量一个键"（并查集，组的键取最小名，答案与规则顺序无关）；恰好
+一次是"效果与偏移同一张表"（`process` 先查再应用，重放零新增、崩溃补一段不重复）；模式演进是
+"加法兼容、减法破坏，必填新增也是减法"；lag 告警是"末尾连续段 + 严格高于阈值"，一次低谷重置。
+
+**踩到的两处**：7.9 的 front matter 标题里用了 ASCII 双引号，TOML 字符串直接坏掉（改成「」）；7.8 的
+译文漏了术语 `step` 的中文（词表要求"步"），`i18n status` 报一条漂移后补上。
+
+**同步的计数**：curriculum §3.9 加五个能力、§12 的步表到九行；台账 **114 能力 / 153 槽位 / 136 步**；
+探题库 **119 道、覆盖 91/91** apply 槽位。
+
+**验收（本机实测）**：`selftest --track broker` 9/9；`probe --check` 119/119、覆盖 91/91；
+`lint-caps` `114 capabilities · 153 slots · 136 ledger positions · 136 authored steps`，no issues；
+`i18n status` 136/136、结构 0 error、漂移 0；`links` 干净；`site --check` **289 页**；
+`rebuild-patches.py --track broker --check` 十七份全 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1；
+`fmt`/`clippy` 干净。
+
+**M7 完成**。下一步按计划是 **M8 rpc**（T8：契约、deadline、流式背压、协议演进）。
