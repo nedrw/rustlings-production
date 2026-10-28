@@ -50,10 +50,20 @@ pub fn run(cli: &Cli, session: &Session, requested: &[String], track: Option<&st
         .filter(|step| project::missing_content(session.course(), track, step).is_empty())
         .collect();
     if authored.is_empty() {
-        println!(
-            "nothing to test yet: no step of {} has a body, a spec and a solution",
-            track.id
-        );
+        // Name what each step is still missing: a track that was laid out but not written is the
+        // normal state of a new one, and "nothing to test yet" alone does not tell the author
+        // which file to write next.
+        println!("nothing to test yet: no step of {} is complete.", track.id);
+        for step in &track.step {
+            let missing = project::missing_content(session.course(), track, step);
+            if missing.is_empty() {
+                continue;
+            }
+            println!("  {}:", step.qualified_id());
+            for item in missing {
+                println!("    {item}");
+            }
+        }
         return Ok(EXIT_NOT_AUTHORED);
     }
     // Which steps to *assert* on; every earlier step only has to set the state up. References are

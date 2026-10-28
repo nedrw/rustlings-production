@@ -35,6 +35,7 @@ pub mod images;
 pub mod links;
 pub mod lint_caps;
 pub mod list;
+pub mod new_track;
 pub mod plan;
 pub mod prepare;
 pub mod probe;
@@ -179,6 +180,28 @@ pub enum Command {
         /// Step to prepare: `1.14`, `1.14-worker` or `mailer/1.14-worker`.
         #[arg(value_name = "STEP")]
         step: Option<String>,
+    },
+
+    /// Lay out a new track's mechanical half: the directory layout, the metadata, the project
+    /// skeleton and the step and spec placeholders.
+    ///
+    /// What a generator must not decide — the ledger slots, the exit capabilities and the probes —
+    /// is printed as a checklist instead of invented.
+    NewTrack {
+        /// Track id, equal to the directory name (`toy`).
+        id: String,
+
+        /// Human-readable title.
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
+
+        /// The learner's project directory (default: `app/<id>`).
+        #[arg(long, value_name = "PATH")]
+        project: Option<String>,
+
+        /// A step to create: `<phase>.<index>-<slug>:<capability>@<depth>`. Repeatable.
+        #[arg(long = "step", value_name = "STEP")]
+        steps: Vec<String>,
     },
 
     /// Run a step's spec tests (the fast path; default: the first unfinished step).
@@ -390,6 +413,12 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         ),
         Some(Command::Review { due }) => review::run(&session, *due),
         Some(Command::Prepare { step }) => prepare::run(&mut session, step.as_deref()),
+        Some(Command::NewTrack {
+            id,
+            title,
+            project,
+            steps,
+        }) => new_track::run(&session, &id, title.as_deref(), project.as_deref(), &steps),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
         Some(Command::Check { step, slow }) => check::run(&mut session, step.as_deref(), *slow),
