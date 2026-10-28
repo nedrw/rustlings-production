@@ -13,23 +13,31 @@ use crate::site::{self, Options};
 
 /// Render every step body into a static site.
 pub fn run(session: &Session, out: Option<&str>, langs: &[String], check: bool) -> Result<u8> {
-    let mut locales = Vec::with_capacity(langs.len());
+    let mut locales: Vec<Locale> = Vec::with_capacity(langs.len());
     for lang in langs {
-        locales.push(Locale::parse(lang)?);
+        let locale = Locale::parse(lang)?;
+        if !locales.contains(&locale) {
+            locales.push(locale);
+        }
     }
     let options = if check {
+        if out.is_some() || !locales.is_empty() {
+            return Err(KilnError::Invalid(
+                "`--check` renders every locale into a scratch directory — pass `--out` and \
+                 `--locale` only when writing a site"
+                    .to_owned(),
+            ));
+        }
         Options::check()
     } else {
-        let out = out.map_or_else(|| PathBuf::from(site::DEFAULT_OUT), PathBuf::from);
+        let out = out.map_or_else(
+            || session.course().root().join(site::DEFAULT_OUT),
+            PathBuf::from,
+        );
         let mut options = Options::new(out);
         options.locales = locales;
         options
     };
-    if check && !langs.is_empty() {
-        return Err(KilnError::Invalid(
-            "`--check` renders every locale — pass `--locale` only when writing a site".to_owned(),
-        ));
-    }
     let report = site::build(session.course(), &options)?;
     let names: Vec<&str> = report.locales.iter().map(Locale::as_str).collect();
     if check {

@@ -1,0 +1,6 @@
+# The source locale's own catalogue. English lives in the code, so this file carries the one thing
+# the code cannot know: the language's name as its own speakers write it (authoring.md §8.1).
+locale = "en"
+
+[string]
+"site.name" = "English"

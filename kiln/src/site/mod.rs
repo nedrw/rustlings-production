@@ -10,16 +10,17 @@
 //!   `cargo xtask ci` runs (`--check`): CI renders every page into a scratch directory and throws it
 //!   away, so a body that does not render fails the build before anybody deploys a broken link.
 //! * **No server, no index library.** The output is files a static host can serve: HTML, one
-//!   stylesheet, one JSON search index and twenty lines of JavaScript that filter it. A course has
-//!   238 pages; anything heavier is a dependency the next maintainer has to keep alive.
-//! * **The site does not translate anything.** Track titles live in `track.toml` and stay as
-//!   authored; step titles come from each body's front matter, which is where a translator already
-//!   wrote them. Nothing is invented to fill a gap.
+//!   stylesheet, one JSON search index and twenty lines of JavaScript that filter it. The course is
+//!   251 pages; anything heavier is a dependency the next maintainer has to keep alive.
+//! * **The site translates nothing itself.** A step's title and body come from the body the
+//!   learner's locale resolves to, a track's name from `track.toml`'s `[localized_titles]`, and the
+//!   site's own labels from `course/locales/<locale>/ui.toml`. A missing translation falls back to
+//!   the source; nothing is invented to fill a gap.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{KilnError, Result};
 use crate::i18n::ui::Ui;
@@ -75,6 +76,11 @@ pub struct Report {
 }
 
 /// Render the course as a static site.
+///
+/// A real build renders into a staging directory beside `out` and swaps it in only when every page
+/// was written: a page that no longer exists must stop being published, and a failed build must
+/// leave the previous site standing. `--check` renders into a scratch directory, asks the
+/// questions, and removes it again — including when a question fails.
 pub fn build(course: &Course, options: &Options) -> Result<Report> {
     let source = Locale::parse(&course.manifest().default_locale)?;
     let locales = if options.locales.is_empty() {
@@ -88,29 +94,86 @@ pub fn build(course: &Course, options: &Options) -> Result<Report> {
                 .to_owned(),
         ));
     }
-    let out = if options.check {
-        scratch_dir()
-    } else if options.out.as_os_str().is_empty() {
+    if options.check {
+        let out = scratch_dir();
+        let outcome = write_site(course, &locales, &source, &out).and_then(|pages| {
+            check_links(&out)?;
+            check_search(&out)?;
+            Ok(pages)
+        });
+        let _ = std::fs::remove_dir_all(&out);
+        return Ok(Report {
+            locales,
+            pages: outcome?,
+            out,
+        });
+    }
+
+    let out = if options.out.as_os_str().is_empty() {
         course.root().join(DEFAULT_OUT)
     } else {
         options.out.clone()
     };
-    std::fs::create_dir_all(&out).map_err(|source| KilnError::Write {
+    refuse_unsafe_out(course, &out)?;
+    let staging = staging_dir(&out);
+    let pages = match write_site(course, &locales, &source, &staging) {
+        Ok(pages) => pages,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    if out.exists() {
+        std::fs::remove_dir_all(&out).map_err(|source| KilnError::Write {
+            path: out.clone(),
+            source,
+        })?;
+    }
+    std::fs::rename(&staging, &out).map_err(|source| KilnError::Write {
         path: out.clone(),
         source,
     })?;
-    let pages = write_site(course, &locales, &source, &out)?;
-    if options.check {
-        check_links(&out)?;
-    }
-    if options.check {
-        let _ = std::fs::remove_dir_all(&out);
-    }
     Ok(Report {
         locales,
         pages,
         out,
     })
+}
+
+/// Refuse an output directory that contains the repository: `--out ..` from the root would delete
+/// the course along with the site.
+fn refuse_unsafe_out(course: &Course, out: &Path) -> Result<()> {
+    let root = std::fs::canonicalize(course.root()).map_err(|source| KilnError::Read {
+        path: course.root().to_path_buf(),
+        source,
+    })?;
+    let target = if out.exists() {
+        std::fs::canonicalize(out).map_err(|source| KilnError::Read {
+            path: out.to_path_buf(),
+            source,
+        })?
+    } else {
+        let parent = out.parent().filter(|parent| !parent.as_os_str().is_empty());
+        match parent {
+            Some(parent) => {
+                let parent = std::fs::canonicalize(parent).map_err(|source| KilnError::Read {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+                out.file_name()
+                    .map_or(parent.clone(), |name| parent.join(name))
+            }
+            None => root.clone(),
+        }
+    };
+    if root.starts_with(&target) {
+        return Err(KilnError::Invalid(format!(
+            "refusing to write the site into {} — it contains the course itself; pick a directory \
+             inside or beside the repository",
+            out.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The locales the course has bodies for: every directory under `docs/steps/` that names one,
@@ -135,6 +198,12 @@ fn locales_of(course: &Course, source: &Locale) -> Result<Vec<Locale>> {
             locales.push(locale);
         }
     }
+    if !locales.contains(source) {
+        return Err(KilnError::Invalid(format!(
+            "the source locale `{source}` has no step directory under course/docs/steps — the \
+             source is not optional (authoring.md §8)"
+        )));
+    }
     locales.sort_by_key(|locale| (locale != source, locale.as_str().to_owned()));
     Ok(locales)
 }
@@ -146,11 +215,20 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
     write_file(&out.join("assets/search.js"), SEARCH)?;
 
     let mut index: Vec<SearchEntry> = Vec::new();
+    let mut names: Vec<String> = Vec::with_capacity(locales.len());
+    let mut picker_lines: Vec<String> = Vec::new();
     for locale in locales {
         let catalogue = Ui::load(&course.dir(), locale, source)?;
+        names.push(catalogue.text("site.name", locale.as_str()).to_owned());
+        let line = catalogue.text("site.picker", DEFAULT_PICKER).to_owned();
+        if !picker_lines.contains(&line) {
+            picker_lines.push(line);
+        }
         let home = Page {
             ui: &catalogue,
             locale: Some(locale),
+            names: &names,
+            lang: locale.as_str(),
             below: "index.html",
             depth: 1,
             locales,
@@ -167,6 +245,8 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
             let track_page = Page {
                 ui: &catalogue,
                 locale: Some(locale),
+                names: &names,
+                lang: locale.as_str(),
                 below: &track_below,
                 depth: 2,
                 locales,
@@ -192,6 +272,12 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
                 let page = Page {
                     ui: &catalogue,
                     locale: Some(locale),
+                    names: &names,
+                    lang: body
+                        .front_matter
+                        .locale
+                        .as_deref()
+                        .unwrap_or(locale.as_str()),
                     below: &step_below,
                     depth: 2,
                     locales,
@@ -216,12 +302,14 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
     let picker = Page {
         ui: &source_catalogue,
         locale: None,
+        names: &names,
+        lang: source.as_str(),
         below: "index.html",
         depth: 0,
         locales,
         title: "rustlings-production",
     };
-    write_file(&out.join("index.html"), &picker.picker())?;
+    write_file(&out.join("index.html"), &picker.picker(&picker_lines))?;
     pages += 1;
 
     let json = serde_json::to_string(&index)
@@ -328,7 +416,7 @@ fn excerpt(text: &str) -> String {
 const EXCERPT: usize = 200;
 
 /// One row of `search.json`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SearchEntry {
     /// The title the step page shows.
     title: String,
@@ -361,15 +449,6 @@ const DEFAULT_MINUTES: &str = "min";
 const DEFAULT_FOOTER: &str = "rendered by <code>kiln site</code> · \
                               <a href=\"https://github.com/nedrw/rustlings-production\">source</a>";
 
-/// A language's name as its own speakers write it, for the picker.
-fn language_name(locale: &Locale) -> String {
-    match locale.as_str() {
-        "en" => "English".to_owned(),
-        "zh-Hans" => "中文（简体）".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
 /// One page's position in the site: what it links to and what it is called.
 struct Page<'a> {
     /// The locale's UI catalogue: the site's labels and the manifest's messages.
@@ -382,6 +461,10 @@ struct Page<'a> {
     depth: usize,
     /// Every locale the site published, for the language switcher.
     locales: &'a [Locale],
+    /// Each locale's name as its own speakers write it (`site.name`, else the tag).
+    names: &'a [String],
+    /// The language the page's text is actually in — a step that fell back says so here.
+    lang: &'a str,
     /// The page title.
     title: &'a str,
 }
@@ -408,7 +491,7 @@ impl Page<'_> {
         let index = format!("{root}search.json");
         let mut html = String::with_capacity(body.len() + 2048);
         html.push_str("<!doctype html>\n<html lang=\"");
-        html.push_str(self.locale.map_or("en", Locale::as_str));
+        html.push_str(self.lang);
         html.push_str("\">\n<head>\n<meta charset=\"utf-8\">\n");
         html.push_str(
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>",
@@ -423,14 +506,18 @@ impl Page<'_> {
             None => html.push_str("index.html"),
         }
         html.push_str("\">rustlings-production</a>\n<nav class=\"langs\">");
-        for locale in self.locales {
+        for (position, locale) in self.locales.iter().enumerate() {
+            let name = self
+                .names
+                .get(position)
+                .map_or(locale.as_str(), String::as_str);
             if self.locale == Some(locale) {
-                html.push_str(&format!("<span>{}</span>", locale.as_str()));
+                html.push_str(&format!("<span>{}</span>", render::escape(name)));
             } else {
                 html.push_str(&format!(
                     "<a href=\"{}\">{}</a>",
                     self.in_locale(locale),
-                    locale.as_str()
+                    render::escape(name)
                 ));
             }
         }
@@ -450,21 +537,23 @@ impl Page<'_> {
         html
     }
 
-    /// The site root: one link per locale.
-    fn picker(&self) -> String {
-        let ui = self.ui;
+    /// The site root: the picking sentence in every language that has one, then the languages.
+    fn picker(&self, lines: &[String]) -> String {
         let mut body = String::from("<h1>rustlings-production</h1>\n");
-        let _ = writeln!(
-            body,
-            "<p>{}</p>\n<ul class=\"cards\">",
-            render::escape(ui.text("site.picker", DEFAULT_PICKER))
-        );
-        for locale in self.locales {
+        for line in lines {
+            let _ = writeln!(body, "<p>{}</p>", render::escape(line));
+        }
+        body.push_str("<ul class=\"cards\">\n");
+        for (position, locale) in self.locales.iter().enumerate() {
+            let name = self
+                .names
+                .get(position)
+                .map_or(locale.as_str(), String::as_str);
             let _ = writeln!(
                 body,
                 "<li><a href=\"{}/index.html\">{}</a><span class=\"meta\">{}</span></li>",
                 locale.as_str(),
-                render::escape(&language_name(locale)),
+                render::escape(name),
                 locale.as_str()
             );
         }
@@ -479,7 +568,8 @@ impl Page<'_> {
         let mut body = String::from("<h1>rustlings-production</h1>\n");
         let welcome = ui.welcome(manifest);
         // The note is for a reader whose locale has no text of its own — not for the source page.
-        if !ui.has("welcome") && self.locale != Some(source) {
+        let own_catalogue = self.locale.is_some_and(|locale| ui.locale() == locale);
+        if (!own_catalogue || !ui.has("welcome")) && self.locale != Some(source) {
             let _ = writeln!(
                 body,
                 "<p class=\"meta\">{}</p>",
@@ -626,7 +716,7 @@ fn paragraphs(text: &str) -> String {
     for line in text.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
             if !block.is_empty() {
-                let _ = writeln!(html, "<p>{}</p>", render::inline(&block.join(" ")));
+                let _ = writeln!(html, "<p>{}</p>", render::inline(&join_wrapped(&block)));
                 block.clear();
             }
             continue;
@@ -636,12 +726,98 @@ fn paragraphs(text: &str) -> String {
     html
 }
 
+/// Join the wrapped lines of one paragraph: a space between words, nothing between two wide
+/// characters.
+///
+/// The source is wrapped for a 100-column terminal, and a Chinese sentence has no spaces to break
+/// at — joining with `" "` would insert one mid-sentence (`规格会告诉 你`), which is not the text.
+fn join_wrapped(lines: &[&str]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        if let (Some(before), Some(after)) = (out.chars().last(), line.chars().next())
+            && !is_wide(before)
+            && !is_wide(after)
+        {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// CJK ideographs, CJK punctuation and full-width forms: scripts that do not space their words.
+fn is_wide(character: char) -> bool {
+    matches!(character as u32,
+        0x3000..=0x303f | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
+        | 0xff00..=0xffef | 0x20000..=0x2fa1f)
+}
+
+/// The directory a build renders into before it replaces `out`, in the same parent so the swap is a
+/// rename rather than a copy.
+fn staging_dir(out: &Path) -> PathBuf {
+    let name = out.file_name().map_or_else(
+        || "site".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    out.with_file_name(format!(".{name}.kiln-staging-{}", unique_suffix()))
+}
+
+/// Every URL in `search.json` has to name a file that was written.
+fn check_search(out: &Path) -> Result<()> {
+    let path = out.join("search.json");
+    let text = std::fs::read_to_string(&path).map_err(|source| KilnError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let entries: Vec<SearchEntry> = serde_json::from_str(&text)
+        .map_err(|error| KilnError::Invalid(format!("cannot decode search.json: {error}")))?;
+    let mut missing: Vec<&str> = Vec::new();
+    for entry in &entries {
+        let target = normalize(out).join(&entry.url);
+        if !target.is_file() {
+            missing.push(entry.url.as_str());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(KilnError::Invalid(format!(
+        "{} search result(s) point at pages that were not written: {}",
+        missing.len(),
+        missing.join(", ")
+    )))
+}
+
+/// Resolve `.` and `..` lexically, so a generated link can be judged without touching the disk.
+fn normalize(path: &Path) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => parts.push(other.as_os_str().to_owned()),
+        }
+    }
+    let mut out = PathBuf::new();
+    for part in parts {
+        out.push(part);
+    }
+    out
+}
+
 /// A scratch directory unique to this process, removed by the caller.
 fn scratch_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("kiln-site-{}", unique_suffix()))
+}
+
+/// `pid-nanos`: unique enough for a directory in this process's own temp space.
+fn unique_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.subsec_nanos());
-    std::env::temp_dir().join(format!("kiln-site-{}-{nanos}", std::process::id()))
+    format!("{}-{nanos}", std::process::id())
 }
 
 /// Every internal `href`/`src` in the generated pages has to name a file that was written.
@@ -650,17 +826,32 @@ fn scratch_dir() -> PathBuf {
 /// the repository, and nothing about the site, where the same link has to point at `.html`.
 /// Rendering that rewrite wrong is exactly the mistake nobody notices until a reader clicks it, so
 /// the check runs on the output — the one place where both the rewrite and the page names exist.
+/// Links inside `<code>`/`<pre>` are samples, not links, and are skipped (see `render`).
 fn check_links(out: &Path) -> Result<()> {
+    let root = normalize(out);
     let mut broken: Vec<String> = Vec::new();
     for page in html_files(out)? {
         let html = std::fs::read_to_string(&page).map_err(|error| KilnError::Read {
             path: page.clone(),
             source: error,
         })?;
-        let directory = page.parent().unwrap_or(out);
-        for target in internal_targets(&html) {
-            if !directory.join(&target).is_file() {
-                broken.push(format!("{} → {target}", page.display()));
+        let page_url = page
+            .strip_prefix(out)
+            .unwrap_or(&page)
+            .to_string_lossy()
+            .into_owned();
+        for target in render::link_targets(&html) {
+            let Some(relative) = internal_target(target) else {
+                continue;
+            };
+            let page_dir = Path::new(&page_url)
+                .parent()
+                .map_or_else(|| root.clone(), |parent| root.join(parent));
+            let resolved = normalize(&page_dir.join(relative));
+            if !resolved.starts_with(&root) {
+                broken.push(format!("{page_url} → {target} (outside the site)"));
+            } else if !resolved.is_file() {
+                broken.push(format!("{page_url} → {target}"));
             }
         }
     }
@@ -673,6 +864,25 @@ fn check_links(out: &Path) -> Result<()> {
         broken.len(),
         broken.join("\n  ")
     )))
+}
+
+/// The path part of a target this site is responsible for, or `None` for the rest of the web.
+///
+/// Fragments are dropped: the site generates no heading ids, so `#why` cannot be verified — and a
+/// check that silently passes is better than one that pretends to know.
+fn internal_target(target: &str) -> Option<&str> {
+    if target.starts_with('#')
+        || target.contains("://")
+        || target.starts_with("mailto:")
+        || target.starts_with('/')
+    {
+        return None;
+    }
+    let path = target.split_once('#').map_or(target, |(path, _)| path);
+    if path.is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 /// Every `.html` file under `out`, in a stable order.
@@ -702,34 +912,6 @@ fn html_files(out: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
-}
-
-/// Relative targets of `href="…"` and `src="…"` that are this site's own files.
-fn internal_targets(html: &str) -> Vec<String> {
-    let mut targets = Vec::new();
-    for attribute in ["href=\"", "src=\""] {
-        let mut rest = html;
-        while let Some(position) = rest.find(attribute) {
-            let after = &rest[position + attribute.len()..];
-            let Some(end) = after.find('"') else {
-                break;
-            };
-            let target = &after[..end];
-            rest = &after[end..];
-            if target.starts_with('#')
-                || target.contains("://")
-                || target.starts_with("mailto:")
-                || target.starts_with('/')
-            {
-                continue;
-            }
-            let path = target.split_once('#').map_or(target, |(path, _)| path);
-            if !path.is_empty() {
-                targets.push(path.to_owned());
-            }
-        }
-    }
-    targets
 }
 
 /// Write a file, creating its parent directories.
@@ -994,7 +1176,8 @@ mod tests {
             "course/locales/zh-Hans/ui.toml",
             "locale = \"zh-Hans\"\n\n[string]\nwelcome = \"欢迎，按步骤来。\"\n\
              \"site.tracks\" = \"课程\"\n\"site.unit\" = \"步\"\n\"site.project\" = \"项目\"\n\
-             \"site.minutes\" = \"分钟\"\n\"site.source_note\" = \"英文原文\"\n",
+             \"site.minutes\" = \"分钟\"\n\"site.picker\" = \"选择课程语言。\"\n\
+             \"site.name\" = \"中文（简体）\"\n\"site.source_note\" = \"英文原文\"\n",
         );
         course
     }
@@ -1082,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_that_links_a_sibling_step_renders_a_link_the_check_accepts() {
+    fn a_page_that_links_a_sibling_step_is_rewritten() {
         let temp = TempDir::new("site-sibling");
         let course = course(&temp);
         temp.write(
@@ -1098,10 +1281,130 @@ mod tests {
     }
 
     #[test]
-    fn internal_targets_ignore_what_is_not_a_page_of_this_site() {
-        let html = "<a href=\"#top\">t</a><a href=\"https://x/y\">e</a>\
-                    <a href=\"mailto:a@b\">m</a><a href=\"/abs\">a</a><a href=\"page.html\">p</a>";
-        assert_eq!(internal_targets(html), ["page.html"]);
+    fn the_check_mode_fails_on_a_body_link_with_no_page() {
+        let temp = TempDir::new("site-check-broken");
+        let course = course(&temp);
+        temp.write(
+            "course/docs/steps/en/mailer/1.2-toolchain.md",
+            "+++\nid = \"mailer/1.2-toolchain\"\ntitle = \"Pin\"\nlocale = \"en\"\n+++\n\n\
+             # Pin\n\nSee [gone](no-such-page.md).\n",
+        );
+        let error = build(&course, &Options::check()).unwrap_err();
+        assert!(error.to_string().contains("no-such-page.html"), "{error}");
+    }
+
+    #[test]
+    fn a_rebuild_stops_publishing_a_page_that_no_longer_exists() {
+        let temp = TempDir::new("site-rebuild");
+        let course = course(&temp);
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the first build");
+        assert!(out.join("zh-Hans/mailer/1.1-workspace.html").is_file());
+        std::fs::remove_dir_all(temp.path().join("course/docs/steps/zh-Hans")).unwrap();
+        build(&course, &Options::new(&out)).expect("the second build");
+        assert!(
+            !out.join("zh-Hans/mailer/1.1-workspace.html").exists(),
+            "a page that was not written this time must not survive"
+        );
+        assert!(out.join("en/mailer/1.1-workspace.html").is_file());
+    }
+
+    #[test]
+    fn a_failed_build_leaves_the_previous_site_alone() {
+        let temp = TempDir::new("site-failed");
+        let course = course(&temp);
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the first build");
+        let before = std::fs::read_to_string(out.join("index.html")).unwrap();
+        std::fs::remove_file(
+            temp.path()
+                .join("course/docs/steps/en/mailer/1.1-workspace.md"),
+        )
+        .unwrap();
+        build(&course, &Options::new(&out)).expect_err("a missing body fails the build");
+        let after = std::fs::read_to_string(out.join("index.html")).unwrap();
+        assert_eq!(before, after, "the previous site is still there, unchanged");
+    }
+
+    #[test]
+    fn an_output_directory_that_contains_the_repository_is_refused() {
+        let temp = TempDir::new("site-guard");
+        let course = course(&temp);
+        let out = temp.path().parent().expect("a parent").to_path_buf();
+        let error = build(&course, &Options::new(&out)).unwrap_err();
+        assert!(error.to_string().contains("refusing"), "{error}");
+    }
+
+    #[test]
+    fn the_search_index_only_names_pages_that_were_written() {
+        let temp = TempDir::new("site-search");
+        let out = temp.path().join("site");
+        write_file(
+            &out.join("search.json"),
+            "[{\"title\":\"x\",\"url\":\"en/mailer/gone.html\",\"track\":\"mailer\",\
+              \"step\":\"mailer/1.1\",\"text\":\"\"}]",
+        )
+        .unwrap();
+        let error = check_search(&out).unwrap_err();
+        assert!(error.to_string().contains("gone.html"), "{error}");
+    }
+
+    #[test]
+    fn every_published_language_gets_a_line_on_the_picker() {
+        let temp = TempDir::new("site-picker");
+        let course = course_with_catalogue(&temp);
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the site builds");
+        let picker = std::fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(
+            picker.contains("Choose a language for the course."),
+            "{picker}"
+        );
+        assert!(picker.contains("选择课程语言。"), "{picker}");
+        assert!(picker.contains("中文（简体）"), "{picker}");
+    }
+
+    #[test]
+    fn a_wrapped_chinese_welcome_gets_no_invented_spaces() {
+        let temp = TempDir::new("site-cjk");
+        let course = course_with_catalogue(&temp);
+        temp.write(
+            "course/locales/zh-Hans/ui.toml",
+            "locale = \"zh-Hans\"\n\n[string]\nwelcome = \"规格会告诉\\n你接下来必须做到什么。\"\n\
+             \"site.name\" = \"中文（简体）\"\n\"site.picker\" = \"选择课程语言。\"\n",
+        );
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the site builds");
+        let home = std::fs::read_to_string(out.join("zh-Hans/index.html")).unwrap();
+        assert!(home.contains("规格会告诉你接下来"), "{home}");
+        assert!(!home.contains("规格会告诉 你"), "{home}");
+    }
+
+    #[test]
+    fn only_repository_pages_are_internal() {
+        for (target, expected) in [
+            ("#top", None),
+            ("https://x/y", None),
+            ("mailto:a@b", None),
+            ("/abs", None),
+            ("page.html", Some("page.html")),
+            ("page.html#section", Some("page.html")),
+        ] {
+            assert_eq!(internal_target(target), expected, "{target}");
+        }
+    }
+
+    #[test]
+    fn a_code_sample_keeps_its_href() {
+        let html = super::render::markdown(
+            "Use `href=\"example.md\"` and then:\n\n```html\n<a href=\"example.md\">x</a>\n```\n",
+        );
+        assert!(html.contains("<code>href=\"example.md\"</code>"), "{html}");
+        assert!(
+            html.contains("&lt;a href=\"example.md\"&gt;x&lt;/a&gt;"),
+            "{html}"
+        );
+        assert_eq!(super::render::link_targets(&html), Vec::<&str>::new());
     }
 
     #[test]

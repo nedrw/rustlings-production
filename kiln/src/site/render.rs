@@ -1,9 +1,13 @@
 //! Markdown → HTML, and the one rewrite the site needs.
 //!
-//! The course pages are CommonMark plus GFM tables, nothing else (surveyed across all 238 bodies:
-//! no images, no footnotes, no raw HTML). `pulldown-cmark` is a pull parser for exactly that; the
-//! only thing added on top is a link rewrite, because a step body may point at a sibling page by
-//! its repository name (`[2.15](2.15-shutdown-leases.md)`) and the site's sibling is `.html`.
+//! The course pages are CommonMark plus GFM tables, nothing else (surveyed across every body: no
+//! images, no footnotes, no raw HTML). `pulldown-cmark` is a pull parser for exactly that; the only
+//! thing added on top is a link rewrite, because a step body may point at a sibling page by its
+//! repository name (`[2.15](2.15-shutdown-leases.md)`) and the site's sibling is `.html`.
+//!
+//! The rewrite — and the link check that guards it — only ever looks at *markup*, never at the
+//! text inside `<code>`/`<pre>`: an HTML example that prints `href="page.md"` is content, and
+//! changing it would teach the wrong bytes.
 
 use pulldown_cmark::{Options, Parser, html};
 
@@ -28,6 +32,11 @@ pub fn markdown(text: &str) -> String {
 #[must_use]
 pub fn inline(text: &str) -> String {
     let escaped = escape(text);
+    // A lone backtick is a typo, not an unterminated span: leave the text alone rather than open a
+    // tag that can never close (and that would restyle the rest of the paragraph).
+    if !escaped.matches('`').count().is_multiple_of(2) {
+        return escaped;
+    }
     let mut out = String::with_capacity(escaped.len());
     let mut inside = false;
     for character in escaped.chars() {
@@ -37,10 +46,6 @@ pub fn inline(text: &str) -> String {
         } else {
             out.push(character);
         }
-    }
-    if inside {
-        // An unpaired backtick: show it rather than opening a tag that never closes.
-        out.push_str("&#96;");
     }
     out
 }
@@ -68,22 +73,84 @@ pub fn escape(text: &str) -> String {
     out
 }
 
-/// Point every `href` that names a sibling markdown page at the HTML page instead.
-fn rewrite_links(markdown_html: &str) -> String {
-    let mut out = String::with_capacity(markdown_html.len());
-    let mut rest = markdown_html;
-    while let Some(position) = rest.find("href=\"") {
-        let (before, after) = rest.split_at(position + "href=\"".len());
-        out.push_str(before);
-        let Some(end) = after.find('"') else {
-            out.push_str(after);
-            return out;
+/// `(start, end)` byte ranges of every `href`/`src` attribute value outside `<code>`/`<pre>`.
+///
+/// Text inside those two elements is a sample, not a link: the site quotes HTTP and HTML, and a
+/// sample that says `href="page.md"` must keep saying it.
+fn link_ranges(html: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut depth = 0usize;
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while let Some(offset) = html[index..].find('<') {
+        let tag_start = index + offset;
+        let Some(length) = html[tag_start..].find('>') else {
+            break;
         };
-        let (target, tail) = after.split_at(end);
-        out.push_str(&site_href(target));
-        rest = tail;
+        let tag_end = tag_start + length + 1;
+        let tag = &html[tag_start..tag_end];
+        let name = tag[1..]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .next()
+            .unwrap_or_default();
+        if name.eq_ignore_ascii_case("code") || name.eq_ignore_ascii_case("pre") {
+            if depth == 0 && tag_start > cursor {
+                collect(&html[cursor..tag_start], cursor, &mut ranges);
+            }
+            if tag.starts_with("</") {
+                depth = depth.saturating_sub(1);
+            } else {
+                depth += 1;
+            }
+            cursor = tag_end;
+        }
+        index = tag_end;
     }
-    out.push_str(rest);
+    if depth == 0 && cursor < html.len() {
+        collect(&html[cursor..], cursor, &mut ranges);
+    }
+    ranges
+}
+
+/// Attribute values in one stretch of markup, as absolute byte ranges.
+fn collect(segment: &str, offset: usize, ranges: &mut Vec<(usize, usize)>) {
+    for attribute in ["href=\"", "src=\""] {
+        let mut rest = 0usize;
+        while let Some(position) = segment[rest..].find(attribute) {
+            let value_start = rest + position + attribute.len();
+            let Some(length) = segment[value_start..].find('"') else {
+                break;
+            };
+            ranges.push((offset + value_start, offset + value_start + length));
+            rest = value_start + length;
+        }
+    }
+    ranges.sort_unstable();
+}
+
+/// Every link target the site controls (outside code samples).
+pub fn link_targets(html: &str) -> Vec<&str> {
+    link_ranges(html)
+        .into_iter()
+        .map(|(start, end)| &html[start..end])
+        .collect()
+}
+
+/// Point every `href` that names a sibling markdown page at the HTML page instead.
+fn rewrite_links(html: &str) -> String {
+    let ranges = link_ranges(html);
+    if ranges.is_empty() {
+        return html.to_owned();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0usize;
+    for (start, end) in ranges {
+        out.push_str(&html[last..start]);
+        out.push_str(&site_href(&html[start..end]));
+        last = end;
+    }
+    out.push_str(&html[last..]);
     out
 }
 

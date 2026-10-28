@@ -26,6 +26,7 @@ T1 `mailer` 完成了：一个会启动、会迁移、会发信、会重试、�
 """
 
 # The documentation site's furniture (`kiln site`).
+"site.name" = "中文（简体）"
 "site.tracks" = "课程"
 "site.picker" = "选择课程语言。"
 "site.search" = "搜索…"
