@@ -70,3 +70,25 @@ B 批和 A 批的题型不同：A 是"补一个函数体"，B 是**判断**—�
 **下一批（C）**：`obs/structured-logs`（1.6）· `http/service-skeleton`（1.7）· `test/app-factory`（1.8）·
 `db/migrations`（1.9）——偏"协议与契约"：日志事件的字段、404/405 的诚实、装置与生产的同一性、
 迁移的不可编辑性。
+
+## 段 3：第三批四道（协议与契约，2026-10-28）
+
+C 批的题型是"把一条约定写成一个可判定的判断"：
+
+1. **`obs/structured-logs@apply`（1.6）**——`line`：`event=… run.id=…` 之后按给定顺序拼字段，所有
+   值过 `render_value`（给定）。测七条：没有字段也带 run.id；字段顺序；空格/引号/空值/`=` 的引号规则；
+   以及**值里有换行时一行仍是一行**（转义成 `\n`）。
+2. **`http/service-skeleton@apply`（1.7）**——`Router::handle`：未知路径 404 且 `allow` 为空；
+   已知路径配错方法 405 且 `allow` 是该路径注册的方法（不是全局的）；`HEAD` 就是没有正文的 `GET`。
+   最后一条测试特意用了只有 `POST` 的路由：对它发 `HEAD` 必须 405，不能"因为是 HEAD 就放行"。
+3. **`test/app-factory@apply`（1.8）**——`start`：部件顺序固定（router → database → mail），端口来自
+   `Ports::next` 而**从不**读 `config.port`。测的是"固定端口被忽略"与"两个应用不会拿到同一个端口"，
+   后者正是段 1 里那个"共享 target 目录"事故的同一类错误。
+4. **`db/migrations@apply`（1.9）**——`plan`：先查历史（已应用的迁移不能缺失或改动），再算待应用，
+   最后拒绝"编号插进历史中间"的新迁移。四条错误路径各一条测试，外加"已是最新 = 空计划"。
+
+**验收**：`kiln probe --check` **95/95**、覆盖 **67/79**；四道练习在 `todo!()` 上全挂（7/7/6/7）。
+
+**下一批（D）**：`test/fake-external`（1.13）· `sec/authn-session`（1.16）· `test/integration-layering`
+（1.19）· `release/container-image`（1.21）——偏"替身与发布"：端口后面的假实现、会话的有效期与撤销、
+测试之间的资源隔离、镜像的基线钉版与非 root。

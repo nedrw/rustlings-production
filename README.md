@@ -97,7 +97,7 @@ the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
 [docs/m6-plan.md](docs/m6-plan.md): the course is complete on its vertical axis and thin on a few
 horizontal ones. M6.0 is filling the 24 `apply` slots that had no probe — `kiln probe --check` now
 prints coverage and four probes landed in the first batch (`db/transactions`, `api/pagination`,
-`async/graceful-shutdown`, `sec/password-hash`), `91/91` references passing, `63/79` apply slots
+`async/graceful-shutdown`, `sec/password-hash`), `95/95` references passing, `67/79` apply slots
 covered. The cache, broker, RPC, platform and capstone milestones follow in that order.
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
