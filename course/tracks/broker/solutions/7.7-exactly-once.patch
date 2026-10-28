@@ -1,0 +1,23 @@
+--- a/src/exactly_once.rs
++++ b/src/exactly_once.rs
+@@ -63,5 +63,19 @@
+ 
+ /// Apply `[from, to)` of `partition` exactly once, answering how many were new.
+ pub fn process(topic: &Topic, sink: &mut Sink, partition: usize, from: u64, to: u64) -> usize {
+-    todo!("skip what the sink already applied; apply the rest in offset order")
++    let mut applied = 0;
++    let end = to.min(topic.end(partition));
++    for offset in from..end {
++        // The check is the whole mechanism: a redelivered record already has an entry, and applying
++        // it again would be the duplicate that "exactly once" is supposed to prevent.
++        if sink.applied(partition, offset) {
++            continue;
++        }
++        let Some(record) = topic.read(partition, offset) else {
++            break;
++        };
++        sink.apply(partition, offset, &record.payload);
++        applied += 1;
++    }
++    applied
+ }

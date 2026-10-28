@@ -17,6 +17,8 @@ project = "app/broker"
 exit = [
     "broker/partitioning@apply",
     "broker/consumer-offset@apply",
+    "broker/rebalance@apply",
+    "broker/lag@apply",
 ]
 
 # The track name in other languages; the source title above stays the fallback.
@@ -110,6 +112,136 @@ run = { cmd = "cargo test -p broker --test spec_lag" }
 spec = ["spec/7.4/lag.rs"]
 scaffold = "scaffold/7.4-lag.patch"
 solution = "solutions/7.4-lag.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.5-replay"
+title = "A replay is a range, not a position"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.5-replay.md"
+time_hint = "45m"
+concepts = ["replay", "half-open range", "read versus commit"]
+teaches = ["broker/replay@apply"]
+requires = ["broker/consumer-offset@apply"]
+run = { cmd = "cargo test -p broker --test spec_replay" }
+spec = ["spec/7.5/replay.rs"]
+scaffold = "scaffold/7.5-replay.patch"
+solution = "solutions/7.5-replay.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.6-ordering"
+title = "Order what must be ordered, and nothing else"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.6-ordering.md"
+time_hint = "60m"
+concepts = ["partition key", "ordering group", "parallelism"]
+teaches = ["broker/ordering@design"]
+requires = ["broker/partitioning@apply"]
+run = { cmd = "cargo test -p broker --test spec_ordering" }
+spec = ["spec/7.6/ordering.rs"]
+scaffold = "scaffold/7.6-ordering.patch"
+solution = "solutions/7.6-ordering.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.7-exactly-once"
+title = "Exactly once is a table, not a promise"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.7-exactly-once.md"
+time_hint = "60m"
+concepts = ["idempotent effect", "offset table", "at-least-once"]
+teaches = ["broker/exactly-once@design"]
+requires = ["broker/consumer-offset@apply"]
+run = { cmd = "cargo test -p broker --test spec_exactly_once" }
+spec = ["spec/7.7/exactly_once.rs"]
+scaffold = "scaffold/7.7-exactly-once.patch"
+solution = "solutions/7.7-exactly-once.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.8-schema-compat"
+title = "Additive is compatible; subtraction is a breaking change"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.8-schema-compat.md"
+time_hint = "45m"
+concepts = ["event schema", "compatible change", "required field"]
+teaches = ["broker/schema-compat@apply"]
+requires = ["api/contract-testing@apply"]
+run = { cmd = "cargo test -p broker --test spec_schema" }
+spec = ["spec/7.8/schema.rs"]
+scaffold = "scaffold/7.8-schema-compat.patch"
+solution = "solutions/7.8-schema-compat.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.9-lag-alert"
+title = "Alert on the run that says behind"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.9-lag-alert.md"
+time_hint = "45m"
+concepts = ["lag alert", "threshold", "run length"]
+teaches = ["ops/lag-alert@operate"]
+requires = ["broker/lag@apply"]
+run = { cmd = "cargo test -p broker --test spec_lag_alert" }
+spec = ["spec/7.9/lag_alert.rs"]
+scaffold = "scaffold/7.9-lag-alert.patch"
+solution = "solutions/7.9-lag-alert.patch"
 gates = [
     "spec-integrity",
     "caps",

@@ -1,0 +1,25 @@
+--- a/src/schema.rs
++++ b/src/schema.rs
+@@ -51,5 +51,21 @@
+ /// Every breaking difference, sorted.
+ #[must_use]
+ pub fn compat(old: &BTreeMap<String, Field>, new: &BTreeMap<String, Field>) -> Vec<Breaking> {
+-    todo!("removed, type-changed, and required-added; sorted")
++    let mut breaking = Vec::new();
++    for (name, field) in old {
++        match new.get(name) {
++            None => breaking.push(Breaking::Removed(name.clone())),
++            Some(replacement) if replacement.kind != field.kind => {
++                breaking.push(Breaking::TypeChanged(name.clone()));
++            }
++            Some(_) => {}
++        }
++    }
++    for (name, field) in new {
++        if !old.contains_key(name) && !field.optional {
++            breaking.push(Breaking::RequiredAdded(name.clone()));
++        }
++    }
++    breaking.sort();
++    breaking
+ }

@@ -1,0 +1,49 @@
+--- /dev/null
++++ b/src/alert.rs
+@@ -0,0 +1,36 @@
++//! Lag alerts: the number that says "behind", not the one that says "alive".
++//!
++//! A liveness check answers "is the process running"; a lag alert answers "is it keeping up" — and
++//! those are different questions on the day a consumer is alive and ten minutes behind. The rule
++//! needs a threshold and a run length, because one noisy sample is not an incident and one quiet
++//! sample is not a recovery.
++//!
++//! ## What you write
++//!
++//! [`evaluate`] — the alert for the *end* of a lag history:
++//!
++//! * [`Alert::Lagging`] when the last `consecutive` samples are all strictly above `threshold`;
++//!   `samples` is the length of that trailing run (which may be longer than `consecutive`) and
++//!   `lag` is the most recent sample;
++//! * [`Alert::None`] otherwise, including a history shorter than `consecutive` and a lag exactly at
++//!   the threshold (the boundary is not past it).
++
++/// What the end of a lag history says.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Alert {
++    /// Nothing to page anybody about.
++    None,
++    /// The consumer has been behind for a run of samples.
++    Lagging {
++        /// Length of the trailing run above the threshold.
++        samples: usize,
++        /// The most recent sample.
++        lag: u64,
++    },
++}
++
++/// The alert for the end of `history`, given a threshold and a run length.
++#[must_use]
++pub fn evaluate(history: &[u64], threshold: u64, consecutive: usize) -> Alert {
++    todo!("the trailing run above the threshold, and a boundary that is not past it")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod alert;
+ pub mod assignment;
+ pub mod consumer;
+ pub mod exactly_once;

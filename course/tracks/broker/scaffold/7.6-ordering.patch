@@ -1,0 +1,33 @@
+--- /dev/null
++++ b/src/ordering.rs
+@@ -0,0 +1,20 @@
++//! Where the ordering requirement goes: one key per group, and nothing to order, no group.
++//!
++//! There is no global order across a topic's partitions. What a course can teach instead is the
++//! design move this step is about: take the pairs of events that must stay ordered and make them
++//! share a key — the connected groups of the "must be ordered" graph. Everything else stays free to
++//! be parallel, because a key nobody needs to share is a partition nobody needs to serialize.
++//!
++//! ## What you write
++//!
++//! [`plan`] — a key per event, such that two events named in one ordering rule share a key, and
++//! events no rule connects do not. A group's key is the smallest event name in it, which is a
++//! deterministic choice; a rule naming an event outside `events` is ignored.
++
++use std::collections::BTreeMap;
++
++/// A key per event (`event -> key`).
++#[must_use]
++pub fn plan(events: &[&str], must_order: &[(&str, &str)]) -> BTreeMap<String, String> {
++    todo!("one key per connected group of the must-be-ordered graph")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod assignment;
+ pub mod consumer;
+ pub mod lag;
++pub mod ordering;
+ pub mod replay;
+ // kiln:scaffold:end
+ 

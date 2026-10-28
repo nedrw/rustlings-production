@@ -1,0 +1,60 @@
+--- /dev/null
++++ b/src/replay.rs
+@@ -0,0 +1,47 @@
++//! Replay: read an old range again, without touching anybody's position.
++//!
++//! A replay is not a consumer. It reads a closed range of one partition from the beginning, applies
++//! the effect somewhere else (a fixed table, an audit), and leaves the live consumer exactly where
++//! it was — the group's committed offset is a promise about *processing*, and a replay is not part
++//! of it.
++//!
++//! ## What you write
++//!
++//! [`Replay::next_record`] — the next record of `[from, to)`, or `None` once the range is walked out
++//! or the log ends inside it. Half-open, like every range in this course: `to` is the first offset
++//! the replay does *not* read.
++
++use crate::{Record, Topic};
++
++/// A replay of one partition's records.
++#[derive(Debug)]
++pub struct Replay<'a> {
++    topic: &'a Topic,
++    partition: usize,
++    next: u64,
++    end: u64,
++}
++
++impl<'a> Replay<'a> {
++    /// A replay of `[from, to)` in `partition`, clamped to the log's end.
++    #[must_use]
++    pub fn new(topic: &'a Topic, partition: usize, from: u64, to: u64) -> Self {
++        Self {
++            topic,
++            partition,
++            next: from,
++            end: to.min(topic.end(partition)),
++        }
++    }
++
++    /// How many records the replay has not read yet.
++    #[must_use]
++    pub fn remaining(&self) -> u64 {
++        self.end.saturating_sub(self.next)
++    }
++
++    /// The next record of the range.
++    pub fn next_record(&mut self) -> Option<Record> {
++        todo!("read [from, to): stop at `end`, not past it")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod assignment;
+ pub mod consumer;
+ pub mod lag;
++pub mod replay;
+ // kiln:scaffold:end
+ 
+ /// One record in a partition.

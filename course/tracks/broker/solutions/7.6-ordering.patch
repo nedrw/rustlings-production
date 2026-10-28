@@ -1,0 +1,47 @@
+--- a/src/ordering.rs
++++ b/src/ordering.rs
+@@ -16,5 +16,43 @@
+ /// A key per event (`event -> key`).
+ #[must_use]
+ pub fn plan(events: &[&str], must_order: &[(&str, &str)]) -> BTreeMap<String, String> {
+-    todo!("one key per connected group of the must-be-ordered graph")
++    // Union-find over the events: the components of the "must stay ordered" graph are exactly the
++    // key groups. A chain a-b, b-c is one group, and its key is the smallest name in it.
++    let mut parent: BTreeMap<&str, &str> = events.iter().map(|event| (*event, *event)).collect();
++
++    fn root<'a>(parent: &mut BTreeMap<&'a str, &'a str>, mut node: &'a str) -> &'a str {
++        while parent[node] != node {
++            let next = parent[node];
++            // Path compression: point the node at its grandparent and walk on.
++            let grand = parent[next];
++            parent.insert(node, grand);
++            node = grand;
++        }
++        node
++    }
++
++    for (left, right) in must_order {
++        if !parent.contains_key(left) || !parent.contains_key(right) {
++            continue;
++        }
++        let left_root = root(&mut parent, left);
++        let right_root = root(&mut parent, right);
++        if left_root != right_root {
++            // The smaller name wins, so the group's key does not depend on the rule order.
++            let (keep, drop) = if left_root < right_root {
++                (left_root, right_root)
++            } else {
++                (right_root, left_root)
++            };
++            parent.insert(drop, keep);
++        }
++    }
++
++    let keys: Vec<(&str, &str)> = events
++        .iter()
++        .map(|event| (*event, root(&mut parent, event)))
++        .collect();
++    keys.into_iter()
++        .map(|(event, key)| (event.to_owned(), key.to_owned()))
++        .collect()
+ }

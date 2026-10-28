@@ -1,0 +1,24 @@
+--- a/src/alert.rs
++++ b/src/alert.rs
+@@ -32,5 +32,20 @@
+ /// The alert for the end of `history`, given a threshold and a run length.
+ #[must_use]
+ pub fn evaluate(history: &[u64], threshold: u64, consecutive: usize) -> Alert {
+-    todo!("the trailing run above the threshold, and a boundary that is not past it")
++    if consecutive == 0 {
++        return Alert::None;
++    }
++    let mut run = 0usize;
++    for lag in history.iter().rev() {
++        if *lag > threshold {
++            run += 1;
++        } else {
++            break;
++        }
++    }
++    if run < consecutive {
++        return Alert::None;
++    }
++    let lag = history.last().copied().unwrap_or(0);
++    Alert::Lagging { samples: run, lag }
+ }

@@ -1,0 +1,15 @@
+--- a/src/replay.rs
++++ b/src/replay.rs
+@@ -42,6 +42,11 @@
+ 
+     /// The next record of the range.
+     pub fn next_record(&mut self) -> Option<Record> {
+-        todo!("read [from, to): stop at `end`, not past it")
++        if self.next >= self.end {
++            return None;
++        }
++        let record = self.topic.read(self.partition, self.next)?.clone();
++        self.next += 1;
++        Some(record)
+     }
+ }

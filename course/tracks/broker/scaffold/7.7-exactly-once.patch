@@ -1,0 +1,80 @@
+--- /dev/null
++++ b/src/exactly_once.rs
+@@ -0,0 +1,67 @@
++//! Exactly once, end to end: the effect is recorded with the offset it came from.
++//!
++//! At-least-once delivery plus an idempotent effect is exactly-once processing, and the whole trick
++//! is one table: what was applied, keyed by `(partition, offset)`. A redelivered record finds its
++//! entry and is skipped; a crash before the effect leaves no entry, so the record is applied on the
++//! next pass.
++//!
++//! ## What you write
++//!
++//! [`process`] — walk `[from, to)` of one partition and apply every record that the sink has not
++//! applied yet, in offset order. Answer how many effects this pass added.
++
++use crate::Topic;
++
++/// One record's effect.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Effect {
++    /// The partition it came from.
++    pub partition: usize,
++    /// The offset it came from.
++    pub offset: u64,
++    /// The payload that produced it.
++    pub payload: String,
++}
++
++/// Where effects are recorded, and which offsets produced them.
++#[derive(Debug, Default)]
++pub struct Sink {
++    applied: std::collections::BTreeSet<(usize, u64)>,
++    effects: Vec<Effect>,
++}
++
++impl Sink {
++    /// An empty sink.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Has this offset's effect been applied?
++    #[must_use]
++    pub fn applied(&self, partition: usize, offset: u64) -> bool {
++        self.applied.contains(&(partition, offset))
++    }
++
++    /// Apply one record's effect and remember the offset it came from.
++    pub fn apply(&mut self, partition: usize, offset: u64, payload: &str) {
++        if self.applied.insert((partition, offset)) {
++            self.effects.push(Effect {
++                partition,
++                offset,
++                payload: payload.to_owned(),
++            });
++        }
++    }
++
++    /// Every effect, in the order it was applied.
++    #[must_use]
++    pub fn effects(&self) -> &[Effect] {
++        &self.effects
++    }
++}
++
++/// Apply `[from, to)` of `partition` exactly once, answering how many were new.
++pub fn process(topic: &Topic, sink: &mut Sink, partition: usize, from: u64, to: u64) -> usize {
++    todo!("skip what the sink already applied; apply the rest in offset order")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ // kiln:scaffold:begin
+ pub mod assignment;
+ pub mod consumer;
++pub mod exactly_once;
+ pub mod lag;
+ pub mod ordering;
+ pub mod replay;

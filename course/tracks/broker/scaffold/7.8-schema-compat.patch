@@ -1,0 +1,68 @@
+--- /dev/null
++++ b/src/schema.rs
+@@ -0,0 +1,55 @@
++//! Event schema evolution: what a consumer of the old shape can still read.
++//!
++//! An event is a promise in the same way an HTTP body is (step `relay/2.3`). The compatible moves
++//! are additive — a field a consumer did not know about is a field it ignores — and everything that
++//! takes information away breaks somebody: a removed field, a changed type, and an added field that
++//! is *required* is also information taken away (the producer must now supply something the old
++//! schema did not have, and the old consumers' writers do not).
++//!
++//! ## What you write
++//!
++//! [`compat`] — every breaking difference between the schema a consumer was written against and
++//! the one about to be published, sorted:
++//!
++//! * [`Breaking::Removed`] for a field that is gone;
++//! * [`Breaking::TypeChanged`] for a field whose type moved;
++//! * [`Breaking::RequiredAdded`] for a new field that is not optional.
++
++use std::collections::BTreeMap;
++
++/// A field's type.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Kind {
++    /// A string.
++    Text,
++    /// A number.
++    Number,
++    /// A flag.
++    Flag,
++}
++
++/// One field of an event.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Field {
++    /// Its type.
++    pub kind: Kind,
++    /// Whether a reader may ignore it (a new optional field is additive).
++    pub optional: bool,
++}
++
++/// A change that breaks a consumer written against the old schema.
++#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
++pub enum Breaking {
++    /// A field is gone.
++    Removed(String),
++    /// A field's type changed.
++    TypeChanged(String),
++    /// A new field is required.
++    RequiredAdded(String),
++}
++
++/// Every breaking difference, sorted.
++#[must_use]
++pub fn compat(old: &BTreeMap<String, Field>, new: &BTreeMap<String, Field>) -> Vec<Breaking> {
++    todo!("removed, type-changed, and required-added; sorted")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,6 +14,7 @@
+ pub mod lag;
+ pub mod ordering;
+ pub mod replay;
++pub mod schema;
+ // kiln:scaffold:end
+ 
+ /// One record in a partition.
