@@ -398,6 +398,11 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 两种语言、`site --check` 进 CI，检查生成页面的每个站内链接）；[maintenance.md](maintenance.md) 年度
 维护流程（什么会烂、谁先叫、修在哪）。过程与实测数字在 [handoff-m5-log.md](handoff-m5-log.md)。
 
+**M6–M10 的计划**（2026-10-28 的空白分析之后）：M6.0 补齐 24 个 apply 槽位的探题；M6.1 缓存
+（T6 `cache`）；M7 消息中间件（T7 `broker`）；M8 gRPC 与流式（T8 `rpc`）；M9 编排与身份
+（T9 `platform`）；M10 capstone 与协作模板。顺序、判据与成本在 [m6-plan.md](m6-plan.md)；施工日志在
+[handoff-m6-log.md](handoff-m6-log.md)。
+
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。
 
