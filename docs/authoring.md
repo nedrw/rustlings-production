@@ -32,7 +32,10 @@ slug 用英文、连字符、动词优先（`rate-limit-by-tenant` 优于 `tenan
 - **步骤元数据只在 `track.toml`**（`kind`/`origin`/`teaches`/`requires`/`run`/`spec`/`gates`/`hint`/`time_hint`）。
 - **标题的译文不在 `track.toml` 里**：一个步骤的名字属于它的正文（front matter 的 `title`），一个 track
   的名字没有正文可依附，所以 `track.toml` 给它一张表——`[localized_titles]` 加一行 `<locale> = "…"`。
-  `kiln list`、`kiln hint` 与 `kiln site` 都按读者的 locale 读这两处；`title` 本身始终是英文源。
+  学习者读的每一行（`kiln list`、`kiln hint` 的表头、`kiln plan`、`kiln site`）都走同一个
+  `i18n::step_title`，所以一步不会在两个命令里有两个名字；`title` 本身始终是英文源，机器输出
+  （`verify --json`、`spec` 清单）只读它。`kiln/tests/step_titles.rs` 钉住"元数据标题 = 英文正文标题"，
+  因为这两处曾经漂过七步。
 - **`run` 可以带 `timeout`**（秒）：`run = { cmd = "cargo test -p mailer --test spec_image", timeout = 1800 }`。它是个**下界**——取步骤声明的与 `kiln --timeout` 的较大值，同时作用于这一步的规格与闸门。只有「命令本身贵得出格」的步骤该写它（目前只有 1.21：镜像里要编译一棵依赖树，第一次构建在没构建过的机器上是分钟级；被默认 300s 砍掉的构建只会报 “timed out”，而这一步其实在正常工作）。
 - **正文 front-matter 只放文档自身的字段**，避免两处真源漂移：
 
@@ -322,11 +325,14 @@ fixes 模块只能改补丁已携带的文件；新增文件要连段一起加�
 4. **标题也要翻**，但要保持英文源的结构：段数、层级（`#`/`##`/`###`）与顺序一一对应（形状不对 = 结构错误，
    CI 报错；`source_hash` 不符 = 漂移，只告警）。代码块仍然逐字节不动——代码不是散文。
 5. 术语查 `course/glossary.toml`；新术语先加进词表再翻译。
-6. 加一门语言 = 新建目录 + front-matter，**不改任何代码**；`kiln --lang <locale>` 必须优雅回退。
-7. **翻译的边界是课程正文**：`docs/steps/<locale>/` 的步骤正文（以及可选的 `locales/<locale>/ui.toml` 里
-   课程的两句招呼语）。运行器的其余输出——错误消息、提示、闸门名、规格的失败文本——**保持英文**：它们引用
-   代码、路径与编译器输出，翻译后既不能复制粘贴，也会给每次消息改动多添一份译文。译文里的错误字符串、
-   命令与标识符同理，保持原样。
+6. 加一门语言 = 三处文件、**不改任何代码**：`docs/steps/<locale>/`（正文）、`locales/<locale>/ui.toml`
+   （招呼语、站点标签、语言自称）、各 `track.toml` 的 `[localized_titles]`（track 名）。缺哪个就回退，
+   `kiln --lang <locale>` 必须优雅回退。
+7. **翻译的边界是学习者读的内容**：步骤正文、步骤名（正文 front matter 的 `title`）、track 名、
+   招呼语，以及文档站自己的标签（`site.*`）。运行器的其余输出——错误消息、提示、闸门名、规格的失败
+   文本、`kiln verify --json` 的字段——**保持英文**：它们引用代码、路径与编译器输出，翻译后既不能复制
+   粘贴，也会给每次消息改动多添一份译文；机器输出更不能随读者的 locale 变。译文里的错误字符串、命令与
+   标识符同理，保持原样。
 
 ### 8.1 UI 目录（`course/locales/<locale>/ui.toml`）
 
@@ -345,9 +351,10 @@ welcome = """…"""                 # 覆盖 course.toml 的招呼语（kiln 与
 
 | 键 | 类型 | 说明 |
 | --- | --- | --- |
+| `site.name` | 文本 | 这门语言的自称（`中文（简体）`）；语言选择页与顶部切换器都用它 |
 | `site.tracks` / `site.picker` / `site.search` | 文本 | 首页标题、语言选择页那句话、搜索框占位 |
 | `site.unit` / `site.project` / `site.minutes` | 文本 | 计数单位（`步`）、项目标签、时长单位 |
-| `site.source_note` | 文本 | 正文只有英文时，页面上那句说明 |
+| `site.source_note` | 文本 | 非源语言的首页上，招呼语仍是英文时那句说明 |
 | `site.fallback` | HTML 片段 | 这一步没有译文时的句子，占位 `{locale}` / `{found}` |
 | `site.footer` | HTML 片段 | 页脚；两个 HTML 键要包 `<code>` 或链接 |
 

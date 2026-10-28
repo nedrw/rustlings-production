@@ -63,7 +63,9 @@
 7. **慢门与容器**：`kiln verify --slow`（按 track 跑，能在 `kt` 里分 track 定位）。它跑
    `slow:` 前缀的门——mutants、coverage、soak——这些 `cargo xtask ci` 不跑。容器相关的 track
    （mailer 1.9 起、jobq、relay、lakelet 1.21/4.22）第一次跑之前 `kiln images pull`。
-8. **站点**：`kiln site` 把整门课渲染进 `site/`（251 页、两种语言、一个搜索索引）。
+8. **站点**：`kiln site` 把整门课渲染进 `site/`（251 页、两种语言、一个搜索索引）；它先渲染到
+   旁边的临时目录、全部写成后才替换 `site/`，所以删掉/改名的页面不会继续发布，失败的构建也不会
+   留下半更新的一棵树。
    `cargo xtask ci` 跑的 `kiln site --check` 会渲染到一个临时目录再删掉，并检查**生成页面的每个
    站内链接都落在写出来的文件上**——这是 `kiln links` 看不见的那一半（它判 markdown，不判站点）。
    正式发布就是 `kiln site` 然后把 `site/` 交给任意静态托管。
@@ -89,7 +91,7 @@
 
 ## 2.1 加一门语言：三处，不改代码
 
-1. `course/docs/steps/<locale>/`：正文，front matter 四件套（`id`/`title`/`locale`/`source_hash`/`translator`）。
+1. `course/docs/steps/<locale>/`：正文，front matter 五个字段（`id`/`title`/`locale`/`source_hash`/`translator`）。
 2. `course/locales/<locale>/ui.toml`：`welcome`、`final_message` 与 `site.*` 的标签（authoring.md §8.1）。
    缺哪个键就保留英文——部分目录不是错误。
 3. 每条 `track.toml` 的 `[localized_titles]`：track 名。步骤标题不用动：它在正文的 front matter 里。
