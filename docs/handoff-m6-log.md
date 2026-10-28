@@ -363,3 +363,26 @@ OIDC）。
 
 **至此 M6–M10 全部交付**。计划里的"可选"项（SQL 索引深度、DB 复制/切换演练、批流 ETL、搜索）仍是
 可选：它们各是一条新 track 的体量，不在"M6–M10"的范围内。
+
+## 段 13：M6–M10 收尾后的第一次全量 CI（2026-10-29）
+
+用户确认开发完成后要求跑一次全量 `cargo xtask ci`。**结果：`xtask ci: all checks passed`，九条 track
+148/148，全程 1 小时 33 分**（23:45:32 → 01:18:33，本机，`CARGO_NET_OFFLINE=true` +
+`CARGO_TARGET_DIR=/private/tmp/kiln-land-target` + `XDG_CACHE_HOME=/private/tmp/xdg-land`）。
+
+**它抓到了内容层漏掉的一件事**：`format_course_rust` 报了 52 份 `course/probes/**` 没有过 rustfmt。
+`fmt` 门判的是**学员项目**，`probe --check` 只编译——课程自己的探题文件以前从没有一道检查看它们是否
+格式化。用 xtask 自己那条命令格式化（`rustfmt --edition 2024 --config-path rustfmt.toml --config
+skip_children=true`），单独提交 `6096903`；`probe --check` 之后仍是 127/127、覆盖 99/99，且每对
+练习/参考解仍然只差函数体。
+
+**第二次运行在 mailer/1.4 红在网络**：crates.io 索引 "transfer too slow … in 30s"。runner 的判定是
+诚实的——"the crate registry was unreachable — this is the network, not the step"——但 CI 因此不可能
+绿。按维护日志里既有的离线方案，用 `CARGO_NET_OFFLINE=true` 重跑：依赖缓存
+完整，九条 track 全部通过。
+
+**这次全量跑覆盖了什么**（都是内容层检查覆盖不到或覆盖不全的）：`cargo fmt --all --check`、
+课程自有 `.rs` 的 rustfmt、`cargo clippy --workspace --all-targets -D warnings`、`cargo test
+--workspace`（383 + 21 + 1 + 1 + 1）、`spec-integrity`、`patches_check`（九条 track 的补丁链）、
+`lint-caps`、`links`、`probe --check`（127/127、覆盖 99/99）、`site --check`（317 页）、以及九条
+track 的 `selftest`（22 + 24 + 27 + 24 + 22 + 8 + 9 + 5 + 7 = 148/148）。
