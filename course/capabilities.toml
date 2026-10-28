@@ -343,3 +343,17 @@ operate = "meshkv/5.14"
 
 [capability."dist/consistency-audit"]
 operate = "meshkv/5.22"
+
+# T6 `cache` (docs/curriculum.md §11). A read cache over a slow store; the clock is a parameter,
+# so every expiry rule is deterministic.
+[capability."cache/read-through"]
+apply = "cache/6.1"
+
+[capability."cache/invalidation"]
+apply = "cache/6.2"
+
+[capability."cache/single-flight"]
+apply = "cache/6.3"
+
+[capability."cache/expiry-jitter"]
+apply = "cache/6.4"

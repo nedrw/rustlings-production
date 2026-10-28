@@ -879,11 +879,7 @@ mod tests {
         let course = Course::load(root).unwrap();
 
         assert_eq!(course.manifest().default_track, "mailer");
-        assert_eq!(
-            course.tracks().len(),
-            5,
-            "T1-T5 have metadata (T5's steps are authored batch by batch)"
-        );
+        assert_eq!(course.tracks().len(), 6, "T1-T6 have metadata");
 
         let relay = course.track("relay").unwrap();
         assert_eq!(relay.step.len(), 24);
@@ -907,10 +903,10 @@ mod tests {
             "the exit capabilities of §5 are declared"
         );
 
-        // Counts of curriculum.md §3: 97 capabilities, 136 slots, 119 steps pinned.
-        assert_eq!(course.ledger().capability_count(), 97);
-        assert_eq!(course.ledger().slot_count(), 136);
-        assert_eq!(course.ledger().positions().len(), 119);
+        // Counts of curriculum.md §3: 101 capabilities, 140 slots, 123 steps pinned.
+        assert_eq!(course.ledger().capability_count(), 101);
+        assert_eq!(course.ledger().slot_count(), 140);
+        assert_eq!(course.ledger().positions().len(), 123);
 
         // A step reference resolves by number, by id, and with the track prefix.
         for reference in ["1.14", "1.14-worker", "mailer/1.14", "mailer/1.14-worker"] {
