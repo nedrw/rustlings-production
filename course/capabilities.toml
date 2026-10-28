@@ -413,3 +413,19 @@ apply = "rpc/8.4"
 
 [capability."rpc/multiplexing"]
 design = "rpc/8.5"
+
+# T9 `platform` (docs/curriculum.md §14). The layer a service ships on; no cluster.
+[capability."k8s/probe-wiring"]
+apply = "platform/9.1"
+
+[capability."k8s/rollout"]
+apply = "platform/9.2"
+
+[capability."k8s/disruption-budget"]
+apply = "platform/9.3"
+
+[capability."sec/external-secrets"]
+operate = "platform/9.4"
+
+[capability."sec/oidc"]
+apply = "platform/9.5"

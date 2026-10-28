@@ -19,7 +19,7 @@ use kiln::caps::{CapabilityId, Level};
 use kiln::info::Course;
 
 /// Track labels used by the curriculum tables (`T1`) and the ids they stand for.
-const TRACKS: [(u32, &str); 8] = [
+const TRACKS: [(u32, &str); 9] = [
     (1, "mailer"),
     (2, "relay"),
     (3, "jobq"),
@@ -28,6 +28,7 @@ const TRACKS: [(u32, &str); 8] = [
     (6, "cache"),
     (7, "broker"),
     (8, "rpc"),
+    (9, "platform"),
 ];
 
 fn repository_root() -> PathBuf {
@@ -116,6 +117,7 @@ fn positions_from_document() -> BTreeSet<String> {
         ("## 11. T6", "## 12.", "cache"),
         ("## 12. T7", "## 13.", "broker"),
         ("## 13. T8", "## 14.", "rpc"),
+        ("## 14. T9", "## 15.", "platform"),
     ];
     let mut positions = BTreeSet::new();
     for (start, end, track) in bounds {
@@ -164,8 +166,8 @@ fn the_ledger_is_the_transcription_of_the_curriculum() {
     );
 
     // The counts the prototype reports, now pinned against the metadata.
-    assert_eq!(ledger.capability_count(), 119);
-    assert_eq!(ledger.slot_count(), 158);
+    assert_eq!(ledger.capability_count(), 124);
+    assert_eq!(ledger.slot_count(), 163);
 
     // Every slot points at a step the curriculum actually lists, and every listed step has one.
     let document_positions = positions_from_document();
@@ -176,8 +178,8 @@ fn the_ledger_is_the_transcription_of_the_curriculum() {
         .collect();
     assert_eq!(
         document_positions.len(),
-        141,
-        "the curriculum has 141 steps"
+        146,
+        "the curriculum has 146 steps"
     );
     assert_eq!(
         ledger_positions, document_positions,

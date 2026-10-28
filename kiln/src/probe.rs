@@ -1,7 +1,7 @@
 //! Probe exercises: the 3–10 minute re-checks behind `kiln review --due` and `kiln plan --fast`.
 //!
 //! A probe is one file per (capability, depth) slot, and it exists because memory decays on a
-//! different schedule than the course does (plan §10, curriculum.md §14): a learner who passed
+//! different schedule than the course does (plan §10, curriculum.md §15): a learner who passed
 //! `mailer/1.15-idempotent-delivery` a year ago is not the same as one who can still write the
 //! claim/send/record state machine from an empty file.
 //!
@@ -433,7 +433,7 @@ fn parse_file(path: &Path) -> Result<Probe> {
     }
     if requirement.level == Level::Aware {
         return Err(KilnError::Invalid(format!(
-            "{}: `aware` slots get no probe (curriculum.md §14) — they are re-used by later steps, \
+            "{}: `aware` slots get no probe (curriculum.md §15) — they are re-used by later steps, \
              so a three-minute quiz would re-teach rather than re-check",
             path.display()
         )));

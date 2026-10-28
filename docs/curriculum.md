@@ -239,6 +239,16 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `rpc/server-streaming` | — | T8·8.4 | — | — |
 | `rpc/multiplexing` | — | — | T8·8.5 | — |
 
+### 3.11 平台与身份
+
+| 能力 | aware | apply | design | operate |
+| --- | --- | --- | --- | --- |
+| `k8s/probe-wiring` | — | T9·9.1 | — | — |
+| `k8s/rollout` | — | T9·9.2 | — | — |
+| `k8s/disruption-budget` | — | T9·9.3 | — | — |
+| `sec/external-secrets` | — | — | — | T9·9.4 |
+| `sec/oidc` | — | T9·9.5 | — | — |
+
 **这张表就是「不重复」的证明**：一个能力在四个深度上各只出现一次，跨 track 只是换项目、换难度、换失败模式。
 
 ## 4. 去重实例：同一能力的四次出现
@@ -297,6 +307,7 @@ flowchart TD
     T5 --> T6["T6 cache 读缓存层（8 步，中）"]
     T6 --> T7["T7 broker 分区消息日志（9 步，中）"]
     T7 --> T8["T8 rpc 契约先行的 RPC 层（5 步，中）"]
+    T8 --> T9["T9 platform 服务上线的那一层（5 步，中高）"]
     P["probe + drill 库（间隔重复）"] -.-> T1
     P -.-> T3
     P -.-> T4
@@ -315,6 +326,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断 | 8 teach |
 | T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 | 9 teach |
 | T8 `rpc` | T1 的 HTTP 契约 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用 | 5 teach |
+| T9 `platform` | T1 的容器与配置 | 探针接线、滚动发布算术、中断预算、外部 secrets、OIDC | 5 teach（进行中，后续三步见 [m6-plan.md](m6-plan.md)） |
 
 ## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
@@ -566,7 +578,19 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 8.4 | 流是一个窗口，不是一个缓冲 | `rpc/server-streaming@apply` | 在途到达窗口即停；确认后继续 |
 | 8.5 | 一条连接，多条流，没有队头阻塞 | `rpc/multiplexing@design` | 每轮每流一项；阻塞的流不拖住别人 |
 
-## 14. probe 与 drill 库
+## 14. T9 `platform`：服务上线所依赖的那一层（5 步，进行中）
+
+题材：服务上线到集群上要做的那几个判断。没有集群：清单是数据、发布是算术、令牌是结构体。
+
+| # | 步骤 | teaches | 过关条件（要点） |
+| --- | --- | --- | --- |
+| 9.1 | 存活说进程，就绪说能不能服务 | `k8s/probe-wiring@apply` | 存活不查依赖；就绪必须有且真的检查 |
+| 9.2 | 两个预算决定发布的每一步 | `k8s/rollout@apply` | 就绪下限与在途上限；0 不可用需要 surge |
+| 9.3 | 预算为零是告警，不是安全 | `k8s/disruption-budget@apply` | 两种写法、封顶、不为负 |
+| 9.4 | secret 是引用，不是产物 | `sec/external-secrets@operate` | 解析严格；清单里出现值是泄漏 |
+| 9.5 | 令牌是别人的声明，在这里核对 | `sec/oidc@apply` | 签发方、受众、未生效、过期，顺序固定 |
+
+## 15. probe 与 drill 库
 
 - **probe**（3–10 分钟）：每个 (能力, 深度) 格位一个抽查题，用于 `kiln review --due` 的间隔重复，也用于 `kiln plan --fast` 的免修证明。
   台账现在有 97 个能力、136 个格位，全覆盖等于 136 个 probe——这是笔真实成本，所以**只对 `apply` 级以上、
@@ -574,7 +598,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 - **drill**：纯机制训练（取消安全、`Pin`、`Buf`/`Bytes`、`dyn` 兼容性、迭代器适配器），按需插在 track 里；
   每个 drill 独立、可在 15 分钟内完成，不进任何项目。
 
-## 15. 课程如何组装（给未来的作者/翻译者）
+## 16. 课程如何组装（给未来的作者/翻译者）
 
 1. 新 track 的起点是**能力缺口**：先看台账缺什么深度，再设计项目，而不是先想项目
    （T1 是已交付的参考实现：[t1-mailer.md](t1-mailer.md) §5 列了可以照抄的模式）。

@@ -46,7 +46,7 @@ evidence = "mailer/1.14-worker"   # 谁证明的：步骤 id，或 `probe:<slug>
   手感，不是这一深度，只有重做步骤才能重抽这一层）；完全没有题的槽位说「no probe for this slot」，
   不编题。同一侧有多道题时点最接近这个深度的那道（够用里最浅、更浅里最深），判据只有
   `probe::exercise` 一处。
-- **aware 槽位不出题**（curriculum.md §14）；probe 只用 `std`、离线、秒级。
+- **aware 槽位不出题**（curriculum.md §15）；probe 只用 `std`、离线、秒级。
 
 ### 2.3 `kiln plan [--fast]` / `kiln skip`
 
