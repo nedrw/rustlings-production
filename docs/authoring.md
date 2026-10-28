@@ -238,6 +238,23 @@ diff**（交付未格式化的树第一道 fmt 门就红）、按**已提交补�
 fixes 模块只能改补丁已携带的文件；新增文件要连段一起加。200 字节以内的参考代码改动才考虑手补丁，
 且改完必须跑 `--check`。
 
+### 5.6 scaffold 必须编译：桩的签名、"未用"参数、trait 实现
+
+规格要在脚手架上**编译通过、运行失败**——学员看到的应该是一条断言的失败（`assertion failed`），
+而不是一条编译错误。`selftest` 接受编译失败（它只要求"在脚手架上不通过"），但会在旁边写一句
+"the scaffold is missing a signature the spec uses"：那句话有时候说中的是**另一个**毛病。两个实测过的
+来源（`kiln new-track` 的三步验收，handoff-m5 段 16）：
+
+1. **规格用到的每个名字都得有桩**，包括 trait 实现。规格里写了 `error.to_string()`，脚手架就得有
+   `impl std::fmt::Display for Error`——空的方法体写成 `todo!()`。缺了它，规格在编译期就死，
+   `selftest` 的那句提示会让人去找一个根本不缺的签名。
+2. **警告就是错误**。项目的 lint 策略（以及 `clippy -D warnings`）把"未使用的参数"变成编译失败，
+   而桩的参数恰好都没用上。按仓库的既定写法**加下划线前缀**：
+   `pub fn invalid(_message: &str) -> Self { todo!(…) }`，参考解开始用它时再改回 `message`。
+   已有的脚手架都是这个形状（`1.7-http.patch` 的 `_config`、`1.8-test-harness.patch` 的 `_config`）。
+
+判据很简单：把 scaffold 单独应用到一个干净骨架，跑一次 `cargo build`——它必须干净地过。
+
 ## 6. 规格测试规则
 
 1. 规格测试**只读**（`spec/`，哈希入清单），且不得包含 `#[ignore]`。

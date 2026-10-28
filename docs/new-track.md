@@ -2,7 +2,9 @@
 
 > 这份指南对着 [plan.md](plan.md) §11 的验收标准写的：**一个没参与过这个仓库的人，照它能在
 > 一小时内起一条 3 步的玩具 track，并且所有门是绿的。** 下面每一步都来自真实做过一遍的记录
-> （2026-10-27，`docs/handoff-m5-log.md` 段 15），包括走错了的地方。
+> （2026-10-27，`docs/handoff-m5-log.md` 段 15–16），包括走错了的地方。验收本身也跑完了：
+> 用这套命令起的三步 `toy` track，`kiln selftest --track toy` 报 **3/3 step(s) hold the
+> contract**——这是这份指南唯一算数的成绩。
 
 ## 0. 先分清两类活
 
@@ -38,7 +40,7 @@ course/tracks/toy/{scaffold,solutions}/       # 空目录，等你填
 
 它**不会**写的东西，正是第二节那张清单。
 
-## 2. 立刻会撞上的三件事
+## 2. 立刻会撞上的四件事
 
 ### 2.1 这个能力已经有主人了
 
@@ -73,17 +75,47 @@ the ledger already establishes what these steps ask for:
 
 所以你写的第一条真实规格，要断言一件脚手架**做不到**的事。写完把占位替换掉。
 
-### 2.3 补丁的 hunk 头要数对
+### 2.3 不要数 hunk 头：从树生成补丁
 
-这是 §5.4 那条规则，第一次做新 track 的人一定会撞：
+手写补丁是本指南里最费时的一步，也是唯一一步"看起来快、实际一定返工"的活。实测（三步玩具
+track）它一次都没一次过：hunk 头数错（`@@ -6,6 +6,5 @@` 只携带了 5 行）、scaffold 删了行、
+上下文取错。规则在 [authoring.md](authoring.md) §5.4/§5.5：**补丁是树 diff 出来的**，所以先造树。
+每一步的两棵树是：
 
+| 补丁 | 左树 | 右树 |
+| --- | --- | --- |
+| `scaffold/<step>.patch` | 第 N−1 步的完成态 | 第 N 步的脚手架态 |
+| `solutions/<step>.patch` | 第 N 步的脚手架态 | 第 N 步的完成态 |
+
+```sh
+cp -R course/tracks/toy/skeleton /tmp/toy/t0        # 树 0 = 骨架
+cp -R /tmp/toy/t0 /tmp/toy/t1 && $EDITOR /tmp/toy/t1/src/lib.rs   # 树 1 = 第 1 步完成态
+rustfmt --edition 2024 /tmp/toy/t1/src/lib.rs
+diff -u --label a/src/lib.rs --label b/src/lib.rs \
+  /tmp/toy/t0/src/lib.rs /tmp/toy/t1/src/lib.rs > course/tracks/toy/solutions/1.1-first-step.patch
 ```
-solution ✗ the reference solution did not apply: src/lib.rs: hunk `@@ -6,6 +6,5 @@` declares 6 old
-and 6 new line(s) but carries 5 and 5
-```
 
-`@@ -a,b +c,d @@` 里的 `b`/`d` 是这一段**实际携带**的行数。写补丁时数一遍，或者用
-`tools/rebuild-patches.py` 从树重新生成（§5.5）。
+下一步就把 `t1` 拷成 `t2s`（写字面量 `todo!()` 的桩）和 `t2f`（参考实现），再 diff 两次。
+新建文件要用 `--- /dev/null`（kiln 判"创建文件"的唯一依据）；`diff -u` 不会替你写这一行，
+得手工把左边改成 `/dev/null`。整条 track 有真东西可改之后，`tools/rebuild-patches.py --check`
+会替你核对"补丁 = 树"这件事，所以这一步的错误不会活到最后。
+
+### 2.4 规格是项目代码，不是文档
+
+规格文件会被 kiln 拷进学员项目的 `tests/`，所以它会被编译、也会被 `cargo fmt --all --check`
+检查。两件事跟着来：
+
+- **规格要过 rustfmt。** 一行超长的 `assert_eq!` 会让 `fmt` 门在**每一步**都红（它看的是整个
+  项目）。写完三份规格后跑一次 `cargo fmt --all`。
+- **改过规格，就要重钉清单。** `spec-integrity` 哈希的是规格文件：换掉占位规格后 `selftest`
+  的每一步都会报 *"the authoritative spec changed"*。跑一次：
+
+  ```sh
+  cargo run -p kiln -- spec manifest --track toy
+  ```
+
+脚手架那边还有两条硬规矩——桩必须编译、未用的参数要下划线前缀——写在
+[authoring.md](authoring.md) §5.6。
 
 ## 3. 剩下的清单
 
@@ -95,7 +127,8 @@ and 6 new line(s) but carries 5 and 5
 3. **探题**：每个 `apply` 槽位都要有一道探题（`course/probes/`，见 §11），否则
    `kiln probe --check` 会说这个槽位没有题。
 4. **规格与参考解**：把占位规格换成真的，把 `solutions/<id>.patch` 写出来；`scaffold/<id>.patch`
-   是第二步起的脚手架（第一步用整个 `skeleton/`）。
+   是第二步起的脚手架（第一步用整个 `skeleton/`）。换完规格跑一次 `kiln spec manifest --track <id>`
+   （§2.4），补丁从树生成（§2.3）。
 5. **正文**：模板里的 TODO 换成真的散文。`origin = "transfer"` 的步用 RECALL/DELTA，其余用
    WHY/TASK/DONE WHEN/TRAP/FURTHER（R5 会查）。
 
@@ -126,9 +159,17 @@ nothing to test yet: no step of toy is complete.
 | 读这份指南 + 跑一次 `new-track` | 10 分钟 |
 | 台账与 `reteach` 的决定 | 15 分钟 |
 | 三份规格（每份一个行为断言） | 30 分钟 |
-| 三份参考解补丁（手写或从树生成） | 30 分钟 |
+| 三份参考解补丁（从树生成，别手写） | 30 分钟 |
 | 三段正文 | 45 分钟 |
 | 跑门并修 | 30 分钟 |
+
+验收那一轮（三步 `toy`，`selftest` 3/3）的账，与上表只有两处偏差，两处都进了文档：
+
+- **补丁是唯一的返工点。** 手写三次、错三次（hunk 头、删行、上下文），换成 §2.3 的"先造树再
+  diff"后一次过。所以表里那 30 分钟是按"从树生成"算的；手写没有上限。
+- **脚手架会编译失败，而 `selftest` 的提示不像在说这件事。** 缺一个 `Display` 实现、一个未用
+  参数没有下划线前缀，它都只说"不在脚手架上通过"，还附一句会误导人的 *"the scaffold is missing
+  a signature the spec uses"*。判据是单独跑一次 `cargo build`（authoring.md §5.6）。
 
 超时了，通常卡在**规格写得太满**（一步只教一件事，规格只断言那件事）或**补丁手写**（改用
 `tools/rebuild-patches.py` 从树生成）。
