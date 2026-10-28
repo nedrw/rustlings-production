@@ -1,0 +1,48 @@
+--- /dev/null
++++ b/src/lag.rs
+@@ -0,0 +1,35 @@
++//! Lag: how far each partition's consumer is behind, and which partitions are past the threshold.
++//!
++//! ## What you write
++//!
++//! [`lag`] — end offset minus the committed offset, per partition of the topic:
++//!
++//! * a partition with no commit is fully behind (`end - 0`);
++//! * a commit past the end is `0`, not a negative number: the commit is a mistake, and a saturating
++//!   subtraction is the honest answer;
++//! * every partition of the topic appears in the answer, even when its lag is zero.
++
++use std::collections::BTreeMap;
++
++use crate::Topic;
++
++/// Lag per partition: the end offset minus the commit, saturating at zero.
++#[must_use]
++pub fn lag(topic: &Topic, committed: &BTreeMap<usize, u64>) -> BTreeMap<usize, u64> {
++    todo!("end minus commit, saturating, every partition")
++}
++
++/// The total backlog: every partition's lag added up.
++#[must_use]
++pub fn backlog(lag: &BTreeMap<usize, u64>) -> u64 {
++    lag.values().sum()
++}
++
++/// The partitions whose lag is strictly above `threshold`.
++#[must_use]
++pub fn behind(lag: &BTreeMap<usize, u64>, threshold: u64) -> Vec<usize> {
++    lag.iter()
++        .filter(|(_, value)| **value > threshold)
++        .map(|(partition, _)| *partition)
++        .collect()
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,6 +10,7 @@
+ // kiln:scaffold:begin
+ pub mod assignment;
+ pub mod consumer;
++pub mod lag;
+ // kiln:scaffold:end
+ 
+ /// One record in a partition.

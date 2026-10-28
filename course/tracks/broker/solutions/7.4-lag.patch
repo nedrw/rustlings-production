@@ -1,0 +1,16 @@
+--- a/src/lag.rs
++++ b/src/lag.rs
+@@ -16,7 +16,12 @@
+ /// Lag per partition: the end offset minus the commit, saturating at zero.
+ #[must_use]
+ pub fn lag(topic: &Topic, committed: &BTreeMap<usize, u64>) -> BTreeMap<usize, u64> {
+-    todo!("end minus commit, saturating, every partition")
++    let mut lag = BTreeMap::new();
++    for partition in 0..topic.partitions() {
++        let committed = committed.get(&partition).copied().unwrap_or(0);
++        lag.insert(partition, topic.end(partition).saturating_sub(committed));
++    }
++    lag
+ }
+ 
+ /// The total backlog: every partition's lag added up.

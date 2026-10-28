@@ -1,0 +1,71 @@
+--- /dev/null
++++ b/src/consumer.rs
+@@ -0,0 +1,58 @@
++//! Consumer offsets: where a group has got to, and what a restart resumes from.
++//!
++//! ## What you write
++//!
++//! [`Consumer::commit`] — record the group's position after the work is done:
++//!
++//! * a partition the topic does not have is ignored (a commit for somebody else's topic is a bug
++//!   in the caller, not a position);
++//! * an offset past the end is clamped to the end: the log is the truth, and a commit cannot
++//!   promise records that do not exist;
++//! * anything else is recorded as given.
++
++use std::collections::BTreeMap;
++
++use crate::{Record, Topic};
++
++/// One consumer's position in a topic.
++#[derive(Debug, Default)]
++pub struct Consumer {
++    committed: BTreeMap<usize, u64>,
++    next: BTreeMap<usize, u64>,
++}
++
++impl Consumer {
++    /// A consumer at the beginning of every partition.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// A consumer that starts where `committed` says a previous one stopped.
++    #[must_use]
++    pub fn resume(committed: &BTreeMap<usize, u64>) -> Self {
++        Self {
++            committed: committed.clone(),
++            next: committed.clone(),
++        }
++    }
++
++    /// The group's committed offset for `partition` (`0` when nothing was committed).
++    #[must_use]
++    pub fn committed(&self, partition: usize) -> u64 {
++        self.committed.get(&partition).copied().unwrap_or(0)
++    }
++
++    /// The next record to process in `partition`, if there is one.
++    pub fn poll(&mut self, topic: &Topic, partition: usize) -> Option<Record> {
++        let offset = self.next.get(&partition).copied().unwrap_or(0);
++        let record = topic.read(partition, offset)?.clone();
++        self.next.insert(partition, offset + 1);
++        Some(record)
++    }
++
++    /// Commit the group's position in `partition`.
++    pub fn commit(&mut self, topic: &Topic, partition: usize, offset: u64) {
++        todo!("ignore an unknown partition, clamp to the end, record the rest")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod consumer;
+ // kiln:scaffold:end
+ 
+ /// One record in a partition.

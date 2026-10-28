@@ -1,0 +1,26 @@
+--- a/src/assignment.rs
++++ b/src/assignment.rs
+@@ -15,5 +15,22 @@
+ /// The partitions each member owns, by member name.
+ #[must_use]
+ pub fn assign(partitions: usize, members: &[&str]) -> BTreeMap<String, Vec<usize>> {
+-    todo!("sorted members, contiguous ranges, every partition once")
++    let mut sorted: Vec<&str> = members.to_vec();
++    sorted.sort_unstable();
++    let mut assignment: BTreeMap<String, Vec<usize>> = BTreeMap::new();
++    if sorted.is_empty() {
++        return assignment;
++    }
++    let base = partitions / sorted.len();
++    let extra = partitions % sorted.len();
++    let mut next = 0usize;
++    for (index, member) in sorted.iter().enumerate() {
++        // The first `extra` members take one more partition: an uneven split has to put the
++        // remainder somewhere, and "the earliest member" is the rule that keeps it contiguous.
++        let count = base + usize::from(index < extra);
++        let range: Vec<usize> = (next..next + count).collect();
++        next += count;
++        assignment.insert((*member).to_owned(), range);
++    }
++    assignment
+ }

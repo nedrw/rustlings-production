@@ -1,0 +1,32 @@
+--- /dev/null
++++ b/src/assignment.rs
+@@ -0,0 +1,19 @@
++//! Rebalance: the range assignor.
++//!
++//! ## What you write
++//!
++//! [`assign`] — split the partitions over the members, contiguously and as evenly as the count
++//! allows:
++//!
++//! * members are sorted, and a partition range never straddles a member;
++//! * every partition belongs to exactly one member;
++//! * more members than partitions leaves the later ones with nothing, which is an honest answer;
++//! * no members is an empty assignment.
++
++use std::collections::BTreeMap;
++
++/// The partitions each member owns, by member name.
++#[must_use]
++pub fn assign(partitions: usize, members: &[&str]) -> BTreeMap<String, Vec<usize>> {
++    todo!("sorted members, contiguous ranges, every partition once")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod assignment;
+ pub mod consumer;
+ // kiln:scaffold:end
+ 

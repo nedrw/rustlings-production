@@ -1,0 +1,123 @@
+# T7 `broker` — a partitioned message log (4 steps, first landing), see `docs/curriculum.md` §12.
+#
+# Conventions: see the header of `mailer/track.toml`; they are the same for every track.
+#
+# There is no broker process here: the log is a `Vec` per partition, and the semantics under test —
+# routing, offsets, assignment, lag — are the ones a broker gives you.
+
+format_version = 1
+id = "broker"
+index = 7
+title = "Broker — a partitioned message log"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/broker"
+
+# Exit capabilities (curriculum.md §5): whatever else happens, these are established here.
+exit = [
+    "broker/partitioning@apply",
+    "broker/consumer-offset@apply",
+]
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Broker —— 分区的消息日志"
+
+[[step]]
+id = "7.1-partitioning"
+title = "A key has one partition, and a partition has one order"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.1-partitioning.md"
+time_hint = "60m"
+concepts = ["partition", "key routing", "offset"]
+teaches = ["broker/partitioning@apply"]
+requires = []
+run = { cmd = "cargo test -p broker --test spec_partitioning" }
+spec = ["spec/7.1/partitioning.rs"]
+scaffold = "skeleton"
+solution = "solutions/7.1-partitioning.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+]
+
+[[step]]
+id = "7.2-consumer-offsets"
+title = "Commit after the work, and a restart resumes there"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.2-consumer-offsets.md"
+time_hint = "60m"
+concepts = ["consumer offset", "commit", "at-least-once"]
+teaches = ["broker/consumer-offset@apply"]
+requires = ["broker/partitioning@apply"]
+run = { cmd = "cargo test -p broker --test spec_consumer_offsets" }
+spec = ["spec/7.2/consumer_offsets.rs"]
+scaffold = "scaffold/7.2-consumer-offsets.patch"
+solution = "solutions/7.2-consumer-offsets.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+
+[[step]]
+id = "7.3-rebalance"
+title = "Every partition has exactly one owner"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.3-rebalance.md"
+time_hint = "60m"
+concepts = ["range assignment", "rebalance", "consumer group"]
+teaches = ["broker/rebalance@apply"]
+requires = ["broker/consumer-offset@apply"]
+run = { cmd = "cargo test -p broker --test spec_rebalance" }
+spec = ["spec/7.3/rebalance.rs"]
+scaffold = "scaffold/7.3-rebalance.patch"
+solution = "solutions/7.3-rebalance.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "7.4-lag"
+title = "Lag is the number that says who is behind"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/broker/7.4-lag.md"
+time_hint = "45m"
+concepts = ["lag", "backlog", "threshold"]
+teaches = ["broker/lag@apply"]
+requires = ["broker/consumer-offset@apply"]
+run = { cmd = "cargo test -p broker --test spec_lag" }
+spec = ["spec/7.4/lag.rs"]
+scaffold = "scaffold/7.4-lag.patch"
+solution = "solutions/7.4-lag.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]

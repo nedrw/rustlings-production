@@ -1,0 +1,14 @@
+--- a/src/consumer.rs
++++ b/src/consumer.rs
+@@ -53,6 +53,10 @@
+ 
+     /// Commit the group's position in `partition`.
+     pub fn commit(&mut self, topic: &Topic, partition: usize, offset: u64) {
+-        todo!("ignore an unknown partition, clamp to the end, record the rest")
++        if partition >= topic.partitions() {
++            return;
++        }
++        let offset = offset.min(topic.end(partition));
++        self.committed.insert(partition, offset);
+     }
+ }
