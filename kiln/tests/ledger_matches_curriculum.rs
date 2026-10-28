@@ -1,10 +1,11 @@
 //! `course/capabilities.toml` must stay the transcription of `docs/curriculum.md` §3.
 //!
-//! `kiln lint-caps` (rule R0) cross-checks the ledger against the authored `track.toml` files, which
-//! covers T1 only: the remaining 108 slots describe tracks whose metadata does not exist yet, so
-//! nothing else would notice if the document and the ledger drifted apart. This test closes that
-//! gap by re-deriving the whole ledger from the document — the same comparison the document-level
-//! prototype (`tools/lint-caps-md.py`) makes, done against the metadata instead of the tables.
+//! `kiln lint-caps` (rule R0) cross-checks the ledger against the authored `track.toml` files, and
+//! all five tracks are authored now — but only 119 of the ledger's 136 slots are claimed by a step.
+//! A slot no step claims still shapes what later tracks may teach, so nothing else would notice if
+//! the document and the ledger drifted apart there. This test closes that gap by re-deriving the
+//! whole ledger from the document: the same comparison the document-level prototype
+//! (`tools/lint-caps-md.py`) makes, done against the metadata instead of the tables.
 //!
 //! It is deliberately strict: the ledger is not allowed to gain a slot the curriculum does not
 //! claim, or to lose one it does.
