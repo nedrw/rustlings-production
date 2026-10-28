@@ -28,7 +28,7 @@
 
 | 阶段 | 内容 | 验收 | 估时 |
 | --- | --- | --- | --- |
-| **M6.0** | 补齐 24 个 apply 槽位的探题（六批，每批 4 道） | `kiln probe --check` 107/107；每个 apply 槽位都有题 | 24–36 h |
+| **M6.0** | 补齐 24 个 apply 槽位的探题（六批，每批 4 道） | `kiln probe --check` 107/107；每个 apply 槽位都有题 | **已完成 2026-10-28**：107/107、79/79，缺一道即失败 |
 | **M6.1** | 缓存与热点：新 track **T6 `cache`**（8 步） | `selftest --track cache` 全绿；台账/退出能力/探题齐 | 25–35 h |
 | **M7** | 消息中间件语义：新 track **T7 `broker`**（9 步） | 同上；分区/消费组/rebalance/lag 各一步 | 30–40 h |
 | **M8** | gRPC 与流式：新 track **T8 `rpc`**（7 步） | 同上；契约、deadline、流式背压、协议演进 | 25–35 h |
@@ -52,8 +52,8 @@
 | B | `repo/workspace-layout`（1.1）· `repo/toolchain-pinning`（1.2）· `ci/pipeline`（1.3）· `sec/secrets-management`（1.4） | **已写（2026-10-28）**：91/91，覆盖 63/79 |
 | C | `obs/structured-logs`（1.6）· `http/service-skeleton`（1.7）· `test/app-factory`（1.8）· `db/migrations`（1.9） | **已写（2026-10-28）**：95/95，覆盖 67/79 |
 | D | `test/fake-external`（1.13）· `sec/authn-session`（1.16）· `test/integration-layering`（1.19）· `release/container-image`（1.21） | **已写（2026-10-28）**：99/99，覆盖 71/79 |
-| E | `ops/runbook-drill`（1.22）· `http/middleware-layering`（2.1）· `api/idempotency-key`（2.2）· `api/contract-testing`（2.3） | 待写 |
-| F | `async/backpressure`（2.14）· `test/chaos-injection`（2.17）· `ops/rolling-upgrade`（2.22）· `ops/degradation-modes`（2.24） | 待写 |
+| E | `ops/runbook-drill`（1.22）· `http/middleware-layering`（2.1）· `api/idempotency-key`（2.2）· `api/contract-testing`（2.3） | **已写（2026-10-28）**：103/103，覆盖 75/79 |
+| F | `async/backpressure`（2.14）· `test/chaos-injection`（2.17）· `ops/rolling-upgrade`（2.22）· `ops/degradation-modes`（2.24） | **已写（2026-10-28）**：107/107，覆盖 **79/79** |
 
 写题的三条硬规矩（来自已有的 83 道）：
 

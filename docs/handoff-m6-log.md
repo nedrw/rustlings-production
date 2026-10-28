@@ -115,3 +115,31 @@ D1 写的时候差点留下一条"只测给定代码"的测试（`FakeMailer::ne
 
 **下一批（E）**：`ops/runbook-drill`（1.22）· `http/middleware-layering`（2.1）·
 `api/idempotency-key`（2.2）· `api/contract-testing`（2.3）——偏"接口与演练"。
+
+## 段 5：第五、六批，覆盖率改为失败，M6.0 完成（2026-10-28）
+
+**E 批（接口与演练）**：`ops/runbook-drill`（1.22，程序里每一步的前置条件必须由**更早**的步骤
+建立；自己提供自己的前置条件不算）、`http/middleware-layering`（2.1，logging 最外层、限流在鉴权
+之前、鉴权在处理函数之前；缺的层不审计）、`api/idempotency-key`（2.2，同键同载荷重放、同键不同
+载荷冲突、无键不记录）、`api/contract-testing`（2.3，删端点/删请求或响应字段是破坏性，加不是）。
+
+**F 批（容量与降级）**：`async/backpressure`（2.14，容量算"排队 + 运行中"，拒绝的任务不入队）、
+`test/chaos-injection`（2.17，脚本化的故障按顺序消费，延迟按 tick 预算判超时）、
+`ops/rolling-upgrade`（2.22，每个仍在线上的版本只能提及 schema 里存在的列）、
+`ops/degradation-modes`（2.24，只按特性自己的依赖判断，fallback 决定剩下什么）。
+
+**测试自身又抓出三处**：E1 的"完整 runbook"夹具里有一个没人提供的前置事实；E4 的排序断言把
+`FieldRemoved` 排在 `Removed` 前面（枚举声明顺序才是排序依据）；这些都在参考解运行时暴露并修好。
+F 批没有再出现。
+
+**覆盖率从信息变成失败**：`kiln probe --check` 的覆盖行还在，但缺一道现在会进 `problems`，退出码 2。
+负向验证做过——临时把 `db-transactions.apply.rs` 移走，输出 `✗ 1 apply slot(s) have no probe:
+db/transactions@apply` 并失败；移回来 79/79 绿。同时新增 `kiln/tests/probes_cover_apply.rs`，让
+`cargo test` 不启动 cargo 也能说同一句话。
+
+**M6.0 完成**：107 道练习 / 107 个参考解 / 覆盖 **79/79**。`plan --fast` 现在能为每一个 apply 槽位
+提供跳过依据，`review --due` 能重新检查每一个 apply 能力——间隔重复从 61% 到 100%。六批共 24 道，
+每道都两侧验证（参考解全过、练习在 `todo!()` 上全挂）。
+
+**下一步（M6.1）**：缓存 track T6 的 8 步（计划 §4 有步表草稿）。它要动台账、curriculum、规格、
+树与补丁、正文与译文、每步一道探题——按 `new-track.md` 的流程走，不是加一批文件那么简单。
