@@ -49,7 +49,13 @@ struct Wanted {
 }
 
 /// Create a track's layout.
-pub fn run(session: &Session, id: &str, title: Option<&str>, project: Option<&str>, steps: &[String]) -> Result<u8> {
+pub fn run(
+    session: &Session,
+    id: &str,
+    title: Option<&str>,
+    project: Option<&str>,
+    steps: &[String],
+) -> Result<u8> {
     let course = session.course();
     let root = course.root();
     let track_dir = root.join("course/tracks").join(id);
@@ -73,7 +79,14 @@ pub fn run(session: &Session, id: &str, title: Option<&str>, project: Option<&st
     let project = project.map_or_else(|| format!("app/{id}"), str::to_owned);
     let crate_name = project.rsplit('/').next().unwrap_or(id).to_owned();
 
-    write_track_toml(&track_dir, id, title.unwrap_or(id), &project, index, &wanted)?;
+    write_track_toml(
+        &track_dir,
+        id,
+        title.unwrap_or(id),
+        &project,
+        index,
+        &wanted,
+    )?;
     write_skeleton(&track_dir, &crate_name)?;
     write_steps(&root, id, &wanted)?;
     write_specs(&track_dir, id, &wanted)?;
@@ -111,16 +124,24 @@ pub fn run(session: &Session, id: &str, title: Option<&str>, project: Option<&st
     println!("  {}", track_dir.join("skeleton").display());
     println!("  {} spec file(s)", wanted.len());
     println!("  {}", manifest_path.display());
-    println!("  {} step bod{}", wanted.len(), if wanted.len() == 1 { "y" } else { "ies" });
+    println!(
+        "  {} step bod{}",
+        wanted.len(),
+        if wanted.len() == 1 { "y" } else { "ies" }
+    );
     println!();
     println!("what a generator must not decide for you — the checklist:");
     println!("  1. the ledger: every `teaches` above needs a slot in course/capabilities.toml");
     println!("     (add it at the depth you wrote, with this step's id); `kiln lint-caps` says so");
-    println!("  2. the exit capabilities: `exit = [...]` in the track header, each one established");
+    println!(
+        "  2. the exit capabilities: `exit = [...]` in the track header, each one established"
+    );
     println!("     by a step of this track (rule R6)");
     println!("  3. the probes: every `apply` slot needs a probe in course/probes/ — `kiln probe");
     println!("     --check` and authoring.md §11 say how");
-    println!("  4. the spec and the solution: the generated spec is a placeholder that fails; write");
+    println!(
+        "  4. the spec and the solution: the generated spec is a placeholder that fails; write"
+    );
     println!("     the real one, and the solution patch that answers it");
     println!("  5. the step bodies: the generated ones are templates — write the prose");
     println!();
@@ -184,8 +205,10 @@ fn write_track_toml(
     let mut lines: Vec<String> = vec![
         format!("# The `{id}` track — {title}."),
         "#".to_owned(),
-        "# Written by `kiln new-track`. What a generator can decide is here; what needs a".to_owned(),
-        "# curriculum decision (the ledger slots, the exit capabilities, the probes) is listed".to_owned(),
+        "# Written by `kiln new-track`. What a generator can decide is here; what needs a"
+            .to_owned(),
+        "# curriculum decision (the ledger slots, the exit capabilities, the probes) is listed"
+            .to_owned(),
         "# in the command's output and in authoring.md §12.".to_owned(),
         String::new(),
         "format_version = 1".to_owned(),
@@ -298,12 +321,19 @@ fn number_of(id: &str) -> &str {
     id.split_once('-').map_or(id, |(number, _)| number)
 }
 
-/// The learner's project skeleton: a crate that builds, with the regions later scaffolds write into.
-fn write_skeleton(track_dir: &Path, crate_name: &str) -> Result<()> {
-    let manifest = join(vec![
+/// The skeleton's `Cargo.toml`.
+///
+/// `[lints.rust] unsafe_code = "deny"` is not decoration: `unsafe-budget@0` lands on the third
+/// step (see `LATER_STEP_GATES`), and the gate asks the project to *deny* `unsafe`, not merely to
+/// contain none — a gate that only counts what is there today would go green on a tree that grows
+/// an `unsafe` block tomorrow. A track that later teaches `unsafe` removes this in the scaffold
+/// that does.
+fn manifest(crate_name: &str) -> String {
+    join(vec![
         format!("# The `{crate_name}` service, as it comes out of the box."),
         "#".to_owned(),
-        "# The `kiln:scaffold:begin`/`end` blocks are the regions later scaffolds are allowed to".to_owned(),
+        "# The `kiln:scaffold:begin`/`end` blocks are the regions later scaffolds are allowed to"
+            .to_owned(),
         "# write into (authoring.md §5).".to_owned(),
         String::new(),
         "[package]".to_owned(),
@@ -315,14 +345,23 @@ fn write_skeleton(track_dir: &Path, crate_name: &str) -> Result<()> {
         "# kiln:scaffold:begin".to_owned(),
         "# kiln:scaffold:end".to_owned(),
         String::new(),
-        "# This project is its own workspace, so it never picks up the course's settings".to_owned(),
+        "[lints.rust]".to_owned(),
+        "unsafe_code = \"deny\"".to_owned(),
+        String::new(),
+        "# This project is its own workspace, so it never picks up the course's settings"
+            .to_owned(),
         "# (docs/plan.md §3 D6).".to_owned(),
         "[workspace]".to_owned(),
         "members = [".to_owned(),
         "    # kiln:scaffold:begin".to_owned(),
         "    # kiln:scaffold:end".to_owned(),
         "]".to_owned(),
-    ]);
+    ])
+}
+
+/// The learner's project skeleton: a crate that builds, with the regions later scaffolds write into.
+fn write_skeleton(track_dir: &Path, crate_name: &str) -> Result<()> {
+    let manifest = manifest(crate_name);
     // The stub *fails*: a skeleton whose stub already satisfies a spec would make the first step
     // "BROKEN STEP — the spec passes on the scaffold" the moment the author wrote the spec. The
     // learner is meant to replace the `todo!()`; the reference solution replaces it too.
@@ -338,12 +377,19 @@ fn write_skeleton(track_dir: &Path, crate_name: &str) -> Result<()> {
         "pub fn version() -> &'static str {".to_owned(),
         "    todo!(\"the first step of this track implements this\")".to_owned(),
         "}".to_owned(),
+        String::new(),
+        "// The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may"
+            .to_owned(),
+        "// only *insert* lines inside it, and only *remove* nothing.".to_owned(),
+        "// kiln:scaffold:begin".to_owned(),
+        "// kiln:scaffold:end".to_owned(),
     ]);
     // The binary refuses an argument it does not understand: the `exit-code` gate (from the second
     // step on) asks the program to exit non-zero and *name* the argument it refused, and a binary
     // that ignores unknown arguments would fail that gate on its first run.
     let main = join(vec![
-        "//! The binary: it asks the library what to do and exits with the code it decides.".to_owned(),
+        "//! The binary: it asks the library what to do and exits with the code it decides."
+            .to_owned(),
         "//!".to_owned(),
         "//! # TODO: the first step of this track replaces this stub.".to_owned(),
         String::new(),
@@ -373,7 +419,9 @@ fn write_skeleton(track_dir: &Path, crate_name: &str) -> Result<()> {
         "            ExitCode::SUCCESS".to_owned(),
         "        }".to_owned(),
         "        other => {".to_owned(),
-        format!("            eprintln!(\"{crate_name}: unknown argument `{{other}}`\\n{{USAGE}}\");"),
+        format!(
+            "            eprintln!(\"{crate_name}: unknown argument `{{other}}`\\n{{USAGE}}\");"
+        ),
         "            ExitCode::from(2)".to_owned(),
         "        }".to_owned(),
         "    }".to_owned(),
@@ -485,4 +533,27 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
         path: PathBuf::from(path),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The acceptance run's wall (handoff-m5 §16): without the lint, the third step's
+    /// `unsafe-budget@0` gate was red on a project that had never written `unsafe`.
+    #[test]
+    fn the_skeleton_denies_unsafe_because_the_third_step_asks_it_to() {
+        let manifest = manifest("toy");
+        assert!(
+            manifest.contains("[lints.rust]\nunsafe_code = \"deny\""),
+            "the generated manifest must deny unsafe:\n{manifest}"
+        );
+    }
+
+    /// Step ids carry the phase: `4.3-downsampling` → `4.3`, which is the spec directory name.
+    #[test]
+    fn a_step_id_knows_its_number() {
+        assert_eq!(number_of("4.3-downsampling"), "4.3");
+        assert_eq!(number_of("1.1"), "1.1");
+    }
 }
