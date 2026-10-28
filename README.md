@@ -93,6 +93,13 @@ every link checked by `site --check`, which `cargo xtask ci` runs), and
 [docs/maintenance.md](docs/maintenance.md) is the annual pass. What changed, what it cost and what
 the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
 
+**M6 has started** (2026-10-28), on the gap analysis in
+[docs/m6-plan.md](docs/m6-plan.md): the course is complete on its vertical axis and thin on a few
+horizontal ones. M6.0 is filling the 24 `apply` slots that had no probe — `kiln probe --check` now
+prints coverage and four probes landed in the first batch (`db/transactions`, `api/pagination`,
+`async/graceful-shutdown`, `sec/password-hash`), `91/91` references passing, `63/79` apply slots
+covered. The cache, broker, RPC, platform and capstone milestones follow in that order.
+
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
 (`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,
 re-verified at `dd47c11`) and say so; the current-tree numbers are from this README's own pass over

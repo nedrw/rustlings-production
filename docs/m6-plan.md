@@ -49,7 +49,7 @@
 | 批 | 槽位（教它的步） | 状态 |
 | --- | --- | --- |
 | **A** | `db/transactions`（1.17）· `api/pagination`（2.4）· `async/graceful-shutdown`（1.14）· `sec/password-hash`（1.11） | **已写（2026-10-28）**：`probe --check` 87/87，覆盖 59/79 |
-| B | `repo/workspace-layout`（1.1）· `repo/toolchain-pinning`（1.2）· `ci/pipeline`（1.3）· `sec/secrets-management`（1.4） | 待写 |
+| B | `repo/workspace-layout`（1.1）· `repo/toolchain-pinning`（1.2）· `ci/pipeline`（1.3）· `sec/secrets-management`（1.4） | **已写（2026-10-28）**：91/91，覆盖 63/79 |
 | C | `obs/structured-logs`（1.6）· `http/service-skeleton`（1.7）· `test/app-factory`（1.8）· `db/migrations`（1.9） | 待写 |
 | D | `test/fake-external`（1.13）· `sec/authn-session`（1.16）· `test/integration-layering`（1.19）· `release/container-image`（1.21） | 待写 |
 | E | `ops/runbook-drill`（1.22）· `http/middleware-layering`（2.1）· `api/idempotency-key`（2.2）· `api/contract-testing`（2.3） | 待写 |
