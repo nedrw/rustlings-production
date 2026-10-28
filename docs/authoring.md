@@ -30,6 +30,9 @@ slug 用英文、连字符、动词优先（`rate-limit-by-tenant` 优于 `tenan
 ## 2. 元数据的唯一真源
 
 - **步骤元数据只在 `track.toml`**（`kind`/`origin`/`teaches`/`requires`/`run`/`spec`/`gates`/`hint`/`time_hint`）。
+- **标题的译文不在 `track.toml` 里**：一个步骤的名字属于它的正文（front matter 的 `title`），一个 track
+  的名字没有正文可依附，所以 `track.toml` 给它一张表——`[localized_titles]` 加一行 `<locale> = "…"`。
+  `kiln list`、`kiln hint` 与 `kiln site` 都按读者的 locale 读这两处；`title` 本身始终是英文源。
 - **`run` 可以带 `timeout`**（秒）：`run = { cmd = "cargo test -p mailer --test spec_image", timeout = 1800 }`。它是个**下界**——取步骤声明的与 `kiln --timeout` 的较大值，同时作用于这一步的规格与闸门。只有「命令本身贵得出格」的步骤该写它（目前只有 1.21：镜像里要编译一棵依赖树，第一次构建在没构建过的机器上是分钟级；被默认 300s 砍掉的构建只会报 “timed out”，而这一步其实在正常工作）。
 - **正文 front-matter 只放文档自身的字段**，避免两处真源漂移：
 
@@ -325,7 +328,33 @@ fixes 模块只能改补丁已携带的文件；新增文件要连段一起加�
    代码、路径与编译器输出，翻译后既不能复制粘贴，也会给每次消息改动多添一份译文。译文里的错误字符串、
    命令与标识符同理，保持原样。
 
-### 8.1 术语表（`course/glossary.toml`）
+### 8.1 UI 目录（`course/locales/<locale>/ui.toml`）
+
+英文写在打印它的代码里——一份真源，没有第二份会漂的目录。译文只写它要覆盖的键，缺的键保留英文，
+所以**部分目录永远不是错误**：
+
+```toml
+locale = "zh-Hans"
+
+[string]
+welcome = """…"""                 # 覆盖 course.toml 的招呼语（kiln 与 kiln site 都读）
+"site.tracks" = "课程"            # 键里有「.」，要加引号（dotted key 会造出子表）
+```
+
+`welcome` / `final_message` 是 `course.toml` 那两句的译文；`site.*` 是文档站自己的标签：
+
+| 键 | 类型 | 说明 |
+| --- | --- | --- |
+| `site.tracks` / `site.picker` / `site.search` | 文本 | 首页标题、语言选择页那句话、搜索框占位 |
+| `site.unit` / `site.project` / `site.minutes` | 文本 | 计数单位（`步`）、项目标签、时长单位 |
+| `site.source_note` | 文本 | 正文只有英文时，页面上那句说明 |
+| `site.fallback` | HTML 片段 | 这一步没有译文时的句子，占位 `{locale}` / `{found}` |
+| `site.footer` | HTML 片段 | 页脚；两个 HTML 键要包 `<code>` 或链接 |
+
+换一门语言要动的三处：`docs/steps/<locale>/`、`locales/<locale>/ui.toml`、各 `track.toml` 的
+`[localized_titles]`。代码不动。
+
+### 8.2 术语表（`course/glossary.toml`）
 
 术语表是"同一门课只有一套词汇"的机器可查形式：一个英文词 + 每种语言约定的说法。
 

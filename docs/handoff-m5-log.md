@@ -359,3 +359,44 @@ CommonMark 把以 `<DIR>` 开头的行当成 HTML 块，于是段落断在半句
 **没做的**：没有做视觉走查（这台机器上没有 Chrome/Chromium，浏览器截图无从谈起）；做的是结构核对
 （标签配平、每页有 `<h1>`、表格/代码块/链接全在）。发布形态也没接任何托管商——`site/` 是普通文件，
 交给谁都能托管。
+
+## 段 18：用 Moli 做视觉走查，改了六处
+
+段 17 结尾写了"没有做视觉走查"。用户指出这台机器上有 Moli（无头浏览器），于是补上：`moli serve
+--layout` 起 CDP（127.0.0.1:9222），`python3 -m http.server` 服务 `site/`，再用一个 30 行、零依赖的
+Node 脚本（`WebSocket` + `Page.navigate` + `Page.captureScreenshot`）截图。截了十张：两种语言的首页、
+track 页、步骤页（表格、代码、长列表）、语言选择页、搜索结果下拉、暗色、390px 手机、手机表格。
+
+**看到的问题与处置**（六处，全部是"看"才能发现的）：
+
+1. **`<details>` 在 Moli 里渲染成一个圆点，而且内容永远展开。** 中文首页把英文招呼语塞进
+   `<details>`，本意是"折叠起来"；引擎不认识它就成了一行怪东西。处置：不当折叠用，改成普通的
+   段落 + 一行说明。
+2. **搜索框永远没有结果。** JS 里 `new URL(row.url, "../../search.json")` 抛 `TypeError`——相对
+   路径不能当 base。处置：先 `new URL(dataset.index, location.href)` 解析成绝对地址，再拼结果。
+   截图验证："迁移" 出四条结果（1.9、1.21、2.1、2.22…）。
+3. **中文站点的家具是英文的**：`Tracks`、`step(s)`、`project`、`search…`、页脚。处置：接到已有的
+   `course/locales/<locale>/ui.toml` 机制上（`i18n::ui::Ui`，authoring.md §8.1），新增 `site.*`
+   键；`welcome`/`final_message` 也走它。这样"加一门语言"仍然不改代码。
+4. **track 名在中文页面上是英文**（"Mailer — subscription microservice"）。处置：`track.toml`
+   新增可选 `[localized_titles]`（步骤标题本来就在正文 front matter 里，track 没有正文）；顺手把
+   `kiln list`/`kiln hint` 也改成按 locale 读正文标题——命令行在 `--lang zh-Hans` 下现在说中文。
+5. **语言选择页只显示 `en` / `zh-Hans` 两个标签。** 处置：语言用自称（English / 中文（简体）），
+   tag 放到下面一行。
+6. **390px 上表格式样坏掉**（列被挤成一条，长代码在单元格里画出一道竖条）与**吸顶页头占掉四分之一
+   屏幕**。处置：手机上表格保持自然宽度、外层横向滚动；页头在手机上改成随页面滚走；行内 `code`
+   改为 `inline-block`（标识符不再被拆到两行，也不再出现跨行的空片段）。
+
+**一个真实的内容缺陷**（不是样式）：手机上看到 `记在 |` 后面一个灰色竖条，顺着它查回正文——那是
+跨行的行内代码在行尾留下的空片段；同一类问题在段 17 已经修过一次（`<DIR>` 开头成 HTML 块）。两处
+现在都由同一条规则挡着：正文行不以 `<` 开头，行内代码不跨行拆。
+
+**同时删掉的一处设计错误**：段 17 的站点把 UI 文案硬编码成 `UI_EN`/`UI_ZH_HANS` 两张表。那等于
+在代码里给每种语言加一次班；`course/locales/<locale>/ui.toml` 从 M0 起就是为这件事存在的（段 17
+甚至把它当成"CLI 的目录"而绕开）。改完后的规则只有一条：**英文在代码里，译文在目录里，缺键回退**。
+
+**验收**（本机实测）：`kiln site --check` 251 页、链接全通；`cargo test -p kiln` **371 + 21 + 1**
+（新增两个测试：目录覆盖与无目录时的回退说明）；`cargo clippy -p kiln --all-targets -- -D warnings`
+干净；`cargo fmt --all --check` 干净；`i18n status` 结构 0 error / 漂移 0 warning（并打印了正在用的
+`course/locales/zh-Hans/ui.toml`）；`kiln --lang zh-Hans` 的中文招呼语与中文步骤标题都验证过。
+截图留在 `/tmp/shots/`（不入库）。

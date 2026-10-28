@@ -19,6 +19,7 @@
 | 正文里的外部链接腐烂（330 个） | **没人**，除了 `kiln links --external` | 正文 |
 | 一行正文以 `<` 开头（渲染成原始 HTML，段落断在半句） | `kiln site --check`（在 ci 里） | 重排那一行 |
 | 英文正文改了、译文没跟上 | **没人**，除了 `kiln i18n status` 的漂移告警 | 译文（或词表） |
+| 新语言的站点标签、track 名没翻 | **没人**（缺键就回退英文，永远不报错） | `locales/<locale>/ui.toml`、`[localized_titles]` |
 | 正文里的数字（119 步、83 道探题…） | **没人** | 人肉改散文 |
 | 译文读起来是否通顺 | **没人** | 人读 |
 | 题还分不分得出"会"与"不会" | **没人** | 人做一遍 |
@@ -82,8 +83,19 @@
 | 能力台账 | `course/capabilities.toml` + `docs/curriculum.md` §3 | `cargo test -p kiln`（那份等价性测试）与 `lint-caps` |
 | 加一个门 | `xtask/src/main.rs`（唯一入口）+ plan §6 的阶梯 | 从引入它的那一步起，后面每一步都要带上 |
 | 加一道探题 | `course/probes/<capability>.<depth>.rs` | `kiln probe --check` |
+| 一门新语言 | `docs/steps/<locale>/`、`course/locales/<locale>/ui.toml`、各 `track.toml` 的 `[localized_titles]` | `i18n status`、`kiln site --check` |
 | 正文的排版（换行、代码跨度） | `course/docs/steps/<locale>/…` | `kiln site --check`、`i18n status` |
 | 加一条 track | 见 [new-track.md](new-track.md) | 那份指南自己的验收 |
+
+## 2.1 加一门语言：三处，不改代码
+
+1. `course/docs/steps/<locale>/`：正文，front matter 四件套（`id`/`title`/`locale`/`source_hash`/`translator`）。
+2. `course/locales/<locale>/ui.toml`：`welcome`、`final_message` 与 `site.*` 的标签（authoring.md §8.1）。
+   缺哪个键就保留英文——部分目录不是错误。
+3. 每条 `track.toml` 的 `[localized_titles]`：track 名。步骤标题不用动：它在正文的 front matter 里。
+
+判据：`kiln --lang <locale> list <track>` 与 `kiln site --locale <locale>` 读起来是这门语言，
+`kiln i18n status` 结构 0 error、漂移 0 warning。
 
 ## 3. 一年里不要做的事
 
