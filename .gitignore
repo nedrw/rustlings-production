@@ -5,6 +5,9 @@
 /.kiln
 /app
 
+# The rendered documentation site: `kiln site` writes it, a static host serves it.
+/site
+
 # The desktop's own metadata, not this repository's content.
 .DS_Store
 

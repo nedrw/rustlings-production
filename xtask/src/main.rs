@@ -106,6 +106,9 @@ fn ci() -> Result<(), String> {
     // `links` reads the tree and answers in under a second; `probe_check` starts a scratch crate.
     links(&root)?;
     probe_check(&root)?;
+    // The documentation site (plan §11, M5): every step body, in every locale, renders. The pages
+    // are thrown away — what CI owns is that the course *can* be published, not the artifact.
+    site_check(&root)?;
     // The course's own anti-rot check (plan §10). It is the command a learner can run too, so CI
     // and a human have one implementation between them, not two. Every authored track is walked:
     // `kiln selftest` defaults to the course's default track (the one a learner is on), and CI has
@@ -212,6 +215,20 @@ fn patches_check(root: &Path) -> Result<(), String> {
 ///
 /// Deliberately not a nested `cargo run`: `xtask` and `kiln` must agree on what the metadata
 /// rules are, and the only way to guarantee that is to call the same code (plan §10).
+/// Render the whole site into a scratch directory: every body, in every locale.
+fn site_check(root: &Path) -> Result<(), String> {
+    println!("xtask ci: site (every step body renders, in every authored locale)");
+    let course = kiln::info::Course::load(root).map_err(|error| error.to_string())?;
+    let report = kiln::site::build(&course, &kiln::site::Options::check())
+        .map_err(|error| error.to_string())?;
+    println!(
+        "  {} page(s) in {} locale(s)",
+        report.pages,
+        report.locales.len()
+    );
+    Ok(())
+}
+
 fn lint_caps(root: &Path) -> Result<(), String> {
     println!("xtask ci: kiln lint-caps (rules R0-R6 over course/)");
     let report = kiln::caps::lint::lint_root(root).map_err(|error| error.to_string())?;

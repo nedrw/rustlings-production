@@ -34,6 +34,7 @@ pub mod process;
 pub mod project;
 pub mod runtime;
 pub mod scratch;
+pub mod site;
 pub mod spec;
 pub mod state;
 

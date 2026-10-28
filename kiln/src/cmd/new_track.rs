@@ -88,7 +88,7 @@ pub fn run(
         &wanted,
     )?;
     write_skeleton(&track_dir, &crate_name)?;
-    write_steps(&root, id, &wanted)?;
+    write_steps(root, id, &wanted)?;
     write_specs(&track_dir, id, &wanted)?;
     // The two patch directories exist even when they are empty: a track whose `scaffold/` and
     // `solutions/` are missing is a track the author has to guess the shape of, and the shape is

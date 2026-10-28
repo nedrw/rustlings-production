@@ -43,6 +43,7 @@ pub mod reset;
 pub mod review;
 pub mod run;
 pub mod selftest;
+pub mod site;
 pub mod skip;
 pub mod solution;
 pub mod spec;
@@ -295,6 +296,21 @@ pub enum Command {
         action: Option<ImageAction>,
     },
 
+    /// Render the course as a static site: every step body, in every locale.
+    Site {
+        /// Directory to write (default: `site/`).
+        #[arg(long, value_name = "DIR")]
+        out: Option<String>,
+
+        /// Locale to render; repeatable (default: every locale with a step directory).
+        #[arg(long = "locale", value_name = "LOCALE")]
+        langs: Vec<String>,
+
+        /// Render into a scratch directory, report, and remove it: the check `xtask ci` runs.
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Check the links in a tree of markdown (default: this repository).
     ///
     /// The offline half is the `links` gate, so a learner sees exactly what the gate sees; a
@@ -418,7 +434,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
             title,
             project,
             steps,
-        }) => new_track::run(&session, &id, title.as_deref(), project.as_deref(), &steps),
+        }) => new_track::run(&session, id, title.as_deref(), project.as_deref(), steps),
         Some(Command::Run { step }) => run::run(&mut session, step.as_deref()),
         Some(Command::Watch { step }) => watch::run(&mut session, step.as_deref()),
         Some(Command::Check { step, slow }) => check::run(&mut session, step.as_deref(), *slow),
@@ -437,6 +453,9 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         },
         Some(Command::Images { action }) => {
             images::run(&session, *action == Some(ImageAction::Pull))
+        }
+        Some(Command::Site { out, langs, check }) => {
+            site::run(&session, out.as_deref(), langs, *check)
         }
         Some(Command::Links { path, external }) => links::run(&session, path.as_deref(), *external),
         Some(Command::Doctor) => doctor::run(&session),
