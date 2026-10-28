@@ -47,7 +47,10 @@ mod tests {
     #[test]
     fn every_occurrence_is_replaced() {
         let line = "hunter2 and again hunter2";
-        assert_eq!(redact(line, &["hunter2"]), "[REDACTED] and again [REDACTED]");
+        assert_eq!(
+            redact(line, &["hunter2"]),
+            "[REDACTED] and again [REDACTED]"
+        );
     }
 
     #[test]

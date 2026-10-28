@@ -94,7 +94,10 @@ mod tests {
     #[test]
     fn the_use_case_builds_the_message_the_fake_records() {
         let mut mailer = FakeMailer::new();
-        assert_eq!(send_confirmation(&mut mailer, "a@example.test", "tok-1"), Ok(()));
+        assert_eq!(
+            send_confirmation(&mut mailer, "a@example.test", "tok-1"),
+            Ok(())
+        );
         assert_eq!(
             mailer.sent(),
             [Message {
@@ -112,14 +115,23 @@ mod tests {
             send_confirmation(&mut mailer, "a@example.test", "tok-1"),
             Err("smtp is down".to_owned())
         );
-        assert!(mailer.sent().is_empty(), "a failed send was recorded as sent");
+        assert!(
+            mailer.sent().is_empty(),
+            "a failed send was recorded as sent"
+        );
     }
 
     #[test]
     fn two_confirmations_are_two_messages_in_order() {
         let mut mailer = FakeMailer::new();
-        assert_eq!(send_confirmation(&mut mailer, "a@example.test", "tok-1"), Ok(()));
-        assert_eq!(send_confirmation(&mut mailer, "b@example.test", "tok-2"), Ok(()));
+        assert_eq!(
+            send_confirmation(&mut mailer, "a@example.test", "tok-1"),
+            Ok(())
+        );
+        assert_eq!(
+            send_confirmation(&mut mailer, "b@example.test", "tok-2"),
+            Ok(())
+        );
         let subjects: Vec<&str> = mailer.sent().iter().map(|m| m.to.as_str()).collect();
         assert_eq!(subjects, ["a@example.test", "b@example.test"]);
         assert!(mailer.sent()[1].body.contains("tok-2"));
@@ -161,7 +173,10 @@ mod tests {
         }
 
         let mut mailer = CountingMailer::default();
-        assert_eq!(send_confirmation(&mut mailer, "a@example.test", "tok-1"), Ok(()));
+        assert_eq!(
+            send_confirmation(&mut mailer, "a@example.test", "tok-1"),
+            Ok(())
+        );
         assert_eq!(mailer.calls, 1);
     }
 }

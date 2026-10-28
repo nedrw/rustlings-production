@@ -141,7 +141,10 @@ mod tests {
             fields: vec![("reason", "first\nsecond".to_owned())],
         };
         let rendered = line("run-1", &event);
-        assert!(!rendered.contains('\n'), "two lines for one event: {rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "two lines for one event: {rendered}"
+        );
         assert_eq!(
             rendered,
             "event=failed run.id=run-1 reason=\"first\\nsecond\""

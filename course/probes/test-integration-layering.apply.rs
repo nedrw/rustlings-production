@@ -75,7 +75,9 @@ pub enum Finding {
 /// Every finding about `tests`, sorted and deduplicated.
 #[must_use]
 pub fn audit(tests: &[Test]) -> Vec<Finding> {
-    todo!("for each resource, the pairs that share it; then the unit tests that are really integration")
+    todo!(
+        "for each resource, the pairs that share it; then the unit tests that are really integration"
+    )
 }
 
 #[cfg(test)]
@@ -102,7 +104,11 @@ mod tests {
     fn a_layered_suite_has_nothing_to_report() {
         let tests = [
             test("unit_signup", Layer::Unit, &["fake:mail", "fake:db"]),
-            test("integration_signup", Layer::Integration, &["real:mail", "db:signup"]),
+            test(
+                "integration_signup",
+                Layer::Integration,
+                &["real:mail", "db:signup"],
+            ),
         ];
         assert_eq!(audit(&tests), []);
     }

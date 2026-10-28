@@ -54,7 +54,11 @@ mod tests {
             let names: Vec<String> = (0..members).map(|index| format!("m{index}")).collect();
             let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
             let assignment = assign(9, &borrowed);
-            assert_eq!(owners(&assignment), (0..9).collect::<Vec<usize>>(), "{members} members");
+            assert_eq!(
+                owners(&assignment),
+                (0..9).collect::<Vec<usize>>(),
+                "{members} members"
+            );
         }
     }
 

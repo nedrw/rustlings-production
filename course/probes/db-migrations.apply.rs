@@ -151,7 +151,10 @@ mod tests {
         let migrations = three();
         let applied = applied(&migrations[..2]);
         let mut with_old_number = migrations.clone();
-        with_old_number.push(migration("0001b_extra.sql", "ALTER TABLE subscribers ADD note"));
+        with_old_number.push(migration(
+            "0001b_extra.sql",
+            "ALTER TABLE subscribers ADD note",
+        ));
         assert_eq!(
             plan(&applied, &with_old_number),
             Err(Problem::OutOfOrder("0001b_extra.sql".to_owned()))

@@ -160,7 +160,10 @@ mod tests {
         ];
         let violations = check(&workspace);
         assert_eq!(violations.len(), 2, "{violations:?}");
-        assert!(matches!(violations[0], Violation::Cycle { .. }), "{violations:?}");
+        assert!(
+            matches!(violations[0], Violation::Cycle { .. }),
+            "{violations:?}"
+        );
         assert!(
             matches!(violations[1], Violation::LibraryDependsOnBinary { .. }),
             "{violations:?}"
@@ -172,7 +175,11 @@ mod tests {
         // The direction rule and the cycle rule are separate: a binary may depend on a library,
         // but if the library also depends on a *third* lib that depends back on the binary, the
         // graph has a loop regardless of the kinds.
-        let workspace = [bin("app", &["core"]), lib("core", &["util"]), lib("util", &["app"])];
+        let workspace = [
+            bin("app", &["core"]),
+            lib("core", &["util"]),
+            lib("util", &["app"]),
+        ];
         let violations: BTreeSet<Violation> = check(&workspace).into_iter().collect();
         assert!(
             violations.contains(&Violation::Cycle {

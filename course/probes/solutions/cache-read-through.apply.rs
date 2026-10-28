@@ -61,7 +61,8 @@ impl Cache {
         // The fetch is the slow path, and the count in the tests is what proves it was not taken.
         // A key the fetch does not have is not cached: "not there" is the answer that changes fastest.
         let value = fetch(key)?;
-        self.entries.insert(key.to_owned(), (value.clone(), now + self.ttl));
+        self.entries
+            .insert(key.to_owned(), (value.clone(), now + self.ttl));
         Some(value)
     }
 }
@@ -97,7 +98,11 @@ mod tests {
         cache.get("a", 9, &mut fetch);
         assert_eq!(calls.get(), 1);
         cache.get("a", 10, &mut fetch);
-        assert_eq!(calls.get(), 2, "the deadline second was served from the cache");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the deadline second was served from the cache"
+        );
     }
 
     #[test]
@@ -120,8 +125,14 @@ mod tests {
         let mut answer = "first".to_owned();
         cache.get("a", 0, |_| Some(answer.clone()));
         answer = "second".to_owned();
-        assert_eq!(cache.get("a", 10, |_| Some(answer.clone())), Some("second".to_owned()));
-        assert_eq!(cache.get("a", 11, |_| Some(answer.clone())), Some("second".to_owned()));
+        assert_eq!(
+            cache.get("a", 10, |_| Some(answer.clone())),
+            Some("second".to_owned())
+        );
+        assert_eq!(
+            cache.get("a", 11, |_| Some(answer.clone())),
+            Some("second".to_owned())
+        );
     }
 
     #[test]

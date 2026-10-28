@@ -37,7 +37,10 @@ impl Log {
 
     /// Append a payload to `partition`.
     pub fn append(&mut self, partition: usize, payload: &str) {
-        self.parts.entry(partition).or_default().push(payload.to_owned());
+        self.parts
+            .entry(partition)
+            .or_default()
+            .push(payload.to_owned());
     }
 
     /// The partition's end offset.

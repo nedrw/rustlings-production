@@ -57,10 +57,7 @@ pub struct Feature {
 /// What `feature` is doing while `down` is away.
 #[must_use]
 pub fn mode(feature: &Feature, down: &[&str]) -> Mode {
-    let missing = feature
-        .needs
-        .iter()
-        .any(|need| down.contains(need));
+    let missing = feature.needs.iter().any(|need| down.contains(need));
     if !missing {
         return Mode::Full;
     }

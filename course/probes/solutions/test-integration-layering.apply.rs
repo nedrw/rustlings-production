@@ -135,7 +135,11 @@ mod tests {
     fn a_layered_suite_has_nothing_to_report() {
         let tests = [
             test("unit_signup", Layer::Unit, &["fake:mail", "fake:db"]),
-            test("integration_signup", Layer::Integration, &["real:mail", "db:signup"]),
+            test(
+                "integration_signup",
+                Layer::Integration,
+                &["real:mail", "db:signup"],
+            ),
         ];
         assert_eq!(audit(&tests), []);
     }

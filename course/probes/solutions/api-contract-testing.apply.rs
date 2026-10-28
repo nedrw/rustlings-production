@@ -149,7 +149,12 @@ mod tests {
     #[test]
     fn adding_a_field_or_an_endpoint_is_compatible() {
         let after = [
-            endpoint("POST", "/events", &["kind", "payload", "trace"], &["id", "status"]),
+            endpoint(
+                "POST",
+                "/events",
+                &["kind", "payload", "trace"],
+                &["id", "status"],
+            ),
             endpoint("GET", "/events/{id}", &[], &["id"]),
         ];
         assert_eq!(breaking(&[one()], &after), []);

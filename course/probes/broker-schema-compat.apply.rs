@@ -117,7 +117,10 @@ mod tests {
     fn a_removed_field_is_breaking() {
         let mut new = base();
         new.remove("count");
-        assert_eq!(compat(&base(), &new), [Breaking::Removed("count".to_owned())]);
+        assert_eq!(
+            compat(&base(), &new),
+            [Breaking::Removed("count".to_owned())]
+        );
     }
 
     #[test]

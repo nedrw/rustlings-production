@@ -160,7 +160,10 @@ mod tests {
     fn two_different_versions_are_a_disagreement() {
         let files = [
             ("rust-toolchain.toml", "channel = \"1.98.1\"\n"),
-            ("ci.yml", "      - run: cargo +1.80 test\n  toolchain: 1.80.0\n"),
+            (
+                "ci.yml",
+                "      - run: cargo +1.80 test\n  toolchain: 1.80.0\n",
+            ),
         ];
         assert_eq!(
             audit(&files),

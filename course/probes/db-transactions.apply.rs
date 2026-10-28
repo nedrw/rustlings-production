@@ -132,7 +132,12 @@ mod tests {
         let mut ledger = ledger();
         ledger.open("carol", 0);
         ledger.close("carol");
-        let before = (ledger.balance("alice"), ledger.balance("bob"), ledger.balance("carol"), ledger.total());
+        let before = (
+            ledger.balance("alice"),
+            ledger.balance("bob"),
+            ledger.balance("carol"),
+            ledger.total(),
+        );
 
         assert_eq!(
             ledger.transfer("nobody", "bob", 10),
@@ -151,7 +156,12 @@ mod tests {
             Err(TransferError::InsufficientFunds)
         );
 
-        let after = (ledger.balance("alice"), ledger.balance("bob"), ledger.balance("carol"), ledger.total());
+        let after = (
+            ledger.balance("alice"),
+            ledger.balance("bob"),
+            ledger.balance("carol"),
+            ledger.total(),
+        );
         assert_eq!(before, after, "a refused transfer wrote something");
     }
 
@@ -216,7 +226,11 @@ mod tests {
             let amount = (state >> 11) % 400;
             let _ = ledger.transfer(from, to, amount);
 
-            assert_eq!(ledger.total(), total, "{from} -> {to} {amount} moved the total");
+            assert_eq!(
+                ledger.total(),
+                total,
+                "{from} -> {to} {amount} moved the total"
+            );
             for account in accounts {
                 let balance = ledger.balance(account).expect("every account exists");
                 assert!(balance <= total, "{account} holds more than the ledger");

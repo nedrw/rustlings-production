@@ -116,7 +116,10 @@ mod tests {
         assert_eq!(service.submit(7), Err(Closed));
 
         let report = service.drain(10);
-        assert!(report.completed.is_empty(), "a refused job was queued anyway");
+        assert!(
+            report.completed.is_empty(),
+            "a refused job was queued anyway"
+        );
         assert!(report.dropped.is_empty());
     }
 

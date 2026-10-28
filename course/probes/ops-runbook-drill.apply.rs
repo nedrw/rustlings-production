@@ -76,7 +76,11 @@ mod tests {
         let runbook = [
             step("the alert fires", &[], &["database is down"]),
             step("find the backup", &[], &["backup path"]),
-            step("restore", &["backup path", "database is down"], &["database running"]),
+            step(
+                "restore",
+                &["backup path", "database is down"],
+                &["database running"],
+            ),
             step("verify", &["database running"], &[]),
         ];
         assert_eq!(audit(&runbook), []);
@@ -99,19 +103,17 @@ mod tests {
 
     #[test]
     fn every_gap_is_reported_in_step_order() {
-        let runbook = [
-            step("first", &["a"], &[]),
-            step("second", &["b"], &["c"]),
-        ];
-        assert_eq!(
-            audit(&runbook),
-            [gap("first", "a"), gap("second", "b")]
-        );
+        let runbook = [step("first", &["a"], &[]), step("second", &["b"], &["c"])];
+        assert_eq!(audit(&runbook), [gap("first", "a"), gap("second", "b")]);
     }
 
     #[test]
     fn a_step_cannot_provide_its_own_precondition() {
-        let runbook = [step("restore", &["database running"], &["database running"])];
+        let runbook = [step(
+            "restore",
+            &["database running"],
+            &["database running"],
+        )];
         assert_eq!(audit(&runbook), [gap("restore", "database running")]);
     }
 

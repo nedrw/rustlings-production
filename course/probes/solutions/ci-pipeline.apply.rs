@@ -108,10 +108,7 @@ steps:
   - run: cargo xtask ci
   - run: cargo test --workspace
 ";
-        assert_eq!(
-            audit(workflow, CHECKS),
-            [reimplemented(3, "cargo test")]
-        );
+        assert_eq!(audit(workflow, CHECKS), [reimplemented(3, "cargo test")]);
     }
 
     #[test]
@@ -151,7 +148,10 @@ steps:
 ";
         assert_eq!(
             audit(workflow, CHECKS),
-            [reimplemented(2, "cargo clippy"), reimplemented(4, "cargo fmt")]
+            [
+                reimplemented(2, "cargo clippy"),
+                reimplemented(4, "cargo fmt")
+            ]
         );
     }
 

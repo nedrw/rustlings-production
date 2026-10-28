@@ -84,8 +84,8 @@ impl Router {
             };
         };
         // `HEAD` is what `GET` means without the body: the route that answers one answers both.
-        let allowed = methods.contains(&method)
-            || (method == Method::Head && methods.contains(&Method::Get));
+        let allowed =
+            methods.contains(&method) || (method == Method::Head && methods.contains(&Method::Get));
         if allowed {
             let body = if method == Method::Head {
                 ""

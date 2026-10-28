@@ -125,7 +125,10 @@ mod tests {
         let text = record.as_str();
         assert!(!text.contains("correct"), "{text}");
         assert!(!text.contains("horse"), "{text}");
-        assert!(text.starts_with(&format!("v1${ITERATIONS}$salt-a$")), "{text}");
+        assert!(
+            text.starts_with(&format!("v1${ITERATIONS}$salt-a$")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -140,7 +143,10 @@ mod tests {
     #[test]
     fn an_unusable_salt_is_refused() {
         assert!(hash("pw", "").is_none());
-        assert!(hash("pw", "salt$a").is_none(), "the salt would split the record");
+        assert!(
+            hash("pw", "salt$a").is_none(),
+            "the salt would split the record"
+        );
     }
 
     #[test]

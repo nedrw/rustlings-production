@@ -105,7 +105,10 @@ impl Ledger {
     pub fn transfer(&mut self, from: &str, to: &str, amount: u64) -> Result<(), TransferError> {
         // Read both sides before the first write. A refusal after the debit is a debit that
         // stands, which is the whole failure this probe is about.
-        let source = *self.accounts.get(from).ok_or(TransferError::UnknownSource)?;
+        let source = *self
+            .accounts
+            .get(from)
+            .ok_or(TransferError::UnknownSource)?;
         let target = *self.accounts.get(to).ok_or(TransferError::UnknownTarget)?;
         if !target.open {
             return Err(TransferError::UnknownTarget);
@@ -150,7 +153,12 @@ mod tests {
         let mut ledger = ledger();
         ledger.open("carol", 0);
         ledger.close("carol");
-        let before = (ledger.balance("alice"), ledger.balance("bob"), ledger.balance("carol"), ledger.total());
+        let before = (
+            ledger.balance("alice"),
+            ledger.balance("bob"),
+            ledger.balance("carol"),
+            ledger.total(),
+        );
 
         assert_eq!(
             ledger.transfer("nobody", "bob", 10),
@@ -169,7 +177,12 @@ mod tests {
             Err(TransferError::InsufficientFunds)
         );
 
-        let after = (ledger.balance("alice"), ledger.balance("bob"), ledger.balance("carol"), ledger.total());
+        let after = (
+            ledger.balance("alice"),
+            ledger.balance("bob"),
+            ledger.balance("carol"),
+            ledger.total(),
+        );
         assert_eq!(before, after, "a refused transfer wrote something");
     }
 
@@ -234,7 +247,11 @@ mod tests {
             let amount = (state >> 11) % 400;
             let _ = ledger.transfer(from, to, amount);
 
-            assert_eq!(ledger.total(), total, "{from} -> {to} {amount} moved the total");
+            assert_eq!(
+                ledger.total(),
+                total,
+                "{from} -> {to} {amount} moved the total"
+            );
             for account in accounts {
                 let balance = ledger.balance(account).expect("every account exists");
                 assert!(balance <= total, "{account} holds more than the ledger");

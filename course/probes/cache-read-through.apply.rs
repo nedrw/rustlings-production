@@ -88,7 +88,11 @@ mod tests {
         cache.get("a", 9, &mut fetch);
         assert_eq!(calls.get(), 1);
         cache.get("a", 10, &mut fetch);
-        assert_eq!(calls.get(), 2, "the deadline second was served from the cache");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the deadline second was served from the cache"
+        );
     }
 
     #[test]
@@ -111,8 +115,14 @@ mod tests {
         let mut answer = "first".to_owned();
         cache.get("a", 0, |_| Some(answer.clone()));
         answer = "second".to_owned();
-        assert_eq!(cache.get("a", 10, |_| Some(answer.clone())), Some("second".to_owned()));
-        assert_eq!(cache.get("a", 11, |_| Some(answer.clone())), Some("second".to_owned()));
+        assert_eq!(
+            cache.get("a", 10, |_| Some(answer.clone())),
+            Some("second".to_owned())
+        );
+        assert_eq!(
+            cache.get("a", 11, |_| Some(answer.clone())),
+            Some("second".to_owned())
+        );
     }
 
     #[test]

@@ -36,7 +36,10 @@ mod tests {
 
     #[test]
     fn no_surge_and_no_unavailable_budget_is_stuck() {
-        assert!(!progress(3, 0, 0, 3, 3), "nothing may leave and nothing may be created");
+        assert!(
+            !progress(3, 0, 0, 3, 3),
+            "nothing may leave and nothing may be created"
+        );
     }
 
     #[test]

@@ -55,10 +55,7 @@ pub fn plan(applied: &[(String, u64)], migrations: &[Migration]) -> Result<Vec<S
     // The history first: an applied migration that is gone or edited means the repository and the
     // database disagree, and adding to a disagreement is how a schema splits in two.
     for (name, recorded) in applied {
-        match migrations
-            .iter()
-            .find(|migration| &migration.name == name)
-        {
+        match migrations.iter().find(|migration| &migration.name == name) {
             None => return Err(Problem::Missing(name.clone())),
             Some(migration) => {
                 if checksum(&migration.sql) != *recorded {
@@ -71,11 +68,7 @@ pub fn plan(applied: &[(String, u64)], migrations: &[Migration]) -> Result<Vec<S
     let last_applied = applied.iter().map(|(name, _)| name.as_str()).max();
     let mut pending: Vec<&Migration> = migrations
         .iter()
-        .filter(|migration| {
-            !applied
-                .iter()
-                .any(|(name, _)| name == &migration.name)
-        })
+        .filter(|migration| !applied.iter().any(|(name, _)| name == &migration.name))
         .collect();
     pending.sort_by(|left, right| left.name.cmp(&right.name));
 
@@ -188,7 +181,10 @@ mod tests {
         let migrations = three();
         let applied = applied(&migrations[..2]);
         let mut with_old_number = migrations.clone();
-        with_old_number.push(migration("0001b_extra.sql", "ALTER TABLE subscribers ADD note"));
+        with_old_number.push(migration(
+            "0001b_extra.sql",
+            "ALTER TABLE subscribers ADD note",
+        ));
         assert_eq!(
             plan(&applied, &with_old_number),
             Err(Problem::OutOfOrder("0001b_extra.sql".to_owned()))

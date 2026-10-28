@@ -20,10 +20,7 @@ use std::collections::BTreeMap;
 
 /// Lag per partition, saturating at zero.
 #[must_use]
-pub fn lag(
-    end: &BTreeMap<usize, u64>,
-    committed: &BTreeMap<usize, u64>,
-) -> BTreeMap<usize, u64> {
+pub fn lag(end: &BTreeMap<usize, u64>, committed: &BTreeMap<usize, u64>) -> BTreeMap<usize, u64> {
     todo!("end minus commit, saturating, one entry per partition")
 }
 

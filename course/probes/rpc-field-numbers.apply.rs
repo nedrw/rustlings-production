@@ -92,6 +92,9 @@ mod tests {
         new.remove(2);
         let breaking = wire(&base(), &new);
         assert_eq!(breaking.len(), 2, "{breaking:?}");
-        assert!(breaking.windows(2).all(|pair| pair[0] <= pair[1]), "{breaking:?}");
+        assert!(
+            breaking.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{breaking:?}"
+        );
     }
 }

@@ -128,7 +128,10 @@ mod tests {
         let (mut backend, mut cache) = fixture();
         write(&mut backend, &mut cache, "a", "new");
         assert_eq!(backend.get("a"), Some("new".to_owned()));
-        assert!(!cache.contains("a"), "the cache still holds the written key");
+        assert!(
+            !cache.contains("a"),
+            "the cache still holds the written key"
+        );
     }
 
     #[test]
@@ -136,7 +139,11 @@ mod tests {
         let (mut backend, mut cache) = fixture();
         let reads_before = backend.reads();
         write(&mut backend, &mut cache, "a", "new");
-        assert_eq!(backend.reads(), reads_before, "the write path read the store");
+        assert_eq!(
+            backend.reads(),
+            reads_before,
+            "the write path read the store"
+        );
     }
 
     #[test]

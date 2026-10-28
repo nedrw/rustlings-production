@@ -44,7 +44,10 @@ mod tests {
     #[test]
     fn the_range_is_half_open() {
         let records = records();
-        assert_eq!(range(&records, 1, 3), ["two".to_owned(), "three".to_owned()]);
+        assert_eq!(
+            range(&records, 1, 3),
+            ["two".to_owned(), "three".to_owned()]
+        );
     }
 
     #[test]

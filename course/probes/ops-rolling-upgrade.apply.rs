@@ -82,7 +82,11 @@ mod tests {
     fn the_expand_phase_fits_both_versions() {
         let schema = schema(&["id", "email", "status", "confirmed_at"]);
         let old = code("old", &["id", "email"], &["id", "email", "status"]);
-        let new = code("new", &["id", "email", "confirmed_at"], &["id", "email", "status"]);
+        let new = code(
+            "new",
+            &["id", "email", "confirmed_at"],
+            &["id", "email", "status"],
+        );
         assert_eq!(audit(&schema, &[old, new]), []);
     }
 
@@ -144,6 +148,9 @@ mod tests {
         let new = code("new", &[], &["a"]);
         let findings = audit(&schema, &[new, old]);
         assert_eq!(findings.len(), 2, "{findings:?}");
-        assert!(findings.windows(2).all(|pair| pair[0] <= pair[1]), "{findings:?}");
+        assert!(
+            findings.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{findings:?}"
+        );
     }
 }

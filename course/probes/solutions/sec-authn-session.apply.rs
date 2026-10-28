@@ -67,7 +67,11 @@ impl Store {
 
     /// Revoke a session. Revoking a token nobody issued is not an error.
     pub fn revoke(&mut self, token: &str) {
-        if let Some(session) = self.sessions.iter_mut().find(|session| session.token == token) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.token == token)
+        {
             session.revoked = true;
         }
     }
@@ -119,7 +123,10 @@ mod tests {
 
     #[test]
     fn the_deadline_second_is_already_expired() {
-        assert_eq!(store().authenticate("tok-a", 1_000), Err(AuthError::Expired));
+        assert_eq!(
+            store().authenticate("tok-a", 1_000),
+            Err(AuthError::Expired)
+        );
     }
 
     #[test]

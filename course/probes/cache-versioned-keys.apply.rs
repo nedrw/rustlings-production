@@ -62,13 +62,7 @@ impl Versioned {
     }
 
     /// Read `key` in `namespace`, fetching through `fetch` on a miss.
-    pub fn get<F>(
-        &mut self,
-        namespace: &str,
-        key: &str,
-        now: u64,
-        mut fetch: F,
-    ) -> Option<String>
+    pub fn get<F>(&mut self, namespace: &str, key: &str, now: u64, mut fetch: F) -> Option<String>
     where
         F: FnMut(&str) -> Option<String>,
     {
@@ -98,8 +92,14 @@ mod tests {
     fn a_second_read_in_the_same_version_is_a_hit() {
         let mut cache = Versioned::new(60);
         let calls = fetch_calls();
-        assert_eq!(cache.get("subs", "a", 0, fetch(&calls, "v1".to_owned())), Some("v1".to_owned()));
-        assert_eq!(cache.get("subs", "a", 1, fetch(&calls, "v1".to_owned())), Some("v1".to_owned()));
+        assert_eq!(
+            cache.get("subs", "a", 0, fetch(&calls, "v1".to_owned())),
+            Some("v1".to_owned())
+        );
+        assert_eq!(
+            cache.get("subs", "a", 1, fetch(&calls, "v1".to_owned())),
+            Some("v1".to_owned())
+        );
         assert_eq!(calls.get(), 1);
     }
 
@@ -109,7 +109,10 @@ mod tests {
         let calls = fetch_calls();
         cache.get("subs", "a", 0, fetch(&calls, "old".to_owned()));
         cache.bump("subs");
-        assert_eq!(cache.get("subs", "a", 1, fetch(&calls, "new".to_owned())), Some("new".to_owned()));
+        assert_eq!(
+            cache.get("subs", "a", 1, fetch(&calls, "new".to_owned())),
+            Some("new".to_owned())
+        );
         assert_eq!(calls.get(), 2, "the old entry was still reachable");
     }
 
@@ -130,7 +133,10 @@ mod tests {
         cache.get("subs", "a", 0, fetch(&calls, "v1".to_owned()));
         cache.get("news", "a", 0, fetch(&calls, "v1".to_owned()));
         cache.bump("subs");
-        assert_eq!(cache.get("news", "a", 1, fetch(&calls, "v1".to_owned())), Some("v1".to_owned()));
+        assert_eq!(
+            cache.get("news", "a", 1, fetch(&calls, "v1".to_owned())),
+            Some("v1".to_owned())
+        );
         assert_eq!(calls.get(), 2, "bumping one namespace dropped another");
     }
 
@@ -141,8 +147,14 @@ mod tests {
         cache.get("subs", "a", 0, fetch(&calls, "subs-value".to_owned()));
         cache.get("news", "a", 0, fetch(&calls, "news-value".to_owned()));
         assert_eq!(cache.len(), 2);
-        assert_eq!(cache.get("subs", "a", 1, fetch(&calls, "x".to_owned())), Some("subs-value".to_owned()));
-        assert_eq!(cache.get("news", "a", 1, fetch(&calls, "x".to_owned())), Some("news-value".to_owned()));
+        assert_eq!(
+            cache.get("subs", "a", 1, fetch(&calls, "x".to_owned())),
+            Some("subs-value".to_owned())
+        );
+        assert_eq!(
+            cache.get("news", "a", 1, fetch(&calls, "x".to_owned())),
+            Some("news-value".to_owned())
+        );
         assert_eq!(calls.get(), 2);
     }
 }
