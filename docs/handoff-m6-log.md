@@ -188,3 +188,33 @@ db/transactions@apply` 并失败；移回来 79/79 绿。同时新增 `kiln/test
 `rebuild-patches.py --track cache --check` 全部 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1。
 
 **未完**：6.5–6.8（版本化键、热点两层、命中率 SLO、缓存故障降级）按计划表待写。
+
+## 段 7：T6 后四步，八步齐（2026-10-28）
+
+6.5 版本化键（`cache/versioned-keys@apply`）、6.6 两层缓存（`cache/two-level@apply`）、
+6.7 命中率与 SLO（`obs/cache-effectiveness@operate`）、6.8 缓存故障的熔断（`ops/cache-failure@operate`）。
+`kiln selftest --track cache` → **8/8 step(s) hold the contract**。
+
+**一处设计返工（6.5）**：第一版把 `Versioned` 写成包着 6.1 的 `Cache` 的壳，`get` 里派生一个
+`namespace#version:key` 交给内层——然后规格立刻红了三处：`Cache::get` 会用**同一个键**去问存储，
+而存储只知道原始键，于是每个 miss 都返回 `None`。这恰恰是 6.5 的题眼：**被版本化的是缓存键，
+存储的键不变**。改法是让 `Versioned` 自带条目表与 ttl（几十行、不再复用 `Cache`），`get` 用原始
+键取数、用派生键存。补丁与树全部重新生成，`rebuild-patches.py --check` 八份全 identical。
+
+**两处探题自身的毛病**：`fetch(&calls, "v1")` 的闭包同时借用 `Cell` 和字面量的 `&str`，`impl
+FnMut + '_` 说不清借的是谁；把字面量改成 `String` 传进去（只借 `calls`）。另一处是
+`cache-two-level` 的探题用"谁回答"的枚举代替计数器——同一个事实的另一种观察方式，比复制课内的
+计数器更值得重写。
+
+**同步的计数**：curriculum §3/§11 与台账到 **105 能力 / 144 槽位 / 127 步**，四个仓库级测试同步；
+探题库 113 道、覆盖 **85/85** apply 槽位。
+
+**验收（本机实测）**：`selftest --track cache` 8/8；`probe --check` 113/113、覆盖 85/85；
+`lint-caps` `105 capabilities · 144 slots · 127 ledger positions · 127 authored steps`，no issues；
+`i18n status` 127/127、结构 0 error、漂移 0；`links` 干净；`site --check` **269 页**；
+`rebuild-patches.py --track cache --check` 全部 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1；
+`fmt`/`clippy` 干净。
+
+**M6.1 完成**：T6 八步、双语正文、每步规格与补丁；6.1–6.6 六个 apply 槽位各有一道探题，
+6.7/6.8 是 operate 深度——按现行政策（`aware` 不出题、`apply` 全覆盖）不出题，`plan --fast` 不会
+因此跳过它们。下一步按计划是 **M7 broker**（T7）。
