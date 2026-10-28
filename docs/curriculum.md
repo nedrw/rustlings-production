@@ -248,6 +248,8 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `k8s/disruption-budget` | — | T9·9.3 | — | — |
 | `sec/external-secrets` | — | — | — | T9·9.4 |
 | `sec/oidc` | — | T9·9.5 | — | — |
+| `k8s/autoscaling` | — | — | T9·9.6 | — |
+| `k8s/rollout-drill` | — | — | — | T9·9.7 |
 
 **这张表就是「不重复」的证明**：一个能力在四个深度上各只出现一次，跨 track 只是换项目、换难度、换失败模式。
 
@@ -326,7 +328,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断 | 8 teach |
 | T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 | 9 teach |
 | T8 `rpc` | T1 的 HTTP 契约 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用 | 5 teach |
-| T9 `platform` | T1 的容器与配置 | 探针接线、滚动发布算术、中断预算、外部 secrets、OIDC | 5 teach（进行中，后续三步见 [m6-plan.md](m6-plan.md)） |
+| T9 `platform` | T1 的容器与配置 | 探针接线、滚动发布算术、中断预算、外部 secrets、OIDC、自动伸缩、发布演练 | 7 teach |
 
 ## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
@@ -578,7 +580,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 8.4 | 流是一个窗口，不是一个缓冲 | `rpc/server-streaming@apply` | 在途到达窗口即停；确认后继续 |
 | 8.5 | 一条连接，多条流，没有队头阻塞 | `rpc/multiplexing@design` | 每轮每流一项；阻塞的流不拖住别人 |
 
-## 14. T9 `platform`：服务上线所依赖的那一层（5 步，进行中）
+## 14. T9 `platform`：服务上线所依赖的那一层（7 步）
 
 题材：服务上线到集群上要做的那几个判断。没有集群：清单是数据、发布是算术、令牌是结构体。
 
@@ -589,6 +591,8 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 9.3 | 预算为零是告警，不是安全 | `k8s/disruption-budget@apply` | 两种写法、封顶、不为负 |
 | 9.4 | secret 是引用，不是产物 | `sec/external-secrets@operate` | 解析严格；清单里出现值是泄漏 |
 | 9.5 | 令牌是别人的声明，在这里核对 | `sec/oidc@apply` | 签发方、受众、未生效、过期，顺序固定 |
+| 9.6 | 快上、慢下，加一条止抖动的带 | `k8s/autoscaling@design` | 公式与容差带；扩容立即、缩容等连续低窗口 |
+| 9.7 | 发布的每一步，而不只是结尾 | `k8s/rollout-drill@operate` | 每一步都核两个预算；一个字符的一步也算 |
 
 ## 15. probe 与 drill 库
 

@@ -429,3 +429,9 @@ operate = "platform/9.4"
 
 [capability."sec/oidc"]
 apply = "platform/9.5"
+
+[capability."k8s/autoscaling"]
+design = "platform/9.6"
+
+[capability."k8s/rollout-drill"]
+operate = "platform/9.7"
