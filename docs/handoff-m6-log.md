@@ -275,3 +275,34 @@ FnMut + '_` 说不清借的是谁；把字面量改成 `String` 传进去（只�
 `fmt`/`clippy` 干净。
 
 **M7 完成**。下一步按计划是 **M8 rpc**（T8：契约、deadline、流式背压、协议演进）。
+
+## 段 10：T8 `rpc` 五步交付（2026-10-28）
+
+第八条 track，按 `new-track.md` 一次落地五步：8.1 线路字段号（`rpc/field-numbers@apply`）、
+8.2 绝对 deadline（`rpc/deadline@apply`）、8.3 规范状态码（`rpc/status-codes@apply`）、
+8.4 流式窗口（`rpc/server-streaming@apply`）、8.5 多路复用（`rpc/multiplexing@design`）。
+`kiln selftest --track rpc` → **5/5 step(s) hold the contract**。
+
+**项目形状**：`app/rpc` 是库 + 薄二进制，没有网络也没有代码生成——契约是数据（`Field` 的号码与类型）、
+deadline 是一个整数、流是一个窗口。每条判断因此都能在一次调用里复现。
+
+**五步各自的题眼**：号码是线路的身份（改名兼容，删号与复用号破坏；号码搬家算删除）；deadline 是绝对
+的时间点（每跳从同一份预算里付，恰好花光算完成，装不下的跳**跑之前**失败）；状态码是 API 的一部分
+（内部失败 → 规范码，可重试只含瞬时）；流是窗口不是缓冲（在途到窗口即停，确认后继续）；多路复用靠
+每流窗口 + 每轮一项的 pump（一条阻塞的流被跳过，不拖住别人）。
+
+**踩到的两处**：`call` 返回 `Result` 却没有 `# Errors` 一节，`clippy@1` 门（`-D missing_errors_doc`）
+在第 8.2 步红了；`deadline` 的译名——译文本着"gRPC 里就叫 deadline"写了英文，词表要求出现"截止时间"，
+在第一处加了括注。
+
+**同步的计数**：curriculum §3.10 加五个能力、§13 加 T8，探题库与组装两节顺延到 §14/§15（引用同改）；
+台账 **119 能力 / 158 槽位 / 141 步**；探题库 **123 道、覆盖 95/95** apply 槽位。
+
+**验收（本机实测）**：`selftest --track rpc` 5/5；`probe --check` 123/123、覆盖 95/95；
+`lint-caps` `119 capabilities · 158 slots · 141 ledger positions · 141 authored steps`，no issues；
+`i18n status` 141/141、结构 0 error、漂移 0；`links` 干净；`site --check` **301 页**；
+`rebuild-patches.py --track rpc --check` 九份全 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1；
+`fmt`/`clippy` 干净。
+
+**M8 完成**。下一步按计划是 **M9 platform**（T9：K8s 清单与探针、rollout、HPA/PDB、外部 secrets、
+OIDC）。

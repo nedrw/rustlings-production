@@ -42,6 +42,7 @@ with stricter gates and fewer hints.
 | T5 | `meshkv` — distributed KV / scheduler (optional) **authored** | highest | 22 |
 | T6 | `cache` — a read cache in front of a slow store **delivered** | mid | 8 |
 | T7 | `broker` — a partitioned message log **delivered** | mid | 9 |
+| T8 | `rpc` — a contract-first RPC layer **delivered** | mid | 5 |
 
 ## Read next
 
@@ -98,13 +99,13 @@ the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
 **M6 has started** (2026-10-28), on the gap analysis in
 [docs/m6-plan.md](docs/m6-plan.md): the course is complete on its vertical axis and thin on a few
 horizontal ones. M6.0 is done: the 24 `apply` slots that had no probe now have one —
-`kiln probe --check` reads `119/119` references and `91/91` apply slots, and a slot without an
+`kiln probe --check` reads `123/123` references and `95/95` apply slots, and a slot without an
 exercise is a failure instead of a number (`kiln/tests/probes_cover_apply.rs` states the same rule
 for `cargo test`). M6.1 added **T6 `cache`**, an eight-step read-cache track, delivered: `kiln selftest --track cache`
-is `8/8`. **M7** is delivered: **T7 `broker`**, a partitioned message log in nine steps (partitioning,
-consumer offsets, rebalance, lag, replay, ordering, exactly-once, schema compatibility, lag alerts),
-`selftest --track broker` `9/9`. Both languages are written for every step, and each `apply` slot has
-its probe. Broker, RPC, platform and capstone follow in that
+is `8/8`. **M7** is delivered: **T7 `broker`**, a partitioned message log in nine steps, `selftest --track
+broker` `9/9`. **M8** is delivered too: **T8 `rpc`**, a contract-first RPC layer in five steps (field
+numbers, deadlines, status codes, streaming windows, multiplexing), `selftest --track rpc` `5/5`.
+Both languages are written for every step, and each `apply` slot has its probe. Broker, RPC, platform and capstone follow in that
 order ([docs/m6-plan.md](docs/m6-plan.md)).
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree

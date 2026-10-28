@@ -31,7 +31,7 @@
 | **M6.0** | 补齐 24 个 apply 槽位的探题（六批，每批 4 道） | `kiln probe --check` 107/107；每个 apply 槽位都有题 | **已完成 2026-10-28**：107/107、79/79，缺一道即失败 |
 | **M6.1** | 缓存与热点：新 track **T6 `cache`** | `selftest --track cache` 全绿；台账/退出能力/探题齐 | **已交付 2026-10-28**：8/8 步、113/113 探题、覆盖 85/85 |
 | **M7** | 消息中间件语义：新 track **T7 `broker`** | 同上；分区/消费组/rebalance/lag 各一步 | **已交付 2026-10-28**：9/9 步、119/119 探题、覆盖 91/91 |
-| **M8** | gRPC 与流式：新 track **T8 `rpc`**（7 步） | 同上；契约、deadline、流式背压、协议演进 | 25–35 h |
+| **M8** | gRPC 与流式：新 track **T8 `rpc`** | 同上；契约、deadline、流式背压、协议演进 | **已交付 2026-10-28**：5/5 步、123/123 探题、覆盖 95/95 |
 | **M9** | 编排与身份：新 track **T9 `platform`**（8 步） | 同上；K8s 清单/探针/rollout、外部 secrets、OIDC | 30–40 h |
 | **M10** | capstone 与协作模板（不是 track） | 一个无 scaffold 项目的门与评审清单；ADR/复盘/评审模板 | 15–20 h |
 | 可选 | SQL 索引深度（4 步）、DB 复制/切换演练、批流 ETL、搜索 | 各自独立评估 | — |
@@ -99,7 +99,20 @@
 项目形状：`app/broker` 是一个库 + 薄二进制；每个分区就是一个 `Vec`，没有 broker 进程也没有网络。
 确定性来自"没有时钟也没有线程"：所有语义都在一次调用里完成。
 
-## 6. 每个新 track 的验收清单（与 `new-track.md` 一致）
+## 6. M8：T8 `rpc` 的步表（五步已交付）
+
+| 步 | 能力 | 一句话 | 状态 |
+| --- | --- | --- | --- |
+| 8.1 | `rpc/field-numbers@apply` | 线路是号码不是名字：改名兼容、删号/复用号破坏 | **已交付** |
+| 8.2 | `rpc/deadline@apply` | 一个绝对 deadline，每跳从里面付；装不下的跳先失败 | **已交付** |
+| 8.3 | `rpc/status-codes@apply` | 规范状态码；可重试只含瞬时错误 | **已交付** |
+| 8.4 | `rpc/server-streaming@apply` | 流是窗口不是缓冲：在途到窗口即停 | **已交付** |
+| 8.5 | `rpc/multiplexing@design` | 一条连接多条流：每轮每流一项，阻塞不拖累 | **已交付** |
+
+项目形状：`app/rpc` 是一个库 + 薄二进制；契约是数据、deadline 是数字、流是窗口——没有网络也没有
+代码生成，所以每条判断都能在一次调用里复现。
+
+## 7. 每个新 track 的验收清单（与 `new-track.md` 一致）
 
 - 台账：`curriculum.md` §3 与 `capabilities.toml` 同步（`ledger_matches_curriculum` 测试会核）。
 - 退出能力：`exit = [...]` 的每一项由本 track 的某一步建立（R6）。
@@ -109,7 +122,7 @@
 - 探题：每个 apply 槽位一道，`probe --check` 绿。
 - 站点：`kiln site --check` 绿；`i18n status` 结构 0 error、漂移 0 warning。
 
-## 7. 成本口径
+## 8. 成本口径
 
 内容按每步 2–4 小时（plan §11 的实测口径），探题按每道 1–1.5 小时（含参考解与
 `probe --check`）。全量 `cargo xtask ci` 每加一条 track 增加约 20 分钟；五条 track 时约 80 分钟，
