@@ -223,6 +223,11 @@ requires = ["async/graceful-shutdown@apply", "db/atomic-claim@apply"]
 | `broker/consumer-offset` | — | T7·7.2 | — | — |
 | `broker/rebalance` | — | T7·7.3 | — | — |
 | `broker/lag` | — | T7·7.4 | — | — |
+| `broker/replay` | — | T7·7.5 | — | — |
+| `broker/ordering` | — | — | T7·7.6 | — |
+| `broker/exactly-once` | — | — | T7·7.7 | — |
+| `broker/schema-compat` | — | T7·7.8 | — | — |
+| `ops/lag-alert` | — | — | — | T7·7.9 |
 
 **这张表就是「不重复」的证明**：一个能力在四个深度上各只出现一次，跨 track 只是换项目、换难度、换失败模式。
 
@@ -297,7 +302,7 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | T4 `lakelet` | T3 出口 + 性能入门 | WAL 恢复、列式与压缩、查询引擎、批处理、剖析与 soak | 编写时由 `lint-caps` 统计 |
 | T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 编写时由 `lint-caps` 统计 |
 | T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断 | 8 teach |
-| T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag | 4 teach（进行中，后续五步见 [m6-plan.md](m6-plan.md)） |
+| T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 | 9 teach |
 
 ## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
@@ -518,7 +523,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 6.7 | 缓存的有效性要成为 SLO | `obs/cache-effectiveness@operate` | 命中率与回源次数，边界算健康 |
 | 6.8 | 缓存挂了：停止询问它 | `ops/cache-failure@operate` | 熔断打开走直连，冷却后单探针 |
 
-## 12. T7 `broker`：分区消息日志（4 步，进行中）
+## 12. T7 `broker`：分区消息日志（9 步）
 
 题材：一条消息日志的分区语义。没有 broker 进程、没有网络：每个分区就是一个 `Vec`，而这一步要
 重新写出来的是它给的那些承诺——同一个键落在同一个分区、分区内顺序、提交过的偏移才是重启后的位置、
@@ -530,6 +535,11 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 7.2 | 做完再提交，重启从这里继续 | `broker/consumer-offset@apply` | 提交被夹到日志末尾；未提交重投 |
 | 7.3 | 每个分区恰好一个主人 | `broker/rebalance@apply` | 连续区间；每个分区一次；成员离开重分配 |
 | 7.4 | lag 是"谁落后"的那个数 | `broker/lag@apply` | 末尾减提交、饱和为零；阈值严格大于 |
+| 7.5 | 重放是一个区间，不是一个位置 | `broker/replay@apply` | 半开区间；不移动任何提交；夹到日志末尾 |
+| 7.6 | 该排序的排序，其余并行 | `broker/ordering@design` | 排序约束的连通组一个键；无约束各自一个键 |
+| 7.7 | 恰好一次是一张表，不是一句承诺 | `broker/exactly-once@design` | 效果与偏移同表；重放不重复；写 2 后补 1 |
+| 7.8 | 加法兼容，减法破坏 | `broker/schema-compat@apply` | 删字段、改类型、加必填都是破坏；加可选不是 |
+| 7.9 | 用"落后"的连续段告警 | `ops/lag-alert@operate` | 严格高于阈值、连续 N 次；一次低谷重置 |
 
 ## 13. probe 与 drill 库
 

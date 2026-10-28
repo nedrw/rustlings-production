@@ -382,3 +382,18 @@ apply = "broker/7.3"
 
 [capability."broker/lag"]
 apply = "broker/7.4"
+
+[capability."broker/replay"]
+apply = "broker/7.5"
+
+[capability."broker/ordering"]
+design = "broker/7.6"
+
+[capability."broker/exactly-once"]
+design = "broker/7.7"
+
+[capability."broker/schema-compat"]
+apply = "broker/7.8"
+
+[capability."ops/lag-alert"]
+operate = "broker/7.9"

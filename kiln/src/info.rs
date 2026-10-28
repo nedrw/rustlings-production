@@ -903,10 +903,10 @@ mod tests {
             "the exit capabilities of §5 are declared"
         );
 
-        // Counts of curriculum.md §3: 109 capabilities, 148 slots, 131 steps pinned.
-        assert_eq!(course.ledger().capability_count(), 109);
-        assert_eq!(course.ledger().slot_count(), 148);
-        assert_eq!(course.ledger().positions().len(), 131);
+        // Counts of curriculum.md §3: 114 capabilities, 153 slots, 136 steps pinned.
+        assert_eq!(course.ledger().capability_count(), 114);
+        assert_eq!(course.ledger().slot_count(), 153);
+        assert_eq!(course.ledger().positions().len(), 136);
 
         // A step reference resolves by number, by id, and with the track prefix.
         for reference in ["1.14", "1.14-worker", "mailer/1.14", "mailer/1.14-worker"] {
