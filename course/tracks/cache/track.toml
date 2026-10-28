@@ -1,4 +1,4 @@
-# T6 `cache` — a read cache in front of a slow store (4 steps), see `docs/curriculum.md` §11.
+# T6 `cache` — a read cache in front of a slow store (8 steps), see `docs/curriculum.md` §11.
 #
 # Conventions: see the header of `mailer/track.toml`; they are the same for every track.
 #

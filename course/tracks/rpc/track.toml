@@ -1,4 +1,4 @@
-# T8 `rpc` — a contract-first RPC layer (5 steps, first landing), see `docs/curriculum.md` §13.
+# T8 `rpc` — a contract-first RPC layer (5 steps), see `docs/curriculum.md` §13.
 #
 # Conventions: see the header of `mailer/track.toml`; they are the same for every track.
 #

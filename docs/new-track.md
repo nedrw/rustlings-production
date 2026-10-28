@@ -179,7 +179,7 @@ nothing to test yet: no step of toy is complete.
 ```toml
 format_version = 1
 id = "toy"                    # 等于目录名
-index = 6                     # 全仓唯一
+index = 10                    # 全仓唯一（现有九条 track 是 1-9）
 title = "Toy — …"
 project = "app/toy"           # 学员的工作区
 exit = ["cap/you-established"] # R6：每项都要由本 track 建立

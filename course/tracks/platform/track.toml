@@ -1,4 +1,4 @@
-# T9 `platform` — the layer a service ships on (5 steps, first landing), see curriculum.md §14.
+# T9 `platform` — the layer a service ships on (7 steps), see `docs/curriculum.md` §14.
 #
 # Conventions: see the header of `mailer/track.toml`; they are the same for every track.
 #

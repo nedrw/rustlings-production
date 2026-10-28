@@ -319,7 +319,8 @@ OIDC）。
 滚动发布是两个预算的算术（下限与在途上限，`maxUnavailable: 0` 需要 surge，一个副本 + 一个不可用
 预算会把服务打挂——这是写进正文的已知代价，规格也这么断言）；中断预算的边界（零次即挡排干、封顶、
 不为负）；secret 是引用（解析缺失要点名，清单里出现值就是泄漏）；OIDC 先验算法（`alg: none` 是最
-出名的洞），再看签发方、受众、未生效、过期。
+出名的洞），再看签发方、受众、未生效、过期——**这一段当时并不成立**：9.5 的参考解只核了签发方/受众/
+时间，`Claims` 里根本没有算法字段，是段 14 的评审发现并补上的。
 
 **踩到的三处**：`validate` 返回 `Result<&str, _>` 时两个 `&str` 输入让省略的生命周期有歧义
 （E0106），给返回加 `<'a>` 绑定到 claims；9.2 有一条规格把"单副本 + 不可用预算 1"断言成"不能走"，
@@ -341,8 +342,9 @@ OIDC）。
 
 **T9 后两步**：9.6 自动伸缩（`k8s/autoscaling@design`，公式 + 容差带 + 快上慢下）、9.7 发布演练
 （`k8s/rollout-drill@operate`，逐步核两个预算）。`selftest --track platform` → **7/7**。踩到两处：
-9.7 的规格把两个违规的顺序写反（按枚举声明顺序排序才是仓库约定）；9.6/9.7 的正文写完之前 selftest 只
-报 5/5（它跳过没有正文的步骤），补上正文才真正跑起来。台账到 **126 能力 / 165 槽位 / 148 步**。
+9.7 的规格把两个违规的顺序写反，当时改成"按枚举声明顺序排序"——**这个改法本身是错的**，演练报的是
+每一步，顺序就该是步序，段 14 把排序从 `drill` 里拿掉、规格改为断言步序；9.6/9.7 的正文写完之前
+selftest 只报 5/5（它跳过没有正文的步骤），补上正文才真正跑起来。台账到 **126 能力 / 165 槽位 / 148 步**。
 
 **M10 capstone**：按 plan §11 的"不是 track"落地：
 
@@ -373,8 +375,9 @@ OIDC）。
 **它抓到了内容层漏掉的一件事**：`format_course_rust` 报了 52 份 `course/probes/**` 没有过 rustfmt。
 `fmt` 门判的是**学员项目**，`probe --check` 只编译——课程自己的探题文件以前从没有一道检查看它们是否
 格式化。用 xtask 自己那条命令格式化（`rustfmt --edition 2024 --config-path rustfmt.toml --config
-skip_children=true`），单独提交 `6096903`；`probe --check` 之后仍是 127/127、覆盖 99/99，且每对
-练习/参考解仍然只差函数体。
+skip_children=true`），单独提交 `6096903`；`probe --check` 之后仍是 127/127、覆盖 99/99。那句"每对
+练习/参考解只差函数体"当时对两道题并不成立（参考解在函数体外多了专用小助手），段 14 已把它们收进
+函数体，这句话现在是真的。
 
 **第二次运行在 mailer/1.4 红在网络**：crates.io 索引 "transfer too slow … in 30s"。runner 的判定是
 诚实的——"the crate registry was unreachable — this is the network, not the step"——但 CI 因此不可能
@@ -386,3 +389,53 @@ skip_children=true`），单独提交 `6096903`；`probe --check` 之后仍是 1
 --workspace`（383 + 21 + 1 + 1 + 1）、`spec-integrity`、`patches_check`（九条 track 的补丁链）、
 `lint-caps`、`links`、`probe --check`（127/127、覆盖 99/99）、`site --check`（317 页）、以及九条
 track 的 `selftest`（22 + 24 + 27 + 24 + 22 + 8 + 9 + 5 + 7 = 148/148）。
+
+## 段 14：独立评审的 16 条与修复（2026-10-29）
+
+用户要求用一个子 Agent 对 M6–M10 的实现做一次独立评审。它交回 16 条：真缺陷（排序依据、熔断器状态机、
+缓存 miss 计数、演练顺序、OIDC 没验算法、capstone 的 unsafe 检查可被 `allow` 绕过）、代码与文档对不上
+的计数，以及四条"设计债"。逐条处理结果如下。
+
+**代码缺陷（已修，四 track selftest 全绿）**
+
+1. **8.1 的排序**：`wire` 按枚举声明顺序排（`NumberRemoved` 永远在 `NumberReused` 前），"按字段号
+   排序"只在同一种变体内部成立。现在按 `number` 排；规格断言 `[Reused(1), Removed(3)]`；探题同步。
+2. **6.8 的熔断器**：半开状态下每次调用都发一张探针、打开期间的失败会刷新冷却。现在半开只发一张
+   （`only_one_probe_is_handed_out`），打开期间的失败不延长冷却（`a_failure_while_open_does_not_extend_the_cooldown`）。
+3. **6.6 的 miss 计数**：`store.get(key)?` 在缺键时提前返回，miss 没被记。现在先计数再返回
+   （`a_key_the_store_does_not_have_is_still_a_miss`）。
+4. **9.7 的顺序**：`drill` 把违规按 kind 排序（规格还把顺序写反了）。演练报的是每一步，顺序就该是步序：
+   排序从参考解拿掉，规格改为 `violations_arrive_in_step_order_not_kind_order`。
+5. **9.6 的反向边界**：`min > max` 时结果落在两个边界之外。现在先排出 `(floor, ceiling)` 再夹
+   （`a_reversed_bound_is_not_a_panic`）。
+6. **9.4/9.6 的空手步骤**：`SecretStore::leaks` 与 `Stabilizer::observe` 在脚手架里已经实现，学员无事可做。
+   两者都改回 `todo!()` 桩。
+7. **9.5 的 OIDC**：`Claims` 里没有算法字段，`validate` 先核签发方——`alg: none` 根本走不到。现在先核
+   `RS256`（`UnsupportedAlgorithm`），再签发方、受众、未生效、过期；中英正文同步、`source_hash` 重钉。
+8. **capstone**：`unsafe-budget@0` 是按步的门，在 capstone 上"判不了"；改成 `RUSTFLAGS=-F unsafe_code`
+   编译一次，`allow(unsafe_code)` 会被编译器顶回来。顺带：门名用 `FromStr` 解析、退出码统一 0/1/2、
+   q7 指针 3.24 → 3.23、指南与三个模板按实测重写。
+9. **探题的两处泄漏**：`cache-expiry-jitter` 与 `release-container-image` 的参考解把专用小助手放在函数体
+   之外——"只差函数体"对它们不成立。小助手收进函数体。
+10. **计数与文档**：README、plan、curriculum §5/§15、台账头注、四份 track.toml 头注、maintenance、
+    new-track 示例、authoring、handoff-m2 的引用全部对准实测（126 能力 / 165 槽位 / 148 步 / 127 道探题；
+    站点 317 页；`links` 327 页 1202 链接）。
+
+**两条评审没说全的问题**
+
+- **脚手架警告**：29 个 starting state **全部**在第一次 `cargo build` 里刷警告（每步 1–7 条：未用参数、
+  只写不读的字段、8.1 的未用 `BTreeMap`）。按 T2 骨架的桩体点名写法修 34 个桩（4 个在骨架里、30 个在前面的脚手架里），用
+  `rebuild-patches.py --fixes` 在树层面改、再重新生成九个补丁；复测 **29/29 零警告**。桩体点名这种
+  写法（`let _ = (…);`）此前只写在 T2 的骨架里，现在进了 authoring §5.6。
+- **规格里的「给定代码」用例**：29 步里有 9 步、共 14 条测试只调用脚手架给定的 API（`poll`、`may_create`、
+  `version`…），在脚手架上就通过。按 authoring §6 的规则补 `// Pins given code: …`，重钉四份 manifest。
+  `selftest` 判的仍是"整个规格文件在脚手架上失败"。
+
+**没有修的**（写进 m6-plan §10「已知边界」）：T9 的 design/operate 只有代码级证据（没有集群）；design/
+operate 槽位不强制出题；脚手架零警告没有机器检查（`selftest` 不判警告）。
+
+**验收（本机实测）**：`fmt` 干净、`clippy -D warnings` 干净；`cargo test -p kiln` **383 + 21 + 1 + 1 + 1**；
+`lint-caps` `126 capabilities · 165 slots · 148 ledger positions · 148 authored steps`，no issues；
+`i18n status` 148/148、结构 0 error、漂移 0；`links` 327 页 1202 链接 387 外部目标、0 findings；
+`site --check` 317 页；`probe --check` 127/127、覆盖 99/99；`selftest` cache 8/8、broker 9/9、rpc 5/5、
+platform 7/7；四 track 的 `rebuild-patches --check` 全部 identical；脚手架警告复测 0/29。

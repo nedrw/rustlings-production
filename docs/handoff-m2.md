@@ -656,7 +656,7 @@ T3 新增或加深且能用单文件 `std` 诚实地考的槽位都有了题（�
 
 | 槽位 | 为什么没有题 |
 | --- | --- |
-| `api/library-design@aware`（3.1） | `aware` 按政策不出题（curriculum §11） |
+| `api/library-design@aware`（3.1） | `aware` 按政策不出题（curriculum §15） |
 | `err/typed-errors@design`（3.3） | 增量（`#[non_exhaustive]`、Display 快照）已被 `api-library-design.apply` 从表面侧盖住 |
 | `cfg/layered-config@design`（3.4） | 机制是 cargo 编出一个 feature 矩阵，单文件只能给一组 feature 解出一个配置 |
 | `db/transactions@design`（3.6） | 注入序列化冲突 + 有界重试，与 `delivery-retry-budget.design` 重叠（见 §1.3 的写法：要补就只写「注入冲突下收敛」这一半）|

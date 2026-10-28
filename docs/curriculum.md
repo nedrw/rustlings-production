@@ -322,13 +322,13 @@ probe/drill 与 track 解耦：任何深度都可以被抽查。
 | --- | --- | --- | --- |
 | T1 `mailer` | rustlings 水平 | 服务骨架、类型化错误、迁移、后台 worker、可观测基线、容器发布 | 22 teach |
 | T2 `relay` | T1 全部 apply 级 | 至少一次投递、顺序与幂等、DLQ、签名、SSRF、限流、多租户 | 18 teach + 1 transfer + 5 deepen |
-| T3 `jobq` | T2 出口 + 库设计入门 | 库设计、事务深化、租约、cron、变异/覆盖率/基准、在线演进 | 11 teach + 1 transfer + 14 deepen（在建） |
-| T4 `lakelet` | T3 出口 + 性能入门 | WAL 恢复、列式与压缩、查询引擎、批处理、剖析与 soak | 编写时由 `lint-caps` 统计 |
-| T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 编写时由 `lint-caps` 统计 |
-| T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断 | 8 teach |
-| T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 | 9 teach |
-| T8 `rpc` | T1 的 HTTP 契约 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用 | 5 teach |
-| T9 `platform` | T1 的容器与配置 | 探针接线、滚动发布算术、中断预算、外部 secrets、OIDC、自动伸缩、发布演练 | 7 teach |
+| T3 `jobq` | T2 出口 + 库设计入门 | 库设计、事务深化、租约、cron、变异/覆盖率/基准、在线演进 | 11 teach + 1 transfer + 15 deepen |
+| T4 `lakelet` | T3 出口 + 性能入门 | WAL 恢复、列式与压缩、查询引擎、批处理、剖析与 soak | 16 teach + 1 transfer + 7 deepen |
+| T5 `meshkv` | T4 出口 | 共识、成员变更、确定性模拟、线性一致读、mTLS、集群演练 | 20 teach + 1 transfer + 1 deepen |
+| T6 `cache` | T1 的读写习惯 | 读穿、失效、单飞、过期抖动、版本化键、两层、SLO、熔断（`exit` 声明前三个） | 8 teach |
+| T7 `broker` | T1 的读写习惯 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进（`exit` 声明前四个） | 9 teach |
+| T8 `rpc` | T1 的 HTTP 契约 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用（`exit` 声明前两个） | 5 teach |
+| T9 `platform` | T1 的容器与配置 | 探针接线、滚动发布算术、中断预算、外部 secrets、OIDC、自动伸缩、发布演练（`exit` 声明前两个） | 7 teach |
 
 ## 6. T1 `mailer`：邮件订阅微服务（22 步，**已交付**）
 
@@ -502,7 +502,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 4.23 | 密钥轮换 | `sec/secrets-management@design` | 轮换期间不中断 |
 | 4.24 | runbook / SLO / 复盘演练 | `ops/runbook-drill@operate` | 演练 + 复盘文档 |
 
-## 10. T5 `meshkv`：分布式 KV / 调度（22 步，可选）
+## 10. T5 `meshkv`：分布式 KV / 调度（22 步，已交付）
 
 题材：把 `jobq` 的引擎扩展到多节点（共识复制状态机），并验证「架构缝隙是否真的干净」。
 允许 `path` 依赖 T3 的引擎 crate——这是唯一一处跨 track 代码复用（plan.md §3 D6）。
@@ -532,11 +532,11 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 5.21 | 协议与升级演进 | `dist/protocol-evolution@design`、`ops/rolling-upgrade@design` | 新旧节点混跑 |
 | 5.22 | 毕业演练：多节点故障 + 一致性审计 | `dist/consistency-audit@operate` | 审计脚本 + 复盘 |
 
-## 11. T6 `cache`：读缓存层（8 步）
+## 11. T6 `cache`：读缓存层（8 步，已交付）
 
 题材：一个挡在慢存储前面的读缓存。它不引异步运行时也不引 HTTP：时钟是参数，存储是一个计数的
 `BTreeMap`，于是每一条失效语义都能在测试里确定性复现。这条 track 是 M6 的第一块（见
-[m6-plan.md](m6-plan.md)）：先落地读穿、失效、单飞、过期抖动四步，热点与 SLO 两段随后追加。
+[m6-plan.md](m6-plan.md)），八步全部落地：读穿、失效、单飞、过期抖动，再加版本化键、两层、SLO、熔断。
 
 | # | 步骤 | teaches | 过关条件（要点） |
 | --- | --- | --- | --- |
@@ -549,7 +549,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 6.7 | 缓存的有效性要成为 SLO | `obs/cache-effectiveness@operate` | 命中率与回源次数，边界算健康 |
 | 6.8 | 缓存挂了：停止询问它 | `ops/cache-failure@operate` | 熔断打开走直连，冷却后单探针 |
 
-## 12. T7 `broker`：分区消息日志（9 步）
+## 12. T7 `broker`：分区消息日志（9 步，已交付）
 
 题材：一条消息日志的分区语义。没有 broker 进程、没有网络：每个分区就是一个 `Vec`，而这一步要
 重新写出来的是它给的那些承诺——同一个键落在同一个分区、分区内顺序、提交过的偏移才是重启后的位置、
@@ -567,7 +567,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 7.8 | 加法兼容，减法破坏 | `broker/schema-compat@apply` | 删字段、改类型、加必填都是破坏；加可选不是 |
 | 7.9 | 用"落后"的连续段告警 | `ops/lag-alert@operate` | 严格高于阈值、连续 N 次；一次低谷重置 |
 
-## 13. T8 `rpc`：契约先行的 RPC 层（5 步，进行中）
+## 13. T8 `rpc`：契约先行的 RPC 层（5 步，已交付）
 
 题材：一层 gRPC 形状的 RPC。没有网络、没有代码生成：契约是数据，deadline 是一个数字，流是一个窗口
 ——而判断是每个 gRPC 服务在每次调用上都要做的那些。
@@ -580,7 +580,7 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 | 8.4 | 流是一个窗口，不是一个缓冲 | `rpc/server-streaming@apply` | 在途到达窗口即停；确认后继续 |
 | 8.5 | 一条连接，多条流，没有队头阻塞 | `rpc/multiplexing@design` | 每轮每流一项；阻塞的流不拖住别人 |
 
-## 14. T9 `platform`：服务上线所依赖的那一层（7 步）
+## 14. T9 `platform`：服务上线所依赖的那一层（7 步，已交付）
 
 题材：服务上线到集群上要做的那几个判断。没有集群：清单是数据、发布是算术、令牌是结构体。
 
@@ -597,8 +597,9 @@ origin 分布：**11 teach + 1 transfer（3.1）+ 14 deepen**；`exit` 能力见
 ## 15. probe 与 drill 库
 
 - **probe**（3–10 分钟）：每个 (能力, 深度) 格位一个抽查题，用于 `kiln review --due` 的间隔重复，也用于 `kiln plan --fast` 的免修证明。
-  台账现在有 97 个能力、136 个格位，全覆盖等于 136 个 probe——这是笔真实成本，所以**只对 `apply` 级以上、
-  易遗忘的能力做 probe（现有 65 道，T1–T4 已全部落地）**，`aware` 级不单独出题（它本来就只有一步、且在后续步骤里反复被用到）。
+  台账现在有 126 个能力、165 个格位，其中 99 个是 `apply`——这是笔真实成本，所以**`apply` 格位全部有题
+  （现有 127 道，T1–T9 已全部落地）**，`aware` 级不单独出题（它本来就只有一步、且在后续步骤里反复用到）；
+  `design`/`operate` 格位只在有值得重写的判断时出题，`kiln probe --check` 的覆盖率只强制 `apply`。
 - **drill**：纯机制训练（取消安全、`Pin`、`Buf`/`Bytes`、`dyn` 兼容性、迭代器适配器），按需插在 track 里；
   每个 drill 独立、可在 15 分钟内完成，不进任何项目。
 

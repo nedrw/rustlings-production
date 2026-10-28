@@ -1,7 +1,7 @@
 # rustlings-production
 
 A step-by-step course for building **production-grade Rust services** — rustlings-style verification
-(one task, one command, pass/fail), but the training ground is five real projects that grow from
+(one task, one command, pass/fail), but the training ground is nine projects that grow from
 simple to complex instead of isolated single-file exercises.
 
 ```sh
@@ -90,10 +90,10 @@ acceptance ran green on this tree: the offline fast path 24/24, `kiln verify lak
 see [docs/handoff-m3.md](docs/handoff-m3.md) §4 for the numbers and
 [docs/t4-lakelet.md](docs/t4-lakelet.md) for what T4 delivers.
 
-**M5 is delivered.** The course reads in Chinese (119/119 bodies, `kiln i18n status` — structure 0
+**M5 is delivered.** The course reads in Chinese (148/148 bodies, `kiln i18n status` — structure 0
 errors, drift 0 warnings, 133 glossary terms), `kiln new-track` plus [docs/new-track.md](docs/new-track.md)
 were verified the way the plan asks — a three-step toy track built with the guide reaches
-`3/3 step(s) hold the contract` — `kiln site` publishes the whole course (251 pages in two locales,
+`3/3 step(s) hold the contract` — `kiln site` publishes the whole course (317 pages in two locales,
 every link checked by `site --check`, which `cargo xtask ci` runs), and
 [docs/maintenance.md](docs/maintenance.md) is the annual pass. What changed, what it cost and what
 the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
@@ -110,11 +110,11 @@ numbers, deadlines, status codes, streaming windows, multiplexing), `selftest --
 **M9** is delivered: **T9 `platform`**, seven steps (probe wiring, rollout arithmetic, disruption
 budgets, external secrets, OIDC, autoscaling, a rollout drill), `selftest --track platform` `7/7`.
 **M10** is delivered too: [docs/capstone.md](docs/capstone.md) is the capstone — a free project judged
-by `kiln capstone` (the course's generic gates plus a `unsafe_code = "deny"` shape check), with a
+by `kiln capstone` (the course's generic gates, plus a compile with `unsafe` forbidden), with a
 twelve-question review checklist and ADR / incident-review / review templates. It is deliberately not
 a track and not a CI gate. Both languages are written for every step, and each `apply` slot has its
-probe. Broker, RPC, platform and capstone follow in that
-order ([docs/m6-plan.md](docs/m6-plan.md)).
+probe. The plan and its record: [docs/m6-plan.md](docs/m6-plan.md),
+[docs/handoff-m6-log.md](docs/handoff-m6-log.md).
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
 (`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,
@@ -131,27 +131,26 @@ step's own `links` gate).
   `bf9ac5f` fixes; that workaround is no longer needed. The unit tests read 208 then; the current
   tree reads 335 — the growth came with the slow gates, the probe pool and the state-file and
   patch-engine fixes, not with a change to what is judged.)
-- On the current tree (M4, T5 authored end to end): `kiln lint-caps` — `97 capabilities · 136
-  slots · 119 ledger positions · 119 authored steps` (all five tracks' bodies), no issues;
-  `kiln links` — 139 pages, 557 links, 330 external targets, 0 findings; `kiln probe --check` —
-  83/83 (the M4 batch took the pool from 65 to 83); `cargo test -p kiln` — 379 + 21 + 1 + 1 tests (the last file pins step titles to their
-  bodies);
-  the offline fast path — 24/24 with `CARGO_NET_OFFLINE=true` and a private
-  `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
-  `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s).
+- On the current tree (M10, all nine tracks): `kiln lint-caps` — `126 capabilities · 165
+  slots · 148 ledger positions · 148 authored steps`, no issues; `kiln links` — 327 pages,
+  1202 links, 387 external targets, 0 findings; `kiln probe --check` — 127/127 references,
+  coverage 99/99 apply slots; `cargo test -p kiln` — 383 + 21 + 1 + 1 + 1;
+  `cargo xtask ci` — **1 h 33 min**, every track's `selftest` green (148/148), run with
+  `CARGO_NET_OFFLINE=true` and a private `XDG_CACHE_HOME`; `kiln verify lakelet --slow --json` —
+  `{blocked: 0, clean: true, failed: 0, not_authored: 0, passed: 24, steps: 24}` (625 s, M4 tree).
 - `kiln selftest --track relay` — **476 s**, `24/24 step(s) hold the contract`: every T2 step's spec
   fails on its scaffold, passes on the reference solution, and every must gate is green.
 - `kiln verify relay` — **155 s**, `24/24 judged step(s) pass · 0 failed · 0 not prepared · 0 without
   content`; `kiln caps --track relay` shows the six exit capabilities verified.
-- `kiln links` (offline, the repository's own markdown) — 57 pages, 370 links, 228 external targets,
+- `kiln links` (offline, the repository's own markdown) — 327 pages, 1202 links, 387 external targets,
   0 findings; a learner's project under `app/` is skipped and named, so the number is the same on a
   fresh clone as on a machine mid-course. `kiln links --external` — **115 s** (M0 tree),
   `112 answered · 7 unclear · 0 gone` (the seven `?` are hosts that were unreachable from that
   network, not 404s).
 - M0 tree, for reference: `kiln verify --json mailer` — **181 s**, `"passed": 22, "failed": 0`;
   `cargo xtask ci` — **579 s**.
-- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/97 step bodies, falling back through
-  ja -> en`.
+- `kiln --lang ja list` — exit 0, prints `content locale: ja — 0/148 step bodies, falling back
+  through ja -> en`.
 - The three container steps (1.9 Postgres, 1.19 mailpit, 1.21 the image itself) run under local
   podman. `kiln images` says which images to pull first; `kiln doctor` warns when the machine needs
   `KILN_REGISTRY_MIRROR`.
@@ -174,7 +173,7 @@ cargo run -p kiln -- review --due               # capabilities whose last proof 
 cargo run -p kiln -- images                     # what the container steps declare, and what is local
 cargo run -p kiln -- links                      # the repository's own links, offline (learner projects aside)
 cargo run -p kiln -- spec restore               # put the course's spec files back
-cargo run -p kiln -- lint-caps                  # 97 capabilities, 136 slots, 119 steps, all authored
+cargo run -p kiln -- lint-caps                  # 126 capabilities, 165 slots, 148 steps, all authored
 cargo run -p kiln -- doctor                     # toolchain, runtime, cargo tools, registry mirror
 cargo run -p kiln -- i18n status
 ```
@@ -194,10 +193,11 @@ Rust lint was ported from; it still cross-checks the ledger against the curricul
 which is why it is kept:
 
 ```sh
-python3 tools/lint-caps-md.py   # 97 capabilities, 119 steps, 136 (capability, depth) slots, 0 issues
+python3 tools/lint-caps-md.py   # 126 capabilities, 148 steps, 165 (capability, depth) slots, 0 issues
 ```
 
 What is not in yet: hosting for the generated site (`kiln site` writes files; no host is chosen),
-and one full `cargo xtask ci` run over the tree that carries `kiln site` and `kiln new-track` — the
-milestone work was verified with the content tier plus `cargo test -p kiln` (see
-[docs/handoff-m5-log.md](docs/handoff-m5-log.md) §19).
+and the four optional tracks the plan left out of M6–M10 (a SQL-index track, a database
+replication/failover drill, batch/stream ETL, search) — each is a new track's worth of work. The
+full `cargo xtask ci` was run on `6096903` and passed (1 h 33 min, 148/148; see
+[docs/handoff-m6-log.md](docs/handoff-m6-log.md) §13).

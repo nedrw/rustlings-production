@@ -16,7 +16,7 @@ rustlings 的训练场是「单文件小题」；这门课的训练场是**五�
 
 | 项 | 结论 | 对设计的影响 |
 | --- | --- | --- |
-| 时长 | 不限制，优先内容完整性 | 课程规模扩到 5 条 track / 约 118 步；慢闸门可以放心保留；里程碑以「内容完整度」验收而不是工期 |
+| 时长 | 不限制，优先内容完整性 | 课程规模扩到 9 条 track / 148 步；慢闸门可以放心保留；里程碑以「内容完整度」验收而不是工期 |
 | 项目 | 多条 track，从简单到复杂；复杂项目不得重复简单项目的内容 | 新增**能力台账（capability ledger）+ 去重 lint**，见 §3 D4 与 [curriculum.md](curriculum.md) |
 | 首条 track | 邮件微服务（题材参考《Zero To Production in Rust》） | T1 `mailer`，见 [curriculum.md](curriculum.md) |
 | 内容语言 | 英文为源，但预留切换接口，后续可能加语言 | 全套 i18n 目录约定 + 回退链 + 翻译漂移检测，见 §3 D5 与 [authoring.md](authoring.md) |
@@ -39,7 +39,7 @@ rustlings 的训练场是「单文件小题」；这门课的训练场是**五�
 
 | 机制 | 内容 | 对应生产现实 |
 | --- | --- | --- |
-| A 项目脊骨 | 5 条 track，每条都是完整项目（T1→T5 依次变难） | 真实代码库的历史负担 |
+| A 项目脊骨 | 9 条 track，每条都是完整项目（T1→T9 依次变难） | 真实代码库的历史负担 |
 | B 不可篡改规格 | 规格测试只读 + SHA-256 校验 + `kiln spec restore` | 需求/测试不由实现者修改 |
 | C 生产闸门 | lint 阶梯只升不降、变异测试、性能预算、公开 API 基线、依赖审计、unsafe 预算 | 评审与 CI 的实际标准 |
 | D 运维视角 | 优雅停机、故障演练、runbook、SLO、在线迁移 | 交付之后那 90% 的工作 |
@@ -291,19 +291,32 @@ T1 的 `mailer/1.22-runbook` 是这个题型的参考样本（正文、规格、
 
 ## 7. 课程体系
 
-完整内容见 **[docs/curriculum.md](curriculum.md)**：能力注册表、track 依赖关系、5 条 track 的全部阶段与步骤、以及「同一能力跨 track 演进」的实例对照。
+完整内容见 **[docs/curriculum.md](curriculum.md)**：能力注册表、track 依赖关系、9 条 track 的全部阶段与步骤、以及「同一能力跨 track 演进」的实例对照。
 
 概览：
 
 | track | 项目 | 难度 | 步数 | 主要新能力 |
 | --- | --- | --- | --- | --- |
 | T1 | `mailer` 邮件订阅微服务（题材参考《Zero To Production in Rust》）**已交付** | 入门→中 | 22 | 服务骨架、类型化错误、迁移、后台 worker、可观测基线、容器发布 |
-| T2 | `relay` Webhook 投递服务 | 中 | 24 | 至少一次投递、顺序与幂等、DLQ、HMAC 签名、SSRF 防护、限流、多租户 |
-| T3 | `jobq` 通用任务队列（库 + 服务 + CLI） | 中高 | 26 | 库设计、事务与 `SKIP LOCKED` 深化、cron、变异/覆盖率/基准闸门、在线 schema 演进 |
-| T4 | `lakelet` 遥测摄取与查询 | 高 | 24 | WAL 与崩溃恢复、列式存储与压缩、查询引擎、批处理与写放大、性能剖析与 soak |
-| T5 | `meshkv` 分布式 KV / 调度（可选） | 最高 | 22 | 共识与成员变更、确定性模拟测试、线性一致读、mTLS、集群故障演练 |
+| T2 | `relay` Webhook 投递服务 **已交付** | 中 | 24 | 至少一次投递、顺序与幂等、DLQ、HMAC 签名、SSRF 防护、限流、多租户 |
+| T3 | `jobq` 通用任务队列（库 + 服务 + CLI）**已交付** | 中高 | 27 | 库设计、事务与 `SKIP LOCKED` 深化、cron、变异/覆盖率/基准闸门、在线 schema 演进 |
+| T4 | `lakelet` 遥测摄取与查询 **已交付** | 高 | 24 | WAL 与崩溃恢复、列式存储与压缩、查询引擎、批处理与写放大、性能剖析与 soak |
+| T5 | `meshkv` 分布式 KV / 调度（可选）**已交付** | 最高 | 22 |
+| T6 | `cache` 读缓存层 | 中 | 8 | 读穿与失效、单飞、过期抖动、版本化键、两层、命中率 SLO、熔断 |
+| T7 | `broker` 分区消息日志 | 中 | 9 | 分区路由、提交偏移、再平衡、lag、重放、顺序、恰好一次、模式演进 |
+| T8 | `rpc` 契约先行的 RPC 层 | 中 | 5 | 字段号兼容、绝对 deadline、状态码、流式窗口、多路复用 |
+| T9 | `platform` 服务上线的那一层 | 中高 | 7 | 探针接线、发布算术、中断预算、外部 secrets、OIDC、自动伸缩、发布演练 | 共识与成员变更、确定性模拟测试、线性一致读、mTLS、集群故障演练 |
 
-默认学习路径是 T1→T2→T3→T4；T5 可选。每条 track 自成一个交付，前一条的代码不被后一条复用（§3 D6）。
+默认学习路径是 T1→T2→T3→T4；T5 可选，T6–T9 是补齐横向能力域的四条独立 track（M6–M10 交付），
+T10 capstone 不是 track（见 [capstone.md](capstone.md)）。每条 track 自成一个交付，前一条的代码不被
+后一条复用（§3 D6）。
+
+**关于门的阶梯：** §6 的"只升不降"是**一条 track 内部**的规则——第 N 步引入的门，第 N+1 步起一直在。
+它在 track 之间不传递：每条 track 是独立的 cargo workspace（D6），门阶梯从它自己的第一步开始。
+因此 T6–T9 从基础阶梯起步（`clippy@1`），没有继承 T3–T5 的 `@4` 与慢门。这是 M6–M10 的明确取舍：
+把 T3 的严格程度搬过来，需要四条新 track 的骨架重建 T1.2 教的 lint 策略、并把 mutants/coverage
+接到四个小 crate 上（CI 时间再涨约三成）；记录在此，留待需要时再做，而不是让文档声称一件没做到的
+事。
 
 ## 8. 编写规范
 
@@ -404,8 +417,8 @@ T7 `broker` 9 步、T8 `rpc` 5 步、T9 `platform` 7 步）；capstone 见下。
 
 **M5 已交付**（2026-10）：四件事全部落地——中文全量翻译（119/119，`i18n status` 结构 0 error、
 漂移 0 warning，词表 133 条）；`kiln new-track` 生成器与 [new-track.md](new-track.md) 指南，并按本表的
-验收标准跑过一遍（三步玩具 track → `3/3 step(s) hold the contract`）；`kiln site` 文档站（251 页、
-两种语言、`site --check` 进 CI，检查生成页面的每个站内链接）；[maintenance.md](maintenance.md) 年度
+验收标准跑过一遍（三步玩具 track → `3/3 step(s) hold the contract`）；`kiln site` 文档站（M5 时点 251 页、
+两种语言、`site --check` 进 CI，检查生成页面的每个站内链接；现在是 317 页）；[maintenance.md](maintenance.md) 年度
 维护流程（什么会烂、谁先叫、修在哪）。过程与实测数字在 [handoff-m5-log.md](handoff-m5-log.md)。
 
 **M6–M10 的计划**（2026-10-28 的空白分析之后）：M6.0 补齐 24 个 apply 槽位的探题；M6.1 缓存
