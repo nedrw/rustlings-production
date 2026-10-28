@@ -44,7 +44,7 @@ with stricter gates and fewer hints.
 | T6 | `cache` — a read cache in front of a slow store **delivered** | mid | 8 |
 | T7 | `broker` — a partitioned message log **delivered** | mid | 9 |
 | T8 | `rpc` — a contract-first RPC layer **delivered** | mid | 5 |
-| T9 | `platform` — the layer a service ships on **delivered (first five steps)** | mid-high | 5 |
+| T9 | `platform` — the layer a service ships on **delivered** | mid-high | 7 |
 
 ## Read next
 

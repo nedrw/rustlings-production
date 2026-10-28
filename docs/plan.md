@@ -392,6 +392,10 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 交付物一览与实测数字在 [t2-relay.md](t2-relay.md)，机制、命令与继续往下做的约定在
 [handoff-m1.md](handoff-m1.md)。
 
+**M6–M10 已交付**（2026-10）：补探题到 100% apply 覆盖；新增四条 track（T6 `cache` 8 步、
+T7 `broker` 9 步、T8 `rpc` 5 步、T9 `platform` 7 步）；capstone 见下。台账到 126 能力 / 165 槽位 /
+148 步，探题 127 道覆盖 99/99 apply 槽位。
+
 **M10 已交付**（2026-10）：capstone 不是一条 track，而是一张**门 + 清单**——`kiln capstone [PATH]`
 用课程已有的通用门（fmt、clippy@1、no-todo、docs:public、exit-code）判一个自由项目，外加一条
 `unsafe_code = "deny"` 的形状检查；人读的十二问评审清单、ADR / 复盘 / 评审清单三个模板、
