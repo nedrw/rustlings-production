@@ -369,3 +369,16 @@ operate = "cache/6.7"
 
 [capability."ops/cache-failure"]
 operate = "cache/6.8"
+
+# T7 `broker` (docs/curriculum.md §12). A partitioned log; no process, no network.
+[capability."broker/partitioning"]
+apply = "broker/7.1"
+
+[capability."broker/consumer-offset"]
+apply = "broker/7.2"
+
+[capability."broker/rebalance"]
+apply = "broker/7.3"
+
+[capability."broker/lag"]
+apply = "broker/7.4"

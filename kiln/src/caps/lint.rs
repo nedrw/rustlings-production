@@ -1228,15 +1228,15 @@ mod tests {
             .expect("kiln lives one directory below the repository root");
         let report = lint_root(root).unwrap();
 
-        assert_eq!(report.capabilities, 105);
-        assert_eq!(report.slots, 144);
-        assert_eq!(report.ledger_positions, 127);
+        assert_eq!(report.capabilities, 109);
+        assert_eq!(report.slots, 148);
+        assert_eq!(report.ledger_positions, 131);
         // Every track the ledger plans has metadata (T1 22 + T2 24 + T3 27 + T4 24 + T5 22 + T6 4);
         // the bodies inside those steps arrive one at a time, which is what the R5 notice below
         // reports. That is the point of asserting it here.
         assert_eq!(
             report.authored_steps,
-            22 + 24 + 27 + 24 + 22 + 8,
+            22 + 24 + 27 + 24 + 22 + 8 + 4,
             "T1-T6 metadata"
         );
         assert!(report.is_clean(), "{:?}", report.issues);
