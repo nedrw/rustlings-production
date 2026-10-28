@@ -1,0 +1,24 @@
+--- a/src/autoscaling.rs
++++ b/src/autoscaling.rs
+@@ -23,7 +23,20 @@
+ /// The replica count the formula asks for.
+ #[must_use]
+ pub fn desired(current: u32, metric: u64, target: u64, min: u32, max: u32) -> u32 {
+-    todo!("the formula with its tolerance band, clamped")
++    if target == 0 {
++        return current.clamp(min, max);
++    }
++    // The band: 90%..=110% of the target keeps the current count. Integer arithmetic, because a
++    // float comparison here decides whether a cluster flaps.
++    let low = target.saturating_mul(100 - TOLERANCE_PERCENT);
++    let high = target.saturating_mul(100 + TOLERANCE_PERCENT);
++    if metric.saturating_mul(100) >= low && metric.saturating_mul(100) <= high {
++        return current.clamp(min, max);
++    }
++    let product = u64::from(current).saturating_mul(metric);
++    let wanted = product.div_ceil(target);
++    let wanted = u32::try_from(wanted).unwrap_or(u32::MAX);
++    wanted.clamp(min, max)
+ }
+ 
+ /// Scales up at once and down after a run of low windows.

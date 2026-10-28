@@ -147,3 +147,55 @@ gates = [
     "exit-code",
     "unsafe-budget@0",
 ]
+
+[[step]]
+id = "9.6-autoscaling"
+title = "Fast up, slow down, and a band that stops the flapping"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.6-autoscaling.md"
+time_hint = "60m"
+concepts = ["horizontal autoscaling", "tolerance band", "stabilization window"]
+teaches = ["k8s/autoscaling@design"]
+requires = ["k8s/rollout@apply"]
+run = { cmd = "cargo test -p platform --test spec_autoscaling" }
+spec = ["spec/9.6/autoscaling.rs"]
+scaffold = "scaffold/9.6-autoscaling.patch"
+solution = "solutions/9.6-autoscaling.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "9.7-rollout-drill"
+title = "Every step of the rollout, not just the end"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/platform/9.7-rollout-drill.md"
+time_hint = "45m"
+concepts = ["rehearsal", "observed counts", "violation"]
+teaches = ["k8s/rollout-drill@operate"]
+requires = ["k8s/rollout@apply", "k8s/disruption-budget@apply"]
+run = { cmd = "cargo test -p platform --test spec_drill" }
+spec = ["spec/9.7/drill.rs"]
+scaffold = "scaffold/9.7-rollout-drill.patch"
+solution = "solutions/9.7-rollout-drill.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]

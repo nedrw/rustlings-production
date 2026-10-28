@@ -1,0 +1,27 @@
+--- a/src/drill.rs
++++ b/src/drill.rs
+@@ -51,5 +51,23 @@
+ /// Every violation of the budgets, in step order.
+ #[must_use]
+ pub fn drill(steps: &[Observed]) -> Vec<Violation> {
+-    todo!("both budgets at every step, in step order")
++    let mut violations = Vec::new();
++    for (step, observed) in steps.iter().enumerate() {
++        let ceiling = observed.replicas.saturating_add(observed.max_surge);
++        if observed.total > ceiling {
++            violations.push(Violation::TooManyPods {
++                step,
++                total: observed.total,
++            });
++        }
++        let floor = observed.replicas.saturating_sub(observed.max_unavailable);
++        if observed.ready < floor {
++            violations.push(Violation::TooFewReady {
++                step,
++                ready: observed.ready,
++            });
++        }
++    }
++    violations.sort();
++    violations
+ }
