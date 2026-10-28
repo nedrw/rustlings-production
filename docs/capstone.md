@@ -50,13 +50,17 @@ cargo run -p kiln -- capstone app/capstone
 #   ✓ exit-code      demo exits non-zero on `--kiln-exit-code-probe` and names the argument it refused
 ```
 
-退出码：`0` 全绿；`1` 有门红了；`2` 目录不存在（还没有项目）。
+退出码：`0` 全绿；`1` 有检查红了（**包括所有检查全红**——一个完全红掉的项目仍然是一个项目）；
+`2` 目录不存在（还没有项目）。
 
 **它刻意不是 CI 门。** 课程仓库里没有 capstone 项目（`app/` 是学员自己的工作区），所以这条命令是
 学员侧的，和 `kiln run` 一样在你自己的机器上跑。
 
 `unsafe` 为什么是形状检查而不是门：`unsafe-budget@0` 是**按步**的（它数这一步的补丁写了哪些文件），
-capstone 没有补丁，那个门只能回答"判不了"。项目级的等价物就是 `deny` lint——编译器免费替你执行。
+capstone 没有补丁，那个门只能回答"判不了"。项目级的等价物是**编译器**：这条检查用
+`RUSTFLAGS=-F unsafe_code` 编一次项目。`-F` 是命令行级别，crate 里的 `#![allow(unsafe_code)]`
+覆盖不了它——一个读 `Cargo.toml` 的字符串匹配做不到这一点（`allow` 旁边一个真的 `unsafe fn`
+会通过），所以这里编，不读。
 
 ## 3. 评审清单（人读，一条一条有答案）
 
@@ -68,7 +72,7 @@ capstone 没有补丁，那个门只能回答"判不了"。项目级的等价物
 | 4 | 依赖挂了，哪些功能还在？写下来了吗？ | relay/2.24 |
 | 5 | 存活探针读依赖了吗？就绪探针真的检查吗？ | platform/9.1 |
 | 6 | `maxUnavailable` 是多少，为什么是这个数？ | platform/9.2 |
-| 7 | 迁移能在线做吗？回滚路径是什么？ | jobq/3.24 |
+| 7 | 迁移能在线做吗？回滚路径是什么？ | jobq/3.23 |
 | 8 | 出问题时，你看哪三个数？告警的阈值是怎么定的？ | mailer/1.20、broker/7.9 |
 | 9 | 秘密怎么进进程？谁能读别人的数据？ | platform/9.4、mailer/1.18 |
 | 10 | 测试在哪一层最薄，为什么可以薄？ | mailer/1.19 |

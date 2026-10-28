@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::caps::CapRequirement;
 use crate::cmd::Session;
-use crate::error::{EXIT_ERROR, EXIT_FAILED, EXIT_OK, KilnError, Result};
+use crate::error::{EXIT_FAILED, EXIT_OK, KilnError, Result};
 use crate::gates::runner::{self, GateContext};
 use crate::gates::{GateSpec, Tier};
 use crate::info::{Origin, Step, StepKind, Track};
@@ -25,12 +25,14 @@ use crate::info::{Origin, Step, StepKind, Track};
 /// `conformance`, `mutants`, …): those judge the course's own material, and the capstone has none.
 const LADDER: &[&str] = &["fmt", "clippy@1", "no-todo", "docs:public", "exit-code"];
 
-/// The capstone's own shape check, next to the gates: the project denies `unsafe`.
+/// The capstone's own shape check, next to the gates: the project holds no `unsafe`.
 ///
 /// `unsafe-budget@0` is *step-scoped* — it counts the files a step's patches write, and a capstone
-/// has no patches, so the gate can only answer "not judgeable" here. The lint is the project-wide
-/// version of the same rule, and it is the one the compiler enforces for free.
-const DENY_UNSAFE: &str = "unsafe-deny";
+/// has no patches, so the gate can only answer "not judgeable" here. The project-wide equivalent is
+/// the compiler: `cargo build` with `-F unsafe_code` on the command line, which no `#![allow]` in
+/// the crate can override. A manifest lookup would be a string match — `allow(unsafe_code)` beside
+/// an `unsafe fn` would pass it — so the check compiles instead of reading.
+const NO_UNSAFE: &str = "unsafe-code";
 
 /// Judge the project at `path` (default `app/capstone`).
 pub fn run(session: &Session, path: Option<&str>) -> Result<u8> {
@@ -58,12 +60,10 @@ pub fn run(session: &Session, path: Option<&str>) -> Result<u8> {
 
     println!("kiln capstone · {}", project.display());
     let mut failed = 0;
-    match denies_unsafe(&project) {
-        Ok(()) => {
-            println!("  ✓ {DENY_UNSAFE:<14} `[lints.rust] unsafe_code = \"deny\"` is in Cargo.toml")
-        }
+    match holds_no_unsafe(&project, session.timeout()) {
+        Ok(()) => println!("  ✓ {NO_UNSAFE:<14} the project compiles with `-F unsafe_code`"),
         Err(detail) => {
-            println!("  ✗ {DENY_UNSAFE:<14} {detail}");
+            println!("  ✗ {NO_UNSAFE:<14} {detail}");
             failed += 1;
         }
     }
@@ -82,32 +82,7 @@ pub fn run(session: &Session, path: Option<&str>) -> Result<u8> {
         "✗ {failed} check(s) stop the capstone — a blocked gate is not a pass: it means the project \
          cannot be judged yet"
     );
-    Ok(if failed == LADDER.len() + 1 {
-        EXIT_ERROR
-    } else {
-        EXIT_FAILED
-    })
-}
-
-/// Whether the project's manifest denies `unsafe` at the crate level.
-fn denies_unsafe(project: &Path) -> std::result::Result<(), String> {
-    let manifest = project.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest)
-        .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
-    let parsed: toml::Value = toml::from_str(&text)
-        .map_err(|error| format!("{} is not valid TOML: {error}", manifest.display()))?;
-    let denied = parsed
-        .get("lints")
-        .and_then(|lints| lints.get("rust"))
-        .and_then(|rust| rust.get("unsafe_code"))
-        .and_then(toml::Value::as_str)
-        == Some("deny");
-    if denied {
-        Ok(())
-    } else {
-        Err("add `[lints.rust] unsafe_code = \"deny\"` to Cargo.toml — a capstone is safe code              unless it argues otherwise"
-            .to_owned())
-    }
+    Ok(verdict(failed))
 }
 
 /// The gate specs, must-tier, in ladder order.
@@ -164,6 +139,44 @@ fn metadata(project: &Path, gates: &[GateSpec]) -> (Track, Step) {
     (track, step)
 }
 
+/// `0` when nothing failed, `1` when anything did — `2` is reserved for "there is no project".
+fn verdict(failed: usize) -> u8 {
+    if failed == 0 { EXIT_OK } else { EXIT_FAILED }
+}
+
+/// Whether the project compiles with `unsafe` forbidden.
+///
+/// The lint is passed with `-F` on the command line, which is the level an inner `#![allow]` cannot
+/// override — a manifest lookup would be a string match that `allow(unsafe_code)` beside a real
+/// `unsafe fn` passes. `RUSTFLAGS` already in the environment is kept: a learner's own flags are
+/// theirs.
+fn holds_no_unsafe(
+    project: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    if !flags.is_empty() {
+        flags.push(' ');
+    }
+    flags.push_str("-F unsafe_code");
+    let ran = crate::process::run_with_env(
+        "cargo",
+        &["build", "--quiet"],
+        project,
+        timeout,
+        &[("RUSTFLAGS".to_owned(), flags)],
+    )
+    .map_err(|error| format!("cannot run cargo: {error}"))?;
+    if ran.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "the project does not compile with `unsafe` forbidden — the capstone is safe code unless \
+         it argues otherwise in its README:\n    {}",
+        crate::gates::runner::clip(&ran.stderr, 6)
+    ))
+}
+
 /// What the command judges, for the books.
 #[cfg(test)]
 mod tests {
@@ -196,14 +209,10 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_without_the_deny_lint_is_refused() {
-        let temp = crate::test_support::TempDir::new("capstone-deny");
-        temp.write("Cargo.toml", "[package]\nname = \"x\"\n");
-        assert!(denies_unsafe(temp.path()).is_err());
-        temp.write(
-            "Cargo.toml",
-            "[package]\nname = \"x\"\n\n[lints.rust]\nunsafe_code = \"deny\"\n",
-        );
-        assert!(denies_unsafe(temp.path()).is_ok());
+    fn any_failure_is_one_and_none_is_zero() {
+        assert_eq!(verdict(0), EXIT_OK);
+        assert_eq!(verdict(1), EXIT_FAILED);
+        // A project where everything is red is still a project: `2` means "there is none".
+        assert_eq!(verdict(LADDER.len() + 1), EXIT_FAILED);
     }
 }
