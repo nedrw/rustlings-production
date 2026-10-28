@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::caps::Level;
 use crate::cmd::Session;
 use crate::error::{EXIT_ERROR, EXIT_FAILED, EXIT_NOT_AUTHORED, EXIT_OK, KilnError, Result};
 use crate::hash;
@@ -230,6 +231,44 @@ fn check_course(session: &Session) -> Result<u8> {
         probes.len(),
         report.passed.len()
     );
+    // Coverage, printed rather than enforced while it is being closed (docs/m6-plan.md, M6.0). A
+    // slot at `apply` depth with no probe is one `plan --fast` cannot skip and `review --due` will
+    // never re-check; when the last one is written, this becomes a failure instead of a number.
+    let mut apply_slots = 0usize;
+    let mut uncovered: Vec<String> = Vec::new();
+    for (capability, level, _) in course.ledger().slots() {
+        if level != Level::Apply {
+            continue;
+        }
+        apply_slots += 1;
+        let covered = probes.iter().any(|probe| {
+            probe.requirement().level == Level::Apply && probe.requirement().id == *capability
+        });
+        if !covered {
+            uncovered.push(format!("{capability}@apply"));
+        }
+    }
+    uncovered.sort();
+    if apply_slots > 0 {
+        println!(
+            "  coverage: {}/{} apply slot(s) have a probe",
+            apply_slots - uncovered.len(),
+            apply_slots
+        );
+        if !uncovered.is_empty() {
+            let shown: Vec<&str> = uncovered.iter().take(6).map(String::as_str).collect();
+            let more = uncovered.len().saturating_sub(shown.len());
+            println!(
+                "  without one: {}{} — docs/m6-plan.md says which batch writes them",
+                shown.join(", "),
+                if more > 0 {
+                    format!(" … +{more}")
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
     for problem in &problems {
         println!("  ✗ {problem}");
     }
