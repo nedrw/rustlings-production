@@ -1,9 +1,10 @@
 --- a/src/multiplex.rs
 +++ b/src/multiplex.rs
-@@ -37,5 +37,18 @@
+@@ -37,6 +37,18 @@
  
  /// Send as much as the windows allow, one item per stream per round.
  pub fn pump(connection: &mut Connection) -> Vec<(usize, String)> {
+-    let _ = connection;
 -    todo!("one item per stream per round, until a full round sends nothing")
 +    let mut sent = Vec::new();
 +    loop {

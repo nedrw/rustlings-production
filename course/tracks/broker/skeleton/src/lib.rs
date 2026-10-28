@@ -77,6 +77,7 @@ impl Topic {
     /// A keyed record goes to its key's partition; an unkeyed one walks the partitions in order,
     /// so a producer that never keys its records still spreads them.
     pub fn append(&mut self, key: Option<&str>, payload: &str) -> (usize, u64) {
+        let _ = (&self.next_unkeyed, key, payload);
         todo!("route by key, or round-robin when there is none")
     }
 }

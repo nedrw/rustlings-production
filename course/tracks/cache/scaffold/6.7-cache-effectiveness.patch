@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/effectiveness.rs
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +//! What a cache is worth, measured: a hit ratio and the origin calls it saved.
 +//!
 +//! ## What you write
@@ -73,6 +73,7 @@
 +/// The verdict for `report` against `slo` (a ratio, e.g. `0.9`).
 +#[must_use]
 +pub fn verdict(report: &Report, slo: f64) -> Verdict {
++    let _ = (report, slo);
 +    todo!("at or above the slo is healthy; the boundary belongs to healthy")
 +}
 --- a/src/lib.rs

@@ -9,6 +9,7 @@ fn claims() -> Claims {
         subject: "user-1".to_owned(),
         expires_at: 1_000,
         not_before: 0,
+        algorithm: "RS256".to_owned(),
     }
 }
 
@@ -17,6 +18,17 @@ fn a_valid_token_answers_its_subject() {
     assert_eq!(
         validate(&claims(), "https://id.example.test", "mailer", 500),
         Ok("user-1")
+    );
+}
+
+#[test]
+fn an_unsupported_algorithm_is_refused_before_anything_else() {
+    let mut claims = claims();
+    claims.algorithm = "none".to_owned();
+    claims.audience = "relay".to_owned();
+    assert_eq!(
+        validate(&claims, "https://id.example.test", "mailer", 500),
+        Err(ClaimError::UnsupportedAlgorithm)
     );
 }
 

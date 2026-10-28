@@ -43,6 +43,30 @@ fn the_first_call_after_the_cooldown_is_the_probe() {
 }
 
 #[test]
+fn only_one_probe_is_handed_out() {
+    let mut breaker = breaker();
+    breaker.record(false, 10);
+    breaker.record(false, 10);
+    assert_eq!(breaker.route(15), Route::Cache, "the probe");
+    assert_eq!(
+        breaker.route(15),
+        Route::Direct,
+        "a second caller took a probe too"
+    );
+}
+
+#[test]
+fn a_failure_while_open_does_not_extend_the_cooldown() {
+    let mut breaker = breaker();
+    breaker.record(false, 10);
+    breaker.record(false, 10);
+    // The cache is not being called while the breaker is open; a failure recorded anyway must not
+    // push `opened_at` forward.
+    breaker.record(false, 12);
+    assert_eq!(breaker.route(15), Route::Cache);
+}
+
+#[test]
 fn a_success_closes_and_forgets() {
     let mut breaker = breaker();
     breaker.record(false, 1);

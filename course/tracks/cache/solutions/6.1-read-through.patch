@@ -1,9 +1,10 @@
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -103,7 +103,22 @@
+@@ -103,8 +103,22 @@
      ///
      /// A key the store does not have is not cached.
      pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
+-        let _ = (&self.ttl, store, key, now);
 -        todo!("a valid entry is a hit; otherwise fill from the store")
 +        if let Some(entry) = self.entries.get(key)
 +            && now < entry.expires_at

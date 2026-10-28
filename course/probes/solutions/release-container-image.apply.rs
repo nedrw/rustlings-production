@@ -45,6 +45,18 @@ pub enum Finding {
 /// Every finding about `dockerfile`, in the order described above.
 #[must_use]
 pub fn audit(dockerfile: &str) -> Vec<Finding> {
+    // `scratch` cannot change; a digest cannot change; a tag other than `latest` is a decision.
+    // It lives inside the body so the exercise and the reference stay one file that differs only in
+    // this function.
+    fn pinned(image: &str) -> bool {
+        if image == "scratch" || image.contains('@') {
+            return true;
+        }
+        image
+            .rsplit_once(':')
+            .is_some_and(|(name, tag)| !name.is_empty() && !tag.is_empty() && tag != "latest")
+    }
+
     let mut findings = Vec::new();
     let mut seen_stage = false;
     let mut user_chosen = false;
@@ -87,16 +99,6 @@ pub fn audit(dockerfile: &str) -> Vec<Finding> {
         findings.push(Finding::RunsAsRoot);
     }
     findings
-}
-
-/// `scratch` cannot change; a digest cannot change; a tag other than `latest` is a decision.
-fn pinned(image: &str) -> bool {
-    if image == "scratch" || image.contains('@') {
-        return true;
-    }
-    image
-        .rsplit_once(':')
-        .is_some_and(|(name, tag)| !name.is_empty() && !tag.is_empty() && tag != "latest")
 }
 
 #[cfg(test)]

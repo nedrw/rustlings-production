@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/versioned.rs
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,61 @@
 +//! Versioned keys: invalidate a namespace by moving its prefix.
 +//!
 +//! Deleting every entry of a namespace is a scan; moving the prefix is one write. The cache keeps
@@ -58,6 +58,7 @@
 +        key: &str,
 +        now: u64,
 +    ) -> Option<String> {
++        let _ = (&self.ttl, store, namespace, key, now);
 +        todo!("derive the entry key from the namespace, its version and the key")
 +    }
 +}

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/rollout.rs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +//! Rolling updates: two budgets, and the smaller one decides each step.
 +//!
 +//! A Deployment's strategy is two numbers. `maxSurge` is how many extra pods may exist, and
@@ -29,6 +29,7 @@
 +/// Whether one more old pod may be terminated.
 +#[must_use]
 +pub fn may_terminate(replicas: u32, max_unavailable: u32, ready: u32, total: u32) -> bool {
++    let _ = (replicas, max_unavailable, ready, total);
 +    todo!("one more old pod may go only while the floor stays ready")
 +}
 --- a/src/lib.rs

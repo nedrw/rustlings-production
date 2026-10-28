@@ -6,8 +6,8 @@
 format_version = 1
 
 [spec]
-"spec/8.1/field_numbers.rs" = "sha256:2bab632c1591bf12d654d4e36957a9a2cb70cdc629555ab4308450f63d00d122"
-"spec/8.2/deadline.rs" = "sha256:c11b4bfe80934011202047748d8c181b53b47717614d5db642b5e74a0c3d175b"
+"spec/8.1/field_numbers.rs" = "sha256:14c9fe052f547fc45a52dd92443b51755a94c5faa539d21a536a989adbd9c4d6"
+"spec/8.2/deadline.rs" = "sha256:6c9054b52fc26fe77aa50529428dae1b297310fdfe6a89b409513b0bf07b5358"
 "spec/8.3/status.rs" = "sha256:77536129951b042992fd37eb84e2d57f727cda39cad863195d7defddbd417a95"
 "spec/8.4/stream.rs" = "sha256:70a3573f648369aa4003ea0806177e56e0662fdb1b4b31dc21be63e647898e4a"
 "spec/8.5/multiplex.rs" = "sha256:ca181f9a4385c00ac6626a9ceb52eb092df8a50d7a0326d92760ebb1a5759fd3"

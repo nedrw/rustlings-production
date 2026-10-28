@@ -1,9 +1,10 @@
 --- a/src/alert.rs
 +++ b/src/alert.rs
-@@ -32,5 +32,20 @@
+@@ -32,6 +32,20 @@
  /// The alert for the end of `history`, given a threshold and a run length.
  #[must_use]
  pub fn evaluate(history: &[u64], threshold: u64, consecutive: usize) -> Alert {
+-    let _ = (history, threshold, consecutive);
 -    todo!("the trailing run above the threshold, and a boundary that is not past it")
 +    if consecutive == 0 {
 +        return Alert::None;

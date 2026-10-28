@@ -56,6 +56,20 @@ fn sitting_exactly_on_both_budgets_is_allowed() {
 }
 
 #[test]
+fn violations_arrive_in_step_order_not_kind_order() {
+    // Step 0 is below the floor, step 1 is above the ceiling. Sorting the violations (which orders
+    // by kind first) would put the later step's ceiling first.
+    let steps = [step(1, 3), step(3, 5)];
+    assert_eq!(
+        drill(&steps),
+        [
+            Violation::TooFewReady { step: 0, ready: 1 },
+            Violation::TooManyPods { step: 1, total: 5 },
+        ]
+    );
+}
+
+#[test]
 fn every_step_is_checked_not_just_the_last() {
     let steps = [step(1, 3), step(3, 3)];
     assert_eq!(

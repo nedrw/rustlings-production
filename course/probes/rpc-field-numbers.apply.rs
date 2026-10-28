@@ -86,15 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn several_breaks_arrive_sorted() {
+    fn several_breaks_arrive_sorted_by_number() {
         let mut new = base();
         new[0].1 = Kind::Flag;
         new.remove(2);
-        let breaking = wire(&base(), &new);
-        assert_eq!(breaking.len(), 2, "{breaking:?}");
-        assert!(
-            breaking.windows(2).all(|pair| pair[0] <= pair[1]),
-            "{breaking:?}"
+        assert_eq!(
+            wire(&base(), &new),
+            [Problem::Reused(1), Problem::Removed(3)]
         );
     }
 }

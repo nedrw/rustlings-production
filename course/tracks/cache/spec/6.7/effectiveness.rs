@@ -39,6 +39,7 @@ fn below_the_slo_is_below() {
     assert_eq!(verdict(&report(&lookups), 0.9), Verdict::BelowSlo);
 }
 
+// Pins given code: `Report` counts what it is told; the step is `ratio`/`verdict`, which the other tests fail on.
 #[test]
 fn every_miss_is_an_origin_call() {
     let report = report(&[Lookup::Miss, Lookup::Hit, Lookup::Miss]);

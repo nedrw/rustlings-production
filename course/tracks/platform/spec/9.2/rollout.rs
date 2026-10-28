@@ -2,6 +2,7 @@
 
 use platform::rollout::{available_floor, may_create, may_terminate};
 
+// Pins given code: `available_floor`, including its clamp at zero; the step is `may_terminate`.
 #[test]
 fn the_floor_is_replicas_minus_unavailable() {
     assert_eq!(available_floor(3, 0), 3);
@@ -37,6 +38,7 @@ fn a_single_replica_with_an_unavailable_budget_may_go() {
     );
 }
 
+// Pins given code: `may_create`; the step is `may_terminate`.
 #[test]
 fn creation_is_bounded_by_surge() {
     assert!(may_create(3, 1, 3));

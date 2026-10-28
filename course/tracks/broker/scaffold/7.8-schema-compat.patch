@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/schema.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,56 @@
 +//! Event schema evolution: what a consumer of the old shape can still read.
 +//!
 +//! An event is a promise in the same way an HTTP body is (step `relay/2.3`). The compatible moves
@@ -54,6 +54,7 @@
 +/// Every breaking difference, sorted.
 +#[must_use]
 +pub fn compat(old: &BTreeMap<String, Field>, new: &BTreeMap<String, Field>) -> Vec<Breaking> {
++    let _ = (old, new);
 +    todo!("removed, type-changed, and required-added; sorted")
 +}
 --- a/src/lib.rs

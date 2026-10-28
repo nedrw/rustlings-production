@@ -17,6 +17,7 @@ fn completing_a_fill_lets_the_next_asker_fill() {
     assert_eq!(flight.begin("a"), Decision::Fill);
 }
 
+// Pins given code: `complete` is in the scaffold. The step is `begin`, which the other tests fail on.
 #[test]
 fn completing_a_key_that_is_not_in_flight_is_false() {
     let mut flight = InFlight::new();

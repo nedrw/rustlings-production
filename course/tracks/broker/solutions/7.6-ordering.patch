@@ -1,9 +1,10 @@
 --- a/src/ordering.rs
 +++ b/src/ordering.rs
-@@ -16,5 +16,43 @@
+@@ -16,6 +16,43 @@
  /// A key per event (`event -> key`).
  #[must_use]
  pub fn plan(events: &[&str], must_order: &[(&str, &str)]) -> BTreeMap<String, String> {
+-    let _ = (events, must_order);
 -    todo!("one key per connected group of the must-be-ordered graph")
 +    // Union-find over the events: the components of the "must stay ordered" graph are exactly the
 +    // key groups. A chain a-b, b-c is one group, and its key is the smallest name in it.

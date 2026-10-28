@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/status.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,67 @@
 +//! Canonical status codes: what went wrong, and whether trying again can help.
 +//!
 +//! A gRPC status is a small closed set, and a client branches on it: `UNAVAILABLE` is retried by
@@ -58,12 +58,14 @@
 +/// The canonical code for `failure`.
 +#[must_use]
 +pub fn code_for(failure: Failure) -> Code {
++    let _ = failure;
 +    todo!("the canonical code for each internal failure")
 +}
 +
 +/// Whether a client may retry this code.
 +#[must_use]
 +pub fn retryable(code: Code) -> bool {
++    let _ = code;
 +    todo!("retry the transient codes, never the caller's mistakes or the server's bug")
 +}
 --- a/src/lib.rs

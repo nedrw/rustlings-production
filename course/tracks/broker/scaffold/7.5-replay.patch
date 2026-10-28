@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/replay.rs
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,48 @@
 +//! Replay: read an old range again, without touching anybody's position.
 +//!
 +//! A replay is not a consumer. It reads a closed range of one partition from the beginning, applies
@@ -45,6 +45,7 @@
 +
 +    /// The next record of the range.
 +    pub fn next_record(&mut self) -> Option<Record> {
++        let _ = (&self.topic, &self.partition);
 +        todo!("read [from, to): stop at `end`, not past it")
 +    }
 +}

@@ -56,14 +56,14 @@ fn a_number_that_moved_is_a_removal_not_a_reuse() {
 }
 
 #[test]
-fn several_breaks_arrive_sorted() {
+fn several_breaks_arrive_sorted_by_number() {
     let mut new = base();
+    // Number 1 changes type, number 3 disappears: the answer is by number, so the reuse comes
+    // first — sorting by variant would put every removal before every reuse.
     new[0].kind = Kind::Flag;
     new.remove(2);
-    let breaking = wire(&base(), &new);
-    assert_eq!(breaking.len(), 2, "{breaking:?}");
-    assert!(
-        breaking.windows(2).all(|pair| pair[0] <= pair[1]),
-        "{breaking:?}"
+    assert_eq!(
+        wire(&base(), &new),
+        [Breaking::NumberReused(1), Breaking::NumberRemoved(3)]
     );
 }

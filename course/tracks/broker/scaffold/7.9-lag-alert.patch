@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/alert.rs
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,37 @@
 +//! Lag alerts: the number that says "behind", not the one that says "alive".
 +//!
 +//! A liveness check answers "is the process running"; a lag alert answers "is it keeping up" — and
@@ -35,6 +35,7 @@
 +/// The alert for the end of `history`, given a threshold and a run length.
 +#[must_use]
 +pub fn evaluate(history: &[u64], threshold: u64, consecutive: usize) -> Alert {
++    let _ = (history, threshold, consecutive);
 +    todo!("the trailing run above the threshold, and a boundary that is not past it")
 +}
 --- a/src/lib.rs

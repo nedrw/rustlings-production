@@ -25,26 +25,27 @@ use std::collections::BTreeSet;
 /// The TTL each key gets, in the order given.
 #[must_use]
 pub fn schedule<'a>(base: u64, spread: u64, keys: &[&'a str]) -> Vec<(&'a str, u64)> {
+    // A stable hash places each key in the band; the same key always lands in the same place. It
+    // lives inside the body so the exercise and the reference stay one file that differs only in
+    // this function.
+    fn ttl_for(base: u64, spread: u64, key: &str) -> u64 {
+        if spread == 0 {
+            return base;
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let span = u128::from(spread) * 2 + 1;
+        let offset = u128::from(hash) % span;
+        let signed = i128::try_from(offset).unwrap_or(i128::MAX) - i128::from(spread);
+        let ttl = i128::from(base) + signed;
+        u64::try_from(ttl.max(0)).unwrap_or(u64::MAX)
+    }
     keys.iter()
         .map(|key| (*key, ttl_for(base, spread, key)))
         .collect()
-}
-
-/// A stable hash places each key in the band; the same key always lands in the same place.
-fn ttl_for(base: u64, spread: u64, key: &str) -> u64 {
-    if spread == 0 {
-        return base;
-    }
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in key.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let span = u128::from(spread) * 2 + 1;
-    let offset = u128::from(hash) % span;
-    let signed = i128::try_from(offset).unwrap_or(i128::MAX) - i128::from(spread);
-    let ttl = i128::from(base) + signed;
-    u64::try_from(ttl.max(0)).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

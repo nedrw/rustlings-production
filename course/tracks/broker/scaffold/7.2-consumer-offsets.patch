@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/consumer.rs
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +//! Consumer offsets: where a group has got to, and what a restart resumes from.
 +//!
 +//! ## What you write
@@ -56,6 +56,7 @@
 +
 +    /// Commit the group's position in `partition`.
 +    pub fn commit(&mut self, topic: &Topic, partition: usize, offset: u64) {
++        let _ = (topic, partition, offset);
 +        todo!("ignore an unknown partition, clamp to the end, record the rest")
 +    }
 +}

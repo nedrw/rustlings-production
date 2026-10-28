@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/expiry.rs
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +//! Expiry is a range, not a constant.
 +//!
 +//! ## What you write
@@ -12,6 +12,7 @@
 +/// A deterministic time-to-live for `key`, within `base ± spread`.
 +#[must_use]
 +pub fn ttl_for(base: u64, spread: u64, key: &str) -> u64 {
++    let _ = (base, spread, key);
 +    todo!("hash the key into the band; spread 0 is the base")
 +}
 --- a/src/lib.rs

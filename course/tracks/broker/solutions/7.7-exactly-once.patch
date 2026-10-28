@@ -1,9 +1,10 @@
 --- a/src/exactly_once.rs
 +++ b/src/exactly_once.rs
-@@ -63,5 +63,19 @@
+@@ -63,6 +63,19 @@
  
  /// Apply `[from, to)` of `partition` exactly once, answering how many were new.
  pub fn process(topic: &Topic, sink: &mut Sink, partition: usize, from: u64, to: u64) -> usize {
+-    let _ = (topic, sink, partition, from, to);
 -    todo!("skip what the sink already applied; apply the rest in offset order")
 +    let mut applied = 0;
 +    let end = to.min(topic.end(partition));

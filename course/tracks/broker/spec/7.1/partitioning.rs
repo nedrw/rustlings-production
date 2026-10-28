@@ -70,6 +70,7 @@ fn an_unkeyed_producer_still_spreads_records() {
     }
 }
 
+// Pins given code: `read` answers `None` out of range; the step is `append`.
 #[test]
 fn reading_past_the_end_is_not_a_panic() {
     let topic = Topic::new(2);

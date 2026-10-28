@@ -8,8 +8,6 @@
 // kiln:scaffold:begin
 // kiln:scaffold:end
 
-use std::collections::BTreeMap;
-
 /// A field's type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -44,6 +42,7 @@ pub enum Breaking {
 /// Every breaking difference between two messages, sorted by number.
 #[must_use]
 pub fn wire(old: &[Field], new: &[Field]) -> Vec<Breaking> {
+    let _ = (old, new);
     todo!("by number: removed, or the same number with another type")
 }
 

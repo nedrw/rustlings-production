@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/budget.rs
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,28 @@
 +//! Disruption budgets: how many pods a drain may take, and the one that takes none.
 +//!
 +//! A PodDisruptionBudget is the promise a cluster keeps to a workload during *voluntary* work —
@@ -26,6 +26,7 @@
 +/// How many pods may be evicted at once.
 +#[must_use]
 +pub fn allowed(replicas: u32, budget: Budget) -> u32 {
++    let _ = (replicas, budget);
 +    todo!("both spellings, capped at the replicas, never below zero")
 +}
 --- a/src/lib.rs

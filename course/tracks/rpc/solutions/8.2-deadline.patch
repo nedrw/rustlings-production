@@ -1,9 +1,10 @@
 --- a/src/deadline.rs
 +++ b/src/deadline.rs
-@@ -43,5 +43,14 @@
+@@ -43,6 +43,14 @@
  /// [`Status::DeadlineExceeded`] when `now` is at or past `deadline`, or when a hop needs more than
  /// what is left.
  pub fn call(deadline: u64, now: u64, hops: &[u64]) -> Result<u64, Status> {
+-    let _ = (deadline, now, hops);
 -    todo!("subtract each hop from what is left; a hop that does not fit fails before it runs")
 +    let mut left = remaining(deadline, now)?;
 +    for hop in hops {

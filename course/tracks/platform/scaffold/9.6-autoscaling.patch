@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/autoscaling.rs
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,54 @@
 +//! Autoscaling: fast up, slow down, and a tolerance band that stops the flapping.
 +//!
 +//! The formula is one line — `desired = ceil(current * metric / target)` — and the judgement is the
@@ -26,6 +26,7 @@
 +/// The replica count the formula asks for.
 +#[must_use]
 +pub fn desired(current: u32, metric: u64, target: u64, min: u32, max: u32) -> u32 {
++    let _ = (current, metric, target, min, max);
 +    todo!("the formula with its tolerance band, clamped")
 +}
 +
@@ -50,23 +51,8 @@
 +
 +    /// The count to apply for one window's `decision`.
 +    pub fn observe(&mut self, decision: u32) -> u32 {
-+        if decision > self.current {
-+            // The queue is growing now; a run of low windows is over.
-+            self.current = decision;
-+            self.low_windows = 0;
-+            return self.current;
-+        }
-+        if decision == self.current {
-+            self.low_windows = 0;
-+            return self.current;
-+        }
-+        // Below: a dip is a pause, and a pause is not capacity.
-+        self.low_windows += 1;
-+        if self.low_windows >= self.down_after.max(1) {
-+            self.current = decision;
-+            self.low_windows = 0;
-+        }
-+        self.current
++        let _ = (&self.current, &self.down_after, &self.low_windows, decision);
++        todo!("up immediately; down only after a run of low windows")
 +    }
 +}
 --- a/src/lib.rs

@@ -1,10 +1,16 @@
 --- a/src/oidc.rs
 +++ b/src/oidc.rs
-@@ -51,5 +51,19 @@
+@@ -58,6 +58,24 @@
      audience: &str,
      now: u64,
  ) -> Result<&'a str, ClaimError> {
--    todo!("issuer, audience, not-before, expiry — in that order")
+-    let _ = (claims, issuer, audience, now);
+-    todo!("algorithm, issuer, audience, not-before, expiry — in that order")
++    // Checked first and against the list this service chose: reading `alg` to decide how to verify
++    // is how a token gets to pick its own rules.
++    if claims.algorithm != "RS256" {
++        return Err(ClaimError::UnsupportedAlgorithm);
++    }
 +    if claims.issuer != issuer {
 +        return Err(ClaimError::WrongIssuer);
 +    }

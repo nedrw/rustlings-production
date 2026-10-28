@@ -1,9 +1,10 @@
 --- a/src/assignment.rs
 +++ b/src/assignment.rs
-@@ -15,5 +15,22 @@
+@@ -15,6 +15,22 @@
  /// The partitions each member owns, by member name.
  #[must_use]
  pub fn assign(partitions: usize, members: &[&str]) -> BTreeMap<String, Vec<usize>> {
+-    let _ = (partitions, members);
 -    todo!("sorted members, contiguous ranges, every partition once")
 +    let mut sorted: Vec<&str> = members.to_vec();
 +    sorted.sort_unstable();

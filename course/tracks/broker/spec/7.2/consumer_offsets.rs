@@ -14,6 +14,7 @@ fn topic() -> Topic {
     topic
 }
 
+// Pins given code: `poll` walks a partition in order; the step is `commit`, which the other tests fail on.
 #[test]
 fn polling_returns_the_records_in_order() {
     let topic = topic();
@@ -39,6 +40,7 @@ fn a_committed_consumer_resumes_where_it_stopped() {
     assert_eq!(next.payload, "two");
 }
 
+// Pins the at-least-once baseline: with nothing committed a restart begins at zero — true even before `commit` is written.
 #[test]
 fn uncommitted_progress_is_delivered_again() {
     let topic = topic();
@@ -69,6 +71,7 @@ fn committing_a_partition_the_topic_does_not_have_is_ignored() {
     assert!(consumer.poll(&topic, 9).is_none());
 }
 
+// Pins given code: positions live in the consumer, not the topic.
 #[test]
 fn two_consumers_do_not_share_a_position() {
     let topic = topic();

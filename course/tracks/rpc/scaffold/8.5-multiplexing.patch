@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/multiplex.rs
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,42 @@
 +//! Many streams on one connection: per-stream windows, one shared pump.
 +//!
 +//! One HTTP/2 connection carries every call, and each stream has its own flow-control window. The
@@ -40,6 +40,7 @@
 +
 +/// Send as much as the windows allow, one item per stream per round.
 +pub fn pump(connection: &mut Connection) -> Vec<(usize, String)> {
++    let _ = connection;
 +    todo!("one item per stream per round, until a full round sends nothing")
 +}
 --- a/src/lib.rs

@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/single_flight.rs
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,60 @@
 +//! One filler per key.
 +//!
 +//! When an entry expires under load, every asker that arrives in the same instant sees a miss.
@@ -52,6 +52,7 @@
 +
 +    /// Ask to fill `key`.
 +    pub fn begin(&mut self, key: &str) -> Decision {
++        let _ = key;
 +        todo!("the first asker fills and marks the key; the rest wait")
 +    }
 +

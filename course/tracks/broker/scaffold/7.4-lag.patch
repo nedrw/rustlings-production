@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/lag.rs
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
 +//! Lag: how far each partition's consumer is behind, and which partitions are past the threshold.
 +//!
 +//! ## What you write
@@ -19,6 +19,7 @@
 +/// Lag per partition: the end offset minus the commit, saturating at zero.
 +#[must_use]
 +pub fn lag(topic: &Topic, committed: &BTreeMap<usize, u64>) -> BTreeMap<usize, u64> {
++    let _ = (topic, committed);
 +    todo!("end minus commit, saturating, every partition")
 +}
 +

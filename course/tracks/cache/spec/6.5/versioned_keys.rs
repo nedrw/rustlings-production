@@ -59,12 +59,14 @@ fn another_namespace_is_unaffected() {
     assert_eq!(store.reads(), 2, "bumping one namespace dropped another");
 }
 
+// Pins given code: `version` and `bump` are in the scaffold; the prefix work in `get` is the step.
 #[test]
 fn a_never_bumped_namespace_is_version_zero() {
     let (_, cache) = fixture();
     assert_eq!(cache.version("subscribers"), 0);
 }
 
+// Pins given code: `bump`; a namespace that is never read through `get` still counts its bumps.
 #[test]
 fn the_version_only_moves_forward() {
     let (_, mut cache) = fixture();

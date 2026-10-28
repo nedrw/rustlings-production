@@ -1,9 +1,10 @@
 --- a/src/versioned.rs
 +++ b/src/versioned.rs
-@@ -55,6 +55,19 @@
+@@ -55,7 +55,19 @@
          key: &str,
          now: u64,
      ) -> Option<String> {
+-        let _ = (&self.ttl, store, namespace, key, now);
 -        todo!("derive the entry key from the namespace, its version and the key")
 +        // The version is part of the *cache* key, so a bump renames every entry of the namespace
 +        // without walking the cache. `#` and `:` cannot appear in a namespace or a key, which is

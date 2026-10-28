@@ -1,28 +1,46 @@
 --- a/src/breaker.rs
 +++ b/src/breaker.rs
-@@ -71,11 +71,30 @@
+@@ -75,19 +75,41 @@
  
      /// Where a request at `now` should go.
      pub fn route(&mut self, now: u64) -> Route {
--        todo!("closed and half-open try the cache; an expired open becomes half-open")
+-        let _ = (
+-            &self.threshold,
+-            &self.cooldown,
+-            &self.opened_at,
+-            &self.probe_handed_out,
+-            now,
+-        );
+-        todo!("closed and the one half-open probe use the cache; an expired open becomes half-open")
 +        if self.state == State::Open && now >= self.opened_at + self.cooldown {
-+            // Exactly one probe: the first caller after the cool-down finds the breaker half-open,
-+            // and `record` decides whether the next one does.
 +            self.state = State::HalfOpen;
++            self.probe_handed_out = false;
 +        }
-+        if self.state == State::Open {
-+            Route::Direct
-+        } else {
-+            Route::Cache
++        match self.state {
++            State::Closed => Route::Cache,
++            // Exactly one probe: the first caller after the cool-down takes it, and everybody
++            // behind them goes direct until `record` reports on it.
++            State::HalfOpen if !self.probe_handed_out => {
++                self.probe_handed_out = true;
++                Route::Cache
++            }
++            State::HalfOpen | State::Open => Route::Direct,
 +        }
      }
  
      /// Record how a call went.
      pub fn record(&mut self, ok: bool, now: u64) {
+-        let _ = (ok, now);
 -        todo!("success closes and forgets; a failure may open, and reopens from half-open")
 +        if ok {
 +            self.state = State::Closed;
 +            self.failures = 0;
++            self.probe_handed_out = false;
++            return;
++        }
++        // The cache is not being called while the breaker is open, so a failure there is not the
++        // breaker's business — and moving `opened_at` would push the cool-down away forever.
++        if self.state == State::Open {
 +            return;
 +        }
 +        self.failures += 1;
@@ -30,6 +48,7 @@
 +        if self.state == State::HalfOpen || self.failures >= self.threshold {
 +            self.state = State::Open;
 +            self.opened_at = now;
++            self.probe_handed_out = false;
 +        }
      }
  }

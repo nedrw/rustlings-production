@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/breaker.rs
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,93 @@
 +//! The cache is gone: stop asking it, and come back carefully.
 +//!
 +//! When the cache is down, every request still pays the cache's failure — a timeout, a refused
@@ -11,11 +11,13 @@
 +//!
 +//! ## What you write
 +//!
-+//! * [`Breaker::route`] — [`Route::Cache`] while closed or while half-open (the probe), and
-+//!   [`Route::Direct`] while open; an open breaker moves to half-open once `now` has reached
-+//!   `opened_at + cooldown`.
-+//! * [`Breaker::record`] — `ok` closes the breaker and forgets the failures; a failure counts, and
-+//!   a failure while half-open opens it again for a fresh cool-down.
++//! * [`Breaker::route`] — [`Route::Cache`] while closed, and **once** while half-open: the first
++//!   caller after the cool-down is the probe, and everybody behind it goes direct until the probe
++//!   reports. An open breaker becomes half-open once `now` has reached `opened_at + cooldown`.
++//! * [`Breaker::record`] — `ok` closes the breaker, forgets the failures and resets the probe. A
++//!   failure counts *while the breaker is not open*; a failure while half-open opens it again at
++//!   `now`. A failure recorded while open is ignored: the cache is not being called, and refreshing
++//!   `opened_at` would extend the cool-down forever.
 +
 +/// What the breaker is doing.
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,7 @@
 +    threshold: u32,
 +    cooldown: u64,
 +    opened_at: u64,
++    probe_handed_out: bool,
 +}
 +
 +impl Breaker {
@@ -57,6 +60,7 @@
 +            threshold,
 +            cooldown,
 +            opened_at: 0,
++            probe_handed_out: false,
 +        }
 +    }
 +
@@ -74,11 +78,19 @@
 +
 +    /// Where a request at `now` should go.
 +    pub fn route(&mut self, now: u64) -> Route {
-+        todo!("closed and half-open try the cache; an expired open becomes half-open")
++        let _ = (
++            &self.threshold,
++            &self.cooldown,
++            &self.opened_at,
++            &self.probe_handed_out,
++            now,
++        );
++        todo!("closed and the one half-open probe use the cache; an expired open becomes half-open")
 +    }
 +
 +    /// Record how a call went.
 +    pub fn record(&mut self, ok: bool, now: u64) {
++        let _ = (ok, now);
 +        todo!("success closes and forgets; a failure may open, and reopens from half-open")
 +    }
 +}

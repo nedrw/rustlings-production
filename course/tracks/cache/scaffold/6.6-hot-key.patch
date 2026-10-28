@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/two_level.rs
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +//! Two layers: a short-lived local cache in front of a shared one.
 +//!
 +//! A local cache in each instance is the cheapest read there is — and it multiplies staleness by
@@ -75,6 +75,7 @@
 +
 +    /// Read `key` at `now`, from the first layer that can answer.
 +    pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
++        let _ = (&self.local, &self.shared, &self.shared_ttl, store, key, now);
 +        todo!("local first, then shared, then the store; count who answered")
 +    }
 +}

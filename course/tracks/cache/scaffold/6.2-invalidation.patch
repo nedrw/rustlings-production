@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/invalidation.rs
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,15 @@
 +//! The write path: a value changes in the store, and the cache is told it is no longer true.
 +//!
 +//! ## What you write
@@ -13,6 +13,7 @@
 +
 +/// Write `value` for `key`: the store first, then the cache.
 +pub fn write(store: &mut Store, cache: &mut Cache, key: &str, value: &str) {
++    let _ = (store, cache, key, value);
 +    todo!("write the store first, then drop the cached entry")
 +}
 --- a/src/lib.rs

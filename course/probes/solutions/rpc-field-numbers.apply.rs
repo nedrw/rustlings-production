@@ -51,7 +51,11 @@ pub fn wire(old: &[(u32, Kind)], new: &[(u32, Kind)]) -> Vec<Problem> {
             Some(_) => {}
         }
     }
-    breaking.sort();
+    // Sorted by number: sorting `Problem` itself orders by variant, and a removal would come
+    // before a reuse with a smaller number.
+    breaking.sort_by_key(|breaking| match breaking {
+        Problem::Removed(number) | Problem::Reused(number) => *number,
+    });
     breaking
 }
 
@@ -99,15 +103,13 @@ mod tests {
     }
 
     #[test]
-    fn several_breaks_arrive_sorted() {
+    fn several_breaks_arrive_sorted_by_number() {
         let mut new = base();
         new[0].1 = Kind::Flag;
         new.remove(2);
-        let breaking = wire(&base(), &new);
-        assert_eq!(breaking.len(), 2, "{breaking:?}");
-        assert!(
-            breaking.windows(2).all(|pair| pair[0] <= pair[1]),
-            "{breaking:?}"
+        assert_eq!(
+            wire(&base(), &new),
+            [Problem::Reused(1), Problem::Removed(3)]
         );
     }
 }

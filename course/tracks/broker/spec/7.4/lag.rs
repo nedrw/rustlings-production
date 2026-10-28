@@ -42,12 +42,14 @@ fn a_commit_past_the_end_is_not_negative_lag() {
     assert_eq!(lag[&0], 0, "a commit past the end went below zero");
 }
 
+// Pins given code: `backlog`; the step is `lag`.
 #[test]
 fn the_backlog_is_the_sum_of_the_lags() {
     let lag = BTreeMap::from([(0, 2), (1, 0), (2, 5)]);
     assert_eq!(backlog(&lag), 7);
 }
 
+// Pins given code: `behind`, including its strict bound; the step is `lag`.
 #[test]
 fn behind_lists_only_the_partitions_past_the_threshold() {
     let lag = BTreeMap::from([(0, 2), (1, 5), (2, 6)]);

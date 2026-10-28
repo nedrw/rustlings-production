@@ -1,9 +1,10 @@
 --- a/src/schema.rs
 +++ b/src/schema.rs
-@@ -51,5 +51,21 @@
+@@ -51,6 +51,21 @@
  /// Every breaking difference, sorted.
  #[must_use]
  pub fn compat(old: &BTreeMap<String, Field>, new: &BTreeMap<String, Field>) -> Vec<Breaking> {
+-    let _ = (old, new);
 -    todo!("removed, type-changed, and required-added; sorted")
 +    let mut breaking = Vec::new();
 +    for (name, field) in old {

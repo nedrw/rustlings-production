@@ -29,6 +29,7 @@ fn no_hops_is_the_whole_budget() {
     assert_eq!(call(10, 3, &[]), Ok(7));
 }
 
+// Pins given code: `remaining`; the step is `call`, and its accounting is what the other tests fail on.
 #[test]
 fn remaining_is_an_absolute_deadline_minus_now() {
     assert_eq!(remaining(100, 30), Ok(70));

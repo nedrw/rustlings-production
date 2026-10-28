@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/stream.rs
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,51 @@
 +//! A server stream has a window, not a buffer.
 +//!
 +//! Server streaming looks like "produce the items" and is really "produce as many items as the
@@ -48,6 +48,7 @@
 +
 +    /// The next item if the window allows it.
 +    pub fn send(&mut self) -> Option<String> {
++        let _ = (&self.items, &self.window);
 +        todo!("the next item while the window has room; None when it is full")
 +    }
 +}

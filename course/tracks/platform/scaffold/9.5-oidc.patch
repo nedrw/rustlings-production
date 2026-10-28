@@ -1,19 +1,22 @@
 --- /dev/null
 +++ b/src/oidc.rs
-@@ -0,0 +1,55 @@
-+//! OIDC tokens: four checks, and the one everybody forgets.
+@@ -0,0 +1,63 @@
++//! OIDC tokens: five checks, and the one that makes the rest meaningful.
 +//!
 +//! A token is a bearer credential; validating it is not "parse the claims", it is comparing them
-+//! against what this service accepts. Three checks are famous — issuer, expiry, not-before — and the
-+//! fourth is the one that turns a token minted for *any* client of the provider into a token for
-+//! this one: **the audience**. A service that skips it accepts its neighbours' tokens, which is one
-+//! shared identity provider away from a cross-tenant hole.
++//! against what this service accepts. The first check is not a claim at all: **the algorithm**. A
++//! verifier that trusts the token's own `alg` accepts `none` — no signature at all — which is the
++//! JWT hole that made "trust the header" famous. This service verifies with one algorithm it chose,
++//! and refuses every token that names another.
++//!
++//! Then the claims: issuer, audience, not-before, expiry. The audience is the one everybody forgets
++//! — a token minted for any client of the same provider is valid *somewhere*, and one shared
++//! provider is all it takes.
 +//!
 +//! ## What you write
 +//!
 +//! [`validate`] — the subject when every check passes, else the first failing one, in this order:
-+//! issuer, audience, not-before, expiry. The order is the contract; a token that is both expired
-+//! and for another audience is the wrong audience.
++//! algorithm, issuer, audience, not-before, expiry. The order is the contract.
 +
 +/// The claims this service reads.
 +#[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,11 +31,15 @@
 +    pub expires_at: u64,
 +    /// The first second at which it is valid.
 +    pub not_before: u64,
++    /// The algorithm the token claims.
++    pub algorithm: String,
 +}
 +
 +/// Why a token was refused.
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +pub enum ClaimError {
++    /// The algorithm is not one this service verifies with.
++    UnsupportedAlgorithm,
 +    /// Another provider minted it.
 +    WrongIssuer,
 +    /// It is for another audience.
@@ -47,14 +54,15 @@
 +///
 +/// # Errors
 +///
-+/// See [`ClaimError`]; the checks run issuer, audience, not-before, expiry.
++/// See [`ClaimError`]; the checks run algorithm, issuer, audience, not-before, expiry.
 +pub fn validate<'a>(
 +    claims: &'a Claims,
 +    issuer: &str,
 +    audience: &str,
 +    now: u64,
 +) -> Result<&'a str, ClaimError> {
-+    todo!("issuer, audience, not-before, expiry — in that order")
++    let _ = (claims, issuer, audience, now);
++    todo!("algorithm, issuer, audience, not-before, expiry — in that order")
 +}
 --- a/src/lib.rs
 +++ b/src/lib.rs

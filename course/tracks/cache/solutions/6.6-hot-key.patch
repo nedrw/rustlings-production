@@ -1,9 +1,10 @@
 --- a/src/two_level.rs
 +++ b/src/two_level.rs
-@@ -72,6 +72,29 @@
+@@ -72,7 +72,35 @@
  
      /// Read `key` at `now`, from the first layer that can answer.
      pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
+-        let _ = (&self.local, &self.shared, &self.shared_ttl, store, key, now);
 -        todo!("local first, then shared, then the store; count who answered")
 +        if let Some((value, expires_at)) = self.local.get(key)
 +            && now < *expires_at
@@ -22,7 +23,13 @@
 +                .insert(key.to_owned(), (value.clone(), now + self.local_ttl));
 +            return Some(value);
 +        }
-+        let value = store.get(key)?;
++        // The miss is counted before the store answers: a key it does not have is still a lookup
++        // that neither layer could answer, and the ratio in the next step would be inflated by
++        // leaving those out.
++        let Some(value) = store.get(key) else {
++            self.misses += 1;
++            return None;
++        };
 +        self.misses += 1;
 +        self.local
 +            .insert(key.to_owned(), (value.clone(), now + self.local_ttl));

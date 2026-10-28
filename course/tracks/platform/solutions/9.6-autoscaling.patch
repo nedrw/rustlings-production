@@ -1,24 +1,54 @@
 --- a/src/autoscaling.rs
 +++ b/src/autoscaling.rs
-@@ -23,7 +23,20 @@
+@@ -23,8 +23,24 @@
  /// The replica count the formula asks for.
  #[must_use]
  pub fn desired(current: u32, metric: u64, target: u64, min: u32, max: u32) -> u32 {
+-    let _ = (current, metric, target, min, max);
 -    todo!("the formula with its tolerance band, clamped")
++    // `u32::clamp` panics when `min > max`, and the manifest is caller input: a reversed pair is a
++    // configuration mistake the function survives by taking the two as a range rather than a
++    // promise about which is which.
++    let (floor, ceiling) = if min <= max { (min, max) } else { (max, min) };
 +    if target == 0 {
-+        return current.clamp(min, max);
++        return current.clamp(floor, ceiling);
 +    }
 +    // The band: 90%..=110% of the target keeps the current count. Integer arithmetic, because a
 +    // float comparison here decides whether a cluster flaps.
 +    let low = target.saturating_mul(100 - TOLERANCE_PERCENT);
 +    let high = target.saturating_mul(100 + TOLERANCE_PERCENT);
 +    if metric.saturating_mul(100) >= low && metric.saturating_mul(100) <= high {
-+        return current.clamp(min, max);
++        return current.clamp(floor, ceiling);
 +    }
 +    let product = u64::from(current).saturating_mul(metric);
 +    let wanted = product.div_ceil(target);
 +    let wanted = u32::try_from(wanted).unwrap_or(u32::MAX);
-+    wanted.clamp(min, max)
++    wanted.clamp(floor, ceiling)
  }
  
  /// Scales up at once and down after a run of low windows.
+@@ -48,7 +64,22 @@
+ 
+     /// The count to apply for one window's `decision`.
+     pub fn observe(&mut self, decision: u32) -> u32 {
+-        let _ = (&self.current, &self.down_after, &self.low_windows, decision);
+-        todo!("up immediately; down only after a run of low windows")
++        if decision > self.current {
++            // The queue is growing now; a run of low windows is over.
++            self.current = decision;
++            self.low_windows = 0;
++            return self.current;
++        }
++        if decision == self.current {
++            self.low_windows = 0;
++            return self.current;
++        }
++        // Below: a dip is a pause, and a pause is not capacity.
++        self.low_windows += 1;
++        if self.low_windows >= self.down_after.max(1) {
++            self.current = decision;
++            self.low_windows = 0;
++        }
++        self.current
+     }
+ }

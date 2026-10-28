@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/drill.rs
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,56 @@
 +//! The rollout drill: check an observed rollout against its budgets, step by step.
 +//!
 +//! Between a plan and a production rollout there is a rehearsal: watch the counts move and assert
@@ -54,6 +54,7 @@
 +/// Every violation of the budgets, in step order.
 +#[must_use]
 +pub fn drill(steps: &[Observed]) -> Vec<Violation> {
++    let _ = steps;
 +    todo!("both budgets at every step, in step order")
 +}
 --- a/src/lib.rs

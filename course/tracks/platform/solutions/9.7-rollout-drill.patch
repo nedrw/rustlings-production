@@ -1,9 +1,10 @@
 --- a/src/drill.rs
 +++ b/src/drill.rs
-@@ -51,5 +51,23 @@
+@@ -51,6 +51,26 @@
  /// Every violation of the budgets, in step order.
  #[must_use]
  pub fn drill(steps: &[Observed]) -> Vec<Violation> {
+-    let _ = steps;
 -    todo!("both budgets at every step, in step order")
 +    let mut violations = Vec::new();
 +    for (step, observed) in steps.iter().enumerate() {
@@ -22,6 +23,9 @@
 +            });
 +        }
 +    }
-+    violations.sort();
++    // No sort: the loop already visits the steps in order, and sorting the violations themselves
++    // would group every ceiling before every floor — a step-1 ceiling would come before a step-0
++    // floor. Within one step the ceiling is reported before the floor, which is the order the
++    // checks run in.
 +    violations
  }

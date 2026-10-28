@@ -103,6 +103,7 @@ impl Cache {
     ///
     /// A key the store does not have is not cached.
     pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
+        let _ = (&self.ttl, store, key, now);
         todo!("a valid entry is a hit; otherwise fill from the store")
     }
 }

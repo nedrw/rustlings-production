@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/ordering.rs
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,21 @@
 +//! Where the ordering requirement goes: one key per group, and nothing to order, no group.
 +//!
 +//! There is no global order across a topic's partitions. What a course can teach instead is the
@@ -19,6 +19,7 @@
 +/// A key per event (`event -> key`).
 +#[must_use]
 +pub fn plan(events: &[&str], must_order: &[(&str, &str)]) -> BTreeMap<String, String> {
++    let _ = (events, must_order);
 +    todo!("one key per connected group of the must-be-ordered graph")
 +}
 --- a/src/lib.rs

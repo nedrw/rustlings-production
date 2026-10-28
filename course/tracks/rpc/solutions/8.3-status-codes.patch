@@ -1,9 +1,10 @@
 --- a/src/status.rs
 +++ b/src/status.rs
-@@ -55,11 +55,21 @@
+@@ -55,13 +55,21 @@
  /// The canonical code for `failure`.
  #[must_use]
  pub fn code_for(failure: Failure) -> Code {
+-    let _ = failure;
 -    todo!("the canonical code for each internal failure")
 +    match failure {
 +        Failure::BadRequest => Code::InvalidArgument,
@@ -18,6 +19,7 @@
  /// Whether a client may retry this code.
  #[must_use]
  pub fn retryable(code: Code) -> bool {
+-    let _ = code;
 -    todo!("retry the transient codes, never the caller's mistakes or the server's bug")
 +    matches!(
 +        code,

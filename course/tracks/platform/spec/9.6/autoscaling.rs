@@ -29,6 +29,14 @@ fn the_answer_is_clamped_to_the_bounds() {
 }
 
 #[test]
+fn a_reversed_bound_is_not_a_panic() {
+    // `min > max` is a configuration mistake; the function treats the two as the range they are.
+    assert_eq!(desired(3, 200, 100, 10, 5), 6);
+    assert_eq!(desired(3, 1_000, 100, 10, 5), 10);
+    assert_eq!(desired(1, 1, 100, 10, 5), 5);
+}
+
+#[test]
 fn a_target_of_zero_keeps_the_current_count() {
     assert_eq!(desired(3, 200, 0, 1, 10), 3);
 }

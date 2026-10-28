@@ -57,6 +57,19 @@ fn after_both_ttls_the_store_answers_again() {
 }
 
 #[test]
+fn a_key_the_store_does_not_have_is_still_a_miss() {
+    let (mut store, mut cache) = fixture();
+    assert_eq!(cache.get(&mut store, "absent", 0), None);
+    assert_eq!(
+        cache.misses(),
+        1,
+        "a miss that found nothing was not counted"
+    );
+    assert_eq!(store.reads(), 1);
+}
+
+// Pins given code: `staleness_budget`; the step is `get`, and its counters are what the other tests read.
+#[test]
 fn the_staleness_budget_is_the_local_ttl() {
     let (_, cache) = fixture();
     assert_eq!(cache.staleness_budget(), 3);

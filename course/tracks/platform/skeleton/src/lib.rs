@@ -33,6 +33,7 @@ pub enum Finding {
 /// Every problem with `probes`, sorted.
 #[must_use]
 pub fn audit(probes: Probes) -> Vec<Finding> {
+    let _ = probes;
     todo!("liveness must be about the process; readiness must be about serving")
 }
 
