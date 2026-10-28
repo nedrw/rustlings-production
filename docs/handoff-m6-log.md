@@ -439,3 +439,20 @@ operate 槽位不强制出题；脚手架零警告没有机器检查（`selftest
 `i18n status` 148/148、结构 0 error、漂移 0；`links` 327 页 1202 链接 387 外部目标、0 findings；
 `site --check` 317 页；`probe --check` 127/127、覆盖 99/99；`selftest` cache 8/8、broker 9/9、rpc 5/5、
 platform 7/7；四 track 的 `rebuild-patches --check` 全部 identical；脚手架警告复测 0/29。
+
+## 段 15：评审修复后的全量 CI（2026-10-29）
+
+评审修复落在三个提交上——`e0b65b5`（T6–T9 的代码缺陷、零警告脚手架、规格的给定代码注解）、`27b4539`
+（capstone 的编译器级 unsafe 检查与退出码）、`a8bef9d`（计数与文档）——然后在 `a8bef9d` 上跑全量
+`cargo xtask ci`。
+
+**结果：`xtask ci: all checks passed`，退出 0，九条 track 148/148**（22 + 24 + 27 + 24 + 22 + 8 + 9 + 5 + 7），
+本机 02:50 → 05:09，约 **2 小时 20 分**（离线、复用 land 的 `target/`）。比上次的 1 小时 33 分长了近
+一小时：这次 jobq（约 30 分钟）与 lakelet（约 50 分钟，soak 与 mutants 为主）是耗时大头，说明全量 CI 的
+时长主要由慢闸门的排队决定，不随 track 数线性增长。
+
+它覆盖的与内容层检查互不替代的部分：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets
+-D warnings`、`cargo test --workspace`（383 + 21 + 1 + 1 + 1）、`spec-integrity`（四份重钉过的 manifest
+在这里被核）、`patches_check`（九条 track 的补丁链 + 工具自检）、`format_course_rust`（127 道探题）、
+`lint-caps`、`links`、`probe --check`（127/127、99/99）、`site --check`（317 页）、九条 track 的
+`selftest`。
