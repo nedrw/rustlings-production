@@ -392,6 +392,12 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 交付物一览与实测数字在 [t2-relay.md](t2-relay.md)，机制、命令与继续往下做的约定在
 [handoff-m1.md](handoff-m1.md)。
 
+**M5 已交付**（2026-10）：四件事全部落地——中文全量翻译（119/119，`i18n status` 结构 0 error、
+漂移 0 warning，词表 133 条）；`kiln new-track` 生成器与 [new-track.md](new-track.md) 指南，并按本表的
+验收标准跑过一遍（三步玩具 track → `3/3 step(s) hold the contract`）；`kiln site` 文档站（251 页、
+两种语言、`site --check` 进 CI，检查生成页面的每个站内链接）；[maintenance.md](maintenance.md) 年度
+维护流程（什么会烂、谁先叫、修在哪）。过程与实测数字在 [handoff-m5-log.md](handoff-m5-log.md)。
+
 顺序上的硬约束：**M0 必须先出 T1 的 22 步真实内容，再补框架功能**。
 反面教材是「先写完美框架、内容放最后」——判据格式只有写真题时才能定型，而 T1 正好同时也是框架的压力测试。
 

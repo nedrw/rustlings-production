@@ -17,6 +17,8 @@ kiln plan     # the path ahead; --fast marks the steps a passed probe has alread
 kiln skip     # skip such a step (recorded as `»`, never counted as done)
 kiln probe    # re-check one capability with a 3–10 minute exercise
 kiln review   # what you have proven per capability, and what is going stale (--due)
+kiln site     # render the course as a static site, every authored locale
+kiln new-track # lay the mechanical half of a new track (docs/new-track.md)
 ```
 
 Every step = a short brief (WHY / TASK / DONE WHEN / TRAP / FURTHER) + read-only spec tests + a set of
@@ -82,6 +84,14 @@ acceptance ran green on this tree: the offline fast path 24/24, `kiln verify lak
 `{passed: 24, failed: 0, clean: true}`, all six acceptance drills, and `cargo xtask ci` exit 0 —
 see [docs/handoff-m3.md](docs/handoff-m3.md) §4 for the numbers and
 [docs/t4-lakelet.md](docs/t4-lakelet.md) for what T4 delivers.
+
+**M5 is delivered.** The course reads in Chinese (119/119 bodies, `kiln i18n status` — structure 0
+errors, drift 0 warnings, 133 glossary terms), `kiln new-track` plus [docs/new-track.md](docs/new-track.md)
+were verified the way the plan asks — a three-step toy track built with the guide reaches
+`3/3 step(s) hold the contract` — `kiln site` publishes the whole course (251 pages in two locales,
+every link checked by `site --check`, which `cargo xtask ci` runs), and
+[docs/maintenance.md](docs/maintenance.md) is the annual pass. What changed, what it cost and what
+the acceptance run found: [docs/handoff-m5-log.md](docs/handoff-m5-log.md).
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
 (`bf9ac5f`) with a clean build cache; the T1-only numbers are kept from the M0 tree (`62e7c5c`,
