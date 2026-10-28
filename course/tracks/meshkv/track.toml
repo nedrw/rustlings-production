@@ -16,6 +16,7 @@ id = "meshkv"
 index = 5
 title = "Meshkv — distributed KV / scheduler"
 
+
 requires_track = "jobq"
 
 # The learner's workspace for this track.
@@ -30,6 +31,10 @@ exit = [
     "api/library-reuse@design",
     "dist/consistency-audit@operate",
 ]
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Meshkv —— 分布式 KV / 调度器"
 
 [[step]]
 id = "5.1-multi-node-topology"

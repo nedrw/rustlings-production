@@ -1,0 +1,37 @@
+# The CLI and site text this course speaks in Chinese (authoring.md §8.1).
+#
+# English lives in the code that prints it; this file overrides the keys a translator chose to
+# translate. A key that is missing keeps its English text, so a partial catalogue is never an
+# error — and adding a language is still "add a directory, change no code".
+locale = "zh-Hans"
+
+[string]
+# The two messages `kiln` prints around a track (course.toml holds the English source).
+welcome = """
+欢迎来到 rustlings-production。
+
+kiln 一次只判一步。`kiln list` 告诉你走到哪了，`kiln run` 跑当前这一步的规格测试，
+`kiln check` 跑它的生产闸门，`kiln hint` 在你卡住的时候给一句提示。
+
+每一步都发生在 `app/<track>` 下的一个真实项目里：你接手的是一个已经能编译的服务，规格会告诉
+你它接下来必须做到什么。
+"""
+
+final_message = """
+T1 `mailer` 完成了：一个会启动、会迁移、会发信、会重试、会排干、会上线的服务。
+
+剩下的课程建立在你已经养成的生产习惯之上。T2 `relay` 在一个自己的项目里继续：
+`kiln list relay` 看它走到哪，`kiln plan relay` 看还剩什么，`kiln review --due` 看开工前
+值得再确认一遍的东西。
+"""
+
+# The documentation site's furniture (`kiln site`).
+"site.tracks" = "课程"
+"site.picker" = "选择课程语言。"
+"site.search" = "搜索…"
+"site.unit" = "步"
+"site.project" = "项目"
+"site.minutes" = "分钟"
+"site.fallback" = "这一步还没有 <code>{locale}</code> 的正文——本页是 <code>{found}</code>。"
+"site.source_note" = "英文原文——这段文字的译文还没有"
+"site.footer" = "由 <code>kiln site</code> 渲染 · <a href=\"https://github.com/nedrw/rustlings-production\">源码</a>"

@@ -28,6 +28,7 @@ id = "jobq"
 index = 3
 title = "Jobq — a job queue engine (library, worker, CLI)"
 
+
 # The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
 project = "app/jobq"
 
@@ -47,6 +48,10 @@ exit = [
 # --------------------------------------------------------------------------------------------
 # Phase A — the engine and its contract (3.1-3.4): a library someone else can depend on.
 # --------------------------------------------------------------------------------------------
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Jobq —— 作业队列引擎（库、worker、CLI）"
 
 [[step]]
 id = "3.1-engine-boundary"

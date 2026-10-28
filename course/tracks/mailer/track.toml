@@ -19,6 +19,7 @@ id = "mailer"
 index = 1
 title = "Mailer — subscription microservice"
 
+
 # The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
 project = "app/mailer"
 
@@ -35,6 +36,10 @@ exit = [
 # ---------------------------------------------------------------------------------------
 # Phase A — skeleton and toolchain (1.1-1.6): a service that starts, logs, and fails well.
 # ---------------------------------------------------------------------------------------
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Mailer —— 订阅微服务"
 
 [[step]]
 id = "1.1-workspace"

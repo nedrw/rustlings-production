@@ -32,6 +32,7 @@ id = "lakelet"
 index = 4
 title = "Lakelet — a telemetry store with a query engine"
 
+
 # The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6), and it
 # has no database: the point of T4 is the store the project builds itself (WAL, segments, compaction).
 project = "app/lakelet"
@@ -55,6 +56,10 @@ exit = [
 # --------------------------------------------------------------------------------------------
 # Phase A — the ingest protocol, its edges, and the write path (4.1-4.4).
 # --------------------------------------------------------------------------------------------
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Lakelet —— 遥测存储与查询引擎"
 
 [[step]]
 id = "4.1-ingest-protocol"

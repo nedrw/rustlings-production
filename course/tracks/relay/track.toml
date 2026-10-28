@@ -21,6 +21,7 @@ id = "relay"
 index = 2
 title = "Relay — webhook delivery service"
 
+
 # The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
 project = "app/relay"
 
@@ -38,6 +39,10 @@ exit = [
 # Phase A — the service and its boundaries (2.1-2.6): a multi-tenant ingest path that keeps
 # what it accepted, at least once.
 # ---------------------------------------------------------------------------------------
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Relay —— webhook 投递服务"
 
 [[step]]
 id = "2.1-project-skeleton"
