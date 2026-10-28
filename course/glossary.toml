@@ -488,3 +488,22 @@ zh-Hans = "调度器"
 
 [terms."quota"]
 zh-Hans = "配额"
+
+# --- T6 `cache` --------------------------------------------------------------------------------
+
+[terms."cache"]
+zh-Hans = "缓存"
+note = "the layer, not the CPU cache: `Cache` the type, 缓存 the concept"
+
+[terms."invalidation"]
+zh-Hans = "失效"
+note = "the write path's job: take the knowledge away, do not update it"
+
+[terms."TTL"]
+zh-Hans = "存活时间"
+zh-Hans-also = ["TTL"]
+note = "time to live; the code and the tests keep `ttl`"
+
+[terms."thundering herd"]
+zh-Hans = "惊群"
+note = "many askers filling one expired key at once"

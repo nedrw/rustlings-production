@@ -1,0 +1,26 @@
+--- /dev/null
++++ b/src/expiry.rs
+@@ -0,0 +1,13 @@
++//! Expiry is a range, not a constant.
++//!
++//! ## What you write
++//!
++//! [`ttl_for`] — a time-to-live for `key` inside `base ± spread`, decided by the key itself:
++//! the same key always gets the same value, and keys that share a base do not all expire in the
++//! same second. A spread of zero means the base, exactly.
++
++/// A deterministic time-to-live for `key`, within `base ± spread`.
++#[must_use]
++pub fn ttl_for(base: u64, spread: u64, key: &str) -> u64 {
++    todo!("hash the key into the band; spread 0 is the base")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod expiry;
+ pub mod invalidation;
+ pub mod single_flight;
+ // kiln:scaffold:end

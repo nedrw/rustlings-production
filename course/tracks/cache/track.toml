@@ -1,0 +1,124 @@
+# T6 `cache` — a read cache in front of a slow store (4 steps), see `docs/curriculum.md` §11.
+#
+# Conventions: see the header of `mailer/track.toml`; they are the same for every track.
+#
+# The project is a library with a thin binary. The clock is a parameter of every API here, so each
+# expiry rule is a deterministic test; `Store` counts its reads, so "the cache served this" is an
+# assertion rather than a feeling.
+
+format_version = 1
+id = "cache"
+index = 6
+title = "Cache — a read cache in front of a slow store"
+
+# The learner's workspace for this track. Each track is its own cargo workspace (plan §3 D6).
+project = "app/cache"
+
+# Exit capabilities (curriculum.md §5): whatever else happens, these are established here.
+exit = [
+    "cache/read-through@apply",
+    "cache/single-flight@apply",
+]
+
+# The track name in other languages; the source title above stays the fallback.
+[localized_titles]
+zh-Hans = "Cache —— 挡在慢存储前面的读缓存"
+
+[[step]]
+id = "6.1-read-through"
+title = "A hit does not touch the store, and an entry is not valid forever"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.1-read-through.md"
+time_hint = "60m"
+concepts = ["cache aside", "time to live", "store read count"]
+teaches = ["cache/read-through@apply"]
+requires = []
+run = { cmd = "cargo test -p cache --test spec_read_through" }
+spec = ["spec/6.1/read_through.rs"]
+scaffold = "skeleton"
+solution = "solutions/6.1-read-through.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+]
+
+[[step]]
+id = "6.2-invalidation"
+title = "A write invalidates the cache instead of updating it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.2-invalidation.md"
+time_hint = "60m"
+concepts = ["write then invalidate", "stale read", "cache aside write path"]
+teaches = ["cache/invalidation@apply"]
+requires = ["db/transactions@apply"]
+run = { cmd = "cargo test -p cache --test spec_invalidation" }
+spec = ["spec/6.2/invalidation.rs"]
+scaffold = "scaffold/6.2-invalidation.patch"
+solution = "solutions/6.2-invalidation.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+]
+
+[[step]]
+id = "6.3-single-flight"
+title = "One filler per key, however many askers arrive"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.3-single-flight.md"
+time_hint = "60m"
+concepts = ["single flight", "in-flight marker", "thundering herd"]
+teaches = ["cache/single-flight@apply"]
+requires = ["async/backpressure@apply"]
+run = { cmd = "cargo test -p cache --test spec_single_flight" }
+spec = ["spec/6.3/single_flight.rs"]
+scaffold = "scaffold/6.3-single-flight.patch"
+solution = "solutions/6.3-single-flight.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "6.4-expiry-jitter"
+title = "Expiry is a range, not a constant"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.4-expiry-jitter.md"
+time_hint = "45m"
+concepts = ["ttl jitter", "cache avalanche", "deterministic spread"]
+teaches = ["cache/expiry-jitter@apply"]
+requires = ["time/clock-injection@apply"]
+run = { cmd = "cargo test -p cache --test spec_expiry_jitter" }
+spec = ["spec/6.4/expiry_jitter.rs"]
+scaffold = "scaffold/6.4-expiry-jitter.patch"
+solution = "solutions/6.4-expiry-jitter.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]

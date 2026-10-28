@@ -1,0 +1,27 @@
+--- /dev/null
++++ b/src/invalidation.rs
+@@ -0,0 +1,14 @@
++//! The write path: a value changes in the store, and the cache is told it is no longer true.
++//!
++//! ## What you write
++//!
++//! [`write`] — put the new value in the store, then drop whatever the cache holds for that key.
++//! The order is the whole exercise: a cache updated before the store can serve a value the store
++//! never had, and a cache updated *instead of* being invalidated keeps serving the old one.
++
++use crate::{Cache, Store};
++
++/// Write `value` for `key`: the store first, then the cache.
++pub fn write(store: &mut Store, cache: &mut Cache, key: &str, value: &str) {
++    todo!("write the store first, then drop the cached entry")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod invalidation;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;

@@ -1,0 +1,13 @@
+--- a/src/invalidation.rs
++++ b/src/invalidation.rs
+@@ -10,5 +10,9 @@
+ 
+ /// Write `value` for `key`: the store first, then the cache.
+ pub fn write(store: &mut Store, cache: &mut Cache, key: &str, value: &str) {
+-    todo!("write the store first, then drop the cached entry")
++    // Store first: if the process dies between the two, the cache still holds a value the store
++    // has moved past, and the entry expires. The other order leaves the store *behind* the cache,
++    // and nothing expires a store.
++    store.put(key, value);
++    cache.remove(key);
+ }

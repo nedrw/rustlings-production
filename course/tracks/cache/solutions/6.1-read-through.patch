@@ -1,0 +1,26 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -103,7 +103,22 @@
+     ///
+     /// A key the store does not have is not cached.
+     pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
+-        todo!("a valid entry is a hit; otherwise fill from the store")
++        if let Some(entry) = self.entries.get(key)
++            && now < entry.expires_at
++        {
++            return Some(entry.value.clone());
++        }
++        // A miss (or an expired entry) is filled from the store. A key the store does not have is
++        // *not* cached: a negative entry would outlive the row somebody is about to insert.
++        let value = store.get(key)?;
++        self.entries.insert(
++            key.to_owned(),
++            Entry {
++                value: value.clone(),
++                expires_at: now + self.ttl,
++            },
++        );
++        Some(value)
+     }
+ }
+ 

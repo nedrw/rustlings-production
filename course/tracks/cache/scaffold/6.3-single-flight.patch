@@ -1,0 +1,72 @@
+--- /dev/null
++++ b/src/single_flight.rs
+@@ -0,0 +1,59 @@
++//! One filler per key.
++//!
++//! When an entry expires under load, every asker that arrives in the same instant sees a miss.
++//! Without a marker, they all fill — the thundering herd the cache was supposed to prevent. The
++//! marker is a set of keys somebody is already filling: the first asker fills, the rest wait.
++//!
++//! ## What you write
++//!
++//! [`InFlight::begin`] — [`Decision::Fill`] when this key is not being filled, and the key is now
++//! marked; [`Decision::Wait`] when it is, and the key stays marked exactly once.
++//!
++//! [`InFlight::complete`] is given: it removes the marker and answers whether one was there.
++
++use std::collections::BTreeSet;
++
++/// What an asker should do.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Decision {
++    /// This asker fills the entry.
++    Fill,
++    /// Somebody else is filling it; wait for the result.
++    Wait,
++}
++
++/// The keys somebody is filling right now.
++#[derive(Debug, Default)]
++pub struct InFlight {
++    filling: BTreeSet<String>,
++}
++
++impl InFlight {
++    /// Nothing in flight.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// How many keys are being filled.
++    #[must_use]
++    pub fn len(&self) -> usize {
++        self.filling.len()
++    }
++
++    /// `true` when nothing is being filled.
++    #[must_use]
++    pub fn is_empty(&self) -> bool {
++        self.filling.is_empty()
++    }
++
++    /// Ask to fill `key`.
++    pub fn begin(&mut self, key: &str) -> Decision {
++        todo!("the first asker fills and marks the key; the rest wait")
++    }
++
++    /// A fill finished. `true` when the key was marked.
++    pub fn complete(&mut self, key: &str) -> bool {
++        self.filling.remove(key)
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,6 +9,7 @@
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
+ pub mod invalidation;
++pub mod single_flight;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;
