@@ -119,6 +119,15 @@ impl Ui {
         self.strings.is_empty()
     }
 
+    /// `true` when the catalogue overrides `key`.
+    ///
+    /// The difference between "this locale has no text for the key" and "this locale's text is
+    /// the English one" only matters where a reader is told which of the two they are reading.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        self.strings.contains_key(key)
+    }
+
     /// Override for `key`, or the English text the caller passes as the fallback.
     #[must_use]
     pub fn text<'a>(&'a self, key: &str, english: &'a str) -> &'a str {

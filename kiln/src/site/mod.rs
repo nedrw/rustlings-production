@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::error::{KilnError, Result};
+use crate::i18n::ui::Ui;
 use crate::i18n::{self, Locale, StepDoc};
 use crate::info::{Course, Step, Track};
 
@@ -146,7 +147,9 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
 
     let mut index: Vec<SearchEntry> = Vec::new();
     for locale in locales {
+        let catalogue = Ui::load(&course.dir(), locale, source)?;
         let home = Page {
+            ui: &catalogue,
             locale: Some(locale),
             below: "index.html",
             depth: 1,
@@ -162,11 +165,12 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
         for track in course.tracks() {
             let track_below = format!("{}/index.html", track.id);
             let track_page = Page {
+                ui: &catalogue,
                 locale: Some(locale),
                 below: &track_below,
                 depth: 2,
                 locales,
-                title: &track.title,
+                title: track.title_in(locale.as_str()),
             };
             write_file(
                 &out.join(locale.as_str()).join(&track.id).join("index.html"),
@@ -181,11 +185,12 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
                     title: title.clone(),
                     url: format!("{}/{}/{}.html", locale.as_str(), track.id, step.id),
                     track: track.id.clone(),
-                    step: step.id.clone(),
+                    step: format!("{}/{}", track.id, step.id),
                     text: excerpt(&body.text),
                 });
                 let step_below = format!("{}/{}.html", track.id, step.id);
                 let page = Page {
+                    ui: &catalogue,
                     locale: Some(locale),
                     below: &step_below,
                     depth: 2,
@@ -207,7 +212,9 @@ fn write_site(course: &Course, locales: &[Locale], source: &Locale, out: &Path) 
         }
     }
 
+    let source_catalogue = Ui::load(&course.dir(), source, source)?;
     let picker = Page {
+        ui: &source_catalogue,
         locale: None,
         below: "index.html",
         depth: 0,
@@ -335,8 +342,38 @@ struct SearchEntry {
     text: String,
 }
 
+/// The site's own words — labels and sentences, not course content.
+///
+/// They live where the CLI's words live: English in the code, overrides in
+/// `course/locales/<locale>/ui.toml` (`i18n::ui::Ui`, authoring.md §8.1). A locale that translates
+/// nothing still gets every page; it simply reads its furniture in English. Two keys are HTML
+/// fragments rather than text — `site.fallback` and `site.footer` — because they wrap a locale tag
+/// and a link.
+const DEFAULT_TRACKS: &str = "Tracks";
+const DEFAULT_PICKER: &str = "Choose a language for the course.";
+const DEFAULT_SEARCH: &str = "search…";
+const DEFAULT_UNIT: &str = "step(s)";
+const DEFAULT_PROJECT: &str = "project";
+const DEFAULT_FALLBACK: &str =
+    "no <code>{locale}</code> body for this step yet — this page is in <code>{found}</code>.";
+const DEFAULT_SOURCE_NOTE: &str = "in English — the only locale this text is written in";
+const DEFAULT_MINUTES: &str = "min";
+const DEFAULT_FOOTER: &str = "rendered by <code>kiln site</code> · \
+                              <a href=\"https://github.com/nedrw/rustlings-production\">source</a>";
+
+/// A language's name as its own speakers write it, for the picker.
+fn language_name(locale: &Locale) -> String {
+    match locale.as_str() {
+        "en" => "English".to_owned(),
+        "zh-Hans" => "中文（简体）".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// One page's position in the site: what it links to and what it is called.
 struct Page<'a> {
+    /// The locale's UI catalogue: the site's labels and the manifest's messages.
+    ui: &'a Ui,
     /// Locale the page is in, or `None` for the locale picker at the site root.
     locale: Option<&'a Locale>,
     /// Path below the locale directory (`mailer/1.1-workspace.html`) or `index.html`.
@@ -364,6 +401,7 @@ impl Page<'_> {
 
     /// Wrap a body in the header, the switcher and the search box.
     fn layout(&self, body: &str) -> String {
+        let ui = self.ui;
         let root = self.root();
         let css = format!("{root}assets/style.css");
         let search = format!("{root}assets/search.js");
@@ -397,15 +435,16 @@ impl Page<'_> {
             }
         }
         html.push_str(
-            "</nav>\n<div class=\"search\"><input id=\"q\" type=\"search\" \
-                       placeholder=\"search…\" autocomplete=\"off\" data-index=\"",
+            "</nav>\n<div class=\"search\"><input id=\"q\" type=\"search\" placeholder=\"",
         );
+        html.push_str(&render::escape(ui.text("site.search", DEFAULT_SEARCH)));
+        html.push_str("\" autocomplete=\"off\" data-index=\"");
         html.push_str(&index);
         html.push_str("\"><ol id=\"results\" hidden></ol></div>\n</header>\n<main>\n");
         html.push_str(body);
-        html.push_str("</main>\n<footer><p>rendered by <code>kiln site</code> · \
-                       <a href=\"https://github.com/nedrw/rustlings-production\">source</a></p></footer>\n\
-                       <script src=\"");
+        html.push_str("</main>\n<footer><p>");
+        html.push_str(ui.text("site.footer", DEFAULT_FOOTER));
+        html.push_str("</p></footer>\n<script src=\"");
         html.push_str(&search);
         html.push_str("\"></script>\n</body>\n</html>\n");
         html
@@ -413,13 +452,19 @@ impl Page<'_> {
 
     /// The site root: one link per locale.
     fn picker(&self) -> String {
+        let ui = self.ui;
         let mut body = String::from("<h1>rustlings-production</h1>\n");
-        body.push_str("<p>Choose a language for the course.</p>\n<ul class=\"cards\">\n");
+        let _ = writeln!(
+            body,
+            "<p>{}</p>\n<ul class=\"cards\">",
+            render::escape(ui.text("site.picker", DEFAULT_PICKER))
+        );
         for locale in self.locales {
             let _ = writeln!(
                 body,
-                "<li><a href=\"{}/index.html\">{}</a></li>",
+                "<li><a href=\"{}/index.html\">{}</a><span class=\"meta\">{}</span></li>",
                 locale.as_str(),
+                render::escape(&language_name(locale)),
                 locale.as_str()
             );
         }
@@ -429,28 +474,38 @@ impl Page<'_> {
 
     /// A locale's home page: the welcome text and the tracks.
     fn home(&self, course: &Course, source: &Locale) -> String {
+        let ui = self.ui;
         let manifest = course.manifest();
         let mut body = String::from("<h1>rustlings-production</h1>\n");
-        if self.locale == Some(source) {
-            body.push_str(&paragraphs(&manifest.welcome));
-        } else {
+        let welcome = ui.welcome(manifest);
+        // The note is for a reader whose locale has no text of its own — not for the source page.
+        if !ui.has("welcome") && self.locale != Some(source) {
             let _ = writeln!(
                 body,
-                "<details><summary>welcoming note (in English — the only locale it is written \
-                 in)</summary>\n{}</details>",
-                paragraphs(&manifest.welcome)
+                "<p class=\"meta\">{}</p>",
+                render::escape(ui.text("site.source_note", DEFAULT_SOURCE_NOTE))
             );
         }
-        body.push_str("<h2>Tracks</h2>\n<ul class=\"cards\">\n");
+        body.push_str(&paragraphs(welcome));
+        let _ = writeln!(
+            body,
+            "<h2>{}</h2>\n<ul class=\"cards\">",
+            render::escape(ui.text("site.tracks", DEFAULT_TRACKS))
+        );
         for track in course.tracks() {
             let steps = track.step.len();
+            let title = self.locale.map_or(track.title.as_str(), |locale| {
+                track.title_in(locale.as_str())
+            });
             let _ = writeln!(
                 body,
                 "<li><a href=\"{}/index.html\">{}</a><span class=\"meta\">T{} · {steps} \
-                 step(s) · {}</span></li>",
+                 {} · {} <code>{}</code></span></li>",
                 track.id,
-                render::escape(&track.title),
+                render::escape(title),
                 track.index,
+                render::escape(ui.text("site.unit", DEFAULT_UNIT)),
+                render::escape(ui.text("site.project", DEFAULT_PROJECT)),
                 render::escape(&track.project)
             );
         }
@@ -460,12 +515,16 @@ impl Page<'_> {
 
     /// A track's page: every step, in order, with the title the reader's locale gives it.
     fn overview(&self, track: &Track, locale: &Locale, source: &Locale, course: &Course) -> String {
-        let mut body = format!("<h1>{}</h1>\n", render::escape(&track.title));
+        let ui = self.ui;
+        let title = track.title_in(locale.as_str());
+        let mut body = format!("<h1>{}</h1>\n", render::escape(title));
         let _ = writeln!(
             body,
-            "<p class=\"meta\">T{} · {} step(s) · project <code>{}</code></p>",
+            "<p class=\"meta\">T{} · {} {} · {} <code>{}</code></p>",
             track.index,
             track.step.len(),
+            render::escape(ui.text("site.unit", DEFAULT_UNIT)),
+            render::escape(ui.text("site.project", DEFAULT_PROJECT)),
             render::escape(&track.project)
         );
         body.push_str("<ol class=\"steps\">\n");
@@ -479,7 +538,7 @@ impl Page<'_> {
                 "<li><a href=\"{}.html\">{}</a><span class=\"meta\">{}</span></li>",
                 step.id,
                 render::escape(&title),
-                render::escape(&step.time_hint)
+                render::escape(&time_hint(ui, &step.time_hint))
             );
         }
         body.push_str("</ol>\n");
@@ -498,24 +557,25 @@ impl Page<'_> {
         previous: Option<&Step>,
         next: Option<&Step>,
     ) -> String {
+        let ui = self.ui;
         let mut html = String::new();
         let _ = writeln!(
             html,
             "<nav class=\"crumbs\"><a href=\"index.html\">{}</a> / {}</nav>",
-            render::escape(&track.title),
+            render::escape(track.title_in(locale.as_str())),
             render::escape(&step.id)
         );
         if body.front_matter.locale.as_deref() != Some(locale.as_str()) && *locale != *source {
-            let _ = writeln!(
-                html,
-                "<p class=\"fallback\">no <code>{}</code> body for this step yet — this page is \
-                 in <code>{}</code>.</p>",
-                locale.as_str(),
-                body.front_matter
-                    .locale
-                    .as_deref()
-                    .unwrap_or(source.as_str())
-            );
+            let found = body
+                .front_matter
+                .locale
+                .as_deref()
+                .unwrap_or(source.as_str());
+            let sentence = ui
+                .text("site.fallback", DEFAULT_FALLBACK)
+                .replace("{locale}", &render::escape(locale.as_str()))
+                .replace("{found}", &render::escape(found));
+            let _ = writeln!(html, "<p class=\"fallback\">{sentence}</p>");
         }
         html.push_str("<article>\n");
         html.push_str(&render::markdown(&body.text));
@@ -547,14 +607,26 @@ impl Page<'_> {
     }
 }
 
-/// Turn a plain-text manifest block into paragraphs.
+/// `60m` in the reader's language: `60 分钟` or `60 min`. Anything that is not `<number>m` is
+/// shown as authored — the hint is metadata, and the site does not invent a unit for it.
+fn time_hint(ui: &Ui, hint: &str) -> String {
+    let Some(minutes) = hint.strip_suffix('m') else {
+        return hint.to_owned();
+    };
+    if minutes.is_empty() || !minutes.bytes().all(|byte| byte.is_ascii_digit()) {
+        return hint.to_owned();
+    }
+    format!("{minutes} {}", ui.text("site.minutes", DEFAULT_MINUTES))
+}
+
+/// Turn a plain-text manifest block into paragraphs, with its `code spans` marked up.
 fn paragraphs(text: &str) -> String {
     let mut html = String::new();
     let mut block: Vec<&str> = Vec::new();
     for line in text.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
             if !block.is_empty() {
-                let _ = writeln!(html, "<p>{}</p>", render::escape(&block.join(" ")));
+                let _ = writeln!(html, "<p>{}</p>", render::inline(&block.join(" ")));
                 block.clear();
             }
             continue;
@@ -714,10 +786,20 @@ h1 { font-size: 1.9rem; margin: 1rem 0 .6rem; }
 h2 { font-size: 1.3rem; margin: 2.2rem 0 .6rem; border-bottom: 1px solid var(--rule); padding-bottom: .25rem; }
 h3 { font-size: 1.05rem; margin: 1.6rem 0 .4rem; }
 a { color: var(--accent); }
-code { font: .92em/1.4 ui-monospace, "SF Mono", Menlo, monospace; background: var(--rule); padding: .1em .3em; border-radius: .25rem; }
+/* Inline-block, so a code span is never split across two lines: an identifier stays whole, and no
+   engine is left painting the empty leading fragment as a stray bar at the end of a line. Long
+   spans wrap inside the box (capped at the column width) instead of overflowing. */
+code {
+  display: inline-block; max-width: 100%; overflow-wrap: break-word;
+  font: .92em/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--rule); padding: .1em .3em; border-radius: .25rem;
+}
+pre code { display: inline; background: none; padding: 0; }
 pre { background: var(--rule); padding: .9rem 1rem; border-radius: .5rem; overflow: auto; }
 pre code { background: none; padding: 0; }
 table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+.table-wrap { overflow-x: auto; margin: 1rem 0; }
+.table-wrap table { margin: 0; }
 th, td { border: 1px solid var(--rule); padding: .4rem .6rem; text-align: left; vertical-align: top; }
 blockquote { margin: 1rem 0; padding: .2rem 1rem; border-left: 3px solid var(--rule); color: var(--muted); }
 .meta { color: var(--muted); font-size: .85rem; }
@@ -730,15 +812,31 @@ blockquote { margin: 1rem 0; padding: .2rem 1rem; border-left: 3px solid var(--r
 .steps { counter-reset: step; }
 .pager { display: flex; justify-content: space-between; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); }
 footer { text-align: center; color: var(--muted); font-size: .85rem; padding-bottom: 3rem; }
+@media (max-width: 42rem) {
+  /* The header is two rows on a phone; sticky costs a quarter of the screen, so it scrolls. */
+  header { position: static; padding: .6rem .8rem; gap: .45rem; }
+  .brand { font-size: .95rem; }
+  .search { margin-left: 0; width: 100%; }
+  .search input { width: 100%; }
+  #results { right: auto; left: 0; width: 100%; }
+  main { padding: 1rem .8rem 3rem; }
+  main ul, main ol { padding-left: 1.2rem; }
+  /* A phone cannot fit four columns: keep their natural width and let the wrapper scroll. */
+  .table-wrap table { width: max-content; min-width: 100%; }
+  h1 { font-size: 1.55rem; }
+  .cards li, .steps li { padding: .55rem .7rem; }
+}
 "#;
 
 /// The twenty lines of search: fetch the index once, filter on every keystroke.
 const SEARCH: &str = r#"const box = document.getElementById("q");
 const list = document.getElementById("results");
+// A relative dataset value is not a valid base for `new URL`, so resolve it once against the page.
+const base = new URL(box.dataset.index, window.location.href);
 let index = null;
 async function load() {
   if (index === null) {
-    const response = await fetch(box.dataset.index);
+    const response = await fetch(base);
     index = await response.json();
   }
   return index;
@@ -749,7 +847,7 @@ function show(rows) {
   for (const row of rows) {
     const item = document.createElement("li");
     const link = document.createElement("a");
-    link.href = new URL(row.url, box.dataset.index).href;
+    link.href = new URL(row.url, base).href;
     link.textContent = row.title;
     const small = document.createElement("small");
     small.textContent = row.step;
@@ -768,6 +866,9 @@ box.addEventListener("input", async () => {
 });
 box.addEventListener("keydown", (event) => {
   if (event.key === "Escape") { box.value = ""; list.hidden = true; }
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".search")) { list.hidden = true; }
 });
 "#;
 
@@ -842,6 +943,90 @@ mod tests {
         assert!(fallback.contains("Pin the toolchain"), "{fallback}");
         let index = std::fs::read_to_string(out.join("search.json")).unwrap();
         assert!(index.contains("拆分 crate"), "{index}");
+    }
+
+    /// The catalogue is the course's one place for translated furniture (CLI and site alike).
+    fn course_with_catalogue(temp: &TempDir) -> Course {
+        let mut tracks = crate::test_support::one_track(
+            &[
+                crate::test_support::step_toml(
+                    "mailer",
+                    "1.1-workspace",
+                    &["repo/workspace-layout@apply"],
+                ),
+                crate::test_support::step_toml(
+                    "mailer",
+                    "1.2-toolchain",
+                    &["build/toolchain@apply"],
+                ),
+            ],
+            &["repo/workspace-layout@apply", "build/toolchain@apply"],
+        );
+        tracks[0].2 = tracks[0].2.replacen(
+            "[[step]]",
+            "[localized_titles]\nzh-Hans = \"邮件服务\"\n\n[[step]]",
+            1,
+        );
+        let course = crate::test_support::load_course(
+            temp.path(),
+            &tracks,
+            &crate::test_support::ledger_toml(&[
+                ("repo/workspace-layout", "apply", "mailer/1.1"),
+                ("build/toolchain", "apply", "mailer/1.2"),
+            ]),
+        );
+        temp.write(
+            "course/docs/steps/en/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"Split\"\nlocale = \"en\"\n+++\n\n\
+             # Split\n\n## WHY\n\nBecause.\n",
+        );
+        temp.write(
+            "course/docs/steps/en/mailer/1.2-toolchain.md",
+            "+++\nid = \"mailer/1.2-toolchain\"\ntitle = \"Pin\"\nlocale = \"en\"\n+++\n\n\
+             # Pin\n\n## WHY\n\nAlso.\n",
+        );
+        temp.write(
+            "course/docs/steps/zh-Hans/mailer/1.1-workspace.md",
+            "+++\nid = \"mailer/1.1-workspace\"\ntitle = \"拆分\"\nlocale = \"zh-Hans\"\n\
+             source_hash = \"sha256:00\"\ntranslator = \"t\"\n+++\n\n# 拆分\n\n## 为什么\n\n因为。\n",
+        );
+        temp.write(
+            "course/locales/zh-Hans/ui.toml",
+            "locale = \"zh-Hans\"\n\n[string]\nwelcome = \"欢迎，按步骤来。\"\n\
+             \"site.tracks\" = \"课程\"\n\"site.unit\" = \"步\"\n\"site.project\" = \"项目\"\n\
+             \"site.minutes\" = \"分钟\"\n\"site.source_note\" = \"英文原文\"\n",
+        );
+        course
+    }
+
+    #[test]
+    fn a_catalogue_translates_the_home_page_and_the_track_name() {
+        let temp = TempDir::new("site-catalogue");
+        let course = course_with_catalogue(&temp);
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the site builds");
+        let home = std::fs::read_to_string(out.join("zh-Hans/index.html")).unwrap();
+        assert!(home.contains("欢迎，按步骤来。"), "{home}");
+        assert!(home.contains(">课程<"), "{home}");
+        assert!(home.contains("邮件服务"), "{home}");
+        assert!(!home.contains("<details>"), "no disclosure widget: {home}");
+        let track = std::fs::read_to_string(out.join("zh-Hans/mailer/index.html")).unwrap();
+        assert!(track.contains("邮件服务"), "{track}");
+        assert!(track.contains("2 步"), "{track}");
+        assert!(track.contains("60 分钟"), "{track}");
+    }
+
+    #[test]
+    fn without_a_catalogue_the_home_page_says_the_text_is_in_english() {
+        let temp = TempDir::new("site-no-catalogue");
+        let course = course(&temp);
+        let out = temp.path().join("site");
+        build(&course, &Options::new(&out)).expect("the site builds");
+        let home = std::fs::read_to_string(out.join("zh-Hans/index.html")).unwrap();
+        assert!(home.contains("in English — the only locale"), "{home}");
+        // The source page is not a translation of anything, so it carries no note.
+        let source = std::fs::read_to_string(out.join("en/index.html")).unwrap();
+        assert!(!source.contains("in English — the only locale"), "{source}");
     }
 
     #[test]

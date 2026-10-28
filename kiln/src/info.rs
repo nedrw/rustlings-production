@@ -5,6 +5,7 @@
 //! This module reads those files, enforces the conventions the linters and gates rely on, and
 //! resolves step references. It never writes.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -242,6 +243,12 @@ pub struct Track {
     pub index: u32,
     /// Human-readable title.
     pub title: String,
+    /// The track's name in other locales, keyed by locale tag (`"zh-Hans"`).
+    ///
+    /// Step titles are translated in each body's front matter; a track has no body, so its name
+    /// lives here. A missing entry means "use `title`", never an error.
+    #[serde(default)]
+    pub localized_titles: BTreeMap<String, String>,
     /// Learner workspace for this track, relative to the repository root (`app/mailer`).
     pub project: String,
     /// The track whose project this one builds on, if any: its steps declare a `path` dependency
@@ -259,6 +266,14 @@ pub struct Track {
 }
 
 impl Track {
+    /// The track's name in `locale`, or the source title when it has none.
+    #[must_use]
+    pub fn title_in(&self, locale: &str) -> &str {
+        self.localized_titles
+            .get(locale)
+            .map_or(self.title.as_str(), String::as_str)
+    }
+
     /// Directory of this track's metadata, `course/tracks/<id>`.
     #[must_use]
     pub fn dir(&self, root: &Path) -> PathBuf {

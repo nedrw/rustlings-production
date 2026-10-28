@@ -16,7 +16,39 @@ pub fn markdown(text: &str) -> String {
     let parser = Parser::new_ext(text, options);
     let mut out = String::with_capacity(text.len());
     html::push_html(&mut out, parser);
-    rewrite_links(&out)
+    wrap_tables(&rewrite_links(&out))
+}
+
+/// Render a plain-text block (the manifest's welcome): escape it, and turn `code spans` into
+/// `<code>`.
+///
+/// Not `markdown()`: the welcome is written for a terminal, where `app/<track>` is literal text.
+/// Through the markdown parser `<track>` would become an HTML element and disappear, so this path
+/// escapes first and only then recognises the one piece of markup the text actually uses.
+#[must_use]
+pub fn inline(text: &str) -> String {
+    let escaped = escape(text);
+    let mut out = String::with_capacity(escaped.len());
+    let mut inside = false;
+    for character in escaped.chars() {
+        if character == '`' {
+            out.push_str(if inside { "</code>" } else { "<code>" });
+            inside = !inside;
+        } else {
+            out.push(character);
+        }
+    }
+    if inside {
+        // An unpaired backtick: show it rather than opening a tag that never closes.
+        out.push_str("&#96;");
+    }
+    out
+}
+
+/// A wide table scrolls instead of squeezing its columns on a narrow screen.
+fn wrap_tables(html: &str) -> String {
+    html.replace("<table>", "<div class=\"table-wrap\"><table>")
+        .replace("</table>", "</table></div>")
 }
 
 /// Escape text for an HTML text node or a double-quoted attribute.

@@ -65,7 +65,11 @@ pub fn welcome(session: &Session) -> Result<u8> {
                 .unwrap_or_else(|_| doc.path())
                 .display()
                 .to_string();
-            println!("next step: {} — {}", step.qualified_id(), step.title);
+            println!(
+                "next step: {} — {}",
+                step.qualified_id(),
+                step_title(session, step)
+            );
             println!("  read     {body}");
             println!("  project  {}", track.project);
             println!(
@@ -91,6 +95,29 @@ pub fn first_unfinished<'a>(track: &'a Track, state: &State) -> Option<&'a Step>
         .find(|step| state.status(&step.qualified_id()).is_unfinished())
 }
 
+/// The title a reader of this locale sees: the body's own front-matter title when a translation is
+/// there, the metadata title otherwise.
+///
+/// `track.toml` carries the English source title (authoring.md §3) — the translated one lives in
+/// the body that a `--lang` switch resolves to, which is exactly the file `kiln hint` would open.
+fn step_title(session: &Session, step: &Step) -> String {
+    if session.locale() == session.source() {
+        return step.title.clone();
+    }
+    let Ok(crate::i18n::StepDoc::Found { path, .. }) = crate::i18n::resolve_step_doc(
+        &session.course().dir(),
+        &step.entry,
+        session.locale(),
+        session.source(),
+    ) else {
+        return step.title.clone();
+    };
+    crate::i18n::read_step_body(&path)
+        .ok()
+        .and_then(|body| body.front_matter.title)
+        .unwrap_or_else(|| step.title.clone())
+}
+
 /// Print one track and return `(steps done, steps total)`.
 fn print_track(session: &Session, track: &Track) -> (usize, usize) {
     let done = track
@@ -102,7 +129,7 @@ fn print_track(session: &Session, track: &Track) -> (usize, usize) {
         "{} {} — {} ({done}/{} steps done)",
         track.label(),
         track.id,
-        track.title,
+        track.title_in(session.locale().as_str()),
         track.step.len()
     );
     println!("   project: {}", track.project);
@@ -124,7 +151,10 @@ fn print_track(session: &Session, track: &Track) -> (usize, usize) {
             "  {} {:<id_width$}  {}",
             status.marker(),
             step.id,
-            clip(&step.title, ROW_WIDTH.saturating_sub(id_width + 6).max(24))
+            clip(
+                &step_title(session, step),
+                ROW_WIDTH.saturating_sub(id_width + 6).max(24)
+            )
         );
         let teaches = step
             .teaches
