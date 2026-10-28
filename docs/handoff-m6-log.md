@@ -218,3 +218,35 @@ FnMut + '_` 说不清借的是谁；把字面量改成 `String` 传进去（只�
 **M6.1 完成**：T6 八步、双语正文、每步规格与补丁；6.1–6.6 六个 apply 槽位各有一道探题，
 6.7/6.8 是 operate 深度——按现行政策（`aware` 不出题、`apply` 全覆盖）不出题，`plan --fast` 不会
 因此跳过它们。下一步按计划是 **M7 broker**（T7）。
+
+## 段 8：T7 `broker` 前四步（2026-10-28）
+
+第七条 track，按 `new-track.md` 落地前四步：7.1 分区路由（`broker/partitioning@apply`）、7.2 提交
+偏移（`broker/consumer-offset@apply`）、7.3 范围再平衡（`broker/rebalance@apply`）、7.4 lag
+（`broker/lag@apply`）。`kiln selftest --track broker` → **4/4 step(s) hold the contract**。
+
+**项目形状**：`app/broker` 是一个库 + 薄二进制，每个分区就是一个 `Vec`，没有 broker 进程也没有网络
+——所有语义在一次调用里完成，确定性来自"没有时钟、没有线程"。`partition_for`（FNV-1a）是给定项，
+因为哈希不是题；题是路由、偏移、分配与 lag 这四个承诺。
+
+**这一步最值钱的教训（补丁链）**：第一次生成的 7.2–7.4 脚手架补丁全在 `kiln prepare` 上失败——
+因为我用**骨架文本**当每一棵树的 `lib.rs` 基座，于是 `diff(上一棵树, 这一棵)` 里出现了"删掉 7.1
+参考解的 `append`"这种段，脚手架拒绝删行。正确的模型是**脚手架链**：第 N 步的准备状态 =
+骨架 + 解 1 + 脚手架 2 + 解 2 + … + 脚手架 N；因此
+`scaffold_N = diff(full_{N-1}, scaffold_N)`、`solution_N = diff(scaffold_N, full_N)`。
+改成这个模型后四步一次过。这条已经写进 [[repo-workflow-conventions]]。
+
+**另外两处小毛病**：规格里 `use broker::{Consumer, Topic}` 少了模块段（类型在
+`broker::consumer::Consumer`）；`i18n status` 抓到三处术语漂移（`claim` 这里是"主张"不是"认领"、
+`deterministic` 要写"确定性"、`backlog` 要写"积压"），都按词表裁决后改文本。
+
+**同步的计数**：curriculum §3.9 加四个能力、§12 加 T7、探题库与组装两节顺延到 §13/§14（引用同改）；
+台账到 **109 能力 / 148 槽位 / 131 步**；探题库 **117 道、覆盖 89/89** apply 槽位。
+
+**验收（本机实测）**：`selftest --track broker` 4/4；`probe --check` 117/117、覆盖 89/89；
+`lint-caps` `109 capabilities · 148 slots · 131 ledger positions · 131 authored steps`，no issues；
+`i18n status` 131/131、结构 0 error、漂移 0；`links` 干净；`site --check` **279 页**；
+`rebuild-patches.py --track broker --check` 七份全 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1；
+`fmt`/`clippy` 干净。
+
+**未完**：7.5–7.9（重放、跨分区顺序、恰好一次、事件模式演进、lag 告警）在计划 §5 的表里。
