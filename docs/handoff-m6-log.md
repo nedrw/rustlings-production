@@ -336,3 +336,30 @@ OIDC）。
 `fmt`/`clippy` 干净。
 
 **未完**：9.6 HPA、9.7 滚动发布演练；之后是 M10 capstone。
+
+## 段 12：T9 收尾，M10 capstone（2026-10-28）
+
+**T9 后两步**：9.6 自动伸缩（`k8s/autoscaling@design`，公式 + 容差带 + 快上慢下）、9.7 发布演练
+（`k8s/rollout-drill@operate`，逐步核两个预算）。`selftest --track platform` → **7/7**。踩到两处：
+9.7 的规格把两个违规的顺序写反（按枚举声明顺序排序才是仓库约定）；9.6/9.7 的正文写完之前 selftest 只
+报 5/5（它跳过没有正文的步骤），补上正文才真正跑起来。台账到 **126 能力 / 165 槽位 / 148 步**。
+
+**M10 capstone**：按 plan §11 的"不是 track"落地：
+
+- **`kiln capstone [PATH]`**（默认 `app/capstone`）跑课程的通用门——`fmt`、`clippy@1`、`no-todo`、
+  `docs:public`、`exit-code`——外加一条形状检查 `[lints.rust] unsafe_code = "deny"`。它用一份
+  合成的 track/step 元数据喂 `GateContext`，所以**没有新增门、也没有改门**；退出码 0/1/2。
+- **为什么没有 `unsafe-budget@0`**：那个门是**按步**的（数这一步补丁写的文件），capstone 没有补丁，
+  它只能回答"判不了"。项目级的等价物就是 deny lint，编译器免费执行——这一条写进了 capstone.md。
+- **`docs/capstone.md`**：题目的三种形状、可判定的形状要求（库 + 薄二进制、deny unsafe、至少六个能力
+  其中两个 operate、README 三节、ADR、演练记录）、门的用法、**十二问评审清单**（每一问指向课程里教它
+  的那一步）、完成定义。
+- **三个模板**：`docs/templates/adr.md`（背景/选项/决定/后果，后果里"变坏的"不许空）、
+  `incident-review.md`（影响/时间线/根因/做对/做错/行动项，行动项要能变绿）、`review-checklist.md`
+  （按课程顺序的评审清单）。
+
+**验收**：`kiln capstone /tmp/cap-demo` 全绿、退出 0；一份故意坏掉的副本（去掉 deny、加 `todo!()`）
+红三道、退出 1；不存在的目录退出 2。`cargo test -p kiln` 里两个新单测（阶梯解析、deny 检查）通过。
+
+**至此 M6–M10 全部交付**。计划里的"可选"项（SQL 索引深度、DB 复制/切换演练、批流 ETL、搜索）仍是
+可选：它们各是一条新 track 的体量，不在"M6–M10"的范围内。

@@ -392,6 +392,12 @@ T2 `relay` 的 24 步**全部交付**（正文、规格、scaffold、参考解�
 交付物一览与实测数字在 [t2-relay.md](t2-relay.md)，机制、命令与继续往下做的约定在
 [handoff-m1.md](handoff-m1.md)。
 
+**M10 已交付**（2026-10）：capstone 不是一条 track，而是一张**门 + 清单**——`kiln capstone [PATH]`
+用课程已有的通用门（fmt、clippy@1、no-todo、docs:public、exit-code）判一个自由项目，外加一条
+`unsafe_code = "deny"` 的形状检查；人读的十二问评审清单、ADR / 复盘 / 评审清单三个模板、
+"至少六个能力、其中两个 `operate`"的可判定要求都在 [capstone.md](capstone.md)。它刻意不做成 CI 门
+——仓库里没有 capstone 项目（`app/` 是学员的工作区）。
+
 **M5 已交付**（2026-10）：四件事全部落地——中文全量翻译（119/119，`i18n status` 结构 0 error、
 漂移 0 warning，词表 133 条）；`kiln new-track` 生成器与 [new-track.md](new-track.md) 指南，并按本表的
 验收标准跑过一遍（三步玩具 track → `3/3 step(s) hold the contract`）；`kiln site` 文档站（251 页、

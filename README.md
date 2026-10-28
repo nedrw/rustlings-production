@@ -18,6 +18,7 @@ kiln skip     # skip such a step (recorded as `»`, never counted as done)
 kiln probe    # re-check one capability with a 3–10 minute exercise
 kiln review   # what you have proven per capability, and what is going stale (--due)
 kiln site     # render the course as a static site, every authored locale
+kiln capstone # judge a free project with the course's generic gates (docs/capstone.md)
 kiln new-track # lay the mechanical half of a new track (docs/new-track.md)
 ```
 
@@ -106,9 +107,13 @@ for `cargo test`). M6.1 added **T6 `cache`**, an eight-step read-cache track, de
 is `8/8`. **M7** is delivered: **T7 `broker`**, a partitioned message log in nine steps, `selftest --track
 broker` `9/9`. **M8** is delivered too: **T8 `rpc`**, a contract-first RPC layer in five steps (field
 numbers, deadlines, status codes, streaming windows, multiplexing), `selftest --track rpc` `5/5`.
-**M9** has begun: **T9 `platform`**, five steps so far (probe wiring, rollout arithmetic,
-disruption budgets, external secrets, OIDC), `selftest --track platform` `5/5`. Both languages are
-written for every step, and each `apply` slot has its probe. Broker, RPC, platform and capstone follow in that
+**M9** is delivered: **T9 `platform`**, seven steps (probe wiring, rollout arithmetic, disruption
+budgets, external secrets, OIDC, autoscaling, a rollout drill), `selftest --track platform` `7/7`.
+**M10** is delivered too: [docs/capstone.md](docs/capstone.md) is the capstone — a free project judged
+by `kiln capstone` (the course's generic gates plus a `unsafe_code = "deny"` shape check), with a
+twelve-question review checklist and ADR / incident-review / review templates. It is deliberately not
+a track and not a CI gate. Both languages are written for every step, and each `apply` slot has its
+probe. Broker, RPC, platform and capstone follow in that
 order ([docs/m6-plan.md](docs/m6-plan.md)).
 
 **What the numbers below measure.** The M1 numbers were measured on this machine on the M1 tree
