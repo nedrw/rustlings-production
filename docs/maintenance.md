@@ -114,5 +114,6 @@
 
 一次 `cargo xtask ci` 在 M0 收尾时是 **486 s**（22 步）；现在它逐条走完九条 track 的 148 步
 （`selftest` 会重新构建每一步的脚手架与参考解），一次完整运行本机实测 **1 小时 33 分**（2026-10-29，
-离线、复用 `target/` 缓存），CI 每次 push 都跑。年度维护真正花时间的是三件慢活：`verify --slow`、`links --external`、
+离线、复用 `target/` 缓存）；评审修复后的第二次实测 **2 小时 20 分**（同日）——时长主要由慢闸门决定
+（jobq 的 mutants 约 30 分、lakelet 的 soak+mutants 约 50 分），不随 track 数线性增长，CI 每次 push 都跑。年度维护真正花时间的是三件慢活：`verify --slow`、`links --external`、
 以及"人读一遍"——前两件各几十分钟，最后一件没有上限，也不该有。

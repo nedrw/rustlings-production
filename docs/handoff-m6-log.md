@@ -425,7 +425,9 @@ track 的 `selftest`（22 + 24 + 27 + 24 + 22 + 8 + 9 + 5 + 7 = 148/148）。
 
 - **脚手架警告**：29 个 starting state **全部**在第一次 `cargo build` 里刷警告（每步 1–7 条：未用参数、
   只写不读的字段、8.1 的未用 `BTreeMap`）。按 T2 骨架的桩体点名写法修 34 个桩（4 个在骨架里、30 个在前面的脚手架里），用
-  `rebuild-patches.py --fixes` 在树层面改、再重新生成九个补丁；复测 **29/29 零警告**。桩体点名这种
+  `rebuild-patches.py --fixes` 在树层面改、再重新生成九个补丁（修复模块存档在
+  [tools/fixes-t6-t9-stub-bodies.py](../tools/fixes-t6-t9-stub-bodies.py)，是 `--fixes` 的第二个
+  完整示例）；复测 **29/29 零警告**。桩体点名这种
   写法（`let _ = (…);`）此前只写在 T2 的骨架里，现在进了 authoring §5.6。
 - **规格里的「给定代码」用例**：29 步里有 9 步、共 14 条测试只调用脚手架给定的 API（`poll`、`may_create`、
   `version`…），在脚手架上就通过。按 authoring §6 的规则补 `// Pins given code: …`，重钉四份 manifest。

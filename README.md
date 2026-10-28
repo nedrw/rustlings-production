@@ -199,5 +199,6 @@ python3 tools/lint-caps-md.py   # 126 capabilities, 148 steps, 165 (capability, 
 What is not in yet: hosting for the generated site (`kiln site` writes files; no host is chosen),
 and the four optional tracks the plan left out of M6–M10 (a SQL-index track, a database
 replication/failover drill, batch/stream ETL, search) — each is a new track's worth of work. The
-full `cargo xtask ci` was run on `6096903` and passed (1 h 33 min, 148/148; see
-[docs/handoff-m6-log.md](docs/handoff-m6-log.md) §13).
+full `cargo xtask ci` was last run on `a8bef9d` (the review fixes) and passed (2 h 20 min, 148/148;
+an earlier run on `6096903` took 1 h 33 min — the duration is set by the slow gates, not the track
+count; see [docs/handoff-m6-log.md](docs/handoff-m6-log.md) §13 and §15).

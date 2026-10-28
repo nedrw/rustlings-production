@@ -42,7 +42,7 @@
 ```sh
 cargo run -p kiln -- capstone app/capstone
 # kiln capstone · app/capstone
-#   ✓ unsafe-deny    `[lints.rust] unsafe_code = "deny"` is in Cargo.toml
+#   ✓ unsafe-code    every target compiles with `-F unsafe_code`
 #   ✓ fmt            `cargo fmt --all --check` is clean
 #   ✓ clippy@1       clippy@1 is clean (…)
 #   ✓ no-todo        no clippy::todo, … anywhere in the step's code
@@ -58,9 +58,11 @@ cargo run -p kiln -- capstone app/capstone
 
 `unsafe` 为什么是形状检查而不是门：`unsafe-budget@0` 是**按步**的（它数这一步的补丁写了哪些文件），
 capstone 没有补丁，那个门只能回答"判不了"。项目级的等价物是**编译器**：这条检查用
-`RUSTFLAGS=-F unsafe_code` 编一次项目。`-F` 是命令行级别，crate 里的 `#![allow(unsafe_code)]`
-覆盖不了它——一个读 `Cargo.toml` 的字符串匹配做不到这一点（`allow` 旁边一个真的 `unsafe fn`
-会通过），所以这里编，不读。
+`RUSTFLAGS=-F unsafe_code` 编一次项目，而且是 **`--all-targets`**：普通的 `cargo build` 根本不编译
+`#[cfg(test)]` 代码，藏在测试模块里的 `unsafe` 会溜过去。`-F` 是命令行级别，crate 里的
+`#![allow(unsafe_code)]` 覆盖不了它——一个读 `Cargo.toml` 的字符串匹配做不到这一点（`allow` 旁边一个
+真的 `unsafe fn` 会通过），所以这里编，不读。依赖不受影响：cargo 会把依赖的 lint 封顶在 `allow`，
+依赖里的 `unsafe` 是依赖自己的事（实测：带 tokio 依赖的项目照常通过）。
 
 ## 3. 评审清单（人读，一条一条有答案）
 

@@ -29,9 +29,13 @@ const LADDER: &[&str] = &["fmt", "clippy@1", "no-todo", "docs:public", "exit-cod
 ///
 /// `unsafe-budget@0` is *step-scoped* — it counts the files a step's patches write, and a capstone
 /// has no patches, so the gate can only answer "not judgeable" here. The project-wide equivalent is
-/// the compiler: `cargo build` with `-F unsafe_code` on the command line, which no `#![allow]` in
-/// the crate can override. A manifest lookup would be a string match — `allow(unsafe_code)` beside
-/// an `unsafe fn` would pass it — so the check compiles instead of reading.
+/// the compiler: a build with `-F unsafe_code` on the command line, which no `#![allow]` in the
+/// crate can override. A manifest lookup would be a string match — `allow(unsafe_code)` beside an
+/// `unsafe fn` would pass it — so the check compiles instead of reading.
+///
+/// The build is `--all-targets`: a plain `cargo build` never compiles `#[cfg(test)]` code, and
+/// `unsafe` parked in a test module would sail through it. Dependencies are unaffected — cargo
+/// caps their lints at `allow`, so their `unsafe` is theirs, not the capstone's.
 const NO_UNSAFE: &str = "unsafe-code";
 
 /// Judge the project at `path` (default `app/capstone`).
@@ -61,7 +65,7 @@ pub fn run(session: &Session, path: Option<&str>) -> Result<u8> {
     println!("kiln capstone · {}", project.display());
     let mut failed = 0;
     match holds_no_unsafe(&project, session.timeout()) {
-        Ok(()) => println!("  ✓ {NO_UNSAFE:<14} the project compiles with `-F unsafe_code`"),
+        Ok(()) => println!("  ✓ {NO_UNSAFE:<14} every target compiles with `-F unsafe_code`"),
         Err(detail) => {
             println!("  ✗ {NO_UNSAFE:<14} {detail}");
             failed += 1;
@@ -144,12 +148,13 @@ fn verdict(failed: usize) -> u8 {
     if failed == 0 { EXIT_OK } else { EXIT_FAILED }
 }
 
-/// Whether the project compiles with `unsafe` forbidden.
+/// Whether every target of the project compiles with `unsafe` forbidden.
 ///
 /// The lint is passed with `-F` on the command line, which is the level an inner `#![allow]` cannot
 /// override — a manifest lookup would be a string match that `allow(unsafe_code)` beside a real
 /// `unsafe fn` passes. `RUSTFLAGS` already in the environment is kept: a learner's own flags are
-/// theirs.
+/// theirs. `--all-targets` so test-only `unsafe` is judged too; dependencies are unaffected, because
+/// cargo caps their lints at `allow` regardless.
 fn holds_no_unsafe(
     project: &Path,
     timeout: std::time::Duration,
@@ -161,7 +166,7 @@ fn holds_no_unsafe(
     flags.push_str("-F unsafe_code");
     let ran = crate::process::run_with_env(
         "cargo",
-        &["build", "--quiet"],
+        &["build", "--quiet", "--all-targets"],
         project,
         timeout,
         &[("RUSTFLAGS".to_owned(), flags)],
@@ -172,7 +177,8 @@ fn holds_no_unsafe(
     }
     Err(format!(
         "the project does not compile with `unsafe` forbidden — the capstone is safe code unless \
-         it argues otherwise in its README:\n    {}",
+         it argues otherwise in its README (every target compiles: library, binary and tests \
+         included):\n    {}",
         crate::gates::runner::clip(&ran.stderr, 6)
     ))
 }
