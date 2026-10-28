@@ -27,6 +27,7 @@ use crate::process;
 use crate::state::State;
 
 pub mod caps;
+pub mod capstone;
 pub mod check;
 pub mod doctor;
 pub mod hint;
@@ -311,6 +312,13 @@ pub enum Command {
         check: bool,
     },
 
+    /// Judge a free project with the course's generic gates (docs/capstone.md).
+    Capstone {
+        /// Project directory (default: `app/capstone`).
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+    },
+
     /// Check the links in a tree of markdown (default: this repository).
     ///
     /// The offline half is the `links` gate, so a learner sees exactly what the gate sees; a
@@ -457,6 +465,7 @@ fn dispatch(cli: &Cli) -> Result<u8> {
         Some(Command::Site { out, langs, check }) => {
             site::run(&session, out.as_deref(), langs, *check)
         }
+        Some(Command::Capstone { path }) => capstone::run(&session, path.as_deref()),
         Some(Command::Links { path, external }) => links::run(&session, path.as_deref(), *external),
         Some(Command::Doctor) => doctor::run(&session),
         None => list::welcome(&session),
