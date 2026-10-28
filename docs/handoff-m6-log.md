@@ -306,3 +306,33 @@ deadline 是一个整数、流是一个窗口。每条判断因此都能在一�
 
 **M8 完成**。下一步按计划是 **M9 platform**（T9：K8s 清单与探针、rollout、HPA/PDB、外部 secrets、
 OIDC）。
+
+## 段 11：T9 `platform` 前五步（2026-10-28）
+
+第九条 track。9.1 探针接线（`k8s/probe-wiring@apply`）、9.2 滚动发布算术（`k8s/rollout@apply`）、
+9.3 中断预算（`k8s/disruption-budget@apply`）、9.4 外部 secrets（`sec/external-secrets@operate`）、
+9.5 OIDC（`sec/oidc@apply`）。`kiln selftest --track platform` → **5/5 step(s) hold the contract**。
+
+**项目形状**：`app/platform` 是库 + 薄二进制，没有集群——清单是数据、发布是算术、令牌是结构体。
+
+**五步的题眼**：存活探针失败会重启进程（所以它不能读依赖），就绪失败只是摘端点（所以它必须真检查）；
+滚动发布是两个预算的算术（下限与在途上限，`maxUnavailable: 0` 需要 surge，一个副本 + 一个不可用
+预算会把服务打挂——这是写进正文的已知代价，规格也这么断言）；中断预算的边界（零次即挡排干、封顶、
+不为负）；secret 是引用（解析缺失要点名，清单里出现值就是泄漏）；OIDC 先验算法（`alg: none` 是最
+出名的洞），再看签发方、受众、未生效、过期。
+
+**踩到的三处**：`validate` 返回 `Result<&str, _>` 时两个 `&str` 输入让省略的生命周期有歧义
+（E0106），给返回加 `<'a>` 绑定到 claims；9.2 有一条规格把"单副本 + 不可用预算 1"断言成"不能走"，
+与正文自相矛盾——按真实语义改成"可以走"，并把"pod 不存在才走不了"单独测；四处术语漂移（`event`/
+`timer`/`secret`/`deadline`）按词表裁决后改文本。
+
+**同步的计数**：curriculum §3.11 加五个能力、§14 加 T9，探题库与组装两节顺延到 §15/§16（引用同改）；
+台账 **124 能力 / 163 槽位 / 146 步**；探题库 **127 道、覆盖 99/99** apply 槽位。
+
+**验收（本机实测）**：`selftest --track platform` 5/5；`probe --check` 127/127、覆盖 99/99；
+`lint-caps` `124 capabilities · 163 slots · 146 ledger positions · 146 authored steps`，no issues；
+`i18n status` 146/146、结构 0 error、漂移 0；`links` 干净；`site --check` **313 页**；
+`rebuild-patches.py --track platform --check` 九份全 identical；`cargo test -p kiln` 379 + 21 + 1 + 1 + 1；
+`fmt`/`clippy` 干净。
+
+**未完**：9.6 HPA、9.7 滚动发布演练；之后是 M10 capstone。
