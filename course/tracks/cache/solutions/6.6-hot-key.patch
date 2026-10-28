@@ -1,0 +1,33 @@
+--- a/src/two_level.rs
++++ b/src/two_level.rs
+@@ -72,6 +72,29 @@
+ 
+     /// Read `key` at `now`, from the first layer that can answer.
+     pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
+-        todo!("local first, then shared, then the store; count who answered")
++        if let Some((value, expires_at)) = self.local.get(key)
++            && now < *expires_at
++        {
++            self.local_hits += 1;
++            return Some(value.clone());
++        }
++        if let Some((value, expires_at)) = self.shared.get(key)
++            && now < *expires_at
++        {
++            // A shared hit is not a miss: the store was not asked, and the local layer is refilled
++            // so the next read in this instance costs nothing at all.
++            self.shared_hits += 1;
++            let value = value.clone();
++            self.local
++                .insert(key.to_owned(), (value.clone(), now + self.local_ttl));
++            return Some(value);
++        }
++        let value = store.get(key)?;
++        self.misses += 1;
++        self.local
++            .insert(key.to_owned(), (value.clone(), now + self.local_ttl));
++        self.shared
++            .insert(key.to_owned(), (value.clone(), now + self.shared_ttl));
++        Some(value)
+     }
+ }

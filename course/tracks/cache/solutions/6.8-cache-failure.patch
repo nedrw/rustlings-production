@@ -1,0 +1,35 @@
+--- a/src/breaker.rs
++++ b/src/breaker.rs
+@@ -71,11 +71,30 @@
+ 
+     /// Where a request at `now` should go.
+     pub fn route(&mut self, now: u64) -> Route {
+-        todo!("closed and half-open try the cache; an expired open becomes half-open")
++        if self.state == State::Open && now >= self.opened_at + self.cooldown {
++            // Exactly one probe: the first caller after the cool-down finds the breaker half-open,
++            // and `record` decides whether the next one does.
++            self.state = State::HalfOpen;
++        }
++        if self.state == State::Open {
++            Route::Direct
++        } else {
++            Route::Cache
++        }
+     }
+ 
+     /// Record how a call went.
+     pub fn record(&mut self, ok: bool, now: u64) {
+-        todo!("success closes and forgets; a failure may open, and reopens from half-open")
++        if ok {
++            self.state = State::Closed;
++            self.failures = 0;
++            return;
++        }
++        self.failures += 1;
++        // Half-open has only one probe: a failure there is the answer, and it reopens immediately.
++        if self.state == State::HalfOpen || self.failures >= self.threshold {
++            self.state = State::Open;
++            self.opened_at = now;
++        }
+     }
+ }

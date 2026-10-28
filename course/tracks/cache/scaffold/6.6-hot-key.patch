@@ -1,0 +1,90 @@
+--- /dev/null
++++ b/src/two_level.rs
+@@ -0,0 +1,77 @@
++//! Two layers: a short-lived local cache in front of a shared one.
++//!
++//! A local cache in each instance is the cheapest read there is — and it multiplies staleness by
++//! the number of instances: every one of them can serve data that is `local_ttl` seconds old. That
++//! number is the *staleness budget*, and it is the first thing to write down before adding the
++//! layer.
++//!
++//! ## What you write
++//!
++//! [`TwoLevel::get`] — local first, then shared, then the store, counting what answered:
++//!
++//! * a valid local entry: `local_hits += 1`, nothing else is touched;
++//! * a valid shared entry: `shared_hits += 1`, the local layer is refilled from it;
++//! * neither: `misses += 1`, the store is read, and both layers are filled.
++//!
++//! The counters are the evidence: "the shared cache was not consulted" is `shared_hits == 0`.
++
++use std::collections::BTreeMap;
++
++use crate::Store;
++
++/// A local cache in front of a shared one.
++#[derive(Debug)]
++pub struct TwoLevel {
++    local: BTreeMap<String, (String, u64)>,
++    shared: BTreeMap<String, (String, u64)>,
++    local_ttl: u64,
++    shared_ttl: u64,
++    local_hits: u64,
++    shared_hits: u64,
++    misses: u64,
++}
++
++impl TwoLevel {
++    /// Two layers: local entries live `local_ttl` seconds, shared ones `shared_ttl`.
++    #[must_use]
++    pub fn new(local_ttl: u64, shared_ttl: u64) -> Self {
++        Self {
++            local: BTreeMap::new(),
++            shared: BTreeMap::new(),
++            local_ttl,
++            shared_ttl,
++            local_hits: 0,
++            shared_hits: 0,
++            misses: 0,
++        }
++    }
++
++    /// The staleness budget: how old the data an instance serves can be, in seconds.
++    #[must_use]
++    pub fn staleness_budget(&self) -> u64 {
++        self.local_ttl
++    }
++
++    /// How often the local layer answered.
++    #[must_use]
++    pub fn local_hits(&self) -> u64 {
++        self.local_hits
++    }
++
++    /// How often the shared layer answered.
++    #[must_use]
++    pub fn shared_hits(&self) -> u64 {
++        self.shared_hits
++    }
++
++    /// How often the store answered.
++    #[must_use]
++    pub fn misses(&self) -> u64 {
++        self.misses
++    }
++
++    /// Read `key` at `now`, from the first layer that can answer.
++    pub fn get(&mut self, store: &mut Store, key: &str, now: u64) -> Option<String> {
++        todo!("local first, then shared, then the store; count who answered")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod expiry;
+ pub mod invalidation;
+ pub mod single_flight;
++pub mod two_level;
+ pub mod versioned;
+ // kiln:scaffold:end
+ 

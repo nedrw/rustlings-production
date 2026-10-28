@@ -1,0 +1,27 @@
+--- a/src/effectiveness.rs
++++ b/src/effectiveness.rs
+@@ -35,7 +35,12 @@
+     /// The share of lookups the cache answered; `1.0` when nothing was asked.
+     #[must_use]
+     pub fn ratio(&self) -> f64 {
+-        todo!("hits over lookups; no lookups is not a failure")
++        let lookups = self.lookups();
++        if lookups == 0 {
++            // Nothing was asked, so nothing is broken: an empty window is healthy.
++            return 1.0;
++        }
++        self.hits as f64 / lookups as f64
+     }
+ 
+     /// How many calls the cache saved the store.
+@@ -70,5 +75,9 @@
+ /// The verdict for `report` against `slo` (a ratio, e.g. `0.9`).
+ #[must_use]
+ pub fn verdict(report: &Report, slo: f64) -> Verdict {
+-    todo!("at or above the slo is healthy; the boundary belongs to healthy")
++    if report.ratio() >= slo {
++        Verdict::Healthy
++    } else {
++        Verdict::BelowSlo
++    }
+ }

@@ -1,0 +1,73 @@
+--- /dev/null
++++ b/src/versioned.rs
+@@ -0,0 +1,60 @@
++//! Versioned keys: invalidate a namespace by moving its prefix.
++//!
++//! Deleting every entry of a namespace is a scan; moving the prefix is one write. The cache keeps
++//! the old entries — nothing reads them again, and a janitor can sweep them later — and every key
++//! derived from the namespace now names a different entry.
++//!
++//! The version belongs to the *cache* key, not to the store's: the store is asked with the key the
++//! caller gave, and the answer is kept under the derived key.
++
++use std::collections::BTreeMap;
++
++use crate::Store;
++
++/// A cache whose entries carry a namespace version.
++#[derive(Debug)]
++pub struct Versioned {
++    versions: BTreeMap<String, u64>,
++    entries: BTreeMap<String, (String, u64)>,
++    ttl: u64,
++}
++
++impl Versioned {
++    /// A versioned cache whose entries live for `ttl` seconds.
++    #[must_use]
++    pub fn new(ttl: u64) -> Self {
++        Self {
++            versions: BTreeMap::new(),
++            entries: BTreeMap::new(),
++            ttl,
++        }
++    }
++
++    /// The namespace's current version; `0` before the first bump.
++    #[must_use]
++    pub fn version(&self, namespace: &str) -> u64 {
++        self.versions.get(namespace).copied().unwrap_or(0)
++    }
++
++    /// Make every entry of `namespace` unreachable. Old entries stay in memory until a janitor.
++    pub fn bump(&mut self, namespace: &str) {
++        *self.versions.entry(namespace.to_owned()).or_insert(0) += 1;
++    }
++
++    /// How many entries the cache still holds (including unreachable ones).
++    #[must_use]
++    pub fn entries(&self) -> usize {
++        self.entries.len()
++    }
++
++    /// Read `key` in `namespace` through the versioned prefix.
++    pub fn get(
++        &mut self,
++        store: &mut Store,
++        namespace: &str,
++        key: &str,
++        now: u64,
++    ) -> Option<String> {
++        todo!("derive the entry key from the namespace, its version and the key")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod expiry;
+ pub mod invalidation;
+ pub mod single_flight;
++pub mod versioned;
+ // kiln:scaffold:end
+ 
+ use std::collections::BTreeMap;

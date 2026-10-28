@@ -17,6 +17,7 @@ project = "app/cache"
 # Exit capabilities (curriculum.md §5): whatever else happens, these are established here.
 exit = [
     "cache/read-through@apply",
+    "cache/invalidation@apply",
     "cache/single-flight@apply",
 ]
 
@@ -111,6 +112,110 @@ run = { cmd = "cargo test -p cache --test spec_expiry_jitter" }
 spec = ["spec/6.4/expiry_jitter.rs"]
 scaffold = "scaffold/6.4-expiry-jitter.patch"
 solution = "solutions/6.4-expiry-jitter.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "6.5-versioned-keys"
+title = "A namespace is invalidated by moving its prefix"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.5-versioned-keys.md"
+time_hint = "60m"
+concepts = ["versioned key", "namespace invalidation", "unreachable entry"]
+teaches = ["cache/versioned-keys@apply"]
+requires = ["cache/invalidation@apply"]
+run = { cmd = "cargo test -p cache --test spec_versioned_keys" }
+spec = ["spec/6.5/versioned_keys.rs"]
+scaffold = "scaffold/6.5-versioned-keys.patch"
+solution = "solutions/6.5-versioned-keys.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "6.6-hot-key"
+title = "Two layers, and the staleness budget written down"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.6-hot-key.md"
+time_hint = "60m"
+concepts = ["local cache", "shared cache", "staleness budget"]
+teaches = ["cache/two-level@apply"]
+requires = ["cache/single-flight@apply"]
+run = { cmd = "cargo test -p cache --test spec_hot_key" }
+spec = ["spec/6.6/hot_key.rs"]
+scaffold = "scaffold/6.6-hot-key.patch"
+solution = "solutions/6.6-hot-key.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "6.7-cache-effectiveness"
+title = "A cache has an SLO or it has a feeling"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.7-cache-effectiveness.md"
+time_hint = "45m"
+concepts = ["hit ratio", "origin calls", "SLO boundary"]
+teaches = ["obs/cache-effectiveness@operate"]
+requires = ["obs/metrics-slo@aware"]
+run = { cmd = "cargo test -p cache --test spec_effectiveness" }
+spec = ["spec/6.7/effectiveness.rs"]
+scaffold = "scaffold/6.7-cache-effectiveness.patch"
+solution = "solutions/6.7-cache-effectiveness.patch"
+gates = [
+    "spec-integrity",
+    "caps",
+    "i18n",
+    "fmt",
+    "clippy@1",
+    "no-todo",
+    "docs:public",
+    "exit-code",
+    "unsafe-budget@0",
+]
+
+[[step]]
+id = "6.8-cache-failure"
+title = "When the cache is gone, stop asking it"
+kind = "milestone"
+origin = "teach"
+entry = "docs/steps/en/cache/6.8-cache-failure.md"
+time_hint = "60m"
+concepts = ["circuit breaker", "half-open", "degradation"]
+teaches = ["ops/cache-failure@operate"]
+requires = ["cache/read-through@apply"]
+run = { cmd = "cargo test -p cache --test spec_cache_failure" }
+spec = ["spec/6.8/cache_failure.rs"]
+scaffold = "scaffold/6.8-cache-failure.patch"
+solution = "solutions/6.8-cache-failure.patch"
 gates = [
     "spec-integrity",
     "caps",

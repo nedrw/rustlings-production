@@ -1,0 +1,23 @@
+--- a/src/versioned.rs
++++ b/src/versioned.rs
+@@ -55,6 +55,19 @@
+         key: &str,
+         now: u64,
+     ) -> Option<String> {
+-        todo!("derive the entry key from the namespace, its version and the key")
++        // The version is part of the *cache* key, so a bump renames every entry of the namespace
++        // without walking the cache. `#` and `:` cannot appear in a namespace or a key, which is
++        // what keeps two different triples from deriving the same entry key.
++        let entry = format!("{namespace}#{}:{key}", self.version(namespace));
++        if let Some((value, expires_at)) = self.entries.get(&entry)
++            && now < *expires_at
++        {
++            return Some(value.clone());
++        }
++        // The store knows nothing about versions: it is asked with the caller's key, and the answer
++        // is kept under the derived one.
++        let value = store.get(key)?;
++        self.entries.insert(entry, (value.clone(), now + self.ttl));
++        Some(value)
+     }
+ }

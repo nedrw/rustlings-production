@@ -1,0 +1,94 @@
+--- /dev/null
++++ b/src/breaker.rs
+@@ -0,0 +1,81 @@
++//! The cache is gone: stop asking it, and come back carefully.
++//!
++//! When the cache is down, every request still pays the cache's failure — a timeout, a refused
++//! connection — before going to the store. A breaker turns that into one failed attempt per
++//! cool-down: it opens after a threshold of failures, sends traffic straight to the origin while it
++//! is open, and after the cool-down lets exactly one probe through (half-open) to find out whether
++//! the cache is back.
++//!
++//! ## What you write
++//!
++//! * [`Breaker::route`] — [`Route::Cache`] while closed or while half-open (the probe), and
++//!   [`Route::Direct`] while open; an open breaker moves to half-open once `now` has reached
++//!   `opened_at + cooldown`.
++//! * [`Breaker::record`] — `ok` closes the breaker and forgets the failures; a failure counts, and
++//!   a failure while half-open opens it again for a fresh cool-down.
++
++/// What the breaker is doing.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum State {
++    /// The cache is being used.
++    Closed,
++    /// The cache is being skipped.
++    Open,
++    /// One probe is allowed.
++    HalfOpen,
++}
++
++/// Where a request should go.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Route {
++    /// Try the cache.
++    Cache,
++    /// Go straight to the store.
++    Direct,
++}
++
++/// A circuit breaker in front of the cache.
++#[derive(Debug)]
++pub struct Breaker {
++    state: State,
++    failures: u32,
++    threshold: u32,
++    cooldown: u64,
++    opened_at: u64,
++}
++
++impl Breaker {
++    /// A breaker that opens after `threshold` consecutive failures and stays open for `cooldown`.
++    #[must_use]
++    pub fn new(threshold: u32, cooldown: u64) -> Self {
++        Self {
++            state: State::Closed,
++            failures: 0,
++            threshold,
++            cooldown,
++            opened_at: 0,
++        }
++    }
++
++    /// What the breaker is doing.
++    #[must_use]
++    pub fn state(&self) -> State {
++        self.state
++    }
++
++    /// Failure count in the current window.
++    #[must_use]
++    pub fn failures(&self) -> u32 {
++        self.failures
++    }
++
++    /// Where a request at `now` should go.
++    pub fn route(&mut self, now: u64) -> Route {
++        todo!("closed and half-open try the cache; an expired open becomes half-open")
++    }
++
++    /// Record how a call went.
++    pub fn record(&mut self, ok: bool, now: u64) {
++        todo!("success closes and forgets; a failure may open, and reopens from half-open")
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod breaker;
+ pub mod effectiveness;
+ pub mod expiry;
+ pub mod invalidation;

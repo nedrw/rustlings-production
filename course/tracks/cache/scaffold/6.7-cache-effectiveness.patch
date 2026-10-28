@@ -1,0 +1,87 @@
+--- /dev/null
++++ b/src/effectiveness.rs
+@@ -0,0 +1,74 @@
++//! What a cache is worth, measured: a hit ratio and the origin calls it saved.
++//!
++//! ## What you write
++//!
++//! * [`Report::ratio`] — hits divided by lookups. A cache nobody asked anything is not failing:
++//!   with zero lookups the ratio is `1.0`, not `0.0` and not a panic.
++//! * [`verdict`] — [`Verdict::Healthy`] when the ratio is at or above the SLO. The boundary belongs
++//!   to the healthy side: a cache exactly on its SLO is not an incident.
++
++/// What one lookup did.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Lookup {
++    /// The cache answered.
++    Hit,
++    /// The store was asked.
++    Miss,
++}
++
++/// What a window of lookups did.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct Report {
++    /// Lookups the cache answered.
++    pub hits: u64,
++    /// Lookups that reached the store.
++    pub misses: u64,
++}
++
++impl Report {
++    /// Lookups in total.
++    #[must_use]
++    pub fn lookups(&self) -> u64 {
++        self.hits + self.misses
++    }
++
++    /// The share of lookups the cache answered; `1.0` when nothing was asked.
++    #[must_use]
++    pub fn ratio(&self) -> f64 {
++        todo!("hits over lookups; no lookups is not a failure")
++    }
++
++    /// How many calls the cache saved the store.
++    #[must_use]
++    pub fn origin_calls(&self) -> u64 {
++        self.misses
++    }
++}
++
++/// Count a window of lookups.
++#[must_use]
++pub fn report(lookups: &[Lookup]) -> Report {
++    let mut report = Report::default();
++    for lookup in lookups {
++        match lookup {
++            Lookup::Hit => report.hits += 1,
++            Lookup::Miss => report.misses += 1,
++        }
++    }
++    report
++}
++
++/// Whether the window met its SLO.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Verdict {
++    /// The ratio is at or above the SLO.
++    Healthy,
++    /// Below it.
++    BelowSlo,
++}
++
++/// The verdict for `report` against `slo` (a ratio, e.g. `0.9`).
++#[must_use]
++pub fn verdict(report: &Report, slo: f64) -> Verdict {
++    todo!("at or above the slo is healthy; the boundary belongs to healthy")
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,7 @@
+ // The region later scaffolds are allowed to write into (authoring.md §5). A scaffold may only
+ // *insert* lines inside it, and only *remove* nothing.
+ // kiln:scaffold:begin
++pub mod effectiveness;
+ pub mod expiry;
+ pub mod invalidation;
+ pub mod single_flight;
