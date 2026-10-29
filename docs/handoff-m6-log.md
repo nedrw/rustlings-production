@@ -458,3 +458,37 @@ platform 7/7；四 track 的 `rebuild-patches --check` 全部 identical；脚手
 在这里被核）、`patches_check`（九条 track 的补丁链 + 工具自检）、`format_course_rust`（127 道探题）、
 `lint-caps`、`links`、`probe --check`（127/127、99/99）、`site --check`（317 页）、九条 track 的
 `selftest`。
+
+## 段 16：对评审建议的重新审议（2026-10-29）
+
+用户要求对评审的 16 条建议做一次复核，按最终审议结果修改。逐条结论：**14 条照原样成立**；两条在
+执行层面有偏差，本轮修正；另有两个评审与上一轮修复都没发现的缺口，本轮补上。
+
+**调整的两条：**
+
+1. **capstone 的 unsafe 检查范围。** 机制（编译器 `-F`、不读清单）成立，而且实测确认依赖不受影响——
+   cargo 给依赖加的 `--cap-lints allow` 把 forbid 一并封顶，带 tokio 依赖的项目照常通过 `unsafe-code`
+   检查。但 `cargo build` 不编译 `#[cfg(test)]` 代码：`unsafe` 藏进测试模块就能溜过去。改为
+   `--all-targets`，新增演示案例（干净的库 + cfg(test) 里的 unsafe 块）现在红、并点名那一行。
+   capstone.md 的示例输出还停留在被删除的字符串匹配实现（`unsafe-deny` 门名），一并改正为
+   `unsafe-code` 与"每个目标都编"。六个演示重验：绿 0；allow 旁路 1（E0453）；无 src 1；
+   目录不存在 2；**测试内 unsafe 1（新案例，旧实现放行）**；tokio 依赖 unsafe ✓。
+2. **两处正文要说出规格所断言的话。** 8.1 的英文正文写的是 "by number and sorted"——歧义并列
+   （中文本来就是"按号码排序"），收紧为 "sorted by number"；6.6 补一句"存储里没有的键也算缺失"
+   ——miss 计数缺陷所在的分支，正文此前只有隐含表述。译文同步、source_hash 重钉，i18n 0 漂移。
+
+**复核中确认无需改动的：** 9.7 正文已写明"按步顺序"；9.5/9.6 的正文都教了规格所测的规则（算法先行、
+反向边界）；`kiln new-track` 生成器的桩是无参的 `version()`，无警告风险；规格里的"给定代码"用例
+保留注解而非删除（它们钉的是学习者依赖的真实行为，删掉是丢覆盖）。
+
+**明确不做的：** T1–T5 的 119 步不扫"给定代码"用例——要再铺五条链、约一小时构建，而 selftest 已保证
+每份规格在脚手架上整文件失败；注解按需补，写进 m6-plan §10。
+
+**记录层面：** README/maintenance/m6-plan 补上第二次全量 CI（`a8bef9d`，2 小时 20 分）与时长原因
+（慢闸门决定：jobq mutants ≈30 分、lakelet soak+mutants ≈50 分，不随 track 数线性增长）；评审修复
+模块存档为 [tools/fixes-t6-t9-stub-bodies.py](../tools/fixes-t6-t9-stub-bodies.py)（`--fixes` 的
+第二个完整示例，重跑应为 no-op，M4 的第一个在 handoff-m4-log 段 12）。
+
+**验收（本机实测）：** 全量 `cargo xtask ci` 在本段所在的提交上重跑——`all checks passed`，退出 0，
+148/148（22+24+27+24+22+8+9+5+7），约 2 小时 45 分（05:29 → 08:15，离线、复用 land 缓存）。同日
+三次全量（1h33m / 2h20m / 2h45m）证实同一事实：时长由慢闸门与机器状态决定，不是 track 数。
